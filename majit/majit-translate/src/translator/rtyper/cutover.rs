@@ -7178,12 +7178,127 @@ fn check_access_directly_sanity(
             }
         }
     }
+    // Dispatcher / prepass graph set. Residual FunDecl calls stamp an
+    // identity that is not in `program.functions`; harvest is also
+    // unregistered and lookup falls back to `segments`. A harvest
+    // that *is* registered with identity missing is a registration gap.
+    {
+        let rows = function_graphs.unregistered_function_path_resolved();
+        let harvest_registered = rows.iter().filter(|(_, _, h)| *h).count();
+        eprintln!(
+            "UNREGISTERED_RESOLVED_PATH count={} harvest_registered={}",
+            rows.len(),
+            harvest_registered
+        );
+        if let Ok(path) = std::env::var("PYRE_UNREGISTERED_CENSUS") {
+            dump_unregistered_resolved_census(function_graphs, &rows, &path);
+        }
+        let gaps: Vec<_> = rows.iter().filter(|(_, _, h)| *h).take(20).collect();
+        let listed = if gaps.is_empty() {
+            rows.iter().take(20).collect::<Vec<_>>()
+        } else {
+            gaps
+        };
+        for (segments, resolved, harvest) in listed {
+            eprintln!(
+                "UNREGISTERED_RESOLVED_PATH segments={} resolved={} harvest_registered={}",
+                segments.join("::"),
+                resolved.display_name(),
+                harvest
+            );
+        }
+    }
     assert!(
         offenders.is_empty(),
         "access_directly on {}, which is outside the JIT graph set; graphs: {}",
         offenders.join(", "),
         offender_graphs.join(", ")
     );
+}
+
+fn dump_unregistered_resolved_census(
+    function_graphs: &crate::codewriter::call::GraphStore,
+    rows: &[(Vec<String>, crate::parse::CallPath, bool)],
+    path: &str,
+) {
+    use std::io::Write;
+    let Ok(mut file) = std::fs::File::create(path) else {
+        eprintln!("UNREGISTERED_RESOLVED_PATH dump failed to create {path}");
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "harvest_registered\tharvest\tharvest_spec\tresolved\tresolved_spec\tregular_resolved_registered\talias_count\taliases\tgraph_name\tfuncobj_identity\tfun_decl_id\towner_root\tmodule\tslot_identity"
+    );
+    for (segments, resolved, harvest_registered) in rows {
+        let mut harvest = crate::parse::CallPath::from_segments(segments.iter().cloned());
+        harvest.specialization = resolved.specialization;
+        let mut resolved_regular = resolved.clone();
+        resolved_regular.specialization = crate::parse::GraphSpecialization::Regular;
+        let regular_resolved_registered = function_graphs.names_funcobj(&resolved_regular);
+        let aliases = if *harvest_registered {
+            function_graphs.alias_paths(&harvest)
+        } else {
+            Vec::new()
+        };
+        let alias_text = aliases
+            .iter()
+            .map(|path| path.display_name())
+            .collect::<Vec<_>>()
+            .join("|");
+        let header = if *harvest_registered {
+            function_graphs.funcobj_header(&harvest)
+        } else {
+            None
+        };
+        let graph_name = header
+            .as_ref()
+            .map(|graph| graph.name.clone())
+            .unwrap_or_default();
+        let funcobj_identity = header
+            .as_ref()
+            .and_then(|graph| graph.funcobj_identity.clone())
+            .unwrap_or_default();
+        let fun_decl_id = header
+            .as_ref()
+            .and_then(|graph| graph.fun_decl_id)
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let owner_root = header
+            .as_ref()
+            .and_then(|graph| graph.owner_root.clone())
+            .unwrap_or_default();
+        let module = header
+            .as_ref()
+            .and_then(|graph| graph.func.module.clone())
+            .unwrap_or_default();
+        let slot_identity = if *harvest_registered {
+            function_graphs
+                .funcobj_identity(&harvest)
+                .map(|path| path.display_name())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            file,
+            "{}\t{}\t{:?}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            harvest_registered,
+            harvest.display_name(),
+            harvest.specialization,
+            resolved.display_name(),
+            resolved.specialization,
+            regular_resolved_registered,
+            aliases.len(),
+            alias_text,
+            graph_name,
+            funcobj_identity,
+            fun_decl_id,
+            owner_root,
+            module,
+            slot_identity
+        );
+    }
 }
 
 /// Wrap an already-annotated two-phase subject graph so
@@ -10750,6 +10865,7 @@ mod tests {
                                 crate::model::FN_CONST_HEAD.into(),
                                 "dummy_compute".into(),
                             ],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -10766,6 +10882,7 @@ mod tests {
                                 "jit".into(),
                                 "conditional_call_elidable1".into(),
                             ],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -11174,6 +11291,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["no_such".into(), "callee".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -11801,6 +11919,7 @@ mod tests {
                             crate::model::FN_CONST_HEAD.into(),
                             OPTION_FN_PBC_CALLEE.into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -16256,6 +16375,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["ordinary_scalar_call".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -16276,6 +16396,7 @@ mod tests {
             let (graph, result, value_to_var) = backfill_call_result_fixture(
                 crate::model::CallTarget::FunctionPath {
                     segments: vec!["erased_gcref_call".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -16308,6 +16429,7 @@ mod tests {
                     "gc_storage".to_string(),
                     "gc_alloc_young_storage_box__inst_RDict".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -16331,6 +16453,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_gcref_call".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -16353,6 +16476,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_named_ref_call".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -16393,6 +16517,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_function_ref".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -16449,6 +16574,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_object_ref".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -17493,6 +17619,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["side_effect".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17791,6 +17918,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["consume".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17870,6 +17998,7 @@ mod tests {
             kind: crate::model::OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["consume_carrier".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -18579,6 +18708,7 @@ mod tests {
                     kind: crate::model::OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["consume".into()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -18999,6 +19129,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: hint_path.split("::").map(str::to_string).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -19033,6 +19164,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: free_path.split("::").map(str::to_string).collect(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19858,6 +19990,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20092,6 +20225,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: callee_segments.iter().map(|s| s.to_string()).collect(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20268,6 +20402,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20317,6 +20452,7 @@ mod tests {
                 kind: crate::model::OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },

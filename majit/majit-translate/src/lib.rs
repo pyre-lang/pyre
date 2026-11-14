@@ -870,6 +870,86 @@ fn lazy_graph_source(
 /// `bookkeeper.getdesc` binds every alias to the same graph object, and a
 /// per-alias deep copy of `FunctionGraph.blocks` multiplied the whole
 /// free-function graph set by the alias count.
+fn unique_call_path(func: &front::semantic::SemanticFunction) -> Option<crate::parse::CallPath> {
+    if func.call_segments.is_empty() {
+        None
+    } else {
+        Some(crate::parse::CallPath::from_segments(
+            func.call_segments.iter().cloned(),
+        ))
+    }
+}
+
+fn unique_call_source(func: &front::semantic::SemanticFunction) -> &str {
+    func.funcobj_identity.as_deref().unwrap_or(&func.name)
+}
+
+/// Identity `CallPath` of each funcobj, keyed by that funcobj's `GraphKey`.
+/// Registration aliases this path onto the harvest key it just bound
+/// (`Bookkeeper.getdesc` from the function object, not from a caller).
+fn unique_call_path_by_graph_key(
+    functions: &[front::semantic::SemanticFunction],
+) -> std::collections::HashMap<crate::model::GraphKey, crate::parse::CallPath> {
+    let mut map = std::collections::HashMap::new();
+    for func in functions {
+        let Some(path) = unique_call_path(func) else {
+            continue;
+        };
+        map.entry(func.lazy_graph().graph_key()).or_insert(path);
+    }
+    map
+}
+
+/// Bind `unique` as an alias of the harvest path this funcobj was just
+/// registered under. No-op when `unique` is already a spelling, when
+/// `registered` names a different funcobj, or when `unique` is the harvest
+/// path itself.
+fn alias_unique_call_path(
+    call_control: &mut call::CallControl,
+    unique: Option<&crate::parse::CallPath>,
+    registered: &crate::parse::CallPath,
+    expected_key: &crate::model::GraphKey,
+) {
+    let Some(unique) = unique else {
+        return;
+    };
+    if unique == registered {
+        return;
+    }
+    let graphs = call_control.function_graphs_mut();
+    if graphs.names_funcobj(unique) {
+        return;
+    }
+    let Some(key) = graphs.key_for(registered) else {
+        return;
+    };
+    if key != *expected_key {
+        return;
+    }
+    graphs.share_path(unique.clone(), registered);
+}
+
+/// Harvest/display path this funcobj was registered under: trait-impl
+/// identity or inherent `for_impl_method`, using `func.name` (the spec
+/// leaf on specialized copies).
+fn harvest_registration_path(
+    func: &front::semantic::SemanticFunction,
+) -> Option<crate::parse::CallPath> {
+    if let Some(identity) = func.trait_impl_identity.as_deref() {
+        let owner = match func.self_ty_root.as_deref() {
+            Some(owner) => owner,
+            None if !func.module_path.is_empty() => func.module_path.as_str(),
+            None => return None,
+        };
+        return Some(crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
+        ));
+    }
+    func.self_ty_root
+        .as_deref()
+        .map(|owner| crate::parse::CallPath::for_impl_method(owner, func.name.as_str()))
+}
+
 fn register_function_graph_alias(
     graphs: &mut std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
     sources: &mut std::collections::HashMap<crate::parse::CallPath, String>,
@@ -1918,6 +1998,15 @@ fn analyze_pipeline_from_module_paths(
     // Python graph object.
     let mut free_function_graphs: Vec<Option<call::GraphSource>> =
         vec![None; program.functions.len()];
+    // Harvest aliases every local crate root. A unique CallPath keeps the
+    // crate Ident, so a harvest prefix of crate A must not occupy crate B's
+    // unique path (`rstring::bloom` in majit-rlib vs pyre-object).
+    let unique_paths: std::collections::HashSet<crate::parse::CallPath> = program
+        .functions
+        .iter()
+        .filter_map(unique_call_path)
+        .collect();
+    let unique_by_graph_key = unique_call_path_by_graph_key(&program.functions);
     for (index, func) in program.functions.iter().enumerate() {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
@@ -1946,6 +2035,9 @@ fn analyze_pipeline_from_module_paths(
                 &func.module_path,
                 &program.struct_fields.foreign_callables,
             ) {
+                if unique_paths.contains(&path) {
+                    continue;
+                }
                 register_function_graph_alias(
                     &mut canonical_function_graphs,
                     &mut canonical_function_alias_source,
@@ -1954,6 +2046,23 @@ fn analyze_pipeline_from_module_paths(
                     &graph,
                 );
             }
+        }
+        // Free functions share one graph across harvest aliases and the
+        // unique walk. Methods are registered later; a LazyGraph minted
+        // here would occupy the GraphKey first and leave harvest
+        // `trait_impl_identity_path` unbound (`insert_lazy`), so
+        // AccessDirect copies land on a leaf-named FunctionDesc that is
+        // not a `find_all_graphs` candidate.
+        if let Some(path) = unique_call_path(func)
+            && let Some(graph) = &free_function_graphs[index]
+        {
+            register_function_graph_alias(
+                &mut canonical_function_graphs,
+                &mut canonical_function_alias_source,
+                path,
+                unique_call_source(func),
+                graph,
+            );
         }
     }
     prof.mark("  free-fn graph aliases");
@@ -2313,7 +2422,14 @@ fn analyze_pipeline_from_module_paths(
             func.return_can_be_none,
             &func.hints,
         );
-        call_control.register_function_graph(path, graph);
+        call_control.register_function_graph(path.clone(), graph.clone());
+        // Identity walk with this funcobj's leaf (spec copies include
+        // `__spec_*`) aliases the same graph (`Bookkeeper.getdesc`).
+        if let Some(unique) = unique_call_path(func)
+            && unique != path
+        {
+            call_control.register_function_graph(unique, graph);
+        }
     }
     prof.mark("  register concrete trait-impl identities");
     // `rpbc.py FunctionReprBase.call`: the `c_graphs` constant is the full
@@ -2373,6 +2489,16 @@ fn analyze_pipeline_from_module_paths(
             &func.module_path,
             &program.struct_fields.foreign_callables,
         ) {
+            if unique_paths.contains(&path) {
+                continue;
+            }
+            call_control.register_function_graph_with_hints(
+                path,
+                graph.clone(),
+                func.hints.clone(),
+            );
+        }
+        if let Some(path) = unique_call_path(func) {
             call_control.register_function_graph_with_hints(
                 path,
                 graph.clone(),
@@ -2455,8 +2581,13 @@ fn analyze_pipeline_from_module_paths(
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
+                let expected_key = graph.graph_key();
+                let unique = unique_by_graph_key.get(&expected_key).cloned();
                 let graph = lazy_graph_source(graph, &method.return_type, &None, false, &[]);
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
+                let harvest =
+                    crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
+                alias_unique_call_path(&mut call_control, unique.as_ref(), &harvest, &expected_key);
                 // The pseudo-type path `[<default methods of Trait>, <method>]`
                 // is the base-class body.  `[<Trait>, <method>]` is bound by
                 // `bind_trait_default_direct_paths` (`classdesc.py` `lookup`,
@@ -2689,8 +2820,16 @@ fn analyze_pipeline_from_module_paths(
         if call_control.function_graphs().names_funcobj(&direct_path) {
             continue;
         }
+        let expected_key = graph.graph_key();
+        let unique = unique_by_graph_key.get(&expected_key).cloned();
         let graph = lazy_graph_source(graph, return_type, &None, false, &[]);
         call_control.register_function_graph(direct_path.clone(), graph);
+        alias_unique_call_path(
+            &mut call_control,
+            unique.as_ref(),
+            &direct_path,
+            &expected_key,
+        );
         // Mirror the default-direct hint registration above so the
         // BFS reaches the same `_reject_function` verdict on this
         // path as on `[impl_type, method]`.
@@ -2734,6 +2873,8 @@ fn analyze_pipeline_from_module_paths(
         let graph: &model::LazyGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
             .unwrap_or(&method_info.graph);
+        let expected_key = graph.graph_key();
+        let unique = unique_by_graph_key.get(&expected_key).cloned();
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
         // `_reject_function("elidable")` mirrors RPython's
@@ -2754,6 +2895,7 @@ fn analyze_pipeline_from_module_paths(
                 method_info.hints.clone(),
             );
         }
+        alias_unique_call_path(&mut call_control, unique.as_ref(), &path, &expected_key);
         // RPython: hints bound to graph identity.
         for hint in &method_info.hints {
             if call_control.mark_aroundstate_hint(path.clone(), hint) {
@@ -2829,6 +2971,25 @@ fn analyze_pipeline_from_module_paths(
             .function_graphs_mut()
             .bind_unique_alias_proposals(proposals);
     }
+    // Identity path is an alias of the harvest funcobj already in the
+    // store (`Bookkeeper.getdesc`). Spec copies use `call_segments`
+    // with the spec leaf so `cachedgraph` is not the base graph.
+    {
+        let graphs = call_control.function_graphs_mut();
+        for func in &program.functions {
+            let Some(unique) = unique_call_path(func) else {
+                continue;
+            };
+            if graphs.names_funcobj(&unique) {
+                continue;
+            }
+            if let Some(harvest) = harvest_registration_path(func)
+                && graphs.names_funcobj(&harvest)
+            {
+                graphs.share_path(unique, &harvest);
+            }
+        }
+    }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
@@ -2875,7 +3036,7 @@ fn analyze_pipeline_from_module_paths(
         // must use the same alias spelling set as the graph-alias loop
         // above so a module-qualified call site finds both the graph
         // AND the hints (elidable/loopinvariant/cannot_collect/oopspec).
-        let paths = if let Some(ref owner) = func.self_ty_root {
+        let mut paths = if let Some(ref owner) = func.self_ty_root {
             // impl method: ["owner", "method"]. A colliding trait-impl
             // keeps only the identity path so its hints do not stamp the
             // inherent's two-segment spelling.
@@ -2905,6 +3066,10 @@ fn analyze_pipeline_from_module_paths(
                 &program.struct_fields.foreign_callables,
             )
         };
+        paths.retain(|path| !unique_paths.contains(path));
+        if let Some(path) = unique_call_path(func) {
+            paths.push(path);
+        }
         for path in &paths {
             call_control.mark_decorator_hints(path, &func.hints);
         }
