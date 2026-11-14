@@ -1117,7 +1117,7 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
 /// residual `push_roots`.
 #[test]
 fn install_ascii_items_bracket_is_scalar_replaced() {
-    let Some(llbc) = object_llbc() else { return };
+    let llbc = object_llbc();
     let graph = lower_named(llbc, "install_ascii_items");
     for leaf in [
         "push_roots",
