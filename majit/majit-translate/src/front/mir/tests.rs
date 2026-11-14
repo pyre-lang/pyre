@@ -39910,5 +39910,133 @@ fn object_array_index_does_not_recast_element_to_str() {
     }
 }
 
+#[test]
+fn option_take_path_is_inlined_mem_exchange() {
+    use super::desugar::std_call::is_option_take_path;
+    assert!(is_option_take_path("core::option::<Impl>::take"));
+    assert!(is_option_take_path("std::option::<Impl>::take"));
+    assert!(!is_option_take_path("core::mem::take"));
+    assert!(!is_option_take_path("core::option::<Impl>::unwrap_or"));
+    assert!(!is_option_take_path("alloc::vec::<Impl>::take"));
+    assert!(super::is_inlined_mem_exchange_path(
+        "core::option::<Impl>::take"
+    ));
+    assert!(super::is_inlined_mem_exchange_path(
+        "std::option::<Impl>::take"
+    ));
+    assert!(super::is_inlined_mem_exchange_path("core::mem::take"));
+    assert!(super::is_inlined_mem_exchange_path("std::mem::replace"));
+    assert!(!super::is_inlined_mem_exchange_path(
+        "core::option::<Impl>::unwrap_or"
+    ));
+}
+
+/// `W_Profiler::enter_return` does `self.current_context.take()` on a niche
+/// `Option<Box<ProfilerContext>>` field. Inlining is `old = f; f = None`:
+/// a field read of `current_context`, a None store from `emit_option_none`,
+/// and no `CallTarget::Method` named `take`.
+#[test]
+fn option_take_on_field_lowers_to_read_and_none_store() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+
+    let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let name = "pyre_module::module::_lsprof::<Impl>::enter_return";
+    let graph = crate::test_support::lower_function(llbc, name)
+        .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+    let ops = graph_ops(&graph);
+    let has_take = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == "take",
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf == "take"),
+        _ => false,
+    });
+    assert!(
+        !has_take,
+        "enter_return residualized Option::take: {}",
+        graph.dump()
+    );
+    let reads_field = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "current_context"
+        )
+    });
+    let writes: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, value, .. } if field.name == "current_context" => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reads_field,
+        "enter_return must read current_context (the old Option): {}",
+        graph.dump()
+    );
+    assert!(
+        !writes.is_empty(),
+        "enter_return must store None into current_context: {}",
+        graph.dump()
+    );
+    let defining_kind = |stored: &LinkArg| -> Option<&OpKind> {
+        let var = stored.as_variable()?;
+        ops.iter()
+            .find(|op| op.result.as_ref() == Some(var))
+            .map(|op| &op.kind)
+    };
+    let is_integer_zero =
+        |kind: &OpKind| matches!(kind, OpKind::ConstInt(0) | OpKind::ConstUInt(0));
+    let is_emit_option_none = |kind: &OpKind| match kind {
+        OpKind::ConstNone => true,
+        OpKind::Call { target, .. } => {
+            let segs = target.path_segments().unwrap_or_default();
+            segs.as_slice() == ["core", "ptr", "null_mut"]
+                || segs.last() == Some(&crate::runtime_names::shims::CAST_INSTANCE)
+                || segs.last() == Some(&"None")
+                || segs.last() == Some(&"cast_int_to_ptr")
+                || segs.last() == Some(&"null_fn")
+                || segs.last() == Some(&"null_raw")
+        }
+        _ => false,
+    };
+    let mut saw_none_store = false;
+    for value in &writes {
+        match value {
+            LinkArg::Const(constant) => panic!(
+                "current_context take stored a constant {constant:?}, not emit_option_none: {}",
+                graph.dump()
+            ),
+            LinkArg::Value(_) => {
+                let Some(kind) = defining_kind(value) else {
+                    // `self.current_context = previous.take()` writes a
+                    // block-input old value, not the None construction.
+                    continue;
+                };
+                assert!(
+                    !is_integer_zero(kind),
+                    "current_context take stored integer 0 ({kind:?}): {}",
+                    graph.dump()
+                );
+                if is_emit_option_none(kind) {
+                    saw_none_store = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_none_store,
+        "current_context take must store emit_option_none's None (null_raw for this niche), not a scalar zero: {}",
+        graph.dump()
+    );
+}
+
 #[path = "exception_class_use_tests.rs"]
 mod exception_class_use_tests;

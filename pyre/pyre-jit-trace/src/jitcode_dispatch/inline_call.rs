@@ -14697,6 +14697,11 @@ pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
     {
         return Ok(None);
     }
+    // Name pin below is GuardValue of the box. A NewWithVtable unicode is
+    // still virtual (`optimize_GUARD_VALUE`: promote of a virtual).
+    if super::specialize::walker_promote_of_virtual(ctx, r_args[3]) {
+        return Ok(None);
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
     try_walker_inline_property_get_named(
         ctx,

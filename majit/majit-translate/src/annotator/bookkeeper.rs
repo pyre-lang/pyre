@@ -2093,11 +2093,11 @@ impl Bookkeeper {
         if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
             return true;
         }
-        let inner = strip_generic_one(spelling.trim(), "Option<")
+        let inner = strip_generic_leaf(spelling.trim(), "Option")
             .map(str::trim)
             .unwrap_or(spelling.trim());
         self.profilefunc_spellings.borrow().iter().any(|known| {
-            let known_inner = strip_generic_one(known.trim(), "Option<")
+            let known_inner = strip_generic_leaf(known.trim(), "Option")
                 .map(str::trim)
                 .unwrap_or(known.trim());
             known == spelling
@@ -2325,18 +2325,23 @@ impl Bookkeeper {
     /// `#[repr(transparent)]` rustc pointer-niche field so a by-value
     /// `Option` of that newtype is the nullable GC word. Intern
     /// reconstructs that from the payload's declared field row.
-    /// `rclass.py` `InstanceRepr.convert_const(None)` is `null_instance`.
+    /// Harvest may re-spell a transparent GC handle's `NonNull<PyObject>`
+    /// as `*mut {Deref::Target}`; `FieldRow.is_rustc_pointer_niche` is the
+    /// declared-type identity that spelling drops. A genuine `*mut T` field
+    /// has no niche. `rclass.py` `InstanceRepr.convert_const(None)` is
+    /// `null_instance`.
     fn niche_option_one_field_pointer_payload(&self, inner: &str) -> Option<String> {
         let key = self.intern_class_key(inner);
-        let row_ty = {
+        let (row_ty, is_declared_pointer_niche) = {
             let guard = self.struct_fields.borrow();
             let rows = guard.as_ref()?.fields.get(&key)?;
             if rows.len() != 1 {
                 return None;
             }
-            rows[0].ty.clone()
+            (rows[0].ty.clone(), rows[0].is_rustc_pointer_niche)
         };
-        crate::front::mir::is_rustc_pointer_niche_spelling(&row_ty).then_some(row_ty)
+        (is_declared_pointer_niche || crate::front::mir::is_rustc_pointer_niche_spelling(&row_ty))
+            .then_some(row_ty)
     }
 
     /// Intern of a by-value payload of type `ty`.
@@ -10690,6 +10695,36 @@ mod tests {
             false,
         );
         assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_of_respelled_pointer_niche_row() {
+        {
+            let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+                "m::Wrap",
+                vec![
+                    crate::front::semantic::FieldRow::positional("__pos_0", "*mut m::Obj")
+                        .with_rustc_pointer_niche(true),
+                ],
+                "m::Obj",
+                true,
+            );
+            assert!(bk.is_niche_option_gc_payload_spelling("Option<Wrap>"));
+            assert!(bk.is_niche_option_gc_payload_spelling("option::Option<Wrap>"));
+        }
+        {
+            let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+                "m::Wrap",
+                vec![
+                    crate::front::semantic::FieldRow::positional("__pos_0", "*mut m::Obj")
+                        .with_rustc_pointer_niche(false),
+                ],
+                "m::Obj",
+                true,
+            );
+            assert!(!bk.is_niche_option_gc_payload_spelling("Option<Wrap>"));
+            assert!(!bk.is_niche_option_gc_payload_spelling("option::Option<Wrap>"));
+        }
     }
 
     #[test]
@@ -19820,5 +19855,12 @@ mod tests {
             matches!(generic, SomeValue::Impossible),
             "generic Option<fn> is lattice bottom until a PBC store, got {generic:?}"
         );
+    }
+
+    #[test]
+    fn is_profilefunc_type_spelling_peels_qualified_option() {
+        let bk = bk();
+        bk.set_profilefunc_family(vec![], vec![], vec!["Option<fn(i64) -> i64>".into()]);
+        assert!(bk.is_profilefunc_type_spelling("option::Option<fn(i64) -> i64>"));
     }
 }

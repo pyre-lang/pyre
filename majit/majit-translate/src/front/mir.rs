@@ -4379,6 +4379,7 @@ fn field_row_from_decl(
             lltype::tyref_is_fieldless_enum_free(&field.ty, llbc)
                 || lltype::tyref_is_borrowed_fieldless_enum_free(&field.ty, llbc),
         )
+        .with_rustc_pointer_niche(lltype::tyref_is_rustc_pointer_niche(&field.ty, llbc))
 }
 
 fn field_decl_name(index: usize, field: &FieldDecl) -> String {
