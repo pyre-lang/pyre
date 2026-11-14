@@ -4,13 +4,15 @@
 //! share mutable bindings between an outer function and its nested
 //! inner functions.
 
+use crate::lltype::{GcType, TypeIdCell};
 use crate::pyobject::*;
 use crate::quasiimmut::{QuasiImmut, QuasiImmutLock, null_mutate_lock, null_mutate_word};
 use pyre_macros::pyre_class;
 use std::sync::Arc;
 
 /// nestedscope.py `class CellFamily` — one per cellvar name of a code
-/// object (`pycode.py` `PyCode._initialize`).
+/// object (`pycode.py` `PyCode._initialize`). Ordinary GC instance
+/// (`lltype.malloc` / `gct_fv_gc_malloc`), headerless like a mapdict node.
 ///
 /// Every cell a frame creates for that cellvar shares this object, so
 /// `ever_mutated` accumulates across frame instantiations: a binding that is
@@ -34,9 +36,16 @@ pub struct CellFamily {
     pub ever_mutated: std::cell::Cell<bool>,
     /// Hidden `mutate_ever_mutated` field (`quasiimmut.py get_mutate_field_name`
     /// of pyre `ever_mutated`; `nestedscope.py CellFamily._immutable_fields_ =
-    /// ['ever_mutated?']`). The owner is a `Box::into_raw` leak that is
-    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
-    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    /// ['ever_mutated?']`). The owner is a GC [`CellFamily`]. An `AtomicPtr`
+    /// plus a lock, no GC pointers, reclaimed by [`cell_family_destructor`].
+    ///
+    /// `quasiimmut.py get_current_qmut_instance` / `QuasiImmutDescr.__init__`
+    /// (`pyjitpl.py opimpl_record_quasiimmut_field`) read `box.getref_base()`
+    /// and add this field's offset. A family interned with `const_ref` lives
+    /// in the trace's const-ptr table (`rewrite.py remove_constptrs_in` /
+    /// `gcreftracer.py`); a moving collection rewrites that slot, so the
+    /// mutate offset still names the forwarded object. [`Self::set_ever_mutated`]
+    /// still sweeps via `quasiimmut.py` `do_invalidate` before the write.
     pub mutate_ever_mutated: std::sync::atomic::AtomicPtr<QuasiImmut>,
     pub mutate_ever_mutated_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
 }
@@ -52,10 +61,35 @@ impl Drop for CellFamily {
     }
 }
 
-/// Host `CellFamily` is a `Box::into_raw`'d host allocation, never a GC object.
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub const _alloc_flavor_CellFamily: &str = "raw";
+/// GC tid for [`CellFamily`], assigned at `register_type`.
+pub static CELL_FAMILY_GC_TYPE_ID: TypeIdCell = TypeIdCell::auto();
+
+impl GcType for CellFamily {
+    fn type_id() -> u32 {
+        CELL_FAMILY_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// Sweep destructor for [`CellFamily`]: drop `name` and reclaim the
+/// `ever_mutated?` qmut words. The GC owns the object itself.
+///
+/// # Safety
+/// `obj_addr` must point at a swept [`CellFamily`].
+pub unsafe fn cell_family_destructor(obj_addr: usize) {
+    let f = obj_addr as *mut CellFamily;
+    unsafe { std::ptr::drop_in_place(f) };
+}
+
+/// nestedscope.py `CellFamily(name)` — `lltype.malloc` of a GC instance
+/// (`gct_fv_gc_malloc`). Same nursery allocator as mapdict `intern_node`
+/// (`malloc_typed_managed` / `try_gc_alloc`: old-gen fallback, no collection
+/// at the malloc). The object is moving: a trace that bakes it as a
+/// `ConstPtr` is rewritten to `LoadFromGcTable` (`rewrite.py
+/// remove_constptrs_in`) and `gcreftracer.py` updates the slot when it moves.
+pub fn new_cell_family(name: String) -> *const CellFamily {
+    crate::lltype::malloc_typed_managed(CellFamily::new(name)) as *const CellFamily
+}
 
 impl CellFamily {
     #[inline]
@@ -106,9 +140,10 @@ impl CellFamily {
 /// carries (`descr_new_cell`, and any cell whose code object has no family
 /// table).  Its `ever_mutated` starts true, so such a cell never folds.
 ///
-/// Held as a leaked address rather than a `OnceLock<CellFamily>` because the
-/// `std::cell::Cell<bool>` inside makes the family non-`Sync`, and the
-/// allocation must outlive every cell pointing at it anyway.
+/// One prebuilt immortal GC object (`malloc_typed_immortal`, the same birth
+/// as `space.w_None`). `std::cell::Cell<bool>` makes the payload non-`Sync`,
+/// so the `OnceLock` stores the payload address as `usize`. The object is
+/// born old with `GCFLAG_NO_HEAP_PTRS` (no GC pointers) and never moves.
 ///
 /// This one family is shared by every cell that has no table of its own, so it
 /// must stay WRITE-FREE, and the `usize` the `OnceLock` stores hides its
@@ -127,7 +162,7 @@ pub fn dummy_family() -> *const CellFamily {
     *DUMMY_FAMILY.get_or_init(|| {
         let family = CellFamily::new("<dummy>".to_string());
         family.ever_mutated.set(true);
-        Box::into_raw(Box::new(family)) as usize
+        crate::lltype::malloc_typed_immortal(family) as usize
     }) as *const CellFamily
 }
 
@@ -139,25 +174,27 @@ pub fn dummy_family() -> *const CellFamily {
 pub struct Cell {
     pub contents: PyObjectRef,
     /// nestedscope.py `Cell` `_immutable_fields_ = ['family']` — the
-    /// [`CellFamily`] shared with every other cell of the same cellvar.  Never
-    /// null.  The families are leaked, not managed, so this word is absent
-    /// from the traced pointer offsets and outlives the code object that
-    /// created it — a closure keeps its cells alive long after the enclosing
-    /// code object is collected.
-    pub family: *const CellFamily,
+    /// GC [`CellFamily`] shared with every other cell of the same cellvar.
+    /// Never null. Stored as [`PyObjectRef`] so the `#[pyre_class]` pointer
+    /// offsets include it; the pointee is a headerless GC payload, not a
+    /// Python object. A closure keeps its cells alive, and each cell traces
+    /// this edge, so the family survives after the enclosing code object
+    /// is collected (`pycode.py` `PyCode._initialize` / `Cell.__init__`).
+    pub family: PyObjectRef,
 }
 
 /// Allocate a new cell wrapping `value` (`nestedscope.py` `Cell.__init__`).
 /// Pass `PY_NULL` for an empty cell, and [`dummy_family`] when no code object
 /// owns the binding.
 pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): `value`
-    // is a live GC pointer that must survive — and be relocated by — the
-    // collection the GC malloc below may trigger. `pin_root` records it in
-    // the shadow stack so the moving collector keeps it alive and rewrites
-    // the slot; we read the relocated address back after the malloc.
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): `value` and
+    // `family` are live GC pointers that must survive — and be relocated
+    // by — the collection the GC malloc below may trigger. `pin_root`
+    // records them in the shadow stack so the moving collector keeps them
+    // alive and rewrites the slots; we read the relocated addresses back
+    // after the malloc.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::pin_roots(&[value]);
+    let save_point = crate::gc_roots::pin_roots(&[value, family as PyObjectRef]);
     let header = PyObject {
         ob_type: &CELL_TYPE as *const PyType,
         w_class: get_instantiate(&CELL_TYPE),
@@ -169,6 +206,7 @@ pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef 
     // mark-sweep skips it and the only-reachable-via-cell value is swept.
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(save_point);
+    let family = crate::gc_roots::shadow_stack_get(save_point + 1);
     if !raw.is_null() {
         unsafe {
             std::ptr::write(
@@ -257,7 +295,7 @@ pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_family(obj: PyObjectRef) -> *const CellFamily {
-    unsafe { (*(obj as *const Cell)).family }
+    unsafe { (*(obj as *const Cell)).family as *const CellFamily }
 }
 
 // Cell.set / Cell.delete read `contents`, decide whether the write is a
@@ -326,7 +364,7 @@ unsafe fn w_cell_set_unlocked(obj: PyObjectRef, value: PyObjectRef) {
     // the ordinary write-once closure variable foldable.
     let cell = obj as *mut Cell;
     if !unsafe { (*cell).contents }.is_null() {
-        let family = unsafe { (*cell).family };
+        let family = unsafe { (*cell).family as *const CellFamily };
         if !family.is_null() {
             unsafe { (*family).set_ever_mutated(true) };
         }
@@ -353,7 +391,7 @@ pub unsafe fn w_cell_delete(obj: PyObjectRef) -> bool {
     let _guard = unsafe { w_cell_lock(crate::gc_roots::shadow_stack_get(cell_slot)) };
     let obj = crate::gc_roots::shadow_stack_get(cell_slot);
     let cell = obj as *mut Cell;
-    let family = unsafe { (*cell).family };
+    let family = unsafe { (*cell).family as *const CellFamily };
     if !family.is_null() {
         unsafe { (*family).set_ever_mutated(true) };
     }
@@ -370,9 +408,9 @@ mod tests {
     use super::*;
 
     /// A family that lives as long as the test, standing in for the one a code
-    /// object owns.
+    /// object owns. Allocated the GC way (`new_cell_family`).
     fn leak_family() -> *const CellFamily {
-        Box::into_raw(Box::new(CellFamily::new("x".to_string()))) as *const CellFamily
+        new_cell_family("x".to_string())
     }
 
     #[test]
@@ -516,5 +554,7 @@ mod tests {
             W_CELL_GC_TYPE_ID
         );
         assert_eq!(<Cell as crate::lltype::GcType>::SIZE, W_CELL_OBJECT_SIZE);
+        assert!(W_CELL_GC_PTR_OFFSETS.contains(&std::mem::offset_of!(Cell, contents)));
+        assert!(W_CELL_GC_PTR_OFFSETS.contains(&std::mem::offset_of!(Cell, family)));
     }
 }

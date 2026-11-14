@@ -11672,7 +11672,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // then the closure's existing cells.  Emit the first half as virtual
         // allocations so the callee's own LOAD_DEREF / STORE_DEREF pair folds
         // against the trace's object instead of forcing one.  The family
-        // address is a trace-time constant: `PyCode._initialize` builds the
+        // is a trace-time `const_ref`: `PyCode._initialize` builds the
         // table once with the code object, which `pycode_const` has already
         // pinned.  A cellvar that also names a varname is not in this band --
         // it shares that varname's slot and `MAKE_CELL` wraps it in the
@@ -11690,7 +11690,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         nlocals + i,
                     )
                 };
-                let family_const = ctx.trace_ctx.const_int(family as i64);
+                let family_const = ctx.trace_ctx.const_ref(family as i64);
                 cell_slots.push(crate::helpers::emit_new_cell_inline(
                     ctx.trace_ctx,
                     family_const,

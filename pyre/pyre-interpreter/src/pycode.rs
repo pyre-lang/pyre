@@ -591,6 +591,7 @@ pub const _immutable_fields_Signature: &str =
     "code_ptr",
     "co_consts_w[*]",
     "co_names_w[*]",
+    "cell_families[*]",
     "co_nlocals",
     "co_stacksize",
     "co_nfreevars",
@@ -685,8 +686,9 @@ pub struct PyCode {
     /// `pycode.py self.co_flags = flags` (`_immutable_fields_ co_flags`).
     pub co_flags: u32,
     /// `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
-    /// cellvars]` — one [`CellFamily`] per cellvar, shared by every cell any
-    /// frame of this code creates for that cellvar.
+    /// cellvars]` (`_immutable_fields_ cell_families[*]`) — one GC
+    /// [`CellFamily`] per cellvar, shared by every cell any frame of this
+    /// code creates for that cellvar.
     ///
     /// Indexed by localsplus slot rather than by cellvar position: pyre
     /// follows the 3.11 unified slot layout, where a cellvar that also names a
@@ -696,11 +698,12 @@ pub struct PyCode {
     /// index in O(1).  Slots naming no cellvar hold null; `null` table when
     /// `code_ptr` is invalid or the code has no cellvars (pycode.py `PyCode._initialize`).
     ///
-    /// The `Vec` is owned via `Box::into_raw` and dropped with the wrapper, but
-    /// the families it points at are leaked: a cell outlives the code object
-    /// that made it whenever a closure survives its enclosing function, and
-    /// `Cell.family` is a raw, untraced pointer.
-    pub cell_families: *mut Vec<*const CellFamily>,
+    /// A type-9 [`FixedObjectArray`] (`Ptr(GcArray(OBJECTPTR))`), the same
+    /// host shape as `co_consts_w`. The array and every family it names are
+    /// ordinary GC objects: `walk_enrolled_code_roots` traces this slot, each
+    /// cell traces `Cell.family`, and the collector reclaims a family once
+    /// the table and every surviving cell are gone.
+    pub cell_families: *mut FixedObjectArray,
     /// `pycode.py self._globals_caches = [None] * len(self.co_names_w)`.
     ///
     /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
@@ -1445,39 +1448,6 @@ fn w_code_new_owned(
             code_ref.flags.bits(),
         )
     };
-    // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
-    // cellvars]`, laid out by localsplus slot — see the field's doc.
-    // pycode.py `PyCode._initialize` leaves the list empty when the code has no cellvars.
-    let cell_families = if !code_ptr_aligned {
-        std::ptr::null_mut()
-    } else {
-        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
-        if code_ref.cellvars.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            let nvarnames = code_ref.varnames.len();
-            let mut slots: Vec<*const CellFamily> =
-                vec![std::ptr::null(); nvarnames + npure_cellvars as usize];
-            let mut pure = 0usize;
-            for cellvar in code_ref.cellvars.iter() {
-                let cellname: &str = cellvar.as_ref();
-                let family = Box::into_raw(Box::new(CellFamily::new(cellname.to_string())))
-                    as *const CellFamily;
-                let shared = code_ref.varnames.iter().position(|varname| {
-                    let varname: &str = varname.as_ref();
-                    varname == cellname
-                });
-                match shared {
-                    Some(slot) => slots[slot] = family,
-                    None => {
-                        slots[nvarnames + pure] = family;
-                        pure += 1;
-                    }
-                }
-            }
-            Box::into_raw(Box::new(slots))
-        }
-    };
     let co_firstlineno_raw = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
         1
     } else {
@@ -1517,7 +1487,7 @@ fn w_code_new_owned(
         co_stacksize,
         co_nfreevars,
         co_flags,
-        cell_families,
+        cell_families: std::ptr::null_mut(),
         globals_caches,
         mapdict_caches,
         co_consts_w: std::ptr::null_mut(),
@@ -1572,6 +1542,47 @@ fn w_code_new_owned(
     // own wrapper against the same owner, and a wrapper that dies during the
     // loop must not find the count at zero.
     attach_code_unit_wrapper(owner, code_ptr);
+    // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name)
+    // for name in cellvars]`, laid out by localsplus slot. Minted after the
+    // wrapper is pinned so the array is a young child of an old-gen PyCode
+    // (same order as `co_consts_w`). `new_cell_family` is
+    // `malloc_typed_managed` and does not collect; each family is stored
+    // into the array immediately. Empty cellvars leave the field null.
+    if code_ptr_aligned {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        if !code_ref.cellvars.is_empty() {
+            let nvarnames = code_ref.varnames.len();
+            let nslots = nvarnames + npure_cellvars as usize;
+            let families_table = unsafe { alloc_co_consts_array(nslots) };
+            let families_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(families_table as pyre_object::PyObjectRef);
+            let mut pure = 0usize;
+            for cellvar in code_ref.cellvars.iter() {
+                let cellname: &str = cellvar.as_ref();
+                let family = pyre_object::nestedscope::new_cell_family(cellname.to_string());
+                let slot = match code_ref.varnames.iter().position(|varname| {
+                    let varname: &str = varname.as_ref();
+                    varname == cellname
+                }) {
+                    Some(shared) => shared,
+                    None => {
+                        let s = nvarnames + pure;
+                        pure += 1;
+                        s
+                    }
+                };
+                let families_table =
+                    pyre_object::gc_roots::shadow_stack_get(families_slot) as *mut FixedObjectArray;
+                unsafe { (*families_table).set_ref(slot, family as pyre_object::PyObjectRef) };
+            }
+            publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            unsafe {
+                (*(pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode))
+                    .cell_families =
+                    pyre_object::gc_roots::shadow_stack_get(families_slot) as *mut FixedObjectArray;
+            }
+        }
+    }
     // Both tables are young `FixedObjectArray`s (`pycode.py PyCode.__init__`
     // `co_consts_w` / `co_names_w`). A null/unaligned `code_ptr` or an empty
     // `names` list still gets a zero-length array so the field is never null.
@@ -5164,26 +5175,10 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     w_globals_stamped_codes().lock().remove(&obj_addr);
     mapdict_method_cache_codes().lock().remove(&obj_addr);
     if !code.cell_families.is_null() {
-        // Only the slot table. The families themselves stay allocated: cells
-        // created from this code may still be alive in a surviving closure,
-        // and each holds an untraced `Cell.family` pointer into them.
-        //
-        // That is why freeing them here is wrong, not why never freeing them is
-        // right. One family is minted per cellvar per code-object construction
-        // and none is ever reclaimed, so a process that keeps compiling grows
-        // without bound -- measured at ~201 bytes retained per cellvar per
-        // compile. `pycode.py` `_initialize` and `nestedscope.py` `Cell.__init__`
-        // hold the family through two ordinary references and let the collector
-        // take it once the table and every surviving cell are gone; reaching
-        // that shape here means tracing both edges, which is deferred rather
-        // than done. Immortality is also what currently makes the untraced word
-        // safe for the recorder's `quasi_immut_descr` read, so the two move
-        // together.
-        //
-        // The code object this hangs off is already leaked whole and on purpose
-        // (`box_code_object`), at a far larger byte rate, so this does not
-        // change what a workload can do today.
-        drop(unsafe { Box::from_raw(code.cell_families) });
+        // Only the no-hook `alloc_mro_block_gc` fallback is freed here; a
+        // GC-owned table is the collector's. The families it names are
+        // traced through this array and through `Cell.family`.
+        unsafe { pyre_object::dealloc_mro_block(code.cell_families) };
         code.cell_families = std::ptr::null_mut();
     }
     if !code.globals_caches.is_null() {
@@ -5397,8 +5392,8 @@ pub unsafe fn w_code_cell_family(obj: PyObjectRef, slot: usize) -> *const CellFa
     if code.cell_families.is_null() {
         return pyre_object::nestedscope::dummy_family();
     }
-    match unsafe { &*code.cell_families }.get(slot) {
-        Some(family) if !family.is_null() => *family,
+    match unsafe { &*code.cell_families }.as_slice().get(slot) {
+        Some(family) if !family.is_null() => *family as *const CellFamily,
         _ => pyre_object::nestedscope::dummy_family(),
     }
 }

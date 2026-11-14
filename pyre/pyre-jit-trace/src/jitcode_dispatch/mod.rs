@@ -16380,15 +16380,15 @@ fn handle<Sym: WalkSym>(
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // Headerless owner: assembler `lookup_reg_with_kind_var` puts the
-        // raw pointer in the int bank (`getfield_raw_*` `i` base), so
+        // Headerless raw owner: assembler `lookup_reg_with_kind_var` puts
+        // the pointer in the int bank (`getfield_raw_*` `i` base), so
         // `rewrite_op_getfield` keys `record_quasiimmut_field/idd`.
         // Keep that Int box. `const_ref` of a data-segment static
-        // (`gil.py GILThreadLocals.gil_ready` as `GIL_READY_STATE`) or a
-        // raw `CellFamily` would enter the GC const_ptr table
-        // (`trace_ctx.rs const_ref` / `hold_live_const_ptr`).
-        // `concrete_gc_ptr` reads the Int address for
-        // `quasiimmut.py get_current_qmut_instance`.
+        // (`gil.py GILThreadLocals.gil_ready` as `GIL_READY_STATE`) would
+        // enter the GC const_ptr table (`trace_ctx.rs const_ref` /
+        // `hold_live_const_ptr`). A GC `CellFamily` is interned with
+        // `const_ref` and takes `/rdd`. `concrete_gc_ptr` reads the Int
+        // address for `quasiimmut.py get_current_qmut_instance`.
         "record_quasiimmut_field/idd" => {
             let obj = read_int_reg(code, op, 0, ctx)?;
             match read_int_reg_concrete(code, op, 0, ctx) {

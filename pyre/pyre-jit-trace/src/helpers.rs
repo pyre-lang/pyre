@@ -918,9 +918,9 @@ pub fn emit_super_inline(
 /// builds — the `NewWithVtable` plus the `SetfieldGc` set `w_cell_new`
 /// performs (`nestedscope.py Cell.__init__`).
 ///
-/// `family` is the address `(pycode, slot)` names
+/// `family` is the GC `CellFamily` `(pycode, slot)` names
 /// (`pycode.py PyCode._initialize` builds the table once with the code
-/// object, so it is a trace-time constant); `header_w_class` is
+/// object, so it is a trace-time `const_ref`); `header_w_class` is
 /// `get_instantiate(&CELL_TYPE)`.  `contents` is not stored: the constructor
 /// this mirrors passes `PY_NULL` for a fresh cell, and a virtual reads an
 /// unwritten reference field as null.

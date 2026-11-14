@@ -9286,9 +9286,10 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // `remove_constptrs_in`, which turns each one into a `LoadFromGcTable`
     // whose slot is a root — and the window before that, while the mint sits
     // in the walker's own `registers_r` bank, is covered by
-    // `InlineRegisterBankGuard` (`miframe_registers`).  The only other address this fold
-    // bakes is the family's, and a family is a `Box::into_raw` leak outside
-    // the collector entirely.
+    // `InlineRegisterBankGuard` (`miframe_registers`).  The family's start is
+    // interned the same way (`walker_pin_cell_family_ever_mutated` /
+    // `const_ref`); `quasiimmut.py get_current_qmut_instance` adds the
+    // mutate offset to that forwarded object.
     super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
 }

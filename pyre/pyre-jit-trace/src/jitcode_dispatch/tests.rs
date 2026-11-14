@@ -10868,9 +10868,7 @@ fn walker_pin_holder_typ_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_cell_family_ever_mutated_records_quasiimmut_from_mutate_descr() {
     // `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
-    let family = Box::into_raw(Box::new(pyre_object::nestedscope::CellFamily::new(
-        "x".to_string(),
-    )));
+    let family = pyre_object::nestedscope::new_cell_family("x".to_string());
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| walker_pin_cell_family_ever_mutated(wc, 0, family).expect("pin"),
         crate::descr::cell_family_ever_mutated_descr(),

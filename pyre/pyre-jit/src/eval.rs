@@ -6087,6 +6087,22 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::mapdict::cached_attribute_holder_destructor,
         |tid| pyre_object::mapdict::CACHED_ATTRIBUTE_HOLDER_GC_TYPE_ID.set(tid),
     );
+    // nestedscope.py `CellFamily` — ordinary GC instance (`lltype.malloc`).
+    // Appended after every existing registration so no hardcoded tid moves.
+    // Headerless, no GC pointers; the destructor drops `name` and reclaims
+    // the `ever_mutated?` qmut words. `dummy_family` is born immortal with
+    // this tid (`malloc_typed_immortal`, the same birth as `space.w_None`).
+    let cell_family_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::nestedscope::CELL_FAMILY_GC_TYPE_ID),
+        || {
+            TypeInfo::with_destructor(
+                std::mem::size_of::<pyre_object::nestedscope::CellFamily>(),
+                pyre_object::nestedscope::cell_family_destructor,
+            )
+        },
+    );
+    pyre_object::nestedscope::CELL_FAMILY_GC_TYPE_ID.set(cell_family_tid);
+    let _ = pyre_object::nestedscope::dummy_family();
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
