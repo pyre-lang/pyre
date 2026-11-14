@@ -2251,6 +2251,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
             "strlen" | "unicodelen" | "strgetitem" | "unicodegetitem" => ValueType::Int,
             // `n <= m < p`, a bool in the signed register bank.
             "int_between" => ValueType::Bool,
+            // `llop.threadlocalref_addr` RESULTTYPE is Address;
+            // `history.getkind` of Address is `'int'`.
+            "threadlocalref_addr" => ValueType::Int,
             "newstr" | "newunicode" => ValueType::Ref(None),
             "strsetitem" | "unicodesetitem" | "copystrcontent" | "copyunicodecontent" => {
                 ValueType::Void

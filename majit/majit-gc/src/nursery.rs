@@ -11,31 +11,53 @@ use std::ptr;
 
 use crate::header::GcHeader;
 
-// ── Heap-allocated nursery pointers ──
+// ── Nursery bump cursor ──
 //
-// incminimark.py:324-325 parity: nursery_free and nursery_top are fields
-// in the GC object. The JIT reads their addresses via gc_adr_of_nursery_free
-// / gc_adr_of_nursery_top (framework.py:994-997, gc.py:525-531).
+// incminimark.py keeps `nursery_free` / `nursery_top` as IncrementalMiniMarkGC
+// instance attributes. Compiled code here loads them as ThreadLocalFields
+// (`tlfield_nursery_free` / `tlfield_nursery_top`) off the frame's
+// `threadlocal_addr`; the interpreter malloc reads the same two words through
+// the published address pair (`PUBLISHED_BUMP`).
 //
-// In Rust, we allocate these two pointers on the heap via Box<NurseryPtrs>.
-// The JIT and the runtime both read/write the SAME memory — no separate
-// global statics, no dual-state synchronization.
-//
-// RPython x86/assembler.py malloc_cond_varsize_frame inline path:
-//   ecx = load(nursery_free_adr)
-//   edx = ecx + size
-//   cmp edx, load(nursery_top_adr)
-//   ja slow_path
-//   store(nursery_free_adr, edx)
+// The two words stay adjacent (`repr(C)` `NurseryPtrs`) so `malloc_fast`
+// can still cast the published free address to `*mut NurseryPtrs`.
 
-/// incminimark.py:324-325 parity: the two mutable nursery pointers
-/// live at a stable heap address so the JIT can hardcode their addresses.
+/// Adjacent `nursery_free` / `nursery_top` words.
+///
+/// Overlay of the owner's `tlfield_nursery_free` / `tlfield_nursery_top`,
+/// or of the GC-owned fallback pair when no thread owns the cursor.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NurseryPtrs {
-    /// incminimark.py:324 self.nursery_free
+    /// `incminimark.py` `self.nursery_free`
     pub free: *mut u8,
-    /// incminimark.py:325 self.nursery_top
+    /// High half of the `i64` TLS word. Pointers are 4 bytes on wasm32.
+    #[cfg(target_pointer_width = "32")]
+    _free_hi: u32,
+    /// `incminimark.py` `self.nursery_top`
     pub top: *const u8,
+    /// High half of the `i64` TLS word. Pointers are 4 bytes on wasm32.
+    #[cfg(target_pointer_width = "32")]
+    _top_hi: u32,
+}
+
+impl NurseryPtrs {
+    /// Adjacent pair occupying two container words.
+    pub const fn pair(free: *mut u8, top: *const u8) -> Self {
+        Self {
+            free,
+            #[cfg(target_pointer_width = "32")]
+            _free_hi: 0,
+            top,
+            #[cfg(target_pointer_width = "32")]
+            _top_hi: 0,
+        }
+    }
+
+    /// Non-owner pair: `free + size <= top` fails for every `size > 0`.
+    pub const fn empty() -> Self {
+        Self::pair(ptr::null_mut(), ptr::null())
+    }
 }
 
 /// incminimark.py:240 fallback `TRANSLATION_PARAMS["nursery_size"]`.
@@ -130,17 +152,20 @@ fn protect_arena(_start: *mut u8, _size: usize, _inaccessible: bool) {}
 
 /// Nursery memory region with bump-pointer allocation.
 ///
-/// incminimark.py:324-325 parity: nursery_free and nursery_top live in
-/// a heap-allocated NurseryPtrs struct at a stable address. Both the JIT
-/// inline fast path and the runtime slow path read/write the same fields.
+/// The live `(free, top)` pair lives in the cursor owner's thread-local
+/// words, reached through [`Self::cursor`]. When no thread owns the cursor
+/// (before the first thread registers, after the owner died, or a bare
+/// [`Nursery`] in unit tests) the GC-owned fallback pair holds it.
 pub struct Nursery {
     /// Start of the nursery memory region.
     start: *mut u8,
     /// Total size of the nursery.
     size: usize,
-    /// Heap-allocated free/top pointers. The Box ensures stable addresses
-    /// that the JIT can hardcode into compiled code.
-    ptrs: Box<NurseryPtrs>,
+    /// Live cursor words: either a thread's `tlfield_nursery_*` pair or
+    /// [`Self::fallback`].
+    cursor: *mut NurseryPtrs,
+    /// Owns the cursor when no thread does.
+    fallback: Box<NurseryPtrs>,
     /// llarena.py mode-3 parity: poison recycled nursery bytes so tests
     /// expose allocation paths that incorrectly rely on zero-filled memory.
     poison_on_reset: bool,
@@ -164,12 +189,14 @@ impl Nursery {
     pub fn new(size: usize) -> Self {
         let start = alloc_arena(size);
         let top = unsafe { start.add(size) };
-        let ptrs = Box::new(NurseryPtrs { free: start, top });
+        let mut fallback = Box::new(NurseryPtrs::pair(start, top));
+        let cursor = fallback.as_mut() as *mut NurseryPtrs;
         let poison_on_reset = crate::gc_nursery_poison_enabled();
         Nursery {
             start,
             size,
-            ptrs,
+            cursor,
+            fallback,
             poison_on_reset,
             rotating: Vec::new(),
         }
@@ -212,8 +239,8 @@ impl Nursery {
         // `debug_rotate_nursery` sets `nursery` and `nursery_top`, and the
         // `nursery_free = nursery` its caller performs at the end of
         // `_minor_collection` lands on the arena installed here.
-        self.ptrs.free = new;
-        self.ptrs.top = unsafe { new.add(self.size) };
+        self.ptrs_mut().free = new;
+        self.ptrs_mut().top = unsafe { new.add(self.size) };
         true
     }
 
@@ -256,16 +283,16 @@ impl Nursery {
         let total_size = (total_size + crate::header::MEMORY_ALIGNMENT - 1)
             & !(crate::header::MEMORY_ALIGNMENT - 1);
 
-        let result = self.ptrs.free;
+        let result = self.ptrs().free;
         // Use wrapping_add for the bound probe: when the nursery is already
         // full `result` sits at `top` (one-past-end), so an in-bounds `.add`
         // would be UB. RPython's integer arithmetic cannot hit this because
         // it operates on untyped addresses.
         let new_free = result.wrapping_add(total_size);
-        if new_free as *const u8 > self.ptrs.top {
+        if new_free as *const u8 > self.ptrs().top {
             return ptr::null_mut();
         }
-        self.ptrs.free = new_free;
+        self.ptrs_mut().free = new_free;
         result
     }
 
@@ -283,7 +310,7 @@ impl Nursery {
     /// themselves. Recycled nursery bytes stay dirty, matching native.
     pub fn reset(&mut self) {
         self.reset_range(self.start as usize, self.start as usize + self.size);
-        self.ptrs.free = self.start;
+        self.ptrs_mut().free = self.start;
     }
 
     /// Reset one free range while leaving pinned-object bytes intact.
@@ -316,13 +343,13 @@ impl Nursery {
     /// incminimark.py:676: current nursery_free.
     #[inline]
     pub fn free_ptr(&self) -> *mut u8 {
-        self.ptrs.free
+        self.ptrs().free
     }
 
     /// gc.py get_nursery_free_addr parity.
     #[inline]
     pub fn free_addr(&self) -> usize {
-        std::ptr::addr_of!(self.ptrs.free) as usize
+        self.cursor as usize
     }
 
     /// Set the free pointer (used after collection with pinned objects).
@@ -331,8 +358,8 @@ impl Nursery {
     /// `ptr` must be within the nursery bounds.
     pub unsafe fn set_free_ptr(&mut self, ptr: *mut u8) {
         debug_assert!(ptr as usize >= self.start as usize);
-        debug_assert!(ptr as usize <= self.ptrs.top as usize);
-        self.ptrs.free = ptr;
+        debug_assert!(ptr as usize <= self.ptrs().top as usize);
+        self.ptrs_mut().free = ptr;
     }
 
     /// incminimark.py:910,1947: set nursery_top (pinned object barriers).
@@ -342,19 +369,75 @@ impl Nursery {
     pub unsafe fn set_top_ptr(&mut self, ptr: *const u8) {
         debug_assert!(ptr as usize >= self.start as usize);
         debug_assert!(ptr as usize <= self.start as usize + self.size);
-        self.ptrs.top = ptr;
+        self.ptrs_mut().top = ptr;
     }
 
     /// incminimark.py:325: current nursery_top.
     #[inline]
     pub fn top_ptr(&self) -> *const u8 {
-        self.ptrs.top
+        self.ptrs().top
     }
 
     /// gc.py get_nursery_top_addr parity.
     #[inline]
     pub fn top_addr(&self) -> usize {
-        std::ptr::addr_of!(self.ptrs.top) as usize
+        unsafe { std::ptr::addr_of!((*self.cursor).top) as usize }
+    }
+
+    #[inline]
+    fn ptrs(&self) -> &NurseryPtrs {
+        unsafe { &*self.cursor }
+    }
+
+    #[inline]
+    fn ptrs_mut(&mut self) -> &mut NurseryPtrs {
+        unsafe { &mut *self.cursor }
+    }
+
+    /// Address of the GC-owned fallback pair.
+    #[inline]
+    pub fn fallback_ptr(&self) -> *mut NurseryPtrs {
+        Box::as_ptr(&self.fallback) as *mut NurseryPtrs
+    }
+
+    /// Address of the live cursor words.
+    #[inline]
+    pub fn cursor(&self) -> *mut NurseryPtrs {
+        self.cursor
+    }
+
+    /// The live cursor is the GC-owned fallback pair.
+    #[inline]
+    pub fn cursor_is_fallback(&self) -> bool {
+        self.cursor == self.fallback_ptr()
+    }
+
+    /// Make `owner` the live cursor pair. A no-op when `owner` already is.
+    ///
+    /// # Safety
+    ///
+    /// `owner` must be a valid, aligned `NurseryPtrs` that outlives this
+    /// claim. The only owners are this thread's `tlfield_nursery_*` overlay
+    /// ([`crate::threadlocal::threadlocal_nursery_ptrs`]) and
+    /// [`Self::fallback_ptr`]. Once another nursery claims the same `owner`,
+    /// this one must not allocate, collect or release until it claims a
+    /// cursor again; it may still be dropped, and its `Drop` leaves a pair it
+    /// does not own untouched (`cursor_pair_belongs_here`).
+    pub(crate) unsafe fn claim_cursor(&mut self, owner: *mut NurseryPtrs) {
+        if self.cursor == owner {
+            return;
+        }
+        unsafe {
+            *owner = *self.cursor;
+            *self.cursor = NurseryPtrs::empty();
+        }
+        self.cursor = owner;
+    }
+
+    /// Move the live cursor back to the GC-owned fallback pair.
+    pub fn release_to_fallback(&mut self) {
+        let fallback = self.fallback_ptr();
+        unsafe { self.claim_cursor(fallback) };
     }
 
     /// Start of nursery.
@@ -372,19 +455,36 @@ impl Nursery {
     /// Bytes currently used.
     #[inline]
     pub fn used(&self) -> usize {
-        self.ptrs.free as usize - self.start as usize
+        self.ptrs().free as usize - self.start as usize
     }
 
     /// Bytes remaining.
     #[inline]
     pub fn remaining(&self) -> usize {
-        self.ptrs.top as usize - self.ptrs.free as usize
+        self.ptrs().top as usize - self.ptrs().free as usize
     }
 
     /// Check if an address is within the nursery.
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.start as usize && addr < (self.start as usize + self.size)
+    }
+
+    /// Whether `ptrs` is this arena's live pair or an already-cleared pair.
+    ///
+    /// A replaced owner still has `cursor` equal to the thread-local words
+    /// after a later [`Self::claim_cursor`] overwrote them. Drop must not
+    /// zero those words when they now hold another nursery's cursor.
+    #[inline]
+    fn cursor_pair_belongs_here(&self, ptrs: NurseryPtrs) -> bool {
+        if ptrs.free.is_null() && ptrs.top.is_null() {
+            return true;
+        }
+        let start = self.start as usize;
+        let end = start + self.size;
+        let free = ptrs.free as usize;
+        let top = ptrs.top as usize;
+        free >= start && free <= end && top >= start && top <= end
     }
 
     /// Whether recycled nursery bytes are filled with the llarena-style
@@ -398,6 +498,16 @@ impl Nursery {
 
 impl Drop for Nursery {
     fn drop(&mut self) {
+        if let Some(me) = crate::threadlocal::try_threadlocal_nursery_ptrs() {
+            if self.cursor == me {
+                if self.cursor_pair_belongs_here(unsafe { *self.cursor }) {
+                    unsafe {
+                        *self.cursor = NurseryPtrs::empty();
+                    }
+                }
+                self.cursor = self.fallback_ptr();
+            }
+        }
         let layout = arena_layout(self.size);
         // Unprotect a parked arena before handing it back: the allocator
         // writes its own bookkeeping into the block it reclaims, and an
@@ -615,5 +725,27 @@ mod tests {
         assert_ne!(free_addr, top_addr);
         let free_val = unsafe { *(free_addr as *const *mut u8) };
         assert_eq!(free_val, nursery.free_ptr());
+    }
+
+    #[test]
+    fn dropping_a_replaced_owner_leaves_the_new_cursor() {
+        let tls = crate::threadlocal::threadlocal_nursery_ptrs();
+        let mut first = Nursery::new(4096);
+        let a = first.alloc(32);
+        assert!(!a.is_null());
+        unsafe { first.claim_cursor(tls) };
+        let mut second = Nursery::new(4096);
+        let b = second.alloc(32);
+        assert!(!b.is_null());
+        unsafe { second.claim_cursor(tls) };
+        drop(first);
+        let ptrs = unsafe { *tls };
+        assert!(!ptrs.free.is_null());
+        assert!(!ptrs.top.is_null());
+        assert!(second.contains(ptrs.free as usize) || ptrs.free as usize == ptrs.top as usize);
+        let c = second.alloc(32);
+        assert!(!c.is_null());
+        assert_ne!(c, b);
+        second.release_to_fallback();
     }
 }

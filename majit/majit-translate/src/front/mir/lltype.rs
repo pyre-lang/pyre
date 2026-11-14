@@ -16980,21 +16980,25 @@ pub(in crate::front::mir) fn host_lltype_cast_llop(
 }
 
 /// `majit_rlib::rthread::threadlocalref_get_int` /
-/// `threadlocalref_store_int` — the llop intrinsics
-/// `ThreadLocalField.getraw` / `setraw` lower to.
+/// `threadlocalref_store_int` / `majit_gc::threadlocal::threadlocalref_addr`
+/// — the llop intrinsics `ThreadLocalField.getraw` / `setraw` and
+/// `llop.threadlocalref_addr` (`lloperation.py`) lower to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadLocalRefLlop {
     Get,
     Store,
+    Addr,
 }
 
-/// The full path, crate included, is `majit_rlib::rthread::threadlocalref_get_int`
-/// or `majit_rlib::rthread::threadlocalref_store_int`; a look-alike in another
+/// The full path, crate included, is `majit_rlib::rthread::threadlocalref_get_int`,
+/// `majit_rlib::rthread::threadlocalref_store_int`, or
+/// `majit_gc::threadlocal::threadlocalref_addr`; a look-alike in another
 /// crate or module stays a call.
 pub(crate) fn host_rthread_threadlocalref_llop(path: &str) -> Option<ThreadLocalRefLlop> {
     match path {
         "majit_rlib::rthread::threadlocalref_get_int" => Some(ThreadLocalRefLlop::Get),
         "majit_rlib::rthread::threadlocalref_store_int" => Some(ThreadLocalRefLlop::Store),
+        "majit_gc::threadlocal::threadlocalref_addr" => Some(ThreadLocalRefLlop::Addr),
         _ => None,
     }
 }

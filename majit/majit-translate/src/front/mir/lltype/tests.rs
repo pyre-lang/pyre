@@ -87,6 +87,181 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
 }
 
+#[test]
+fn host_rthread_threadlocalref_llop_matches_full_crate_paths() {
+    // Get/store stay `majit_rlib::rthread::*`; addr is the majit-gc
+    // spelling `llop.threadlocalref_addr` (`lloperation.py`). A
+    // look-alike in another crate stays a call.
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("majit_rlib::rthread::threadlocalref_get_int"),
+        Some(super::ThreadLocalRefLlop::Get)
+    );
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("majit_rlib::rthread::threadlocalref_store_int"),
+        Some(super::ThreadLocalRefLlop::Store)
+    );
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("majit_gc::threadlocal::threadlocalref_addr"),
+        Some(super::ThreadLocalRefLlop::Addr)
+    );
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("majit_rlib::rthread::threadlocalref_addr"),
+        None
+    );
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("other::threadlocal::threadlocalref_addr"),
+        None
+    );
+    assert_eq!(
+        super::host_rthread_threadlocalref_llop("majit_rlib::rthread::tlfield_getraw_int"),
+        None
+    );
+}
+
+fn graph_mentions_threadlocalref_addr(graph: &FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, .. } => opname == "threadlocalref_addr",
+            OpKind::BinOp { op, .. } | OpKind::UnaryOp { op, .. } => op == "threadlocalref_addr",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("threadlocalref_addr"),
+            _ => false,
+        })
+}
+
+fn graph_calls_leaf(graph: &FunctionGraph, leaf: &str) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some(leaf),
+            _ => false,
+        })
+}
+
+fn graph_has_threadlocalref_llop(graph: &FunctionGraph, opname: &str) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == opname))
+}
+
+/// `tlfield_getraw_int` / `tlfield_setraw_int` call `threadlocalref_get_int`
+/// / `threadlocalref_store_int` with a parameter offset. That is not a
+/// call-site constant (`jtransform.py` `rewrite_op_threadlocalref_get`), so
+/// the projection leaves the call; the runtime-offset accessors are
+/// `dont_look_inside` and `threadlocalref_addr` never reaches the
+/// codewriter (`llmodel.py` `execute_token` is the only JIT-seen user).
+#[test]
+fn runtime_offset_threadlocalref_calls_stay_residual() {
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let opaque = crate::front::mir::dont_look_inside_set_of(llbc);
+    for leaf in [
+        "rthread::threadlocalref_get",
+        "rthread::threadlocalref_set",
+        "rthread::threadlocalref_store_int",
+    ] {
+        assert!(
+            opaque.contains(leaf),
+            "{leaf} must be dont_look_inside; set={opaque:?}"
+        );
+    }
+
+    crate::test_support::with_lowering(llbc, |ctx| {
+        let lower = |suffix: &str| {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| fd.item_meta.name_path().ends_with(suffix))
+                .unwrap_or_else(|| panic!("{suffix} in majit-rlib LLBC"));
+            super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {suffix}: {e}"))
+        };
+
+        let getraw = lower("::tlfield_getraw_int");
+        assert!(
+            !graph_mentions_threadlocalref_addr(&getraw),
+            "tlfield_getraw_int must not lower threadlocalref_addr; ops={:?}",
+            graph_ops(&getraw)
+        );
+        assert!(
+            graph_calls_leaf(&getraw, "threadlocalref_get_int")
+                || graph_calls_leaf(&getraw, "threadlocalref_get"),
+            "tlfield_getraw_int keeps a residual get; ops={:?}",
+            graph_ops(&getraw)
+        );
+
+        let setraw = lower("::tlfield_setraw_int");
+        assert!(
+            !graph_mentions_threadlocalref_addr(&setraw),
+            "tlfield_setraw_int must not lower threadlocalref_addr; ops={:?}",
+            graph_ops(&setraw)
+        );
+        assert!(
+            graph_calls_leaf(&setraw, "threadlocalref_store_int")
+                || graph_calls_leaf(&setraw, "threadlocalref_set"),
+            "tlfield_setraw_int keeps a residual store; ops={:?}",
+            graph_ops(&setraw)
+        );
+
+        let get_int = lower("::threadlocalref_get_int");
+        assert!(
+            !graph_mentions_threadlocalref_addr(&get_int),
+            "threadlocalref_get_int with a parameter offset must not lower \
+             threadlocalref_addr; ops={:?}",
+            graph_ops(&get_int)
+        );
+        assert!(
+            graph_calls_leaf(&get_int, "threadlocalref_get"),
+            "threadlocalref_get_int residualizes threadlocalref_get; ops={:?}",
+            graph_ops(&get_int)
+        );
+
+        let ident = lower("::get_ident");
+        assert!(
+            graph_has_threadlocalref_llop(&ident, "threadlocalref_get"),
+            "const-offset get_ident still projects threadlocalref_get; ops={:?}",
+            graph_ops(&ident)
+        );
+
+        if let Some(fd) = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::set_saved_errno"))
+        {
+            let stored = super::lower_fun_decl(ctx, fd)
+                .unwrap_or_else(|e| panic!("lower set_saved_errno: {e}"));
+            assert!(
+                graph_has_threadlocalref_llop(&stored, "threadlocalref_store"),
+                "const-offset set_saved_errno still projects threadlocalref_store; ops={:?}",
+                graph_ops(&stored)
+            );
+        }
+
+        let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+        for (name, graph) in [
+            ("tlfield_getraw_int", &getraw),
+            ("tlfield_setraw_int", &setraw),
+            ("threadlocalref_get_int", &get_int),
+        ] {
+            let transformed = crate::codewriter::jtransform::transform_graph(graph, &config);
+            assert!(
+                !graph_mentions_threadlocalref_addr(&transformed.graph),
+                "{name} codewriter output must not carry threadlocalref_addr; ops={:?}",
+                graph_ops(&transformed.graph)
+            );
+        }
+    });
+}
+
 fn cow_enum_decl(def_id: u64) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}

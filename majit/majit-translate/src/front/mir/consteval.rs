@@ -1556,17 +1556,17 @@ pub(in crate::front::mir) fn merge_named_const_folds(
     });
 }
 
-/// Fold every local `NamedConst` whose initializer this LLBC actually
+/// Fold every `NamedConst` whose initializer this LLBC actually
 /// carries (a literal assign, or a computed body [`const_eval_init_body`]
-/// can evaluate).  Foreign decls are skipped: Charon left their init
-/// `Opaque`, and the defining crate's harvest is the one that binds
-/// the path.
+/// can evaluate).  A foreign decl whose init Charon left `Opaque` has
+/// nothing to fold.  An `--include`d foreign NamedConst with a
+/// translated initializer is harvested the same as a local one; the
+/// defining crate need not be extracted.  Values are the extraction
+/// host's, as the use-site fold in the same artifact already reads them
+/// (`libc::unix::bsd::apple::EAGAIN` is 35 on a darwin extraction).
 pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMap<String, OpKind> {
     let mut out = std::collections::HashMap::new();
     for gd in llbc.iter_global_decls() {
-        if !gd.item_meta.is_local {
-            continue;
-        }
         if gd.global_kind_str() != Some("NamedConst") {
             continue;
         }
@@ -1892,6 +1892,41 @@ pub(in crate::front::mir) fn const_ty_peels_to_adt(llbc: &Llbc, ty: &TyRef) -> b
         }
         return obj.contains_key("Adt");
     }
+}
+
+/// BinOp name for `core::intrinsics::{add,sub,mul}_with_overflow`.
+/// Debug-MIR writes those as Calls; the product is the same scalar a
+/// `MulChecked` BinaryOp lowers to (`operation.rs` `canonical_binop_label`).
+pub(in crate::front::mir) fn overflow_intrinsic_binop(path: &str) -> Option<&'static str> {
+    match path {
+        "core::intrinsics::add_with_overflow" => Some("add"),
+        "core::intrinsics::sub_with_overflow" => Some("sub"),
+        "core::intrinsics::mul_with_overflow" => Some("mul"),
+        _ => None,
+    }
+}
+
+/// Debug-MIR overflow intrinsic a const initializer uses for
+/// `N * WORD` / `a + b` (`core::intrinsics::mul_with_overflow` and
+/// the add/sub twins).  rustc already const-checked the initializer, so
+/// the overflow flag is false; the pair is the same `Checked` /
+/// `CheckedUInt` a `MulChecked` BinaryOp folds to.
+pub(in crate::front::mir) fn const_eval_overflow_intrinsic(
+    llbc: &Llbc,
+    fun_id: u64,
+    args: &[ConstLit],
+) -> Option<ConstLit> {
+    let path = llbc.fn_by_id(fun_id)?.item_meta.name_path();
+    let op = match overflow_intrinsic_binop(&path) {
+        Some("add") => "AddChecked",
+        Some("sub") => "SubChecked",
+        Some("mul") => "MulChecked",
+        _ => return None,
+    };
+    let [lhs, rhs] = args else {
+        return None;
+    };
+    const_eval_binop(&serde_json::Value::String(op.to_string()), *lhs, *rhs)
 }
 
 /// Opaque `from_element` / `bits` from `bitflagset`.
@@ -2875,6 +2910,13 @@ pub(in crate::front::mir) fn const_eval_const_fn_call(
             const_literal_ty(llbc, &call.dest.ty),
             lit,
         ));
+    }
+    // Debug-MIR `N * WORD` NamedConst inits (`25 * WORD`) are a
+    // `mul_with_overflow` Call plus overflow Assert, not a BinaryOp.
+    // Fold the intrinsic here so an `--include`d foreign initializer
+    // harvests; the generic-types gate below would otherwise refuse it.
+    if let Some(lit) = const_eval_overflow_intrinsic(llbc, *id, args) {
+        return Some(lit);
     }
     if reg
         .generics

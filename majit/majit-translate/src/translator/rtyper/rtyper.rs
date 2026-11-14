@@ -2613,6 +2613,34 @@ impl RPythonTyper {
                     GenopResult::LLType(result_lltype),
                 ))
             }
+            // `llop.threadlocalref_addr` (`lloperation.py`; `llmodel.py`
+            // `threadlocalref_addr(llmemory.Address)`).
+            // `_LLOpEntry.specialize_call` skips RESULTTYPE and genops
+            // 0 args; `canraise` is empty (`LLOp()`).
+            "threadlocalref_addr" => {
+                if hop.nb_args() != 0 {
+                    return Err(TyperError::message(
+                        "threadlocalref_addr: llop has no operands",
+                    ));
+                }
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "threadlocalref_addr: r_result not populated before genop",
+                        )
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "threadlocalref_addr",
+                    vec![],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
             // `llop.threadlocalref_get` (`rthread.py ThreadLocalField.getraw`).
             // Front emits BinOp (offset, loop_invariant); only the offset
             // is an llop operand. The flag selects ExtraEffect in

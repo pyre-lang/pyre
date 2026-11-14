@@ -4036,6 +4036,38 @@ fn call_malloc_nursery_fits_and_keeps_live_int() {
         InputArg::from_type_rc(Type::Int, 1),
     ];
     let token = compile_ops(&mut backend, &inputargs, ops);
+    {
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled loop")
+            .downcast_ref::<majit_backend_dynasm::x86::assembler::CompiledCode>()
+            .expect("dynasm compiled code");
+        let bytes: &[u8] = &compiled.buffer;
+        fn has_i32(bytes: &[u8], v: i32) -> bool {
+            bytes
+                .windows(4)
+                .any(|w| i32::from_le_bytes(w.try_into().unwrap()) == v)
+        }
+        assert!(
+            has_i32(
+                bytes,
+                majit_backend_dynasm::x86::arch::THREADLOCAL_OFS as i32
+            ),
+            "inline bump must load threadlocal base from THREADLOCAL_OFS"
+        );
+        assert!(
+            has_i32(
+                bytes,
+                majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as i32
+            ),
+            "inline bump must address nursery_free at TLFIELD_NURSERY_FREE_OFS"
+        );
+        assert!(
+            has_i32(bytes, majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS as i32),
+            "inline bump must address nursery_top at TLFIELD_NURSERY_TOP_OFS"
+        );
+    }
     let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22)]);
     let ptr = finished_ref(&backend, &frame);
     assert!(!ptr.is_null());

@@ -204,6 +204,42 @@ pub unsafe fn object_lock_release_held(lock: usize) {
     unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
 }
 
+/// Run `$body` holding the object-lock stripe `$acquire` returns for the
+/// first `$local`.
+///
+/// A contended stripe wait leaves the running-mutator census, so a minor
+/// collection can move nursery objects while this thread waits. On the
+/// `gil_ready` branch every `$local` is pinned in one livevar set before the
+/// acquire and assigned its forwarded word after it, as [`with_roots!`]
+/// does. While the GIL is on no stripe is taken and `$body` runs on the
+/// locals as they are.
+///
+/// Every `$local` must be a `mut` binding. `$body` is expanded once per
+/// branch, so keep it a call or a short expression. Keep `?` outside the
+/// macro, for the reason [`with_roots!`] gives. A macro rather than a helper
+/// taking `impl FnOnce` for the reason [`with_roots!`] gives, and so the root
+/// scope opens in the caller's own body.
+#[macro_export]
+macro_rules! with_objlock {
+    ($acquire:path; $($local:ident),+ $(,)? => $body:expr) => {{
+        if $crate::gil_ready::gil_ready_word() != 0 {
+            let _scope = $crate::gc_roots::push_roots();
+            let __roots_base = _scope.pin_roots(&[$($local),+]);
+            #[allow(unused_unsafe)]
+            let _objlock_guard = unsafe {
+                $crate::objlock::ObjectLockGuard::from_word($acquire(_scope.get(__roots_base)))
+            };
+            #[allow(unused_assignments)]
+            {
+                $crate::__with_roots_restore!(_scope, __roots_base; $($local),+);
+            }
+            $body
+        } else {
+            $body
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

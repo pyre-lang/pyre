@@ -127,7 +127,10 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     // no concurrent access.
     unsafe {
         *GC_STORE.0.get() = Some(gc);
-        let installed = (*GC_STORE.0.get()).as_ref().unwrap();
+        let installed = (*GC_STORE.0.get()).as_mut().unwrap();
+        if !crate::rgil::gil_is_initialized() || crate::rgil::am_i_holding_the_gil() {
+            installed.claim_this_thread_cursor();
+        }
         crate::publish_singleton_nursery(&**installed);
         SINGLETON_FINALIZER_QUEUES.store(
             Arc::as_ptr(&installed.finalizer_queues) as *mut FinalizerQueueTable,
@@ -320,6 +323,69 @@ pub fn gc_thread_die() {
     }
     crate::shadow_stack::unregister_mutator();
     unregister_thread();
+}
+
+/// `rthread.py` `gc_thread_run`: claim the live nursery cursor onto this
+/// thread when the GC singleton exists.
+#[inline]
+pub(crate) fn claim_nursery_cursor_for_current_thread() {
+    if !is_initialized() {
+        return;
+    }
+    if crate::rgil::gil_is_initialized() {
+        debug_assert!(
+            crate::rgil::am_i_holding_the_gil(),
+            "gc_thread_run needs the GIL once it is initialized"
+        );
+    }
+    // SAFETY: the caller holds the GIL, or the GIL is not initialized and
+    // this process is single-threaded.
+    unsafe { singleton_mut() }.claim_this_thread_cursor();
+}
+
+/// Move the live cursor to the GC-owned fallback pair. Called by
+/// [`crate::rgil::release`] while the GIL is still held, so a thread that
+/// does not hold the GIL never owns the cursor and may exit freely.
+#[inline]
+pub(crate) fn release_nursery_cursor_to_fallback() {
+    if !is_initialized() {
+        return;
+    }
+    // SAFETY: the caller holds the GIL.
+    let gc = unsafe { singleton_mut() };
+    if !gc.nursery_cursor_is_fallback() {
+        gc.release_cursor_to_fallback();
+    }
+}
+
+/// `rthread.py` `gc_thread_die` for the nursery cursor: a dying thread whose
+/// `tlfield_nursery_*` words are the live cursor hands it to the GC-owned
+/// fallback pair before the container is freed. With the GIL initialized
+/// `rgil::release` has already done this; without it the thread that
+/// installed the GC, or ran `gc_thread_run`, can still own it here.
+pub(crate) fn release_nursery_cursor_owned_by(owner: *mut crate::nursery::NurseryPtrs) {
+    if !is_initialized() {
+        return;
+    }
+    // SAFETY: the dying thread owns the cursor, so it is the GIL holder or
+    // the GIL is not initialized.
+    let gc = unsafe { singleton_mut() };
+    if gc.nursery_cursor() == owner {
+        gc.release_cursor_to_fallback();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn peek_nursery_cursor_is_fallback() -> bool {
+    if !is_initialized() {
+        return true;
+    }
+    unsafe { singleton_mut() }.nursery_cursor_is_fallback()
+}
+
+#[cfg(test)]
+pub(crate) fn peek_nursery_contains(addr: usize) -> bool {
+    unsafe { singleton_mut() }.is_in_nursery(addr)
 }
 
 /// Unregister the current thread. It stops running pyre code, so it gives the
@@ -944,6 +1010,44 @@ mod tests {
         f()
     }
 
+    #[test]
+    fn an_exiting_cursor_owner_hands_the_cursor_back() {
+        const CHILD_ENV: &str = "MAJIT_GC_EXITING_CURSOR_OWNER_TEST";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Other tests initialize the GIL process-wide. Run the body in a
+            // fresh process so the installer / `gc_thread_run` owner can still
+            // hold the cursor when the thread exits.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc_sync::tests::an_exiting_cursor_owner_hands_the_cursor_back",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "exiting cursor owner probe failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        assert!(!crate::rgil::gil_is_initialized());
+        ensure_gc();
+        let t = std::thread::spawn(|| {
+            crate::threadlocal::gc_thread_run();
+            assert!(!peek_nursery_cursor_is_fallback());
+        });
+        t.join().unwrap();
+        assert!(
+            peek_nursery_cursor_is_fallback(),
+            "an exited owner left the cursor in its freed TLS"
+        );
+    }
+
     fn load_eval_breaker_word() -> usize {
         let addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
         assert_ne!(addr, 0);
@@ -1128,16 +1232,14 @@ mod tests {
     /// `llsupport/gc.py get_nursery_free_addr/get_nursery_top_addr`
     /// have no thread-count gate: the non-atomic bump in generated code is safe
     /// because the GIL serialises the mutators that run it.  A second mutator
-    /// must therefore leave the published top alone.
+    /// must therefore leave the live nursery top word alone.
     #[test]
     #[ignore = "requires exclusive process — registers process-global mutators"]
     fn second_registered_thread_leaves_published_nursery_top_live() {
         ensure_gc();
         register_test_mutator();
         fn published_top() -> usize {
-            gc_query(|gc| {
-                unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }.load(Ordering::Acquire)
-            })
+            gc_query(|gc| unsafe { *(gc.nursery_top_addr() as *const usize) })
         }
         let before = published_top();
         assert_ne!(before, 0);

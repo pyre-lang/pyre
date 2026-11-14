@@ -8725,6 +8725,43 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// `llop.threadlocalref_addr` (`lloperation.py`; `llmodel.py`
+    /// `threadlocalref_addr(llmemory.Address)`). Zero operands after
+    /// `_LLOpEntry.specialize_call` skips RESULTTYPE. The result is the
+    /// container base `byte_add(ofs)` and a word load/store then use.
+    /// RESULTTYPE is `llmemory.Address` → `SomeAddress`
+    /// (`_LLOpEntry.compute_result_annotation`); `history.getkind` of
+    /// Address is `'int'`. The host function returns `*mut i64`, the
+    /// same word-sized raw pointer.
+    pub(in crate::front::mir) fn emit_threadlocalref_addr(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        *res.annotation.borrow_mut() = Some(std::rc::Rc::new(
+            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+            ),
+        ));
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::LoweredBlackholeOp {
+                opname: "threadlocalref_addr".to_string(),
+                args: vec![],
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
     /// True when `var` is a `ConstInt` / `ConstUInt` already emitted in
     /// this graph. Used to refuse `threadlocalref_get` projection when
     /// the offset is not a call-site constant.

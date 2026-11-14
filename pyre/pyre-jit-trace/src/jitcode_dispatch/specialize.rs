@@ -6765,7 +6765,6 @@ const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
 /// `objspace.py StdObjSpace.finditem_str` / `baseobjspace::finditem_str_named`.
 const FINDITEM_STR_NAMED_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::baseobjspace::finditem_str_named",
-    commit_label: "finditem_str_named_commit",
     decline_tag: "FINDITEM-STR-NAMED-SUBWALK",
 };
 

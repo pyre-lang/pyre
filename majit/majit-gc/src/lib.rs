@@ -5,6 +5,7 @@ pub use header::{
     GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS, GCREF, GCREFOpaque, GcType,
     is_immortal_header_payload,
 };
+pub use threadlocal::gc_thread_run;
 // `global_hook!` expansions name `$crate::paste` so consumers do not need a
 // direct `paste` dependency.
 #[doc(hidden)]
@@ -69,6 +70,7 @@ pub mod rgil;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rmmap;
 pub mod shadow_stack;
+pub mod threadlocal;
 pub mod trace;
 pub mod weakref;
 
@@ -1353,6 +1355,10 @@ pub trait GcAllocator: Send {
     /// gc.py get_nursery_top_addr parity.
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
+
+    /// Copy the live nursery cursor onto this thread's `tlfield_nursery_*`
+    /// words. The default is a no-op for allocators that keep no cursor.
+    fn claim_nursery_cursor(&mut self) {}
 
     /// Addresses of `nursery_free` and `nursery_top` plus `nonlarge_max + 1`
     /// (`large_object_threshold`) for an inlined `malloc_fast` bump.
@@ -4483,6 +4489,43 @@ static PUBLISHED_BUMP: PublishedBump = PublishedBump {
     top_addr: std::sync::atomic::AtomicUsize::new(0),
     large: std::sync::atomic::AtomicUsize::new(0),
 };
+
+/// Live addresses of the published bump cursor words, or `(0, 0)` when
+/// the bump path is disarmed.
+#[inline]
+pub fn published_bump_cursor_addrs() -> (usize, usize) {
+    (
+        PUBLISHED_BUMP
+            .free_addr
+            .load(std::sync::atomic::Ordering::Relaxed),
+        PUBLISHED_BUMP
+            .top_addr
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Refresh `PUBLISHED_BUMP` from `gc` after a cursor hand-off. Skips a
+/// refused (box) publish so a per-thread allocator does not re-arm the
+/// singleton bump.
+pub fn republish_singleton_bump(gc: &dyn GcAllocator) {
+    if PUBLISHED_NURSERY
+        .refused
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    if let Some((free, top, large)) = gc.malloc_fast_bump_addrs() {
+        PUBLISHED_BUMP
+            .free_addr
+            .store(free, std::sync::atomic::Ordering::Relaxed);
+        PUBLISHED_BUMP
+            .top_addr
+            .store(top, std::sync::atomic::Ordering::Relaxed);
+        PUBLISHED_BUMP
+            .large
+            .store(large, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Publish the singleton's nursery bounds.  A `None` from `nursery_bounds`
 /// (a stub allocator, or one whose nursery is not a fixed range) leaves the

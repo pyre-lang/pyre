@@ -765,8 +765,22 @@ pub fn standalone_jitframe_facts() -> JitframeDescrFacts {
     JitframeDescrFacts {
         is_gc_object: true,
         type_id: STANDALONE_JITFRAME_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed),
-        nursery_free_addr: STANDALONE_NURSERY_FREE_ADDR.load(std::sync::atomic::Ordering::Relaxed),
-        nursery_top_addr: STANDALONE_NURSERY_TOP_ADDR.load(std::sync::atomic::Ordering::Relaxed),
+        nursery_free_addr: {
+            let (free, _) = majit_gc::published_bump_cursor_addrs();
+            if free != 0 {
+                free
+            } else {
+                STANDALONE_NURSERY_FREE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        },
+        nursery_top_addr: {
+            let (_, top) = majit_gc::published_bump_cursor_addrs();
+            if top != 0 {
+                top
+            } else {
+                STANDALONE_NURSERY_TOP_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        },
         chases_forwarding_stubs: STANDALONE_CHASES_FORWARDING_STUBS
             .load(std::sync::atomic::Ordering::Relaxed),
         max_size_of_young_obj: STANDALONE_MAX_SIZE_OF_YOUNG_OBJ
@@ -837,8 +851,17 @@ pub fn try_bump_nursery_jitframe(
     if total >= facts.max_size_of_young_obj {
         return None;
     }
-    let free_cell = facts.nursery_free_addr;
-    let top_cell = facts.nursery_top_addr;
+    let (pub_free, pub_top) = majit_gc::published_bump_cursor_addrs();
+    let free_cell = if pub_free != 0 {
+        pub_free
+    } else {
+        facts.nursery_free_addr
+    };
+    let top_cell = if pub_top != 0 {
+        pub_top
+    } else {
+        facts.nursery_top_addr
+    };
     if free_cell == 0 || top_cell == 0 {
         return None;
     }

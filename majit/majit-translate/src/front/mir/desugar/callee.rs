@@ -1452,7 +1452,9 @@ pub(in crate::front::mir) fn builtin_code_fn_shape(input: &str, output: &str) ->
 // Helpers
 
 /// Collect the MIR locals bound by a scalar [`Rvalue::BinaryOp`]
-/// anywhere in `body`.  See [`Lowering::binop_result_locals`] for why a
+/// anywhere in `body`, plus Call dests of
+/// `core::intrinsics::{add,sub,mul}_with_overflow` (debug-MIR's
+/// `*Checked` form).  See [`Lowering::binop_result_locals`] for why a
 /// single function-wide set is sound (a local's MIR type is fixed, so a
 /// local bound by `BinaryOp` is a `*Checked` scalar at every read site).
 pub(in crate::front::mir) fn compute_binop_result_locals(
@@ -1474,6 +1476,15 @@ pub(in crate::front::mir) fn compute_binop_result_locals(
             {
                 set.insert(i as usize);
             }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && let CallFunc::Regular(reg) = &call.func
+            && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+            && let Some(fd) = llbc.fn_by_id(*id)
+            && overflow_intrinsic_binop(fd.item_meta.name_path().as_str()).is_some()
+            && let PlaceKind::Local(i) = call.dest.kind
+        {
+            set.insert(i as usize);
         }
     }
     set

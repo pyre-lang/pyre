@@ -2909,6 +2909,15 @@ impl RPythonAnnotator {
                         "threadlocalref_get" if sp.args.len() == 2 => Some(SomeValue::Integer(
                             super::model::SomeInteger::new(false, false),
                         )),
+                        // `llop.threadlocalref_addr` (`llmodel.py`
+                        // `threadlocalref_addr(llmemory.Address)`).
+                        // `_LLOpEntry.compute_result_annotation` is
+                        // `lltype_to_annotation(RESULTTYPE.const)`.
+                        "threadlocalref_addr" if sp.args.is_empty() => Some(
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+                            ),
+                        ),
                         // `llop.threadlocalref_store` (`ThreadLocalField.setraw`).
                         "threadlocalref_store" if sp.args.len() == 2 => Some(
                             crate::translator::rtyper::llannotation::lltype_to_annotation(

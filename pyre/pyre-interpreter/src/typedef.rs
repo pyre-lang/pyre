@@ -7785,7 +7785,7 @@ crate::builtin_wrapper_descriptor!(
 
 fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
-    let list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
+    let mut list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
     let w_type = crate::typedef::r#type(list)
         .map(|tp| tp.as_ptr())
         .unwrap_or_else(|| gettypeobject(&pyre_object::LIST_TYPE));
@@ -7796,8 +7796,7 @@ fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         // [3.15-spec] `list___sizeof___impl` (Py_GIL_DISABLED) reads
         // `ob_item` inside `Py_BEGIN_CRITICAL_SECTION(self)`.
         // ↔ PyPy has no list.__sizeof__
-        let _guard = pyre_object::listobject::w_list_lock(list);
-        pyre_object::listobject::w_list_allocated(list)
+        pyre_object::with_objlock!(pyre_object::listobject::w_list_lock_acquire; list => pyre_object::listobject::w_list_allocated(list))
     } as usize;
     let size = (basicsize as usize)
         .wrapping_add(capacity.wrapping_mul(std::mem::size_of::<PyObjectRef>()));

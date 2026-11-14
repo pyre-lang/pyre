@@ -20739,18 +20739,19 @@ pub(crate) fn set_iter_descr_next(obj: PyObjectRef) -> PyResult {
 
 /// interp_itertools.py W_Count.next_w.
 pub(crate) fn count_next_w(obj: PyObjectRef) -> PyResult {
+    // itertools.count.next_w — PyPy interp_itertools.py W_Count.next_w
+    //
+    //     def next_w(self):
+    //         w_c = self.w_c
+    //         self.w_c = self.space.add(w_c, self.w_step)
+    //         return w_c
     unsafe {
-        // itertools.count.next_w — PyPy interp_itertools.py W_Count.next_w
-        //
-        //     def next_w(self):
-        //         w_c = self.w_c
-        //         self.w_c = self.space.add(w_c, self.w_step)
-        //         return w_c
-
-        let _guard = pyre_object::interp_itertools::w_count_lock(obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        // A contended stripe wait may collect: pin the count before the wait and reload after it.
+        let _guard = pyre_object::interp_itertools::w_count_lock(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        );
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_c = pyre_object::interp_itertools::w_count_get_c(w_self);
         let _ = pyre_object::gc_roots::pin_root(w_c);
@@ -20764,7 +20765,7 @@ pub(crate) fn count_next_w(obj: PyObjectRef) -> PyResult {
         )?;
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         pyre_object::interp_itertools::w_count_set_c(w_self, new_c);
-        return Ok(pyre_object::gc_roots::shadow_stack_get(current_slot));
+        Ok(pyre_object::gc_roots::shadow_stack_get(current_slot))
     }
 }
 

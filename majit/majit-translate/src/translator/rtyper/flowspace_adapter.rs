@@ -5122,6 +5122,20 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("int_between", hl_args, result)])
         }
 
+        // `llop.threadlocalref_addr` (`lloperation.py`). Zero operands
+        // after `_LLOpEntry.specialize_call` skips RESULTTYPE. It is not
+        // a flowspace operator; carry it under the llop name.
+        OpKind::LoweredBlackholeOp { opname, args }
+            if opname == "threadlocalref_addr" && args.is_empty() =>
+        {
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "threadlocalref_addr",
+                vec![],
+                result,
+            )])
+        }
+
         // `ptr::write` / `*p = v` / `*p` on raw memory.  Upstream the
         // high-level form is an llop call (`llop.raw_load(TYPE, addr,
         // offset)` / `llop.raw_store(addr, offset, value)`);
