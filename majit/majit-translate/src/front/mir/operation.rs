@@ -1834,9 +1834,10 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// One-word `*p = v`: a raw pointer to a scalar, or a transparent
-    /// GCREF newtype (`PyError`, `PyObjectRef`). Multi-word pointees
-    /// use `move_plan` / `rffi.py` `_get_structcopy_fn`.
+    /// One-word `*p = v`: a raw pointer to a scalar, or a borrowed
+    /// `&mut T` of a primitive scalar whose place `atomic_ref_place`
+    /// did not recover (a pointer field of a closure env). Multi-word
+    /// pointees use `move_plan` / `rffi.py` `_get_structcopy_fn`.
     fn one_word_deref_store_descr(
         &self,
         dest_ty: &TyRef,
@@ -1852,8 +1853,18 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
-        // A transparent GCREF newtype (`PyError`) that missed the cell
-        // FieldWrite declines rather than `raw_store` of a GCREF.
+        // `&mut bool` (and other primitive scalars) behind a pointer
+        // field: the Deref inner is a Field, not a Local, so
+        // `atomic_ref_place` does not fire. Same one-word store as a
+        // raw pointer. A transparent GCREF newtype (`PyError`) is not
+        // a primitive scalar and still declines rather than
+        // `raw_store` of a GCREF.
+        if !deref_base_is_raw_ptr
+            && tyref_is_primitive_scalar(dest_ty, self.llbc)
+            && let Some(descr) = self.raw_word_descr(dest_ty)
+        {
+            return Some(descr);
+        }
         None
     }
 

@@ -5208,6 +5208,85 @@ mod tests {
         assert_eq!(path.specialization, GraphSpecialization::Regular);
     }
 
+    /// `eval_frame_plain_with_resume` is `pyframe.py execute_frame`. The
+    /// outer-try IIFE body (`call_mut`) is an ordinary function graph
+    /// (`rpbc.py` `FunctionReprBase.call`); the execute_frame jitcode
+    /// Regular-`inline_call`s it, then `call_trace`, when
+    /// `jtransform.py` `handle_regular_call` / `policy.py`
+    /// `look_inside_graph` allow.
+    #[test]
+    fn eval_frame_plain_with_resume_regular_inline_calls_call_trace() {
+        let call_trace_idx = call_trace_jitcode_index()
+            .expect("generated `call_trace` jitcode must be in the build-time table");
+        let roots: Vec<usize> = jitcode_index()
+            .paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, path)| {
+                let path = path.as_ref()?;
+                if path.specialization != GraphSpecialization::Regular {
+                    return None;
+                }
+                matches!(
+                    path.segments.last().map(String::as_str),
+                    Some("eval_frame_plain_with_resume" | "execute_frame")
+                )
+                .then_some(i)
+            })
+            .collect();
+        assert!(
+            !roots.is_empty(),
+            "expected a Regular execute_frame / eval_frame_plain_with_resume jitcode"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut work = roots;
+        let mut found = false;
+        while let Some(idx) = work.pop() {
+            if !seen.insert(idx) {
+                continue;
+            }
+            if idx == call_trace_idx {
+                found = true;
+                break;
+            }
+            let Some(jc) = get_jitcode_by_index(idx) else {
+                continue;
+            };
+            let runtime = get_runtime_jitcode_by_index(idx);
+            for op in decoded_ops(&jc.code) {
+                if !op.opname.starts_with("inline_call") {
+                    continue;
+                }
+                let Some(descr_idx) = decoded_op_descr_index(&jc.code, &op) else {
+                    continue;
+                };
+                let descr_idx = descr_idx as usize;
+                let callee = runtime
+                    .as_ref()
+                    .and_then(|frame| frame.descr_at(descr_idx))
+                    .and_then(|descr| descr.as_jitcode_exec())
+                    .map(|callee| callee.index())
+                    .or_else(|| {
+                        descr_ref_table()
+                            .at(descr_idx)
+                            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+                    })
+                    .or_else(|| match get_descr_by_index(descr_idx) {
+                        Some(BhDescr::JitCode { jitcode_index, .. }) => Some(*jitcode_index),
+                        _ => None,
+                    });
+                if let Some(callee) = callee {
+                    work.push(callee);
+                }
+            }
+        }
+        assert!(
+            found,
+            "execute_frame jitcode chain must Regular-inline_call \
+             executioncontext::ExecutionContext::call_trace"
+        );
+    }
+
     #[test]
     fn pathed_index_keeps_a_regular_access_direct_suffix_name_apart_from_the_access_direct_copy() {
         let regular_suffix = CallPath::from_segments(["owner", "f__AccessDirect_None"]);
