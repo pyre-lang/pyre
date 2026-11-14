@@ -18394,8 +18394,8 @@ fn interned_option_char_and_value_some_payloads_are_distinct() {
             "core::option::Option<Value>::Some",
             "__pos_0"
         ),
-        Some("value::Value"),
-        "intern ROW is the TypeDecl identity, CAST suffix stays <Value>; keys={:?}",
+        Some("&value::Value"),
+        "intern ROW is TupleRepr/InstanceRepr Ptr(GcStruct); CAST suffix stays <Value>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }
@@ -18421,8 +18421,8 @@ fn intern_tagged_option_of_opaque_payload_spells_declared_leaf() {
             "option::Option<CodePoint>::Some",
             "__pos_0"
         ),
-        Some("CodePoint"),
-        "declared Opaque payload leaf; keys={:?}",
+        Some("&CodePoint"),
+        "declared Opaque payload is Ptr(GcStruct); keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     let opaque_rows = program.struct_fields.fields.get("CodePoint");
@@ -18528,8 +18528,8 @@ fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
             "core::result::Result<Arguments,PyError>::Ok",
             "__pos_0"
         ),
-        Some("argument::Arguments"),
-        "intern ROW is the TypeDecl identity, CAST suffix stays <Arguments>; keys={:?}",
+        Some("&argument::Arguments"),
+        "intern ROW is TupleRepr/InstanceRepr Ptr(GcStruct); CAST suffix stays <Arguments>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
@@ -18538,10 +18538,99 @@ fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
             "result::Result<Arguments,PyError>::Ok",
             "__pos_0"
         ),
-        Some("argument::Arguments"),
+        Some("&argument::Arguments"),
         "crate-stripped intern KEY matches CAST owner; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
+}
+
+/// A `Result<ObjectKey, E>` sum shell intern's `Ok.__pos_0` as one GC
+/// pointer (`rtuple.py TupleRepr` / `rclass.py InstanceRepr` lowleveltype
+/// `Ptr(GcStruct)`). The field descr is FLAG_POINTER, one word, parent
+/// size two words (tag + payload).
+#[test]
+fn sum_shell_instance_payload_is_one_gc_pointer() {
+    use crate::codewriter::call::StructLayout;
+    use majit_ir::descr::ArrayFlag;
+    use std::collections::{HashMap, HashSet};
+
+    let object_key = interior_struct(
+        1,
+        &["pyre_object", "dictmultiobject", "ObjectKey"],
+        &[
+            (
+                "hash",
+                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+            ),
+            (
+                "obj",
+                serde_json::json!({"RawPtr": [
+                    {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                    "Mut"
+                ]}),
+            ),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let err = interior_struct(
+        2,
+        &["pyre_object", "dictmultiobject", "DictKeyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let llbc =
+        intern_result_from_unwrap_call_llbc(vec![adt_node(1), adt_node(2)], vec![object_key, err]);
+    let program = crate::test_support::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<ObjectKey, DictKeyError>");
+    let keys: Vec<_> = program.struct_fields.fields.keys().collect();
+    let payload = field_row_ty(
+        &program.struct_fields,
+        "result::Result<ObjectKey,DictKeyError>::Ok",
+        "__pos_0",
+    )
+    .or_else(|| {
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<ObjectKey,DictKeyError>::Ok",
+            "__pos_0",
+        )
+    });
+    assert_eq!(
+        payload,
+        Some("&dictmultiobject::ObjectKey"),
+        "Ok.__pos_0 intern is Ptr(GcStruct); keys={keys:?}"
+    );
+    let payload = payload.unwrap();
+    let known_structs: HashSet<String> = HashSet::from(["dictmultiobject::ObjectKey".to_string()]);
+    let known_sizes: HashMap<String, usize> =
+        HashMap::from([("dictmultiobject::ObjectKey".to_string(), 16)]);
+    let layout = StructLayout::from_type_strings(
+        &[
+            ("__discriminant".to_string(), "i64".to_string()),
+            ("__pos_0".to_string(), payload.to_string()),
+        ],
+        &known_structs,
+        &known_sizes,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashSet::new(),
+    );
+    let word = crate::layout::target_word_size();
+    let pos0 = layout
+        .fields
+        .iter()
+        .find(|field| field.name == "__pos_0")
+        .expect("Ok.__pos_0 row");
+    assert_eq!(pos0.flag, ArrayFlag::Pointer);
+    assert_eq!(pos0.size, word);
+    assert_eq!(layout.size, 2 * word);
 }
 
 /// Intern of `Result<RBigInt, RBigIntError>` spells `Err.__pos_0` as the
@@ -18578,8 +18667,8 @@ fn interned_result_err_fieldless_enum_payload_is_discriminant_int() {
             "core::result::Result<RBigInt,RBigIntError>::Ok",
             "__pos_0"
         ),
-        Some("rbigint::RBigInt"),
-        "Ok intern ROW is the Opaque TypeDecl identity; keys={:?}",
+        Some("&rbigint::RBigInt"),
+        "Ok intern ROW is TupleRepr/InstanceRepr Ptr(GcStruct); keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }
@@ -18888,8 +18977,8 @@ fn interned_result_ok_generic_payload_keeps_leaf_render() {
             "core::result::Result<G<u8>,PyError>::Ok",
             "__pos_0"
         ),
-        Some("G<u8>"),
-        "generic intern ROW stays the CAST leaf render; keys={:?}",
+        Some("&G<u8>"),
+        "generic intern ROW is Ptr(GcStruct) of the CAST leaf render; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }
@@ -37393,6 +37482,119 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
             ("cell.b", ValueType::Int)
         ]
     );
+}
+
+/// Transitive harvest: a non-generic struct field of `RDict<K,V>` reaches
+/// `GcEntries` then `[Entry;0]`, and `f_valid` follows a 16-byte by-value key.
+#[test]
+fn register_ordereddict_entry_rows_walks_nested_adt_fields() {
+    let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let tv1 = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let u64_ty = scalar_ty("U64");
+    let raw_u8 = serde_json::json!({"RawPtr": [
+        {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+        "Mut"
+    ]});
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let entry = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["host", "rordereddict_entries", "Entry"], true),
+        "kind": {"Struct": [
+            {"name": "key", "ty": tv0, "attr_info": null},
+            {"name": "f_valid", "ty": bool_ty, "attr_info": null},
+            {"name": "value", "ty": tv1, "attr_info": null},
+            {"name": "f_hash", "ty": u64_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let key16 = interior_struct(
+        1,
+        &["host", "WideKey"],
+        &[
+            (
+                "hash",
+                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+            ),
+            ("obj", raw_u8.clone()),
+        ],
+        16,
+        &[0, 8],
+        false,
+    );
+    let gc_entries = type_decl_struct(
+        2,
+        &["host", "rordereddict_entries", "GcEntries"],
+        vec![serde_json::json!({
+            "name": "items",
+            "ty": {"Array": [named_adt(0, vec![
+                serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+                serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+            ]), array_len, null]},
+            "attr_info": null
+        })],
+    );
+    let rdict = type_decl_struct(
+        3,
+        &["host", "rordereddict", "RDict"],
+        vec![serde_json::json!({
+            "name": "entries",
+            "ty": named_adt(2, vec![
+                serde_json::json!({"TypeVar": {"Bound": [0, 0]}}),
+                serde_json::json!({"TypeVar": {"Bound": [0, 1]}}),
+            ]),
+            "attr_info": null
+        })],
+    );
+    let holder = type_decl_struct(
+        4,
+        &["host", "Holder"],
+        vec![serde_json::json!({
+            "name": "d",
+            "ty": named_adt(3, vec![named_adt(1, vec![]), raw_u8]),
+            "attr_info": null
+        })],
+    );
+    let llbc = llbc_with_types(
+        "host",
+        vec![entry, key16, gc_entries, rdict, holder],
+        vec![],
+    );
+    let mut known = std::collections::HashSet::new();
+    let mut fields = crate::front::semantic::StructFieldRegistry::default();
+    let mut ids = std::collections::HashMap::new();
+    let mut layouts = std::collections::HashMap::new();
+    let gc = std::collections::HashSet::new();
+    super::register_ordereddict_entry_rows(
+        &llbc,
+        &mut known,
+        &mut fields,
+        &mut ids,
+        &mut layouts,
+        &gc,
+    );
+    let intern = "rordereddict_entries::Entry<WideKey,*mut u8>";
+    assert!(
+        fields.fields.get(intern).is_some(),
+        "intern spelling must be published; keys={:?}",
+        fields.fields.keys().collect::<Vec<_>>()
+    );
+    let sid = majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry")
+        .instantiate("<WideKey,*mut u8>");
+    let layout = layouts
+        .get(&sid)
+        .expect("exact layout for instantiated Entry");
+    assert_eq!(layout.field_offsets.get("f_valid"), Some(&16));
+    assert_eq!(layout.size, Some(40));
 }
 
 /// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.

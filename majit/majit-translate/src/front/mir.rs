@@ -1585,7 +1585,7 @@ fn register_ref_enum_instantiation_rows(
                         break;
                     }
                     intern_projection_payload_spelling(trimmed, struct_fields);
-                    rows.push(field_decl_row(i, f, concrete));
+                    rows.push(field_decl_row(i, f, positional_field_type(&concrete)));
                     continue;
                 }
                 // Register a field only when it is layout-safe for the
@@ -1608,7 +1608,17 @@ fn register_ref_enum_instantiation_rows(
                     registrable = false;
                     break;
                 }
-                rows.push(field_row_from_decl(i, f, concrete, llbc));
+                // `rtuple.py TupleRepr` / `rclass.py InstanceRepr` lowleveltype
+                // of an instance-typed item is `Ptr(GcStruct)`. The variant
+                // shell is `New` + `setfield` of that pointer, so intern
+                // `__pos_N` through `positional_field_type` the same way a
+                // Tuple row is interned.
+                rows.push(field_row_from_decl(
+                    i,
+                    f,
+                    positional_field_type(&concrete),
+                    llbc,
+                ));
             }
             if !registrable {
                 continue;
@@ -2057,17 +2067,103 @@ fn register_remaining_opaque_type_decls(
 }
 
 /// One concrete `rordereddict_entries::Entry` / `GcEntries` use found in a
-/// signature or a local. `found` holds the rendered type arguments.
+/// signature or a local. `args` is the rendered spelling; `subst` is the
+/// JSON `generics.types` list `repr_c_struct_field_offset` walks.
+struct EntryInstantiation {
+    args: Vec<String>,
+    subst: Vec<serde_json::Value>,
+}
+
 struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
     entry_id: u64,
     gc_entries_id: Option<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
-    found: Vec<Vec<String>>,
+    seen_inst: std::collections::HashSet<String>,
+    found: Vec<EntryInstantiation>,
+}
+
+fn json_mentions_typevar(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 24 {
+        return false;
+    }
+    match v {
+        serde_json::Value::Object(m) => {
+            if m.contains_key("TypeVar") {
+                return true;
+            }
+            if let Some(id) = m.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                return llbc
+                    .dedup_body(id)
+                    .is_some_and(|body| json_mentions_typevar(body, llbc, depth + 1));
+            }
+            if let Some(arr) = m.get("Value").and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                return json_mentions_typevar(&arr[1], llbc, depth + 1);
+            }
+            m.values()
+                .any(|child| json_mentions_typevar(child, llbc, depth + 1))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|child| json_mentions_typevar(child, llbc, depth + 1)),
+        _ => false,
+    }
+}
+
+fn tyref_mentions_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| json_mentions_typevar(node, llbc, 0))
+}
+
+fn type_decl_mentions_typevar(td: &TypeDecl, llbc: &Llbc) -> bool {
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            fields.iter().any(|f| tyref_mentions_typevar(&f.ty, llbc))
+        }
+        TypeDeclKind::Enum(variants) => variants
+            .iter()
+            .any(|v| v.fields.iter().any(|f| tyref_mentions_typevar(&f.ty, llbc))),
+        TypeDeclKind::Alias(body) => {
+            json_mentions_typevar(body.get("aliased_ty").unwrap_or(body), llbc, 0)
+        }
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+    }
 }
 
 impl EntryInstantiationScan<'_> {
+    fn consider_substed_value(&mut self, ty: &serde_json::Value, subst: &[serde_json::Value]) {
+        let mut json = ty.clone();
+        crate::front::clause_spec::substitute_type_vars(&mut json, self.llbc, subst, &[]);
+        self.consider(Some(&json));
+    }
+
+    fn consider_substed_ty(&mut self, ty: &TyRef, subst: &[serde_json::Value]) {
+        self.consider_substed_value(&tyref_json(ty), subst);
+    }
+
+    fn consider_type_decl_fields(&mut self, td: &TypeDecl, subst: &[serde_json::Value]) {
+        match &td.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                for f in fields {
+                    self.consider_substed_ty(&f.ty, subst);
+                }
+            }
+            TypeDeclKind::Enum(variants) => {
+                for v in variants {
+                    for f in &v.fields {
+                        self.consider_substed_ty(&f.ty, subst);
+                    }
+                }
+            }
+            TypeDeclKind::Alias(body) => {
+                self.consider_substed_value(body.get("aliased_ty").unwrap_or(body), subst);
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+        }
+    }
+
     fn consider(&mut self, root: Option<&serde_json::Value>) {
         let Some(root) = root else {
             return;
@@ -2096,18 +2192,43 @@ impl EntryInstantiationScan<'_> {
                 continue;
             }
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
-                if let Some(id) = type_decl_ref_adt_id(adt)
-                    && (id == self.entry_id || self.gc_entries_id == Some(id))
-                {
+                if let Some(id) = type_decl_ref_adt_id(adt) {
                     let args = render_adt_type_args(adt, self.llbc, depth);
-                    if !args.is_empty()
+                    if (id == self.entry_id || self.gc_entries_id == Some(id))
+                        && !args.is_empty()
                         && args
                             .iter()
                             .all(|arg| !arg.is_empty() && !arg.contains("??"))
                     {
                         let suffix = args.join(",");
                         if self.seen_suffix.insert(suffix) {
-                            self.found.push(args);
+                            let subst = type_decl_ref_generics(adt, self.llbc)
+                                .and_then(|g| g.get("types"))
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.found.push(EntryInstantiation {
+                                args: args.clone(),
+                                subst,
+                            });
+                        }
+                    }
+                    if args.iter().all(|arg| !arg.contains("??"))
+                        && let Some(td) = self.llbc.type_by_id(id)
+                    {
+                        let path = strip_crate_prefix(&td.item_meta.name_path());
+                        let inst = if args.is_empty() {
+                            path
+                        } else {
+                            format!("{path}<{}>", args.join(","))
+                        };
+                        if self.seen_inst.insert(inst) {
+                            let subst = type_decl_ref_generics(adt, self.llbc)
+                                .and_then(|g| g.get("types"))
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.consider_type_decl_fields(td, &subst);
                         }
                     }
                 }
@@ -2148,19 +2269,30 @@ impl EntryInstantiationScan<'_> {
     }
 }
 
-/// Publish concrete `Entry<i64, *mut PyObject>` field rows.
+/// Publish every concrete `rordereddict_entries::Entry<K,V>` field row
+/// and `repr(C)` layout.
 ///
-/// Charon leaves `rordereddict_entries::Entry` generic, so
-/// `derive_program_metadata` records `key` as a type variable.
-/// `_handle_dict_lookup_call` extra descrs need that concrete `i64` key
-/// (`arraydescrof(DICTENTRYARRAY)`). A fully concrete use of `Entry`, or
-/// the same arguments on `GcEntries`, supplies the rows. Only the
-/// qualified spelling is inserted. `#[repr(C)]` places `key`, `f_valid`,
-/// `value`, and `f_hash` in declaration order.
-fn register_ordereddict_i64_entry_rows(
+/// Charon leaves the TypeDecl generic (`layout_for_target` stays
+/// `OffsetOf`), so `derive_program_metadata` records `key` as a type
+/// variable. FunDecl signatures stay generic. `get_ll_dict` mints one
+/// `DICTENTRYARRAY` per `(K,V)`; `cpu.interiorfielddescrof` /
+/// `get_interiorfield_descr` / `get_field_descr` /
+/// `symbolic.get_field_token` then read that element's real offsets.
+/// A concrete TypeDecl field (`RDict` / `OrderedDict` → `GcEntries` →
+/// `[Entry;0]`) supplies the rows after substituting that ADT's type
+/// arguments into its TypeDecl fields (`substitute_type_vars`). Offsets
+/// come from [`repr_c_struct_field_offset`] (resolved layout, else
+/// declaration order with [`instantiated_field_size_align`]). Qualified
+/// spellings only; the unsuffixed template keeps its TypeVar rows.
+fn register_ordereddict_entry_rows(
     llbc: &Llbc,
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     let mut entry: Option<(u64, String)> = None;
@@ -2185,6 +2317,7 @@ fn register_ordereddict_i64_entry_rows(
         gc_entries_id,
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
+        seen_inst: std::collections::HashSet::new(),
         found: Vec::new(),
     };
     for fd in llbc.iter_local_fns() {
@@ -2202,15 +2335,24 @@ fn register_ordereddict_i64_entry_rows(
             }
         }
     }
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_builtin_adt(td) || type_decl_mentions_typevar(td, llbc) {
+            continue;
+        }
+        scan.consider_type_decl_fields(td, &[]);
+    }
     let Some(td) = llbc.type_by_id(entry_id) else {
         return;
     };
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return;
     };
-    for args in scan.found {
+    let canonical_path = strip_crate_prefix(&entry_path);
+    let template_sid = majit_ir::descr::StructId::from_canonical(&canonical_path);
+    for inst in scan.found {
+        let args = inst.args;
+        let subst = inst.subst;
         let mut rows = Vec::with_capacity(fields.len());
-        let mut key_is_i64 = false;
         let mut valid = false;
         let mut value = false;
         let mut hash = false;
@@ -2229,7 +2371,6 @@ fn register_ordereddict_i64_entry_rows(
                 break;
             }
             match fname.as_str() {
-                "key" => key_is_i64 = concrete_ty == "i64",
                 "f_valid" => valid = true,
                 "value" => value = true,
                 "f_hash" => hash = true,
@@ -2237,12 +2378,88 @@ fn register_ordereddict_i64_entry_rows(
             }
             rows.push(field_row_from_decl(index, field, concrete_ty, llbc));
         }
-        if !concrete || !key_is_i64 || !valid || !value || !hash {
+        if !concrete || !valid || !value || !hash {
             continue;
         }
-        let name = format!("{entry_path}<{}>", args.join(","));
-        struct_fields.fields.entry(name.clone()).or_insert(rows);
-        known_struct_names.insert(name);
+        let args_joined = args.join(",");
+        let suffix = format!("<{args_joined}>");
+        let qualified = format!("{entry_path}{suffix}");
+        let canonical_qualified = format!("{canonical_path}{suffix}");
+        let sid = template_sid.instantiate(&suffix);
+        struct_fields
+            .fields
+            .entry(qualified.clone())
+            .or_insert(rows.clone());
+        known_struct_names.insert(qualified.clone());
+        record_struct_id(
+            struct_ids,
+            &mut struct_fields.class_identity,
+            qualified,
+            sid,
+            &canonical_qualified,
+        );
+        if canonical_path != entry_path {
+            struct_fields
+                .fields
+                .entry(canonical_qualified.clone())
+                .or_insert(rows);
+            known_struct_names.insert(canonical_qualified.clone());
+            record_struct_id(
+                struct_ids,
+                &mut struct_fields.class_identity,
+                canonical_qualified.clone(),
+                sid,
+                &canonical_qualified,
+            );
+        }
+        if subst.is_empty() {
+            continue;
+        }
+        let mut field_offsets = std::collections::HashMap::new();
+        for (index, field) in fields.iter().enumerate() {
+            let fname = field_decl_name(index, field);
+            if let Some(off) = repr_c_struct_field_offset(llbc, td, &subst, index) {
+                field_offsets.insert(fname, off);
+            }
+        }
+        if field_offsets.is_empty() {
+            continue;
+        }
+        let mut size_off = 0u64;
+        let mut max_align = 1u64;
+        let mut size_ok = true;
+        for field in fields {
+            match instantiated_field_size_align(llbc, &tyref_json(&field.ty), &subst, &[], 0) {
+                Some((fs, fa)) => {
+                    let fa = fa.max(1);
+                    match align_up_bytes(size_off, fa).and_then(|o| o.checked_add(fs)) {
+                        Some(next) => size_off = next,
+                        None => {
+                            size_ok = false;
+                            break;
+                        }
+                    }
+                    max_align = max_align.max(fa);
+                }
+                None => {
+                    size_ok = false;
+                    break;
+                }
+            }
+        }
+        let size = if size_ok {
+            align_up_bytes(size_off, max_align)
+        } else {
+            None
+        };
+        exact_layouts
+            .entry(sid)
+            .or_insert(crate::front::semantic::ExactLayout {
+                size,
+                align: size_ok.then_some(max_align),
+                field_offsets,
+                host: None,
+            });
     }
 }
 
@@ -2506,13 +2723,16 @@ impl CrateLoweringState {
             gc_struct_ids,
             program_exception_class_hints,
         );
-        // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
-        // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
-        // need the monomorph `get_ll_dict` would have built.
-        register_ordereddict_i64_entry_rows(
+        // Concrete `Entry<K,V>` rows and `repr(C)` layouts. The generic
+        // decl's `key` is a type variable; `get_ll_dict` mints one
+        // `DICTENTRYARRAY` per monomorph and `symbolic.get_field_token`
+        // reads those offsets.
+        register_ordereddict_entry_rows(
             llbc,
             &mut known_struct_names,
             &mut struct_fields,
+            &mut struct_ids,
+            &mut exact_layouts,
             gc_struct_ids,
         );
 
@@ -6251,6 +6471,17 @@ fn derive_program_metadata(
                                 voffsets.insert(fname.clone(), off);
                             }
                             vattrs.push((fname.clone(), attr_ty));
+                            // `rtuple.py TupleRepr` / `rclass.py InstanceRepr`
+                            // lowleveltype of an instance-typed item is
+                            // `Ptr(GcStruct)`. The explicit sum shell is `New`
+                            // + `setfield` of that pointer, so intern `__pos_N`
+                            // through `positional_field_type` the same way a
+                            // Tuple row is interned.
+                            let row_ty = if explicit_sum_shell {
+                                positional_field_type(&row_ty)
+                            } else {
+                                row_ty
+                            };
                             vrows.push(field_row_from_decl(i, f, row_ty, llbc));
                         }
                         struct_fields
