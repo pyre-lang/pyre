@@ -18306,6 +18306,10 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             // expression here"), not as this variant, so they keep their
             // message.  Span rewrite is `starred_slice_bound_span`.
             ParseErrorType::InvalidStarredExpressionUsage => "invalid syntax".to_owned(),
+            // `return yield 42`: the grammar has no expression alternative
+            // there, so the diagnostic is the generic one pointing at `yield`.
+            // Match the variant; ruff's Display for it changed case.
+            ParseErrorType::InvalidYieldExpressionUsage => "invalid syntax".to_owned(),
             // `tok_get_normal_mode` says what it found rather than what it
             // wanted: a backslash is a continuation only when the newline is
             // the next character, and anything else after it -- a space, a
@@ -18565,7 +18569,10 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // generic error names the `yield` token itself.
     let yield_span = match &e {
         crate::compile::CompileError::Parse(parse_error)
-            if msg == "Yield expression cannot be used here" =>
+            if matches!(
+                parse_error.error,
+                ParseErrorType::InvalidYieldExpressionUsage
+            ) =>
         {
             let start = parse_error.raw_location.start().to_usize();
             source
@@ -29779,6 +29786,31 @@ mod tests {
         let end = file_write_at(&mut empty_past, 4096, b"").unwrap();
         assert_eq!(end, 4096);
         assert_eq!(&empty_past, b"abc");
+    }
+
+    #[test]
+    fn return_yield_reports_invalid_syntax_at_the_yield_token() {
+        let _ = new_builtin_module_dict();
+        let source = "def f():\n    return yield 42\n";
+        let err = crate::pyparser::pyparse::compile_source(source, crate::compile::Mode::Exec)
+            .expect_err("return yield 42 must fail to compile");
+        let mut pyerr = compile_err_to_syntax_error(err, source, crate::compile::Mode::Exec);
+        let exc = pyerr.to_exc_object();
+        let msg = crate::baseobjspace::syntax_error_attr(exc, "msg");
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_value_opt(msg) },
+            Some("invalid syntax")
+        );
+        let offset = crate::baseobjspace::syntax_error_attr(exc, "offset");
+        let end_offset = crate::baseobjspace::syntax_error_attr(exc, "end_offset");
+        assert_eq!(
+            unsafe { pyre_object::intobject::w_int_get_value(offset) },
+            12
+        );
+        assert_eq!(
+            unsafe { pyre_object::intobject::w_int_get_value(end_offset) },
+            17
+        );
     }
 
     #[test]
