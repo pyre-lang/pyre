@@ -54,12 +54,12 @@ pub type UnicodeValueStorage = Utf8Str;
 /// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
 /// The copy below fills every byte the caller asked for.
 ///
-/// A failed allocation is `MemoryError` upstream (`rtype_malloc`,
-/// `IncrementalMiniMarkGC.external_malloc`). The raw helper answers null;
-/// this aborts with `handle_alloc_error` rather than handing a null STR to a
-/// caller that would store it as an empty name. `Layout::new` is the abort
-/// path's reported request (`items_block_alloc_failed` uses the same stand-in
-/// when the real layout cannot be named).
+/// A failed allocation is `MemoryError` upstream (`rstr.py` `mallocstr` /
+/// `rtype_malloc`). The raw helper answers 0; a Failed request returns null
+/// so the caller raises (`gc_alloc_failed_pending`). Host OOM with no
+/// pending exception still aborts (`handle_alloc_error`). `Layout::new` is
+/// the abort path's reported request (`items_block_alloc_failed` uses the
+/// same stand-in when the real layout cannot be named).
 pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStorage {
     let p = if managed && lowlevel_str_gc_type_id() != 0 {
         bh_alloc_str_nofill(bytes.len())
@@ -67,6 +67,9 @@ pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStora
         alloc_raw_utf8_payload(bytes.len())
     };
     if p == 0 {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         std::alloc::handle_alloc_error(std::alloc::Layout::new::<Utf8Str>());
     }
     unsafe {
@@ -599,6 +602,9 @@ pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
     // same bracket `w_str_from_storage` / `build_bytes` already use.
     let _roots = crate::gc_roots::push_roots();
     let value = alloc_utf8_payload(value.as_bytes(), true);
+    if value.is_null() {
+        return crate::PY_NULL;
+    }
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
@@ -656,6 +662,9 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
     let byte_len = value.len();
     let char_len = utf8_codepoint_len(&value);
     let value = alloc_utf8_payload(value.as_bytes(), true);
+    if value.is_null() {
+        return crate::PY_NULL;
+    }
     let mut unicode = W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
@@ -800,6 +809,9 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let value = alloc_utf8_payload(value.as_bytes(), true);
+    if value.is_null() {
+        return crate::PY_NULL;
+    }
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
@@ -2609,6 +2621,36 @@ mod tests {
             crate::lowlevel_string::LOWLEVEL_STR_BASE_SIZE,
             1,
         );
+    }
+
+    /// `rstr.py mallocstr`: a Failed GC request returns null after storing
+    /// MemoryError (`gc_alloc_failed_pending`). Host OOM still aborts.
+    #[test]
+    fn alloc_utf8_payload_failed_returns_null_after_storing_memory_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        fn null_hook(_type_id: u32, _payload_size: usize) -> crate::gc_hook::GCREF {
+            std::ptr::null_mut()
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
+        crate::gc_hook::register_gc_alloc_hook(null_hook);
+        let p = alloc_utf8_payload(b"leaf", true);
+        assert!(p.is_null());
+        assert!(crate::gc_hook::gc_alloc_failed_pending());
+        PENDING.store(false, Ordering::SeqCst);
+        crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
     }
 
     fn intern_probe_guard() -> crate::gc_hook::HookTestGuard {

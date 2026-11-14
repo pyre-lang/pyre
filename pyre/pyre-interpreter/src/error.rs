@@ -6042,6 +6042,9 @@ fn valuefmt_is_single_s(valuefmt: &str) -> bool {
 /// converts it on first read.
 fn oefmt_single_s(w_type: PyObjectRef, valuefmt: &'static str, text: &str) -> OperationError {
     let payload = pyre_object::unicodeobject::alloc_utf8_payload(text.as_bytes(), true);
+    if payload.is_null() {
+        return PyError::memory_error("");
+    }
     oefmt_single_t(w_type, valuefmt, payload as pyre_object::gc_hook::GCREF)
 }
 

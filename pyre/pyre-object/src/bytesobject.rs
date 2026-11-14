@@ -56,15 +56,18 @@ pub type BytesBlock = crate::unicodeobject::Utf8Str;
 /// old-gen spill (`gc_hook::try_gc_alloc`), then
 /// `external_malloc(..., alloc_young=True)` without the collection
 /// (`try_gc_alloc_young_nonmoving_no_collect`) when that does not allocate.
-/// A refused request aborts via `handle_alloc_error`. Only
-/// [`try_alloc_bytes_block`] reports `None` so a Python-facing caller can
-/// raise `MemoryError`.
+/// A Failed request returns null so the caller raises (`rstr.py`
+/// `mallocstr` / `gc_alloc_failed_pending`). Host OOM with no pending
+/// exception still aborts. [`try_alloc_bytes_block`] is the `Option` twin.
 ///
 /// Falls back to a plain allocation before the GC is up or in a unit test,
 /// where the block is immortal, as the storage box's `malloc_raw` fallback is.
 pub fn alloc_bytes_block(bytes: &[u8]) -> *mut BytesBlock {
-    try_alloc_bytes_block(bytes)
-        .unwrap_or_else(|| std::alloc::handle_alloc_error(bytes_block_layout(bytes.len())))
+    match try_alloc_bytes_block(bytes) {
+        Some(block) => block,
+        None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => std::alloc::handle_alloc_error(bytes_block_layout(bytes.len())),
+    }
 }
 
 /// Where a bytes block comes from.
@@ -93,24 +96,28 @@ fn route_bytes_block(size: usize) -> BlockRoute {
     if tid == 0 {
         return BlockRoute::Raw;
     }
-    let young = crate::gc_hook::try_gc_alloc(tid, size);
-    let outcome = match young {
-        Some(raw) if !raw.is_null() => crate::gc_hook::GcAllocOutcome::Allocated(raw),
-        _ => crate::gc_hook::GcAllocOutcome::from_hook(
-            crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect(tid, size),
-        ),
-    };
-    match outcome {
-        crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
-            BlockRoute::Managed(raw.cast::<BytesBlock>())
-        }
-        crate::gc_hook::GcAllocOutcome::Failed => BlockRoute::Refused,
-        crate::gc_hook::GcAllocOutcome::NoRoute => BlockRoute::Raw,
+    // `rstr.mallocstr`: Failed stops; only NoRoute tries the non-moving
+    // young allocator (`alloc_lowlevel_string`).
+    let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, size);
+    if crate::gc_hook::gc_alloc_failed_pending() && young.is_null() {
+        return BlockRoute::Refused;
+    }
+    if !young.is_null() {
+        return BlockRoute::Managed(young.cast::<BytesBlock>());
+    }
+    match crate::gc_hook::GcAllocOutcome::from_hook(
+        crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect(tid, size),
+    )
+    .allocated_or_raise()
+    {
+        Some(raw) => BlockRoute::Managed(raw.cast::<BytesBlock>()),
+        None if crate::gc_hook::gc_alloc_failed_pending() => BlockRoute::Refused,
+        None => BlockRoute::Raw,
     }
 }
 
 /// [`alloc_bytes_block`] for a length that came from Python, answering `None`
-/// where its twin ends the process.
+/// where its twin returns null or aborts.
 ///
 /// `bytes(sys.maxsize)` reaches the allocator with a request it cannot meet,
 /// and `PyBytes_FromStringAndSize` reports that as `MemoryError`.
@@ -326,7 +333,11 @@ impl crate::lltype::GcType for W_BytesObjectUser {
 /// allocation, so the JIT residualises the call.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
-    build_bytes(bytes.len(), alloc_bytes_block(bytes))
+    let data = alloc_bytes_block(bytes);
+    if data.is_null() {
+        return crate::PY_NULL;
+    }
+    build_bytes(bytes.len(), data)
 }
 
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 1-byte payload.
@@ -443,6 +454,9 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     // leave a fresh body unrooted across the block's own allocation.
     let data_slot = crate::gc_roots::shadow_stack_len();
     let data = alloc_bytes_block(bytes);
+    if data.is_null() {
+        return crate::PY_NULL;
+    }
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let raw =
         crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTES_USER_GC_TYPE_ID, W_BYTES_USER_OBJECT_SIZE);
@@ -693,6 +707,36 @@ mod tests {
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(bytes_block_chars(block), b"leaf");
         }
+    }
+
+    /// `rstr.py mallocstr`: a Failed GC request returns null after storing
+    /// MemoryError (`gc_alloc_failed_pending`). Host OOM still aborts.
+    #[test]
+    fn alloc_bytes_block_failed_returns_null_after_storing_memory_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        fn null_hook(_type_id: u32, _payload_size: usize) -> crate::gc_hook::GCREF {
+            std::ptr::null_mut()
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
+        crate::gc_hook::register_gc_alloc_hook(null_hook);
+        let p = alloc_bytes_block(b"leaf");
+        assert!(p.is_null());
+        assert!(crate::gc_hook::gc_alloc_failed_pending());
+        PENDING.store(false, Ordering::SeqCst);
+        crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
     }
 
     /// `typedef.py _getusercls(W_BytesObject)`: exact bytes keep the bare

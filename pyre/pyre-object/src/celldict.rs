@@ -608,7 +608,11 @@ pub fn module_dict_entries_insert(
     if let Some(slot) = entries.get_mut(key) {
         return Some(crate::rordereddict::replace_value(slot, w_value));
     }
-    entries.insert(StrKey(module_dict_key_block(key)), w_value)
+    let block = module_dict_key_block(key);
+    if block.is_null() {
+        return None;
+    }
+    entries.insert(StrKey(block), w_value)
 }
 
 /// `celldict.py` `self.unerase(w_dict.dstorage)[key] = w_value`.
@@ -1170,6 +1174,9 @@ impl ModuleDictStrategy {
                 key,
                 w_to_store,
             );
+        }
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return;
         }
         // The store lands in `w_dict.dstorage`; an in-place `write_cell`
         // above barriered the cell it wrote instead.
