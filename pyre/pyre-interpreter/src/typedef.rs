@@ -5957,19 +5957,37 @@ pub fn __majit_wrap_list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if !unsafe { pyre_object::is_list(list) } {
         return list_init_bad_self(list);
     }
-    if args.len() == 2 && unsafe { pyre_object::is_dict(args[1]) } {
-        list_init_dict_arg(list, args[1])?;
+    let iterable = if args.len() == 2 { Some(args[1]) } else { None };
+    if let Some(iterable) = iterable
+        && unsafe { pyre_object::is_dict(iterable) }
+    {
+        list_init_dict_arg(list, iterable)?;
         return Ok(pyre_object::w_none());
     }
     // descr_init always `self.clear(space)` before extend.  A fresh
     // allocate_instance is already Empty, so the clear is skipped there.
     // [3.15-spec] `list___init___impl`: `if (self->ob_item != NULL) list_clear`.
     // SizeListStrategy's sizehint is that allocation, even at live length 0.
-    if !unsafe { pyre_object::listobject::w_list_uses_empty_storage(list) } {
-        list_init_clear(list);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let iterable_slot = iterable.map(|iterable| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(iterable);
+        slot
+    });
+    if !unsafe {
+        pyre_object::listobject::w_list_uses_empty_storage(pyre_object::gc_roots::shadow_stack_get(
+            list_slot,
+        ))
+    } {
+        list_init_clear(pyre_object::gc_roots::shadow_stack_get(list_slot));
     }
-    if args.len() > 1 {
-        crate::type_methods::list_extend_items(list, args[1])?;
+    if let Some(iterable_slot) = iterable_slot {
+        crate::type_methods::list_extend_items(
+            pyre_object::gc_roots::shadow_stack_get(list_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        )?;
     }
     Ok(pyre_object::w_none())
 }
@@ -6047,9 +6065,21 @@ fn list_init_from(
             params.len() - 1
         )));
     }
-    unsafe { pyre_object::w_list_clear(list) };
-    if let Some(&iterable) = params.get(1) {
-        crate::type_methods::list_method_extend(&[list, iterable])?;
+    let iterable = params.get(1).copied();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let iterable_slot = iterable.map(|iterable| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(iterable);
+        slot
+    });
+    unsafe { pyre_object::w_list_clear(pyre_object::gc_roots::shadow_stack_get(list_slot)) };
+    if let Some(iterable_slot) = iterable_slot {
+        crate::type_methods::list_method_extend(&[
+            pyre_object::gc_roots::shadow_stack_get(list_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        ])?;
     }
     Ok(pyre_object::w_none())
 }
@@ -7791,12 +7821,19 @@ fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let basicsize = cpython_type_layout(w_type)
         .expect("list and its subclasses have CPython layout metadata")
         .0;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
     let capacity = unsafe {
         // [3.15-spec] `list___sizeof___impl` (Py_GIL_DISABLED) reads
         // `ob_item` inside `Py_BEGIN_CRITICAL_SECTION(self)`.
         // ↔ PyPy has no list.__sizeof__
-        let _guard = pyre_object::listobject::w_list_lock(list);
-        pyre_object::listobject::w_list_allocated(list)
+        let _guard = pyre_object::listobject::w_list_lock(pyre_object::gc_roots::shadow_stack_get(
+            list_slot,
+        ));
+        pyre_object::listobject::w_list_allocated(pyre_object::gc_roots::shadow_stack_get(
+            list_slot,
+        ))
     } as usize;
     let size = (basicsize as usize)
         .wrapping_add(capacity.wrapping_mul(std::mem::size_of::<PyObjectRef>()));
@@ -19891,10 +19928,22 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__hash__",
                     )?;
-                    let instance = unsafe { pyre_object::w_method_get_self(obj) };
-                    let mut value = (pyre_object::gc_hook::gc_identity_hash(instance as usize)
-                        ^ pyre_object::gc_hook::gc_identity_hash(descr_of(obj) as usize))
-                        as i64;
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(obj);
+                    let instance = unsafe {
+                        pyre_object::w_method_get_self(pyre_object::gc_roots::shadow_stack_get(
+                            obj_slot,
+                        ))
+                    };
+                    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(instance);
+                    let mut value = (pyre_object::gc_hook::gc_identity_hash(
+                        pyre_object::gc_roots::shadow_stack_get(instance_slot) as usize,
+                    ) ^ pyre_object::gc_hook::gc_identity_hash(descr_of(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    )
+                        as usize)) as i64;
                     if value == -1 {
                         value = -2;
                     }
@@ -21598,15 +21647,19 @@ fn staticmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
     // `w_staticmethod_getdict` mints the dict on the first access and the value
     // arrives as a by-value argument, neither of them a word the collector
     // rewrites, so both take a slot and the store reads them back.  The key is
     // an immortal non-GC string and needs none.
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
-    let _ = roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
-    let value_slot = dict_slot + 1;
-    let _ = roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
+    let sm_slot = roots.base();
+    let _ = roots.pin_root(sm);
+    let value_slot = sm_slot + 1;
+    let _ = roots.pin_root(value);
+    let dict_slot = value_slot + 1;
+    let _ = roots
+        .pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(roots.get(sm_slot)) });
     let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
@@ -22235,11 +22288,15 @@ fn classmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn classmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
-    let _ = roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
-    let value_slot = dict_slot + 1;
-    let _ = roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
+    let cm_slot = roots.base();
+    let _ = roots.pin_root(cm);
+    let value_slot = cm_slot + 1;
+    let _ = roots.pin_root(value);
+    let dict_slot = value_slot + 1;
+    let _ =
+        roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(roots.get(cm_slot)) });
     let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
@@ -32157,6 +32214,8 @@ pub(crate) fn set_descr_contains(
             if !set_type_error_matched(&mut e) {
                 return Err(e);
             }
+            let err_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(e.as_gc_ref());
             let converted =
                 convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(other_slot));
             if pyre_object::gc_hook::gc_alloc_failed_pending()
@@ -32165,7 +32224,9 @@ pub(crate) fn set_descr_contains(
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
             let Some(w_f) = converted else {
-                return Err(e);
+                return Err(crate::PyError::from_raw(
+                    pyre_object::gc_roots::shadow_stack_get(err_slot),
+                ));
             };
             crate::type_methods::set_contains_checked(
                 pyre_object::gc_roots::shadow_stack_get(set_slot),
@@ -32208,6 +32269,8 @@ fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool,
             if !set_type_error_matched(&mut e) {
                 return Err(e);
             }
+            let err_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(e.as_gc_ref());
             let converted =
                 convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(item_slot));
             if pyre_object::gc_hook::gc_alloc_failed_pending()
@@ -32216,7 +32279,9 @@ fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool,
                 return Err(crate::runtime_ops::fetch_memory_error());
             }
             let Some(w_f) = converted else {
-                return Err(e);
+                return Err(crate::PyError::from_raw(
+                    pyre_object::gc_roots::shadow_stack_get(err_slot),
+                ));
             };
             set_remove(pyre_object::gc_roots::shadow_stack_get(set_slot), w_f)
         }
@@ -32940,10 +33005,6 @@ pub(crate) fn set_method_union(
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let result = set_copy_real(args[0]);
-    if pyre_object::gc_hook::gc_alloc_failed_pending() && result.is_null() {
-        return Err(crate::runtime_ops::fetch_memory_error());
-    }
     // `collect_iterable` runs a user `__iter__`/`__next__` and
     // `builtin_set_add_items` a user `__hash__`/`__eq__`, so the set being
     // built stays live across every operand — with two non-set operands it
@@ -32955,10 +33016,15 @@ pub(crate) fn set_method_union(
     // than that copy, so reading operand two out of it after operand one has
     // run a user `__hash__` answers a pre-move address.
     let _roots = pyre_object::gc_roots::push_roots();
-    let operand_base = pyre_object::gc_roots::publish_roots(&args[1..]);
-    let result_slot = pyre_object::gc_roots::publish_roots(&[result]);
+    let operand_base = pyre_object::gc_roots::publish_roots(args);
     pyre_object::gc_roots::normalize_roots(operand_base, args.len());
-    for index in 0..args.len() - 1 {
+    let result = set_copy_real(pyre_object::gc_roots::shadow_stack_get(operand_base));
+    if pyre_object::gc_hook::gc_alloc_failed_pending() && result.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    let result_slot = pyre_object::gc_roots::publish_roots(&[result]);
+    pyre_object::gc_roots::normalize_roots(result_slot, 1);
+    for index in 1..args.len() {
         let operand_slot = operand_base + index;
         if unsafe {
             pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
@@ -33725,31 +33791,56 @@ fn symmetric_difference_one_side(
     probe_slot: usize,
     d_new_slot: usize,
 ) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     unsafe {
         let mut index = 0usize;
         loop {
-            let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
-            if index >= pyre_object::w_set_num_ever_used_items(walk) {
+            if index
+                >= pyre_object::w_set_num_ever_used_items(pyre_object::gc_roots::shadow_stack_get(
+                    walk_slot,
+                ))
+            {
                 break;
             }
-            let key = pyre_object::w_set_iterkey_at(walk, index);
+            let key = pyre_object::w_set_iterkey_at(
+                pyre_object::gc_roots::shadow_stack_get(walk_slot),
+                index,
+            );
             if !key.is_null() {
-                let keyhash = pyre_object::w_set_iterkey_hash_at(walk, index);
+                pyre_object::gc_roots::shadow_stack_set(key_slot, key);
+                let keyhash = pyre_object::w_set_iterkey_hash_at(
+                    pyre_object::gc_roots::shadow_stack_get(walk_slot),
+                    index,
+                );
                 let probe = pyre_object::gc_roots::shadow_stack_get(probe_slot);
-                let present = pyre_object::w_set_contains_with_hash(probe, key, keyhash);
+                let present = pyre_object::w_set_contains_with_hash(
+                    probe,
+                    pyre_object::gc_roots::shadow_stack_get(key_slot),
+                    keyhash,
+                );
                 if present < 0 {
                     return Err(crate::baseobjspace::take_pending_hash_error());
                 }
                 if present == 0 {
-                    let walk = pyre_object::gc_roots::shadow_stack_get(walk_slot);
-                    let key = pyre_object::w_set_iterkey_at(walk, index);
+                    let key = pyre_object::w_set_iterkey_at(
+                        pyre_object::gc_roots::shadow_stack_get(walk_slot),
+                        index,
+                    );
                     if key.is_null() {
                         break;
                     }
-                    let keyhash = pyre_object::w_set_iterkey_hash_at(walk, index);
+                    pyre_object::gc_roots::shadow_stack_set(key_slot, key);
+                    let keyhash = pyre_object::w_set_iterkey_hash_at(
+                        pyre_object::gc_roots::shadow_stack_get(walk_slot),
+                        index,
+                    );
                     let d_new = pyre_object::gc_roots::shadow_stack_get(d_new_slot);
                     set_setitem_with_hash_result(pyre_object::w_set_setitem_with_hash(
-                        d_new, key, keyhash,
+                        d_new,
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
+                        keyhash,
                     ))?;
                 }
             }
@@ -38445,9 +38536,10 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
+    let cls_slot = pyre_object::gc_roots::publish_roots(&[cls, exact]);
     let values_base = pyre_object::gc_roots::publish_roots(values);
-    pyre_object::gc_roots::normalize_roots(cls_slot, 1 + values.len());
+    pyre_object::gc_roots::normalize_roots(cls_slot, 2 + values.len());
+    let exact_slot = cls_slot + 1;
     let w_values = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 1) };
     if !unsafe { crate::baseobjspace::isinstance_list_w(w_values) } {
         return Err(crate::PyError::type_error(format!(
@@ -38502,7 +38594,10 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
 
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
-    check_user_subclass(exact, cls)?;
+    check_user_subclass(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) },
+        cls,
+    )?;
     Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(head_slot) })
 }
 

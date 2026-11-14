@@ -590,13 +590,15 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
     set_cached_type(ffi_arg(roots.get(ffi_slot))?, type_index, x);
     if lazy
         && signed_size(s.size) == -2
-        && let Err(error) = do_realize_lazy_struct(x)
+        && let Err(mut error) = do_realize_lazy_struct(roots.get(x_slot))
     {
+        let error_slot = error.pin(&roots);
         set_cached_type(
             ffi_arg(roots.get(ffi_slot))?,
             type_index,
             pyre_object::w_none(),
         );
+        error.reload(&roots, error_slot);
         return Err(error);
     }
     Ok(roots.get(x_slot))
@@ -653,8 +655,14 @@ fn realize_c_enum(w_ffi: PyObjectRef, eindex: isize) -> Result<PyObjectRef, PyEr
         roots.get(values_slot),
         roots.get(base_slot),
     )?;
-    set_cached_type(ffi_arg(roots.get(ffi_slot))?, type_index, w_ctype);
-    Ok(w_ctype)
+    let ctype_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_ctype);
+    set_cached_type(
+        ffi_arg(roots.get(ffi_slot))?,
+        type_index,
+        roots.get(ctype_slot),
+    );
+    Ok(roots.get(ctype_slot))
 }
 
 /// `realize_c_type_or_func`.
@@ -682,13 +690,15 @@ pub fn realize_c_type_or_func(
     }
     let op = unsafe { *opcodes.offset(index) };
     let x = realize_c_type_or_func_now(roots.get(ffi_slot), op, opcodes, index)?;
+    let x_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(x);
     if from_ffi {
         if let Some(old) = cached_type(ffi_arg(roots.get(ffi_slot))?, index) {
-            assert_eq!(old, x);
+            assert_eq!(old, roots.get(x_slot));
         }
-        set_cached_type(ffi_arg(roots.get(ffi_slot))?, index, x);
+        set_cached_type(ffi_arg(roots.get(ffi_slot))?, index, roots.get(x_slot));
     }
-    Ok(x)
+    Ok(roots.get(x_slot))
 }
 
 /// `realize_c_type_or_func_now`.

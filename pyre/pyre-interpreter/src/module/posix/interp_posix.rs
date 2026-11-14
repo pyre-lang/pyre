@@ -6956,15 +6956,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             ScandirStep::Claimed => {}
         }
-        let result = scandir_iter_next_entry(self_obj);
-        scandir_iter_release_next(self_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
+        let result =
+            scandir_iter_next_entry(pyre_object::gc_roots::shadow_stack_get(self_slot));
+        scandir_iter_release_next(pyre_object::gc_roots::shadow_stack_get(self_slot));
         // interp_scandir.py `fail()` → `_close()` when `nextentry` is exhausted.
 
         match result {
             Err(error) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(self_obj);
                 let (stop, error) = error.matches_stop_iteration_keep();
                 if stop {
                     scandir_iter_mark_closed(pyre_object::gc_roots::shadow_stack_get(self_slot));

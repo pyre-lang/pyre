@@ -6779,18 +6779,23 @@ pub(crate) fn set_contains_checked(
         // `self.unwrap(w_key) in d`. Hashing a plain int runs no user code,
         // so the lookup needs no `try_hash_value` first. The helper reads the
         // strategy under the set's stripe lock and answers -1 for any other.
-        if pyre_object::listobject::is_plain_int1(item) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pair = pyre_object::gc_roots::pin_roots(&[set, item]);
+        if pyre_object::listobject::is_plain_int1(pyre_object::gc_roots::shadow_stack_get(pair + 1))
+        {
             let found = pyre_object::setobject::jit_int_set_has_key(
-                set,
-                pyre_object::listobject::plain_int_w(item),
+                pyre_object::gc_roots::shadow_stack_get(pair),
+                pyre_object::listobject::plain_int_w(pyre_object::gc_roots::shadow_stack_get(
+                    pair + 1,
+                )),
             );
             if found >= 0 {
                 return Ok(found != 0);
             }
         }
         set_lookup_checked(
-            set,
-            item,
+            pyre_object::gc_roots::shadow_stack_get(pair),
+            pyre_object::gc_roots::shadow_stack_get(pair + 1),
             pyre_object::setobject::w_set_contains_key_checked,
         )
     }

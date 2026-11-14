@@ -2831,10 +2831,19 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     let count = repeat_count(n)?;
     // BaseRangeListStrategy.inplace_mul materialises before delegating for
     // every multiplier, including 0 and 1.
-    let list = pyre_object::listobject::w_list_materialize_range(list);
-    if pyre_object::listobject::w_list_sizehint(list).is_some() {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let list = pyre_object::listobject::w_list_materialize_range(
+        pyre_object::gc_roots::shadow_stack_get(list_slot),
+    );
+    pyre_object::gc_roots::shadow_stack_set(list_slot, list);
+    if pyre_object::listobject::w_list_sizehint(pyre_object::gc_roots::shadow_stack_get(list_slot))
+        .is_some()
+    {
         return Ok(());
     }
+    let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
     if count == 0 {
         w_list_clear(list);
         return Ok(());
@@ -2852,7 +2861,10 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // Snapshot the original items so the growing list is not re-read while
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
-    let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
+    let snapshot = w_list_items_copy_as_vec_mode(
+        pyre_object::gc_roots::shadow_stack_get(list_slot),
+        majit_metainterp::jit::we_are_jitted(),
+    );
     // `AbstractUnwrappedStrategy.getitems_copy`: wrap failure stays pending
     // and the snapshot is empty; fetch before treating that as a real empty list.
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
@@ -2863,7 +2875,7 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // kinds a minor collection relocates -- and the snapshot, then address them
     // through their slots.
     let roots = pyre_object::gc_roots::push_roots();
-    let list_slot = roots.publish(&[list]);
+    let list_slot = roots.publish(&[pyre_object::gc_roots::shadow_stack_get(list_slot)]);
     let base = roots.publish(&snapshot);
     roots.normalize(list_slot, 1 + snapshot.len());
     // `list_inplace_repeat_lock_held` sizes the whole result with one

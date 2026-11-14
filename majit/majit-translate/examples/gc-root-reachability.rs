@@ -116,6 +116,18 @@ fn main() {
                 .collect()
         })
         .unwrap_or_default();
+    // Cargo workspace package names (`-` → `_`), from the gate script.
+    // Absent or empty: no callee is external (`GraphAnalyzer.analyze_external_call`
+    // is not applied).
+    let workspace_crates: std::collections::HashSet<String> = std::env::var("GC_WORKSPACE_CRATES")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut donor_llbcs: Vec<majit_charon_reader::Llbc> = Vec::with_capacity(donors.len());
     let donor_graphs: Vec<(String, framework::CallGraph)> = donors
         .iter()
@@ -128,7 +140,7 @@ fn main() {
                 }
             };
             mark(&format!("donor loaded  {path}"));
-            let g = framework::build(&llbc);
+            let g = framework::build_with_workspace_crates(&llbc, &workspace_crates);
             mark(&format!("donor graphed {path}"));
             donor_llbcs.push(llbc);
             (path.clone(), g)
@@ -150,7 +162,7 @@ fn main() {
             }
         };
         mark(&format!("subject loaded  {path}"));
-        let cg = framework::build(&llbc);
+        let cg = framework::build_with_workspace_crates(&llbc, &workspace_crates);
         mark(&format!("subject graphed {path}"));
         let total = cg.names.len();
         println!("== {} ({} fun_decls) ==", llbc.crate_name(), total);

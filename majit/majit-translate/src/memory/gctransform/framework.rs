@@ -449,6 +449,9 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "gc_hook::try_gc_collect",
     "gc_hook::try_gc_collect_step",
     "gc_hook::try_gc_collect_oldgen",
+    // `lloperation.py` `gc_identityhash` `canmallocgc=True` (and `gc_id` the
+    // same). MiniMark's public dispatcher covers both operations.
+    "majit_gc::gc_id_or_identityhash",
 ];
 
 /// Public `majit_gc` dispatchers whose every path, including the installed
@@ -480,8 +483,9 @@ const NONCOLLECTING_GC_OPS: &[&str] = &[
 /// `FnPtrCell` whose production body is installed by
 /// `install_pyre_object_hooks` (plus `register_maybe_finalizer_hook` and
 /// `register_stale_array_holder_hook`), so the trampoline is a one-element
-/// family rather than an unknown fn-pointer. `gc_identity_hash` is omitted:
-/// whether its shadow malloc is a collection is decided separately.
+/// family rather than an unknown fn-pointer. `gc_identity_hash` joins through
+/// its trampoline; collection is the `lloperation.py` `gc_identityhash`
+/// `canmallocgc=True` seed on `gc_id_or_identityhash`.
 pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
     (
         "gc_hook::try_gc_alloc",
@@ -573,6 +577,10 @@ pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
     (
         "gc_hook::try_gc_owns_object",
         &["eval::pyre_object_gc_owns_object_trampoline"],
+    ),
+    (
+        "gc_hook::gc_identity_hash",
+        &["eval::pyre_object_gc_identity_hash_trampoline"],
     ),
     (
         "gc_hook::try_gc_write_barrier",
@@ -1230,8 +1238,23 @@ pub(crate) fn call_graph_flow_is_incomplete(
 /// resolve — marks the caller in [`CallGraph::indirect`] instead of inventing
 /// an edge. A `CallKind::Trait` on a generic body is recovered by
 /// propagating the caller's instantiation; see [`super::instantiate`].
+///
+/// Workspace crates are empty: `GraphAnalyzer.analyze_external_call` is not
+/// applied (every bodiless callee keeps the generic/unresolved path).
 pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
-    super::instantiate::build_call_graph(llbc)
+    build_with_workspace_crates(llbc, &HashSet::new())
+}
+
+/// [`build`] with the cargo workspace crate list (`-` → `_`).
+///
+/// A bodiless callee whose crate is not in this set is
+/// `GraphAnalyzer.analyze_external_call`. An empty set classifies no
+/// callee as external.
+pub fn build_with_workspace_crates(
+    llbc: &majit_charon_reader::Llbc,
+    workspace_crates: &HashSet<String>,
+) -> CallGraph {
+    super::instantiate::build_call_graph(llbc, workspace_crates)
 }
 
 #[cfg(test)]
@@ -2922,6 +2945,564 @@ mod tests {
             cg.indirect.contains(&0),
             "convert into template must stay indirect: {:?}",
             cg.indirect
+        );
+    }
+
+    fn workspace_list(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Caller Regular-calls generic `into` with a `TraitImpl`; `into` Trait-calls
+    /// a Clause that resolves to an Opaque method at `method_path`.
+    fn llbc_blanket_into_opaque(method_path: &[&str]) -> majit_charon_reader::Llbc {
+        llbc_blanket_into_opaque_bound(method_path, true)
+    }
+
+    fn llbc_blanket_into_opaque_bound(
+        method_path: &[&str],
+        bind_impl: bool,
+    ) -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let unstructured = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": blocks
+                }
+            })
+        };
+        let call_term = |func: serde_json::Value, target: u64, on_unwind: u64| {
+            serde_json::json!({
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {"func": func, "args": []}, "dest": place(0),
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }}
+        });
+        let clause_ref = serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}}
+        });
+        let fun = |id: u64, path: &[&str], body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(path),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": body,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_clauses": [{"clause_id": 0}],
+                    "regions_outlive": [],
+                    "types_outlive": [],
+                    "trait_type_constraints": []
+                }
+            })
+        };
+        let into = fun(
+            2,
+            &["core", "convert", "into"],
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Trait": [clause_ref, 0]},
+                        "generics": empty_g.clone()
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ]),
+        );
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(method_path),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": "Opaque"
+        });
+        let callee_ref = if bind_impl { impl_ref } else { clause_ref };
+        let use_concrete = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "use_concrete"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 2},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [callee_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind,
+                ret,
+            ])
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [use_concrete, method, into],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["core", "convert", "From"])
+                }],
+                "trait_impls": [{
+                    "def_id": 0,
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }],
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    },
+                    "implied_trait_refs": []
+                }]
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("blanket-into fixture parses")
+    }
+
+    fn llbc_regular_external(
+        trait_ref: serde_json::Value,
+        with_callback: bool,
+    ) -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let unstructured = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": blocks
+                }
+            })
+        };
+        let call_term = |func: serde_json::Value, target: u64, on_unwind: u64| {
+            serde_json::json!({
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {"func": func, "args": []}, "dest": place(0),
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "caller"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 1},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [trait_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ])
+        });
+        let external = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["core", "external_opaque"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": "Opaque"
+        });
+        let mut fun_decls = vec![caller, external];
+        let mut trait_impls = Vec::new();
+        let mut trait_decls = Vec::new();
+        if with_callback {
+            fun_decls.push(serde_json::json!({
+                "def_id": 2,
+                "item_meta": item_meta(&["fixture", "callback"]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": unstructured(vec![
+                    call_term(
+                        serde_json::json!({"Regular": {
+                            "kind": {"Fun": 3},
+                            "generics": empty_g.clone()
+                        }}),
+                        2,
+                        1,
+                    ),
+                    unwind.clone(),
+                    ret.clone(),
+                ])
+            }));
+            fun_decls.push(serde_json::json!({
+                "def_id": 3,
+                "item_meta": item_meta(&["gc_hook", "try_gc_collect"]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            }));
+            trait_decls.push(serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta(&["fixture", "Hook"])
+            }));
+            trait_impls.push(serde_json::json!({
+                "def_id": 0,
+                "methods": [{
+                    "kind": {"TraitMethod": [0, 0]},
+                    "skip_binder": {"id": 2}
+                }],
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [], "types": [],
+                        "const_generics": [], "trait_refs": []
+                    }
+                },
+                "implied_trait_refs": []
+            }));
+        }
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": fun_decls,
+                "global_decls": [],
+                "trait_decls": trait_decls,
+                "trait_impls": trait_impls
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("regular-external fixture parses")
+    }
+
+    /// Specialized blanket-into: caller → generic fn with Clause → Opaque
+    /// method in a non-workspace crate. The caller does not reach `indirect`.
+    #[test]
+    fn external_callee_without_callbacks_is_a_leaf() {
+        let llbc = llbc_blanket_into_opaque(&["rustpython_wtf8", "from"]);
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        assert!(
+            cg.indirect.contains(&2),
+            "the generic into template stays indirect: {:?}",
+            cg.indirect
+        );
+        let (callee, generics) = first_regular_fun_call(&llbc, 0);
+        let spec = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec, 2, "concrete call must name a specialized node");
+        assert!(
+            !cg.indirect.contains(&spec),
+            "specialized into must not be indirect"
+        );
+        assert!(
+            !cg.indirect.contains(&1),
+            "external leaf must not be unresolved"
+        );
+        let spec_callees = cg.callees.get(&spec).expect("spec callees");
+        assert!(
+            spec_callees.contains(&1),
+            "spec must edge to the opaque method, callees={spec_callees:?}"
+        );
+        let reached = cg.reaching(&cg.indirect);
+        assert!(
+            !reached.contains(&0),
+            "caller must not reach indirect: {reached:?}"
+        );
+    }
+
+    /// External bodiless callee whose trait_ref is a workspace TraitImpl
+    /// whose method reaches a collecting seed.
+    #[test]
+    fn external_callee_with_workspace_impl_callback_reaches_it() {
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }}
+        });
+        let llbc = llbc_regular_external(impl_ref, true);
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        let seeds = cg.collecting_seed_ids();
+        assert!(
+            seeds.contains(&3),
+            "try_gc_collect must be a seed: {seeds:?}"
+        );
+        let reached = cg.reaching(&seeds);
+        assert!(
+            reached.contains(&0),
+            "caller must reach the seed via the workspace callback: {reached:?}"
+        );
+        let caller_callees = cg.callees.get(&0).expect("caller callees");
+        assert!(
+            caller_callees.contains(&1),
+            "caller must edge to the external leaf, callees={caller_callees:?}"
+        );
+        assert!(
+            caller_callees.contains(&2),
+            "caller must edge to the workspace callback, callees={caller_callees:?}"
+        );
+        assert!(
+            !cg.indirect.contains(&0),
+            "resolved external call must not mark the caller indirect"
+        );
+        assert!(
+            !cg.indirect.contains(&1),
+            "external leaf must not be unresolved"
+        );
+    }
+
+    /// Trait call whose ref is still a Clause stays unresolved, as today.
+    /// (A Regular `Fun` to a bodiless decl with a Clause in generics stays a
+    /// leaf and does not mark the caller unresolved — that is today's edge.)
+    #[test]
+    fn external_callee_with_unbound_clause_stays_unresolved() {
+        let llbc = llbc_blanket_into_opaque_bound(&["rustpython_wtf8", "from"], false);
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        assert!(
+            cg.indirect.contains(&2),
+            "generic into with an unbound Clause stays unresolved: {:?}",
+            cg.indirect
+        );
+        let reached = cg.reaching(&cg.indirect);
+        assert!(
+            reached.contains(&0),
+            "caller of the unbound-clause template still reaches unresolved dispatch: {reached:?}"
+        );
+    }
+
+    /// Opaque method in a workspace crate is not external: the specialized
+    /// copy is not built and the generic node stays in `indirect`.
+    #[test]
+    fn bodiless_workspace_callee_stays_unresolved() {
+        let llbc = llbc_blanket_into_opaque(&["fixture", "from"]);
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        assert!(
+            cg.indirect.contains(&2),
+            "generic into stays indirect: {:?}",
+            cg.indirect
+        );
+        let (callee, generics) = first_regular_fun_call(&llbc, 0);
+        let node = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_eq!(
+            node, 2,
+            "workspace Opaque method must keep the generic node"
+        );
+        assert!(
+            cg.reaching(&cg.indirect).contains(&0),
+            "caller must still reach unresolved dispatch"
+        );
+    }
+
+    /// An absent workspace list classifies no callee as external.
+    #[test]
+    fn absent_workspace_list_does_not_classify_external() {
+        let llbc = llbc_blanket_into_opaque(&["rustpython_wtf8", "from"]);
+        let cg = build(&llbc);
+        let (callee, generics) = first_regular_fun_call(&llbc, 0);
+        let node = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_eq!(
+            node, 2,
+            "without a workspace list the Opaque method stays Unresolved"
+        );
+        assert!(
+            cg.reaching(&cg.indirect).contains(&0),
+            "caller must still reach unresolved dispatch"
+        );
+    }
+
+    /// `lloperation.py` `gc_identityhash` `canmallocgc=True`. The MiniMark
+    /// dispatcher is a collecting seed, and the hook wrapper reaches it
+    /// through its trampoline family.
+    #[test]
+    fn identity_hash_dispatcher_is_a_collecting_seed() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["gc_hook", "gc_identity_hash"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [
+                                {"Read": place(0)},
+                                {"regions": []}
+                            ]},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let trampoline = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&[
+                "eval",
+                "pyre_object_gc_identity_hash_trampoline"
+            ]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [local(0)]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": empty_g
+                            }},
+                            "args": []
+                        },
+                        "dest": place(0),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}},
+                    unwind.clone(),
+                    ret.clone()
+                ]
+            }}
+        });
+        let dispatch = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["majit_gc", "gc_id_or_identityhash"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [wrapper, trampoline, dispatch],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("identity-hash fixture parses");
+        let cg = build(&llbc);
+        let seeds = cg.collecting_seed_ids();
+        assert!(
+            seeds.contains(&2),
+            "gc_id_or_identityhash must be a collecting seed: {seeds:?}"
+        );
+        assert!(
+            !cg.indirect.contains(&0),
+            "wrapper family must drop indirect: {:?}",
+            cg.indirect
+        );
+        let reach = cg.reaching(&seeds);
+        assert!(
+            reach.contains(&0),
+            "wrapper must reach the identity-hash seed: {reach:?}"
+        );
+        assert!(
+            reach.contains(&1),
+            "trampoline must reach the identity-hash seed: {reach:?}"
         );
     }
 }

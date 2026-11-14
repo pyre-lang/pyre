@@ -172,19 +172,25 @@ impl WriterRefs {
     }
 
     fn find(&self, obj: PyObjectRef) -> Option<(u32, bool)> {
-        let obj =
-            pyre_object::gc_hook::try_gc_current_object_address(obj as pyre_object::gc_hook::GCREF)
-                as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_hook::try_gc_current_object_address(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot) as pyre_object::gc_hook::GCREF,
+        ) as PyObjectRef;
+        pyre_object::gc_roots::shadow_stack_set(obj_slot, obj);
         let bucket = self
             .by_identity
-            .get(&pyre_object::gc_hook::gc_identity_hash(obj as usize))?;
+            .get(&pyre_object::gc_hook::gc_identity_hash(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot) as usize,
+            ))?;
         bucket
             .iter()
             .copied()
             .find(|&index| {
                 std::ptr::eq(
                     pyre_object::gc_roots::shadow_stack_get(self.entries[index as usize].slot),
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 )
             })
             .map(|index| (index, self.entries[index as usize].incomplete))
@@ -195,9 +201,11 @@ impl WriterRefs {
             return Err(PyError::value_error("too many objects to marshal"));
         }
         let index = self.entries.len() as u32;
-        let identity = pyre_object::gc_hook::gc_identity_hash(obj as usize);
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let identity = pyre_object::gc_hook::gc_identity_hash(
+            pyre_object::gc_roots::shadow_stack_get(slot) as usize,
+        );
         self.entries.push(WriterRefEntry { slot, incomplete });
         self.by_identity.entry(identity).or_default().push(index);
         Ok(index)
@@ -368,6 +376,8 @@ fn write_object(
     // Recursive writes can realize code constants and run the collector. Keep
     // every current object rooted even for marshal versions without a ref
     // table, then reload containers before each child fetch.
+    // Rooted / WriterRefs::reserve pin into the marshal driver's outer
+    // bracket: a nested RootScope here would pop those slots on return.
     let obj_root = Rooted::new(obj);
     // PyPy `marshal_impl._marshal_unicode` asks
     // `ObjSpace.get_interned_str` before `write_ref`.  An AsciiListStrategy
@@ -383,15 +393,15 @@ fn write_object(
         None
     };
     let obj_root = canonical_str_root.unwrap_or(obj_root);
-    let obj = obj_root.get();
 
-    if !is_singleton(obj)
+    if !is_singleton(obj_root.get())
         && let Some(table) = refs.as_ref()
-        && let Some((index, incomplete)) = table.find(obj)
+        && let Some((index, incomplete)) = table.find(obj_root.get())
     {
         // CPython 3.14 `w_ref`: code and slice entries retain the high-bit
         // incomplete marker until `w_complete`, because their immutable
         // representation cannot be reconstructed from a recursive reference.
+        let obj = obj_root.get();
         if incomplete {
             return Err(PyError::value_error(format!(
                 "cannot marshal recursion {} objects",
@@ -404,14 +414,20 @@ fn write_object(
     }
 
     let type_pos = out.len();
-    let use_ref = refs.is_some() && !is_singleton(obj);
+    let use_ref = refs.is_some() && !is_singleton(obj_root.get());
     // `w_ref` marks code, slice, and frozendict incomplete and clears that
     // marker in `w_complete` after their contents are written: the reader
     // rebuilds them from their fields.
-    let requires_completion =
-        unsafe { crate::pycode::is_code(obj) || is_slice(obj) || is_frozendict(obj) };
+    let requires_completion = {
+        let obj = obj_root.get();
+        unsafe { crate::pycode::is_code(obj) || is_slice(obj) || is_frozendict(obj) }
+    };
     let ref_index = if use_ref {
-        Some(refs.as_mut().unwrap().reserve(obj, requires_completion)?)
+        Some(
+            refs.as_mut()
+                .unwrap()
+                .reserve(obj_root.get(), requires_completion)?,
+        )
     } else {
         None
     };
@@ -482,7 +498,7 @@ fn write_object(
                 );
             }
             out.write_slice(value);
-        } else if let Some(value) = marshal_buffer_bytes(obj)? {
+        } else if let Some(value) = marshal_buffer_bytes(obj_root.get())? {
             out.write_u8(b's');
             out.write_u32(
                 value
@@ -491,106 +507,110 @@ fn write_object(
                     .map_err(|_| PyError::value_error("object too large to marshal"))?,
             );
             out.write_slice(&value);
-        } else if !is_heap_type && is_tuple(obj) {
-            let len = w_tuple_len(obj);
-            out.write_u8(if version >= 4 && len < 256 {
-                b')'
-            } else {
-                b'('
-            });
-            if version >= 4 && len < 256 {
-                out.write_u8(len as u8);
-            } else {
+        } else {
+            let obj = obj_root.get();
+            if !is_heap_type && is_tuple(obj) {
+                let len = w_tuple_len(obj);
+                out.write_u8(if version >= 4 && len < 256 {
+                    b')'
+                } else {
+                    b'('
+                });
+                if version >= 4 && len < 256 {
+                    out.write_u8(len as u8);
+                } else {
+                    out.write_u32(
+                        len.try_into()
+                            .map_err(|_| PyError::value_error("object too large to marshal"))?,
+                    );
+                }
+                for index in 0..len {
+                    let item = w_tuple_getitem(obj_root.get(), index as i64)
+                        .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
+                    write_object(out, item, refs, version, depth - 1)?;
+                }
+            } else if !is_heap_type && is_list(obj) {
+                // PyPy marshal_list snapshots `w_list.getitems()[:]` before
+                // writing. Besides insulating traversal from mutation, this
+                // preserves AbstractUnwrappedStrategy.getitems_copy's wrapper
+                // reuse for consecutive identical unboxed storage entries.
+                // Rooted uses the marshal call's outer root bracket. A nested
+                // RootScope here would discard WriterRefs' longer-lived slots
+                // when it dropped after recursive writes.
+                let snapshot: Vec<_> = w_list_items_copy_as_vec(obj_root.get())
+                    .into_iter()
+                    .map(Rooted::new)
+                    .collect();
+                let len = snapshot.len();
+                out.write_u8(b'[');
                 out.write_u32(
                     len.try_into()
                         .map_err(|_| PyError::value_error("object too large to marshal"))?,
                 );
-            }
-            for index in 0..len {
-                let item = w_tuple_getitem(obj_root.get(), index as i64)
-                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
-                write_object(out, item, refs, version, depth - 1)?;
-            }
-        } else if !is_heap_type && is_list(obj) {
-            // PyPy marshal_list snapshots `w_list.getitems()[:]` before
-            // writing. Besides insulating traversal from mutation, this
-            // preserves AbstractUnwrappedStrategy.getitems_copy's wrapper
-            // reuse for consecutive identical unboxed storage entries.
-            // Rooted uses the marshal call's outer root bracket. A nested
-            // RootScope here would discard WriterRefs' longer-lived slots
-            // when it dropped after recursive writes.
-            let snapshot: Vec<_> = w_list_items_copy_as_vec(obj_root.get())
-                .into_iter()
-                .map(Rooted::new)
-                .collect();
-            let len = snapshot.len();
-            out.write_u8(b'[');
-            out.write_u32(
-                len.try_into()
-                    .map_err(|_| PyError::value_error("object too large to marshal"))?,
-            );
-            for item in snapshot {
-                write_object(out, item.get(), refs, version, depth - 1)?;
-            }
-        } else if !is_heap_type && (is_dict(obj) || is_frozendict(obj)) {
-            let frozen = is_frozendict(obj);
-            if frozen && version < 6 {
-                return Err(PyError::value_error("unmarshallable object"));
-            }
-            out.write_u8(if frozen { b'}' } else { b'{' });
-            let len = dictmultiobject::w_dict_len(obj);
-            // A slot walk, not a positional one: a deleted entry leaves a
-            // tombstone `_ll_dictnext` steps over.
-            let mut cursor = 0;
-            for _ in 0..len {
-                let (slot, key, value) = dictmultiobject::w_dict_next_item(obj_root.get(), cursor)
-                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
-                cursor = slot + 1;
-                let key_root = Rooted::new(key);
-                let value_root = Rooted::new(value);
-                write_object(out, key_root.get(), refs, version, depth - 1)?;
-                write_object(out, value_root.get(), refs, version, depth - 1)?;
-            }
-            out.write_u8(b'0');
-        } else if !is_heap_type && setobject::is_set_or_frozenset(obj) {
-            out.write_u8(if setobject::is_frozenset(obj) {
-                b'>'
+                for item in snapshot {
+                    write_object(out, item.get(), refs, version, depth - 1)?;
+                }
+            } else if !is_heap_type && (is_dict(obj) || is_frozendict(obj)) {
+                let frozen = is_frozendict(obj);
+                if frozen && version < 6 {
+                    return Err(PyError::value_error("unmarshallable object"));
+                }
+                out.write_u8(if frozen { b'}' } else { b'{' });
+                let len = dictmultiobject::w_dict_len(obj);
+                // A slot walk, not a positional one: a deleted entry leaves a
+                // tombstone `_ll_dictnext` steps over.
+                let mut cursor = 0;
+                for _ in 0..len {
+                    let (slot, key, value) =
+                        dictmultiobject::w_dict_next_item(obj_root.get(), cursor)
+                            .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
+                    cursor = slot + 1;
+                    let key_root = Rooted::new(key);
+                    let value_root = Rooted::new(value);
+                    write_object(out, key_root.get(), refs, version, depth - 1)?;
+                    write_object(out, value_root.get(), refs, version, depth - 1)?;
+                }
+                out.write_u8(b'0');
+            } else if !is_heap_type && setobject::is_set_or_frozenset(obj) {
+                out.write_u8(if setobject::is_frozenset(obj) {
+                    b'>'
+                } else {
+                    b'<'
+                });
+                let len = setobject::w_set_len(obj);
+                write_len(out, len)?;
+                // A slot walk, as the dict arm above: `set_remove_slot` tombstones
+                // the slot it empties, so `len` counts the elements but does not
+                // bound their slot numbers.
+                let mut cursor = 0;
+                for _ in 0..len {
+                    let slot = setobject::w_set_next_slot(obj_root.get(), cursor)
+                        .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
+                    let item = setobject::w_set_key_at(obj_root.get(), slot)
+                        .ok_or_else(|| PyError::value_error("unmarshallable object"))?
+                        .obj;
+                    cursor = slot + 1;
+                    let item_root = Rooted::new(item);
+                    write_object(out, item_root.get(), refs, version, depth - 1)?;
+                }
+            } else if !is_heap_type && crate::pycode::is_code(obj) {
+                let ptr = crate::pycode::w_code_get_ptr(obj_root.get());
+                if ptr.is_null() {
+                    return Err(PyError::value_error("unmarshallable object"));
+                }
+                out.write_u8(b'c');
+                write_code(out, obj_root.get(), refs, version, depth)?;
+            } else if !is_heap_type && is_slice(obj) && version >= 5 {
+                out.write_u8(b':');
+                let start = Rooted::new(sliceobject::w_slice_get_start(obj_root.get()));
+                let stop = Rooted::new(sliceobject::w_slice_get_stop(obj_root.get()));
+                let step = Rooted::new(sliceobject::w_slice_get_step(obj_root.get()));
+                write_object(out, start.get(), refs, version, depth - 1)?;
+                write_object(out, stop.get(), refs, version, depth - 1)?;
+                write_object(out, step.get(), refs, version, depth - 1)?;
             } else {
-                b'<'
-            });
-            let len = setobject::w_set_len(obj);
-            write_len(out, len)?;
-            // A slot walk, as the dict arm above: `set_remove_slot` tombstones
-            // the slot it empties, so `len` counts the elements but does not
-            // bound their slot numbers.
-            let mut cursor = 0;
-            for _ in 0..len {
-                let slot = setobject::w_set_next_slot(obj_root.get(), cursor)
-                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
-                let item = setobject::w_set_key_at(obj_root.get(), slot)
-                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?
-                    .obj;
-                cursor = slot + 1;
-                let item_root = Rooted::new(item);
-                write_object(out, item_root.get(), refs, version, depth - 1)?;
-            }
-        } else if !is_heap_type && crate::pycode::is_code(obj) {
-            let ptr = crate::pycode::w_code_get_ptr(obj_root.get());
-            if ptr.is_null() {
                 return Err(PyError::value_error("unmarshallable object"));
             }
-            out.write_u8(b'c');
-            write_code(out, obj_root.get(), refs, version, depth)?;
-        } else if !is_heap_type && is_slice(obj) && version >= 5 {
-            out.write_u8(b':');
-            let start = Rooted::new(sliceobject::w_slice_get_start(obj_root.get()));
-            let stop = Rooted::new(sliceobject::w_slice_get_stop(obj_root.get()));
-            let step = Rooted::new(sliceobject::w_slice_get_step(obj_root.get()));
-            write_object(out, start.get(), refs, version, depth - 1)?;
-            write_object(out, stop.get(), refs, version, depth - 1)?;
-            write_object(out, step.get(), refs, version, depth - 1)?;
-        } else {
-            return Err(PyError::value_error("unmarshallable object"));
         }
     }
 
@@ -1298,14 +1318,21 @@ fn marshal_to_bytes(
     version: i32,
     allow_code: bool,
 ) -> Result<Vec<u8>, PyError> {
-    if !allow_code {
-        reject_code(value)?;
-    }
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    if !allow_code {
+        reject_code(pyre_object::gc_roots::shadow_stack_get(value_slot))?;
+    }
     let mut out = Vec::new();
     let mut refs = (version >= 3).then(WriterRefs::new);
-    write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;
+    write_object(
+        &mut out,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+        &mut refs,
+        version,
+        MAX_DEPTH,
+    )?;
     Ok(out)
 }
 
@@ -1399,7 +1426,12 @@ fn contains_code(obj: PyObjectRef, seen: &mut Vec<PyObjectRef>) -> bool {
         } else if is_dict(obj) || is_frozendict(obj) {
             dictmultiobject::w_dict_items(obj)
                 .into_iter()
-                .any(|(key, value)| contains_code(key, seen) || contains_code(value, seen))
+                .any(|(key, value)| {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let pair = pyre_object::gc_roots::pin_roots(&[key, value]);
+                    contains_code(pyre_object::gc_roots::shadow_stack_get(pair), seen)
+                        || contains_code(pyre_object::gc_roots::shadow_stack_get(pair + 1), seen)
+                })
         } else {
             setobject::w_set_items(obj)
                 .into_iter()
