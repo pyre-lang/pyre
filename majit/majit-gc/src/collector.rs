@@ -2066,12 +2066,14 @@ impl MiniMarkGC {
         self.pending_reserving_size = total_size;
         self.do_collect_nursery();
         self.pending_reserving_size = 0;
-        // incminimark.py:2603-2615 — a bounded major collection that leaves
-        // the heap over `max_heap_size` asks this allocation to fail so the
-        // caller raises MemoryError: NULL propagates to the compiled-code
-        // `CHECK_MEMORY_ERROR` path. Never taken in the unbounded default
-        // (`PYPY_GC_MAX` unset), so the fallback below is unchanged there.
+        // incminimark.py `major_collection_step` — a bounded major collection
+        // that leaves the heap over `max_heap_size` asks this allocation to
+        // fail so the caller raises MemoryError. `transform.py`
+        // `_ll_malloc_fixedsize` stores that exception in `exc_data` before
+        // returning NULL; the compiled `CHECK_MEMORY_ERROR` path is the same
+        // store. Never taken in the unbounded default (`PYPY_GC_MAX` unset).
         if std::mem::take(&mut self.oom_pending) {
+            crate::raise_memory_error_if_installed();
             return GcRef(0);
         }
         let ptr = self.nursery.alloc(total_size);
@@ -2365,6 +2367,7 @@ impl MiniMarkGC {
         self.do_collect_nursery();
         self.pending_reserving_size = 0;
         if std::mem::take(&mut self.oom_pending) {
+            crate::raise_memory_error_if_installed();
             for i in (0..root_count).rev() {
                 self.roots.remove(unsafe { roots.add(i) });
             }
@@ -9380,18 +9383,26 @@ impl MiniMarkGC {
         //     which is what upstream's raise does for whichever thread ran the
         //     collection.
         //
-        // Both channels clear as they deliver, so an armed one is the whole
-        // test in either case.
+        // The eval-breaker bit, `oom_pending`, and `rpyexc_occurred` each
+        // clear as they deliver, so an armed one is the whole test.
         if bounded && self.threshold_reached(reserving_size) {
-            if self.oom_pending || majit_ir::eval_breaker_word::memory_error_owed_here() {
+            if self.oom_pending
+                || majit_ir::eval_breaker_word::memory_error_owed_here()
+                || crate::gc_alloc_failed_pending()
+            {
                 // Upstream raises again here, and never reaches the collect-step
                 // hook; this return stands for that raise, so suppress it too.
+                // Nursery stores MemoryError in `exc_data` when it takes
+                // `oom_pending` (`_ll_malloc_fixedsize`); `rpyexc_occurred`
+                // is that store, the same "still owed" window as the
+                // eval-breaker bit.
                 self.oom_signalled_this_step = true;
                 self.gc_state = GcState::Scanning;
                 return;
             }
             if self.max_heap_size_already_raised
                 && !majit_ir::eval_breaker_word::memory_error_armed()
+                && !crate::gc_alloc_failed_pending()
             {
                 out_of_memory("using too much memory, aborting");
             }
@@ -13877,6 +13888,70 @@ mod tests {
             gc.finish_incremental_cycle();
         }));
         assert!(second.is_err(), "second bounded breach aborts the process");
+    }
+
+    /// Nursery NULL stores MemoryError in `exc_data` (`_ll_malloc_fixedsize`)
+    /// before the interpreter converts that NULL. A collection in that
+    /// window is the same arrival as the eval-breaker one above, not the
+    /// fatal rung — otherwise the traceback printer's own allocation
+    /// aborts before `MemoryError` is written.
+    #[test]
+    fn a_pending_rpyexc_memory_error_is_not_a_second_arrival() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
+        static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        struct RestoreHooks;
+        impl Drop for RestoreHooks {
+            fn drop(&mut self) {
+                crate::set_active_raise_memory_error(None);
+                crate::set_active_exception_occurred(None);
+                PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _hooks = RestoreHooks;
+        crate::set_active_raise_memory_error(Some(raise));
+        crate::set_active_exception_occurred(Some(occurred));
+
+        let mut gc = test_gc(4096);
+        gc.max_heap_size = 1.0;
+        gc.pending_reserving_size = 4096;
+        majit_ir::eval_breaker_word::take_memory_error();
+        PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert!(gc.max_heap_size_already_raised);
+        assert!(std::mem::take(&mut gc.oom_pending));
+        crate::raise_memory_error_if_installed();
+        assert!(
+            crate::gc_alloc_failed_pending(),
+            "taking oom_pending stores MemoryError in exc_data"
+        );
+
+        gc.pending_reserving_size = 4096;
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert_eq!(
+            gc.gc_state,
+            GcState::Scanning,
+            "a collection while rpyexc_occurred is the same arrival"
+        );
+
+        PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        gc.gc_state = GcState::Sweeping;
+        let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.finish_incremental_cycle();
+        }));
+        assert!(
+            third.is_err(),
+            "a breach after delivery takes the fatal rung"
+        );
+        majit_ir::eval_breaker_word::take_memory_error();
     }
 
     /// A breach that lands while the previous `MemoryError` is still owed is

@@ -2455,8 +2455,8 @@ impl ExecutionContext {
                 }
                 // executioncontext.py — `frame = jit.hint(frame,
                 // access_directly=False)`: from here on, frame is just a
-                // normal w_object.
-                let frame = majit_metainterp::jit::hint_no_access_directly(frame);
+                // normal w_object. `pin_root` of the callback is a safepoint,
+                // so the hint is applied to the live pointer at wrap time.
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
                 let _trace_roots = pyre_object::gc_roots::push_roots();
                 let callback_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2464,7 +2464,9 @@ impl ExecutionContext {
                     callback_live_slot,
                 ));
                 let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame_anchor.live()));
+                let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(
+                    majit_metainterp::jit::hint_no_access_directly(frame_anchor.live()),
+                ));
                 let event_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(event));
                 let arg_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2577,13 +2579,13 @@ impl ExecutionContext {
             self.is_tracing += 1;
             // executioncontext.py:420-425 self.profilefunc(...), clearing
             // profile slots on exceptions.
-            let profile_result = profilefunc(
-                space,
-                self.w_profilefuncarg,
-                frame_anchor.live(),
-                event,
-                w_arg,
-            );
+            // `_trace` rebinds `frame = jit.hint(frame, access_directly=False)` in
+            // the tracing arm; `SomeInstance.union` at the join drops the flag, so
+            // `self.profilefunc` receives a plain frame and `default_specialize`
+            // makes no AccessDirect copy of the family. The tracing arm's rebinding
+            // is closure-scoped here, so the profile arm strips the flag itself.
+            let frame = majit_metainterp::jit::hint_no_access_directly(frame_anchor.live());
+            let profile_result = profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
             if let Err(err) = profile_result {
                 // executioncontext.py:421-425 — clear profile slots and
                 // re-raise so the caller observes the failure (matches

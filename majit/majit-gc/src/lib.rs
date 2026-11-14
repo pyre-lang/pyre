@@ -3245,6 +3245,16 @@ pub fn raise_memory_error() {
     }
 }
 
+/// Store MemoryError when a nursery NULL is the max-heap rung
+/// (`transform.py` `_ll_malloc_fixedsize` writes `exc_data` then
+/// returns NULL). Collector unit tests have no backend hook; skip
+/// rather than `debug.py fatalerror`.
+pub(crate) fn raise_memory_error_if_installed() {
+    if ACTIVE_RAISE_MEMORY_ERROR.get().is_some() {
+        raise_memory_error();
+    }
+}
+
 /// Whether a MemoryError is pending (`exceptiontransform.py rpyexc_occurred`).
 ///
 /// RPython `_ll_malloc_fixedsize` raises MemoryError, which translation

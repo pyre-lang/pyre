@@ -2008,12 +2008,11 @@ impl<'a> Lowering<'a> {
         option_ty: &TyRef,
     ) -> Option<crate::model::NicheIntNull> {
         if self.option_niche_is_int_bank(option_ty) {
-            // `executioncontext.py` `profilefunc`: `None` is `s_None`, not
-            // `lltype.nullptr(FuncType)`. A null_fn `SomePtr` cannot union
-            // with the field's `SomePBC`.
-            if tyref_is_profilefunc_family(option_ty, self.llbc) {
-                return None;
-            }
+            // `Option<fn>` None is spelled `null_fn` (`fn_null_constant`).
+            // A spelling annotates `s_None` so a can_be_None PBC
+            // (`executioncontext.py` `profilefunc`) noneifies; untyped
+            // `ptr::null_fn()` stays `SomePtr`. `rnone.py` `rtype_is_None`
+            // of the Ptr is `ptr_iszero`.
             if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
                 || tyref_node(option_ty, self.llbc)
                     .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
@@ -3661,11 +3660,6 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|payload| tyref_is_raw_c_void_ptr(&payload, self.llbc))
         {
             return emit_voidp_nullptr(&mut self.graph, bb_id);
-        }
-        // `executioncontext.py` `profilefunc`: `None` is `Constant(None)`
-        // (`s_None`), not `null_fn` / `null_mut`.
-        if tyref_is_profilefunc_family(option_ty, self.llbc) {
-            return self.graph.push_const_none(bb_id);
         }
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own
