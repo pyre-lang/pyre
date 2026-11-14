@@ -733,6 +733,37 @@ fn main() {
             found.len(),
             by_fn.len()
         );
+        // Same resolved scan as above, with host `alloc_nursery_typed` /
+        // `alloc_oldgen_typed` treated as collecting. Those twins do not
+        // collect today; this line is the "if host malloc collected"
+        // measurement. `CollectAnalyzer.analyze_simple_operation` answers
+        // True for `malloc` flavor gc.
+        let mut host_malloc_seeds = joined_seeds.clone();
+        host_malloc_seeds.extend(joined.graph.fixedsize_gc_malloc_ids());
+        let host_malloc_reach = joined.project(0, &joined.graph.reaching(&host_malloc_seeds));
+        let host_malloc_t0 = std::time::Instant::now();
+        let (found_host_malloc, _) = liveness::scan(
+            &llbc,
+            &cg,
+            &host_malloc_reach,
+            &push_root_ids,
+            &gc_tys,
+            &movable_callees,
+            &donor_pairs,
+        );
+        mark(&format!(
+            "scan if host malloc collected (gc locals) in {:.3}s",
+            host_malloc_t0.elapsed().as_secs_f64()
+        ));
+        let host_malloc_fns: std::collections::BTreeSet<&str> = found_host_malloc
+            .iter()
+            .map(|f| f.func_name.as_str())
+            .collect();
+        println!(
+            "   unbracketed calls if host malloc collected: {} in {} fn(s)",
+            found_host_malloc.len(),
+            host_malloc_fns.len()
+        );
         println!(
             "       counting unresolved dispatch as collecting too: {} in {} fn(s)",
             found_conservative.len(),

@@ -654,6 +654,16 @@ fn name_is_varsize_malloc_helper(name: &str) -> bool {
     name_last_segment(name) == "malloc_varsize_clear"
 }
 
+/// Host `incminimark.malloc_fixedsize` twins. Exact last-segment match so
+/// `alloc_nursery_collecting_typed` and `alloc_nursery_typed_with_placement`
+/// stay out. Specs keep the `#…` suffix; last-segment match covers both.
+fn name_is_fixedsize_gc_malloc(name: &str) -> bool {
+    matches!(
+        name_last_segment(name),
+        "alloc_nursery_typed" | "alloc_oldgen_typed"
+    )
+}
+
 /// Host calls that leave the collector's RUNNING census.
 ///
 /// `gc_sync::before_external_block` drops the GIL and that census, so another
@@ -770,6 +780,18 @@ impl CallGraph {
             }
         }
         ids
+    }
+
+    /// Host `alloc_nursery_typed` / `alloc_oldgen_typed` node ids (template
+    /// and `#…` specs). `CollectAnalyzer.analyze_simple_operation` answers
+    /// True for `malloc` flavor gc; the host twins do not collect today.
+    /// Used only by the "if host malloc collected" measurement.
+    pub fn fixedsize_gc_malloc_ids(&self) -> HashSet<u64> {
+        self.names
+            .iter()
+            .filter(|(_, name)| name_is_fixedsize_gc_malloc(name))
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// `GraphAnalyzer.analyze_indirect_call` over a hook wrapper's closed
@@ -2870,6 +2892,85 @@ mod tests {
         assert!(
             seeds.contains(&1),
             "spec node must be a collecting seed: {seeds:?}"
+        );
+    }
+
+    /// Host `alloc_nursery_typed` / `alloc_oldgen_typed` (template and `#…`
+    /// spec) are the "if host malloc collected" measurement set, not
+    /// [`collecting_seed_ids`]. `alloc_nursery_collecting_typed` is the
+    /// reverse.
+    #[test]
+    fn fixedsize_gc_malloc_ids_are_not_collecting_seeds() {
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let opaque = |def_id: u64, path: &[&str]| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [
+                    opaque(0, &["majit_gc", "alloc_nursery_typed"]),
+                    opaque(1, &["majit_gc", "alloc_oldgen_typed"]),
+                    opaque(2, &["majit_gc", "alloc_nursery_collecting_typed"]),
+                    opaque(3, &[
+                        "majit_gc",
+                        "alloc_nursery_typed#0=GcType<WIntObject>"
+                    ]),
+                    opaque(4, &["majit_gc", "alloc_nursery_typed_with_placement"]),
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("fixedsize-malloc fixture parses");
+        let cg = build(&llbc);
+        let host = cg.fixedsize_gc_malloc_ids();
+        let collecting = cg.collecting_seed_ids();
+        assert!(
+            host.contains(&0),
+            "nursery template must be a host-malloc id: {host:?}"
+        );
+        assert!(
+            host.contains(&1),
+            "oldgen template must be a host-malloc id: {host:?}"
+        );
+        assert!(
+            host.contains(&3),
+            "nursery spec must be a host-malloc id: {host:?}"
+        );
+        assert!(
+            !host.contains(&2),
+            "collecting twin must stay out of host-malloc ids: {host:?}"
+        );
+        assert!(
+            !host.contains(&4),
+            "with_placement must stay out of host-malloc ids: {host:?}"
+        );
+        assert!(
+            !collecting.contains(&0),
+            "nursery template must not be a collecting seed: {collecting:?}"
+        );
+        assert!(
+            !collecting.contains(&1),
+            "oldgen template must not be a collecting seed: {collecting:?}"
+        );
+        assert!(
+            !collecting.contains(&3),
+            "nursery spec must not be a collecting seed: {collecting:?}"
+        );
+        assert!(
+            collecting.contains(&2),
+            "collecting twin must remain a collecting seed: {collecting:?}"
         );
     }
 

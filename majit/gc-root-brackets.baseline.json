@@ -16,6 +16,8 @@
     "tier1_calls_fns": 0,
     "unbracketed_calls": 0,
     "unbracketed_calls_fns": 0,
+    "unbracketed_if_host_malloc_collects": 2446,
+    "unbracketed_if_host_malloc_collects_fns": 1437,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
@@ -42,6 +44,8 @@
     "tier1_calls_fns": 0,
     "unbracketed_calls": 0,
     "unbracketed_calls_fns": 0,
+    "unbracketed_if_host_malloc_collects": 2445,
+    "unbracketed_if_host_malloc_collects_fns": 1437,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
