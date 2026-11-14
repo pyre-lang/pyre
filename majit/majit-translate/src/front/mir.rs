@@ -3897,9 +3897,10 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            fun_decl_is_dont_look_inside(self.llbc, fd, &self.state.dont_look_inside),
         );
-        let len_shadow = pair_len_shadows_of(&locals, self.llbc, &[], &[], &[], &[]);
+        let len_shadow =
+            pair_len_shadows_of(&graph.name, &locals, self.llbc, &[], &[], &[], &[], &[]);
         rewrite_exception_transformed_input_ops(
             &mut graph,
             &locals,
@@ -4182,7 +4183,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
-            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            fun_decl_is_dont_look_inside(self.llbc, fd, &self.state.dont_look_inside),
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -9489,19 +9490,19 @@ pub(crate) use self::lltype::{
     charon_array_len_to_string, charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
-    fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
+    fixed_array_lowers_to_gcarray, fixed_list_reader, fnptr_indirect_enabled,
+    gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
     host_rthread_threadlocalref_llop, impl_method_owner_for_fundecl, impl_owner_from_item_meta,
     is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
     is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
     is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
-    fixed_array_lowers_to_gcarray, fixed_list_reader, resolve_trait_assoc_type,
-    type_decl_adt_tyref, tyref_nullable_str_enum, tyref_to_value_type,
+    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling,
+    resolve_trait_assoc_type, same_nominal_adt, seed_program_exception_class_hints,
+    stamp_fn_ptr_spelling, strip_crate_prefix, struct_item_flexible_gcarray_block_annotation,
+    type_decl_adt_tyref, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
+    tyref_is_fat_dyn, tyref_nullable_str_enum, tyref_to_value_type, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

@@ -2528,6 +2528,7 @@ pub extern "C" fn jit_get_iter(iterable: PyObjectRef) -> PyObjectRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PyExecutionContext;
     use crate::alloc_execution_context;
     use pyre_object::{w_int_get_value, w_int_new};
 

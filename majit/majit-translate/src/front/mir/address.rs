@@ -1774,7 +1774,7 @@ impl<'a> Lowering<'a> {
         // Regular callees keep the classed-instance Ref bank. Only a
         // residual ABI (dont_look_inside / no body) passes a raw
         // multi-word value as an address integer.
-        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+        if !fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
             return;
         }
         let bb_id = self.block_id[mir_bb];
@@ -2120,7 +2120,7 @@ impl<'a> Lowering<'a> {
             // The stash rule for an opaque helper is `uninspectable` plus
             // a cell that does not outlive the call, not that walk.
             let verdict = match self.llbc.fn_by_id(fun_id) {
-                Some(fd) if fun_decl_is_dont_look_inside(fd, self.dont_look_inside) => {
+                Some(fd) if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) => {
                     SpillAddressVerdict {
                         returned: false,
                         leaked: false,

@@ -4316,7 +4316,13 @@ impl<'a> Lowering<'a> {
                         // Dest is a pointer to the inlined item STRUCT, whose
                         // declared kind is Raw; the header's `GcType` is what
                         // makes this `direct_arrayitems`, not dest paint.
-                        let res = self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+                        let res = self.emit_array_tail_item_ptr(
+                            bb_id,
+                            base,
+                            offset,
+                            &root,
+                            &call.dest.ty,
+                        );
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if dest_is_ref
                         && let Some((base, offset)) =
@@ -8048,8 +8054,6 @@ impl<'a> Lowering<'a> {
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 let profilefunc_graphs = profilefunc_graphs_for_call(self.llbc, &dyn_operand);
                 let const_fn_id = operand_fundef(self.llbc, &dyn_operand);
-                let closed_fnptr_graphs =
-                    closed_fnptr_graphs_for(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -8164,23 +8168,6 @@ impl<'a> Lowering<'a> {
                             struct_path,
                             field_name,
                         )),
-                        result_ty,
-                    }
-                } else if let Some(graphs) = closed_fnptr_graphs {
-                    // `FunctionsPBCRepr` / `SmallFunctionSetPBCRepr`:
-                    // the funcptr was loaded from a field of a type that
-                    // only exists as immutable statics, so the family is
-                    // the FnDefs those initializers stored.
-                    // `handle_regular_indirect_call` records them as
-                    // `indirectcalltargets`; `pyjitpl.py
-                    // do_residual_or_indirect_call` inlines a Const
-                    // funcbox via `bytecode_for_address`.
-                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
-                    OpKind::IndirectCall {
-                        funcptr,
-                        args,
-                        graphs: Some(graphs),
-                        family_key: None,
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {

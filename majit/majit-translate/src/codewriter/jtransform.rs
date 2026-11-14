@@ -2970,14 +2970,6 @@ fn inline_struct_field_offset(
     Some(row.offset)
 }
 
-/// `cpu.fielddescrof(STRUCT, quasiimmut.get_mutate_field_name(name))`.
-/// Same STRUCT object as `field` (`descr.py get_field_descr`).
-fn mutate_field_descr(field: &FieldDescriptor) -> FieldDescriptor {
-    FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
-        .with_owner_id(field.owner_id)
-        .with_owner_declared_gc(field.owner_declared_gc)
-}
-
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
 /// one such edge is not this word on the other edge, so it stays a phi.
 ///
@@ -4357,7 +4349,9 @@ impl<'a> Transformer<'a> {
         // applied after rewrite. Resolve the same handle `hook_access_field`
         // keys flags on.
         let renamed_base = resolve_alias(renamed_base, &self.aliases);
-        let mutate_field = mutate_field_descr(field);
+        let mutate_field =
+            FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
+                .with_owner_id(field.owner_id);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!(
@@ -49098,6 +49092,7 @@ mod tests {
                         "int_ll_newlist".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(std::iter::once(count.clone())),
@@ -49149,6 +49144,7 @@ mod tests {
                         "float_ll_newlist".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(std::iter::once(count.clone())),

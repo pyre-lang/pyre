@@ -67,14 +67,8 @@
 
 mod common;
 
-use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, load_llbc_if_present,
-    lower_named,
-};
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named, rlib_llbc};
 use majit_charon_reader::{FunDecl, Llbc};
-use majit_translate::codewriter::call::CallControl;
-use majit_translate::codewriter::codewriter::CodeWriter;
-use majit_translate::codewriter::jitcode::JitCode;
 use majit_translate::front::mir::build_semantic_program_from_llbc;
 use majit_translate::{
     CallPath, ErrorCarrierSpec, HostStaticAddrs,
@@ -899,9 +893,7 @@ fn copy_string_to_raw_residual_keeps_gc_src_and_ccharp_dst() {
     // `copy_raw_to_string` `@jit.dont_look_inside`): GC string + raw
     // `CCHARP`. `jtransform.py rewrite_op_cast_ptr_to_adr` rejects a GC
     // source, so the Address conversion stays inside the residual.
-    let Some(llbc) = load_llbc_if_present(RLIB_LLBC) else {
-        return;
-    };
+    let llbc = rlib_llbc();
     let copy = lower_named(llbc, "copy_string_to_raw").expect("lower copy_string_to_raw");
     let tys = residual_input_types(&copy);
     assert_eq!(tys.len(), 3, "copy_string_to_raw takes src, dst, length");

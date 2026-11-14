@@ -1410,7 +1410,7 @@ fn install_semantic_layouts(callcontrol: &mut CallControl, program: &SemanticPro
     }
 }
 
-/// `code.names[idx].as_ref()` is a borrow of a by-value String item
+/// `code.names[idx].as_str()` is a borrow of a by-value String item
 /// in the host `Box<[String]>` FatData region. The Index is a raw
 /// `nolength` ArrayRead of the item address; jtransform rewrites it
 /// as `getarraysubstruct` (`int_mul` 24 + `int_add`, kind `'i'`).
@@ -1425,24 +1425,14 @@ fn execute_store_name_names_index_is_raw_item_address() {
             ..Default::default()
         },
         &["pyopcode", "eval", "pyframe", "pycode"],
-        &[
-            "execute_store_name",
-            "opcode_store_name",
-            "store_name_value",
-            "store_name",
-            "get_w_locals",
-            "getdebug_data",
-            "get_or_create_w_locals",
-            "w_code_getname_w_or_new",
-            "w_code_getname_w",
-        ],
+        &["load_name_from_code"],
     )
-    .expect("lower execute_store_name");
+    .expect("lower load_name_from_code");
     let function = program
         .functions
         .iter()
-        .find(|f| f.name == "execute_store_name")
-        .expect("execute_store_name graph");
+        .find(|f| f.name == "load_name_from_code")
+        .expect("load_name_from_code graph");
 
     let array_dump: Vec<String> = function
         .graph()
@@ -1495,7 +1485,7 @@ fn execute_store_name_names_index_is_raw_item_address() {
     }
     assert!(
         saw_names,
-        "execute_store_name must ArrayRead Vec<String>. dump={array_dump:?}"
+        "load_name_from_code must ArrayRead Vec<String>. dump={array_dump:?}"
     );
 
     let saw_fat_len = function.graph().blocks.iter().any(|block| {

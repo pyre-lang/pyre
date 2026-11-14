@@ -7672,12 +7672,15 @@ fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
 fn positional_tuple_field_rows_take_kind_from_dest_ty() {
     let llbc = llbc_with_trait_impls(serde_json::json!([]));
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
-    let pair = TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {"types": [i64_ty.clone(), i64_ty]}
-        }
-    }));
+    let pair = TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [i64_ty.clone(), i64_ty]}
+            }
+        })
+        .into(),
+    );
     let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
     assert_eq!(
         rows.iter()
@@ -7708,12 +7711,15 @@ fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
     let items = serde_json::json!({"Adt": {"id": 1, "generics": {"types": []}}});
     let raw_items = serde_json::json!({"RawPtr": [items, "Mut"]});
     let raw_slot = serde_json::json!({"RawPtr": [raw_items, "Mut"]});
-    let pair = TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {"types": [raw_usize.clone(), raw_slot.clone()]}
-        }
-    }));
+    let pair = TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [raw_usize.clone(), raw_slot.clone()]}
+            }
+        })
+        .into(),
+    );
     let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
     assert_eq!(
         rows.iter()
@@ -7730,9 +7736,12 @@ fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
             ("__pos_1", Some(ValueType::Ref(None))),
         ]
     );
-    let byte = TyRef::Other(serde_json::json!({
-        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
-    }));
+    let byte = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+        })
+        .into(),
+    );
     assert_eq!(
         tyref_aggregate_field_value_type(&byte, &llbc, ""),
         ValueType::Ref(None),
@@ -7749,12 +7758,15 @@ fn positional_tuple_shared_borrow_of_usize_is_the_integer() {
     let llbc = llbc_with_trait_impls(serde_json::json!([]));
     let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
     let ref_usize = serde_json::json!({"Ref": ["Erased", usize_ty.clone(), "Shared"]});
-    let triple = TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {"types": [ref_usize.clone(), ref_usize.clone(), ref_usize.clone()]}
-        }
-    }));
+    let triple = TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [ref_usize.clone(), ref_usize.clone(), ref_usize.clone()]}
+            }
+        })
+        .into(),
+    );
     assert_eq!(
         tyref_positional_aggregate_root(&triple, &llbc).as_deref(),
         Some("Tuple<usize,usize,usize>")
@@ -7776,12 +7788,15 @@ fn positional_tuple_shared_borrow_of_usize_is_the_integer() {
             ("__pos_2", Some(ValueType::Unsigned)),
         ]
     );
-    let by_value = TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {"types": [usize_ty.clone(), usize_ty.clone(), usize_ty]}
-        }
-    }));
+    let by_value = TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [usize_ty.clone(), usize_ty.clone(), usize_ty]}
+            }
+        })
+        .into(),
+    );
     let value_rows = positional_aggregate_field_rows(&by_value, 3, &llbc);
     assert_eq!(
         value_rows
@@ -12647,7 +12662,7 @@ fn rust_vec_ref_item_is_gcref_not_ccharp() {
         ),
     ];
     let (llbc, _) = load_handle(decls, serde_json::json!([gctype_impl_for_adt(1)]), 1);
-    let gcref_ty = TyRef::Other(gcref.clone());
+    let gcref_ty = TyRef::Other(gcref.clone().into());
     assert!(
         matches!(
             super::tyref_to_value_type(&gcref_ty, &llbc),
@@ -12656,9 +12671,12 @@ fn rust_vec_ref_item_is_gcref_not_ccharp() {
         "GcType-seeded Opaque GCREFOpaque getkind is ref"
     );
     let vec_of = |item: serde_json::Value| {
-        TyRef::Other(serde_json::json!({
-            "Adt": {"id": 3, "generics": {"types": [item]}}
-        }))
+        TyRef::Other(
+            serde_json::json!({
+                "Adt": {"id": 3, "generics": {"types": [item]}}
+            })
+            .into(),
+        )
     };
     assert_eq!(
         super::tyref_rust_vec_item_kind(&vec_of(gcref), &llbc),
@@ -13892,7 +13910,7 @@ fn ptr_to_int_cast_origin_is_fn_ptr_or_ptr_to_vec() {
             serde_json::json!({
                 "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
             })
-            .into(),
+            .into()
         ),
         &llbc
     ));
@@ -13956,8 +13974,8 @@ fn rust_vec_type_alias_header_is_int() {
             }
         }
     });
-    let by_value = TyRef::Other(alias_adt.clone());
-    let ptr = TyRef::Other(serde_json::json!({"RawPtr": [alias_adt, "Mut"]}));
+    let by_value = TyRef::Other(alias_adt.clone().into());
+    let ptr = TyRef::Other(serde_json::json!({"RawPtr": [alias_adt, "Mut"]}).into());
     for ty in [&by_value, &ptr] {
         assert!(
             super::tyref_is_rust_vec_header(ty, &llbc),
@@ -14202,9 +14220,12 @@ fn shared_borrow_of_fn_ptr_is_int() {
             }
         }
     });
-    let borrowed = TyRef::Other(serde_json::json!({
-        "Ref": ["_", fn_ptr, "Shared"]
-    }));
+    let borrowed = TyRef::Other(
+        serde_json::json!({
+            "Ref": ["_", fn_ptr, "Shared"]
+        })
+        .into(),
+    );
     assert_eq!(tyref_to_value_type(&borrowed, &llbc), ValueType::Int);
     assert_eq!(tyref_to_attr_value_type(&borrowed, &llbc), ValueType::Int);
 }

@@ -28,6 +28,26 @@ def run(items):
     return t
 
 
+def raise_catch_hot(n):
+    """A compiled loop plus its exception-guard bridge must catch ValueError.
+
+    `raise` sits inside `try/except ValueError`. Enough iterations compile
+    both the loop and the `% 7 == 0` bridge; the bridge has to enter the
+    except body rather than `ExitFrameWithException`.
+    """
+    s = 0
+    i = 0
+    while i < n:
+        try:
+            if i % 7 == 0:
+                raise ValueError("v")
+            s = s + 1
+        except ValueError:
+            s = s + 2
+        i = i + 1
+    return s
+
+
 def main():
     bad = ["x"] * 3000
     good = ["7"] * N
@@ -38,6 +58,10 @@ def main():
         b = run(good)
         c = run(good)
     assert (a, b, c) == (-3000, 7 * N, 7 * N), (a, b, c)
+    hot_n = 20000
+    hot = raise_catch_hot(hot_n)
+    # s+1 on non-multiples of 7, s+2 on multiples of 7 in [0, n).
+    assert hot == hot_n + (hot_n + 6) // 7, hot
 
 
 main()

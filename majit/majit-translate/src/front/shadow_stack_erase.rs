@@ -101,8 +101,9 @@ enum Leaf {
     ItemsGet,
     /// `RootedItems` drop / `drop_in_place`.
     ItemsClose,
-    /// `DictOperationGuard::new`: Open plus publish of the dict and the
-    /// refs slice. The constructor returns the bracket it opened
+    /// `DictOperationGuard::new` and the arity constructors `new0`..`new3`:
+    /// Open plus publish of the dict and the extra refs (slice or by-value).
+    /// The constructor returns the bracket it opened
     /// (`harvest_scope_owning_identities`); one leaf so a caller that also
     /// has its own `with_roots!` (`w_module_dict_setitem_str_internal`) can
     /// erase. Upstream: `ShadowStackFrameworkGCTransformer.push_roots`.
@@ -232,10 +233,11 @@ fn classify_call(
     let dest_items = is_rooted_items_ty(&call.dest.ty, llbc);
     let recv_items = receiver_ty.is_some_and(|ty| is_rooted_items_ty(ty, llbc));
     // `DictOperationGuard` lives in `dictmultiobject`, not `gc_roots`.
-    // Charon names the constructor `dictmultiobject::<Impl>::new`, so the
-    // type is read off the destination (and the receiver for `root`).
-    if (names_type(&call.dest.ty, "DictOperationGuard") && leaf == "new")
-        || (leaf == "new" && segments.contains(&"DictOperationGuard"))
+    // Charon names the slice constructor `dictmultiobject::<Impl>::new` and
+    // the residual ABI `new0`..`new3`; the type is read off the destination
+    // (and the receiver for `root`).
+    if (names_type(&call.dest.ty, "DictOperationGuard") && dict_operation_guard_ctor_leaf(leaf))
+        || (dict_operation_guard_ctor_leaf(leaf) && segments.contains(&"DictOperationGuard"))
     {
         return Some((Leaf::GuardNew, false));
     }
@@ -245,7 +247,7 @@ fn classify_call(
         match leaf {
             "root" => return Some((Leaf::GuardRoot, true)),
             "drop" | "drop_in_place" => return Some((Leaf::Close, true)),
-            "new" => {}
+            "new" | "new0" | "new1" | "new2" | "new3" => {}
             _ => {}
         }
     }
@@ -324,6 +326,32 @@ fn classify_call(
         _ => Leaf::Unmodeled,
     };
     Some((kind, false))
+}
+
+/// Slice constructor `new` and the residual-ABI `new0`..`new3`.
+fn dict_operation_guard_ctor_leaf(leaf: &str) -> bool {
+    matches!(leaf, "new" | "new0" | "new1" | "new2" | "new3")
+}
+
+/// Extra pins besides `obj` for `new0`..`new3`. The slice constructor
+/// `new` is not an arity form.
+fn dict_operation_guard_arity_extra(leaf: &str) -> Option<usize> {
+    match leaf {
+        "new0" => Some(0),
+        "new1" => Some(1),
+        "new2" => Some(2),
+        "new3" => Some(3),
+        _ => None,
+    }
+}
+
+fn dict_guard_arity_extra_of(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let fd = callee_fun_decl(call, llbc)?;
+    let path = fd.item_meta.name_path_str();
+    dict_operation_guard_arity_extra(path.rsplit("::").next()?)
 }
 
 /// `FrameAnchor` ops are identities (`frame_anchor::classify`); they do
@@ -1351,6 +1379,12 @@ fn classify_or_look_through(
     if let Some(class) = classify_call(call, llbc) {
         return Some(class);
     }
+    // FrameAnchor ops are identities of the frame, not shadow-stack leaves.
+    // Looking through a helper that still pushes the native slot would
+    // paint the call as `PushIndex` / `Get` / `Close`.
+    if call_is_anchor_identity(call, llbc) {
+        return None;
+    }
     look_through(call, llbc, in_flight, allow_cached)
         .ok()
         .map(|leaf| (leaf, false))
@@ -1360,7 +1394,8 @@ fn classify_or_look_through(
 /// leaves this pass already models: exactly one leaf, or a cached-slot
 /// wrapper with no RootScope (reload of the held frame, a handle, or only
 /// a cache). Runtime `shadow_stack` / `gc_roots` bodies stay opaque: those
-/// are the implementations, not wrappers. `SlotTop` stays `SlotTop`.
+/// are the implementations, not wrappers. FrameAnchor helpers stay opaque:
+/// they are identities of the frame. `SlotTop` stays `SlotTop`.
 ///
 /// ReloadTop is [`classify_call`] on the `gc_roots` reload primitive
 /// (`reload_top_root` / `reload_top_root_at`) and the `shadow_stack`
@@ -1393,6 +1428,9 @@ fn look_through(
     if runtime_shadow_stack_body(&fd.item_meta.name_path()) {
         return Err(unmodeled_use(&path));
     }
+    if super::frame_anchor::is_helper(fd, llbc) {
+        return Err(unmodeled_use(&path));
+    }
     let Some(body) = fd.unstructured() else {
         return Err(unmodeled_use(&path));
     };
@@ -1422,19 +1460,24 @@ fn look_through(
                     .then(|| inner.args.get(usize::from(method)).and_then(operand_local))
                     .flatten(),
             ),
-            None => match look_through(inner, llbc, &nested, false) {
-                Ok(leaf) => (
-                    leaf,
-                    matches!(leaf, Leaf::Get | Leaf::Set | Leaf::CopyRange)
-                        .then(|| inner.args.first().and_then(operand_local))
-                        .flatten(),
-                ),
-                Err(_) if allow_cached => {
-                    opaque = true;
+            None => {
+                if call_is_anchor_identity(inner, llbc) {
                     continue;
                 }
-                Err(e) => return Err(e),
-            },
+                match look_through(inner, llbc, &nested, false) {
+                    Ok(leaf) => (
+                        leaf,
+                        matches!(leaf, Leaf::Get | Leaf::Set | Leaf::CopyRange)
+                            .then(|| inner.args.first().and_then(operand_local))
+                            .flatten(),
+                    ),
+                    Err(_) if allow_cached => {
+                        opaque = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
         if found.is_some() {
             many = true;
@@ -2064,12 +2107,12 @@ impl<'a> EraseWalk<'a> {
                 });
             }
         } else if k >= lo && k < self.join_band_hi(lo) {
-            return Err("absolute-get-above-join-floor");
+            return Err("absolute-get-above-join-floor".into());
         } else if k >= depth {
             return Err(if set {
-                "set-above-depth"
+                "set-above-depth".into()
             } else {
-                "get-above-depth"
+                "get-above-depth".into()
             });
         }
         Ok(())
@@ -2118,7 +2161,7 @@ impl<'a> EraseWalk<'a> {
                         frozen_lo.is_some_and(|l| lo >= l),
                         "emit incoming lo is below phase-1 lattice"
                     );
-                    return Err("depth-disagrees-at-merge");
+                    return Err("depth-disagrees-at-merge".into());
                 }
                 if !self.visited[target] {
                     self.queue.push_back(target);
@@ -2445,7 +2488,7 @@ impl<'a> EraseWalk<'a> {
             Some(prev) if prev == &self.pin_count => Ok(()),
             Some(prev) => {
                 let Some(joined) = join_pin_counts_min(prev, &self.pin_count) else {
-                    return Err("pin-count-disagrees-at-merge");
+                    return Err("pin-count-disagrees-at-merge".into());
                 };
                 if self.pin_count_in[target].as_ref() != Some(&joined) {
                     self.pin_count_in[target] = Some(joined);
@@ -2960,26 +3003,42 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 json!({ "Use": [copy_operand_json(obj), "Yes"] }),
                             ));
                         }
-                        let extra = match call.args.get(1).and_then(operand_local) {
-                            Some(slice) => {
-                                let (agg_si, operands) =
-                                    resolve_published_array(block, Some(slice))
-                                        .ok_or("publish-array-unresolved")?;
-                                let mut inserted = Vec::new();
-                                for (i, element) in operands.iter().enumerate() {
-                                    let ty = operand_json_ty(element)
-                                        .ok_or("publish-element-untyped")?;
-                                    cx.ensure_slot_ty(ty.clone());
-                                    cx.record_slot_ty(depth + 1 + i, &ty)?;
-                                    inserted.push(assign_json(
+                        let extra = if let Some(n) = dict_guard_arity_extra_of(call, llbc) {
+                            for i in 0..n {
+                                let element = args_json.get(1 + i).ok_or("pin-value-untyped")?;
+                                let ty = operand_json_ty(element).ok_or("pin-value-untyped")?;
+                                cx.ensure_slot_ty(ty.clone());
+                                cx.record_slot_ty(depth + 1 + i, &ty)?;
+                                if cx.emit() {
+                                    stmts.push(assign_json(
                                         local_place_json(cx.slot_local(depth + 1 + i), &ty),
                                         json!({ "Use": [copy_operand_json(element), "Yes"] }),
                                     ));
                                 }
-                                cx.insert_after((bb, agg_si), inserted);
-                                operands.len()
                             }
-                            None => 0,
+                            n
+                        } else {
+                            match call.args.get(1).and_then(operand_local) {
+                                Some(slice) => {
+                                    let (agg_si, operands) =
+                                        resolve_published_array(block, Some(slice))
+                                            .ok_or("publish-array-unresolved")?;
+                                    let mut inserted = Vec::new();
+                                    for (i, element) in operands.iter().enumerate() {
+                                        let ty = operand_json_ty(element)
+                                            .ok_or("publish-element-untyped")?;
+                                        cx.ensure_slot_ty(ty.clone());
+                                        cx.record_slot_ty(depth + 1 + i, &ty)?;
+                                        inserted.push(assign_json(
+                                            local_place_json(cx.slot_local(depth + 1 + i), &ty),
+                                            json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                        ));
+                                    }
+                                    cx.insert_after((bb, agg_si), inserted);
+                                    operands.len()
+                                }
+                                None => 0,
+                            }
                         };
                         pin_depth(&mut depth, &mut lo, 1 + extra);
                         cx.bump_slot_count(depth);
@@ -3259,7 +3318,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     Leaf::ItemsGet => {
                         // `take` has no index; the rewrite has no Vec constructor.
                         let Some(index_op) = call.args.get(arg0) else {
-                            return Err("unmodeled-stack-op");
+                            return Err("unmodeled-stack-op".into());
                         };
                         // `RootedItems::get(i)`: `i` is an offset from the
                         // set's open depth (`gc_roots.rs` `RootedItems::get`).
@@ -3273,7 +3332,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         let (d, _) = cx.guard_open(g)?;
                         let pins = cx.pin_count.get(&g).map(|p| p.count()).unwrap_or(0);
                         if rel >= pins {
-                            return Err("get-out-of-set");
+                            return Err("get-out-of-set".into());
                         }
                         let slot = d.checked_add(rel).ok_or("get-above-depth")?;
                         cx.check_slot_read(slot, false, depth, lo, false)?;
@@ -4245,6 +4304,7 @@ fn independent_leaf_plan(body: &Unstructured, llbc: &Llbc, in_flight: &[u64]) ->
         slot_count: 0,
         slot_ty: None,
         slot_tys: HashMap::new(),
+        pin_count: HashMap::new(),
         unreachable: Vec::new(),
         had_reload: false,
         reload_src: None,
@@ -4311,12 +4371,12 @@ fn independent_leaf_plan(body: &Unstructured, llbc: &Llbc, in_flight: &[u64]) ->
             | Leaf::ItemsOpen
             | Leaf::ItemsPush
             | Leaf::ItemsNop
+            | Leaf::ItemsLen
+            | Leaf::ItemsIsEmpty
             | Leaf::ItemsGet
             | Leaf::ItemsClose
             | Leaf::GuardNew
             | Leaf::GuardRoot
-            | Leaf::AnchorOpen
-            | Leaf::AnchorGet
             | Leaf::SlotTop
             | Leaf::CacheSlot
             | Leaf::ResolveSlot
@@ -4387,7 +4447,7 @@ pub(super) fn erase_shadow_stack(
                     .get(&k)
                     .cloned()
                     .or_else(|| plan.slot_ty.clone())
-                    .ok_or("slot-untyped")
+                    .ok_or_else(|| "slot-untyped".into())
             })
             .collect();
         let tys = tys?;
@@ -4419,7 +4479,11 @@ pub(super) fn erase_shadow_stack(
             let removed = plan.removed.get(&bb);
             let term = plan.terms.get(&bb);
             let has_inserts = plan.inserted_after.keys().any(|(b, _)| *b == bb);
-            if removed.is_none() && term.is_none() && !has_inserts {
+            let seed_here = bb == 0
+                && slot_seed
+                    .as_ref()
+                    .is_some_and(|(_, _, seeds)| seeds.iter().any(Option::is_some));
+            if removed.is_none() && term.is_none() && !has_inserts && !seed_here {
                 continue;
             }
             let stmt_span = block["terminator"]["span"].clone();
@@ -4431,7 +4495,17 @@ pub(super) fn erase_shadow_stack(
                 })
             };
             let old = block["statements"].as_array().cloned().unwrap_or_default();
-            let mut new = Vec::with_capacity(old.len());
+            let mut new = Vec::with_capacity(old.len() + plan.slot_count);
+            if seed_here && let Some((base, tys, seeds)) = &slot_seed {
+                for (k, (ty, rv)) in tys.iter().zip(seeds.iter()).enumerate() {
+                    if let Some(rv) = rv {
+                        new.push(make_stmt(assign_json(
+                            local_place_json(*base + k, ty),
+                            rv.clone(),
+                        )));
+                    }
+                }
+            }
             for (si, stmt) in old.into_iter().enumerate() {
                 if !removed.is_some_and(|r| r.contains(&si)) {
                     new.push(stmt);
@@ -5448,11 +5522,20 @@ fn stack_walk(
                                 }
                                 if matches!(leaf, Leaf::GuardNew) {
                                     depth = depth.add(1);
-                                    let slice = call.args.get(1).and_then(operand_local);
-                                    match resolve_published_array_len(block, slice) {
-                                        Some(n) => depth = depth.add(n),
-                                        None if call.args.get(1).is_none() => {}
-                                        None => depth = depth.after_unknown_push(),
+                                    let arity = path.as_deref().and_then(|p| {
+                                        dict_operation_guard_arity_extra(
+                                            p.rsplit("::").next().unwrap_or(""),
+                                        )
+                                    });
+                                    if let Some(n) = arity {
+                                        depth = depth.add(n);
+                                    } else {
+                                        let slice = call.args.get(1).and_then(operand_local);
+                                        match resolve_published_array_len(block, slice) {
+                                            Some(n) => depth = depth.add(n),
+                                            None if call.args.get(1).is_none() => {}
+                                            None => depth = depth.after_unknown_push(),
+                                        }
                                     }
                                 }
                             }
@@ -9042,7 +9125,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("absolute-get-above-join-floor") => {}
+            Err(reason) if reason == "absolute-get-above-join-floor" => {}
             Ok(Some(_)) => panic!("expected absolute-get-above-join-floor, got accepted"),
             Ok(None) => panic!("expected absolute-get-above-join-floor, got no bracket"),
             Err(reason) => panic!("expected absolute-get-above-join-floor, got {reason}"),
@@ -9705,7 +9788,7 @@ mod tests {
         let fd = llbc.fn_by_id(5).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         match erase_shadow_stack(fd, &body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("reassigned const index should refuse the rewrite, not erase"),
             Ok(None) => {
                 panic!("reassigned const index should refuse the rewrite, not skip as no bracket")
@@ -9794,7 +9877,7 @@ mod tests {
         let fd = llbc.fn_by_id(5).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         match erase_shadow_stack(fd, &body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("dynamic index should refuse the rewrite, not erase"),
             Ok(None) => panic!("dynamic index should refuse the rewrite, not skip as no bracket"),
             Err(reason) => panic!("expected index-not-static, got {reason}"),
@@ -9861,7 +9944,7 @@ mod tests {
         let fd = llbc.fn_by_id(5).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         match erase_shadow_stack(fd, &body, &llbc) {
-            Err("unmodeled-stack-op") => {}
+            Err(reason) if reason == "unmodeled-stack-op" => {}
             Ok(Some(_)) => panic!("take should refuse the rewrite, not erase the bracket"),
             Ok(None) => panic!("take should refuse the rewrite, not skip it as no bracket"),
             Err(reason) => panic!("expected unmodeled-stack-op, got {reason}"),
@@ -9957,7 +10040,7 @@ mod tests {
             .returns_owned_scope
             .store(false, Ordering::Relaxed);
         match analyze(&returned_owned_scope_body(), &llbc) {
-            Err("calls-stack-sensitive-fn") => {}
+            Err(reason) if reason == "calls-stack-sensitive-fn" => {}
             Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
             Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
             Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
@@ -10486,8 +10569,9 @@ mod tests {
         ));
     }
 
-    /// Free-fn `frame_anchor_push` / `live` / `release` are the same
-    /// PushIndex / Get / Close leaves as `shadow_stack::{push,get,try_pop_to}`.
+    /// Free-fn `frame_anchor_push` / `live` / `release` are FrameAnchor
+    /// identities (`frame_anchor::classify`). An anchor-only body has no
+    /// bracket for this pass.
     #[test]
     fn erase_frame_anchor_push_get_close_erases_bracket() {
         let copy = |i| json!({"Read": place(i)});
@@ -10522,18 +10606,11 @@ mod tests {
         let llbc = cached_slot_llbc(funs);
         let fd = llbc.fn_by_id(4).expect("subject");
         let body = fd.unstructured().expect("stripped body");
-        let erased = match erase_shadow_stack(fd, &body, &llbc) {
-            Ok(Some(erased)) => erased,
-            Ok(None) => panic!("expected frame_anchor push/get/close erase, got no bracket"),
-            Err(reason) => panic!("expected frame_anchor push/get/close erase, got {reason}"),
-        };
-        assert!(no_call_path_contains(&erased, &llbc, "frame_anchor_push"));
-        assert!(no_call_path_contains(&erased, &llbc, "frame_anchor_live"));
-        assert!(no_call_path_contains(
-            &erased,
-            &llbc,
-            "frame_anchor_release"
-        ));
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("expected no bracket, FrameAnchor ops are identities"),
+            Err(reason) => panic!("expected no bracket, got {reason}"),
+        }
     }
 
     /// A wrapper whose body is one `shadow_stack::push` is that leaf.

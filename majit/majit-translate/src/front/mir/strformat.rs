@@ -1315,6 +1315,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                     target: CallTarget::FunctionPath {
                         segments: vec!["__strlen".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![rendered.clone()]),
@@ -1348,6 +1349,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "cmp".into(), "max".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![zero, raw_pad]),
@@ -1363,6 +1365,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_rangeto".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![zeros, pad_len]),

@@ -16,7 +16,7 @@
 use crate::jitexc::JitException;
 use majit_ir::GcRef;
 #[cfg(test)]
-use majit_ir::{OpCode, OpRef};
+use majit_ir::OpCode;
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in

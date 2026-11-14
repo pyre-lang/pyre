@@ -725,7 +725,7 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
 /// `Option<&OwnedFd>` lost `T` and a later Discriminant could not read
 /// `getkind(var.concretetype)` (`rnone.py` `rtype_is_None`).
 pub(crate) fn tyref_from_json(v: serde_json::Value) -> TyRef {
-    serde_json::from_value(v.clone()).unwrap_or(TyRef::Other(v))
+    serde_json::from_value(v.clone()).unwrap_or(TyRef::Other(v.into()))
 }
 
 /// The `T` of an `Option<T>` as its own [`TyRef`] — for an

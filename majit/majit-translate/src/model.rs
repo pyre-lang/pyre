@@ -21678,6 +21678,7 @@ mod tests {
                             "alloc_raw".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![tid, size]),
@@ -21772,6 +21773,7 @@ mod tests {
                             "alloc_raw".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![tid, size]),
@@ -25500,6 +25502,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -25516,6 +25519,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__iter_next".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![iter_phi.clone()]),

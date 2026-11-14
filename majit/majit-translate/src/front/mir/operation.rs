@@ -3511,6 +3511,7 @@ impl<'a> Lowering<'a> {
                     if let Some(raw) = self.emit_dest_overlay_cast(
                         overlay_bb,
                         src_kind.as_ref(),
+                        operand_tyref(&operand),
                         arg.clone(),
                         dest_ty,
                     ) {
@@ -3525,6 +3526,7 @@ impl<'a> Lowering<'a> {
                         && let Some(root) = flavor_raw_pointer_class_root(
                             dest_ty,
                             self.llbc,
+                            self.tombstoned_leaves,
                             &self.raw_alloc_flavor_structs,
                         )
                     {
@@ -3570,6 +3572,7 @@ impl<'a> Lowering<'a> {
                         && flavor_raw_pointer_class_root(
                             dest_ty,
                             self.llbc,
+                            self.tombstoned_leaves,
                             &self.raw_alloc_flavor_structs,
                         )
                         .is_none()
@@ -4011,9 +4014,13 @@ impl<'a> Lowering<'a> {
                 // (`rgc.cast_instance_to_gcref`) must reach the marker even
                 // when Charon spells the kind as something other than
                 // `RawPtr` (`*const () as *const CodeObject`).
-                let dest_flavor_raw =
-                    flavor_raw_pointer_class_root(&ty, self.llbc, &self.raw_alloc_flavor_structs)
-                        .is_some();
+                let dest_flavor_raw = flavor_raw_pointer_class_root(
+                    &ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some();
                 // Same `rlist.py ll_items` normalization as the UnaryOp cast.
                 if graph_is_items_block_base_accessor(&self.graph.name)
                     && tyref_is_raw_u8_ptr(&ty, self.llbc)
@@ -5577,9 +5584,12 @@ impl<'a> Lowering<'a> {
         if tyref_rust_vec_item_kind(dest_ty, self.llbc).is_some() {
             return None;
         }
-        if let Some(root) =
-            flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
-        {
+        if let Some(root) = flavor_raw_pointer_class_root(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            &self.raw_alloc_flavor_structs,
+        ) {
             return Some(crate::model::cast_instance_call(root, arg.clone()));
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
@@ -5860,8 +5870,13 @@ impl<'a> Lowering<'a> {
             return None;
         }
         if raw_scalar_address_value_type(dest_ty, self.llbc).is_some()
-            || flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
-                .is_some()
+            || flavor_raw_pointer_class_root(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                &self.raw_alloc_flavor_structs,
+            )
+            .is_some()
         {
             return None;
         }
@@ -10200,6 +10215,7 @@ impl<'a> Lowering<'a> {
                     flavor_raw_pointer_class_root(
                         declared,
                         self.llbc,
+                        self.tombstoned_leaves,
                         &self.raw_alloc_flavor_structs,
                     )
                     .is_some()
@@ -10353,7 +10369,7 @@ impl<'a> Lowering<'a> {
             match tyref_node(&substituted, self.llbc)
                 .and_then(|node| strip_ty_indirections(node, self.llbc))
             {
-                Some(node) => TyRef::Other(node.clone()),
+                Some(node) => TyRef::Other(node.clone().into()),
                 None => substituted,
             }
         };
@@ -13311,7 +13327,7 @@ pub(in crate::front::mir) fn tyref_to_spec_json(ty: &TyRef) -> serde_json::Value
     match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => serde_json::json!({ "Value": [id, body] }),
-        TyRef::Other(v) => v.clone(),
+        TyRef::Other(v) => v.as_ref().clone(),
     }
 }
 

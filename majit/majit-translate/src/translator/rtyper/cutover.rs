@@ -16466,13 +16466,14 @@ mod tests {
                     "gc_alloc_young_storage_box__inst_RDict".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(None),
         );
         let twin = value_to_var.get(&result).expect("twin");
         *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         assert_eq!(
             twin.concretetype(),
             Some(GCREF.clone()),
@@ -16489,13 +16490,14 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_gcref_call".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(None),
         );
         let twin = value_to_var.get(&result).expect("twin");
         *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         assert_eq!(
             kind_of_in(&value_to_var, &result),
             ConcreteType::Void,

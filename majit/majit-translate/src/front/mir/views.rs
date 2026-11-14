@@ -1087,6 +1087,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
@@ -4022,7 +4023,7 @@ impl<'a> Lowering<'a> {
         // `rstr.py copy_string_to_raw` src is `STR` next to a CCHARP
         // dst (`mark_residual_str_params`). A constructor residual
         // (`w_bytes_from_bytes(&[u8])`) keeps the two-word window.
-        let residual_str = fun_decl_is_dont_look_inside(fd, self.dont_look_inside)
+        let residual_str = fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside)
             && inputs.iter().any(|ty| tyref_is_u8_window(ty, self.llbc))
             && inputs.iter().any(|ty| tyref_is_raw_u8_ptr(ty, self.llbc));
         let is_pair_or_window = |ty: &TyRef| {
@@ -5230,7 +5231,7 @@ pub(in crate::front::mir) fn tyref_rust_vec_item_ty(ty: &TyRef, llbc: &Llbc) -> 
         .as_array()?
         .first()?;
     let stripped = strip_ty_indirections(item, llbc).unwrap_or(item);
-    Some(TyRef::Other(stripped.clone()))
+    Some(TyRef::Other(stripped.clone().into()))
 }
 
 /// Whether `ty` is `Vec<u8>` (by value, borrow, or raw pointer). The
@@ -5263,7 +5264,7 @@ pub(in crate::front::mir) fn rust_vec_item_kind_of_item_node(
     {
         return Some(majit_ir::rvec::VecItemKind::Ref);
     }
-    let item_ty = TyRef::Other(item.clone());
+    let item_ty = TyRef::Other(item.clone().into());
     if tyref_is_raw_pointer(&item_ty, llbc) {
         return match tyref_to_value_type(&item_ty, llbc) {
             ValueType::Ref(_) => Some(majit_ir::rvec::VecItemKind::Ref),

@@ -3346,17 +3346,14 @@ fn emit_dispatch_loop_head(
     );
     let join = dispatch.merge_join.clone();
     let join_state = dispatch.merge_join_state.clone();
-    record_graph_op(
-        &join.block(),
-        super::flatten::OPNAME_LIVE,
-        Vec::new(),
-        None,
-        LOOP_HEAD_OFFSET,
-    );
     let Some(super::flow::FlowValue::Variable(next_instr_var)) = join_state.dispatch_next_instr
     else {
         return;
     };
+    // `jtransform.py promote_greens` then `handle_jit_marker__jit_merge_point`:
+    // each Variable green is `-live-` + `{kind}_guard_value`, then op3
+    // `-live-` immediately before `jit_merge_point`. `emit_do_promote`
+    // already emits that leading `-live-`.
     emit_do_promote(
         &join.block(),
         "int_guard_value",
@@ -3367,6 +3364,13 @@ fn emit_dispatch_loop_head(
         &join.block(),
         "int_guard_value",
         next_instr_var,
+        LOOP_HEAD_OFFSET,
+    );
+    record_graph_op(
+        &join.block(),
+        super::flatten::OPNAME_LIVE,
+        Vec::new(),
+        None,
         LOOP_HEAD_OFFSET,
     );
     let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
@@ -21557,9 +21561,68 @@ mod tests {
             merge_pos > 0 && opnames[merge_pos - 1] == "live",
             "op3 -live- must immediately precede jit_merge_point, got {opnames:?}"
         );
+        for (gpos, &name) in opnames[..merge_pos].iter().enumerate() {
+            if name != "int_guard_value" {
+                continue;
+            }
+            assert!(
+                gpos > 0 && opnames[gpos - 1] == "live",
+                "promote_greens int_guard_value at {gpos} must follow -live-, got {opnames:?}"
+            );
+        }
         assert!(
             !opnames[..merge_pos].contains(&"ref_guard_value"),
             "promote_greens skips Constant pycode; no ref_guard_value before header jit_merge_point, got {opnames:?}"
+        );
+    }
+
+    #[test]
+    fn portal_dense_jit_merge_point_live_precedes_promote_guards() {
+        // Generator bodies use the dispatch loop (`interp_jit.py
+        // PyFrame.dispatch`), so there is one loop-head `jit_merge_point`.
+        let code = first_nested_function_code(
+            "def gen(a):\n    while a:\n        a = a - 1\n        yield a\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal generator must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        let mut merge_count = 0;
+        let mut region_start = 0;
+        for (pos, &name) in opnames.iter().enumerate() {
+            if name != "jit_merge_point" {
+                continue;
+            }
+            merge_count += 1;
+            assert!(
+                pos > 0 && opnames[pos - 1] == "live",
+                "op3 -live- must immediately precede jit_merge_point at {pos}, got {opnames:?}"
+            );
+            for gpos in region_start..pos {
+                if opnames[gpos] != "int_guard_value" {
+                    continue;
+                }
+                assert!(
+                    gpos > 0 && opnames[gpos - 1] == "live",
+                    "promote_greens int_guard_value at {gpos} must follow -live-, got {opnames:?}"
+                );
+            }
+            region_start = pos + 1;
+        }
+        assert_eq!(
+            merge_count, 1,
+            "interp_jit.py PyFrame.dispatch emits one jit_merge_point, got {merge_count} in {opnames:?}"
         );
     }
 

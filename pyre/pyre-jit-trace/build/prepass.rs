@@ -1520,6 +1520,7 @@ fn real_main() {
                         "eval",
                         "ll_tuple_hash_portal_runner_shim",
                     ])),
+                    portal_enter: None,
                     greens: vec!["w_type".to_string()],
                     reds: vec![],
                     green_kinds: vec![majit_ir::Type::Ref],

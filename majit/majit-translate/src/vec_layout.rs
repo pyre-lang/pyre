@@ -170,8 +170,7 @@ pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
     {
         return false;
     }
-    spelling_is_alloc_vec(type_str)
-        || type_str.rsplit("::").next().unwrap_or(type_str) == "String"
+    spelling_is_alloc_vec(type_str) || type_str.rsplit("::").next().unwrap_or(type_str) == "String"
 }
 
 #[cfg(test)]
