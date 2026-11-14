@@ -609,6 +609,32 @@ pub(in crate::front::mir) fn eval_hook_graphs_for_call(
     )
 }
 
+/// `ExecutionContext.profilefunc` (`setllprofile` / `_trace`): the closed
+/// family published on `llbc`. `FunctionsPBCRepr` /
+/// `SmallFunctionSetPBCRepr` (`rpbc.py`) lower a call through that slot
+/// to `indirect_call(funcptr, *args, c_graphs)`.
+pub(in crate::front::mir) fn profilefunc_graphs_for_call(
+    llbc: &Llbc,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let paths = llbc.profilefunc_graphs();
+    if paths.is_empty() {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    if !tyref_is_profilefunc_family(&place.ty, llbc) && !place_is_profilefunc_field(place, llbc) {
+        return None;
+    }
+    Some(
+        paths
+            .iter()
+            .map(|path| crate::parse::CallPath::from_segments(path.split("::")))
+            .collect(),
+    )
+}
+
 pub(in crate::front::mir) fn operand_is_eval_fn(operand: &Operand, llbc: &Llbc) -> bool {
     let ty = match operand {
         Operand::Copy(place) | Operand::Move(place) => &place.ty,

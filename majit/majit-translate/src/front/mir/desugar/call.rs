@@ -6913,6 +6913,7 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
+                let profilefunc_graphs = profilefunc_graphs_for_call(self.llbc, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -6981,6 +6982,18 @@ impl<'a> Lowering<'a> {
                     // funcptr is `portal_runner_ptr`; this pointer is not,
                     // so `rewrite_op_indirect_call` takes
                     // `handle_regular_indirect_call` or `handle_residual_call`.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: Some(graphs),
+                        family_key: None,
+                        result_ty,
+                    }
+                } else if let Some(graphs) = profilefunc_graphs {
+                    // `setllprofile` / `_trace` store a closed `ProfileFunc`
+                    // PBC (`executioncontext.py`). Same `indirect_call`
+                    // `c_graphs` row as the eval-hook family above.
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
                     OpKind::IndirectCall {
                         funcptr,
