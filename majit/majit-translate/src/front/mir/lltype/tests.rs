@@ -264,18 +264,20 @@ fn cow_str_class_root_is_str_family_cow_bytes_is_not() {
 
 #[test]
 fn os_path_family_roots_are_str_family_and_reject_lookalikes() {
+    let _origins =
+        crate::test_support::register_struct_origins_serialized(std::collections::HashMap::new());
     for root in [
-        "PathBuf",
         "path::PathBuf",
         "std::path::PathBuf",
-        "Path",
         "path::Path",
-        "OsString",
+        "std::path::Path",
         "ffi::OsString",
         "std::ffi::OsString",
         "ffi::os_str::OsString",
-        "OsStr",
+        "std::ffi::os_str::OsString",
         "ffi::OsStr",
+        "std::ffi::OsStr",
+        "std::ffi::os_str::OsStr",
     ] {
         assert!(
             is_os_path_family_root(root),
@@ -286,33 +288,138 @@ fn os_path_family_roots_are_str_family_and_reject_lookalikes() {
             "{root} projects as the rpath.py s_Str0 string family"
         );
     }
+    assert!(!is_os_path_family_root("PathBuf"));
+    assert!(!is_os_path_family_root("Path"));
+    assert!(!is_os_path_family_root("OsString"));
+    assert!(!is_os_path_family_root("OsStr"));
+    assert!(!is_str_family_class_root("PathBuf"));
     assert!(!is_os_path_family_root("other::PathBuf"));
     assert!(!is_os_path_family_root("other::OsString"));
     assert!(!is_str_family_class_root("other::PathBuf"));
     assert!(!is_str_family_class_root("other::OsString"));
     assert!(!is_os_path_family_root("String"));
     assert!(!is_os_path_family_root("string::String"));
+    majit_ir::descr::register_struct_origins(std::collections::HashMap::from([(
+        "PathBuf".to_string(),
+        "path".to_string(),
+    )]));
+    assert!(
+        is_str_family_class_root("PathBuf"),
+        "a CAST PathBuf leaf resolves through TypeDecl struct_origins"
+    );
+    assert!(
+        !is_os_path_family_root("PathBuf"),
+        "the os-path predicate still rejects a bare leaf"
+    );
+    majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
+}
+
+/// `std::path::PathBuf` is `Opaque` (`opacity: Foreign`) in the
+/// interpreter LLBC. Harvest the TypeDecl origin so a CAST intern leaf
+/// noneifies as `SomeString` (`rpath.py` `_posix_rnormpath`).
+#[test]
+fn opaque_os_path_typedecl_harvests_origin_not_classdef() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            opaque_type_decl(0, &["std", "path", "PathBuf"]),
+            opaque_type_decl(1, &["std", "ffi", "os_str", "OsString"]),
+            opaque_type_decl(2, &["other", "PathBuf"]),
+        ],
+        vec![],
+    );
+    let (_, _, fields, _, origins, _, _, ids) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    assert_eq!(origins.get("PathBuf").map(String::as_str), Some("path"));
+    assert_eq!(
+        origins.get("OsString").map(String::as_str),
+        Some("ffi::os_str")
+    );
+    assert!(
+        !fields.fields.contains_key("PathBuf"),
+        "Opaque PathBuf is rpath.py s_Str0, not a ClassDef"
+    );
+    assert!(
+        ids.get("PathBuf").is_none(),
+        "by-value Opaque PathBuf has no StructId"
+    );
+    let _guard = crate::test_support::register_struct_origins_serialized(origins);
+    assert!(
+        is_str_family_class_root("PathBuf"),
+        "CAST PathBuf leaf resolves through the Opaque TypeDecl origin"
+    );
+    assert!(!is_os_path_family_root("PathBuf"));
+    assert!(
+        is_niche_option_gc_payload_spelling("option::Option<PathBuf>", None),
+        "Option<PathBuf> noneifies as SomeString after Opaque origin harvest"
+    );
+    majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
+}
+
+/// Option intern suffix uses the crate-stripped TypeDecl path
+/// (`charon_type_value_to_enum_arg`). CAST / Vec intern of the same
+/// TypeDecl keeps the leaf (`charon_adt_to_ast_string`) so `type_align`
+/// still sees `Vec<PathBuf>`.
+#[test]
+fn option_intern_suffix_qualifies_os_path_and_oparg_typedecl() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            code_struct(0, &["std", "path", "PathBuf"]),
+            code_struct(1, &["other", "PathBuf"]),
+            code_struct(
+                2,
+                &["rustpython_compiler_core", "bytecode", "oparg", "ConstIdx"],
+            ),
+            code_struct(3, &["other", "ConstIdx"]),
+        ],
+        vec![],
+    );
+    let adt = |id: u64| serde_json::json!({"id": id, "generics": {"types": []}});
+    let render = |id: u64| super::charon_adt_to_ast_string(adt(id).as_object().unwrap(), &llbc, 0);
+    let enum_arg = |id: u64| {
+        super::charon_type_value_to_enum_arg(
+            &serde_json::json!({"Adt": {"id": id, "generics": {"types": []}}}),
+            &llbc,
+            0,
+            super::no_tombstoned_leaves(),
+        )
+    };
+    assert_eq!(render(0), "PathBuf");
+    assert_eq!(enum_arg(0), "path::PathBuf");
+    assert_eq!(render(1), "PathBuf");
+    assert_eq!(enum_arg(1), "PathBuf");
+    assert_eq!(render(2), "ConstIdx");
+    assert_eq!(enum_arg(2), "bytecode::oparg::ConstIdx");
+    assert_eq!(render(3), "ConstIdx");
+    assert_eq!(enum_arg(3), "ConstIdx");
 }
 
 #[test]
 fn oparg_newtype_spelling_is_the_compiler_core_wrapper() {
     for spelling in [
-        "ConstIdx",
-        "LoadAttr",
-        "OpArg",
         "bytecode::oparg::ConstIdx",
         "bytecode::oparg::LoadAttr",
         "oparg::ConstIdx",
         "rustpython_compiler_core::bytecode::oparg::ConstIdx",
         "rustpython_compiler_core::bytecode::oparg::LoadAttr",
-        "&ConstIdx",
-        "&mut LoadAttr",
+        "&bytecode::oparg::ConstIdx",
+        "&mut bytecode::oparg::LoadAttr",
     ] {
         assert!(
             is_oparg_newtype_spelling(spelling),
             "{spelling} is a newtype_oparg! wrapper"
         );
     }
+    assert!(!is_oparg_newtype_spelling("ConstIdx"));
+    assert!(!is_oparg_newtype_spelling("LoadAttr"));
+    assert!(!is_oparg_newtype_spelling("OpArg"));
+    assert!(!is_oparg_newtype_spelling("&ConstIdx"));
     assert!(!is_oparg_newtype_spelling("other::ConstIdx"));
     assert!(!is_oparg_newtype_spelling("other::LoadAttr"));
     assert!(!is_oparg_newtype_spelling("String"));
@@ -516,14 +623,30 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     let intern_none = |s: &str| is_niche_option_gc_payload_spelling(s, None);
     assert!(intern_none("option::Option<string::String>"));
     assert!(intern_none("Option<*mut unicodeobject::Utf8Str>"));
-    assert!(intern_none("Option<path::PathBuf>"));
-    assert!(intern_none("option::Option<PathBuf>"));
-    assert!(intern_none("Option<ffi::OsString>"));
-    assert!(!intern_none("Option<other::PathBuf>"));
-    assert!(intern_none("Option<borrow::Cow<str>>"));
-    assert!(intern_none("option::Option<Cow<'static, str>>"));
-    assert!(intern_none("Option<alloc::borrow::Cow<String>>"));
-    assert!(!intern_none("Option<borrow::Cow<[u8]>>"));
+    {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        assert!(intern_none("Option<path::PathBuf>"));
+        assert!(intern_none("option::Option<std::path::PathBuf>"));
+        assert!(intern_none("Option<ffi::OsString>"));
+        assert!(intern_none("Option<std::ffi::os_str::OsString>"));
+        assert!(!intern_none("option::Option<PathBuf>"));
+        assert!(!intern_none("Option<other::PathBuf>"));
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::from([(
+            "PathBuf".to_string(),
+            "path".to_string(),
+        )]));
+        assert!(
+            intern_none("option::Option<PathBuf>"),
+            "a CAST PathBuf leaf noneifies after TypeDecl struct_origins"
+        );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
+        assert!(intern_none("Option<borrow::Cow<str>>"));
+        assert!(intern_none("option::Option<Cow<'static, str>>"));
+        assert!(intern_none("Option<alloc::borrow::Cow<String>>"));
+        assert!(!intern_none("Option<borrow::Cow<[u8]>>"));
+    }
     assert!(!intern_none("Option<pyobject::PyObject>"));
     assert!(!intern_none("Option<W_BufferedReader>"));
     assert!(!intern_none("pyobject::PyObject"));
@@ -7310,6 +7433,141 @@ fn user_trait_deref_method_is_not_ops_deref() {
     // Unresolved Trait fallback: full declared path, not the last segment.
     assert!(super::is_deref_call(&clause_call(0), &llbc));
     assert!(!super::is_deref_call(&clause_call(1), &llbc));
+}
+
+#[test]
+fn from_impl_method_is_core_convert_from_not_leaf_name() {
+    // `description.py` does not key a conversion on the identifier
+    // `from`. A FunDecl whose leaf is `from` is `From::from` only when
+    // its impl's `impl_trait` is `core::convert::From`.
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let string_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": []}}
+    });
+    let string_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["alloc", "string", "String"]),
+        "kind": {"Struct": []}
+    });
+    let fundecl = |def_id: u64, impl_id: u64, segs: &[&str]| {
+        let mut name: Vec<serde_json::Value> = segs
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        name.push(serde_json::json!({
+            "Impl": {
+                "Ty": {"skip_binder": {"Value": [0, string_adt.clone()]}},
+                "Trait": impl_id
+            }
+        }));
+        name.push(serde_json::json!({"Ident": ["from", 0]}));
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [string_adt.clone()],
+                "output": string_adt.clone()
+            },
+            "body": null
+        })
+    };
+    let inherent_from = {
+        let mut name: Vec<serde_json::Value> = ["foo", "PathBuf"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        name.push(serde_json::json!({
+            "Impl": {
+                "Ty": {"skip_binder": {"Value": [0, string_adt.clone()]}}
+            }
+        }));
+        name.push(serde_json::json!({"Ident": ["from", 0]}));
+        serde_json::json!({
+            "def_id": 3,
+            "item_meta": {
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [string_adt.clone()],
+                "output": string_adt.clone()
+            },
+            "body": null
+        })
+    };
+    let trait_impl = |trait_id: u64, fn_id: u64| {
+        serde_json::json!({
+            "impl_trait": {"id": trait_id, "generics": {"types": [string_adt.clone()]}},
+            "generics": {"types": [], "const_generics": [], "trait_refs": []},
+            "methods": [{
+                "kind": {"TraitMethod": [trait_id, 0]},
+                "skip_binder": {"id": fn_id}
+            }]
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [string_td],
+            "fun_decls": [
+                null,
+                fundecl(1, 0, &["alloc", "string"]),
+                fundecl(2, 1, &["foo"]),
+                inherent_from
+            ],
+            "global_decls": [],
+            "trait_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "convert", "From"]),
+                    "methods": [{"skip_binder": {"name": "from"}}]
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["foo", 0]}, {"Ident": ["MyFrom", 0]}],
+                        "span": span.clone(),
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "methods": [{"skip_binder": {"name": "from"}}]
+                }
+            ],
+            "trait_impls": [trait_impl(0, 1), trait_impl(1, 2)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let core_from = llbc.fn_by_id(1).expect("String as From::from");
+    let my_from = llbc.fn_by_id(2).expect("String as MyFrom::from");
+    let inherent = llbc.fn_by_id(3).expect("inherent foo::PathBuf::from");
+    assert!(super::fundecl_is_core_convert_from_from(&llbc, core_from));
+    assert!(!super::fundecl_is_core_convert_from_from(&llbc, my_from));
+    assert!(!super::fundecl_is_core_convert_from_from(&llbc, inherent));
 }
 
 #[test]

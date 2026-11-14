@@ -1093,6 +1093,13 @@ pub trait GcAllocator: Send {
         0
     }
 
+    /// Whether `obj` is in the freeze set. Collectors without a freeze
+    /// set answer false. `visit_get_objects` / `visit_get_referrers`
+    /// skip `_PyGC_BITS_FROZEN`.
+    fn is_frozen(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
     /// `incminimark.py collect_step`: perform one minor collection
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
@@ -2044,6 +2051,13 @@ impl GcAllocator for GcHandle {
     }
     fn freeze_count(&mut self) -> i64 {
         gc_sync::gc_op(|gc| gc.freeze_count())
+    }
+    fn is_frozen(&mut self, obj: GcRef) -> bool {
+        if gc_sync::in_gc_op() {
+            gc_sync::gc_query_reentrant(|gc| gc.is_frozen(obj))
+        } else {
+            gc_sync::gc_op(|gc| gc.is_frozen(obj))
+        }
     }
     fn collect_step(&mut self) -> GcStepTransition {
         gc_sync::gc_op(|gc| gc.collect_step())
@@ -3807,6 +3821,21 @@ pub fn freeze_count() -> i64 {
     match ACTIVE_FREEZE_COUNT.get() {
         Some(f) => f(),
         None => 0,
+    }
+}
+
+/// Whether `obj` is in the freeze set. False when no collector is
+/// installed. Uses the reentrant query while an inspection already
+/// holds `gc_op`, so `get_objects` / `get_referrers` visitors can ask
+/// without nesting `&mut`.
+pub fn is_frozen(obj: GcRef) -> bool {
+    if !gc_sync::is_initialized() {
+        return false;
+    }
+    if gc_sync::in_gc_op() {
+        gc_sync::gc_query_reentrant(|gc| gc.is_frozen(obj))
+    } else {
+        gc_sync::gc_op(|gc| gc.is_frozen(obj))
     }
 }
 

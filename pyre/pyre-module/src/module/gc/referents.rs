@@ -186,7 +186,14 @@ fn pin_object(object: majit_ir::GcRef) {
 /// collector. Keep the PyPy/RPython traversal in `majit_gc`; filter only at
 /// the public CPython-compatible boundary, using the same tracked-state model
 /// as `interp_gc::is_tracked`.
+///
+/// `[3.15-spec]` `visit_get_objects` / `visit_get_referrers` skip
+/// `_PyGC_BITS_FROZEN`. `rgc.do_get_objects` still reports the whole live
+/// set so `freeze` can union that snapshot.
 fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
+    if majit_gc::is_frozen(object) {
+        return;
+    }
     let w_obj = object.0 as PyObjectRef;
     if pyre_interpreter::typedef::cpython_object_is_gc(w_obj) {
         let _ = pyre_object::gc_roots::pin_root(w_obj);

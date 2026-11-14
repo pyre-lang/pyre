@@ -5885,6 +5885,15 @@ impl Bookkeeper {
             .trim_start_matches("*const ")
             .trim_start_matches("*mut ")
             .trim();
+        // `charon_adt_to_ast_string` still emits the TypeDecl leaf for a
+        // CAST tuple / Result payload (`Tuple<ConstIdx>`, `Tuple<PathBuf>`
+        // from `option_payload_tuple_suffix`). `canonical_struct_name`
+        // prepends the module harvested from `item_meta.name_path`
+        // (`derive_program_metadata` `struct_origins`) so the existing
+        // `tyref_is_oparg` / `is_os_path_family_root` spellings see
+        // `bytecode::oparg::ConstIdx` / `path::PathBuf`. A bare leaf
+        // with no origin stays the leaf and is rejected.
+        let resolved = majit_ir::descr::canonical_struct_name(stripped);
         // `rstring.py` `StringBuilder` (`pyre_object::rstring`): the
         // `rutf8.py` `Utf8StringBuilder._s` attribute is `SomeStringBuilder`.
         if stripped == "StringBuilder" || stripped.ends_with("rstring::StringBuilder") {
@@ -5913,8 +5922,12 @@ impl Bookkeeper {
             // Name(u32)` (`OpArg`, `ConstIdx`, `LoadAttr`, …). Interning
             // the name as a Ptr struct made `Result<ConstIdx, Never>::Ok`
             // `__pos_0` fail to union with the Integer `Into<ConstIdx>`
-            // result (`core::convert` `TryFrom` blanket `Ok(U::into(value))`).
-            _ if crate::front::mir::is_oparg_newtype_spelling(stripped) => {
+            // result (`core::convert` `TryFrom` blanket `Ok(U::into(value))`;
+            // `annotator/model.py` `SomeInteger`). A CAST leaf is
+            // `resolved` above.
+            _ if crate::front::mir::is_oparg_newtype_spelling(stripped)
+                || crate::front::mir::is_oparg_newtype_spelling(&resolved) =>
+            {
                 return super::model::s_uint();
             }
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
@@ -5951,6 +5964,7 @@ impl Bookkeeper {
             // (`op_gc_restore_root`) and `LLHelpers.ll_strlen` read it as
             // the string itself.
             _ if crate::front::mir::is_str_family_class_root(stripped)
+                || crate::front::mir::is_str_family_class_root(&resolved)
                 || crate::front::mir::is_rstr_str_layout_declaration(stripped)
                 || crate::front::mir::is_cow_str_family_class_root(stripped) =>
             {
@@ -8171,7 +8185,12 @@ fn fn_ptr_arg_lltype(
         "str" | "String" | "Wtf8" | "Wtf8Buf" => {
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
         }
-        other if crate::front::mir::is_os_path_family_root(other) => {
+        other
+            if crate::front::mir::is_os_path_family_root(other)
+                || crate::front::mir::is_os_path_family_root(
+                    &majit_ir::descr::canonical_struct_name(other),
+                ) =>
+        {
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
         }
         "StringBuilder" => {
@@ -8222,7 +8241,14 @@ fn fn_ptr_result_lltype(
         "f32" => ValueType::SingleFloat,
         "f64" => ValueType::Float,
         "str" | "String" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
-        other if crate::front::mir::is_os_path_family_root(other) => ValueType::Str,
+        other
+            if crate::front::mir::is_os_path_family_root(other)
+                || crate::front::mir::is_os_path_family_root(
+                    &majit_ir::descr::canonical_struct_name(other),
+                ) =>
+        {
+            ValueType::Str
+        }
         "StringBuilder" => ValueType::StringBuilder,
         other if is_fn_type_spelling(other) => ValueType::Int,
         _ => ValueType::Ref(None),
@@ -9731,12 +9757,14 @@ mod tests {
             "the carrier predicate does not treat a sum as the carrier"
         );
 
+        let _path_origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
         for spelling in [
-            "fn() -> PathBuf",
             "fn() -> path::PathBuf",
             "fn() -> std::path::PathBuf",
-            "fn() -> OsString",
             "fn() -> std::ffi::OsString",
+            "fn() -> std::ffi::os_str::OsString",
         ] {
             let s = fn_ptr_somevalue_for_spelling(spelling)
                 .unwrap_or_else(|| panic!("{spelling}: fn-pointer spelling"));
@@ -9752,6 +9780,25 @@ mod tests {
                 "{spelling}: FUNC.RESULT is STRPTR (`rpath.py` s_Str0 / `rstr.py` one string type)"
             );
         }
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> PathBuf", &|_| false, &|_| false)
+                .expect("bare PathBuf is a fn pointer")
+                .result,
+            OBJECTPTR.clone(),
+            "a bare PathBuf leaf is not rpath.py s_Str0"
+        );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::from([(
+            "PathBuf".to_string(),
+            "path".to_string(),
+        )]));
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> PathBuf", &|_| false, &|_| false)
+                .expect("resolved PathBuf is a fn pointer")
+                .result,
+            STRPTR.clone(),
+            "a CAST PathBuf leaf resolves through TypeDecl struct_origins"
+        );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
         let arg = fn_ptr_somevalue_for_spelling("fn(path::PathBuf) -> ()")
             .expect("PathBuf arg spelling is a fn pointer");
         let SomeValue::Ptr(p_arg) = &arg else {
@@ -9971,9 +10018,16 @@ mod tests {
 
     #[test]
     fn project_struct_field_type_os_path_family_is_s_str0() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
         let bk = bk();
         assert_eq!(
             bk.project_struct_field_type("path::PathBuf"),
+            crate::annotator::model::s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("std::path::PathBuf"),
             crate::annotator::model::s_str0()
         );
         assert_eq!(
@@ -9981,8 +10035,13 @@ mod tests {
             crate::annotator::model::s_str0()
         );
         assert_eq!(
-            bk.project_struct_field_type("PathBuf"),
+            bk.project_struct_field_type("std::ffi::os_str::OsString"),
             crate::annotator::model::s_str0()
+        );
+        assert_ne!(
+            bk.project_struct_field_type("PathBuf"),
+            crate::annotator::model::s_str0(),
+            "a bare PathBuf leaf is not rpath.py s_Str0"
         );
         assert_ne!(
             bk.project_struct_field_type("other::PathBuf"),
@@ -9994,28 +10053,66 @@ mod tests {
             crate::annotator::model::s_str0(),
             "an unrelated OsString declaration is not rpath.py s_Str0"
         );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::from([(
+            "PathBuf".to_string(),
+            "path".to_string(),
+        )]));
+        assert_eq!(
+            bk.project_struct_field_type("PathBuf"),
+            crate::annotator::model::s_str0(),
+            "a CAST PathBuf leaf resolves through TypeDecl struct_origins"
+        );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
     }
 
     #[test]
     fn project_struct_field_type_oparg_newtype_is_s_uint() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
         let bk = bk();
         assert_eq!(
             bk.project_struct_field_type("bytecode::oparg::ConstIdx"),
             crate::annotator::model::s_uint()
         );
         assert_eq!(
-            bk.project_struct_field_type("LoadAttr"),
+            bk.project_struct_field_type("rustpython_compiler_core::bytecode::oparg::ConstIdx"),
             crate::annotator::model::s_uint()
         );
         assert_eq!(
-            bk.project_struct_field_type("ConstIdx"),
+            bk.project_struct_field_type("oparg::LoadAttr"),
             crate::annotator::model::s_uint()
+        );
+        assert_ne!(
+            bk.project_struct_field_type("LoadAttr"),
+            crate::annotator::model::s_uint(),
+            "a bare LoadAttr leaf is not a newtype_oparg! wrapper"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("ConstIdx"),
+            crate::annotator::model::s_uint(),
+            "a bare ConstIdx leaf is not a newtype_oparg! wrapper"
         );
         assert_ne!(
             bk.project_struct_field_type("other::ConstIdx"),
             crate::annotator::model::s_uint(),
             "an unrelated ConstIdx declaration is not a newtype_oparg! wrapper"
         );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::from([
+            ("ConstIdx".to_string(), "bytecode::oparg".to_string()),
+            ("LoadAttr".to_string(), "bytecode::oparg".to_string()),
+        ]));
+        assert_eq!(
+            bk.project_struct_field_type("ConstIdx"),
+            crate::annotator::model::s_uint(),
+            "a CAST ConstIdx leaf resolves through TypeDecl struct_origins"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("LoadAttr"),
+            crate::annotator::model::s_uint(),
+            "a CAST LoadAttr leaf resolves through TypeDecl struct_origins"
+        );
+        majit_ir::descr::register_struct_origins(std::collections::HashMap::new());
     }
 
     #[test]

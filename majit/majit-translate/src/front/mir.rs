@@ -1734,6 +1734,19 @@ fn intern_payload_registry_spelling(
             continue;
         }
         let canon = strip_crate_prefix(&name);
+        // Foreign `Opaque` std path / `newtype_oparg!` wrappers have no
+        // harvested field row. Remap the unique TypeDecl leaf onto the
+        // crate-stripped path so intern is `path::PathBuf` /
+        // `bytecode::oparg::ConstIdx` (`rpath.py` `_posix_rnormpath`
+        // `s_Str0`; `annotator/model.py` `SomeInteger`).
+        if decl_is_str0_or_oparg(&name) {
+            match resolved.as_ref() {
+                Some(prev) if prev != &canon => return spelling.to_string(),
+                Some(_) => {}
+                None => resolved = Some(canon),
+            }
+            continue;
+        }
         let key = if !canon.is_empty() && struct_fields.fields.contains_key(&canon) {
             canon
         } else if struct_fields.fields.contains_key(&name) {
@@ -1748,6 +1761,15 @@ fn intern_payload_registry_spelling(
         }
     }
     resolved.unwrap_or_else(|| spelling.to_string())
+}
+
+/// TypeDecl whose crate-stripped path is rpath `s_Str0` or a
+/// `newtype_oparg!` wrapper. `std::path::PathBuf` is `Opaque` in the
+/// interpreter LLBC (`opacity: Foreign`); intern is the TypeDecl path,
+/// not a ClassDef.
+fn decl_is_str0_or_oparg(name_path: &str) -> bool {
+    let canon = strip_crate_prefix(name_path);
+    is_os_path_family_root(&canon) || is_oparg_newtype_spelling(&canon)
 }
 
 /// Publish an empty struct row for a `TypeDeclKind::Opaque` payload the
@@ -1782,6 +1804,14 @@ fn intern_opaque_payload_spelling(
         let canon = strip_crate_prefix(&name);
         if spelling != name && spelling != leaf && spelling != canon {
             continue;
+        }
+        // `rpath.py` `_posix_rnormpath` `s_Str0` / `newtype_oparg!`
+        // wrappers intern as string / integer, not a ClassDef. Publishing
+        // the CAST leaf as an empty field row made
+        // `classdef_for_known_struct_root("PathBuf")` mint
+        // `Instance(PathBuf)` that cannot union with `SomeString`.
+        if decl_is_str0_or_oparg(&name) {
+            return;
         }
         for key in [name.as_str(), canon.as_str(), leaf] {
             if key.is_empty() {
@@ -4198,6 +4228,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Option<")
         && !is_rust_heap_string_root(ty)
         && !is_os_path_family_root(ty)
+        && !is_os_path_family_root(&majit_ir::descr::canonical_struct_name(ty))
     {
         format!("&{ty}")
     } else {
@@ -4249,7 +4280,16 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `rpath.py` `_posix_rnormpath` `s_Str0`: the same owned-header
         // `Ref` paint as rust-heap `String` so `ll_strconcat` does not
         // consume `{cap, ptr, len}`.
-        s if is_os_path_family_root(s) => ValueType::Ref(Some(s.into())),
+        s if is_os_path_family_root(s)
+            || is_os_path_family_root(&majit_ir::descr::canonical_struct_name(s)) =>
+        {
+            let root = if is_os_path_family_root(s) {
+                s.to_string()
+            } else {
+                majit_ir::descr::canonical_struct_name(s)
+            };
+            ValueType::Ref(Some(root))
+        }
         s if is_rstr_str_family_spelling(s) => ValueType::Str,
         _ => {
             if majit_ir::descr::is_shared_u8_slice_spelling(type_name)
@@ -6218,7 +6258,25 @@ fn derive_program_metadata(
                     &mut known_struct_names,
                 );
             }
-            TypeDeclKind::Union(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+            TypeDeclKind::Union(_) | TypeDeclKind::Unknown => {}
+            TypeDeclKind::Opaque => {
+                // Foreign std `PathBuf` / `OsString` and `newtype_oparg!`
+                // wrappers are `Opaque` (`opacity: Foreign`). They have
+                // no field rows; harvest the TypeDecl leaf origin so a
+                // CAST intern leaf resolves through
+                // `canonical_struct_name` (`rpath.py` `_posix_rnormpath`
+                // `s_Str0`; `annotator/model.py` `SomeInteger`).
+                if decl_is_str0_or_oparg(&name) {
+                    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                    let segs: Vec<&str> = name.split("::").collect();
+                    let module = if segs.len() >= 2 {
+                        segs[1..segs.len() - 1].join("::")
+                    } else {
+                        String::new()
+                    };
+                    struct_origins.entry(leaf).or_insert(module);
+                }
+            }
         }
     }
 

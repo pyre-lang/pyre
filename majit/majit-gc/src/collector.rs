@@ -1193,8 +1193,9 @@ pub struct MiniMarkGC {
     /// Extra root list for `gc.freeze()` / `gc.unfreeze()` /
     /// `gc.get_freeze_count()`. 3.15t observable: freeze snapshots every live
     /// GC object, later collections treat them as roots (kept alive until
-    /// unfreeze), `get_freeze_count` is the list length. Engineered as an extra
-    /// `AddressStack` like incminimark.py `prebuilt_root_objects`.
+    /// unfreeze), `get_freeze_count` is the list length, and
+    /// `gc.get_objects` / `gc.get_referrers` omit the set. Engineered as an
+    /// extra `AddressStack` like incminimark.py `prebuilt_root_objects`.
     frozen_objects: Vec<usize>,
     /// High-water capacity of [`Self::enumerate_labeled_root_walker_values`]'s
     /// snapshot, so the next one asks the allocator once instead of growing
@@ -6913,7 +6914,7 @@ impl MiniMarkGC {
 
     /// `frozen_objects` is scanned with `prebuilt_root_objects`
     /// (`incminimark.py` `prebuilt_root_objects.foreach(_collect_obj)`).
-    /// Frozen entries are old heap objects after `do_collect_full`; the
+    /// Frozen entries are old heap objects after the freeze minor; the
     /// extra-root seeder leaves `old_objects_pointing_to_young` to the write
     /// barrier the same way `visit` does for `prebuilt_root_objects`.
     fn seed_frozen_objects(&mut self) {
@@ -7133,12 +7134,17 @@ impl MiniMarkGC {
 
     /// Snapshot currently live objects as extra roots (`gc.freeze`).
     ///
-    /// `do_collect_full` first so nursery survivors are old and non-moving
-    /// and every remaining old object is live, then the all-generations
-    /// `do_get_objects` walk (`rgc.py` `do_get_objects`) is the live set.
-    /// Union with the previous frozen set, then sort+dedup.
+    /// A minor collection first so nursery survivors are old and non-moving:
+    /// `frozen_objects` holds addresses. No major collection (`_PyGC_Freeze`
+    /// only marks objects frozen). Then the all-generations `do_get_objects`
+    /// walk (`rgc.py` `do_get_objects`) is the live set. Union with the
+    /// previous frozen set, then sort+dedup. A major cycle already in
+    /// progress picks the new entries up in
+    /// `rescan_major_nonstack_roots_and_drain`, which re-seeds
+    /// `frozen_objects` with `prebuilt_root_objects` (`incminimark.py`
+    /// `collect_nonstack_roots`).
     pub fn freeze(&mut self) {
-        self.do_collect_full();
+        self.minor_collection_only();
         let mut newly = Vec::new();
         self.do_get_objects(-1, &mut |gcref| newly.push(gcref.0));
         self.frozen_objects.extend(newly);
@@ -7155,6 +7161,12 @@ impl MiniMarkGC {
     /// `gc.get_freeze_count`: size of the freeze set.
     pub fn freeze_count(&self) -> i64 {
         self.frozen_objects.len() as i64
+    }
+
+    /// Whether `obj` is in the freeze set. The vec is sorted and deduped
+    /// by [`Self::freeze`].
+    pub fn is_frozen(&self, obj: GcRef) -> bool {
+        self.frozen_objects.binary_search(&obj.0).is_ok()
     }
 
     /// `inspector.py get_rpy_roots`: enumerate the raw root values
@@ -11301,6 +11313,10 @@ impl GcAllocator for MiniMarkGC {
         MiniMarkGC::freeze_count(self)
     }
 
+    fn is_frozen(&mut self, obj: GcRef) -> bool {
+        MiniMarkGC::is_frozen(self, obj)
+    }
+
     fn collect_step(&mut self) -> crate::GcStepTransition {
         self.collect_step()
     }
@@ -14610,6 +14626,29 @@ mod tests {
         assert_eq!(gc.freeze_count(), n);
         gc.unfreeze();
         assert_eq!(gc.freeze_count(), 0);
+    }
+
+    /// `_PyGC_Freeze` does not collect: unreachable old garbage that
+    /// existed before the call stays, and `is_frozen` tracks the set
+    /// until `unfreeze`.
+    #[test]
+    fn freeze_does_not_free_old_garbage_and_is_frozen_tracks_the_set() {
+        let mut gc = test_gc(4096);
+        let mut info = TypeInfo::simple(16);
+        info.is_object = true;
+        let tid = gc.register_type(info);
+        let garbage = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        let mut obj = gc.alloc_with_type(tid, 16);
+        unsafe { gc.roots.add(&mut obj) };
+        let freed_before = gc.objects_freed();
+        gc.freeze();
+        assert_eq!(gc.objects_freed(), freed_before);
+        assert_eq!(unsafe { (*header_of(garbage.0)).type_id() }, tid);
+        assert!(gc.is_frozen(obj));
+        assert!(!gc.is_frozen(garbage));
+        gc.unfreeze();
+        assert!(!gc.is_frozen(obj));
+        gc.roots.clear();
     }
 
     // incminimark gates the write barrier solely on GCFLAG_TRACK_YOUNG_PTRS:

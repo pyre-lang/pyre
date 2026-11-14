@@ -10491,14 +10491,16 @@ fn eval_with_jit_inner(
     // eval loop, so the recursion budget is spent here, where every JIT route
     // through the frame — compiled, JIT eval loop, or declined to the plain
     // evaluator — passes exactly once.
-    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    //
+    // `enter_recursive_frame` crosses a write barrier and
     // `PYRE_JIT_PROCESS_SETUP.call_once` collects on the first frame
     // (`init_gc_root_walkers` / `install_jit_call_bridge`). The EvalFn
     // `&mut PyFrame` is a register snapshot of a `FrameBox` DerefMut;
     // `FrameRoot` is the shadow-stack livevar (`shadowstack.py`
-    // `push_roots` / `pop_roots`) re-read after that collect
-    // (`framework.py` `gct_direct_call`).
+    // `push_roots` / `pop_roots`), pushed before the first of them and
+    // re-read after each (`framework.py` `gct_direct_call`).
     let mut frame_root = FrameRoot::new(frame);
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
     // Process-global JIT/eval setup. The walkers, reverse hooks, call
     // bridge, callback table and cranelift deopt latch are each
     // idempotent; running them on every frame paid the call and the
@@ -11544,8 +11546,10 @@ pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
     // `record_activation_charge` already emitted this door's logical depth
     // check into the compiled trace. Only a guard exit that re-enters through
     // `portal_activation_result` needs to repeat the check in Rust.
-    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    // `FrameRoot` is pushed before `enter_recursive_frame`, whose write
+    // barrier can move a nursery frame (`shadowstack.py` `push_roots`).
     let mut frame_root = FrameRoot::new(frame);
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
     portal_activation_bracketed(&mut frame_root, None, None, PortalLeaveOwner::CompiledTrace)
@@ -11612,11 +11616,13 @@ pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
 ///
 /// `ll_portal_runner` is an activation entry in its own right: recursive portal
 /// calls can reach it without the ordinary `eval_with_jit_inner` wrapper.
-/// Account before constructing `FrameRoot`, because a moving GC may change the
-/// frame's address while the activation remains the same.
+/// `FrameRoot` is constructed before the activation is accounted:
+/// `enter_recursive_frame` crosses a write barrier, and the accounted claim it
+/// stores is the frame address re-read from the root after any move.
 fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> PyResult {
-    let _recursion_depth = enter_portal_activation(frame)?;
+    // Same push-before-collect order as `eval_with_jit_inner`.
     let mut frame_root = FrameRoot::new(frame);
+    let _recursion_depth = enter_portal_activation(frame_root.frame())?;
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
     body(&mut frame_root)
