@@ -5,6 +5,11 @@
 # instance now promotes its map (mapdict.py MapdictStorageMixin._get_mapdict_map
 # = jit.promote(self.map); class identity is terminator.w_cls). Map nodes are
 # interned + immortal, so that GUARD_VALUE is a stable word; wasm agrees.
+# pyre-check: jitstats-band=fbw_blackhole_adopted_single_frame=1,fbw_blackhole_adopted_multi_frame=1
+# The `Pickler.save` walk that inlines `save_dict` stops at the 6000-op trace
+# limit, and the blackhole adopts that abort from whichever frame is current at
+# op 6001: darwin and ubuntu-24.04 read 0/1 (single/multi), windows-latest 1/0.
+# loops and bridges stay exact.
 # A guard-failure bridge resumes `pickle._Unpickler.load` in the middle of its
 # `while True` loop, inlines the dispatched opcode handler and reaches the loop
 # header again.  It finishes that frame there and runs the rest of the loop with
