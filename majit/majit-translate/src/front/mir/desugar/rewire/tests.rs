@@ -2,7 +2,7 @@ use super::is_core_result_map_err_path;
 
 use crate::flowspace::model::Variable;
 
-use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, ValueType};
 
 use crate::front::mir::tests::{
     OptionRecvRepr, assert_option_recv_repr, build_two_arg_combinator, count_branch_calls,
@@ -936,6 +936,185 @@ fn result_and_then_lowers_to_discriminant_switch() {
     assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
 }
 
+fn variant_ctor_name(op: &crate::model::SpaceOperation) -> Option<&str> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            ..
+        } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn producer_variant_ctor<'g>(graph: &'g FunctionGraph, v: &Variable) -> Option<&'g str> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| {
+            (op.result.as_ref() == Some(v))
+                .then(|| variant_ctor_name(op))
+                .flatten()
+        })
+}
+
+/// Merge of a carrier `and_then(fn_item)`: incoming values are Result
+/// shells (`Ok`/`Err` from `catch_and_rewrap`, plus `Err` rebuilt from
+/// the receiver).
+fn merge_slot0_variant_ctors(graph: &FunctionGraph) -> Vec<&str> {
+    let merge = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block.inputargs.len() == 1
+                && graph
+                    .blocks
+                    .iter()
+                    .filter(|pred| pred.exits.iter().any(|link| link.target == block.id))
+                    .count()
+                    >= 2
+        })
+        .expect("and_then diamond merge");
+    let mut names = Vec::new();
+    for pred in &graph.blocks {
+        for link in &pred.exits {
+            if link.target != merge.id {
+                continue;
+            }
+            let Some(arg) = link.args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            if let Some(name) = producer_variant_ctor(graph, arg) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn fn_item_call_block<'g>(graph: &'g FunctionGraph, leaf: &str) -> &'g crate::model::Block {
+    graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some(leaf)
+                )
+            })
+        })
+        .expect("fn-item call block")
+}
+
+fn last_exception_catch_target(block: &crate::model::Block) -> crate::model::BlockId {
+    assert!(
+        matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+        "fn-item call block must have ExitSwitch::LastException"
+    );
+    let catch = block
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_some())
+        .expect("LastException catch link");
+    assert!(
+        matches!(catch.exitcase, Some(ExitCase::ErrorCarrier)),
+        "catch link is except OperationError as e (`error_carrier_exitcase`)"
+    );
+    catch.target
+}
+
+fn graph_reaches(
+    graph: &FunctionGraph,
+    start: crate::model::BlockId,
+    pred: impl Fn(usize) -> bool,
+) -> bool {
+    let mut seen = vec![false; graph.blocks.len()];
+    let mut stack = vec![start.0];
+    while let Some(i) = stack.pop() {
+        if seen.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        seen[i] = true;
+        if pred(i) {
+            return true;
+        }
+        for link in &graph.blocks[i].exits {
+            stack.push(link.target.0);
+        }
+    }
+    false
+}
+
+fn block_has_err_ctor(graph: &FunctionGraph, i: usize) -> bool {
+    graph.blocks[i]
+        .operations
+        .iter()
+        .any(|op| variant_ctor_name(op) == Some("Err"))
+}
+
+fn block_has_question_const(graph: &FunctionGraph, i: usize) -> bool {
+    graph.blocks[i].operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.len() == 2 && segments[0] == "__str_const" && segments[1] == "?"
+        )
+    })
+}
+
+/// Carrier `Result::and_then` of a function item: the Ok arm's fn-item
+/// call has `LastException` (`catch_and_rewrap`), so both the normal
+/// `Ok(raw)` and the catch `Err(last_exc_value)` join as Result
+/// (`annrpython.py` `unionof`). A closure `and_then` still forwards
+/// `call_once`.
+#[test]
+fn result_and_then_carrier_fn_item_ok_arm_rebuilds_ok() {
+    let (mut graph, result) = build_two_arg_combinator("and_then");
+    let mut site = disc_site(super::DiscCombinator::ResultAndThen, result);
+    site.call_once_owner = String::new();
+    site.fn_item_segments = Some(["test", "step"].map(str::to_string).to_vec());
+    site.call_result_ty = ValueType::Ref(Some("core::result::Result".into()));
+    site.carrier_recv = true;
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[site],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    assert_eq!(count_method_calls(&graph, "and_then"), 0);
+    assert_eq!(count_method_calls(&graph, "call_once"), 0);
+    let fn_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("step")
+            )
+        })
+        .count();
+    assert_eq!(fn_calls, 1);
+    assert_eq!(merge_slot0_variant_ctors(&graph), ["Err", "Ok"]);
+    let call_block = fn_item_call_block(&graph, "step");
+    let catch = last_exception_catch_target(call_block);
+    assert!(
+        graph_reaches(&graph, catch, |i| block_has_err_ctor(&graph, i)),
+        "catch link must reach the Err arm"
+    );
+}
+
 /// A combinator call `result_exc` made can-raise (its result renamed to
 /// the `Ok` payload), whose receiver is the `Ok`/`Err` shell pair
 /// `catch_and_rewrap` rebuilt around a raising producer.
@@ -1471,4 +1650,90 @@ fn classed_result_enum_owner_is_core_result_path() {
     );
     let leaf = ValueType::Ref(Some("Result<Infallible, E>".to_string()));
     assert_eq!(super::classed_result_enum_owner(&leaf), None);
+}
+
+fn producer_is_bare_fn_path(graph: &FunctionGraph, v: &Variable) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            op.result.as_ref() == Some(v)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target,
+                        ..
+                    } if matches!(target, CallTarget::FunctionPath { .. })
+                        && crate::model::fn_const_segments(target).is_none()
+                )
+        })
+}
+
+/// Production `and_then` of a function item on a carrier Result: a
+/// two-predecessor merge must not join a bare function-item call with a
+/// rebuilt `Err` (`annrpython.py` `mergeinputargs` / `unionof`).
+#[test]
+fn format_obj_name_and_then_join_is_a_result() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "pyre_interpreter::error::PyError",
+        carrier_class: "",
+        carrier_wrappers: &[],
+        to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+        from_exc_object: Some(("PyError", "from_exc_object")),
+    };
+    let name = "pyre_interpreter::error::format_obj_name";
+    let graph = crate::front::mir::lower_function_with_static_addrs(
+        &llbc,
+        name,
+        crate::HostStaticAddrs {
+            error_carrier: spec,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+    for block in &graph.blocks {
+        if block.inputargs.is_empty() {
+            continue;
+        }
+        let preds: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|pred| {
+                pred.exits
+                    .iter()
+                    .filter(|link| link.target == block.id && !link.args.is_empty())
+                    .map(move |link| link)
+            })
+            .collect();
+        if preds.len() < 2 {
+            continue;
+        }
+        let mut saw_fn_path = false;
+        let mut saw_ctor = false;
+        for link in preds {
+            let Some(arg) = link.args[0].as_variable() else {
+                continue;
+            };
+            saw_fn_path |= producer_is_bare_fn_path(&graph, arg);
+            saw_ctor |= producer_variant_ctor(&graph, arg).is_some();
+        }
+        assert!(
+            !(saw_fn_path && saw_ctor),
+            "{name}: merge of {} joins a function-item call with a Result ctor",
+            block.id.0
+        );
+    }
+    let call_block = fn_item_call_block(&graph, "text_wtf8_w");
+    let catch = last_exception_catch_target(call_block);
+    assert!(
+        graph_reaches(&graph, catch, |i| block_has_question_const(&graph, i)),
+        "{name}: text_wtf8_w catch link must reach the \"?\" path"
+    );
 }

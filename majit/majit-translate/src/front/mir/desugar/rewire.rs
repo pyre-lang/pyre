@@ -1043,6 +1043,28 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
         &name,
     )?;
     close_goto_mixed(graph, then_bb, b_target, then_args);
+    // Function-item `and_then(f)`: `f` is a `FunctionDesc` call
+    // (`description.py`). After `exceptiontransform.py`
+    // `create_exception_handling` the callee returns `T` and raises
+    // (`flowspace/model.py` `Link.last_exception`). Carrier disc
+    // combinators run before `rewire_result_exc_call_sites`, so this
+    // synthesized FunctionPath is not in the ResultExcCall list.
+    // `catch_and_rewrap` installs LastException with N=`Ok(raw)` and
+    // E=`Err(last_exc_value)` (`except OperationError as e`).
+    if site.kind == DiscCombinator::ResultAndThen
+        && site.carrier_recv
+        && site.fn_item_segments.is_some()
+        && site.fn_item_ctor.is_none()
+    {
+        let suffix = result_shell_suffix(&site.result_owner);
+        crate::front::result_exc::catch_and_rewrap(
+            graph,
+            then_bb.0,
+            &then_value,
+            suffix,
+            &site.result_payload0_ty,
+        )?;
+    }
 
     let else_value = build_disc_arm(
         graph,
@@ -1258,6 +1280,18 @@ pub(in crate::front::mir) fn disc_callable_env(
         .ok_or_else(|| format!("{name}: {method} env not threaded"))
 }
 
+/// Instantiation suffix `catch_and_rewrap` keys the rebuilt `Ok`/`Err`
+/// ClassDef with, taken from the combinator dest owner the diamond Err
+/// arm already uses (`emit_sum_variant`).
+fn result_shell_suffix(result_owner: &str) -> &str {
+    let owner = result_owner
+        .strip_suffix("::Ok")
+        .or_else(|| result_owner.strip_suffix("::Err"))
+        .unwrap_or(result_owner);
+    let base = majit_ir::descr::strip_instantiation_suffix(owner);
+    owner.strip_prefix(base).unwrap_or("")
+}
+
 /// Run `site`'s callable on `arg` in `block`: `call_once(env, (arg,))` for a
 /// closure, a direct call for a function item, and the constructed aggregate
 /// for a constructor function item.
@@ -1389,6 +1423,11 @@ pub(in crate::front::mir) fn build_disc_arm(
                 ),
             )?;
             let mapped = emit_narrow(graph, block, mapped, &site.call_result_class);
+            // `and_then(f)` forwards `f(t)` as a Result. A closure
+            // `call_once` keeps that spelling; a constructor item already
+            // builds the variant. A function-item is `FunctionDesc`
+            // (`description.py`) called directly; the diamond wraps that
+            // call with `catch_and_rewrap`.
             if site.kind == DiscCombinator::ResultAndThen {
                 Ok(mapped)
             } else {

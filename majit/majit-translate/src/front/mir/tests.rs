@@ -3322,7 +3322,10 @@ pub(in crate::front::mir) fn window_call_leafs(graph: &crate::model::FunctionGra
 
 fn window_has_join_chars(graph: &crate::model::FunctionGraph) -> bool {
     window_call_leafs(graph).iter().any(|leaf| {
-        leaf == "ll_join_chars" || leaf == "ll_str2uintlist" || leaf == "ll_string2list"
+        leaf == "ll_join_chars"
+            || leaf == "ll_str2uintlist"
+            || leaf == "ll_string2list"
+            || leaf == "ll_charpsize2uintlist"
     })
 }
 
@@ -3986,10 +3989,11 @@ fn window_param_passed_to_opaque_window_fn_is_identity() {
 }
 
 /// `fn f(s: &[u8]) -> Vec<u8> { s.to_vec() }` of a window parameter is
-/// `rffi.charpsize2str` of the two window words.
+/// `ll_charpsize2uintlist` of the two window words. Dest is a list, not
+/// the interned `Result<Vec<u8>, MemoryError>` graph.
 #[test]
-fn window_param_to_vec_is_charpsize2str() {
-    use crate::model::{CallTarget, LinkArg, OpKind};
+fn window_param_to_vec_is_ll_charpsize2uintlist() {
+    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
 
     let shared = window_shared_slice();
     let u8_ty = window_u8();
@@ -4047,8 +4051,17 @@ fn window_param_to_vec_is_charpsize2str() {
         .expect("lower window param to_vec");
     let leafs = window_call_leafs(&graph);
     assert!(
-        leafs.iter().any(|leaf| leaf == "charpsize2str"),
-        "window to_vec is charpsize2str; leafs={leafs:?} graph={}",
+        leafs
+            .iter()
+            .any(|leaf| leaf == crate::front::join_chars::LL_CHARPSIZE2UINTLIST),
+        "window to_vec is ll_charpsize2uintlist; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        !leafs.iter().any(|leaf| leaf == "charpsize2str"
+            || leaf == crate::front::join_chars::LL_CHARPSIZE2STR
+            || leaf == crate::front::join_chars::LL_STR2UINTLIST),
+        "window to_vec must not Call the Result graph or compose STR copies; leafs={leafs:?} graph={}",
         graph.dump()
     );
     assert!(
@@ -4070,39 +4083,65 @@ fn window_param_to_vec_is_charpsize2str() {
             _ => None,
         })
         .collect();
-    let cps: Option<(Vec<_>, Option<u64>)> =
-        window_graph_ops(&graph)
-            .into_iter()
-            .find_map(|op| match &op.kind {
-                OpKind::Call {
-                    target:
-                        CallTarget::FunctionPath {
-                            segments,
-                            fun_decl_id,
-                            ..
-                        },
-                    args,
-                    ..
-                } if segments.last().map(String::as_str) == Some("charpsize2str") => Some((
+    let cps: Option<(Vec<_>, Option<u64>, ValueType)> = window_graph_ops(&graph)
+        .into_iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    },
+                args,
+                result_ty,
+                ..
+            } if segments.as_slice() == [crate::front::join_chars::LL_CHARPSIZE2UINTLIST] => {
+                Some((
                     args.iter()
                         .filter_map(LinkArg::as_variable)
                         .cloned()
                         .collect::<Vec<_>>(),
                     *fun_decl_id,
-                )),
-                _ => None,
-            });
-    let (cps_args, fun_decl_id) = cps.expect("charpsize2str is called");
+                    result_ty.clone(),
+                ))
+            }
+            _ => None,
+        });
+    let (cps_args, fun_decl_id, result_ty) = cps.expect("ll_charpsize2uintlist is called");
     assert_eq!(
         fun_decl_id,
-        Some(2),
-        "charpsize2str carries its FunDecl id; graph={}",
+        None,
+        "ll_charpsize2uintlist is the minted helper, not a FunDecl; graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(result_ty, ValueType::Ref(_)),
+        "window to_vec dest is list-typed, not Result; result_ty={result_ty:?} graph={}",
+        graph.dump()
+    );
+    let dest = window_graph_ops(&graph)
+        .into_iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == [crate::front::join_chars::LL_CHARPSIZE2UINTLIST] => {
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .expect("ll_charpsize2uintlist dest");
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&dest),
+        crate::model::ConcreteType::GcRef,
+        "window to_vec dest is a list GcRef, not a Result instance; graph={}",
         graph.dump()
     );
     assert_eq!(
         cps_args,
         inputs,
-        "charpsize2str receives the two window words; leafs={leafs:?} graph={}",
+        "ll_charpsize2uintlist receives the two window words; leafs={leafs:?} graph={}",
         graph.dump()
     );
 }

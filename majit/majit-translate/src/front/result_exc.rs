@@ -9684,7 +9684,7 @@ pub(crate) fn catch_overflow_and_rewrap(
     )
 }
 
-fn catch_and_rewrap(
+pub(crate) fn catch_and_rewrap(
     graph: &mut FunctionGraph,
     a: usize,
     r: &Variable,

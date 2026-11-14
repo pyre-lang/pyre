@@ -793,7 +793,8 @@ impl<'a> Lowering<'a> {
             (CallClass::Dynamic, CallFunc::Dynamic(..))
         );
         // `<[u8]>::to_vec` by representation, before the pair-ABI match: a
-        // W3 window is `rffi.charpsize2str`, not a pair call of `to_vec`.
+        // W3 window copies through `ll_charpsize2uintlist`, not a pair call
+        // of `to_vec`.
         if let CallFunc::Regular(reg) = &call.func
             && args.len() == 1
             && regular_call_is_slice_to_vec(reg, self.llbc)
@@ -833,7 +834,7 @@ impl<'a> Lowering<'a> {
                     window_parts = Some((data.clone(), len.clone()));
                 }
                 if let Some((data, len)) = window_parts {
-                    let dest = self.emit_charpsize2str_list(mir_bb, data, len);
+                    let dest = self.emit_ll_charpsize2uintlist(mir_bb, data, len);
                     self.local_var[dest_local] = Some(LocalValue::One(dest));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -894,8 +895,8 @@ impl<'a> Lowering<'a> {
             }
             // A call passing pair slices is the plain call of a callee that
             // declares them, with each length after its pointer.
-            // `<[u8]>::to_vec` of a window is `rffi.charpsize2str`, not the
-            // pair-ABI residual of `to_vec` itself (`is_slice_to_vec`).
+            // `<[u8]>::to_vec` of a window is `ll_charpsize2uintlist`, not
+            // the pair-ABI residual of `to_vec` itself (`is_slice_to_vec`).
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(reg))
                 if !pair_lens.is_empty()
                     && !from_bytes_identity

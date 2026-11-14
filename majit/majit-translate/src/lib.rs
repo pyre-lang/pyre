@@ -3008,6 +3008,10 @@ fn analyze_pipeline_from_module_paths(
     // Minted in the rich model because the Wtf8-from-bytes Ok window
     // rewrite runs on the front spine before prepass.
     front::join_chars::register_ll_charpsize2str_helper(&mut call_control);
+    // Dest-list sibling: window → unsigned list (`rlist.py` `ll_newlist`
+    // plus `ll_setitem_fast`). Minted because `<[u8]>::to_vec` of a
+    // window rewrites on the front spine before prepass.
+    front::join_chars::register_ll_charpsize2uintlist_helper(&mut call_control);
 
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function

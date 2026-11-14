@@ -3440,8 +3440,9 @@ impl<'a> Lowering<'a> {
     /// `copy_raw_to_string(cp, ll_str, 0, size)` plus `hlstrtype(ll_str)`.
     /// The dest is rstr `STR`. The interned
     /// `majit_rlib::rffi::buffer::charpsize2str` graph returns
-    /// `Result<Vec<u8>, MemoryError>` and is the list form
-    /// ([`Self::emit_charpsize2str_list`]), not this copy.
+    /// `Result<Vec<u8>, MemoryError>` and must not be the Call target of
+    /// this dest-Str site. Dest-list window copies go through
+    /// [`Self::emit_ll_charpsize2uintlist`].
     pub(in crate::front::mir) fn emit_charpsize2str(
         &mut self,
         mir_bb: usize,
@@ -3531,12 +3532,11 @@ impl<'a> Lowering<'a> {
         args
     }
 
-    /// Window → unsigned list (`rffi.py` `charpsize2str` → `Vec<u8>`).
-    /// Direct call of the `rffi::buffer::charpsize2str` graph (crate-stripped
-    /// `registered_path_for_fun_decl` / `spec_segments` spelling). Attach the
-    /// FunDecl id when this artefact loaded it. The result is the list, not
-    /// `STR`.
-    pub(in crate::front::mir) fn emit_charpsize2str_list(
+    /// Window → unsigned list (`rlist.py` `ll_newlist` + `ll_setitem_fast`
+    /// of `size` raw chars from `cp`). The interned
+    /// `majit_rlib::rffi::buffer::charpsize2str` graph returns
+    /// `Result<Vec<u8>, MemoryError>` and is not this copy.
+    pub(in crate::front::mir) fn emit_ll_charpsize2uintlist(
         &mut self,
         mir_bb: usize,
         ptr: Variable,
@@ -3545,25 +3545,6 @@ impl<'a> Lowering<'a> {
         let dest = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
-        let fun_decl_id = self.fun_decl_id_path_ends_with(&["rffi", "buffer", "charpsize2str"]);
-        let segments = fun_decl_id
-            .and_then(|id| self.llbc.fn_by_id(id))
-            .map(|fd| registered_path_for_fun_decl(self.llbc, fd).segments)
-            .unwrap_or_else(|| {
-                vec![
-                    "rffi".to_string(),
-                    "buffer".to_string(),
-                    "charpsize2str".to_string(),
-                ]
-            });
-        let mut target = CallTarget::FunctionPath {
-            segments,
-            fun_decl_id: None,
-            specialization: crate::parse::GraphSpecialization::Regular,
-        };
-        if let Some(fun_decl_id) = fun_decl_id {
-            target = target.with_fun_decl_id(fun_decl_id);
-        }
         let ptr = {
             let coerced = self.ensure_window_ccharp(mir_bb, ptr);
             stamp_as_ccharp(&coerced);
@@ -3573,7 +3554,9 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(dest.clone()),
             kind: OpKind::Call {
-                target,
+                target: CallTarget::function_path([
+                    crate::front::join_chars::LL_CHARPSIZE2UINTLIST,
+                ]),
                 args: crate::model::call_args(vec![ptr, len]),
                 result_ty: ValueType::Ref(None),
             },
