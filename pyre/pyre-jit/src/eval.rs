@@ -2152,14 +2152,15 @@ fn build_gc() -> Box<MiniMarkGC> {
     // The payload is three machine ints; the one traced offset is the
     // header's `w_class`, which a `class R(range_iterator)` instance points
     // at a managed heap type.
-    let range_iter_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
-        object_tid,
-        <pyre_object::functional::W_IntRangeIterator
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
-            .ptr_offsets
-            .to_vec(),
-    ));
+    let range_iter_descr = <pyre_object::functional::W_IntRangeIterator
+        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let range_iter_tid = gc.get_type_id(GcTypeKey::of(range_iter_descr.gc_type_id), || {
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
+            object_tid,
+            range_iter_descr.ptr_offsets.to_vec(),
+        )
+    });
     assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
     // rlist.py:116 parity: W_ListObject has a single GC pointer
     // field — `items: Ptr(GcArray(OBJECTPTR))` — directly at
@@ -3731,14 +3732,14 @@ fn build_gc() -> Box<MiniMarkGC> {
     {
         let array_descr = <pyre_object::interp_array::W_Array
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let array_tid = gc.register_type(
+        let array_tid = gc.get_type_id(GcTypeKey::of(array_descr.gc_type_id), || {
             TypeInfo::object_subclass_with_gc_ptrs(
                 array_descr.object_size,
                 object_tid,
                 array_descr.ptr_offsets.to_vec(),
             )
-            .with_destructor_fn(array_object_destructor),
-        );
+            .with_destructor_fn(array_object_destructor)
+        });
         if array_descr.gc_type_id.is_unassigned() {
             array_descr.gc_type_id.set(array_tid);
         } else {
@@ -3782,14 +3783,14 @@ fn build_gc() -> Box<MiniMarkGC> {
     {
         let mv_descr = <pyre_object::memoryview::W_MemoryView
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let mv_tid = gc.register_type(
+        let mv_tid = gc.get_type_id(GcTypeKey::of(mv_descr.gc_type_id), || {
             TypeInfo::object_subclass_with_custom_trace(
                 mv_descr.object_size,
                 object_tid,
                 memoryview_object_custom_trace,
             )
-            .with_destructor_fn(memoryview_object_destructor),
-        );
+            .with_destructor_fn(memoryview_object_destructor)
+        });
         mv_descr.gc_type_id.set(mv_tid);
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
@@ -3921,11 +3922,16 @@ fn build_gc() -> Box<MiniMarkGC> {
     // share one payload layout and the traced `w_dict` edge, just as the
     // W_DictMultiIter*Object subclasses do in PyPy.  Auto-register at the tail
     // so no fixed frame/type ids shift.
-    let w_dict_view_iterator_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
-        object_tid,
-        pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS.to_vec(),
-    ));
+    let w_dict_view_iterator_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_TYPE_ID),
+        || {
+            TypeInfo::object_subclass_with_gc_ptrs(
+                pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
+                object_tid,
+                pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS.to_vec(),
+            )
+        },
+    );
     pyre_object::dictmultiobject::W_DICT_VIEW_ITERATOR_GC_TYPE_ID.set(w_dict_view_iterator_tid);
     for tp in [
         &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE,
@@ -4192,10 +4198,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     let deque_block_descr =
         <pyre_interpreter::module::_collections::deque_block::W_DequeBlock
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let deque_block_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        deque_block_descr.object_size,
-        deque_block_descr.ptr_offsets.to_vec(),
-    ));
+    let deque_block_tid = gc.get_type_id(GcTypeKey::of(deque_block_descr.gc_type_id), || {
+        TypeInfo::with_gc_ptrs(
+            deque_block_descr.object_size,
+            deque_block_descr.ptr_offsets.to_vec(),
+        )
+    });
     deque_block_descr.gc_type_id.set(deque_block_tid);
     // CPython `_buffer_wrapper`: two ordinary inline GC edges (`mv`, `obj`).
     // Append it after every pre-existing object and the deque's internal
@@ -4989,38 +4997,51 @@ fn build_gc() -> Box<MiniMarkGC> {
         let host_exc_pytype = &pyre_interpreter::error::HOST_EXCEPTION_TYPE as *const _ as usize;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, host_exc_pytype, host_exc_tid);
         pytype_to_tid.insert(host_exc_pytype, host_exc_tid);
-        let pyerror_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            pyre_interpreter::error::PYERROR_OBJECT_SIZE,
-            host_exc_tid,
-            vec![
-                std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
-                pyre_interpreter::error::PYERROR_W_TYPE_OFFSET,
-                pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
-                pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
-                pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
-                pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
-                pyre_interpreter::error::PYERROR_FMT_X0_OFFSET,
-            ],
-        ));
+        let pyerror_tid = gc.get_type_id(
+            GcTypeKey::of(&pyre_interpreter::error::PYERROR_GC_TYPE_ID_CELL),
+            || {
+                TypeInfo::object_subclass_with_gc_ptrs(
+                    pyre_interpreter::error::PYERROR_OBJECT_SIZE,
+                    host_exc_tid,
+                    vec![
+                        std::mem::offset_of!(
+                            pyre_interpreter::error::PyErrorObject,
+                            ob_header.w_class
+                        ),
+                        pyre_interpreter::error::PYERROR_W_TYPE_OFFSET,
+                        pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
+                        pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
+                        pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
+                        pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+                        pyre_interpreter::error::PYERROR_FMT_X0_OFFSET,
+                    ],
+                )
+            },
+        );
         assert_eq!(pyerror_tid, pyre_interpreter::error::pyerror_gc_type_id());
         pyre_interpreter::error::PYERROR_GC_TYPE_ID_CELL.set(pyerror_tid);
         let pytype = &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype, pyerror_tid);
         pytype_to_tid.insert(pytype, pyerror_tid);
-        let sapp_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OBJECT_SIZE,
-            object_tid,
-            vec![
-                std::mem::offset_of!(
-                    pyre_interpreter::pyopcode::SApplicationException,
-                    ob_header.w_class
-                ),
-                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OPERR_OFFSET,
-                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW0_OFFSET,
-                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW1_OFFSET,
-                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW2_OFFSET,
-            ],
-        ));
+        let sapp_tid = gc.get_type_id(
+            GcTypeKey::of(&pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_GC_TYPE_ID_CELL),
+            || {
+                TypeInfo::object_subclass_with_gc_ptrs(
+                    pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OBJECT_SIZE,
+                    object_tid,
+                    vec![
+                        std::mem::offset_of!(
+                            pyre_interpreter::pyopcode::SApplicationException,
+                            ob_header.w_class
+                        ),
+                        pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OPERR_OFFSET,
+                        pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW0_OFFSET,
+                        pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW1_OFFSET,
+                        pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW2_OFFSET,
+                    ],
+                )
+            },
+        );
         assert_eq!(
             sapp_tid,
             pyre_interpreter::pyopcode::s_application_exception_gc_type_id()
@@ -5257,10 +5278,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // stable; do not add it to `pytype_to_tid` or the subclass alias census.
     let lifeline_descr = <pyre_object::weakref::W_WeakrefLifeline
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let lifeline_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        lifeline_descr.object_size,
-        lifeline_descr.ptr_offsets.to_vec(),
-    ));
+    let lifeline_tid = gc.get_type_id(GcTypeKey::of(lifeline_descr.gc_type_id), || {
+        TypeInfo::with_gc_ptrs(
+            lifeline_descr.object_size,
+            lifeline_descr.ptr_offsets.to_vec(),
+        )
+    });
     if lifeline_descr.gc_type_id.is_unassigned() {
         lifeline_descr.gc_type_id.set(lifeline_tid);
     } else {
@@ -5329,10 +5352,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // WeakrefLifeline above.
     let gateway_descr =
         <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let gateway_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        gateway_descr.object_size,
-        gateway_descr.ptr_offsets.to_vec(),
-    ));
+    let gateway_tid = gc.get_type_id(GcTypeKey::of(gateway_descr.gc_type_id), || {
+        TypeInfo::with_gc_ptrs(
+            gateway_descr.object_size,
+            gateway_descr.ptr_offsets.to_vec(),
+        )
+    });
     if gateway_descr.gc_type_id.is_unassigned() {
         gateway_descr.gc_type_id.set(gateway_tid);
     } else {
@@ -5359,10 +5384,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     let deque_lock_descr =
         <pyre_interpreter::module::_collections::deque_lock::W_DequeLock
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let deque_lock_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        deque_lock_descr.object_size,
-        deque_lock_descr.ptr_offsets.to_vec(),
-    ));
+    let deque_lock_tid = gc.get_type_id(GcTypeKey::of(deque_lock_descr.gc_type_id), || {
+        TypeInfo::with_gc_ptrs(
+            deque_lock_descr.object_size,
+            deque_lock_descr.ptr_offsets.to_vec(),
+        )
+    });
     deque_lock_descr.gc_type_id.set(deque_lock_tid);
 
     // `opencoder.py` `Trace._ops`: one `GcArray(Char)`. Registered at the
