@@ -5908,17 +5908,38 @@ fn trace_tuple_hash_bridge_via_interpret(
         ));
     }
 
-    let action = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().interpret(&mut sym, portal_pc)
-    };
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[tuple.hash] bridge interpret action={action:?} key={green_key} descr=0x{:x}",
-            majit_ir::descr_identity(descr_arc)
-        );
+    // `pyjitpl.py MetaInterp.reached_loop_header`: a CloseLoop that only
+    // appends a merge point (`cancelled, tracing more...`) RETURNS and
+    // `_interpret` keeps recording. Re-enter `interpret` from that merge
+    // point until compile, finish, or abort.
+    loop {
+        let action = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().interpret(&mut sym, portal_pc)
+        };
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[tuple.hash] bridge interpret action={action:?} key={green_key} descr=0x{:x}",
+                majit_ir::descr_identity(descr_arc)
+            );
+        }
+        match action {
+            majit_metainterp::TraceAction::CloseLoop => {
+                use majit_metainterp::JitState;
+                let jump_args =
+                    pyre_jit_trace::tuplehash_state::TupleHashJitState::collect_jump_args(&sym);
+                if let Some(resolution) = compile_tuple_hash_bridge_close(green_key, &jump_args) {
+                    return resolution;
+                }
+            }
+            majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
+                if let Some(resolution) = compile_tuple_hash_bridge_close(green_key, &jump_args) {
+                    return resolution;
+                }
+            }
+            other => return apply_tuple_hash_bridge_action(other, &sym),
+        }
     }
-    apply_tuple_hash_bridge_action(action, green_key, &sym)
 }
 
 fn tuple_hash_sym_from_rebuilt_portal(
@@ -5993,7 +6014,6 @@ fn tuple_hash_sym_from_rebuilt_portal(
 
 fn apply_tuple_hash_bridge_action(
     action: majit_metainterp::TraceAction,
-    green_key: u64,
     sym: &pyre_jit_trace::tuplehash_state::TupleHashSym,
 ) -> BridgeResolution {
     use majit_metainterp::JitState;
@@ -6047,12 +6067,6 @@ fn apply_tuple_hash_bridge_action(
             } else {
                 BridgeResolution::Finished(pyre_jit_trace::state::ConcreteValue::Int(result_int))
             }
-        }
-        majit_metainterp::TraceAction::CloseLoop => {
-            compile_tuple_hash_bridge_close(green_key, &jump_args_from_sym())
-        }
-        majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
-            compile_tuple_hash_bridge_close(green_key, &jump_args)
         }
         majit_metainterp::TraceAction::SegmentedLoop
         | majit_metainterp::TraceAction::SegmentedBridge { .. } => {
@@ -6117,17 +6131,23 @@ fn live_tuple_hash_args(jump_args: &[majit_ir::OpRef]) -> Option<Vec<majit_ir::V
 /// `pyjitpl.py MetaInterp.reached_loop_header` for a `hash_driver` bridge
 /// close (`TraceAction::CloseLoop` / `CloseLoopWithArgs`).
 ///
+/// `if not self.partial_trace:` then
 /// `has_compiled_targets(get_procedure_token(greenboxes))` →
-/// `compile_trace(live_arg_boxes, ptoken)` JUMPS into that loop. Otherwise
-/// `compile_loop(original_boxes, live_arg_boxes, start)` cuts the recorded
-/// body at the merge point the walker appended to `current_merge_points`
-/// (the bridge prefix is not attached). Success is
-/// `raise_if_successful` → `raise_continue_running_normally`. A cancelled
-/// `compile_loop` is `SwitchToBlackhole(ABORT_BAD_LOOP)`.
+/// `compile_trace(live_arg_boxes, ptoken)`. Success is
+/// `raise_if_successful`. Failure does not give the trace up: control
+/// falls into `compile_loop` while the tracer is live. A drained tracer
+/// ends the walk with the reason `MetaInterp` staged.
+/// `compile_loop` success is `raise_if_successful` →
+/// `raise_continue_running_normally`. `CompileOutcome::Cancelled` with a
+/// live tracer is `cancelled, tracing more...`
+/// (`current_merge_points.append`); `None` tells the interpret loop to
+/// keep recording. `Cancelled` after the tracer is taken, or `Aborted`,
+/// ends the walk with the staged reason. `SwitchToBlackhole` carries its
+/// reason through to `run_blackhole_interp_to_cancel_tracing`.
 fn compile_tuple_hash_bridge_close(
     green_key: u64,
     jump_args: &[majit_ir::OpRef],
-) -> BridgeResolution {
+) -> Option<BridgeResolution> {
     let boxes: Vec<Operand> = {
         let (driver, _) = crate::eval::driver_pair();
         let meta = driver.meta_interp_mut();
@@ -6138,28 +6158,51 @@ fn compile_tuple_hash_bridge_close(
             .map(|r| ctx.operand_for(r))
             .collect()
     };
-    let has_targets = {
+    let (has_targets, has_partial_trace) = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().has_compiled_targets(green_key)
+        let meta = driver.meta_interp();
+        (
+            meta.has_compiled_targets(green_key),
+            meta.partial_trace().is_some(),
+        )
     };
-    if has_targets {
+    if has_targets && !has_partial_trace {
         let outcome = {
             let (driver, _) = crate::eval::driver_pair();
             driver
                 .meta_interp_mut()
                 .compile_trace(green_key, &boxes, true)
         };
-        return match outcome {
+        match outcome {
             majit_metainterp::CompileOutcome::Compiled { .. } => {
-                finish_tuple_hash_bridge_compiled(live_tuple_hash_args(jump_args))
+                return Some(finish_tuple_hash_bridge_compiled(live_tuple_hash_args(
+                    jump_args,
+                )));
             }
-            _ => cancel_tuple_hash_bridge_walk(majit_metainterp::SwitchToBlackhole::giveup()),
-        };
+            _ => {
+                let still_tracing = {
+                    let (driver, _) = crate::eval::driver_pair();
+                    driver.is_tracing()
+                };
+                if !still_tracing {
+                    return Some(end_tuple_hash_bridge_drained_compile());
+                }
+                // `reached_loop_header`: compile_trace did not raise;
+                // fall through to the `current_merge_points` scan.
+            }
+        }
     }
 
     // Collect live reds before `compile_loop` takes the tracer
     // (`compile_loop_body` `self.tracing.take()`).
     let live_args = live_tuple_hash_args(jump_args);
+    let start_cell_key = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .trace_ctx()
+            .map(|ctx| ctx.root_green_key())
+    };
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().compile_loop(&boxes)
@@ -6169,21 +6212,56 @@ fn compile_tuple_hash_bridge_close(
     }
     match outcome {
         majit_metainterp::CompileOutcome::Compiled { .. } => {
-            finish_tuple_hash_bridge_compiled(live_args)
+            Some(finish_tuple_hash_bridge_compiled(live_args))
         }
-        majit_metainterp::CompileOutcome::SwitchToBlackhole { reason } => {
+        majit_metainterp::CompileOutcome::SwitchToBlackhole { reason } => Some(
             cancel_tuple_hash_bridge_walk(majit_metainterp::SwitchToBlackhole {
                 reason,
                 raising_exception: false,
-            })
+            }),
+        ),
+        majit_metainterp::CompileOutcome::Cancelled => {
+            let still_tracing = {
+                let (driver, _) = crate::eval::driver_pair();
+                driver.is_tracing()
+            };
+            if still_tracing {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[tuple.hash] cancelled, tracing more...");
+                }
+                let (driver, _) = crate::eval::driver_pair();
+                let meta = driver.meta_interp_mut();
+                let _ = meta.take_keep_tracing_after_close();
+                if let Some(ctx) = meta.trace_ctx() {
+                    ctx.resume_walk_after_close();
+                }
+                None
+            } else {
+                if let Some(gk) = start_cell_key {
+                    let (driver, _) = crate::eval::driver_pair();
+                    let jd_no = driver
+                        .meta_interp()
+                        .active_jitdriver_sd
+                        .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_for_driver(jd_no)
+                        .finish_tracing(gk);
+                }
+                Some(BridgeResolution::ResumeBlackhole)
+            }
         }
-        majit_metainterp::CompileOutcome::Cancelled | majit_metainterp::CompileOutcome::Aborted => {
-            cancel_tuple_hash_bridge_walk(majit_metainterp::SwitchToBlackhole {
-                reason: majit_metainterp::counters::ABORT_BAD_LOOP,
-                raising_exception: false,
-            })
-        }
+        majit_metainterp::CompileOutcome::Aborted => Some(end_tuple_hash_bridge_drained_compile()),
     }
+}
+
+/// End a jd3 bridge close whose compile already drained History.
+/// `MetaInterp.abort_trace` consumes the `pending_abort_reason` the
+/// compile staged (`pyjitpl.py aborted_tracing(stb.reason)`).
+fn end_tuple_hash_bridge_drained_compile() -> BridgeResolution {
+    let (driver, _) = crate::eval::driver_pair();
+    driver.meta_interp_mut().abort_trace(false);
+    BridgeResolution::ResumeBlackhole
 }
 
 fn finish_tuple_hash_bridge_compiled(live_args: Option<Vec<majit_ir::Value>>) -> BridgeResolution {

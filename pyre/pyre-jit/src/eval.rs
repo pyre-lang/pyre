@@ -9641,8 +9641,8 @@ fn drive_tuple_hash_trace(
     let _ = pyre_object::gc_roots::pin_root(w_tuple);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
     let w_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
-    let green_args = [(majit_metainterp::JitArgKind::Ref, w_type as usize as i64)];
-    let red_args = [
+    let mut green_args = [(majit_metainterp::JitArgKind::Ref, w_type as usize as i64)];
+    let mut red_args = [
         (
             majit_metainterp::JitArgKind::Int,
             majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
@@ -9675,163 +9675,234 @@ fn drive_tuple_hash_trace(
         use majit_metainterp::JitCodeSym;
         sym.loop_header_pc()
     };
-    let drove = meta.with_trace_ctx_and_token_resolver(
-        |ctx,
-         recursive_target,
-         recursive_decision,
-         recursive_exec,
-         recursive_exec_ref,
-         recursive_exec_float,
-         recursive_exec_void| {
-            let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
-                |_pc: usize| 0usize,
-                recursive_target,
-                recursive_decision,
-                recursive_exec,
-                recursive_exec_ref,
-                recursive_exec_float,
-                recursive_exec_void,
-            );
-            majit_metainterp::trace_jitcode_from_merge_point(
-                ctx,
-                &mut sym,
-                &jitcode,
-                header_pc,
-                &runtime,
-                &green_args,
-                &red_args,
-            )
-        },
-    );
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!("[tuple.hash] trace_jitcode action={drove:?}");
-    }
+    let start_cell_key = meta
+        .trace_ctx()
+        .map(|ctx| ctx.root_green_key())
+        .unwrap_or(green_key);
 
     use majit_metainterp::{JitState, TraceAction};
-    // The walk executed the remaining iterations concretely. An Int
-    // FINISH is the accumulator; the portal runner returns it and does
-    // not run the body again. An exception FINISH is `Err`.
-    let produced: Option<Result<u64, pyre_interpreter::error::PyError>> = match &drove {
-        Some(TraceAction::Finish {
-            finish_args,
-            exit_with_exception: false,
-            ..
-        }) => {
-            let value = finish_args
-                .first()
-                .and_then(|op| meta.trace_ctx()?.concrete_of_opref(*op));
-            match value {
-                Some(majit_ir::Value::Int(v)) => Some(Ok(v as u64)),
-                // A non-int FINISH is a terminal state. `None` would make
-                // the portal hash this item again.
-                _ => Some(Err(tuple_hash_invalid_finish())),
-            }
-        }
-        Some(TraceAction::Finish {
-            exit_with_exception: true,
-            exc_value,
-            ..
-        }) => Some(Err(portal_error_from_exc_ref(*exc_value)
-            .unwrap_or_else(tuple_hash_exception_exit_without_exception))),
-        _ => None,
-    };
-    let jump_args = match &drove {
-        Some(TraceAction::CloseLoop) => {
-            Some(pyre_jit_trace::tuplehash_state::TupleHashJitState::collect_jump_args(&sym))
-        }
-        Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
-        _ => None,
-    };
-    if let Some(jump_args) = jump_args {
-        // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
-        // `reached_loop_header` `live_arg_boxes` are the merge-point reds
-        // after the recorded iteration (`set_redboxes`); execute_assembler
-        // enters with those same concrete values so the portal does not
-        // hash the traced element again.
-        let (jump_boxes, close_live) = {
-            let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
-            let jump_boxes: Vec<Operand> = jump_args
-                .iter()
-                .copied()
-                .map(|r| ctx.operand_for(r))
-                .collect();
-            let close_live = jump_args
-                .iter()
-                .copied()
-                .map(|r| ctx.concrete_of_opref(r))
-                .collect::<Option<Vec<_>>>();
-            (jump_boxes, close_live)
-        };
-        let outcome = meta.compile_loop(&jump_boxes);
+    // `pyjitpl.py MetaInterp.reached_loop_header`: a CloseLoop that only
+    // appends a merge point (`cancelled, tracing more...`) RETURNS and
+    // the portal keeps recording. Loop the same `trace_jitcode_from_merge_point`
+    // driver until Compiled / Finish / abort. `NestedTraceGuard` Drop would
+    // abort a live keep-tracing session if this function returned here.
+    loop {
+        let drove = meta.with_trace_ctx_and_token_resolver(
+            |ctx,
+             recursive_target,
+             recursive_decision,
+             recursive_exec,
+             recursive_exec_ref,
+             recursive_exec_float,
+             recursive_exec_void| {
+                let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                    |_pc: usize| 0usize,
+                    recursive_target,
+                    recursive_decision,
+                    recursive_exec,
+                    recursive_exec_ref,
+                    recursive_exec_float,
+                    recursive_exec_void,
+                );
+                majit_metainterp::trace_jitcode_from_merge_point(
+                    ctx,
+                    &mut sym,
+                    &jitcode,
+                    header_pc,
+                    &runtime,
+                    &green_args,
+                    &red_args,
+                )
+            },
+        );
         if majit_metainterp::majit_log_enabled() {
-            eprintln!("[tuple.hash] compile_loop outcome={outcome:?}");
+            eprintln!("[tuple.hash] trace_jitcode action={drove:?}");
         }
-        if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. })
-            && let Some(live) = close_live
-        {
-            drop(driver);
-            return run_compiled_tuple_hash(green_key, &live);
-        }
-    } else if let Some(TraceAction::Finish {
-        finish_args,
-        finish_arg_types,
-        exit_with_exception,
-        exc_value: _,
-    }) = drove
-    {
-        if exit_with_exception {
-            crate::call_jit::drain_backend_jit_exc();
-        }
-        match meta.compile_finish_from_active_session(
-            &finish_args,
+
+        // The walk executed the remaining iterations concretely. An Int
+        // FINISH is the accumulator; the portal runner returns it and does
+        // not run the body again. An exception FINISH is `Err`.
+        let produced: Option<Result<u64, pyre_interpreter::error::PyError>> = match &drove {
+            Some(TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            }) => {
+                let value = finish_args
+                    .first()
+                    .and_then(|op| meta.trace_ctx()?.concrete_of_opref(*op));
+                match value {
+                    Some(majit_ir::Value::Int(v)) => Some(Ok(v as u64)),
+                    // A non-int FINISH is a terminal state. `None` would make
+                    // the portal hash this item again.
+                    _ => Some(Err(tuple_hash_invalid_finish())),
+                }
+            }
+            Some(TraceAction::Finish {
+                exit_with_exception: true,
+                exc_value,
+                ..
+            }) => Some(Err(portal_error_from_exc_ref(*exc_value)
+                .unwrap_or_else(tuple_hash_exception_exit_without_exception))),
+            _ => None,
+        };
+        let jump_args = match &drove {
+            Some(TraceAction::CloseLoop) => {
+                Some(pyre_jit_trace::tuplehash_state::TupleHashJitState::collect_jump_args(&sym))
+            }
+            Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
+            _ => None,
+        };
+        if let Some(jump_args) = jump_args {
+            // recorder → compile edge (`MetaInterp.compile_loop` jumpargs).
+            // `reached_loop_header` `live_arg_boxes` are the merge-point reds
+            // after the recorded iteration (`set_redboxes`); execute_assembler
+            // enters with those same concrete values so the portal does not
+            // hash the traced element again.
+            let (jump_boxes, close_live) = {
+                let ctx = meta.trace_ctx().expect("compile_loop: live TraceCtx");
+                let jump_boxes: Vec<Operand> = jump_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.operand_for(r))
+                    .collect();
+                let close_live = jump_args
+                    .iter()
+                    .copied()
+                    .map(|r| ctx.concrete_of_opref(r))
+                    .collect::<Option<Vec<_>>>();
+                (jump_boxes, close_live)
+            };
+            let outcome = meta.compile_loop(&jump_boxes);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] compile_loop outcome={outcome:?}");
+            }
+            match outcome {
+                majit_metainterp::CompileOutcome::Compiled { .. } => {
+                    if let Some(live) = close_live {
+                        drop(driver);
+                        return run_compiled_tuple_hash(green_key, &live);
+                    }
+                    return produced;
+                }
+                majit_metainterp::CompileOutcome::Cancelled if meta.is_tracing() => {
+                    // `reached_loop_header`: `cancelled, tracing more...`
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] cancelled, tracing more...");
+                    }
+                    let _ = meta.take_keep_tracing_after_close();
+                    if let Some(ctx) = meta.trace_ctx() {
+                        ctx.resume_walk_after_close();
+                    }
+                    if let Some(
+                        [
+                            majit_ir::Value::Int(len),
+                            majit_ir::Value::Int(acc),
+                            majit_ir::Value::Int(i),
+                            majit_ir::Value::Ref(majit_ir::GcRef(obj)),
+                        ],
+                    ) = close_live.as_deref()
+                    {
+                        green_args = [(
+                            majit_metainterp::JitArgKind::Ref,
+                            pyre_object::gc_roots::shadow_stack_get(type_slot) as usize as i64,
+                        )];
+                        red_args = [
+                            (majit_metainterp::JitArgKind::Int, sym.len, *len),
+                            (majit_metainterp::JitArgKind::Int, sym.acc, *acc),
+                            (majit_metainterp::JitArgKind::Int, sym.i, *i),
+                            (majit_metainterp::JitArgKind::Ref, sym.obj, *obj as i64),
+                        ];
+                    }
+                    continue;
+                }
+                majit_metainterp::CompileOutcome::Cancelled => {
+                    // Post-take cancel already finished History
+                    // (`jitdriver.rs compile_and_record_loop`).
+                    let jd_no = meta
+                        .active_jitdriver_sd
+                        .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
+                    meta.warm_state_for_driver(jd_no)
+                        .finish_tracing(start_cell_key);
+                    return produced;
+                }
+                majit_metainterp::CompileOutcome::Aborted => {
+                    meta.abort_trace(false);
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] abort_trace");
+                    }
+                    return None;
+                }
+                majit_metainterp::CompileOutcome::SwitchToBlackhole { reason } => {
+                    meta.stage_abort_reason(reason);
+                    meta.abort_trace(false);
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] abort_trace");
+                    }
+                    return None;
+                }
+            }
+        } else if let Some(TraceAction::Finish {
+            finish_args,
             finish_arg_types,
             exit_with_exception,
-        ) {
-            Ok(()) => {
-                if meta.is_tracing() {
-                    meta.abort_trace(false);
+            exc_value: _,
+        }) = drove
+        {
+            if exit_with_exception {
+                crate::call_jit::drain_backend_jit_exc();
+            }
+            match meta.compile_finish_from_active_session(
+                &finish_args,
+                finish_arg_types,
+                exit_with_exception,
+            ) {
+                Ok(()) => {
+                    if meta.is_tracing() {
+                        meta.abort_trace(false);
+                    }
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[tuple.hash] compile_finish ok exit_with_exception={exit_with_exception} \
+                             still_tracing={}",
+                            meta.is_tracing(),
+                        );
+                    }
                 }
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[tuple.hash] compile_finish ok exit_with_exception={exit_with_exception} \
-                         still_tracing={}",
-                        meta.is_tracing(),
-                    );
+                Err(stb) => {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[tuple.hash] compile_finish aborted reason={}", stb.reason);
+                    }
+                    meta.aborted_tracing(stb.reason);
                 }
             }
-            Err(stb) => {
+            return produced;
+        } else {
+            // `trace_jitcode_from_merge_point` walks a standalone stack.
+            // `publish_walk_abort_handoff` stages it on `aborted_framestack`
+            // unless `symbolic_residual_abort` declined. Adopt before
+            // `abort_trace_live` recycles it.
+            let published = meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.aborted_framestack.take());
+            if let Some(stack) = published.filter(|s| !s.is_empty()) {
+                meta.framestack = stack;
+                let stb = interpret_abort_switch_to_blackhole(meta);
+                let outcome = run_blackhole_interp_to_cancel_tracing(meta, stb);
                 if majit_metainterp::majit_log_enabled() {
-                    eprintln!("[tuple.hash] compile_finish aborted reason={}", stb.reason);
+                    eprintln!("[tuple.hash] blackhole outcome={outcome:?}");
                 }
-                meta.aborted_tracing(stb.reason);
+                return Some(tuple_hash_result_from_blackhole(outcome));
             }
-        }
-    } else {
-        // `trace_jitcode_from_merge_point` walks a standalone stack.
-        // `publish_walk_abort_handoff` stages it on `aborted_framestack`
-        // unless `symbolic_residual_abort` declined. Adopt before
-        // `abort_trace_live` recycles it.
-        let published = meta
-            .trace_ctx()
-            .and_then(|ctx| ctx.aborted_framestack.take());
-        if let Some(stack) = published.filter(|s| !s.is_empty()) {
-            meta.framestack = stack;
-            let stb = interpret_abort_switch_to_blackhole(meta);
-            let outcome = run_blackhole_interp_to_cancel_tracing(meta, stb);
+            meta.abort_trace(false);
             if majit_metainterp::majit_log_enabled() {
-                eprintln!("[tuple.hash] blackhole outcome={outcome:?}");
+                eprintln!("[tuple.hash] abort_trace");
             }
-            return Some(tuple_hash_result_from_blackhole(outcome));
+            // The walk did not finish the hash; the interpreter portal
+            // continues from this merge's `acc`/`i`.
+            return None;
         }
-        meta.abort_trace(false);
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!("[tuple.hash] abort_trace");
-        }
-        // The walk did not finish the hash; the interpreter portal
-        // continues from this merge's `acc`/`i`.
-        return None;
     }
-    produced
 }
 
 fn tuple_hash_invalid_finish() -> pyre_interpreter::error::PyError {
