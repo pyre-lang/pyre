@@ -12449,6 +12449,65 @@ fn one_word_item_vec_set_len_writes_the_len_word() {
 }
 
 #[test]
+fn vec_is_empty_is_container_len_eq_zero() {
+    use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let i64_len: Vec<String> = vec_helper_path(VecOp::Length, VecItemKind::Int)
+        .split("::")
+        .map(str::to_string)
+        .collect();
+    let cases: [(&str, serde_json::Value, Vec<serde_json::Value>, Vec<String>); 2] = [
+        (
+            "vec_i64_is_empty",
+            vec_of(i64_ty()),
+            vec_type_decls(),
+            i64_len,
+        ),
+        (
+            "vec_string_is_empty",
+            vec_of(string_ty()),
+            vec_string_type_decls(),
+            vec!["__len".to_string()],
+        ),
+    ];
+    for (caller, recv, decls, expected_len) in cases {
+        let llbc = std_extern_call_fixture_with_types(
+            caller,
+            &["alloc", "vec", "<Impl>", "is_empty"],
+            &[recv],
+            bool_ty.clone(),
+            decls,
+        );
+        let graph =
+            crate::test_support::lower_function(&llbc, caller).expect("lower Vec::is_empty");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if *segments == expected_len
+            )),
+            "Vec::is_empty must emit the container len op {expected_len:?}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "Vec::is_empty must compare with 0; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
+            "Vec::is_empty must become eq; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "is_empty"),
+            "Vec::is_empty must not residualize; ops={ops:?}"
+        );
+    }
+}
+
+#[test]
 fn one_word_copy_nonoverlapping_is_slice_arraycopy() {
     let generics = |types: Vec<serde_json::Value>| {
         serde_json::json!({

@@ -1016,26 +1016,7 @@ impl<'a> Lowering<'a> {
                         len_var
                     };
                     if self.is_slice_is_empty(&reg) {
-                        let zero = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(zero.clone()),
-                            kind: OpKind::ConstInt(0),
-                        });
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::BinOp {
-                                op: "eq".to_string(),
-                                lhs: len,
-                                rhs: zero,
-                                result_ty: ValueType::Int,
-                            },
-                        });
-                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        self.emit_int_eq_zero(bb_id, dest_local, len);
                     } else {
                         self.local_var[dest_local] = Some(LocalValue::One(len));
                     }
@@ -5299,26 +5280,7 @@ impl<'a> Lowering<'a> {
                         });
                         len
                     };
-                    let zero = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(zero.clone()),
-                        kind: OpKind::ConstInt(0),
-                    });
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::BinOp {
-                            op: "eq".to_string(),
-                            lhs: len,
-                            rhs: zero,
-                            result_ty: ValueType::Int,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    self.emit_int_eq_zero(bb_id, dest_local, len);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5515,7 +5477,12 @@ impl<'a> Lowering<'a> {
                 // becomes `getattr("__len__")`. [`Self::is_container_len`]
                 // emits the `FieldRead` of `len` (`typed_array_len_owner`)
                 // instead of entering that body.
-                if args.len() == 1 && self.is_container_len(&reg) {
+                // `Vec::is_empty` is the same length op compared with 0
+                // (`rlist.py` `ll_length`; RPython has no `is_empty`
+                // callee). Dispatch stays per receiver (`ListRepr` /
+                // `RustVecRepr` `rtype_len`).
+                let is_container_is_empty = self.is_container_is_empty(&reg);
+                if args.len() == 1 && (self.is_container_len(&reg) || is_container_is_empty) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -5561,7 +5528,11 @@ impl<'a> Lowering<'a> {
                             // sees already-lowered uses, so a later
                             // `gcarray_from_pyobject_vec` / link of the
                             // same field would keep a dead operand.
-                            self.local_var[dest_local] = Some(LocalValue::One(len));
+                            if is_container_is_empty {
+                                self.emit_int_eq_zero(bb_id, dest_local, len);
+                            } else {
+                                self.local_var[dest_local] = Some(LocalValue::One(len));
+                            }
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
                             self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5616,7 +5587,11 @@ impl<'a> Lowering<'a> {
                         {
                             // Same as the one-word arm: keep the whole-field
                             // read; the length word is a second getfield.
-                            self.local_var[dest_local] = Some(LocalValue::One(len));
+                            if is_container_is_empty {
+                                self.emit_int_eq_zero(bb_id, dest_local, len);
+                            } else {
+                                self.local_var[dest_local] = Some(LocalValue::One(len));
+                            }
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
                             self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5636,7 +5611,11 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind,
                     });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    if is_container_is_empty {
+                        self.emit_int_eq_zero(bb_id, dest_local, res);
+                    } else {
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);

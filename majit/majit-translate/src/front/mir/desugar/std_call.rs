@@ -7383,6 +7383,20 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `Vec::is_empty` — `len(l) == 0` (`rlist.py` `ll_length`). RPython
+    /// has no `is_empty` callee; `not l` / `len(l) == 0` is that length
+    /// read compared with zero. Residual `alloc::vec::<Impl>::is_empty`
+    /// would share one unique graph across `SomeList` and `SomeRustVec`
+    /// receivers. `<[T]>::is_empty` is [`Self::is_slice_is_empty`].
+    pub(in crate::front::mir) fn is_container_is_empty(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "alloc::vec::<Impl>::is_empty")
+    }
+
     /// `Vec::set_len(v, n)` — `l.length = n` (`ll_set_length`).
     pub(in crate::front::mir) fn is_vec_set_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
@@ -7709,6 +7723,36 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path_str() == "core::slice::<Impl>::is_empty")
+    }
+
+    /// `len == 0`. `<[T]>::is_empty` and `Vec::is_empty` share this tail
+    /// (`rlist.py` `ll_length` compared with zero). The dest is the bool.
+    pub(in crate::front::mir) fn emit_int_eq_zero(
+        &mut self,
+        bb_id: BlockId,
+        dest_local: usize,
+        len: Variable,
+    ) {
+        let zero = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: len,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
