@@ -8907,33 +8907,20 @@ pub(crate) fn reconstruct_inline_recipe(
     } else {
         None
     };
-    let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
-    // The encoder enumerates live boxes in bank order [int | ref | float] and
-    // `frame.values` mirrors that order. A pending call-result color (the dst of
-    // an in-flight residual call) is removed from the ref bank below because the
-    // framestack walk delivers that value via `make_result_of_lastop`, not from
-    // resumedata. Drop its encoded value from the SAME position so the liveness
-    // enumeration and the consumed value section stay aligned
-    // (resume.py consume_boxes).
-    let mut pending_value_index: Option<usize> = None;
-    if let Some(color) = pending_result_color {
-        if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
-            pending_value_index = Some(reg_indices.int.len() + ref_pos);
-            reg_indices.ref_.remove(ref_pos);
-        }
-    }
-    let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
-        Some(idx) => frame
-            .values
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| if i == idx { None } else { Some(v) })
-            .collect(),
-        None => frame.values.iter().collect(),
-    };
-    // resume.py consume_boxes: the liveness enumeration count must match
-    // the (pending-excluded) encoded frame section exactly.
-    if reg_indices.total_len() != values.len() {
+    let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    // `get_list_of_active_boxes(in_a_call=True)` keeps dest in the live list
+    // and writes `CONST_NULL` (r) / `CONST_FALSE` (i) / `CONST_FZERO` (f)
+    // there. `ResumeDataBoxReader.consume_boxes` decodes that box into
+    // `registers_r[index]` like every other live color. Leave dest in
+    // `reg_indices.ref_` and consume `frame.values` as encoded: dest
+    // decodes into `by_color_r` / `registers_r_color` as that NULL constant.
+    // The dest color's semantic `locals_cells_stack_w` slot still holds the
+    // in-flight operand; `pending_result_abs_slot` skips filling it.
+    // `make_result_of_lastop` / `call_result_register_in` overwrite dest on
+    // return.
+    // `consume_boxes`: the liveness enumeration count must match the encoded
+    // frame section exactly (dest included).
+    if reg_indices.total_len() != frame.values.len() {
         decline!("LivenessValueCountMismatch");
     }
     // resume.py rebuild_from_resumedata hands `consume_boxes` all three banks
@@ -8949,16 +8936,16 @@ pub(crate) fn reconstruct_inline_recipe(
     //
     // Decoded before the portal-callee branch below so both its returns carry
     // the banks, and so the section offsets are computed once: the encoder
-    // enumerates live boxes in bank order and `values` mirrors it, so the Ref
-    // section starts at `int_len` (`pending_value_index` above already removed
-    // the pending call result from within that section).
+    // enumerates live boxes in bank order and `frame.values` mirrors it, so
+    // the Ref section starts at `int_len` (dest is in that section as the
+    // encoded NULL).
     let int_len = reg_indices.int.len();
     let mut registers_i: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
     for (pos, &reg_idx) in reg_indices.int.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            values[pos],
+            &frame.values[pos],
             Type::Int,
             rd_virtuals,
             resume_data,
@@ -8982,7 +8969,7 @@ pub(crate) fn reconstruct_inline_recipe(
     for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            values[float_base + pos],
+            &frame.values[float_base + pos],
             Type::Float,
             rd_virtuals,
             resume_data,
@@ -9000,7 +8987,8 @@ pub(crate) fn reconstruct_inline_recipe(
     }
     // The Ref section alone, so every `reg_indices.ref_` position below indexes
     // it directly instead of carrying the `int_len` offset to each use site.
-    let ref_values: Vec<&majit_ir::resumedata::RebuiltValue> = values[int_len..float_base].to_vec();
+    let ref_values: Vec<&majit_ir::resumedata::RebuiltValue> =
+        frame.values[int_len..float_base].iter().collect();
 
     // Virtualizable-callee shape (pyre's "every function is its own portal"
     // model): the callee's live ref registers are the portal reds [frame, ec]
@@ -9015,16 +9003,15 @@ pub(crate) fn reconstruct_inline_recipe(
     // `pcdep_entries`; this portal shape keeps locals in the `frame` red's
     // array, so recover them from that array here.
     //
-    // An `in_a_call` callee suspended at one of its own CALL sites carries a
-    // pending result whose register was already dropped from the ref bank above
-    // (`pending_value_index`). When that pending-result color coincides with the
-    // `ec` portal red, the removal leaves only `[frame]` live — a one-ref
-    // reduced form of the SAME portal-callee shape. `pec_reg` is consumed only
-    // by this classifier gate; the reconstruction body threads
-    // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
-    // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
-    // pending call-result slot is delivered by `make_result_of_lastop`, not from
-    // resumedata, and is skipped by `pending_result_abs_slot`).
+    // An `in_a_call` callee suspended at one of its own CALL sites keeps dest
+    // in `reg_indices.ref_` (`get_list_of_active_boxes(in_a_call=True)`),
+    // decoded as `CONST_NULL` into its color (`consume_boxes`). When dest
+    // coincides with the `ec` portal red, that color is already in the live
+    // list, so the bank carries both reds. The classifier keys off the frame
+    // red: `pec_reg` is consumed only by this gate; the reconstruction body
+    // threads `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w`
+    // array and never reads `ec`. Dest's semantic slot is skipped by
+    // `pending_result_abs_slot` and delivered later by `make_result_of_lastop`.
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
@@ -9037,7 +9024,7 @@ pub(crate) fn reconstruct_inline_recipe(
     for &reg_idx in &reg_indices.ref_ {
         let (op, val) = bridge_decode_box(
             ctx,
-            values[value_cursor],
+            &frame.values[value_cursor],
             Type::Ref,
             rd_virtuals,
             resume_data,

@@ -12257,6 +12257,53 @@ fn entry_instantiation_splits_key_class() {
 }
 
 #[test]
+fn gc_entries_instantiation_splits_key_class() {
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![code_struct(
+            0,
+            &["pyre_object", "rordereddict_entries", "GcEntries"],
+        )],
+        vec![],
+    );
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let node = |args: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": args,
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let tomb = std::collections::HashSet::new();
+    let a_node = node(vec![u64_ty.clone(), i64_ty.clone()]);
+    let b_node = node(vec![i64_ty.clone(), i64_ty]);
+    let a = super::adt_node_class_root_with(&a_node, &llbc, &tomb);
+    let b = super::adt_node_class_root_with(&b_node, &llbc, &tomb);
+    assert_ne!(
+        a, b,
+        "GcEntries<K,V> instantiations must not share one class"
+    );
+    assert!(a.as_deref().unwrap_or("").contains('<'), "got {a:?}");
+    let adt = a_node.get("Adt").and_then(|v| v.as_object()).expect("Adt");
+    assert_eq!(
+        super::struct_instantiation_suffix(
+            "pyre_object::rordereddict_entries::GcEntries",
+            adt,
+            &llbc
+        )
+        .as_deref(),
+        Some("<u64,i64>")
+    );
+}
+
+#[test]
 fn tyref_enum_instantiation_suffix_unwraps_value_wrapper() {
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let wrapped = TyRef::Other(serde_json::json!({
@@ -17892,6 +17939,31 @@ fn field_row_scalar_pointer_is_address() {
     let got = super::field_row_lltype(&reg, "*mut u8", &mut field_row_visited())
         .expect("scalar pointer field");
     assert_eq!(got, LowLevelType::Address);
+}
+
+#[test]
+fn raw_struct_array_item_interns_instantiation_name() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    let template = "rordereddict_entries::Entry";
+    reg.fields.insert(
+        template.to_string(),
+        vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ],
+    );
+    let item = format!("{template}<i64,*mut u8>");
+    let mut visited = std::collections::HashSet::new();
+    let got = super::raw_struct_array_item_lltype(&reg, &item, &mut visited)
+        .expect("instantiated Entry item intern");
+    let LowLevelType::Struct(st) = got else {
+        panic!("ARRAY.OF must be Struct, got {got:?}");
+    };
+    assert_eq!(st._name, item);
+    assert_ne!(st._name.as_str(), template);
 }
 
 #[test]

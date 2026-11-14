@@ -5620,12 +5620,12 @@ pub(in crate::front::mir) fn gc_array_id_for_named_struct_node(
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
-    let leaf = majit_ir::descr::strip_instantiation_suffix(&root);
-    Some(format!("GcArray<{leaf}>"))
+    Some(format!("GcArray<{root}>"))
 }
 
-/// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,
-/// non-transparent struct pointee.
+/// `GcArray<Point>` / `GcArray<Entry<K,V>>` for a `*mut`/`*const` named,
+/// non-transparent struct pointee. The ARRAY identity is the
+/// instantiation's (`get_ll_dict` `DICTENTRYARRAY`).
 pub(in crate::front::mir) fn struct_pointee_array_type_id(
     base_ty: &TyRef,
     llbc: &Llbc,
@@ -6060,7 +6060,8 @@ pub(in crate::front::mir) fn trace_struct_ptr_add_header(
 ///
 /// Requires `ptr::add` (not `sub`), a MIR-local index, a named
 /// non-transparent struct pointee, and a destination used only as
-/// `(*dest).field`. The array identity is taken from the add's pointer
+/// `(*dest).field`. The ARRAY identity is the instantiation's
+/// (`get_ll_dict` `DICTENTRYARRAY`), taken from the add's pointer
 /// type, which is `*mut Entry` even when the header is a `GcEntries`.
 ///
 /// A reassignment of the index or the header that reaches a `(*dest).field`

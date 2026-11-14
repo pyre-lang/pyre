@@ -5986,6 +5986,19 @@ impl CallControl {
         (descr as majit_ir::descr::DescrRef, key)
     }
 
+    /// Dump-only ARRAY.OF name: peel the container spelling, keep the
+    /// instantiated element when that struct is registered, else the
+    /// template (`strip_generic_args`).
+    fn dump_array_elem_name(&self, array_str: &str) -> String {
+        let peeled =
+            extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
+        if self.is_known_struct(&peeled) {
+            peeled
+        } else {
+            majit_ir::descr::strip_generic_args(&peeled).into_owned()
+        }
+    }
+
     /// Trait-typed sibling of [`Self::arraydescrof`] returning the cached
     /// `Arc<dyn ArrayDescr>` rather than the trait-erased `DescrRef`.
     /// Used by [`Self::interiorfielddescrof`] which needs the array-descr
@@ -6055,11 +6068,9 @@ impl CallControl {
             _ => None,
         });
         let elem_name = interned_of_struct.clone().or_else(|| {
-            array_type_id.as_deref().and_then(|s| {
-                extract_element_type_from_str(s)
-                    .or_else(|| Some(s.to_string()))
-                    .map(|n| majit_ir::descr::strip_generic_args(&n).into_owned())
-            })
+            array_type_id
+                .as_deref()
+                .map(|s| self.dump_array_elem_name(s))
         });
         let elem_ref = elem_name.as_deref();
         // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
@@ -6981,9 +6992,7 @@ impl CallControl {
         let elem_name = if let Some(name) = interned_of_struct.clone() {
             name
         } else {
-            let raw =
-                extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
-            majit_ir::descr::strip_generic_args(&raw).into_owned()
+            self.dump_array_elem_name(array_str)
         };
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
@@ -24247,6 +24256,97 @@ mod tests {
         if crate::layout::target_word_size() == 8 {
             assert_eq!(offset, 16);
         }
+    }
+
+    /// Dump-only `interiorfielddescrof_keyed` peels
+    /// `GcArray<rordereddict_entries::Entry<K,V>>` and, when that
+    /// instantiation is registered, uses its layout (`get_ll_dict`
+    /// `DICTENTRYARRAY`). A 16-byte by-value key puts `f_valid` at 16.
+    #[test]
+    fn interiorfielddescrof_keyed_dump_uses_registered_instantiation() {
+        let template = "rordereddict_entries::Entry";
+        let key_ty = "WideKey";
+        let elem = format!("{template}<{key_ty},*mut PyObject>");
+        let atid = format!("GcArray<{elem}>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let elem_sid = template_sid.instantiate(&format!("<{key_ty},*mut PyObject>"));
+        let key_sid = majit_ir::descr::StructId::from_canonical(key_ty);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (elem.clone(), Some(elem_sid)),
+                (key_ty.to_string(), Some(key_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let inst_rows = [
+            ("key".into(), key_ty.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            elem.clone(),
+            key_ty.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(key_ty.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(key_ty.to_string(), 8usize)]);
+        let inst_layout = StructLayout::from_type_strings(
+            &inst_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let template_valid = template_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("template f_valid")
+            .offset;
+        let inst_valid = inst_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("instantiation f_valid")
+            .offset;
+        assert_eq!(template_valid, 8);
+        assert_eq!(inst_valid, 16);
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(elem.clone(), inst_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout);
+        cc.set_struct_layout(elem_sid, inst_layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &None, "f_valid")
+            .expect("dump interior field descr");
+        let offset = descr
+            .as_interior_field_descr()
+            .expect("InteriorFieldDescr")
+            .field_descr()
+            .offset();
+        assert_eq!(offset, inst_valid);
+        assert_ne!(offset, template_valid);
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

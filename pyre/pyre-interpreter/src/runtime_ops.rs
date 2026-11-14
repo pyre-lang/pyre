@@ -395,6 +395,13 @@ impl majit_ir::helper_fnaddr::ResidualError for PyError {
     }
 }
 
+impl majit_ir::helper_fnaddr::ResidualRefResult for PyError {
+    #[inline]
+    fn into_residual_ref(self) -> i64 {
+        self.0.as_ptr() as usize as i64
+    }
+}
+
 /// Widest `jit_call_known_builtin_N` published by [`known_builtin_call_helper`],
 /// plus the leading code slot.
 const MAX_KNOWN_BUILTIN_ARGS: usize = 9;
