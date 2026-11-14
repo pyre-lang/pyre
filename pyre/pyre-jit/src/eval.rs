@@ -10005,13 +10005,7 @@ fn run_compiled_tuple_hash_from_frame(
                     .unwrap_or(live_values);
                 driver
                     .meta_interp_mut()
-                    .run_compiled_detailed_with_token_on_driver(
-                        pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX,
-                        green_key,
-                        &token,
-                        live,
-                        0,
-                    )
+                    .run_compiled_detailed_with_token_on_driver(green_key, &token, live, 0)
             };
             Some((
                 r.is_finish,
