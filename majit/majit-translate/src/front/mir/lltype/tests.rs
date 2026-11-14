@@ -8602,8 +8602,8 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
     );
     assert_eq!(super::impl_method_owner_for_fundecl(&llbc, outer), None);
     assert_eq!(super::impl_method_owner_for_fundecl(&llbc, inner), None);
-    let outer_path = super::registered_path_for_fun_decl(&llbc, outer).segments;
-    let inner_path = super::registered_path_for_fun_decl(&llbc, inner).segments;
+    let outer_path = super::fundecl_fn_item_segments(&llbc, outer);
+    let inner_path = super::fundecl_fn_item_segments(&llbc, inner);
     assert_ne!(outer_path, inner_path);
     assert_eq!(
         outer_path,
@@ -8612,6 +8612,24 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
     assert_eq!(
         inner_path,
         super::trait_impl_identity_path("bytecode::_::<Impl>", "i64", "combine")
+    );
+    let outer_unique = super::registered_path_for_fun_decl(&llbc, outer).segments;
+    let inner_unique = super::registered_path_for_fun_decl(&llbc, inner).segments;
+    assert_ne!(outer_unique, inner_unique);
+    assert_ne!(outer_unique, outer_path);
+    assert_eq!(
+        outer_unique,
+        vec!["fixture", "bytecode", "_#5", "usize", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        inner_unique,
+        vec!["fixture", "bytecode", "_#5", "i64", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
 
     let mut outer_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
@@ -8634,13 +8652,13 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
         crate::front::mir::lower_fun_decl(&context, outer).expect("lower outer combine");
     let (callee_id, callee_path) = first_call_binding(&outer_graph);
     assert_eq!(callee_id, Some(2));
-    assert_eq!(callee_path, inner_path);
+    assert_eq!(callee_path, inner_unique);
 
     let caller_graph =
         crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
     let (caller_id, caller_path) = first_call_binding(&caller_graph);
     assert_eq!(caller_id, Some(2));
-    assert_eq!(caller_path, inner_path);
+    assert_eq!(caller_path, inner_unique);
 }
 
 fn unique_primitive_inherent_impl_fixture() -> Llbc {
@@ -8790,33 +8808,33 @@ fn spec_segments_keeps_unique_primitive_inherent_impl_name_path() {
         super::inherent_impl_callee_identity(&llbc, method, "combine"),
         None
     );
-    let registered = super::registered_path_for_fun_decl(&llbc, method).segments;
+    let harvest = super::fundecl_fn_item_segments(&llbc, method);
     assert_eq!(
-        registered,
+        harvest,
         vec!["bytecode", "_", "<Impl>", "combine"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
     assert!(
-        !registered
+        !harvest
             .iter()
             .any(|s| crate::front::mir::is_trait_impl_identity_segment(s))
+    );
+    let registered = super::registered_path_for_fun_decl(&llbc, method).segments;
+    assert_eq!(
+        registered,
+        vec!["fixture", "bytecode", "_#5", "i64", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
 
     let caller_graph =
         crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
     let (callee_id, callee_path) = first_call_binding(&caller_graph);
     assert_eq!(callee_id, Some(1));
-    assert_eq!(
-        callee_path,
-        method
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(callee_path, registered);
 }
 
 #[test]
