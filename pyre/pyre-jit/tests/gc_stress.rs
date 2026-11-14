@@ -1173,16 +1173,15 @@ assert result == 1428, result
     );
 }
 
-/// A mortal (user) `Function`'s `name` string and a heap `W_TypeObject`'s `name`
-/// string are GC-managed leaf storage boxes shared under one `NameStorage` tid
-/// (off-GC storage): the function's `FUNCTION_NAME_OFFSET` gc-pointer
-/// edge and the type's `type_object_custom_trace` name-slot greying keep the box
-/// live, and the box tid's drop glue is the sole reclaimer. Regression for the
-/// migration off `function_object_destructor` / the type destructor's name-free:
-/// a function/type reachable only through a list must keep its name across
-/// collections (UAF on `__name__` read-back if swept early), the `__name__`
-/// setter must rebox on a mortal holder, and per-round dead functions/types must
-/// be reclaimed without a double-free.
+/// A mortal (user) `Function`'s `name` and a heap `W_TypeObject`'s `name` are
+/// rstr `STR` payloads: the function's `FUNCTION_NAME_OFFSET` gc-pointer edge
+/// and the type's `type_object_custom_trace` name-slot greying keep the leaf
+/// live. Regression for the migration off `function_object_destructor` / the
+/// type destructor's name-free: a function/type reachable only through a list
+/// must keep its name across collections (UAF on `__name__` read-back if swept
+/// early), the `__name__` setter aliases `text_w` (`self._utf8`) on a mortal
+/// type, and per-round dead functions/types must be reclaimed without a
+/// double-free.
 ///
 /// `fns` and `types` are reachable only through lists; each function's name is
 /// reassigned via the setter. The checksum reads every `__name__` back after

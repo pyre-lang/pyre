@@ -1448,13 +1448,37 @@ impl PyError {
         })
     }
 
-    /// Bool view of [`Self::display_message`]. The `Wtf8Buf` match stays
-    /// inside the residual helper. A pending deferred `%T` / `%s` / `%R` formats
-    /// first, so a non-empty computed message reads as true
-    /// (`OpErrFmt._compute_value`).
+    /// Bool view of the display text. A pending deferred `%T` / `%s` / `%R`
+    /// formats first, so a non-empty computed message reads as true
+    /// (`OpErrFmt._compute_value`). Empty rstr is false, matching
+    /// `DisplayMessage::Text` with an empty buffer.
     #[majit_macros::dont_look_inside]
     fn has_display_message(&self) -> bool {
-        matches!(self.display_message(), DisplayMessage::Text(m) if !m.is_empty())
+        if self.has_deferred_fmt() {
+            return self.deferred_computed().has_display_message();
+        }
+        if self.message.is_null() {
+            return false;
+        }
+        unsafe {
+            !pyre_object::unicodeobject::utf8_payload_bytes(
+                self.message as *const pyre_object::unicodeobject::UnicodeValueStorage,
+            )
+            .is_empty()
+        }
+    }
+
+    /// `error.py OperationError.get_w_value`: `space.newtext(value, lgt)`.
+    /// Wrap the existing message rstr; do not copy the payload.
+    fn wrap_display_message_str(&self) -> PyObjectRef {
+        let storage = self.message as *mut pyre_object::unicodeobject::UnicodeValueStorage;
+        let lgt = if storage.is_null() {
+            0
+        } else {
+            let wtf8 = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(storage) };
+            pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, wtf8.len())
+        };
+        pyre_object::unicodeobject::w_str_from_storage_and_length(storage, lgt)
     }
 
     fn has_deferred_fmt(&self) -> bool {
@@ -1518,7 +1542,7 @@ impl PyError {
                 message.push_str(&fmt[start..i]);
                 match c {
                     b'T' => {
-                        message.push_str(&type_name_of(x0 as PyObjectRef));
+                        message.push_str(type_name_str(x0 as PyObjectRef));
                         count += 1;
                     }
                     b's' => {
@@ -2670,7 +2694,7 @@ impl PyError {
         if !self.has_display_message() {
             return pyre_object::w_none();
         }
-        let w_value = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
+        let w_value = self.wrap_display_message_str();
         self.reload(&_roots, handle_slot);
         self.set_exc_object(w_value);
         self.exc_object
@@ -2745,7 +2769,7 @@ impl PyError {
         self.reload(&_roots, handle_slot);
         if self.has_display_message() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-            let msg = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
+            let msg = self.wrap_display_message_str();
             let _ = pyre_object::gc_roots::pin_root(msg);
             let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
@@ -6254,22 +6278,27 @@ fn format_obj_name(obj: PyObjectRef) -> Wtf8Buf {
     }
 }
 
-/// `space.type(w_obj).getname(space)` — the `%T` spelling.
+/// `space.type(w_obj).name` — the `%T` spelling (`error.py`). rstr; no copy.
 ///
 /// The Python-visible type, which is `w_class`; `ob_type` names the storage a
 /// value is laid out as, and a class deriving from a builtin shares its
 /// storage while presenting its own name.
-pub fn type_name_of(w_obj: PyObjectRef) -> String {
+pub fn type_name_str(w_obj: PyObjectRef) -> &'static str {
     // A tagged int immediate is an exact builtin int; skip the ob_type deref.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
-        return "int".to_string();
+        return "int";
     }
     unsafe {
         match crate::typedef::r#type(w_obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*w_obj).ob_type).name.to_string(),
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()),
+            None => (*(*w_obj).ob_type).name,
         }
     }
+}
+
+/// Owned copy of [`type_name_str`] for callers that format into a `String`.
+pub fn type_name_of(w_obj: PyObjectRef) -> String {
+    type_name_str(w_obj).to_string()
 }
 
 /// `oefmt(space.w_<kind>, valuefmt)` with no argument, for the builtin class
@@ -6454,7 +6483,7 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -
             ('T', FmtArg::Obj(_)) => {
                 let obj = _roots.get(next_obj_slot);
                 next_obj_slot += 1;
-                message.push_str(&type_name_of(obj));
+                message.push_str(type_name_str(obj));
             }
             ('N', FmtArg::Obj(_)) => {
                 let obj = _roots.get(next_obj_slot);
@@ -7307,6 +7336,30 @@ mod tests {
         // `OpErrFmtNoArgs._value` is the constant itself, not a copy.
         let again = super::oefmt_noargs(PyErrorKind::IndexError, "pop %s from empty list");
         assert_eq!(err.message, again.message);
+    }
+
+    #[test]
+    fn get_w_value_wraps_the_message_str() {
+        // `error.py OperationError.get_w_value`: `space.newtext(value, lgt)`
+        // wraps the existing rstr (`OpErrFmtNoArgs._value`).
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let mut err = super::oefmt_noargs(
+            PyErrorKind::ValueError,
+            "type name must not contain null characters",
+        );
+        let message = err.message;
+        let w_value = err.get_w_value(pyre_object::PY_NULL);
+        assert_eq!(
+            unsafe { pyre_object::unicodeobject::w_str_storage(w_value) }
+                as pyre_object::gc_hook::GCREF,
+            message
+        );
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_value_opt(w_value) },
+            Some("type name must not contain null characters")
+        );
     }
 
     #[test]

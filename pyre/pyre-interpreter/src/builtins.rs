@@ -7269,19 +7269,23 @@ fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
 /// and `(2, 3)` on PyPy.  Those exception attributes are observable, so the
 /// CPython 3.14 specification wins while the surrounding PyPy call shape is
 /// retained.
-pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn check_surrogate(mut w_name: PyObjectRef) -> Result<(), crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if let Err(e) = pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false) {
         // RPython's CheckError position, `e.pos + 1`, and the exception's
         // start/end fields are all Signed; keep that type through the call.
+        // Root `w_name` only on this arm: `unicode_encode_error` allocates,
+        // and the success path (`check_utf8` Ok) does not collect.
         let pos = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, e.pos as usize) as i64;
-        return Err(crate::typedef::unicode_encode_error(
-            "utf8",
-            w_name,
-            pos,
-            pos + 1,
-            "surrogates not allowed",
-        ));
+        return pyre_object::with_roots!(w_name => {
+            Err(crate::typedef::unicode_encode_error(
+                "utf8",
+                w_name,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ))
+        });
     }
     Ok(())
 }

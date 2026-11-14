@@ -556,11 +556,9 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         f(&mut t.w_doc as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
-        // epic S5) for a mortal heap type; forward the field slot so a major GC greys
-        // the box, and the box tid's drop glue reclaims the buffer on sweep. An
-        // immortal type's `malloc_raw` name is not collector-owned, so the guard
-        // skips it.
+        // `name` points at rstr `STR` (`typeobject.py W_TypeObject.name`). Forward
+        // the field slot so a major GC greys the leaf. An immortal type's immortal
+        // STR is not collector-owned, so the guard skips it.
         if !t.name.is_null()
             && pyre_object::gc_hook::try_gc_owns_object(t.name as pyre_object::gc_hook::GCREF)
         {
@@ -619,9 +617,8 @@ unsafe fn cached_attribute_holder_gc_trace(
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
-/// heap type. `name` is a GC-managed leaf storage box (`NameStorage`, off-GC
-/// storage) reclaimed by its own box tid's drop glue — freeing it here
-/// too would double-free a box swept before its owner. `mro_w` is a GC-managed
+/// heap type. `name` is rstr `STR` reclaimed by the collector — freeing it here
+/// would double-free a leaf swept before its owner. `mro_w` is a GC-managed
 /// `FixedObjectArray` reclaimed by the collector and must not be freed here. The
 /// managed namespace object is also reclaimed by the collector. The
 /// `terminator` map node is a GC object (`mapdict.py AbstractAttribute`)
@@ -5220,13 +5217,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::rutf8::Utf8IndexStorage>,
         pyre_object::unicodeobject::set_utf8_index_gc_type_id,
     );
-    // Mortal `name` string storage box for heap `W_TypeObject` (off-GC
+    // Mortal `qualname` string storage box for heap `W_TypeObject` (off-GC
     // storage). A leaf `String` (no inner refs); the type's
-    // `type_object_custom_trace` name-slot greying reaches it, and the box
+    // `type_object_custom_trace` qualname-slot greying reaches it, and the box
     // tid's drop glue reclaims the buffer on sweep. Only mortal types box
-    // their name; immortal builtin types keep a `malloc_raw` name. Function
-    // names are rstr `STR` payloads, not this box. Keep this id at the
-    // absolute registration tail.
+    // their qualname; immortal builtin types keep a `malloc_raw` qualname.
+    // `W_TypeObject.name` and Function names are rstr `STR` payloads, not this
+    // box. Keep this id at the absolute registration tail.
     register_leaf_storage_box::<pyre_object::typeobject::NameStorage>(
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::typeobject::NameStorage>,

@@ -16645,26 +16645,29 @@ fn check_set_special_type_attr(
     w_value: PyObjectRef,
     name: &str,
 ) -> Result<(), crate::PyError> {
+    let valuefmt: &'static str = if w_value.is_null() {
+        "cannot delete '%s' attribute of type '%s'"
+    } else if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
+        // [3.15-spec] check_set_special_type_attr IMMUTABLETYPE <->
+        // typeobject.py descr_set__name__ is_heaptype — freeze of a heap
+        // type refuses `__name__`; evidence: Objects/typeobject.c
+        // check_set_special_type_attr / type_set_name.
+        "cannot set '%s' attribute of immutable type '%s'"
+    } else {
+        return Ok(());
+    };
+    let w_te = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::TypeError,
+    );
     let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
-    if w_value.is_null() {
-        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            "cannot delete '",
-            name,
-            "' attribute of type '",
-            type_name,
-            "'"
-        )));
-    }
-    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            "cannot set '",
-            name,
-            "' attribute of immutable type '",
-            type_name,
-            "'"
-        )));
-    }
-    Ok(())
+    Err(crate::error::oefmt(
+        w_te,
+        valuefmt,
+        &[
+            crate::error::FmtArg::Text(name),
+            crate::error::FmtArg::Text(type_name),
+        ],
+    ))
 }
 
 /// The `fdel` half of the special type getsets: deletion is never allowed,
@@ -16686,9 +16689,8 @@ fn special_type_attr_delete(
 pub fn __majit_wrap_type_descr_set_name(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let mut w_type = args[1];
-    let mut w_value = args[2];
-    // Only heap types may be renamed.
+    let w_type = args[1];
+    let w_value = args[2];
     check_set_special_type_attr(w_type, w_value, "__name__")?;
     // typeobject.py descr_set__name__ `space.isinstance_w(w_value, space.w_text)`
     // accepts str and any str subclass, not only the exact type.
@@ -16697,7 +16699,7 @@ pub fn __majit_wrap_type_descr_set_name(
             "can only assign string to ",
             unsafe { pyre_object::w_type_get_name(w_type) },
             ".__name__, not '",
-            type_name_of(w_value),
+            crate::error::type_name_str(w_value),
             "'"
         )));
     }
@@ -16709,10 +16711,11 @@ pub fn __majit_wrap_type_descr_set_name(
     // exception type is observable, so `_check_surrogate` runs first;
     // both checks stay before `w_type.name = name`. U+0000 is a
     // single 0x00 byte in WTF-8.
-    pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
+    crate::builtins::check_surrogate(w_value)?;
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
     if wtf8.as_bytes().contains(&0) {
-        return Err(crate::PyError::value_error(
+        return Err(crate::error::oefmt_noargs(
+            crate::PyErrorKind::ValueError,
             "type name must not contain null characters",
         ));
     }

@@ -225,8 +225,8 @@ pub struct W_TypeObject {
     /// owns the interpreter object and is therefore an O-link, for which
     /// `rawrefcount.from_obj` deliberately has no identity-table entry.
     pub cpy_ref: *mut u8,
-    /// Class name (heap-allocated, leaked).
-    pub name: *mut String,
+    /// Class name (`typeobject.py W_TypeObject.name`) — rstr `STR`.
+    pub name: *mut crate::unicodeobject::UnicodeValueStorage,
     /// App-level `__name__` object.  CPython preserves this object's identity
     /// (including a str subclass assigned to a heap type); null means the
     /// initial exact string has not been materialised yet.
@@ -611,20 +611,20 @@ impl crate::lltype::GcType for W_TypeObject {
     const SIZE: usize = W_TYPE_OBJECT_SIZE;
 }
 
-/// Byte offset of the `name: *mut String` slot within `W_TypeObject`.
+/// Byte offset of the `name` rstr slot within `W_TypeObject`.
 pub const W_TYPE_NAME_OFFSET: usize = std::mem::offset_of!(W_TypeObject, name);
 
-/// GC-managed name-string box shared by `W_TypeObject` and `Function`, whose
-/// `name` fields are both `String` behind a raw pointer.
+unsafe fn name_as_str(name: *const crate::unicodeobject::UnicodeValueStorage) -> &'static str {
+    unsafe { std::str::from_utf8_unchecked(crate::unicodeobject::utf8_payload_bytes(name)) }
+}
+
+/// GC-managed box for `W_TypeObject.qualname` (`String` behind a raw pointer).
 ///
+/// `W_TypeObject.name` is rstr `STR` (`UnicodeValueStorage`), not this box.
 /// A leaf (`String` = heap `Vec<u8>`, no inner `PyObjectRef`); its GC box
-/// carries only drop glue that reclaims the buffer on sweep. Holders the
-/// collector owns box their name — a heap type (`w_type_new`) and a `Function`
-/// from `function_new_impl` once the stable hook is installed, builtin code or
-/// not. Immortal holders (builtin types, and a function minted before that
-/// hook) keep a `malloc_raw` name, because an immortal holder is never greyed
-/// and so could never keep an old-gen box alive. Mirrors
-/// [`crate::unicodeobject::UnicodeValueStorage`] and the `longobject` bigint box.
+/// carries only drop glue that reclaims the buffer on sweep. Immortal holders
+/// keep a `malloc_raw` qualname, because an immortal holder is never greyed
+/// and so could never keep an old-gen box alive.
 pub type NameStorage = String;
 
 /// Runtime-assigned GC type id for [`NameStorage`]. Published by
@@ -708,32 +708,32 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     })
     .allocated_or_raise()
     .unwrap_or(std::ptr::null_mut());
-    // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
-    // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
-    // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
-    // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
-    // grey. The type alloc above may collect; bases / dict are pinned. The
-    // name-box alloc is old-gen and does not collect, so the box cannot be
-    // swept before it is stored into the type below.
-    let name_value = name.to_string();
+    // A mortal heap type's `name` is rstr `STR` (`typeobject.py self.name = name`,
+    // `unicodeobject.py text_w` returns `_utf8`). `alloc_utf8_payload` is
+    // `rstr.mallocstr`; the `name` slot is greyed from `type_object_custom_trace`.
+    // The immortal fallback (pre-GC / snapshot tools) keeps an immortal STR that
+    // an immortal holder can never grey. The type alloc above may collect; bases
+    // / dict are pinned. `bh_alloc_str_nofill` does not collect, so the STR cannot
+    // be swept before it is stored into the type below. `qualname` stays a
+    // `NameStorage` box.
     let (name, qualname) = if raw.is_null() {
         if crate::gc_hook::gc_alloc_failed_pending() {
             return crate::PY_NULL;
         }
         (
-            crate::lltype::malloc_raw(name_value.clone()),
-            crate::lltype::malloc_raw(name_value),
+            crate::unicodeobject::alloc_utf8_payload(name.as_bytes(), false),
+            crate::lltype::malloc_raw(name.to_string()),
         )
     } else {
-        let name = crate::gc_storage::gc_alloc_young_storage_box(
-            name_value.clone(),
+        let name_utf8 = crate::unicodeobject::alloc_utf8_payload(name.as_bytes(), true);
+        let _ = crate::gc_roots::pin_root(name_utf8 as PyObjectRef);
+        let qualname = crate::gc_storage::gc_alloc_young_storage_box(
+            name.to_string(),
             name_storage_gc_type_id(),
         );
-        let _ = crate::gc_roots::pin_root(name as PyObjectRef);
-        let qualname =
-            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id());
-        let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
-        (name, qualname)
+        let name_utf8 = crate::gc_roots::shadow_stack_get(save_point + 2)
+            as *mut crate::unicodeobject::UnicodeValueStorage;
+        (name_utf8, qualname)
     };
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).
@@ -981,7 +981,7 @@ pub unsafe fn w_type_init_builtin(
 ) {
     let w_self = &mut *(w_type as *mut W_TypeObject);
     assert!(w_self.name.is_null(), "builtin type initialized twice");
-    w_self.name = crate::lltype::malloc_raw(name.to_string());
+    w_self.name = crate::unicodeobject::alloc_utf8_payload(name.as_bytes(), false);
     w_self.qualname =
         crate::lltype::malloc_raw(name.rsplit('.').next().unwrap_or(name).to_string());
     w_self.bases = bases;
@@ -1639,7 +1639,7 @@ pub unsafe fn w_type_set_hasuserdel(obj: PyObjectRef, v: bool) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
-    &*(*(obj as *const W_TypeObject)).name
+    name_as_str((*(obj as *const W_TypeObject)).name)
 }
 
 /// Return the stable app-level `type.__name__` object.
@@ -1649,8 +1649,7 @@ pub unsafe fn w_type_get_name(obj: PyObjectRef) -> &'static str {
 pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_name.is_null() {
-        let full = &*t.name;
-        let bytes = full.as_bytes();
+        let bytes = crate::unicodeobject::utf8_payload_bytes(t.name);
         let mut i = 0usize;
         let mut last = 0usize;
         while i < bytes.len() {
@@ -1660,9 +1659,8 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
             i += 1;
         }
         let bare = if t.flag_heaptype {
-            full.as_str()
+            name_as_str(t.name)
         } else {
-            // The stored name is a Rust `String`, so the suffix is UTF-8.
             unsafe { std::str::from_utf8_unchecked(&bytes[last..]) }
         };
         let w_name = crate::w_str_new(bare);
@@ -1687,9 +1685,8 @@ pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// Replace the class name (`descr_set__name__`, typeobject.py
-/// `w_type.name = name`).  `name` is an owned `String` behind a raw
-/// pointer (`malloc_raw` = boxed); assigning through it drops the old
-/// name and installs the new one, leaving the slot itself unchanged.
+/// `w_type.name = name`). `name` is rstr `STR`; the store is
+/// `space.text_w(w_value)` (`unicodeobject.py text_w` returns `self._utf8`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1700,22 +1697,13 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // does not call `mutated()`, so `_version_tag?` is not this pin.
     // The walker names that force as [`w_type_w_name_qmut_installed`] at the
     // residual setattr, the way mapdict names `setattr_would_force_quasi_immut`.
-    // The sweep and the store share the watcher lock: an `is_installed`
-    // test outside it lets a recorder publish a watcher for the old
-    // pointer after the test and before the store.  pyre is 3.14t, so
-    // `quasi_immut_store!` owns every store; the GIL made that pair
-    // indivisible in `quasiimmut.py make_invalidation_function.invalidation`.
+    // `quasi_immut_store!` / `begin_store` is the interpreter half: GIL-held
+    // stores match `make_invalidation_function.invalidation` (pointer check,
+    // then sweep); a store that may race a recorder (`objlock::stripes_taken`)
+    // holds the field lock across the sweep and the stores.
     let t = obj as *mut W_TypeObject;
     crate::quasi_immut_store!((*t).mutate_w_name() =>
-        // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
-        // `w_type_get_name` returns `&str` and is read from the interpreter, the
-        // JIT GC trace, cpyext, and extension modules, so this slot is not switched
-        // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
-        // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
-        // keeps the assigned object.
-        if let Some(name) = crate::w_str_get_value_opt(w_name) {
-            *(*t).name = name.to_string();
-        };
+        (*t).name = crate::unicodeobject::w_str_storage(w_name);
         (*t).w_name = w_name;
         type_write_barrier(obj);
     );

@@ -14234,10 +14234,19 @@ pub unsafe fn isinstance_miss_class_lookup_is_pure(w_type: PyObjectRef) -> bool 
 
 /// typeobject.py `setattr_if_not_from_object` — the `__setattr__`
 /// companion of [`getattribute_if_not_from_object`].
+///
+/// [3.15-spec] distinct type.__setattr__ (hackcheck, test_carloverre) <->
+/// typeobject.py W_TypeObject.typedef has no __setattr__ —
+/// `object.__setattr__(str, "foo", 42)` raises TypeError; evidence:
+/// lib-python/3/test/test_descr.py test_carloverre, Objects/typeobject.c
+/// hackcheck.
+/// The slot forwards to `object_setattr`, so the predicate treats it as the
+/// object default, and `space.setattr` takes the inlined `descr__setattr__`
+/// path the way `setattr_if_not_from_object` answers `None` upstream.
 pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
         if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
-            if is_object_setattr_descr(w_descr) {
+            if is_object_setattr_descr(w_descr) || is_type_setattr_descr(w_descr) {
                 return None;
             }
             return Some(w_descr);
@@ -14248,7 +14257,7 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
         return None;
     }
     if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
-        if is_object_setattr_descr(w_descr) {
+        if is_object_setattr_descr(w_descr) || is_type_setattr_descr(w_descr) {
             // typeobject.py setattr_if_not_from_object — remember the default.
             if side_effects_ok() {
                 pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
@@ -15500,14 +15509,12 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
                     return false;
                 }
             }
-        } else if let Some(sa) = setattr_if_not_from_object(metaclass) {
-            // Same reasoning for setattr: the canonical `type`'s own
-            // `__setattr__` slot forwards to `object_setattr`, so only a
-            // genuine metaclass override (neither `object`'s nor `type`'s
-            // standard slot) diverts away from the terminal raise.
-            if !is_type_setattr_descr(sa) {
-                return false;
-            }
+        } else if setattr_if_not_from_object(metaclass).is_some() {
+            // A genuine metaclass `__setattr__` override (neither
+            // `object`'s nor `type`'s standard slot — the latter is
+            // already `None` from `setattr_if_not_from_object`) diverts
+            // away from the terminal raise.
+            return false;
         }
         // The terminal's metaclass-MRO descriptor walk runs before the
         // heaptype guard; any hit (`__name__`, `__dict__`, …) diverts.
@@ -27069,6 +27076,22 @@ mod tests {
             mutated_absent(t);
             assert!(!pyre_object::typeobject::w_type_get_uses_object_getattribute(t));
             assert!(!pyre_object::typeobject::w_type_get_uses_object_setattr(t));
+        }
+    }
+
+    /// typeobject.py `setattr_if_not_from_object`: `W_TypeObject.typedef`
+    /// has no `__setattr__`, so the predicate answers `None` for `type`.
+    /// pyre's distinct `type.__setattr__` (Carlo Verre) is a thin forward
+    /// and counts as that default.
+    #[test]
+    fn setattr_if_not_from_object_type_slot_is_object_default() {
+        crate::typedef::init_typeobjects();
+        let w_type = crate::typedef::w_type();
+        unsafe {
+            assert!(
+                setattr_if_not_from_object(w_type).is_none(),
+                "type.__setattr__ is the object-default for setattr dispatch"
+            );
         }
     }
 
