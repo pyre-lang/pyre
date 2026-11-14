@@ -133,11 +133,39 @@ fn measure_slice_indices() -> (usize, usize) {
     (ptr_index, len_index)
 }
 
+/// Constructor path of `alloc::vec::Vec`: unique intern `Vec<T>`,
+/// crate-stripped `vec::Vec` / `vec::Vec<T>`, or `alloc::vec::Vec<T>`.
+/// Type-argument `::` is not a constructor segment, so
+/// `Vec<module::marshal::Rooted>` is still this ADT. Another crate's
+/// `foo::Vec<T>` is not.
+pub fn spelling_is_alloc_vec(type_str: &str) -> bool {
+    let type_str = type_str.trim();
+    let head = type_str.split('<').next().unwrap_or(type_str);
+    let mut segs = head.rsplit("::");
+    let last = segs.next().unwrap_or("");
+    if last != "Vec" {
+        return false;
+    }
+    match segs.next() {
+        None => type_str.contains('<'),
+        Some("vec") => true,
+        _ => false,
+    }
+}
+
 /// A field-layout spelling that is an inline `Vec<T>`, not `Box<Vec<T>>`
 /// and not `&Vec<T>`.
 pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
-    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
-    leaf.starts_with("Vec<")
+    let type_str = type_str.trim();
+    if type_str.starts_with('&')
+        || type_str.starts_with('*')
+        || type_str.starts_with("Box<")
+        || type_str.starts_with("Arc<")
+        || type_str.starts_with("Rc<")
+    {
+        return false;
+    }
+    spelling_is_alloc_vec(type_str)
 }
 
 #[cfg(test)]
@@ -184,5 +212,42 @@ mod tests {
             (4, 8),
             "a wasm32 target places the buffer and length at 4 and 8"
         );
+    }
+
+    #[test]
+    fn inline_vec_matches_the_alloc_vec_declaration_path() {
+        use super::{field_layout_is_inline_vec, spelling_is_alloc_vec};
+        for spelling in [
+            "Vec<u8>",
+            "Vec<module::marshal::Rooted>",
+            "vec::Vec<module::marshal::Rooted>",
+            "alloc::vec::Vec<usize>",
+        ] {
+            assert!(
+                field_layout_is_inline_vec(spelling),
+                "{spelling} is inline alloc::vec::Vec"
+            );
+            assert!(
+                spelling_is_alloc_vec(spelling),
+                "{spelling} is the alloc::vec::Vec constructor"
+            );
+        }
+        for spelling in [
+            "Vec",
+            "VecDeque<u8>",
+            "Box<Vec<u8>>",
+            "&Vec<u8>",
+            "&mut Vec<u8>",
+            "*const Vec<u8>",
+            "foo::Vec<u8>",
+            "Option<Vec<u8>>",
+        ] {
+            assert!(
+                !field_layout_is_inline_vec(spelling),
+                "{spelling} is not an inline alloc::vec::Vec value"
+            );
+        }
+        assert!(!spelling_is_alloc_vec("&mut Vec<i64>"));
+        assert!(spelling_is_alloc_vec("Vec<i64>"));
     }
 }

@@ -3043,7 +3043,10 @@ impl majit_metainterp::RuntimeDescrTable for LazyRuntimeDescrTable {
 
 static LAZY_RUNTIME_DESCR_TABLE: LazyRuntimeDescrTable = LazyRuntimeDescrTable;
 
-pub fn install_global_build_descr_pool() {
+/// Process-global `Assembler.descrs` analog. Called only from
+/// [`crate::state::ensure_finish_setup`] (`pyjitpl.py
+/// MetaInterpStaticData.finish_setup`).
+pub(crate) fn install_global_build_descr_pool() {
     majit_metainterp::init_global_build_descr_pool(&LAZY_RUNTIME_DESCR_TABLE);
 }
 
@@ -3487,6 +3490,17 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
         pc,
         next_pc: cursor,
     })
+}
+
+/// JitCode ops that pause a Python caller (`MIFrame.pc` immediately after
+/// the call, `pyjitpl.py` `get_list_of_active_boxes` `in_a_call` /
+/// `after_residual_call`). `cond_call` is not one: it is not a Python CALL.
+pub fn is_python_call_jit_op(opname: &str) -> bool {
+    opname.starts_with("residual_call")
+        || opname.starts_with("inline_call")
+        || opname.starts_with("call_assembler")
+        || opname.starts_with("call_may_force")
+        || opname.starts_with("recursive_call")
 }
 
 /// Iterator over every instruction in a jitcode `code` slice. Yields

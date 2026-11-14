@@ -37,7 +37,8 @@ use common::{
 };
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
-    CallFunc, CallKind, FunId, Operand, PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured,
+    CallFunc, CallKind, FunId, JsonVal, Operand, PlaceKind, SwitchTargets, TermKind, TyRef,
+    Unstructured,
 };
 use majit_translate::CallPath;
 use majit_translate::HostStaticAddrs;
@@ -127,7 +128,11 @@ fn bracket_closes_for_each_caller_shape() {
             interpreter_llbc,
             "call_function_impl_result",
         ),
-        ("cffi", module_llbc, "do_call"),
+        // `do_call` n>1 is `pin_roots(args_w)` plus `get(args_slot + i)`:
+        // leftover-slice erasure takes that bracket out. `do_call_fargs`
+        // loops `pin_root` of each argument, so the depth is not a
+        // compile-time offset and the imported-crate close stays.
+        ("cffi", module_llbc, "do_call_fargs"),
     ];
     for (name, load, leaf) in cases {
         let llbc = load();
@@ -484,7 +489,7 @@ fn folded_switch_bools(llbc: &Llbc, body: &Unstructured) -> Vec<Option<bool>> {
 
 /// Whether a `SwitchInt` arm scalar is the integer 0. `None` if the JSON
 /// is not a scalar we can read.
-fn switch_int_arm_is_zero(scalar: &serde_json::Value) -> Option<bool> {
+fn switch_int_arm_is_zero(scalar: &JsonVal) -> Option<bool> {
     if let Some(b) = scalar.get("Bool").and_then(serde_json::Value::as_bool) {
         return Some(!b);
     }
@@ -513,7 +518,7 @@ fn switch_int_arm_is_zero(scalar: &serde_json::Value) -> Option<bool> {
 
 /// Target of the 0 arm, or `default` when every readable arm is nonzero.
 /// `None` when no 0 arm is visible and at least one scalar is unreadable.
-fn switch_int_zero_target(arms: &[(serde_json::Value, u64)], default: u64) -> Option<u64> {
+fn switch_int_zero_target(arms: &[(JsonVal, u64)], default: u64) -> Option<u64> {
     let mut zero = None;
     let mut unreadable = false;
     for (scalar, target) in arms {
@@ -673,6 +678,34 @@ fn ll_listslice_inner_bracket_is_scalar_replaced() {
                 calls_to(&graph, leaf),
                 0,
                 "ll_listslice_inner still calls {leaf} after the bracket was scalar-replaced"
+            );
+        }
+    });
+}
+
+/// `funccall_flat_from_args` pins 2..=6 slots per `match nargs` arm, so
+/// the join after that match is `AtMerge`. A later `match nargs` with
+/// matching suffix gets is the same scrutinee (`constfold.constant_diffuse`
+/// / `rewire_link_for_known_exitswitch`); erasure takes `push_roots` /
+/// `pin_roots` / `get` out of the jitcode.
+#[test]
+fn funccall_flat_from_args_bracket_is_scalar_replaced() {
+    let llbc = interpreter_llbc();
+    with_llbc_link_state(llbc, || {
+        majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+        let graph = lower_named(llbc, "funccall_flat_from_args");
+        for leaf in [
+            "push_roots",
+            "pin_roots",
+            "pin_root",
+            "get",
+            "shadow_stack_get",
+            "root_scope_close",
+        ] {
+            assert_eq!(
+                calls_to(&graph, leaf),
+                0,
+                "funccall_flat_from_args still calls {leaf} after the nargs-pin merge was erased"
             );
         }
     });
@@ -1452,6 +1485,303 @@ fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
     );
 }
 
+/// `gil.py GILThreadLocals.gil_ready` is a harvested `_alloc_flavor_ = raw`
+/// `static mut`. The Global emits an Address-stamped ConstRefAddr and
+/// `__cast_instance_intrinsic` onto the class root so getattr of
+/// `gil_ready` annotates; the instance pointer is int-kinded
+/// (`descr.py get_type_flag` of a raw Ptr).
+#[test]
+fn orig_gil_ready_word_static_is_int_banked_address() {
+    let llbc = object_llbc();
+    let harvested = majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    assert!(
+        harvested.iter().any(|s| s.contains("GilReadyState")),
+        "harvested flavor set must include GilReadyState, got {harvested:?}"
+    );
+    let graph = with_shared_lowering(llbc, |ctx| {
+        lower_fun_decl_with_static_addrs(
+            ctx,
+            fun_decl_named(llbc, "gil_ready_word"),
+            HostStaticAddrs {
+                refs: &[("gil_ready::GIL_READY_STATE", 0x1111)],
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("lower gil_ready_word: {e:?}"))
+    });
+    let mut const_ref = Vec::new();
+    let mut casts = 0usize;
+    let mut cast_kind = None;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::ConstRefAddr(addr) => {
+                let ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+                let ll = op.result.as_ref().and_then(|v| v.concretetype());
+                const_ref.push((*addr, ct, ll));
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                casts += 1;
+                cast_kind = Some((
+                    op.result.as_ref().map(FunctionGraph::concretetype_of),
+                    result_ty.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        const_ref
+            .iter()
+            .map(|(addr, _, _)| *addr)
+            .collect::<Vec<_>>(),
+        vec![0x1111],
+        "gil_ready_word must load GIL_READY_STATE as ConstRefAddr: {const_ref:?} graph={graph:?}"
+    );
+    assert!(
+        const_ref.iter().any(|(_, ct, ll)| {
+            *ct == Some(majit_translate::ConcreteType::Signed)
+                && matches!(
+                    ll,
+                    Some(majit_translate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+                )
+        }),
+        "GIL_READY_STATE address word must be llmemory.Address, got {const_ref:?} graph={graph:?}"
+    );
+    assert_eq!(
+        casts, 1,
+        "raw-flavor STRUCT static wraps as the class instance: {graph:?}"
+    );
+    assert_eq!(
+        cast_kind,
+        Some((
+            Some(majit_translate::ConcreteType::Signed),
+            majit_translate::ValueType::Int
+        )),
+        "raw instance pointer is int-kinded: {graph:?}"
+    );
+}
+
+/// `jtransform.py rewrite_op_getfield` of `gil_ready?` is
+/// `-live-` + `record_quasiimmut_field` + `getfield_*_pure`. A residual
+/// Call of the static field would leave the sub-walk with a symbolic
+/// fnaddr (`get_jitcode_shell_falls_back_to_symbolic_fnaddr`).
+#[test]
+fn orig_gil_ready_word_transforms_to_quasiimmut_field_read() {
+    let llbc = object_llbc();
+    let ranks = majit_translate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    assert!(
+        ranks.get("GilReadyState").is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|(name, rank)| name == "gil_ready" && rank.is_quasi_immutable())
+        }),
+        "harvested _immutable_fields_ for GilReadyState: {:?}",
+        ranks.get("GilReadyState")
+    );
+    let flavors = majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    let graph = with_shared_lowering(llbc, |ctx| {
+        lower_fun_decl_with_static_addrs(
+            ctx,
+            fun_decl_named(llbc, "gil_ready_word"),
+            HostStaticAddrs {
+                refs: &[("gil_ready::GIL_READY_STATE", 0x1111)],
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("lower gil_ready_word: {e:?}"))
+    });
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "gil_ready"
+            )),
+        "gil_ready_word front graph must FieldRead gil_ready: {graph:?}"
+    );
+    let mut cc = CallControl::new();
+    cc.immutable_fields_by_struct = ranks;
+    cc.raw_alloc_flavor_structs = flavors;
+    let out = Transformer::new(&GraphTransformConfig::default())
+        .with_callcontrol(&mut cc)
+        .transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| match &op.kind {
+            OpKind::RecordQuasiImmutField {
+                field,
+                mutate_field,
+                ..
+            } => {
+                format!("RecordQuasiImmutField:{}:{}", field.name, mutate_field.name)
+            }
+            OpKind::FieldRead { field, pure, .. } => {
+                format!("FieldRead:{}:pure={pure}", field.name)
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => format!("Call:{}", segments.join("::")),
+            OpKind::CallResidual { .. } => "CallResidual".to_string(),
+            OpKind::ConstRefAddr(_) => "ConstRefAddr".to_string(),
+            OpKind::Live { .. } => "Live".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .any(|k| k == "RecordQuasiImmutField:gil_ready:mutate_gil_ready"),
+        "rewrite_op_getfield must emit record_quasiimmut_field for gil_ready?: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "FieldRead:gil_ready:pure=true"),
+        "quasi-immut gil_ready read must be getfield_*_pure: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k.starts_with("CallResidual")
+            || (k.starts_with("Call:") && !k.contains("__cast_instance_intrinsic"))),
+        "gil_ready_word must not residualize the static field read: {kinds:?}"
+    );
+}
+
+/// `_orig_ll_list_int_resize_hint_really` is the look_inside body the
+/// LIST_EXTEND unroll walks. Its `int_ll_newlist` must become `new_array`
+/// the same way `ll_listslice_new_int_list` does; a residual call aborts
+/// the helper subwalk at that pc.
+#[test]
+fn orig_ll_list_int_resize_hint_really_newlist_becomes_new_array() {
+    let llbc = object_llbc();
+    let hints =
+        majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let harvested: Vec<(String, Vec<String>)> = hints
+        .iter()
+        .filter(|(k, _)| k.contains("int_ll_newlist") || k.contains("ll_list_int_resize_hint"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let graph = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut call_shapes = Vec::new();
+    let mut cc = CallControl::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().is_some_and(|s| s == "int_ll_newlist") {
+            let ct = op
+                .result
+                .as_ref()
+                .and_then(|v| v.concretetype())
+                .map(|t| format!("{t:?}"));
+            call_shapes.push((segments.join("::"), format!("{result_ty:?}"), ct));
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                "newlist(length)".to_string(),
+            );
+        }
+    }
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::NewArray { .. } => Some("NewArray".to_string()),
+            OpKind::NewArrayClear { .. } => Some("NewArrayClear".to_string()),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!(
+                "Call:{}",
+                segments.last().cloned().unwrap_or_default()
+            )),
+            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
+            _ => None,
+        })
+        .collect();
+    let new_arrays = kinds.iter().filter(|k| *k == "NewArray").count();
+    assert!(
+        new_arrays > 0,
+        "int_ll_newlist in _orig_ll_list_int_resize_hint_really must become NewArray, \
+         harvested={harvested:?} call_shapes={call_shapes:?} ops={kinds:?} notes={:?}",
+        out.notes
+    );
+    assert_eq!(
+        calls_to(&out.graph, "int_ll_newlist"),
+        0,
+        "int_ll_newlist must not remain a residual call after newlist(length) rewrite; \
+         harvested={harvested:?} call_shapes={call_shapes:?}"
+    );
+    assert_eq!(
+        calls_to(&out.graph, "list_write_barrier"),
+        0,
+        "list_write_barrier must not remain a residual; the items setfield \
+         takes COND_CALL_GC_WB from rewrite.py; \
+         harvested={harvested:?} call_shapes={call_shapes:?} ops={kinds:?}"
+    );
+
+    // Dual-gate Skip kind-collapses the result to OBJECTPTR. The Call's
+    // result_ty still names TypedItemsBlock; recover the ARRAY from that
+    // spelling, the way `newlist_clear` recovers FixedObjectArray.
+    let collapsed = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut cc = CallControl::new();
+    for op in collapsed.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().is_some_and(|s| s == "int_ll_newlist") {
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                "newlist(length)".to_string(),
+            );
+            if let Some(result) = &op.result {
+                result.set_concretetype(None);
+            }
+        }
+    }
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&collapsed);
+    let collapsed_new_arrays = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(op.kind, OpKind::NewArray { .. }))
+        .count();
+    assert!(
+        collapsed_new_arrays > 0,
+        "kind-collapsed TypedItemsBlock result must still become NewArray, \
+         call_shapes={call_shapes:?} notes={:?}",
+        out.notes
+    );
+}
+
 /// `from_storage_and_strategy` is `instantiate` plus field stores.
 /// `w_list_adopt_int_items` is that cluster: `malloc_typed_managed` fuses
 /// to `NewWithVtable`, and the live Integer storage is the oopspec
@@ -1537,6 +1867,105 @@ fn shadow_stack_erase_census() {
             }
         }
     }
+}
+
+/// Nested exclusive RootScopes in `zip_two_tuple_next` close before they
+/// merge with a sibling that never opened them. Closing must drop that
+/// set's pin-count key; leftover keys refuse the rewrite and leave a
+/// residual unpublished `push_roots`. FOR_ITER over zip already calls
+/// `zip_two_tuple_next` as a residual; the body is not descended.
+#[test]
+fn zip_two_tuple_next_erases_the_nested_root_brackets() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        let context = LowerContext::new(interpreter);
+        let graph = lower_fun(interpreter, &context, "zip_two_tuple_next");
+        for leaf in [
+            "push_roots",
+            "pin_root",
+            "pin_roots",
+            "shadow_stack_len",
+            "shadow_stack_get",
+            "root_scope_close",
+        ] {
+            assert_eq!(
+                calls_to(&graph, leaf),
+                0,
+                "zip_two_tuple_next still calls {leaf} after nested-scope erasure"
+            );
+        }
+    });
+}
+
+/// `FrameBox::new` closes with `drop(frame_root)`, which Charon spells as
+/// `_t = Move(guard); core::mem::drop(Move(_t))`. Production harvests
+/// pyre-object's root-stack effects before lowering the interpreter, the
+/// same order `lib.rs` uses; that Call is Close of the watched Guard so
+/// the bracket is not a residual `push_roots`.
+#[test]
+fn frame_box_new_erases_the_explicit_drop_root_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let fd = interpreter
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+        .expect("FrameBox::new");
+    let graph =
+        lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower FrameBox::new: {e:?}"));
+    let leftover: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str).unwrap_or("");
+                let forbidden = matches!(
+                    leaf,
+                    "push_roots"
+                        | "pin_root"
+                        | "publish"
+                        | "normalize"
+                        | "get"
+                        | "root_scope_close"
+                ) || segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["core", "mem", "drop"]);
+                forbidden.then_some(segments.join("::"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "FrameBox::new still calls root-bracket leaves after explicit-drop erasure: {leftover:?}"
+    );
 }
 
 /// `slice_unpack` pins with free `pin_root` onto a `shadow_stack_len` base.
@@ -1688,10 +2117,158 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
     });
 }
 
+/// `try_new_for_call_with_closure_and_globals_obj` publishes `live` (the
+/// `[code, globals, closure, *args]` Vec) through `pin_roots`. That is
+/// the incoming-slice shape (`cdataobj.py descr_call` / `W_CData.call`
+/// passes `args_w` through; `pyframe.py Frame.__init__` livevars are
+/// that list), so the scalar replacement takes the bracket out of the
+/// jitcode and the walker is not left with a residual `push_roots`.
+#[test]
+fn try_new_for_call_erases_the_published_slice_bracket() {
+    let llbc = interpreter_llbc();
+    let graph = lower_named(llbc, "try_new_for_call_with_closure_and_globals_obj");
+    for leaf in ["push_roots", "pin_roots", "root_scope_close"] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "try_new still calls {leaf} after published-slice erasure"
+        );
+    }
+}
+
+/// `finish_for_call_with_globals_obj` publishes a 4-element array then
+/// the incoming `args` slice. Both runs erase; a leftover `push_roots`
+/// would residualize the whole constructor before `new_frame.run`.
+#[test]
+fn finish_for_call_erases_the_published_slice_bracket() {
+    let llbc = interpreter_llbc();
+    let graph = lower_named(llbc, "finish_for_call_with_globals_obj");
+    for leaf in ["push_roots", "pin_roots", "publish", "root_scope_close"] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "finish_for_call still calls {leaf} after published-slice erasure"
+        );
+    }
+}
+
+fn callee_leaf<'a>(
+    llbc: &'a Llbc,
+    call: &majit_charon_reader::ullbc::CallPayload,
+) -> Option<&'a str> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    llbc.fn_by_id(*id)?
+        .item_meta
+        .name_path_str()
+        .rsplit("::")
+        .next()
+}
+
+/// FunDecl ids of `FrameLocalsRoot::new`: the inherent `new` whose body
+/// calls `register_frame_locals_slot`. Tests may name that helper; the
+/// erase pass itself keys only `gc_hook`.
+fn frame_locals_root_new_ids(llbc: &Llbc) -> Vec<u64> {
+    llbc.iter_fun_decls()
+        .filter(|fd| {
+            fd.item_meta.name_path().ends_with("::new")
+                && fd.unstructured().is_some_and(|body| {
+                    body.body.iter().any(|bb| {
+                        matches!(
+                            bb.term_ref(llbc),
+                            Ok(TermKind::Call { call, .. })
+                                if callee_leaf(llbc, &call) == Some("register_frame_locals_slot")
+                        )
+                    })
+                })
+        })
+        .map(|fd| fd.def_id)
+        .collect()
+}
+
+fn call_fun_decl_id(target: &CallTarget) -> Option<u64> {
+    match target {
+        CallTarget::FunctionPath { fun_decl_id, .. } | CallTarget::Method { fun_decl_id, .. } => {
+            *fun_decl_id
+        }
+        _ => None,
+    }
+}
+
+fn calls_to_frame_locals_root_new(graph: &FunctionGraph, ids: &[u64]) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call { target, .. } => {
+                call_fun_decl_id(target).is_some_and(|id| ids.contains(&id))
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// `finish_for_call_with_globals_obj` roots `addr_of_mut!(frame.locals_cells_stack_w)`
+/// through a RAII guard over a by-value local aggregate. The slot is already
+/// an SSA Ref in this graph, so the opener is not a jitcode op
+/// (`shadowstack.py` `push_roots` / `pop_roots` run after `make_jitcodes`).
+#[test]
+fn finish_for_call_erases_the_frame_locals_root_registration() {
+    let llbc = interpreter_llbc();
+    let ids = frame_locals_root_new_ids(llbc);
+    assert!(
+        !ids.is_empty(),
+        "interpreter LLBC must contain FrameLocalsRoot::new"
+    );
+    let graph = lower_named(llbc, "finish_for_call_with_globals_obj");
+    assert_eq!(
+        calls_to_frame_locals_root_new(&graph, &ids),
+        0,
+        "finish_for_call still calls FrameLocalsRoot::new"
+    );
+    for leaf in [
+        "register_frame_locals_slot",
+        "try_gc_add_root",
+        "unregister_frame_locals_slot",
+        "try_gc_remove_root",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "finish_for_call still calls {leaf} after the local-aggregate root erase"
+        );
+    }
+}
+
+/// A guard over a heap frame pointer (`into_raw` / `as_mut_ptr`) is not
+/// a scalar-replaced local aggregate. The opener stays in the jitcode.
+#[test]
+fn into_generator_named_keeps_heap_frame_root_registration() {
+    let llbc = interpreter_llbc();
+    let ids = frame_locals_root_new_ids(llbc);
+    assert!(
+        !ids.is_empty(),
+        "interpreter LLBC must contain FrameLocalsRoot::new"
+    );
+    let graph = lower_named(llbc, "into_generator_named");
+    assert_eq!(
+        calls_to_frame_locals_root_new(&graph, &ids),
+        1,
+        "into_generator_named must keep the heap-pointer FrameLocalsRoot::new"
+    );
+}
+
 /// `do_call` `n == 1` pins `args_w[0]` with `base()` + `pin_root` + `get(base)`.
-/// The pin temporary is `StorageDead` before the get, so erasure has to
-/// rewrite the get as `getarrayitem` of the incoming list. `n > 1` still
-/// loops `get(args_slot + i)` with a non-const index, so that bracket stays.
+/// The pin temporary is `StorageDead` before the get, so erasure rewrites
+/// the get as `getarrayitem` of the incoming list. `n > 1` is
+/// `pin_roots(args_w)` plus `get(args_slot + i)`: leftover-slice erasure
+/// takes that bracket out the same way (`cdataobj.py descr_call` /
+/// `pyframe.py Frame.__init__` livevars).
 #[test]
 fn do_call_erases_the_n1_incoming_elem_bracket() {
     let object = load_llbc(OBJECT_LLBC);
@@ -1713,8 +2290,13 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
                 let graph = lower_fun(module, &context, "do_call");
                 assert_eq!(
                     calls_to(&graph, "push_roots"),
-                    1,
-                    "n==1 push_roots must be erased; n>1 loop-index get stays"
+                    0,
+                    "n==1 incoming-elem and n>1 incoming-slice push_roots must both erase"
+                );
+                assert_eq!(
+                    calls_to(&graph, "pin_roots"),
+                    0,
+                    "n>1 pin_roots(args_w) must be erased as leftover-slice"
                 );
                 assert_eq!(
                     calls_to(&graph, "pin_root"),
@@ -1734,10 +2316,43 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
                     .count();
                 assert!(
                     array_reads > 0,
-                    "n==1 get(base) must rewrite to getarrayitem of args_w"
+                    "get(base) / get(args_slot + i) must rewrite to getarrayitem of args_w"
                 );
             });
         });
+    });
+}
+
+/// `w_code_frame_stores_global` publishes `[obj, w_globals]`, then on the
+/// miss path calls `publish_code_slot_store_rooting` which returns an owned
+/// nested `RootScope`. The leftover is that dest (and ParamSlots methods
+/// of it), so scalar replacement takes the outer bracket out.
+#[test]
+fn w_code_frame_stores_global_erases_the_outer_root_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = load_llbc(OBJECT_LLBC);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
+        interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+        let context = LowerContext::new(interpreter);
+        let graph = lower_fun(interpreter, &context, "w_code_frame_stores_global");
+        for leaf in ["push_roots", "pin_roots", "publish", "root_scope_close"] {
+            assert_eq!(
+                calls_to(&graph, leaf),
+                0,
+                "w_code_frame_stores_global still calls {leaf} after owned-scope erasure"
+            );
+        }
+        assert!(
+            calls_to(&graph, "publish_code_slot_store_rooting") > 0,
+            "the nested owned-scope helper keeps its own bracket"
+        );
     });
 }
 

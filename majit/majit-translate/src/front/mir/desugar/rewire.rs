@@ -297,6 +297,18 @@ pub(in crate::front::mir) struct DiscCombinatorSite {
     /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
     /// `None` is a ref-bank niche (`push_niche_null`).
     pub(in crate::front::mir) int_null: Option<crate::model::NicheIntNull>,
+    /// Instance STRUCT of the receiver tag-0 variant (`Result::Ok`).
+    pub(in crate::front::mir) recv_tag0_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the receiver tag-1 variant (`Option::Some` /
+    /// `Result::Err`).
+    pub(in crate::front::mir) recv_tag1_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built result tag-0 variant (`Result::Ok`).
+    pub(in crate::front::mir) result_tag0_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built result tag-1 variant (`Option::Some` /
+    /// `Result::Err`).
+    pub(in crate::front::mir) result_tag1_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built result `Option::None`.
+    pub(in crate::front::mir) result_none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 #[derive(Clone)]
@@ -311,6 +323,8 @@ pub(in crate::front::mir) struct ResultTrySite {
     pub(in crate::front::mir) err_is_raw_u8: bool,
     pub(in crate::front::mir) err_class: Option<String>,
     pub(in crate::front::mir) recv_err_ast: String,
+    pub(in crate::front::mir) ok_vsid: Option<majit_ir::descr::StructId>,
+    pub(in crate::front::mir) err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 #[derive(Clone)]
@@ -319,6 +333,7 @@ pub(in crate::front::mir) struct ResultTryReturnOwners {
     pub(in crate::front::mir) err_owner: String,
     pub(in crate::front::mir) err_ty: ValueType,
     pub(in crate::front::mir) err_ast: String,
+    pub(in crate::front::mir) err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -933,7 +948,13 @@ pub(in crate::front::mir) fn rewire_result_is_ok_err(
     let recv = args[0].clone();
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.truncate(ci);
-    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    let disc = emit_enum_disc_read(
+        graph,
+        a_id,
+        recv,
+        &site.recv_owner,
+        site.recv_tag0_vsid.or(site.recv_tag1_vsid),
+    );
     let tag = graph
         .push_op_var(
             a_id,
@@ -1095,6 +1116,8 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
             &then_value,
             suffix,
             &site.result_payload0_ty,
+            site.result_tag0_vsid,
+            site.result_tag1_vsid,
         )?;
     }
 
@@ -1245,6 +1268,7 @@ pub(in crate::front::mir) fn rewire_option_filter_diamond(
                 keep_payload,
                 site.result_payload1_ty.clone(),
             )),
+            site.result_tag1_vsid,
         )
     };
     let drop_none = emit_option_result_none(graph, drop_bb, site);
@@ -1384,6 +1408,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     payload,
                     site.result_payload0_ty.clone(),
                 )),
+                site.result_tag0_vsid,
             ))
         }
         (DiscCombinator::OptionOkOr, false) => {
@@ -1402,6 +1427,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     err,
                     site.result_payload1_ty.clone(),
                 )),
+                site.result_tag1_vsid,
             ))
         }
         (DiscCombinator::OptionOkOrElse, false) => {
@@ -1429,6 +1455,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     err,
                     site.result_payload1_ty.clone(),
                 )),
+                site.result_tag1_vsid,
             ))
         }
         (DiscCombinator::ResultMap, true) | (DiscCombinator::ResultAndThen, true) => {
@@ -1440,6 +1467,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 block,
                 recv,
                 &site.recv_tag0_owner,
+                site.recv_tag0_vsid,
                 site.payload0_ty.clone(),
                 site.payload0_is_raw_u8,
             );
@@ -1474,6 +1502,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                         mapped,
                         site.result_payload0_ty.clone(),
                     )),
+                    site.result_tag0_vsid,
                 ))
             }
         }
@@ -1485,6 +1514,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 block,
                 recv,
                 &site.recv_tag1_owner,
+                site.recv_tag1_vsid,
                 site.payload1_ty.clone(),
                 site.payload1_is_raw_u8,
             );
@@ -1500,6 +1530,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     payload,
                     site.result_payload1_ty.clone(),
                 )),
+                site.result_tag1_vsid,
             ))
         }
         (DiscCombinator::ResultUnwrapOrElse, true) | (DiscCombinator::ResultOrElse, true) => {
@@ -1513,6 +1544,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     block,
                     recv,
                     &site.recv_tag0_owner,
+                    site.recv_tag0_vsid,
                     site.payload0_ty.clone(),
                     site.payload0_is_raw_u8,
                 ))
@@ -1527,6 +1559,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 block,
                 recv,
                 &site.recv_tag1_owner,
+                site.recv_tag1_vsid,
                 site.payload1_ty.clone(),
                 site.payload1_is_raw_u8,
             );
@@ -1550,6 +1583,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 block,
                 recv,
                 &site.recv_tag0_owner,
+                site.recv_tag0_vsid,
                 site.payload0_ty.clone(),
                 site.payload0_is_raw_u8,
             );
@@ -1564,6 +1598,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     payload,
                     site.result_payload1_ty.clone(),
                 )),
+                site.result_tag1_vsid,
             ))
         }
         (DiscCombinator::ResultOk, false) => Ok(emit_option_variant(
@@ -1572,6 +1607,7 @@ pub(in crate::front::mir) fn build_disc_arm(
             &site.result_owner,
             0,
             None,
+            site.result_none_vsid,
         )),
         (DiscCombinator::ResultErr, true) => {
             let recv = map_source(sources, inputs, recv)
@@ -1581,6 +1617,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 block,
                 recv,
                 &site.recv_tag1_owner,
+                site.recv_tag1_vsid,
                 site.payload1_ty.clone(),
                 site.payload1_is_raw_u8,
             );
@@ -1595,6 +1632,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     payload,
                     site.result_payload1_ty.clone(),
                 )),
+                site.result_tag1_vsid,
             ))
         }
         (DiscCombinator::ResultErr, false) => Ok(emit_option_variant(
@@ -1603,6 +1641,7 @@ pub(in crate::front::mir) fn build_disc_arm(
             &site.result_owner,
             0,
             None,
+            site.result_none_vsid,
         )),
         (DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr, _) => unreachable!(),
     }
@@ -1727,6 +1766,7 @@ pub(in crate::front::mir) fn rewire_result_map_last_exception(
         ok_bb,
         recv_ok,
         &site.recv_tag0_owner,
+        site.recv_tag0_vsid,
         site.payload0_ty.clone(),
         site.payload0_is_raw_u8,
     );
@@ -1743,6 +1783,7 @@ pub(in crate::front::mir) fn rewire_result_map_last_exception(
         err_bb,
         recv_err,
         &site.recv_tag1_owner,
+        site.recv_tag1_vsid,
         site.payload1_ty.clone(),
         site.payload1_is_raw_u8,
     );
@@ -1759,7 +1800,13 @@ pub(in crate::front::mir) fn rewire_result_map_last_exception(
 
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.truncate(ci);
-    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    let disc = emit_enum_disc_read(
+        graph,
+        a_id,
+        recv,
+        &site.recv_owner,
+        site.recv_tag0_vsid.or(site.recv_tag1_vsid),
+    );
     graph.set_branch(a_id, disc, err_bb, err_sources, ok_bb, ok_sources);
     Ok(())
 }
@@ -2142,7 +2189,13 @@ pub(in crate::front::mir) fn emit_option_recv_tag(
         });
         disc
     } else {
-        emit_enum_disc_read(graph, block, recv, &site.recv_owner)
+        emit_enum_disc_read(
+            graph,
+            block,
+            recv,
+            &site.recv_owner,
+            site.recv_tag0_vsid.or(site.recv_tag1_vsid),
+        )
     }
 }
 
@@ -2161,6 +2214,7 @@ pub(in crate::front::mir) fn option_recv_payload(
             block,
             recv,
             &site.recv_tag1_owner,
+            site.recv_tag1_vsid,
             site.payload1_ty.clone(),
             site.payload1_is_raw_u8,
         )
@@ -2181,7 +2235,14 @@ pub(in crate::front::mir) fn emit_option_result_none(
             .push_op_var(block, nonzero_option_zero(&site.result_owner), true)
             .expect("scalar None produces a value")
     } else {
-        emit_option_variant(graph, block, &site.result_owner, 0, None)
+        emit_option_variant(
+            graph,
+            block,
+            &site.result_owner,
+            0,
+            None,
+            site.result_none_vsid,
+        )
     }
 }
 
@@ -2244,6 +2305,7 @@ pub(in crate::front::mir) fn emit_enum_disc_read(
     block: BlockId,
     recv: Variable,
     owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
 ) -> Variable {
     let disc = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
@@ -2253,7 +2315,7 @@ pub(in crate::front::mir) fn emit_enum_disc_read(
             field: FieldDescriptor {
                 name: "__discriminant".to_string(),
                 owner_root: Some(owner.to_string()),
-                owner_id: None,
+                owner_id,
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -2274,6 +2336,7 @@ pub(in crate::front::mir) fn emit_payload_read(
     block: BlockId,
     recv: Variable,
     owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
     ty: ValueType,
     field_is_raw_u8: bool,
 ) -> Variable {
@@ -2285,7 +2348,7 @@ pub(in crate::front::mir) fn emit_payload_read(
             field: FieldDescriptor {
                 name: "__pos_0".to_string(),
                 owner_root: Some(owner.to_string()),
-                owner_id: None,
+                owner_id,
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -2457,11 +2520,21 @@ pub(in crate::front::mir) fn control_flow_owner(result_ty: &ValueType) -> String
     }
 }
 
+/// STRUCT identity for a producer that already holds a module-qualified
+/// owner spelling. A leaf (`ControlFlow::Continue`) hashes a different
+/// template than `resolve_adt_field`; leave that to `owner_id: None`.
+pub(in crate::front::mir) fn struct_id_from_enum_owner_spelling(
+    owner: &str,
+) -> Option<majit_ir::descr::StructId> {
+    crate::front::option_variant::struct_id_from_enum_owner_spelling(owner)
+}
+
 pub(in crate::front::mir) fn push_enum_field_read(
     graph: &mut FunctionGraph,
     block: BlockId,
     base: Variable,
     owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
     field: &str,
     ty: ValueType,
     field_is_raw_u8: bool,
@@ -2474,7 +2547,7 @@ pub(in crate::front::mir) fn push_enum_field_read(
             field: FieldDescriptor {
                 name: field.to_string(),
                 owner_root: Some(owner.to_string()),
-                owner_id: None,
+                owner_id,
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -2643,6 +2716,9 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
         block,
         operand.clone(),
         result_owner,
+        payloads
+            .and_then(|p| p.ok_vsid)
+            .or_else(|| struct_id_from_enum_owner_spelling(result_owner)),
         "__discriminant",
         ValueType::Int,
         false,
@@ -2654,12 +2730,27 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
         let sources = prefix_defined.clone();
         let (arm, arm_inputs) = graph.create_block_with_arg_vars(sources.len());
         let operand_arm = map_source(&sources, &arm_inputs, operand).expect("operand threaded");
-        let (read_ty, write_ty) = match (tag, payloads) {
-            (0, Some(payloads)) => (payloads.ok.clone(), payloads.continue_ty.clone()),
-            (1, Some(payloads)) => (payloads.err.clone(), payloads.break_ty.clone()),
+        let (read_ty, write_ty, result_vsid, flow_vsid) = match (tag, payloads) {
+            (0, Some(payloads)) => (
+                payloads.ok.clone(),
+                payloads.continue_ty.clone(),
+                payloads.ok_vsid,
+                payloads.continue_vsid,
+            ),
+            (1, Some(payloads)) => (
+                payloads.err.clone(),
+                payloads.break_ty.clone(),
+                payloads.err_vsid,
+                payloads.break_vsid,
+            ),
             // A call lowered without type decls keeps the reference bank the
             // match used before the decls were consulted.
-            _ => (Some(ValueType::Ref(None)), Some(ValueType::Ref(None))),
+            _ => (
+                Some(ValueType::Ref(None)),
+                Some(ValueType::Ref(None)),
+                None,
+                None,
+            ),
         };
         let payload_owner = format!("{cf_owner}::{flow_variant}");
         let payload = match (read_ty, write_ty) {
@@ -2669,6 +2760,11 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
                     arm,
                     operand_arm,
                     &format!("{result_owner}::{result_variant}"),
+                    result_vsid.or_else(|| {
+                        struct_id_from_enum_owner_spelling(&format!(
+                            "{result_owner}::{result_variant}"
+                        ))
+                    }),
                     "__pos_0",
                     read_ty.clone(),
                     false,
@@ -2690,6 +2786,7 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
                         "Err",
                         1,
                         Some((err_field.as_str(), read, read_ty)),
+                        payloads.and_then(|p| p.err_vsid),
                     );
                     (wrapped, write_ty)
                 } else {
@@ -2708,6 +2805,7 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
             payload
                 .as_ref()
                 .map(|(owner, value, ty)| (owner.as_str(), value.clone(), ty.clone())),
+            flow_vsid,
         );
         let mut args: Vec<Variable> = sources
             .iter()
@@ -2904,6 +3002,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
             ok_bb,
             res_in_ok,
             &site.ok_owner,
+            site.ok_vsid,
             site.ok_ty.clone(),
             site.ok_is_raw_u8,
         );
@@ -2934,6 +3033,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
         err_bb,
         res_in_err,
         &site.err_owner,
+        site.err_vsid,
         site.err_ty.clone(),
         site.err_is_raw_u8,
     );
@@ -2949,6 +3049,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
             err_payload,
             return_owners.err_ty.clone(),
         )),
+        return_owners.err_vsid,
     );
     let err_link_args = err_specs
         .iter()
@@ -2967,7 +3068,13 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
     );
 
     let a_id = graph.blocks[a].id;
-    let disc = emit_enum_disc_read(graph, a_id, res_a, &site.result_owner);
+    let disc = emit_enum_disc_read(
+        graph,
+        a_id,
+        res_a,
+        &site.result_owner,
+        site.ok_vsid.or(site.err_vsid),
+    );
     graph.set_control_flow_metadata(
         a_id,
         Some(ExitSwitch::Value(disc)),

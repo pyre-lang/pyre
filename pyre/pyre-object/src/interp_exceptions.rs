@@ -2735,6 +2735,128 @@ pub fn register_residual_exc_publisher(f: ResidualExcPublisher) {
     let _ = RESIDUAL_EXC_PUBLISHER.set(f);
 }
 
+/// Non-destructive read of the residual-call exception word
+/// (`llmodel.py` `pos_exc_value` / `rpyexc_occurred`). The compiled
+/// `GUARD_NO_EXCEPTION` path resets the backend cell
+/// (`assembler.py` `_store_and_reset_exception`); peek that cell so a
+/// consumed raise is not a leftover for the next dict probe.
+///
+/// Last-writer-wins: interpreter tests install a `BH_LAST_EXC_VALUE` peek
+/// first, and `install_jit_call_bridge` then points at the backend cell.
+type ResidualExcWordFn = extern "C" fn() -> i64;
+static RESIDUAL_EXC_PEEK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static RESIDUAL_EXC_FETCH: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn store_residual_exc_word_fn(slot: &std::sync::atomic::AtomicPtr<()>, f: ResidualExcWordFn) {
+    slot.store(
+        f as *const () as *mut (),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+fn load_residual_exc_word_fn(slot: &std::sync::atomic::AtomicPtr<()>) -> Option<ResidualExcWordFn> {
+    let p = slot.load(std::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), ResidualExcWordFn>(p) })
+    }
+}
+
+pub fn register_residual_exc_peek(f: ResidualExcWordFn) {
+    store_residual_exc_word_fn(&RESIDUAL_EXC_PEEK, f);
+}
+
+pub fn register_residual_exc_fetch(f: ResidualExcWordFn) {
+    store_residual_exc_word_fn(&RESIDUAL_EXC_FETCH, f);
+}
+
+/// Interpreter-test fallback: do not replace a production backend peek
+/// `install_jit_call_bridge` already installed.
+pub fn register_residual_exc_peek_if_unset(f: ResidualExcWordFn) {
+    let _ = RESIDUAL_EXC_PEEK.compare_exchange(
+        std::ptr::null_mut(),
+        f as *const () as *mut (),
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+pub fn register_residual_exc_fetch_if_unset(f: ResidualExcWordFn) {
+    let _ = RESIDUAL_EXC_FETCH.compare_exchange(
+        std::ptr::null_mut(),
+        f as *const () as *mut (),
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+/// `exceptiontransform.py` `rpyexc_raise`: write the one ll exception
+/// state. Production dual-writes `BH_LAST_EXC_VALUE` and the backend
+/// `JIT_EXC_VALUE` through the publisher `register_jit_exc_raiser`
+/// installs.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn rpyexc_raise(obj: PyObjectRef) {
+    std::hint::black_box(7u32);
+    if let Some(publish) = RESIDUAL_EXC_PUBLISHER.get() {
+        publish(obj as i64);
+    }
+}
+
+/// `exceptiontransform.py` `rpyexc_occurred`.
+///
+/// `dont_look_inside`: the installed cell has no extractable graph
+/// (`has_hash_w_hook`). Distinct `black_box` datum so the residual
+/// fnaddr is not folded onto a sibling predicate.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn rpyexc_occurred() -> bool {
+    std::hint::black_box(8u32);
+    load_residual_exc_word_fn(&RESIDUAL_EXC_PEEK).is_some_and(|f| f() != 0)
+}
+
+/// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear`.
+/// Returns null when no exception is pending (unlike the MemoryError
+/// fallback on the interpreter's allocation path).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn rpyexc_fetch() -> PyObjectRef {
+    std::hint::black_box(9u32);
+    load_residual_exc_word_fn(&RESIDUAL_EXC_FETCH)
+        .map(|f| f() as PyObjectRef)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RPYEXC: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+extern "C" fn test_rpyexc_raise(value: i64) {
+    TEST_RPYEXC.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+extern "C" fn test_rpyexc_peek() -> i64 {
+    TEST_RPYEXC.with(|cell| cell.get())
+}
+
+#[cfg(test)]
+extern "C" fn test_rpyexc_fetch() -> i64 {
+    TEST_RPYEXC.with(|cell| cell.replace(0))
+}
+
+/// Install a process-local rpyexc cell for `pyre-object` lib tests that
+/// never reach `register_jit_exc_raiser`. The value is thread-local so
+/// parallel `#[test]` threads do not share a raise.
+#[cfg(test)]
+pub fn install_test_rpyexc() {
+    let _ = RESIDUAL_EXC_PUBLISHER.set(test_rpyexc_raise);
+    register_residual_exc_peek(test_rpyexc_peek);
+    register_residual_exc_fetch(test_rpyexc_fetch);
+}
+
 /// Raise MemoryError from a residual helper that is about to return null.
 ///
 /// `rstr.py` `LLHelpers.ll_strconcat` / `ll_str_mul` and `ll_str.py`

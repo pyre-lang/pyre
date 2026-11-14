@@ -3475,6 +3475,90 @@ fn code_flags_methods_call_translated_bodies() {
     });
 }
 
+/// `PyFrame.co_flags` is `self.getcode().flags.bits()`. The `bits()`
+/// unwrap of the linked `CodeFlags` word is identity
+/// (`is_transparent_scalar_word_identity`), so the graph reads the
+/// flags field and does not residualize a compiler-core `bits` call.
+#[test]
+fn co_flags_peels_bits_as_the_flag_word() {
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = lower_named(llbc, "co_flags").unwrap_or_else(|e| panic!("lower co_flags: {e}"));
+    for op in graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+    {
+        let OpKind::Call { target, .. } = &op.kind else {
+            continue;
+        };
+        match target {
+            CallTarget::FunctionPath { segments, .. }
+                if path_ends_with_code_flags_method(segments, "bits") =>
+            {
+                panic!(
+                    "co_flags still calls CodeFlags::bits: {target:?}\n{}",
+                    graph.dump()
+                );
+            }
+            CallTarget::Method { name, .. } if name == "bits" => {
+                panic!(
+                    "co_flags bits lowered as Method: {target:?}\n{}",
+                    graph.dump()
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .all(|op| !matches!(op.kind, OpKind::Abort { .. })),
+        "co_flags must not abort a CodeFlags borrow, got {}",
+        graph.dump()
+    );
+    let mut saw_flags_word = false;
+    for op in graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+    {
+        let OpKind::FieldRead { field, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "flags" {
+            continue;
+        }
+        assert!(
+            !field.taken_by_address,
+            "CodeFlags borrow is the word, got {}",
+            graph.dump()
+        );
+        saw_flags_word = true;
+    }
+    assert!(
+        saw_flags_word
+            || graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().map(String::as_str) == Some("getcode")
+                    )
+                }),
+        "co_flags should read getcode/flags, got {}",
+        graph.dump()
+    );
+}
+
 /// `FrameBox::new` copies a by-value `PyFrame` with `core::ptr::write`.
 /// That write becomes one field store per registered field.
 #[test]
@@ -3561,6 +3645,79 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                     )
                 }),
             "offset-0 header is the `super` chain: inner PyObject descriptors"
+        );
+        // `owner_root` stores the bump as another object's GCREF word, so
+        // `_try_inline_malloc` leaves the Call for `rewrite_op_malloc`.
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().map(String::as_str)
+                            == Some("try_gc_alloc_young_nonmoving_raw")
+                            || segments.last().map(String::as_str)
+                                == Some("try_gc_alloc_stable_raw")
+                    )
+                }),
+            "FrameBox::new must call the frame allocator"
+        );
+        // A leftover host `simple_call(lltype.cast_ptr_to_int)` is orthodox
+        // here: `simplify.py CanRemoveBuiltins = {hasattr: True}`, so the
+        // pre-rtype call is not removable. After rtyping it is the
+        // `cast_ptr_to_int` llop (`rbuiltin.py rtype_cast_ptr_to_int`) and
+        // `transform_dead_op_vars` drops the unused result —
+        // `frame_box_new_unused_cast_ptr_to_int_dies_after_rtype`.
+    });
+}
+
+fn op_is_cast_ptr_to_int(op: &majit_translate::model::SpaceOperation) -> bool {
+    use majit_translate::model::{CallTarget, OpKind};
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str) == Some("cast_ptr_to_int"),
+        OpKind::UnaryOp { op, .. } => op == "cast_ptr_to_int",
+        _ => false,
+    }
+}
+
+/// After rtyping, unused `p as usize` must not remain as `cast_ptr_to_int`.
+/// `GcRef` retypes the source pointer; a surviving `CastPtrToInt` forces
+/// the virtual `NewWithVtable`.
+#[test]
+fn frame_box_new_unused_cast_ptr_to_int_dies_after_rtype() {
+    use majit_translate::front::mir::lower_fun_decl;
+    use majit_translate::{GraphTransformConfig, transform_graph};
+
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+        .expect("FrameBox::new");
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        assert!(
+            !transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(op_is_cast_ptr_to_int),
+            "unused rtyped cast_ptr_to_int must die after transform_graph: {}",
+            transformed.graph.dump()
         );
     });
 }

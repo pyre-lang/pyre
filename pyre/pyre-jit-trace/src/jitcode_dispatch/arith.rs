@@ -78,20 +78,21 @@ pub(crate) fn binop_int_record<Sym: WalkSym>(
     }
     count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
-    // Box(value) parity: stamp the result from the operands' Box.value
-    // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
-    // The folded value also feeds the slot-keyed `concrete_registers_i`
-    // shadow via [`write_int_reg`] so handlers that read the slot
-    // (Ref-bank symmetry) see the same concrete as the OpRef channel.
-    let concrete = if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
-        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
-    {
-        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
-        ctx.trace_ctx
-            .set_opref_concrete(result, majit_ir::Value::Int(folded));
-        ConcreteValue::Int(folded)
-    } else {
-        ConcreteValue::Null
+    // `execute_and_record` stamps `box.value` from `box.getint()` of each
+    // operand (`pyjitpl.py` / `executor.py`). The MIFrame int-register
+    // shadow is that value when the OpRef sits outside this recorder
+    // (`setup_call` / a getfield heapcache hit).
+    let concrete = match (
+        box_getint(ctx, a, read_int_reg_concrete(code, op, 0, ctx)),
+        box_getint(ctx, b, read_int_reg_concrete(code, op, 1, ctx)),
+    ) {
+        (Some(la), Some(rb)) => {
+            let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+            ctx.trace_ctx
+                .set_opref_concrete(result, majit_ir::Value::Int(folded));
+            ConcreteValue::Int(folded)
+        }
+        _ => ConcreteValue::Null,
     };
     let dst = code[op.pc + 3] as usize;
     write_int_reg(ctx, op.pc, dst, result, concrete)?;
@@ -124,6 +125,8 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     opcode: OpCode,
     a: OpRef,
     b: OpRef,
+    a_concrete: ConcreteValue,
+    b_concrete: ConcreteValue,
 ) -> OpRef {
     if a == b {
         let folded = fastpath_same_boxes(opcode).unwrap_or_else(|| {
@@ -141,9 +144,10 @@ pub(crate) fn record_int_cmp<Sym: WalkSym>(
     }
     count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
-        (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
-    {
+    if let (Some(la), Some(rb)) = (
+        box_getint(ctx, a, a_concrete),
+        box_getint(ctx, b, b_concrete),
+    ) {
         let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
@@ -158,6 +162,7 @@ pub(crate) fn record_int_unary<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode: OpCode,
     a: OpRef,
+    a_concrete: ConcreteValue,
 ) -> OpRef {
     count_ops_executed(ctx, opcode);
     if let Some(Value::Int(la)) = a.inline_const_to_value() {
@@ -167,7 +172,7 @@ pub(crate) fn record_int_unary<Sym: WalkSym>(
     }
     count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
-    if let Some(majit_ir::Value::Int(la)) = ctx.trace_ctx.box_value(a) {
+    if let Some(la) = box_getint(ctx, a, a_concrete) {
         let folded = majit_metainterp::eval_unary_i(opcode, la);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
@@ -361,11 +366,9 @@ pub(crate) fn unop_int_record<Sym: WalkSym>(
     }
     count_ops_recorded(ctx, opcode);
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
-    // Box(value) parity: stamp the unary result from the operand's
-    // Box.value carrier (matches dispatch.rs trace_unary_i).  The
-    // folded value also feeds the slot-keyed shadow via
-    // [`write_int_reg`].
-    let concrete = if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+    // `execute_and_record` stamps from `box.getint()`; the register
+    // shadow is that value when the OpRef cannot carry it.
+    let concrete = if let Some(n) = box_getint(ctx, a, read_int_reg_concrete(code, op, 0, ctx)) {
         let folded = majit_metainterp::eval_unary_i(opcode, n);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));

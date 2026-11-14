@@ -2092,6 +2092,7 @@ fn lowering_state(llbc: &majit_charon_reader::Llbc) -> super::super::CrateLoweri
         &raw,
         None,
         None,
+        Default::default(),
     )
 }
 

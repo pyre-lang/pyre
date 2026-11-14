@@ -1143,12 +1143,16 @@ fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
     }
 }
 
-/// `w_range_iter` keeps the word iterator only when
-/// `start + length * step` still fits i64 (`i64::try_from(i128)`).
-/// That shell is the same checked Result `c_int_w` writes, with
-/// `longlongmask` on the Ok payload (`rbuiltin.py`).
+/// `w_range_iter` (`functional.rs`) copies `rangeobject.c range_iter`:
+/// empty length stays word; else the gate is
+/// `stop > i64::MAX - (step - 1)` (step > 0) or
+/// `stop < i64::MIN.wrapping_add((-1i64).wrapping_sub(step))` (step < 0).
+/// The source has no `checked_mul` / `checked_add`. Lowering must stay
+/// transparent: no opaque `convert::num::<Impl>::try_from` call, and no
+/// residual `checked_mul` / `checked_add` / `wrapping_add` /
+/// `wrapping_sub` FunctionPath call.
 #[test]
-fn w_range_iter_i128_try_from_lowers_to_checked_result() {
+fn w_range_iter_overflow_gate_lowers_transparently() {
     use crate::model::{CallTarget, OpKind};
 
     let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
@@ -1164,25 +1168,17 @@ fn w_range_iter_i128_try_from_lowers_to_checked_result() {
             }),
             "w_range_iter: i128 try_from must not remain an opaque core call"
         );
-    for expected in ["lt", "gt", "or"] {
+    for residual in ["checked_mul", "checked_add", "wrapping_add", "wrapping_sub"] {
         assert!(
-            graph
-                .blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected) }),
-            "w_range_iter: missing checked-narrowing {expected} op"
-        );
-    }
-    assert!(
-        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(&op.kind, OpKind::Call {
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("longlongmask"))
-        }),
-        "w_range_iter: Ok payload must go through longlongmask"
-    );
+                } if segments.last().map(String::as_str) == Some(residual))
+            }),
+            "w_range_iter: {residual} must not remain a residual FunctionPath call"
+        );
+    }
 }
 
 #[test]

@@ -9715,9 +9715,9 @@ pub fn ec_topframeref_descr() -> DescrRef {
 ///
 /// Marked `w_tracefunc?` so the pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// An inlined callee walks `call_trace` at entry
-/// (`walker_inline_execute_frame_call_trace`); `CALL_ASSEMBLER` and
-/// generator resume pin it through `walker_call_trace_hook_reads`.
+/// An inlined callee and `CALL_ASSEMBLER` walk `call_trace` at entry
+/// (`walker_inline_execute_frame_call_trace`); generator resume pins it
+/// through `walker_call_trace_hook_reads` (that door does not enter again).
 /// Same group as the two accessors above, so the read shares their
 /// struct identity.
 pub fn ec_w_tracefunc_descr() -> DescrRef {

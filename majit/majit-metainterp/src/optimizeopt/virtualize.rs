@@ -2923,6 +2923,15 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     fn all_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
         &VREF_ALL_FIELDDESCRS
     }
+    /// `heaptracker.py gc_fielddescrs` is `all_fielddescrs(only_gc=True)`.
+    /// `virtualref.py:17-20` registers both payload fields as GC pointers
+    /// (`virtual_token: GCREF`, `forced: OBJECTPTR`), so the lists agree.
+    /// `rewrite.py clear_gc_fields` delayed-zeros this view; the default
+    /// empty list left `token`/`forced` as recycled nursery bytes until
+    /// the first SETFIELD.
+    fn gc_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
+        &VREF_ALL_FIELDDESCRS
+    }
 }
 
 #[cfg(test)]
@@ -5059,6 +5068,53 @@ mod tests {
         assert!(
             result.is_empty(),
             "matching new_with_vtable class must drop GUARD_CLASS: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tautological_guard_class_on_plain_new_is_removed() {
+        // `rewrite_op_malloc` emits `new` for the object-header type
+        // (`has_gcstruct_a_vtable`: `rclass.OBJECT` has no vtable).
+        // `rewrite_op_setfield` drops the typeptr store, so the recorded
+        // GUARD_CLASS carries expected class 0. Folding it keeps the
+        // vstruct virtual; emitting it `force_box`es a unique nursery
+        // object every iteration.
+        let sd = size_descr(1);
+        let mut guard = Op::new(
+            OpCode::GuardClass,
+            &[
+                crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                Operand::const_from_value(Value::Int(0)),
+            ],
+        );
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
+        let mut ops = vec![Op::with_descr(OpCode::New, &[], sd), guard];
+        assign_positions(&mut ops);
+        let result = run_default_pipeline(&ops);
+        assert!(
+            result.is_empty(),
+            "GUARD_CLASS(new, 0) must drop so the vstruct DCE's: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn guard_class_zero_on_new_with_vtable_zero_is_not_folded_as_vstruct() {
+        // `NewWithVtable` vtable 0 is the published-group fill form.
+        // `get_known_class` filters 0, so this guard must survive — it
+        // is not the plain-`new` tautology above.
+        let ops = new_with_vtable_then_guard_class(0, 0);
+        let result = run_default_pipeline(&ops);
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::GuardClass),
+            "GUARD_CLASS on new_with_vtable(vtable=0) must remain: {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }

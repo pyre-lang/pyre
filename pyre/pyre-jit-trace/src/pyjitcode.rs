@@ -47,6 +47,7 @@
 //! to consult — `assembler.assemble` populates `code` in place and
 //! per-PC mapping is implicit in the bytecode stream.
 
+use majit_jitcode::codewriter::jitcode::ConstSlotR;
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
@@ -465,6 +466,12 @@ pub(crate) struct LoopScanIndex {
     pub(crate) loop_headers: Vec<usize>,
     /// Last `residual_call*`, for queries against any loop-header merge.
     pub(crate) last_residual_call: Option<usize>,
+    /// Exact `op.next_pc` of each Python-call jitcode op, sorted, with that
+    /// op's own pc. `python_call_ending_at` binary-searches this instead of
+    /// re-decoding the body on every snapshot capture (`pyjitpl.py`
+    /// `get_list_of_active_boxes` `in_a_call`: `MIFrame.pc` is already the
+    /// byte after the call).
+    pub(crate) python_call_endings: Vec<(usize, usize)>,
 }
 
 impl LoopScanIndex {
@@ -475,8 +482,12 @@ impl LoopScanIndex {
             label_gotos: Vec::new(),
             loop_headers: Vec::new(),
             last_residual_call: None,
+            python_call_endings: Vec::new(),
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
+            if crate::jitcode_runtime::is_python_call_jit_op(op.opname) {
+                index.python_call_endings.push((op.next_pc, op.pc));
+            }
             if op.opname == "jit_merge_point" {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
@@ -494,6 +505,18 @@ impl LoopScanIndex {
             }
         }
         index
+            .python_call_endings
+            .sort_unstable_by_key(|&(next, _)| next);
+        index
+    }
+
+    /// Call-op pc whose fallthrough is `pc`, if `pc` is immediately after a
+    /// Python-call jitcode op.
+    pub(crate) fn python_call_ending_at(&self, pc: usize) -> Option<usize> {
+        self.python_call_endings
+            .binary_search_by_key(&pc, |&(next, _)| next)
+            .ok()
+            .map(|i| self.python_call_endings[i].1)
     }
 
     /// The first `jit_merge_point` at or after `pc`.
@@ -520,6 +543,9 @@ pub struct PyJitCodePayload {
     /// `w_code` when available, but the cached object carries the raw
     /// CodeObject pointer so the queue can stay a bare graph list.
     pub code_ptr: *const pyre_interpreter::CodeObject,
+    /// Owner `PyCode` (`pycode.py` `PyCode`; `warmspot.py` jitcodes are
+    /// reached from the code object).
+    pub w_code: ConstSlotR,
     /// True if the jitcode contains an `abort` or `abort_permanent` opcode
     /// (unsupported bytecodes / emission-time bail-outs). Precomputed at
     /// compile time to avoid repeated bytecode scanning.
@@ -801,11 +827,13 @@ impl PyJitCode {
         metadata: PyJitCodeMetadata,
         code_ptr: *const pyre_interpreter::CodeObject,
         has_abort: bool,
+        w_code: *const (),
     ) -> Self {
         Self::new(PyJitCodePayload {
             jitcode,
             metadata,
             code_ptr,
+            w_code: ConstSlotR::new(w_code as i64),
             has_abort,
             sub_descr_pool: std::cell::OnceCell::new(),
             inline_body_facts: std::cell::OnceCell::new(),
@@ -817,6 +845,16 @@ impl PyJitCode {
             const_r_box_indexes: std::cell::OnceCell::new(),
             deleted_name_indexes: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Stamp the owner `PyCode` wrapper if this payload does not yet
+    /// carry one. First write wins so a later assembler `from_parts`
+    /// refill with a null slot cannot wipe a skeleton stamp.
+    pub fn stamp_w_code(&self, w_code: *const ()) {
+        if w_code.is_null() || self.w_code.get() != 0 {
+            return;
+        }
+        self.w_code.set(w_code as i64);
     }
 
     /// Fill the cached payload without changing the outer `PyJitCode`
@@ -850,6 +888,7 @@ impl PyJitCode {
             jitcode: next_jitcode,
             metadata,
             code_ptr,
+            w_code,
             has_abort,
             sub_descr_pool,
             inline_body_facts,
@@ -890,6 +929,12 @@ impl PyJitCode {
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
             current.code_ptr = code_ptr;
+            // Assembler `from_parts` may still leave the slot null when the
+            // refill has no wrapper in hand. Keep the skeleton stamp unless
+            // the replacement payload already carries one.
+            if w_code.get() != 0 {
+                current.w_code = w_code;
+            }
             current.has_abort = has_abort;
         }
     }
@@ -1458,11 +1503,22 @@ impl PyJitCode {
     /// `get_jitcode` calls can find an existing key without recompiling
     /// (call.py `if graph in self.jitcodes: return`).
     pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject) -> Self {
+        Self::skeleton_with_w_code(code_ptr, std::ptr::null())
+    }
+
+    /// Empty `PyJitCode` slot with the owner `PyCode` already stamped.
+    /// `CallControl::get_jitcode` uses this so a Python-code skeleton
+    /// carries its wrapper from enqueue, before the drain refill.
+    pub fn skeleton_with_w_code(
+        code_ptr: *const pyre_interpreter::CodeObject,
+        w_code: *const (),
+    ) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata::degenerate(),
             code_ptr,
             false,
+            w_code,
         )
     }
 
@@ -1479,11 +1535,23 @@ impl PyJitCode {
         code_ptr: *const pyre_interpreter::CodeObject,
         has_abort: bool,
     ) -> Self {
+        // Codeless helpers bake `abort/>r` / `abort/>i` into `has_abort` once
+        // (`assembler.abort()` only sets `abort/`). Python (code-keyed)
+        // jitcodes keep the assembler flag: a cold-arm `abort` byte is not
+        // a reason to refuse `blackhole_from_resumedata`.
+        let has_abort = if code_ptr.is_null() {
+            has_abort
+                || crate::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
+                    .any(|op| op.opname.starts_with("abort"))
+        } else {
+            has_abort
+        };
         Self::from_parts(
             jitcode,
             PyJitCodeMetadata::degenerate(),
             code_ptr,
             has_abort,
+            std::ptr::null(),
         )
     }
 }
@@ -1609,7 +1677,8 @@ mod tests {
             (8, merge_pcs[2] as u32),
         ];
         metadata.loop_header_by_green = vec![(8, merge_pcs[2] as u32)];
-        let pjc = PyJitCode::from_parts(jitcode, metadata, std::ptr::null(), false);
+        let pjc =
+            PyJitCode::from_parts(jitcode, metadata, std::ptr::null(), false, std::ptr::null());
         assert_eq!(pjc.first_loop_header_merge_point(), Some(merge_pcs[2]));
         let first_insn = pjc
             .merge_entry_for(2)

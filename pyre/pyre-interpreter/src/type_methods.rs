@@ -579,6 +579,21 @@ pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// lives in its own function so `contains_loop` cannot decline this graph
 /// and turn `list(iterable)` / `sorted(x)` into one residual CALL.
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `descr_init` keeps `format!` out of the length-2 type-call graph by
+    // sending surplus/missing/non-list receivers to a residual. The method
+    // body is the same split so `LIST_EXTEND`'s `[list, iterable]` call
+    // looks inside `list_extend_items`.
+    if args.len() == 2 && unsafe { is_list(args[0]) } {
+        list_extend_items(args[0], args[1])?;
+        return Ok(w_none());
+    }
+    list_method_extend_slow(args)
+}
+
+/// Gateway arity/receiver TypeError for `list.extend`. Residual so `format!`
+/// stays out of the length-2 method-call graph.
+#[majit_macros::dont_look_inside]
+fn list_method_extend_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "extend", true)?;
     arity_exact(args, "extend", 1)?;
     list_extend_items(args[0], args[1])?;
@@ -715,8 +730,15 @@ fn extend_from_tuple_iff(_list: PyObjectRef, other: PyObjectRef) -> bool {
 /// `listobject.py UNROLL_CUTOFF`.
 const LIST_UNROLL_CUTOFF: usize = 5;
 
+/// `listobject.py ListStrategy._extend_from_tuple`. The dispatch wrapper's
+/// jitted false-predicate arm residual-calls `<name>_trampoline`; that
+/// word-ABI entry is crate-visible so `jit_fnaddr` can publish it the
+/// same way `ll_list_*_resize_hint_really_trampoline` is published.
 #[majit_macros::look_inside_iff(extend_from_tuple_iff)]
-fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn extend_from_tuple(
+    list: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<(), crate::PyError> {
     // An integer- or float-specialised tuple boxes each item as it is read,
     // so `w_tuple_getitem` allocates and both operands can move under the
     // loop.  Keep them on the shadow stack and re-read them per item.
@@ -795,14 +817,13 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
 
 /// `list(FrameLocalsProxy)` — append each bound name onto `list`.
 ///
-/// `pyframe.py fast2locals` walks the slots with `@jit.unroll_safe`. The
-/// same walk is `append_bound_entries`. `bool`, not
-/// `Result`: a `Result` residual is may-force and `descr_init` is a
-/// transparent helper. `false` asks the caller to use the generic iterable
-/// drain. The names go straight onto `list`; an intermediate key list would
-/// then call `extend_from_list`, and that may-force residual is not
-/// recordable here.
-#[majit_macros::unroll_safe]
+/// `ListStrategy.extend` has no this arm; list/tuple/set/iterable are the
+/// only ones. Looking inside walks `cell_slot` / `CO_FAST_CELL`, which the
+/// CallRegistry does not name, and poisons `list_extend_items` /
+/// `list_extend_value`. Residual like `_extend_from_list`. `bool`, not
+/// `Result`: a `Result` residual is may-force. `false` asks the caller to
+/// use the generic iterable drain.
+#[majit_macros::dont_look_inside]
 fn extend_from_frame_locals_proxy(list: PyObjectRef, other: PyObjectRef) -> bool {
     crate::pyframe::frame_locals_proxy::extend_bound_entries(list, other, 0)
 }

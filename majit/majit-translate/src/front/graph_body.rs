@@ -21,7 +21,7 @@ use crate::front::clause_spec::{CrateView, CrossCrateLookup};
 
 use majit_charon_reader::Llbc;
 
-use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations};
+use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, StructLayoutTable};
 #[cfg(test)]
 use crate::front::mir::LowerError;
 use crate::front::mir::{self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp};
@@ -75,6 +75,8 @@ struct ProviderTables {
     /// FunDecl across artefacts is its `name_path` (`bookkeeper.py`
     /// `getdesc` / `FunctionDesc.cachedgraph` on the defining funcobj).
     cross: Rc<CrossCrateSpec>,
+    /// One live layout table for the translation (`descr.py` `get_size_descr`).
+    struct_layouts: StructLayoutTable,
 }
 
 /// Loaded crates of one `GraphBodyProvider`, for Opaque-import
@@ -176,6 +178,7 @@ impl GraphBodyProvider {
             cross: Rc::new(CrossCrateSpec {
                 crates: RefCell::new(Vec::new()),
             }),
+            struct_layouts: Default::default(),
         };
         Self {
             crates: Vec::new(),
@@ -211,6 +214,7 @@ impl GraphBodyProvider {
             raw_alloc_flavor_structs,
             None,
             None,
+            self.tables.struct_layouts.clone(),
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
@@ -249,6 +253,7 @@ impl GraphBodyProvider {
             &HashSet::new(),
             None,
             Some(&function_filter),
+            self.tables.struct_layouts.clone(),
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());

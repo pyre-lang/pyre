@@ -868,6 +868,13 @@ pub struct WalkSession {
     /// driver is active so `walk_session_roots` forwards its parent
     /// concretes until `push_frame` publishes it (`MetaInterp.newframe`).
     pub(crate) pending_helper_level: Option<HelperLevel>,
+    /// Portal CALL image captured when a Converted helper is entered from
+    /// the portal (`publish_helper_outer_call_image`). Converted helpers
+    /// do not push a `HelperLevel`, so a later helper→portal `perform_call`
+    /// numbers this as section 0 (`capture_resumedata` /
+    /// `ResumeDataLoopMemo.number`). A numbered `CallResult` helper leaves
+    /// this empty: its paused caller is the section itself.
+    pub(crate) helper_outer_call_parent: Option<InlineParentFrame>,
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
@@ -1039,6 +1046,7 @@ impl Default for WalkSession {
             helper_live: Vec::new(),
             framestack: Vec::new(),
             pending_helper_level: None,
+            helper_outer_call_parent: None,
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -1144,6 +1152,15 @@ impl WalkSession {
 
     pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
         self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    /// Last inlined Python callee, skipping transparent helper levels.
+    /// `last_inline` is any non-portal frame; helpers count there.
+    pub(crate) fn last_python_inline(&self) -> Option<&InlineFrame> {
+        self.framestack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_portal && !frame.is_helper_level())
     }
 
     /// [`HelperChain`] of the helper levels on top of `framestack`.
@@ -1392,9 +1409,18 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     // skipped at the `SubRaise` catch site instead, matching
     // `pyopcode.py handle_bytecode` routing that exception around
     // `record_context`.
+    //
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
-    // the value the compiled iterations will store.
+    // the value the compiled iterations will store. A recording-time skip
+    // when `sys_exc_info` is None would bake that into the trace; compiled
+    // iterations that later run under a live handler would leave
+    // `__context__` unset. PyPy traces `executioncontext.py sys_exc_info`
+    // as jitcode (`guard_isnull` on `sys_exc_operror` and
+    // `current_gen_or_coroutine`) and compiles a bridge when a guard fails.
+    // Those guards synthesized here resume at the inlined CALL whose
+    // valuestack was already consumed. Residual-call the hook instead
+    // (`resolve_exception_context` reads `get_sys_exception` at run time).
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
@@ -3634,8 +3660,11 @@ pub enum DispatchError {
         callee_num_regs_f: usize,
     },
     /// Internal yield from one heap-owned sub-walk frame to the explicit
-    /// sub-walk driver.  It is consumed before ordinary abort handling and can
-    /// never escape [`run_sub_jitcode_walk`].  RPython's `_interpret` gets the
+    /// sub-walk driver.  [`SubWalkDriver::drive`] consumes it by pushing the
+    /// pending callee and continuing the same `_interpret` loop.  Nested
+    /// helpers yield from [`run_sub_jitcode_walk`]; a helper residual that
+    /// `MetaInterp.perform_call`s a portal Python frame yields from
+    /// [`perform_portal_call_from_helper`].  RPython's `_interpret` gets the
     /// same transition by changing `framestack[-1]` in its single driver loop.
     SubWalkSuspended { pc: usize },
     /// `inline_call_r_r/dR>r`'s callee surfaced
@@ -5026,6 +5055,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let raised = match exec {
         ResidualExecOutcome::Executed(Ok(_)) => 0i64,
         ResidualExecOutcome::Executed(Err(exc)) => exc,
+        ResidualExecOutcome::PortalPerformCall { result: Ok(_) } => 0i64,
+        ResidualExecOutcome::PortalPerformCall { result: Err(exc) } => exc,
         ResidualExecOutcome::Declined(cause) => {
             fbw_state::fbw_mark_unjournaled_effect(cause);
             let recorded =
@@ -5205,6 +5236,30 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     } else {
         code[op.next_pc - 1] as usize
     };
+    recursive_call_from_green_red_boxes(
+        ctx, op, jd_index, dst_bank, dst, &greens_i, &greens_r, &greens_f, &reds_i, &reds_r,
+        &reds_f,
+    )
+}
+
+/// `_opimpl_recursive_call` / `do_recursive_call` after greens and reds
+/// are already boxes. The EvalFn residual rebuilds those boxes from the
+/// live helper-ABI frame and enters here so it never `execute_varargs`s
+/// the process evaluator.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recursive_call_from_green_red_boxes<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    jd_index: usize,
+    dst_bank: char,
+    dst: usize,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    greens_f: &[OpRef],
+    reds_i: &[OpRef],
+    reds_r: &[OpRef],
+    reds_f: &[OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
     let (adr, descr) = {
         let (driver, _) = crate::driver::driver_pair();
         let Some(jd) = driver.meta_interp().staticdata.jitdrivers_sd.get(jd_index) else {
@@ -5321,6 +5376,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     }
     let raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_state::fbw_mark_unjournaled_effect(cause);
             false
@@ -5506,11 +5562,23 @@ pub(crate) fn helper_abort_resume_pc(
 /// has the callee `PyFrame` and converts in place
 /// (`run_blackhole_interp_to_cancel_tracing`). `AbortPermanentMarkerReached`
 /// at the root still owns the AbortPc flush.
+///
+/// A clean decline (`do_residual_call`) never stages an image.
+///
+/// A heap-writing residual already executed
+/// (`fbw_heap_writing_effect_count`) is unrewindable:
+/// `_compile_and_run_once` except `SwitchToBlackhole` always
+/// `run_blackhole_interp_to_cancel_tracing`. Entry replay would re-apply
+/// that residual. Journaled-only walks (heap-writing == 0) keep the
+/// legacy entry replay for missing-value classes.
 pub(crate) fn abort_image_latchable_for(
     error: &DispatchError,
     frames_materialized: bool,
     crossed_inline_subwalk: bool,
 ) -> bool {
+    if error.is_clean_decline() {
+        return false;
+    }
     let carrier_owned = !frames_materialized
         && matches!(
             error,
@@ -5521,7 +5589,8 @@ pub(crate) fn abort_image_latchable_for(
         );
     (error.leaves_complete_image()
         || (frames_materialized && error.can_convert_seeded_inline())
-        || crossed_inline_subwalk)
+        || crossed_inline_subwalk
+        || fbw_heap_writing_effect_count() > 0)
         && !carrier_owned
         && !abort_blackhole_latched()
 }
@@ -5758,9 +5827,16 @@ pub fn walk<Sym: WalkSym>(
                 let coordinate_belongs_to_this_frame =
                     walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
+                    let helper_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+                    let helper_name = helper_index.and_then(|idx| {
+                        crate::jitcode_runtime::get_jitcode_ref_by_index(idx)
+                            .map(|jc| jc.name.clone())
+                    });
+                    let op_key = decode_op_at(code, opcode_position).map(|op| op.key);
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
-                         helper={} inline={} claimed={} callee_jc={:?}",
+                         helper={} inline={} claimed={} callee_jc={:?} \
+                         helper_index={:?} helper_name={:?} op={:?}",
                         error,
                         error.stop_pc(),
                         opcode_position,
@@ -5768,6 +5844,9 @@ pub fn walk<Sym: WalkSym>(
                         ctx.fbw_mode.inline_subwalk,
                         coordinate_belongs_to_this_frame,
                         ctx.inline_callee_consts.map(|c| c.jitcode_index),
+                        helper_index,
+                        helper_name,
+                        op_key,
                     );
                 }
                 // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
@@ -5860,6 +5939,11 @@ pub fn walk<Sym: WalkSym>(
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
+                //
+                // A heap-writing residual already ran: entry replay would
+                // re-apply it, so `abort_image_latchable_for` still stages
+                // the enclosing Python CALL image
+                // (`run_blackhole_interp_to_cancel_tracing`).
                 //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not
@@ -7170,6 +7254,29 @@ unsafe fn raw_load_float(addr: *const u8, itemsize: usize) -> f64 {
     }
 }
 
+/// `pyjitpl.py opimpl_goto_if_not` reads `box.getint()`. The FrontendOp
+/// carries that value (`history.py` `IntFrontendOp` / `Box.getint()`);
+/// pyre also keeps it in the MIFrame int-register shadow when the OpRef
+/// was allocated outside this recorder (`setup_call` / a helper splice).
+/// `execute_and_record` stamps the result from those `getint()` values.
+fn box_getint<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+    shadow: ConcreteValue,
+) -> Option<i64> {
+    match opref
+        .inline_const_to_value()
+        .or_else(|| ctx.trace_ctx.box_value(opref))
+    {
+        Some(Value::Int(n)) => Some(n),
+        _ => match shadow {
+            ConcreteValue::Int(n) => Some(n),
+            ConcreteValue::Bool(v) => Some(i64::from(v)),
+            ConcreteValue::Null | ConcreteValue::Ref(_) | ConcreteValue::Float(_) => None,
+        },
+    }
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -7649,12 +7756,8 @@ fn top_level_live_code<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<*
     if sym.jitcode().is_null() {
         return None;
     }
-    let raw = unsafe { (&(*sym.jitcode()).payload).code_ptr };
-    if raw.is_null() {
-        None
-    } else {
-        Some(pyre_interpreter::live_code_wrapper(raw as *const ()) as *const ())
-    }
+    let w = unsafe { (&(*sym.jitcode()).payload).w_code.get() };
+    (w != 0).then_some(w as *const ())
 }
 
 fn guard_current_frame_globals_identity<Sym: WalkSym>(
@@ -8276,6 +8379,12 @@ pub(crate) enum ResidualDecline {
 pub(crate) enum ResidualExecOutcome {
     Executed(Result<i64, i64>),
     Declined(ResidualDecline),
+    /// `MetaInterp.perform_call` of the portal from a helper EvalFn residual.
+    /// The callee walk already recorded the body (or CALL_ASSEMBLER); do not
+    /// also record the EvalFn `CallMayForce`.
+    PortalPerformCall {
+        result: Result<i64, i64>,
+    },
 }
 
 /// `pyjitpl.py _get_list_of_active_boxes` parity for the
@@ -9501,6 +9610,9 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         for parent in level.parents.iter_mut().chain(call_entry) {
             walk_parent(parent);
         }
+    }
+    if let Some(parent) = session.helper_outer_call_parent.as_mut() {
+        walk_parent(parent);
     }
 }
 
@@ -11019,7 +11131,9 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         .get(boundary_index + 1)
         .map(|&(off, _)| off as usize)
         .unwrap_or(code.len());
-    let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
+    // `ActiveResumeFrame::current` already selected the innermost inline
+    // frame's payload; its `w_code` is the green `pycode`.
+    let w_code = active.0.w_code.get() as usize;
     if w_code == 0 {
         return Ok(None);
     }
@@ -11351,6 +11465,7 @@ fn direct_libffi_call<Sym: WalkSym>(
     }
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
@@ -11625,6 +11740,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // the walk-end no-replay commit must stay off for this trace.
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
@@ -13161,7 +13277,7 @@ fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<Stri
         if code_ptr.is_null() {
             return None;
         }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        let code = &*code_ptr;
         pyre_interpreter::pyframe::load_name_from_code(code, name_idx).map(ToString::to_string)
     }
 }
@@ -14611,7 +14727,9 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let b = read_int_reg(code, op, 1, ctx)?;
-    let condbox = record_int_cmp(ctx, opcode, a, b);
+    let a_concrete = read_int_reg_concrete(code, op, 0, ctx);
+    let b_concrete = read_int_reg_concrete(code, op, 1, ctx);
+    let condbox = record_int_cmp(ctx, opcode, a, b, a_concrete, b_concrete);
     let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
         Some(Value::Int(v)) => v,
         _ => {
@@ -14643,9 +14761,10 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
 /// was recorded — is `gettrace()`'s `jit.promote` walked at an inlined
-/// callee entry (`walker_inline_execute_frame_call_trace`), the
-/// [`walker_call_trace_hook_reads`] pins on `CALL_ASSEMBLER` and generator
-/// resume, and the `is_being_profiled` green / back-edge read for a profiler.
+/// callee entry (`walker_inline_execute_frame_call_trace`, also the
+/// `CALL_ASSEMBLER` door after `record_ec_enter_frame_chain`), the
+/// [`walker_call_trace_hook_reads`] pin on generator resume, and the
+/// `is_being_profiled` green / back-edge read for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc().is_null() || (*ec).profilefunc.is_some() }
@@ -15090,11 +15209,11 @@ pub(crate) fn inlined_loop_header_call_assembler(
 /// `blackhole_if_trace_too_long` (`pyjitpl.py`) inside it resumes at that
 /// CALL (`HelperReturn::CalleePrologue` / `HelperResume::CallEntry`).
 ///
-/// `pyframe.py execute_frame` runs `call_trace` after `enter`. Doors walk it
-/// just before `enter` because those prologue guards resume at the CALL
-/// entry (no `execute_frame` frame to pause past `call_trace`). The order is
-/// unobservable on the unarmed path: `enter` writes only `topframeref` /
-/// `f_backref`, which that path does not read.
+/// `pyframe.py execute_frame` runs `enter` then `call_trace`. Doors that
+/// enter a callee record enter first, matching that order, so a body that
+/// reads `f_back` sees the caller's vref (or `vref_None` at the chain end).
+/// Callee-prologue resume stays at the CALL entry (no `execute_frame` frame
+/// to pause past `call_trace`).
 pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15188,8 +15307,11 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     }
 }
 
-/// `CALL_ASSEMBLER` and generator-resume door: the running ExecutionContext
-/// box plus the callee frame the door holds, then [`walker_walk_call_trace`].
+/// Generator-resume door: the running ExecutionContext box plus the
+/// resumed frame the door holds, then [`walker_walk_call_trace`].
+/// `CALL_ASSEMBLER` walks `call_trace` through
+/// `walker_inline_execute_frame_call_trace` with the assembler `ec` box
+/// after `record_ec_enter_frame_chain`.
 pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15344,7 +15466,8 @@ fn fused_goto_if_not_int_unary<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
-    let condbox = record_int_unary(ctx, opcode, a);
+    let a_concrete = read_int_reg_concrete(code, op, 0, ctx);
+    let condbox = record_int_unary(ctx, opcode, a, a_concrete);
     let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
         Some(Value::Int(v)) => v,
         _ => {

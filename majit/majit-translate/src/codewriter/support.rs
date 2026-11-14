@@ -52,11 +52,14 @@
 //! mirror of upstream's `_obj.<callable>.oopspec` access: same
 //! information, different host vehicle.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
+use crate::inline::{op_variable_refs, remap_op_kind};
 use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -264,6 +267,500 @@ pub(crate) fn rewrite_jit_merge_point(
         },
     });
     graph.set_return(block, result);
+}
+
+/// Origportal-for-EvalFn: rewrite the registered-override graph so a
+/// no-resume call of `(frame, None)` is a `direct_call` of
+/// `portal_runner_ptr` with greens/reds read off dest's frame formal.
+///
+/// Same shape as `rewrite_jit_merge_point`, applied to the EvalFn graph
+/// callers invoke. Identified by `discover_eval_override_graphs` (the
+/// registrar's `FnDef` argument), not a function path. The process-eval
+/// driver is the spec with a portal runner, a `"frame"` virtualizable,
+/// and a `"frame"` red.
+///
+/// The portal's rewritten origportal keeps the loop-header prefix that
+/// produces the marker args (GC reload, ticker). Copying that body onto
+/// EvalFn makes `bytecode_for_address(eval_with_jit)` a looped helper
+/// walk. This pass keeps dest's formals and materializes only the
+/// portal_runner arguments from dest's frame: FieldRead at most one hop
+/// from the frame formal, residual Calls, and the unique phi of those.
+/// Look-inside Calls expand to that producer (started-frame `last_instr+1`
+/// for `next_instr`); cloning one lets the inliner walk a discriminant-only
+/// enum payload and panics `fielddescrof`.
+pub(crate) fn rewrite_eval_override_graphs(
+    call_control: &mut CallControl,
+    specs: &[crate::pipeline::JitDriverSpec],
+) {
+    let overrides = call_control.eval_override_graphs().to_vec();
+    if overrides.is_empty() {
+        return;
+    }
+    let Some(spec) = specs.iter().find(|spec| {
+        spec.split_portal
+            && spec.portal_runner.is_some()
+            && spec.virtualizables.iter().any(|name| name == "frame")
+            && spec.reds.iter().any(|name| name == "frame")
+    }) else {
+        return;
+    };
+    if call_control
+        .jitdrivers_sd()
+        .iter()
+        .find(|jd| jd.jit_merge_point_in == spec.portal)
+        .and_then(|jd| jd.portal_runner.as_ref())
+        .or(spec.portal_runner.as_ref())
+        .is_none()
+    {
+        return;
+    }
+    let Some(original) = call_control.function_graphs().get(&spec.portal) else {
+        return;
+    };
+    let calls_runner = original.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| call_target_is_portal_runner(call_control, &op.kind))
+    });
+    if !calls_runner {
+        return;
+    }
+    let origportal = crate::model::copygraph(&original);
+    drop(original);
+    let mut rewritten = Vec::new();
+    for path in &overrides {
+        if path == &spec.portal {
+            continue;
+        }
+        let Some(dest_graph) = call_control.function_graphs().get(path) else {
+            continue;
+        };
+        let mut dest = crate::model::copygraph(&dest_graph);
+        drop(dest_graph);
+        if !rewrite_eval_override_graph(&mut dest, &origportal, spec.greens.len(), call_control) {
+            continue;
+        }
+        if let Some(slot) = call_control.function_graphs_mut().get_mut(path) {
+            *slot = dest;
+            rewritten.push(path.clone());
+        }
+    }
+    for path in rewritten {
+        call_control.register_helper_graph(path);
+    }
+}
+
+fn call_target_is_portal_runner(call_control: &CallControl, kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call { target, .. } => call_control.target_to_path(target).is_some_and(|path| {
+            call_control
+                .jitdriver_sd_from_portal_runner_ptr(&path)
+                .is_some()
+        }),
+        _ => false,
+    }
+}
+
+fn find_portal_runner_call(
+    call_control: &CallControl,
+    graph: &FunctionGraph,
+) -> Option<(crate::model::CallTarget, Vec<LinkArg>, ValueType)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if call_target_is_portal_runner(call_control, &op.kind)
+                && let OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                } = &op.kind
+            {
+                return Some((target.clone(), args.clone(), result_ty.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn defining_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    })
+}
+
+/// Variable phi sources of `var`, excluding self-loops. A Const link arg
+/// beside a Variable source is a second arm (`None => false`); that mix
+/// is not a unique producer.
+fn phi_var_sources(graph: &FunctionGraph, var: &Variable) -> Option<Vec<Variable>> {
+    let mut sources: Vec<Variable> = Vec::new();
+    let mut saw_const = false;
+    for block in &graph.blocks {
+        let Some(index) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for exit in &pred.exits {
+                if exit.target != block.id {
+                    continue;
+                }
+                match exit.args.get(index) {
+                    Some(LinkArg::Value(src)) if src != var => {
+                        if !sources.iter().any(|seen| seen == src) {
+                            sources.push(src.clone());
+                        }
+                    }
+                    Some(LinkArg::Const(_)) => saw_const = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if saw_const && !sources.is_empty() {
+        return None;
+    }
+    (!sources.is_empty()).then_some(sources)
+}
+
+fn kind_is_linear_producer(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstInt128(_)
+            | OpKind::ConstUInt128(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstSingleFloat(_)
+            | OpKind::ConstRef(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstNone
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
+            | OpKind::ConstSymbolic { .. }
+            | OpKind::FieldRead { .. }
+            | OpKind::UnaryOp { .. }
+            | OpKind::BinOp { .. }
+            | OpKind::Hint { .. }
+    )
+}
+
+struct MaterializeCtx<'a> {
+    dest: &'a mut FunctionGraph,
+    dest_frame: &'a Variable,
+    dest_block: BlockId,
+    frame_vars: &'a HashSet<Variable>,
+    map: &'a mut HashMap<Variable, Variable>,
+    hop0: &'a mut HashSet<Variable>,
+    call_control: &'a CallControl,
+}
+
+/// Portal greens/reds are fields of dest's frame, or one hop through a
+/// frame field (debugdata → `is_being_profiled`). A deeper FieldRead is a
+/// nested object's payload (`code_ptr` → names → `Cow::Owned.__pos_0`);
+/// cloning that panics `fielddescrof` on a discriminant-only layout.
+fn field_read_is_frame_derived(ctx: &MaterializeCtx<'_>, mapped_base: &Variable) -> bool {
+    mapped_base == ctx.dest_frame || ctx.hop0.contains(mapped_base)
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+fn materialize_portal_arg(
+    ctx: &mut MaterializeCtx<'_>,
+    orig: &FunctionGraph,
+    var: &Variable,
+    depth: usize,
+    allow_clone_look_inside: bool,
+) -> Option<Variable> {
+    if let Some(mapped) = ctx.map.get(var) {
+        return Some(mapped.clone());
+    }
+    if ctx.frame_vars.contains(var) {
+        ctx.map.insert(var.clone(), ctx.dest_frame.clone());
+        return Some(ctx.dest_frame.clone());
+    }
+    if depth > 32 {
+        return None;
+    }
+    if let Some(op) = defining_op(orig, var) {
+        if matches!(op.kind, OpKind::Input { .. }) {
+            return None;
+        }
+        if let OpKind::Call { .. } = &op.kind {
+            return materialize_call_producer(ctx, orig, var, op, depth, allow_clone_look_inside);
+        }
+        if !kind_is_linear_producer(&op.kind) {
+            return None;
+        }
+        if let OpKind::FieldRead { base, .. } = &op.kind {
+            let mapped_base =
+                materialize_portal_arg(ctx, orig, base, depth + 1, allow_clone_look_inside)?;
+            if !field_read_is_frame_derived(ctx, &mapped_base) {
+                return None;
+            }
+            let remap = |operand: &Variable| {
+                ctx.map
+                    .get(operand)
+                    .cloned()
+                    .unwrap_or_else(|| operand.clone())
+            };
+            let kind = remap_op_kind(&op.kind, &remap);
+            let result = ctx
+                .dest
+                .alloc_value_var_with_type(FunctionGraph::concretetype_of(var));
+            result.set_concretetype(var.concretetype());
+            ctx.dest
+                .push_op_with_result_var(ctx.dest_block, kind, result.clone());
+            if &mapped_base == ctx.dest_frame {
+                ctx.hop0.insert(result.clone());
+            }
+            ctx.map.insert(var.clone(), result.clone());
+            return Some(result);
+        }
+        for operand in op_variable_refs(&op.kind) {
+            materialize_portal_arg(ctx, orig, &operand, depth + 1, allow_clone_look_inside)?;
+        }
+        let remap = |operand: &Variable| {
+            ctx.map
+                .get(operand)
+                .cloned()
+                .unwrap_or_else(|| operand.clone())
+        };
+        let kind = remap_op_kind(&op.kind, &remap);
+        let result = ctx
+            .dest
+            .alloc_value_var_with_type(FunctionGraph::concretetype_of(var));
+        result.set_concretetype(var.concretetype());
+        ctx.dest
+            .push_op_with_result_var(ctx.dest_block, kind, result.clone());
+        ctx.map.insert(var.clone(), result.clone());
+        return Some(result);
+    }
+    let sources = phi_var_sources(orig, var)?;
+    let mut unique: Option<Variable> = None;
+    for src in sources {
+        let Some(mapped) =
+            materialize_portal_arg(ctx, orig, &src, depth + 1, allow_clone_look_inside)
+        else {
+            continue;
+        };
+        if let Some(prev) = &unique {
+            if prev != &mapped {
+                return None;
+            }
+        } else {
+            unique = Some(mapped);
+        }
+    }
+    let mapped = unique?;
+    ctx.map.insert(var.clone(), mapped.clone());
+    Some(mapped)
+}
+
+fn clone_call_op(
+    ctx: &mut MaterializeCtx<'_>,
+    orig: &FunctionGraph,
+    var: &Variable,
+    op: &SpaceOperation,
+    depth: usize,
+) -> Option<Variable> {
+    for operand in op_variable_refs(&op.kind) {
+        materialize_portal_arg(ctx, orig, &operand, depth + 1, false)?;
+    }
+    let remap = |operand: &Variable| {
+        ctx.map
+            .get(operand)
+            .cloned()
+            .unwrap_or_else(|| operand.clone())
+    };
+    let kind = remap_op_kind(&op.kind, &remap);
+    let result = ctx
+        .dest
+        .alloc_value_var_with_type(FunctionGraph::concretetype_of(var));
+    result.set_concretetype(var.concretetype());
+    ctx.dest
+        .push_op_with_result_var(ctx.dest_block, kind, result.clone());
+    ctx.map.insert(var.clone(), result.clone());
+    Some(result)
+}
+
+fn materialize_call_producer(
+    ctx: &mut MaterializeCtx<'_>,
+    orig: &FunctionGraph,
+    var: &Variable,
+    op: &SpaceOperation,
+    depth: usize,
+    allow_clone_look_inside: bool,
+) -> Option<Variable> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    let Some(path) = ctx.call_control.target_to_path(target) else {
+        return if allow_clone_look_inside {
+            clone_call_op(ctx, orig, var, op, depth)
+        } else {
+            None
+        };
+    };
+    if ctx
+        .call_control
+        .jitdriver_sd_from_portal_runner_ptr(&path)
+        .is_some()
+    {
+        return None;
+    }
+    let callee = ctx.call_control.function_graphs().get(&path);
+    let look_inside = callee.as_ref().and_then(|graph| graph.func.jit_look_inside);
+    if look_inside == Some(false) || callee.is_none() {
+        return clone_call_op(ctx, orig, var, op, depth);
+    }
+    let callee = callee.unwrap();
+    let call_vars = crate::model::call_arg_vars(args);
+    let callee_inputs = callee.block(callee.startblock).inputargs.clone();
+    if callee_inputs.len() != call_vars.len() {
+        return if allow_clone_look_inside {
+            clone_call_op(ctx, orig, var, op, depth)
+        } else {
+            None
+        };
+    }
+    for (input, arg) in callee_inputs.iter().zip(call_vars.iter()) {
+        let mapped = materialize_portal_arg(ctx, orig, arg, depth + 1, false)?;
+        ctx.map.insert(input.clone(), mapped);
+    }
+    let Some(ret) = callee.block(callee.returnblock).inputargs.first() else {
+        return if allow_clone_look_inside {
+            clone_call_op(ctx, orig, var, op, depth)
+        } else {
+            None
+        };
+    };
+    if let Some(expanded) = materialize_portal_arg(ctx, callee.as_ref(), ret, depth + 1, false) {
+        ctx.map.insert(var.clone(), expanded.clone());
+        return Some(expanded);
+    }
+    if allow_clone_look_inside {
+        clone_call_op(ctx, orig, var, op, depth)
+    } else {
+        None
+    }
+}
+
+/// Keep `dest`'s identity and startblock formals. Emit greens/reds from
+/// dest's frame, then `direct_call` of `portal_runner` (`rewrite_jit_merge_point`
+/// applied to the EvalFn graph).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+pub(crate) fn rewrite_eval_override_graph(
+    dest: &mut FunctionGraph,
+    origportal: &FunctionGraph,
+    numgreens: usize,
+    call_control: &CallControl,
+) -> bool {
+    let Some((target, runner_args, result_ty)) = find_portal_runner_call(call_control, origportal)
+    else {
+        return false;
+    };
+    let dest_inputs = dest.block(dest.startblock).inputargs.clone();
+    let dest_input_ops: Vec<SpaceOperation> = dest
+        .block(dest.startblock)
+        .operations
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Input { .. }))
+        .cloned()
+        .collect();
+    let Some(dest_frame) = dest_inputs.first().cloned() else {
+        return false;
+    };
+
+    let mut frame_vars: HashSet<Variable> = HashSet::new();
+    if let Some(orig_frame) = origportal.block(origportal.startblock).inputargs.first() {
+        frame_vars.insert(orig_frame.clone());
+    }
+    let runner_vars = crate::model::call_arg_vars(&runner_args);
+    if let Some(frame_red) = runner_vars.get(numgreens) {
+        frame_vars.insert(frame_red.clone());
+    }
+
+    let mut stub = FunctionGraph::new(dest.name.clone());
+    stub.source_identity = dest.source_identity.clone();
+    stub.fun_decl_id = dest.fun_decl_id;
+    stub.owner_root = dest.owner_root.clone();
+    stub.notes = dest.notes.clone();
+    stub.return_type = dest.return_type.clone();
+    stub.return_class_root = dest.return_class_root.clone();
+    stub.return_can_be_none = dest.return_can_be_none;
+    stub.return_is_str = dest.return_is_str;
+    stub.return_container_root = dest.return_container_root.clone();
+    stub.residual_return_type = dest.residual_return_type.clone();
+    stub.hints = dest.hints.clone();
+    stub.specialization = dest.specialization;
+    // Keep `FunctionGraph::new`'s `access_directly = false` and empty
+    // `access_directly_inputs`. Copying dest's flags would hint
+    // dest_frame and mint an AccessDirect cachedgraph of
+    // portal_runner_ptr, which is outside `jit_graphs`.
+    stub.return_flags = dest.return_flags;
+    stub.func = dest.func.clone();
+    stub.block_mut(stub.startblock).inputargs = dest_inputs;
+    stub.block_mut(stub.startblock).operations = dest_input_ops;
+
+    let dest_block = stub.startblock;
+    let mut map: HashMap<Variable, Variable> = HashMap::new();
+    let mut hop0: HashSet<Variable> = HashSet::new();
+    for frame_var in &frame_vars {
+        map.insert(frame_var.clone(), dest_frame.clone());
+    }
+
+    let mut call_args: Vec<Variable> = Vec::with_capacity(runner_vars.len());
+    for arg in &runner_vars {
+        let mut ctx = MaterializeCtx {
+            dest: &mut stub,
+            dest_frame: &dest_frame,
+            dest_block,
+            frame_vars: &frame_vars,
+            map: &mut map,
+            hop0: &mut hop0,
+            call_control,
+        };
+        let Some(mapped) = materialize_portal_arg(&mut ctx, origportal, arg, 0, true) else {
+            return false;
+        };
+        call_args.push(mapped);
+    }
+
+    let result = if matches!(result_ty, ValueType::Void) {
+        None
+    } else {
+        let ty = match result_ty {
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool => ConcreteType::Signed,
+            ValueType::Float => ConcreteType::Float,
+            _ => ConcreteType::GcRef,
+        };
+        Some(stub.alloc_value_var_with_type(ty))
+    };
+    stub.block_mut(dest_block).operations.push(SpaceOperation {
+        result: result.clone(),
+        kind: OpKind::Call {
+            target,
+            args: crate::model::call_args(call_args),
+            result_ty,
+        },
+    });
+    stub.set_return(dest_block, result);
+    stub.project_policy_hints();
+    if !stub.func.unroll_safe {
+        stub.push_hint("unroll_safe");
+    }
+    *dest = stub;
+    true
 }
 
 /// The split portal's start block is a fresh parameter list (the

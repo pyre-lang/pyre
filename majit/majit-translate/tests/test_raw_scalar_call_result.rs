@@ -67,18 +67,22 @@ mod common;
 use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named};
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
-    ErrorCarrierSpec, HostStaticAddrs,
+    CallPath, ErrorCarrierSpec, HostStaticAddrs,
     call::CallControl,
+    codewriter::codewriter::CodeWriter,
     codewriter::jtransform::{GraphTransformConfig, Transformer},
+    flatten::{FlatOp, RegKind, Register, SSARepr},
     flowspace::model::ConstValue,
+    format::format_assembler,
     front::llbc_hints::harvest_immutable_fields_from_llbcs,
     front::mir::{
         LowerError, discover_fnptr_field_families, lower_fun_decl, lower_function,
         lower_function_with_static_addrs,
     },
+    jitcode::JitCode,
     model::{
-        CallTarget, FunctionGraph, IndirectFamilyKey, LinkArg, OpKind, SpaceOperation, ValueType,
-        cast_instance_root,
+        CallTarget, ConcreteType, FunctionGraph, IndirectFamilyKey, LinkArg, OpKind, SpaceOperation,
+        ValueType, cast_instance_root,
     },
     translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget},
 };
@@ -466,6 +470,8 @@ fn map_terminator_w_cls_is_gc_field_read_from_object_start() {
         let mut saw_w_cls_gcref = false;
         let mut saw_pure_w_cls = false;
         let mut saw_raw_overlay = false;
+        let mut helper_has_cast_ptr_to_int = false;
+        let mut helper_has_cast_int_to_ptr = false;
         for leaf in [
             "map_terminator",
             "map_terminator_w_cls",
@@ -476,21 +482,39 @@ fn map_terminator_w_cls_is_gc_field_read_from_object_start() {
             for fd in fns {
                 let graph = lower_fun_decl(context, fd)
                     .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
+                let is_helper = leaf == "map_terminator_w_cls";
                 for op in ops(&graph) {
                     if let OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         args,
                         ..
                     } = &op.kind
-                        && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
-                        && args.len() == 2
-                        && let LinkArg::Const(c) = &args[0]
-                        && let ConstValue::LowLevelType(ll) = &c.value
-                        && let LowLevelType::Ptr(ptr) = ll.as_ref()
-                        && let PtrTarget::Struct(st) = &ptr.TO
-                        && st._gckind == GcKind::Raw
                     {
-                        saw_raw_overlay = true;
+                        let last = segments.last().map(String::as_str);
+                        if is_helper && last == Some("cast_ptr_to_int") {
+                            helper_has_cast_ptr_to_int = true;
+                        }
+                        if is_helper && last == Some("cast_int_to_ptr") {
+                            helper_has_cast_int_to_ptr = true;
+                        }
+                        if (last == Some("cast_int_to_ptr") || last == Some("cast_pointer"))
+                            && args.len() == 2
+                            && let LinkArg::Const(c) = &args[0]
+                            && let ConstValue::LowLevelType(ll) = &c.value
+                            && let LowLevelType::Ptr(ptr) = ll.as_ref()
+                            && let PtrTarget::Struct(st) = &ptr.TO
+                            && st._gckind == GcKind::Raw
+                        {
+                            saw_raw_overlay = true;
+                        }
+                    }
+                    if is_helper && let OpKind::UnaryOp { op: unop, .. } = &op.kind {
+                        if unop == "cast_ptr_to_int" {
+                            helper_has_cast_ptr_to_int = true;
+                        }
+                        if unop == "cast_int_to_ptr" {
+                            helper_has_cast_int_to_ptr = true;
+                        }
                     }
                     if let OpKind::FieldRead { field, ty, .. } = &op.kind {
                         if field.name == "terminator" {
@@ -525,6 +549,14 @@ fn map_terminator_w_cls_is_gc_field_read_from_object_start() {
         assert!(
             !saw_raw_overlay,
             "map_terminator_w_cls is a GC field read, not a raw overlay"
+        );
+        assert!(
+            !helper_has_cast_ptr_to_int,
+            "map_terminator_w_cls has no cast_ptr_to_int"
+        );
+        assert!(
+            !helper_has_cast_int_to_ptr,
+            "map_terminator_w_cls has no cast_int_to_ptr"
         );
         assert!(saw_terminator, "FieldRead of terminator");
         assert!(saw_terminator_gcref, "terminator FieldRead is GCREF");
@@ -10181,4 +10213,267 @@ fn idle_drop_of_a_nested_field_referent_still_frees() {
         "the spill is freed after the call\n{}",
         op_lines(&graph)
     );
+}
+
+/// `flatten.py` `getkind` of an untyped cell is `'r'`.
+fn flatten_kind(var: &majit_translate::flowspace::model::Variable) -> char {
+    match FunctionGraph::concretetype_of(var) {
+        ConcreteType::Signed => 'i',
+        ConcreteType::GcRef => 'r',
+        ConcreteType::Float => 'f',
+        ConcreteType::Void => 'v',
+        ConcreteType::Unknown => 'r',
+    }
+}
+
+fn call_is_std_alloc_raw(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match segs.as_slice() {
+        [.., crate_or_std, "alloc", leaf]
+            if matches!(*crate_or_std, "std" | "alloc" | "core")
+                && matches!(*leaf, "alloc" | "alloc_zeroed") =>
+        {
+            true
+        }
+        [.., "alloc_zeroed"] => true,
+        _ => false,
+    }
+}
+
+fn int_add_flatten_key(op: &SpaceOperation) -> Option<String> {
+    let OpKind::BinOp {
+        op: name, lhs, rhs, ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    if name != "add" && name != "int_add" {
+        return None;
+    }
+    let result = op.result.as_ref()?;
+    Some(format!(
+        "int_add/{}{}>{}",
+        flatten_kind(lhs),
+        flatten_kind(rhs),
+        flatten_kind(result)
+    ))
+}
+
+/// `std::alloc::alloc` is `llmemory.raw_malloc`: the result is Address
+/// (`history.py` `getkind` `'int'`). Adding the GcArray header size is
+/// `int_add/ii>i`, not `int_add/ri>i`.
+#[test]
+fn std_alloc_address_plus_signed_constant_flattens_int_add_ii() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(
+            &context,
+            find_exact(&llbc, "pyre_object::object_array::std_alloc_gc_array"),
+        )
+        .expect("lower std_alloc_gc_array");
+
+        let mut alloc_dests = Vec::new();
+        for op in ops(&graph) {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !call_is_std_alloc_raw(target) {
+                continue;
+            }
+            assert_eq!(
+                result_ty,
+                &ValueType::Int,
+                "raw_malloc Address is int-kind, got {result_ty:?} dest={:?} in {}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of),
+                graph.name
+            );
+            let dest = op.result.as_ref().expect("std.alloc.alloc dest").clone();
+            assert_eq!(
+                FunctionGraph::concretetype_of(&dest),
+                ConcreteType::Signed,
+                "Address from alloc is Signed from birth in {}",
+                graph.name
+            );
+            alloc_dests.push(dest);
+        }
+        assert!(
+            !alloc_dests.is_empty(),
+            "std_alloc_gc_array must call std.alloc.alloc / alloc_zeroed"
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut cc = CallControl::new();
+        let rewritten = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        for dest in &alloc_dests {
+            assert_eq!(
+                FunctionGraph::concretetype_of(dest),
+                ConcreteType::Signed,
+                "residual rewrite keeps the Address in the int bank"
+            );
+        }
+        // `authoritative_result_types` overlays ConstInt / ConstUInt as Signed
+        // before flatten (`history.py` `getkind` of Signed / Unsigned).
+        for block in &rewritten.blocks {
+            for op in &block.operations {
+                if matches!(&op.kind, OpKind::ConstInt(_) | OpKind::ConstUInt(_))
+                    && let Some(result) = op.result.as_ref()
+                {
+                    FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                }
+            }
+        }
+        let add_keys: Vec<String> = ops(&rewritten).filter_map(int_add_flatten_key).collect();
+        assert!(
+            add_keys.iter().any(|key| key == "int_add/ii>i"),
+            "header add of an Address and a Signed constant is int_add/ii>i, got {add_keys:?}"
+        );
+        assert!(
+            add_keys.iter().all(|key| key == "int_add/ii>i"),
+            "no mixed-kind int_add; got {add_keys:?}"
+        );
+    });
+}
+
+/// `instance_getclass` promotes the map word before reading the
+/// terminator. `liveness.py compute_liveness` over projected Registers puts
+/// the guarded colour in the `-live-` immediately before `guard_value`.
+#[test]
+fn instance_getclass_live_before_guard_value_includes_guarded_register() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    common::with_shared_lowering(llbc, |context| {
+        let ranks = harvest_immutable_fields_from_llbcs(std::slice::from_ref(llbc));
+        let getclass_fd = mapdict_fns(&llbc, "instance_getclass")
+            .into_iter()
+            .next()
+            .expect("instance_getclass is in pyre-object LLBC");
+        let helper_fd = mapdict_fns(&llbc, "map_terminator_w_cls")
+            .into_iter()
+            .next()
+            .expect("map_terminator_w_cls is in pyre-object LLBC");
+        let getclass = lower_fun_decl(&context, getclass_fd)
+            .unwrap_or_else(|err| panic!("lower instance_getclass: {err}"));
+        let helper = lower_fun_decl(&context, helper_fd)
+            .unwrap_or_else(|err| panic!("lower map_terminator_w_cls: {err}"));
+
+        let path_of = |graph: &FunctionGraph| {
+            CallPath::from_segments(
+                graph
+                    .name
+                    .split("::")
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let getclass_path = path_of(&getclass);
+        let helper_path = path_of(&helper);
+
+        let mut callcontrol = CallControl::new();
+        callcontrol.set_struct_fields(context.struct_field_registry());
+        callcontrol.immutable_fields_by_struct = ranks;
+        // Same install as `test_fast2locals_codewriter`: the graph was lowered
+        // from this LLBC, so `fielddescrof` `getattr`s the harvested field
+        // names (`LowerContext::struct_field_registry`).
+        callcontrol.set_struct_fields(context.struct_field_registry());
+        callcontrol.register_function_graph(getclass_path.clone(), getclass.clone());
+        callcontrol.register_function_graph(helper_path, helper);
+
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        let jitcode = std::sync::Arc::new(JitCode::new("instance_getclass"));
+        let cfg = GraphTransformConfig::default();
+        codewriter.transform_graph_to_jitcode(
+            &getclass,
+            &getclass_path,
+            &mut callcontrol,
+            &cfg,
+            &jitcode,
+            false,
+            0,
+        );
+
+        let ssarepr = jitcode
+            .body()
+            ._ssarepr
+            .as_ref()
+            .and_then(|repr| repr.as_any().downcast_ref::<SSARepr>())
+            .expect("assembled instance_getclass keeps its SSA representation");
+        let dump = format_assembler(ssarepr);
+        let positions = ssarepr
+            .insns_pos
+            .as_ref()
+            .expect("assemble records insns_pos");
+        let (guard_idx, guard_kind) = ssarepr
+            .insns
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match op {
+                FlatOp::Op(inner) => match &inner.kind {
+                    OpKind::GuardValue { kind_char, .. } => Some((i, *kind_char)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("instance_getclass emits a guard_value\n{dump}"));
+        // `MapRef` points at a raw-flavored `MapNode`, so the promoted word is
+        // the int-banked address (`rclass.py getgcflavor`).
+        let (guard_key, guard_regkind) = match guard_kind {
+            'i' => ("int_guard_value/i", RegKind::Int),
+            'r' => ("ref_guard_value/r", RegKind::Ref),
+            other => panic!("unexpected guard_value kind {other}\n{dump}"),
+        };
+        let opnum = *codewriter
+            .assembler
+            .insns
+            .get(guard_key)
+            .unwrap_or_else(|| panic!("{guard_key} is a wired opcode"));
+        let body = jitcode.body();
+        let lo = guard_idx.saturating_sub(12);
+        let hi = (guard_idx + 12).min(ssarepr.insns.len());
+        let mut window = String::new();
+        for (i, op) in ssarepr.insns[lo..hi].iter().enumerate() {
+            let idx = lo + i;
+            let pc = positions.get(idx).copied().unwrap_or(usize::MAX);
+            window.push_str(&format!("  [{idx}] pc={pc} {op:?}\n"));
+        }
+        let guard_pc = positions[guard_idx];
+        assert_eq!(
+            body.code.get(guard_pc).copied(),
+            Some(opnum),
+            "insns_pos[{guard_idx}] must be {guard_key}\nwindow:\n{window}\n{dump}"
+        );
+        let guarded = Register::new(
+            guard_regkind,
+            *body
+                .code
+                .get(guard_pc + 1)
+                .expect("guard_value carries the guarded register") as usize,
+        );
+        let mut live_before = None;
+        for op in ssarepr.insns[..guard_idx].iter().rev() {
+            match op {
+                FlatOp::Live { live_values } => {
+                    live_before = Some(live_values.as_slice());
+                    break;
+                }
+                FlatOp::EndOfBlock | FlatOp::Label(_) => {}
+                _ => break,
+            }
+        }
+        let live = live_before
+            .unwrap_or_else(|| panic!("-live- before {guard_key}\nwindow:\n{window}\n{dump}"));
+        assert!(
+            live.contains(&guarded),
+            "liveness.py adds the guarded ref; {} missing from {live:?}\nwindow:\n{window}\n{dump}",
+            guarded.repr()
+        );
+    });
 }

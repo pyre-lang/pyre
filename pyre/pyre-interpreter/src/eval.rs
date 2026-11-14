@@ -55,7 +55,6 @@ thread_local! {
             .with(|cell| cell as *const _),
         jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
-        pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
 }
 
@@ -68,7 +67,6 @@ struct PyFrameRootArea {
     guard_exception: *const Cell<i64>,
     jit_pending_exception: *const Cell<i64>,
     pending_call_error: *const (),
-    pending_hash_error: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -1172,7 +1170,6 @@ pub unsafe fn walk_pyframe_roots_area(
             walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
         }
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
-        crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
     }
     // incminimark.py:339-355 prebuilt-object scanning parity: a minor
     // collection scans an old/prebuilt object only when the write barrier
@@ -4704,6 +4701,10 @@ fn import_module_importhook(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn pycode(&self) -> pyre_object::PyObjectRef {
+        self.pycode as pyre_object::PyObjectRef
+    }
+
     fn getname_u(&self, index: usize) -> Result<&'static str, PyError> {
         let w_name = unsafe { crate::pycode::w_code_getname_w(self.getcode_w(), index) };
         crate::baseobjspace::text_w(w_name)

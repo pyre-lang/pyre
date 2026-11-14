@@ -54,9 +54,10 @@ use super::bookkeeper::Bookkeeper;
 use super::classdesc::{ClassDef, ClassDesc};
 use super::description::DescEntry;
 use super::model::{
-    AnnotatorError, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat, SomeInstance,
-    SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeUnicodeCodePoint,
-    SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none, union, unionof,
+    AnnotatorError, SomeAddress, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat,
+    SomeInstance, SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple,
+    SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none,
+    union, unionof,
 };
 use crate::flowspace::model::ConstValue;
 
@@ -726,6 +727,18 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `rffi.cast = ll2ctypes.force_cast` (`rffi.py`); `ForceCastEntry`
     // (`ll2ctypes.py`) keys the analyser on the HostObject qualname.
     analyzer_for(&mut reg, "rffi.cast", rffi_cast);
+    // llmemory.py — `@analyzer_for(cast_ptr_to_adr)`,
+    // `@analyzer_for(cast_adr_to_int)`.
+    analyzer_for(
+        &mut reg,
+        "llmemory.cast_ptr_to_adr",
+        llmemory_cast_ptr_to_adr,
+    );
+    analyzer_for(
+        &mut reg,
+        "llmemory.cast_adr_to_int",
+        llmemory_cast_adr_to_int,
+    );
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -2363,6 +2376,10 @@ fn cast_instance_intrinsic(
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::String(str_) => str_.inner.can_be_none,
         SomeValue::None_(_) => true,
+        // CastBasePtrToInstanceEntry.compute_result_annotation: a
+        // GCREF / address word is a nullable pointer, so a String
+        // restore (`with_nullability`) keeps `can_be_None`.
+        SomeValue::Ptr(_) | SomeValue::Address(_) => true,
         _ => false,
     };
     let projected = project_cast_root(bk, &root, operand_can_be_none)?;
@@ -3127,6 +3144,55 @@ fn lltype_cast_ptr_to_int(
     Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
+/// Upstream `ann_cast_ptr_to_adr(s)` (`llmemory.py`).
+///
+/// ```python
+/// @analyzer_for(cast_ptr_to_adr)
+/// def ann_cast_ptr_to_adr(s):
+///     from rpython.rtyper.llannotation import SomeInteriorPtr
+///     assert not isinstance(s, SomeInteriorPtr)
+///     return SomeAddress()
+/// ```
+fn llmemory_cast_ptr_to_adr(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "cast_ptr_to_adr expects one pointer argument",
+        ));
+    }
+    let s = arg_at(args_s, 0, "llmemory.cast_ptr_to_adr");
+    if matches!(s, SomeValue::InteriorPtr(_)) {
+        return Err(AnnotatorError::new("cast_ptr_to_adr of interior pointer"));
+    }
+    Ok(SomeValue::Address(SomeAddress::new()))
+}
+
+/// Upstream `ann_cast_adr_to_int(s, s_mode=None)` (`llmemory.py`).
+///
+/// ```python
+/// @analyzer_for(cast_adr_to_int)
+/// def ann_cast_adr_to_int(s, s_mode=None):
+///     return SomeInteger()
+/// ```
+///
+/// The 1-arg form is mode `"emulated"` (`cast_adr_to_int`); the 2-arg
+/// form carries that mode string.
+fn llmemory_cast_adr_to_int(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.is_empty() || args_s.len() > 2 {
+        return Err(AnnotatorError::new(
+            "cast_adr_to_int expects an address and optional mode",
+        ));
+    }
+    Ok(SomeValue::Integer(SomeInteger::default()))
+}
+
 /// Upstream `ann_direct_ptradd(s_p, s_n)`
 /// (`rpython/rtyper/lltypesystem/lltype.py` `ann_direct_ptradd`).
 ///
@@ -3172,6 +3238,15 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
     SomeValue::Ptr(SomePtr::new(*ptr_ty))
 }
 
+/// `ann_cast_int_to_ptr` / `ann_cast_pointer` result for a constant
+/// `PTRTYPE` whose value is a `Ptr` (`lltype.py`).
+fn somevalue_from_constant_ptrtype(
+    ptr_ty: &crate::translator::rtyper::lltypesystem::lltype::Ptr,
+) -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
+    SomeValue::Ptr(SomePtr::new(ptr_ty.clone()))
+}
+
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
 /// (rpython/rtyper/lltypesystem/lltype.py).
 ///
@@ -3212,7 +3287,7 @@ fn lltype_cast_int_to_ptr(
                 "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
             ));
         };
-        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+        return Ok(somevalue_from_constant_ptrtype(ptr_ty.as_ref()));
     }
     let LowLevelType::Ptr(ptr_ty) = (*GCREF).clone() else {
         unreachable!("GCREF is a pointer");
@@ -3323,28 +3398,44 @@ fn lltype_cast_pointer(
     let s_clspbc_v = arg_at(args_s, 0, "lltype_cast_pointer");
     // `ann_cast_pointer(PtrT, s_p)` (lltype.py): a constant LowLevelType
     // Ptr is `cast_pointer(PtrT.const, s_p.ll_ptrtype._defl())` via
-    // `_cast_to` → `castable`.
+    // `_cast_to` → `castable`. The result is the same SomePtr
+    // `ann_cast_int_to_ptr` returns for that PTRTYPE.
     if let Some(ConstValue::LowLevelType(ll)) = s_clspbc_v.const_() {
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr, castable};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, castable};
         let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
             return Err(AnnotatorError::new(
                 "cast_pointer() PtrT.const is not a Ptr",
             ));
         };
-        let ptrtype = (**ptr_ty).clone();
         match arg_at(args_s, 1, "lltype_cast_pointer") {
             SomeValue::Ptr(s_p) => {
-                if let Err(msg) = castable(&ptrtype, &s_p.ll_ptrtype) {
-                    return Err(AnnotatorError::new(msg));
+                if let Err(msg) = castable(ptr_ty.as_ref(), &s_p.ll_ptrtype) {
+                    // `castable` is Struct-to-Struct (`lltype.py`). A raw
+                    // interned node (`MapRef` / `_NONGCREF`) overlay onto a
+                    // prefix Struct (`MapNodeTerminatorView`) is Opaque →
+                    // typed with the same `_gckind` — `cast_opaque_ptr`.
+                    // `emit_dest_overlay_cast` still spells that recast as
+                    // `cast_pointer`.
+                    let dest_struct = matches!(ptr_ty.TO, PtrTarget::Struct(_));
+                    let src_opaque = matches!(s_p.ll_ptrtype.TO, PtrTarget::Opaque(_));
+                    let same_gc = s_p.ll_ptrtype._gckind() == ptr_ty._gckind();
+                    if !(dest_struct && src_opaque && same_gc) {
+                        return Err(AnnotatorError::new(msg));
+                    }
                 }
-                return Ok(SomeValue::Ptr(SomePtr::new(ptrtype)));
             }
+            // Overlay dest recasts a GC object (`SomeInstance`) onto a
+            // raw `Ptr(Struct)` (`emit_dest_overlay_cast`). Other dests
+            // (CCHARP, arrays) still require SomePtr; Instance → those
+            // is `__cast_instance_intrinsic`.
+            SomeValue::Instance(_) if matches!(ptr_ty.TO, PtrTarget::Struct(_)) => {}
             other => {
                 return Err(AnnotatorError::new(format!(
                     "cast_pointer(): casting of non-pointer: {other:?}"
                 )));
             }
         }
+        return Ok(somevalue_from_constant_ptrtype(ptr_ty.as_ref()));
     }
     let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
         return Err(AnnotatorError::new(
@@ -5118,6 +5209,8 @@ mod tests {
         ));
         assert!(is_registered("std.slice.from_raw_parts"));
         assert!(is_registered("std.slice.from_raw_parts_mut"));
+        assert!(is_registered("llmemory.cast_ptr_to_adr"));
+        assert!(is_registered("llmemory.cast_adr_to_int"));
     }
 
     #[test]
@@ -5357,18 +5450,116 @@ mod tests {
 
     #[test]
     fn lltype_cast_pointer_rejects_non_class_target() {
-        // upstream `assert s_CURTYPE.is_constant()` — a non-PBC first
-        // argument is not a constant target type.
+        // `ann_cast_pointer` `assert PtrT.is_constant()`: a non-constant
+        // or non-Ptr first argument is not PTRTYPE.
         let bk = bk();
-        let s_int = bk.immutablevalue(&ConstValue::Int(1)).unwrap();
         let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
-        let err = lltype_cast_pointer(&bk, &[Some(s_int), Some(s_ptr)], &no_kwds()).unwrap_err();
+        let s_int = bk.immutablevalue(&ConstValue::Int(1)).unwrap();
+        let err =
+            lltype_cast_pointer(&bk, &[Some(s_int), Some(s_ptr.clone())], &no_kwds()).unwrap_err();
         assert!(
             err.msg
                 .as_deref()
                 .unwrap_or("")
                 .contains("constant class PBC"),
         );
+
+        let s_nonconst = SomeValue::Integer(SomeInteger::default());
+        let err = lltype_cast_pointer(&bk, &[Some(s_nonconst), Some(s_ptr.clone())], &no_kwds())
+            .unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("constant class PBC"),
+        );
+
+        let mut s_signed = SomeValue::Type(super::super::model::SomeType::new());
+        s_signed.set_const_box(crate::flowspace::model::Constant::new(
+            ConstValue::LowLevelType(Box::new(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+            )),
+        ));
+        let err = lltype_cast_pointer(&bk, &[Some(s_signed), Some(s_ptr)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg.as_deref().unwrap_or("").contains("not a Ptr"),
+            "constant non-Ptr LowLevelType: {err}"
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_accepts_constant_ptrtype() {
+        // `ann_cast_pointer(PtrT, s_p)` (lltype.py) for a constant
+        // `LowLevelType` Ptr — the same SomePtr `ann_cast_int_to_ptr`
+        // returns for that PTRTYPE (`Bookkeeper.immutablevalue` annotates
+        // `ConstValue::LowLevelType` as SomeType with `.const_`).
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Ptr, Struct};
+
+        let bk = bk();
+        let body = Struct::registry_fields(
+            "MapNodeAbstractAttribute",
+            vec![("terminator".into(), LowLevelType::Signed)],
+            GcKind::Raw,
+        );
+        let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body)))
+            .expect("overlay Struct yields a Ptr");
+        let ptr_ty = LowLevelType::Ptr(Box::new(ptr));
+        let s_ptrt = bk
+            .immutablevalue(&ConstValue::LowLevelType(Box::new(ptr_ty.clone())))
+            .expect("LowLevelType constant annotates");
+        assert!(s_ptrt.is_constant());
+        let s_p = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let out = lltype_cast_pointer(&bk, &[Some(s_ptrt.clone()), Some(s_p)], &no_kwds())
+            .expect("ann_cast_pointer of constant Ptr overlay");
+        let s_int = SomeValue::Integer(SomeInteger::default());
+        let via_int_to_ptr = lltype_cast_int_to_ptr(&bk, &[Some(s_ptrt), Some(s_int)], &no_kwds())
+            .expect("ann_cast_int_to_ptr of the same PTRTYPE");
+        assert_eq!(
+            out, via_int_to_ptr,
+            "cast_pointer PTRTYPE arm matches ann_cast_int_to_ptr"
+        );
+        let SomeValue::Ptr(ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone())), ptr_ty);
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed,
+            "raw overlay Ptr kinds as Signed"
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_nongcref_onto_raw_overlay_struct() {
+        // Overlay dest recasts `_NONGCREF` (`MapRef` after getattr
+        // `terminator`) onto `Ptr(Struct MapNodeTerminatorView)`.
+        // `castable` is Struct-to-Struct; Opaque → typed, same `_gckind`,
+        // is `cast_opaque_ptr`.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GCREF, GcKind, LowLevelType, NONGCREF, Ptr, SomePtr, Struct,
+        };
+
+        let overlay = Struct::registry_fields(
+            "MapNodeTerminatorView",
+            vec![
+                ("_discriminant".into(), LowLevelType::Signed),
+                ("terminator".into(), LowLevelType::Signed),
+                ("w_cls".into(), (*GCREF).clone()),
+            ],
+            GcKind::Raw,
+        );
+        let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(overlay)))
+            .expect("overlay Struct yields a Ptr");
+        let s_ptrt = const_lltype(LowLevelType::Ptr(Box::new(ptr.clone())));
+        let s_p = SomeValue::Ptr(SomePtr::new((*NONGCREF).clone()));
+        let out = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect("NONGCREF overlay onto raw Struct");
+        let SomeValue::Ptr(out_ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(out_ptr.ll_ptrtype, ptr);
     }
 
     #[test]
@@ -9014,6 +9205,68 @@ mod tests {
         assert!(
             matches!(out, SomeValue::Integer(_)),
             "lltype.py ann_cast_ptr_to_int yields SomeInteger, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn ann_cast_ptr_to_adr_returns_someaddress() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let out = llmemory_cast_ptr_to_adr(&bk(), &[Some(s_ptr)], &no_kwds())
+            .expect("ann_cast_ptr_to_adr returns SomeAddress");
+        assert!(
+            matches!(out, SomeValue::Address(_)),
+            "llmemory.py ann_cast_ptr_to_adr yields SomeAddress, got {out:?}"
+        );
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let out = llmemory_cast_ptr_to_adr(&bk(), &[Some(s_inst)], &no_kwds())
+            .expect("non-interior pointer annotates");
+        assert!(matches!(out, SomeValue::Address(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn ann_cast_ptr_to_adr_rejects_interior_ptr() {
+        use crate::annotator::model::SomeInteriorPtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let s_interior = SomeValue::InteriorPtr(SomeInteriorPtr::new(InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )))),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Field("x".into())],
+        }));
+        let err = llmemory_cast_ptr_to_adr(&bk(), &[Some(s_interior)], &no_kwds())
+            .expect_err("ann_cast_ptr_to_adr asserts not SomeInteriorPtr");
+        assert!(err.to_string().contains("interior pointer"), "got {err}");
+    }
+
+    #[test]
+    fn ann_cast_adr_to_int_one_and_two_arg_are_someinteger() {
+        let s_addr = SomeValue::Address(SomeAddress::new());
+        let one = llmemory_cast_adr_to_int(&bk(), &[Some(s_addr.clone())], &no_kwds())
+            .expect("1-arg emulated form");
+        assert!(
+            matches!(one, SomeValue::Integer(_)),
+            "llmemory.py ann_cast_adr_to_int yields SomeInteger, got {one:?}"
+        );
+
+        let s_mode = SomeValue::String(SomeString::new(false, true));
+        let two = llmemory_cast_adr_to_int(&bk(), &[Some(s_addr), Some(s_mode)], &no_kwds())
+            .expect("2-arg mode form");
+        assert!(
+            matches!(two, SomeValue::Integer(_)),
+            "2-arg mode form yields SomeInteger, got {two:?}"
         );
     }
 

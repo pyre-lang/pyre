@@ -401,9 +401,17 @@ pub fn enter_runtime_thread() {
 }
 
 /// Get the current eval function (JIT-aware if registered, plain otherwise).
-/// Respects the force-plain-eval mode.
+/// Respects the force-plain-eval mode in the interpreter.
 #[inline]
 pub fn get_eval_fn() -> EvalFn {
+    // `we_are_jitted` is `_we_are_jitted` (`rlib/jit.py`): the interpreter
+    // reads false, jitcode folds true (`fold_we_are_jitted_calls`). The
+    // recorded EvalFn is therefore always `current_eval_fn_addr` (the portal
+    // `EVAL_OVERRIDE`, `guess_call_kind` `'recursive'` via
+    // `jitdriver_sd_from_portal_runner_ptr`). `force_plain_eval` stays an
+    // interpreter-only switch so blackhole / bridge residual execute does
+    // not re-enter compiled code; it must not specialize the helper body.
+    //
     // The thread-local read stays in `is_force_plain_eval`. Inlined here it
     // is a call whose target is the `FORCE_PLAIN_EVAL` static, a symbolic
     // path the portal walk cannot execute.
@@ -411,12 +419,11 @@ pub fn get_eval_fn() -> EvalFn {
     // Both arms produce the address word and one transmute follows: a
     // function item in one arm and a transmuted word in the other merge as
     // `Ptr(Func) ∪ Integer`, which the annotator has no arm for.
-    let addr = if is_force_plain_eval() {
+    let addr = if majit_rlib::jit::we_are_jitted() {
+        current_eval_fn_addr()
+    } else if is_force_plain_eval() {
         plain_eval_fn_addr()
     } else {
-        // `EVAL_OVERRIDE` is a `OnceLock` static. Reading it in the portal
-        // graph is a symbolic path. The word comes back from a residual
-        // and is the registered eval function.
         current_eval_fn_addr()
     };
     unsafe { std::mem::transmute::<usize, EvalFn>(addr) }
@@ -429,7 +436,18 @@ pub fn plain_eval_fn_addr() -> usize {
 }
 
 /// Address of the process eval function (`EVAL_OVERRIDE`, else plain).
-#[majit_macros::dont_look_inside]
+///
+/// `rlib/jit.py` `@elidable` (`_elidable_function_`) plus
+/// `call.py getcalldescr` `EF_ELIDABLE_CANNOT_RAISE`: the OnceLock is
+/// written once at startup (`register_eval_override`) and the helper
+/// cannot raise. `function.py funccall` calls `new_frame.run`
+/// (`run._always_inline_`) which inlines into the portal
+/// `execute_frame`; the jitted path therefore sees no residual eval-fn
+/// getter. `we_are_jitted` already folds `get_eval_fn` onto this helper,
+/// so the helper itself must be the elidable residual — a
+/// `dont_look_inside` `EF_CAN_RAISE` call would `may_force` every
+/// virtual (the callee `PyFrame`, its vref) before the portal enter.
+#[majit_macros::elidable_cannot_raise]
 pub fn current_eval_fn_addr() -> usize {
     EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain) as usize
 }
@@ -4788,9 +4806,9 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
 /// wraps it for callers that expect a bare `PyObjectRef` and stash the
 /// error in `PENDING_CALL_ERROR` instead.
 ///
-/// Residual (`look_inside_graph` sees the `args` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// Look-inside: `baseobjspace.py call_function` has no JIT hint;
+/// RPython specializes `*args_w` per arity, so `look_inside_graph` accepts it.
+#[majit_macros::unroll_safe]
 pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],

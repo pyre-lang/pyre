@@ -150,8 +150,34 @@ pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> 
 }
 
 use crate::optimizeopt::OptContext;
-use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
+use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
+
+/// virtualstate.py `_generate_guards_knownclass` LEVEL_CONSTANT:
+///
+/// ```python
+/// if (other.constbox.nonnull() and
+///         self.known_class.same_constant(cpu.cls_of_box(other.constbox))):
+///     pass
+/// else:
+///     raise VirtualStatesCantMatch("classes don't match")
+/// ```
+fn knownclass_matches_const_ref(
+    class_ptr: i64,
+    gcref: GcRef,
+    cpu: &dyn crate::cpu::Cpu,
+) -> Result<(), VirtualStatesCantMatch> {
+    if gcref.is_null() {
+        return Err(VirtualStatesCantMatch::default());
+    }
+    // `cpu.cls_of_box(other.constbox)` on a Const is `bh_classof` of its ref.
+    let const_cls = cpu.bh_classof(gcref);
+    if const_cls != 0 && const_cls == class_ptr {
+        Ok(())
+    } else {
+        Err(VirtualStatesCantMatch::default())
+    }
+}
 
 /// Abstract info for one value at the loop boundary.
 ///
@@ -1630,18 +1656,13 @@ impl VirtualState {
             (
                 VirtualStateInfo::KnownClass { class_ptr },
                 VirtualStateInfo::Constant(Value::Ref(r)),
-            ) if !r.is_null() => {
+            ) => {
                 // virtualstate.py LEVEL_CONSTANT branch.
                 // Static check only — `cls_of_box(other.constbox)` against
                 // self.known_class. No guard emitted; pass-or-fail decides.
                 // The runtime_box gate at :601/:608 is absent here because
                 // the constant's class is statically known from `r` itself.
-                let const_cls = PtrInfo::Constant(*r).get_known_class(state.ctx.cpu.as_ref());
-                if const_cls.as_ref() == Some(class_ptr) {
-                    Ok(())
-                } else {
-                    Err(VirtualStatesCantMatch::default())
-                }
+                knownclass_matches_const_ref(*class_ptr, *r, state.ctx.cpu.as_ref())
             }
 
             // ── NonNull target ── (virtualstate.py _generate_guards_nonnull)
@@ -3052,6 +3073,50 @@ mod tests {
             &mut ctx
         ));
         assert!(!kc1.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx));
+    }
+
+    #[test]
+    fn test_knownclass_rejects_constant_of_different_class() {
+        // virtualstate.py `_generate_guards_knownclass` LEVEL_CONSTANT:
+        // `knownclass_info` vs `constclass2_info` /
+        // `constantnull_info` → VirtualStatesCantMatch.
+        let expected = vs1(VirtualStateInfo::KnownClass { class_ptr: 0x100 });
+        let incoming = vs1(VirtualStateInfo::Constant(Value::Ref(GcRef(0x200))));
+        let mut ctx = OptContext::new(128);
+        ctx.cpu = crate::cpu::cpu_from_bh_classof_fn(|raw| if raw == 0x200 { 0x300 } else { 0 });
+        let box_ = Operand::const_from_value(Value::Ref(GcRef(0x200)));
+        assert!(
+            expected
+                .generate_guards(&incoming, &[box_.clone()], &[box_.clone()], &mut ctx, false)
+                .is_err()
+        );
+
+        let null_incoming = vs1(VirtualStateInfo::Constant(Value::Ref(GcRef::NULL)));
+        let null_box = Operand::const_from_value(Value::Ref(GcRef::NULL));
+        assert!(
+            expected
+                .generate_guards(
+                    &null_incoming,
+                    &[null_box.clone()],
+                    &[null_box],
+                    &mut ctx,
+                    false
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_knownclass_accepts_constant_of_same_class() {
+        let expected = vs1(VirtualStateInfo::KnownClass { class_ptr: 0x100 });
+        let incoming = vs1(VirtualStateInfo::Constant(Value::Ref(GcRef(0x200))));
+        let mut ctx = OptContext::new(128);
+        ctx.cpu = crate::cpu::cpu_from_bh_classof_fn(|raw| if raw == 0x200 { 0x100 } else { 0 });
+        let box_ = Operand::const_from_value(Value::Ref(GcRef(0x200)));
+        let guards = expected
+            .generate_guards(&incoming, &[box_.clone()], &[box_.clone()], &mut ctx, false)
+            .unwrap();
+        assert!(guards.is_empty());
     }
 
     #[test]

@@ -638,7 +638,9 @@ impl Default for BlackholeInterpreter {
 /// `_copy_data_from_miframe` (`blackhole.py`) does `box.getint()` /
 /// `box.getref_base()` / `box.getfloatstorage()` then `setarg_*`. FBW abort
 /// captures those raw words here instead of minting `OpRef::const_*` onto
-/// the tracing MIFrame. A `None` slot is `box is None`.
+/// the tracing MIFrame. A `None` slot is `box is None` when the MIFrame
+/// register is also empty. A virtual/symbolic box lives on the MIFrame
+/// with this bank slot left `None`.
 #[derive(Clone, Debug, Default)]
 pub struct BlackholeAbortBanks {
     pub registers_i: Vec<Option<i64>>,
@@ -1099,22 +1101,31 @@ impl BlackholeInterpreter {
     ///
     /// FBW abort captures those words on [`BlackholeAbortBanks`] instead of
     /// minting `OpRef::const_*` onto the tracing MIFrame. `setposition`
-    /// still comes from the MIFrame; typed `setarg_*` come from the banks.
-    /// A `None` slot is `box is None` and is skipped.
+    /// still comes from the MIFrame; typed `setarg_*` come from the banks
+    /// when a colour has a concrete. A `None` bank slot with a box on the
+    /// MIFrame is a virtual: read `getint` / `getref_base` /
+    /// `getfloatstorage` off that box (an unstamped FrontendOp is 0). A
+    /// `None` slot with no box is `box is None` and is skipped.
     pub fn copy_data_from_abort_banks(&mut self, miframe: &MIFrame, banks: &BlackholeAbortBanks) {
         self.setposition(miframe.jitcode.clone(), miframe.pc);
         for i in 0..self.jitcode.num_regs_i() {
             if let Some(val) = banks.registers_i.get(i).copied().flatten() {
+                self.setarg_i(i, val);
+            } else if let Some(val) = miframe.int_value_for_blackhole(i) {
                 self.setarg_i(i, val);
             }
         }
         for i in 0..self.jitcode.num_regs_r() {
             if let Some(val) = banks.registers_r.get(i).copied().flatten() {
                 self.setarg_r(i, val);
+            } else if let Some(val) = miframe.ref_value_for_blackhole(i) {
+                self.setarg_r(i, val);
             }
         }
         for i in 0..self.jitcode.num_regs_f() {
             if let Some(val) = banks.registers_f.get(i).copied().flatten() {
+                self.setarg_f(i, val);
+            } else if let Some(val) = miframe.float_value_for_blackhole(i) {
                 self.setarg_f(i, val);
             }
         }
@@ -5117,6 +5128,29 @@ mod tests {
 
             assert_eq!(bh.registers_r[0], 0xBEEF);
             assert!(frame.ref_regs.iter().all(Option::is_none));
+        }
+
+        /// A `None` bank slot with a box on the MIFrame is that box, not
+        /// `box is None`. `_copy_data_from_miframe` still `getref_base`s it.
+        #[test]
+        fn copy_data_from_abort_banks_reads_virtual_miframe_box() {
+            use crate::blackhole::BlackholeAbortBanks;
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::{GcRef, OpRef};
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_regs[0] = Some(OpRef::const_ptr(GcRef(0xBEEF)));
+            let banks = BlackholeAbortBanks::sized_for(&frame);
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.copy_data_from_abort_banks(&frame, &banks);
+
+            assert_eq!(bh.registers_r[0], 0xBEEF);
+            assert!(banks.registers_r[0].is_none());
         }
 
         #[test]

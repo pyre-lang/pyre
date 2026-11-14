@@ -127,47 +127,31 @@ pub fn space_lookup_builtin(name: &str) -> Option<PyObjectRef> {
     }
 }
 
-// ── Pending dict-key-callback error slot ─────────────────────────────
-// The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`
-// / `pyre_object_eq_w_trampoline` in pyre-jit) cannot return a `Result`
-// across the pyre-object dict probe, so on a raising `__hash__` or
-// `__eq__` they stash the concrete PyError here.  Dict entry gates call
-// `take_pending_hash_error` after a checked dict op returns
-// `DictKeyError` to recover whichever exception was raised.
-thread_local! {
-    static PENDING_HASH_ERROR: Cell<Option<PyError>> = const { Cell::new(None) };
-    static PENDING_ERROR_FROM_HASH: Cell<bool> = const { Cell::new(false) };
-}
+// ── Dict-key-callback exception recovery ─────────────────────────────
+// `descroperation.py hash_w` / `baseobjspace.py eq_w` raise through
+// `get_and_call_function`. The crate-boundary trampoline keeps the
+// `fn -> i64` / `fn -> bool` ABI and publishes that raise on the one ll
+// exception state (`exceptiontransform.py` `rpyexc_raise`). Checked dict
+// ops peek `rpyexc_occurred` after the residual (IndexMap `Eq` cannot
+// abort) and return `DictKeyError`; the interpreter fetches the instance
+// here. The exception object is already a GC root of `BH_LAST_EXC_VALUE`
+// / backend `JIT_EXC_VALUE`.
 
-/// Store an error raised by the equality half of the dict `r_dict` callback
-/// pair.  The historical name is retained for existing callers; hash
-/// callbacks use [`set_pending_dict_hash_error`] so Python 3.14's hash-only
-/// dict-key error remapping does not rewrite equality errors.
-pub fn set_pending_hash_error(e: PyError) {
-    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
-}
-
-pub fn set_pending_dict_hash_error(e: PyError) {
-    PENDING_HASH_ERROR.with(|cell| cell.set(Some(e)));
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(true));
-}
-
-pub fn take_pending_hash_error() -> PyError {
-    PyError::from_raw(take_pending_hash_error_raw() as PyObjectRef)
-}
-
-/// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with` read has no extractable graph; the call stays a
-/// residual, and the error travels as its raw handle so the residual call has a word-ABI target.
+/// Recover the exception a failed `hash_w` / `eq_w` residual left in the
+/// one ll exception state. Empty fetch is the unhashable-type default
+/// the previous pending slot materialised.
+///
+/// `dont_look_inside`: returns a `PyError` as a value; publishing that
+/// object through `BH_LAST_EXC_VALUE` would convert the return into a
+/// raise (`jit_fnaddr` leaves this unpublished).
 #[majit_macros::dont_look_inside]
-fn take_pending_hash_error_raw() -> *mut crate::error::PyErrorObject {
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
-    PENDING_HASH_ERROR
-        .with(|cell| {
-            cell.take()
-                .unwrap_or_else(|| PyError::type_error("unhashable type"))
-        })
-        .as_raw()
+pub fn take_pending_hash_error() -> PyError {
+    let obj = pyre_object::interp_exceptions::rpyexc_fetch();
+    if obj.is_null() {
+        PyError::type_error("unhashable type")
+    } else {
+        unsafe { PyError::from_exc_object(obj) }
+    }
 }
 
 /// Convert the failure modes of a checked set-table operation back into
@@ -180,39 +164,6 @@ pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyEr
             PyError::runtime_error("Set changed size during iteration")
         }
         pyre_object::setobject::SetUpdateError::Memory => crate::runtime_ops::fetch_memory_error(),
-    }
-}
-
-/// Root the exception parked in `PENDING_HASH_ERROR` while a raising
-/// `__hash__`/`__eq__` propagates across a dict probe. Its `PyError` holds GC
-/// refs the precise collector does not reach through the raw `Cell`; forward
-/// them in place via [`PyError::walk_gc_refs`]. Never materialises the
-/// lazy-null `exc_object`.
-pub fn walk_pending_hash_error(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    PENDING_HASH_ERROR.with(|cell| {
-        unsafe { walk_pending_hash_error_area(cell as *const _ as *const (), visitor) };
-    });
-}
-
-pub(crate) fn capture_pending_hash_error_area() -> *const () {
-    PENDING_HASH_ERROR.with(|cell| cell as *const _ as *const ())
-}
-
-/// Walk the deferred dict callback error belonging to one stopped mutator.
-///
-/// # Safety
-/// `data` must come from [`capture_pending_hash_error_area`], and the owning
-/// mutator must be quiesced.
-pub(crate) unsafe fn walk_pending_hash_error_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    let cell = unsafe { &*(data as *const Cell<Option<PyError>>) };
-    // SAFETY: the owning mutator is stopped, so the collector has exclusive
-    // access to the Cell interior while forwarding the PyError's object slots.
-    let opt = unsafe { &mut *cell.as_ptr() };
-    if let Some(err) = opt.as_mut() {
-        err.walk_gc_refs(visitor);
     }
 }
 
@@ -254,22 +205,16 @@ pub fn take_pending_set_element_error(item: PyObjectRef) -> PyError {
 
 /// Recover the exception a failed hash left pending and give it the calling
 /// container's context.  [`take_pending_hash_error`] is the same recovery
-/// without the context, for a caller with no operand to name.  An error from
-/// anywhere but the hash is returned as raised: only hashing is what the
-/// wrappers describe.
+/// without the context, for a caller with no operand to name.
+///
+/// IndexMap `Eq` cannot abort, so a raising `__hash__` and a raising
+/// `__eq__` share this recovery. `wrap` applies `dict_unhashable_type` to
+/// an exact `TypeError`; a different exception passes through.
 fn take_pending_hash_error_for(
     subject: PyObjectRef,
     wrap: fn(PyObjectRef, PyError) -> PyError,
 ) -> PyError {
-    let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
-    let err = PENDING_HASH_ERROR.with(|cell| {
-        cell.take()
-            .unwrap_or_else(|| PyError::type_error("unhashable type"))
-    });
-    if !from_hash {
-        return err;
-    }
-    wrap(subject, err)
+    wrap(subject, take_pending_hash_error())
 }
 
 /// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
@@ -2184,9 +2129,9 @@ pub(crate) unsafe fn normalize_slice(
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
 ///
-/// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// Look-inside: `descroperation.py get_and_call_function` has no JIT hint;
+/// RPython specializes `*args_w` per arity, so `look_inside_graph` accepts it.
+#[majit_macros::unroll_safe]
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -3873,12 +3818,12 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
     let _ = pyre_object::gc_roots::pin_root(w_substop);
     let substop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    Ok(pyre_object::w_range_new(
+    crate::builtins::w_range_new(
         pyre_object::gc_roots::shadow_stack_get(substart_slot),
         pyre_object::gc_roots::shadow_stack_get(substop_slot),
         pyre_object::gc_roots::shadow_stack_get(substep_slot),
         false,
-    ))
+    )
 }
 
 /// `space.type(w_item) is space.w_int or space.w_bool` used by
@@ -4629,12 +4574,12 @@ pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_step = w_int_new(step);
         let _ = pyre_object::gc_roots::pin_root(w_step);
         let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_range = pyre_object::w_range_new(
+        let w_range = crate::builtins::w_range_new(
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
             false,
-        );
+        )?;
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
         let state_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4692,12 +4637,12 @@ pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_step = pyre_object::range_bigint_to_obj(step_b.translated_alias());
         let _ = pyre_object::gc_roots::pin_root(w_step);
         let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_range = pyre_object::w_range_new(
+        let w_range = crate::builtins::w_range_new(
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
             false,
-        );
+        )?;
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
         let state_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4744,6 +4689,10 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
                 }
             })?;
             let (current, remaining, step) = pyre_object::w_range_iter_fields(w_iter);
+            // `rangeiter_setstate` clamps against `len >= 0`. A negative
+            // remaining (raw-stop empty promoted iterator) would panic
+            // `i64::clamp` because min > max.
+            let remaining = remaining.max(0);
             let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
             pyre_object::w_range_iter_set_cursor(w_iter, next, remaining - skipped);
@@ -5149,7 +5098,8 @@ fn filter_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyEr
 }
 
 pub(crate) fn filter_iter_method(args: &[PyObjectRef]) -> PyResult {
-    filter_receiver(args, "__iter__")
+    let self_ = filter_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_filter_iter(self_) })
 }
 
 pub(crate) fn filter_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5387,7 +5337,8 @@ fn map_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn map_iter_method(args: &[PyObjectRef]) -> PyResult {
-    map_receiver(args, "__iter__")
+    let self_ = map_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_map_iter(self_) })
 }
 
 pub(crate) fn map_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5476,9 +5427,12 @@ fn zip_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn zip_iter_method(args: &[PyObjectRef]) -> PyResult {
-    zip_receiver(args, "__iter__")
+    let self_ = zip_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_zip_iter(self_) })
 }
 
+/// `functional.py W_Zip.next_w`. FOR_ITER calls [`zip_two_tuple_next`] as
+/// a residual; the body is not descended.
 pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
     zip_next_w(zip_receiver(args, "__next__")?)
 }
@@ -19582,16 +19536,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::is_w_range(obj) {
             return Ok(pyre_object::w_range_iter(obj));
         }
-        // Already an iterator
-        if is_range_iter(obj)
-            || pyre_object::is_long_range_iter(obj)
-            || is_seq_iter(obj)
-            || pyre_object::is_list_iter(obj)
-            || pyre_object::is_list_reverse_iter(obj)
-            || pyre_object::is_tuple_iter(obj)
-            || pyre_object::generator::is_generator(obj)
-        {
-            return Ok(obj);
+        // `functional.py W_AbstractRangeIterator.descr_iter` — `return self`.
+        if is_range_iter(obj) || pyre_object::is_long_range_iter(obj) {
+            return Ok(pyre_object::functional::w_range_iterator_iter(obj));
+        }
+        // `generator.py GeneratorIterator.descr__iter` — `return self`.
+        if pyre_object::generator::is_generator(obj) {
+            return Ok(pyre_object::generator::w_generator_iter(obj));
+        }
+        // `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+        if is_seq_iter(obj) || pyre_object::is_list_iter(obj) || pyre_object::is_tuple_iter(obj) {
+            return Ok(pyre_object::w_seqiter_iter(obj));
+        }
+        // `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+        if pyre_object::is_list_reverse_iter(obj) {
+            return Ok(pyre_object::w_reverseseqiter_iter(obj));
         }
         // W_ISlice.iter_w returns self, but a heap subtype can replace
         // `__iter__`; dispatch that override before taking the native fast
@@ -19703,12 +19662,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `pypy/module/__builtin__/functional.py W_Filter.iter_w` —
         // `return self`.
         if pyre_object::functional::is_filter(obj) {
-            return Ok(obj);
+            return Ok(pyre_object::functional::w_filter_iter(obj));
         }
-        // `functional.py W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
-        // `return self`.
-        if pyre_object::functional::is_map(obj) || pyre_object::functional::is_zip(obj) {
-            return Ok(obj);
+        // `functional.py W_Map.iter_w` — `return self`.
+        if pyre_object::functional::is_map(obj) {
+            return Ok(pyre_object::functional::w_map_iter(obj));
+        }
+        // `functional.py W_Zip.iter_w` — `return self`.
+        if pyre_object::functional::is_zip(obj) {
+            return Ok(pyre_object::functional::w_zip_iter(obj));
         }
         // `pypy/module/_sre/interp_sre.py W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
@@ -20058,11 +20020,12 @@ unsafe fn tuple_exact_cursor_exhausted(it: PyObjectRef) -> bool {
     (index as u64) >= (pyre_object::w_tuple_len(seq) as u64)
 }
 
-/// `functional.py` `W_Zip.next_w` for two `W_FastTupleIterObject` cursors
-/// over `W_TupleObject`. The traced product is `w_specialised_tuple_oo_new`,
-/// the constructor `next`'s arity-two zip arm allocates (`makespecialisedtuple2`
-/// would box plain ints as `Cls_ii` and change the unpack). A shape this
-/// arm does not own goes to `zip_two_tuple_next_other`.
+/// `functional.py` `W_Zip.next_w` recordable leaf: length==2 over two
+/// `W_FastTupleIterObject` cursors on `W_TupleObject` is two
+/// `tuple_iter_descr_next` calls plus `w_specialised_tuple_oo_new`
+/// (`space.newtuple2`). Every other shape goes to
+/// `zip_two_tuple_next_other`. FOR_ITER calls this body as a residual;
+/// `zip_next_w` uses it through `zip_two_tuple_fast_pyresult`.
 unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
     // Same pin as `zip_two_tuple_next_other`: the first item stays live
     // across the second `next`, and `w_specialised_tuple_oo_new` allocates.
@@ -24594,6 +24557,26 @@ pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     Ok(obj)
+}
+
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` gateway.
+pub(crate) fn seqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_seqiter_iter(obj) })
+}
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` gateway.
+pub(crate) fn reverseseqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_reverseseqiter_iter(obj) })
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)

@@ -91,11 +91,13 @@ pub(in crate::front::mir) struct InteriorFieldAlias {
     pub(in crate::front::mir) header: InteriorHeader,
     pub(in crate::front::mir) index_local: usize,
     pub(in crate::front::mir) index_var: Variable,
-    /// `GcArray<Entry>` / `GcArray<Point>`. `extract_element_type_from_str`
-    /// takes the angle-bracket interior, so the leaf is
-    /// `strip_instantiation_suffix`'d. The `GcArray<>` wrapper is the
-    /// length-prefixed ARRAY spelling: `nolength_from_array_type_id` is
-    /// false, matching `interiorfielddescrof_keyed`.
+    /// `GcArray<Entry>` / `GcArray<Point>` for a non-generic pointee;
+    /// `GcArray<rordereddict_entries::Entry<K,V>>` when the class root is
+    /// instantiation-suffixed. `extract_element_type_from_str` peels the
+    /// `GcArray<>` wrapper (first `<` to last `>`), so a suffixed Entry
+    /// element keeps `<K,V>`. The wrapper is the length-prefixed ARRAY
+    /// spelling: `nolength_from_array_type_id` is false, matching
+    /// `interiorfielddescrof_keyed`.
     pub(in crate::front::mir) array_type_id: String,
 }
 
@@ -123,6 +125,7 @@ pub(in crate::front::mir) struct TaggedPairAggregateSite {
     pub(in crate::front::mir) disc: Variable,
     pub(in crate::front::mir) payload: Variable,
     pub(in crate::front::mir) payload_ty: ValueType,
+    pub(in crate::front::mir) variant_ids: [Option<majit_ir::descr::StructId>; 2],
 }
 
 /// Variant table of one marked exception-class enum, recorded on the
@@ -143,11 +146,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// lower Opaque scalar fields.
     pub(in crate::front::mir) struct_fields:
         Option<&'a crate::front::semantic::StructFieldRegistry>,
+    /// Live translation layout table. Empty in unit tests that call
+    /// [`Lowering::new`] directly.
+    pub(in crate::front::mir) struct_layouts: crate::codewriter::call::StructLayoutTable,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     pub(in crate::front::mir) raw_alloc_flavor_structs: std::collections::HashSet<String>,
-    /// Harvested `#[dont_look_inside]` marker set (keyed
-    /// `strip_crate_prefix(name_path())`, the same spelling
+    /// Harvested `#[dont_look_inside]` marker set (keyed by
+    /// `llbc_hints::fun_decl_hint_keys`, the same spelling
     /// `stamp_return_token` uses at the whole-program registration loop).
     /// A residual-marked inherent method must not route as
     /// `CallTarget::Method`: that surfaces `getattr(recv, method)` on a
@@ -253,7 +259,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
-    pub(in crate::front::mir) block_live_in: Vec<bit_set::BitSet>,
+    block_live_in: Vec<LocalSet>,
     /// MIR locals this body moves out of.  A root-bracket guard among them is
     /// dropped under an initialisation flag the artefact does not carry, so
     /// its bracket is left open rather than closed on a path that may not own
@@ -288,14 +294,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
         Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
     pub(in crate::front::mir) block_entry_positional_aggregate_locals:
         Vec<std::collections::HashMap<usize, String>>,
-    pub(in crate::front::mir) block_positional_seen: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_positional_conflict: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_byte_view_seen: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_byte_view_conflict: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_entry_list_view_locals: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_list_view_seen: Vec<bit_set::BitSet>,
-    pub(in crate::front::mir) block_list_view_conflict: Vec<bit_set::BitSet>,
+    block_positional_seen: Vec<LocalSet>,
+    block_positional_conflict: Vec<LocalSet>,
+    pub(in crate::front::mir) block_entry_string_byte_view_locals: Vec<LocalSet>,
+    pub(in crate::front::mir) block_byte_view_seen: Vec<LocalSet>,
+    pub(in crate::front::mir) block_byte_view_conflict: Vec<LocalSet>,
+    block_entry_list_view_locals: Vec<LocalSet>,
+    block_list_view_seen: Vec<LocalSet>,
+    block_list_view_conflict: Vec<LocalSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -535,9 +541,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Result `Variable`s of `RBigInt::toint` / `i64::try_from(&RBigInt)`
     /// intercepts retargeted to `jit_bigint_toint`. The OverflowError rewrite
     /// (`front::result_exc`) stamps `LastException` after the body lowers.
-    /// Sibling of [`Self::result_exc_call_results`]; `RBigIntError` is not
-    /// an [`crate::ErrorCarrierSpec`].
-    pub(in crate::front::mir) toint_call_results: Vec<(Variable, Option<String>, ValueType)>,
+    /// Same record as [`Self::result_exc_call_results`] so the rebuilt
+    /// `Result<_, RBigIntError>` shells carry the instantiation STRUCTs.
+    /// `RBigIntError` is not an [`crate::ErrorCarrierSpec`].
+    pub(in crate::front::mir) toint_call_results: Vec<crate::front::result_exc::ResultExcCall>,
     /// `Result<T, RBigIntError>::unwrap_or` sites fused onto the toint call's
     /// OverflowError catch (`CarrierCatchKind::JoinDefault`).
     pub(in crate::front::mir) toint_combinator_sites:
@@ -725,6 +732,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// dest is `same_as`: the register already holds the payload, not a
     /// `Ref` guard.
     pub(in crate::front::mir) refcell_payload_vars: Vec<Variable>,
+    /// Dest locals of a GC-root registration this body erased. `Drop` of
+    /// a bare local in the set is nothing.
+    pub(in crate::front::mir) erased_gc_root_locals: std::collections::HashSet<usize>,
+    /// Per-crate memo of [`gc_root_registration::root_registration_effect`].
+    pub(in crate::front::mir) gc_root_effects: Option<&'a gc_root_registration::EffectMemo>,
+    /// [`gc_root_registration::locals_only_dropped`] for this body.
+    pub(in crate::front::mir) gc_root_only_dropped: Option<Vec<bool>>,
 }
 
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
@@ -877,8 +891,8 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // StringRepr and InstanceRepr callers never meet in one
         // source-level FunctionDesc cell.
         //
-        // Key it on the LAST parameter, never on index 1: both spellings
-        // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+        // Key it on the LAST parameter, never on index 1: `pin_root` takes
+        // one `PyObjectRef` and `pin_roots` takes the slice; the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
         let class_root = if let Some((_, class_root)) = &cell_stamp {
@@ -1749,8 +1763,8 @@ impl<'a> Lowering<'a> {
             // StringRepr and InstanceRepr callers never meet in one
             // source-level FunctionDesc cell.
             //
-            // Key it on the LAST parameter, never on index 1: both spellings
-            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+            // Key it on the LAST parameter, never on index 1: `pin_root` takes
+            // one `PyObjectRef` and `pin_roots` takes the slice; the
             // `RootScope` method form puts `&self` first, so stamping index 1
             // there annotates the receiver and leaves the GC pointer untouched.
             // Same membership as [`gc_mut_ref_param_locals`] /
@@ -2025,7 +2039,7 @@ impl<'a> Lowering<'a> {
         // flow into the switch that targets them. Only the lowered closure
         // keeps a row; filtering before the extensions below keeps the
         // dropped rows from growing to `n_slots` bits.
-        let mut block_live_in: Vec<(usize, bit_set::BitSet)> =
+        let mut block_live_in: Vec<(usize, LocalSet)> =
             compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops, &cell_plan.locals)
                 .into_iter()
                 .enumerate()
@@ -2055,6 +2069,21 @@ impl<'a> Lowering<'a> {
                 }
                 for temp in root_bracket.capture_temps.keys() {
                     live.remove(*temp);
+                }
+            }
+        }
+        // Local-aggregate `FrameLocalsRoot` dests bind no Variable
+        // (`lower_erased_gc_root_registration_call`). `#276` `drop(_locals_root)`
+        // keeps the dest live into the `mem::drop` block; strip it, and the
+        // drop temps, the way erased `RootScope` guards are stripped.
+        let gc_root_ident: gc_root_registration::EffectMemo =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let erased_gc_root_locals =
+            gc_root_registration::erased_registration_locals(body, llbc, &gc_root_ident);
+        if !erased_gc_root_locals.is_empty() {
+            for (_, live) in &mut block_live_in {
+                for local in &erased_gc_root_locals {
+                    live.remove(*local);
                 }
             }
         }
@@ -2106,7 +2135,9 @@ impl<'a> Lowering<'a> {
                 .collect();
             live.extend(extras);
         }
-        let block_live_in: Vec<bit_set::BitSet> =
+        // Filtered to lowered blocks before the slot extensions above, so
+        // dropped rows never grew to `n_slots` bits.
+        let block_live_in: Vec<LocalSet> =
             block_live_in.into_iter().map(|(_, live)| live).collect();
         let nrows = block_id.nrows();
         let mut block_entry_local_var = vec![
@@ -2217,6 +2248,7 @@ impl<'a> Lowering<'a> {
             graph,
             llbc,
             struct_fields: None,
+            struct_layouts: Default::default(),
             raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
             dont_look_inside,
             oopspec_fns,
@@ -2250,10 +2282,10 @@ impl<'a> Lowering<'a> {
             input_copied_from: std::collections::HashMap::new(),
             object_vec_headers: std::collections::HashSet::new(),
             block_entry_positional_aggregate_locals,
-            block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_positional_seen: empty_block_local_sets(nrows),
+            block_positional_conflict: empty_block_local_sets(nrows),
             block_entry_string_byte_view_locals: {
-                let mut rows = vec![bit_set::BitSet::with_capacity(n_locals); nrows];
+                let mut rows = empty_block_local_sets(nrows);
                 for (i, marked) in str_view_locals.iter().enumerate() {
                     if *marked {
                         for row in &mut rows {
@@ -2263,10 +2295,10 @@ impl<'a> Lowering<'a> {
                 }
                 rows
             },
-            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_byte_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_byte_view_seen: empty_block_local_sets(nrows),
+            block_byte_view_conflict: empty_block_local_sets(nrows),
             block_entry_list_view_locals: {
-                let mut rows = vec![bit_set::BitSet::with_capacity(n_locals); nrows];
+                let mut rows = empty_block_local_sets(nrows);
                 for (i, marked) in list_view_locals.iter().enumerate() {
                     if *marked {
                         for row in &mut rows {
@@ -2276,8 +2308,8 @@ impl<'a> Lowering<'a> {
                 }
                 rows
             },
-            block_list_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_list_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_list_view_seen: empty_block_local_sets(nrows),
+            block_list_view_conflict: empty_block_local_sets(nrows),
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(llbc, body),
             builder_mode: false,
@@ -2362,6 +2394,9 @@ impl<'a> Lowering<'a> {
             owner_root: analyze_owner_roots(body, llbc),
             owner_root_reroot: None,
             pending_vec_frees: Vec::new(),
+            erased_gc_root_locals,
+            gc_root_effects: None,
+            gc_root_only_dropped: None,
         })
     }
 
@@ -3335,13 +3370,17 @@ impl<'a> Lowering<'a> {
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
-            let kind = st.stmt_kind().map_err(LowerError::Schema)?;
-            self.lower_statement(mir_bb, s_idx, kind)?;
+            let kind = st
+                .stmt_kind_ref()
+                .map_err(|e| LowerError::Schema(e.to_string()))?;
+            self.lower_statement(mir_bb, s_idx, kind.clone())?;
         }
 
         // 2. Terminator -> block exits (close the block).
-        let term = bb.term(self.llbc).map_err(LowerError::Schema)?;
-        self.lower_terminator(mir_bb, term)
+        let term = bb
+            .term_ref(self.llbc)
+            .map_err(|e| LowerError::Schema(e.to_string()))?;
+        self.lower_terminator(mir_bb, term.clone())
     }
 
     // Statements
@@ -3500,6 +3539,27 @@ impl<'a> Lowering<'a> {
             )
         {
             return Ok(());
+        }
+        // `_t = Move(guard)` into `core::mem::drop` of an erased
+        // local-aggregate root registration. The dest binds no Variable.
+        if let PlaceKind::Local(dest_local) = dest.kind {
+            let dest_local = dest_local as usize;
+            if self.erased_gc_root_locals.contains(&dest_local) {
+                return Ok(());
+            }
+            if let Rvalue::Use(op, _) = &rvalue {
+                let src = match op {
+                    Operand::Move(place) | Operand::Copy(place) => match place.kind {
+                        PlaceKind::Local(local) => Some(local as usize),
+                        _ => None,
+                    },
+                    Operand::Const(_) => None,
+                };
+                if src.is_some_and(|local| self.erased_gc_root_locals.contains(&local)) {
+                    self.erased_gc_root_locals.insert(dest_local);
+                    return Ok(());
+                }
+            }
         }
         // The borrow, aggregate and argument tuple that build a closure over
         // an erased index. The call is answered by the pinned value, so these
@@ -4306,7 +4366,7 @@ impl<'a> Lowering<'a> {
         bb_id: BlockId,
         discr_var: Variable,
         info: ExceptionDiscInfo,
-        arms: Vec<(serde_json::Value, u64)>,
+        arms: Vec<(majit_charon_reader::ullbc::JsonVal, u64)>,
         default: u64,
     ) -> Result<(), LowerError> {
         let mut present: Vec<(String, u64)> = Vec::new();
@@ -4605,7 +4665,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         bb_id: BlockId,
         discr_var: Variable,
-        arms: Vec<(serde_json::Value, u64)>,
+        arms: Vec<(majit_charon_reader::ullbc::JsonVal, u64)>,
         default: u64,
     ) -> Result<(), LowerError> {
         let mut some_bb: Option<u64> = None;

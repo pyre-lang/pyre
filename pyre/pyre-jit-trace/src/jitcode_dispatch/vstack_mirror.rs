@@ -758,10 +758,8 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     };
     // GET_ITER / LOAD_SPECIAL after-residual: the residual's result is the
     // first pushed value (`make_result_of_lastop`), and neither push has
-    // run yet. Fill from `vstack_last_ref` after the hole-fill below, and
-    // only while the slot is still NONE, so a looked-inside GET_ITER that
-    // already wrote the iterator through `setarrayitem_vable_r` is not
-    // overwritten by a previous opcode's residual.
+    // run yet. Fill from `vstack_last_ref` after the hole-fill below so a
+    // leftover that reseeds the hole cannot sit in the iterator slot.
     let mut fill_first_push_from_residual = false;
     match effective_class {
         // The saved boxes ARE the reconcile for this boundary; the previous
@@ -1014,16 +1012,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     }
     if fill_first_push_from_residual && ctx.vstack_valid && new_depth >= 2 {
         let result = ctx.frame_state.borrow().vstack_last_ref;
-        let hole = ctx
-            .frame_state
-            .borrow()
-            .vstack_boxes
-            .get(new_depth - 2)
-            .copied()
-            == Some(OpRef::NONE);
-        // LoadSpecialMethod's last store is the trailing NULL sentinel, not
-        // the first push; a null-constant result would fill the hole wrongly.
-        if hole && result != OpRef::NONE && !opref_is_null_const_ptr(result) {
+        // GET_ITER / LOAD_SPECIAL's first push is this opcode's result
+        // (`make_result_of_lastop` / `write_ref_reg`). A dest-stamp
+        // leftover (`indices` after `[0]*r`, `range.__iter__`) can fill
+        // the hole first; the opcode dst overwrites that occupant.
+        // LoadSpecialMethod's last store is the trailing NULL sentinel;
+        // a null-constant result would fill the hole wrongly.
+        if result != OpRef::NONE && !opref_is_null_const_ptr(result) {
             ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
         }
     }
@@ -1563,6 +1558,51 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
         fbw_note_opcode_entry_effects(dest_py as usize);
     }
     reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false, jit_pc);
+}
+
+/// Portal operand-stack mirror across a helper body that is not Python
+/// bytecode. `run_orthodox_helper_subwalk` sets `inline_subwalk`, and
+/// [`step_vstack_mirror`] then cannot map the helper's jit_pc onto a
+/// Python opcode, latching `vstack_valid = false` for the rest of the
+/// portal walk. GET_ITER / FOR_ITER that descend a helper would then
+/// leave a leftover occupant in the iterator slot.
+pub(crate) struct VstackMirrorCheckpoint {
+    valid: bool,
+    cur_pypc: u32,
+    depth: usize,
+    reorder_ceiling: u32,
+    handler_landing_py: Option<u32>,
+    boxes: Vec<OpRef>,
+    last_ref: OpRef,
+}
+
+pub(crate) fn save_vstack_mirror<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> VstackMirrorCheckpoint {
+    let state = ctx.frame_state.borrow();
+    VstackMirrorCheckpoint {
+        valid: ctx.vstack_valid,
+        cur_pypc: ctx.vstack_cur_pypc,
+        depth: ctx.vstack_depth,
+        reorder_ceiling: ctx.vstack_reorder_ceiling,
+        handler_landing_py: ctx.vstack_handler_landing_py,
+        boxes: state.vstack_boxes.clone(),
+        last_ref: state.vstack_last_ref,
+    }
+}
+
+pub(crate) fn restore_vstack_mirror<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    saved: VstackMirrorCheckpoint,
+) {
+    ctx.vstack_valid = saved.valid;
+    ctx.vstack_cur_pypc = saved.cur_pypc;
+    ctx.vstack_depth = saved.depth;
+    ctx.vstack_reorder_ceiling = saved.reorder_ceiling;
+    ctx.vstack_handler_landing_py = saved.handler_landing_py;
+    let mut state = ctx.frame_state.borrow_mut();
+    state.vstack_boxes = saved.boxes;
+    state.vstack_last_ref = saved.last_ref;
 }
 
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(

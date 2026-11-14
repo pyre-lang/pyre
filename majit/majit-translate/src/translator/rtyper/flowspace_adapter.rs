@@ -688,7 +688,8 @@ fn const_ref_addr_define_hlvalue(addr: i64, result: &Variable) -> Hlvalue {
             LowLevelType::Void,
         ))
     } else if matches!(result.concretetype(), Some(LowLevelType::Address)) {
-        // A `FnPtrCell` / `OnceLock<fn>` static is a raw host address
+        // A `FnPtrCell` / `OnceLock<fn>` static, or a harvested
+        // `_alloc_flavor_ = "raw"` static, is a raw host address
         // (`llmemory.Address`), not a GCREF singleton. `raw_load`
         // keeps an int-kinded addr (`inputarg_llop_intkind_or_signed`).
         use crate::translator::rtyper::lltypesystem::lltype::_address;
@@ -3966,7 +3967,9 @@ pub fn translate_op(
             }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
                 // A GC owner's slice FatLen is `len(getattr(owner, field))`
-                // (`ListRepr.rtype_len`).
+                // (`ListRepr.rtype_len`). Dyn FatLen already returned above
+                // as `getitem` of `two_word_fat_struct` (`rtuple.py`
+                // `rtype_getitem`).
                 let list = Hlvalue::Variable(Variable::new());
                 return Ok(vec![
                     FlowspaceOp::new(

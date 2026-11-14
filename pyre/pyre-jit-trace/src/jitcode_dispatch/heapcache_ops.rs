@@ -938,11 +938,23 @@ pub(crate) fn known_int_operand<Sym: WalkSym>(
 }
 
 /// Payload address of one interior field, or `None` when the pointer is
-/// not a collector object or the index does not fit the length word.
+/// null/unresolved or the index does not fit the length word.
+///
+/// `llmodel.py bh_getinteriorfield_gc_i` adds `arraydescr.basesize +
+/// index * itemsize + field_offset` and reads; it does not call
+/// `gc_owns_object`. MiniMark `is_managed_heap_object` is nursery or
+/// oldgen only, so a young-rawmalloced or immortal `DICTENTRYARRAY`
+/// (`alloc_entries` `try_gc_alloc_young_nonmoving_no_collect_raw` /
+/// the pre-hook `alloc_zeroed` fallback) would skip the stamp, leave
+/// `entry_valid`'s `getinteriorfield_gc_i` of `f_valid` as a bare
+/// `IntOp`, and `opimpl_goto_if_not` (`box.getint()`) would surface
+/// `GotoIfNotValueNotConcrete`.
 ///
 /// `arraylen_sanity_load` declines an interior descr (it is not an array
 /// descr). The length word is the array descr's, at offset 0 on the
-/// `GcTypedArray` / `DICTENTRYARRAY` header this materializer allocates.
+/// `GcTypedArray` / `DICTENTRYARRAY` header. The interior base is that
+/// header (`interior_header_base` `InteriorHeader::Entries` /
+/// `rewrite_op_getinteriorfield`), not `entries_item_ptr`.
 fn interior_field_addr(
     array_ptr: i64,
     index: i64,
@@ -955,9 +967,6 @@ fn interior_field_addr(
         return None;
     }
     let block = array_ptr as usize as *mut u8;
-    if !pyre_object::gc_hook::try_gc_owns_object(block as pyre_object::gc_hook::GCREF) {
-        return None;
-    }
     let len = unsafe { block.cast::<usize>().read_unaligned() };
     let index = index as usize;
     if index >= len {
@@ -1056,6 +1065,10 @@ fn concrete_interior_store_bits<Sym: WalkSym>(
 /// An interior store writes `field_size` bytes (`f_valid` is one unsigned
 /// byte) through `setinteriorfield`, and a ref store write-barriers the
 /// array the way `bh_setinteriorfield_gc_r` does.
+///
+/// `array_ptr` is the address after `record_op_with_descr` (the pin
+/// `getfield_gc_via_heapcache` uses around that recording). A missing
+/// pin falls back to the register / box carrier.
 fn replay_setinteriorfield<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -1065,11 +1078,13 @@ fn replay_setinteriorfield<Sym: WalkSym>(
     value: OpRef,
     descr: &majit_ir::DescrRef,
     value_bank: char,
+    array_ptr: Option<i64>,
 ) {
     let Some(access) = interior_field_access(descr) else {
         return;
     };
-    let Some(array_ptr) = concrete_ref_operand_ptr(code, op, 0, array, ctx) else {
+    let Some(array_ptr) = array_ptr.or_else(|| concrete_ref_operand_ptr(code, op, 0, array, ctx))
+    else {
         return;
     };
     let Some(index) = known_int_operand(code, op, 1, index, ctx, true) else {
@@ -1104,9 +1119,13 @@ fn replay_setinteriorfield<Sym: WalkSym>(
 ///
 /// `pyjitpl.py _opimpl_getinteriorfield_gc_any`: the heapcache key is the
 /// interior field descr, via the same `getarrayitem` methods as an array
-/// element. A miss records `GETINTERIORFIELD_GC_*` and, when the block is
-/// the traced allocation, stamps `bh_getinteriorfield_gc_*` so
-/// `opimpl_goto_if_not_int_is_zero` can take `box.getint()`.
+/// element. A miss records `GETINTERIORFIELD_GC_*` and stamps
+/// `bh_getinteriorfield_gc_*` when the array pointer and index are
+/// concrete, so `opimpl_goto_if_not` can take `box.getint()`.
+///
+/// `record_op_with_descr` can minor-collect. Pin the array first the way
+/// `getfield_gc_via_heapcache` pins the receiver, then stamp from the
+/// forwarded address.
 pub(crate) fn getinteriorfield_gc_via_heapcache<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -1118,6 +1137,11 @@ pub(crate) fn getinteriorfield_gc_via_heapcache<Sym: WalkSym>(
     let index = read_int_reg(code, op, 1, ctx)?;
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
+    let array_ptr = concrete_ref_operand_ptr(code, op, 0, array, ctx);
+    let array_pin = array_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));
+    let index_value = known_int_operand(code, op, 1, index, ctx, true);
+    let live_array_ptr =
+        || array_ptr.map(|p| array_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
     let result = if let Some(cached) =
         ctx.trace_ctx
             .heapcache_getarrayitem(array, index, descr_index)
@@ -1136,11 +1160,9 @@ pub(crate) fn getinteriorfield_gc_via_heapcache<Sym: WalkSym>(
         let resbox = ctx
             .trace_ctx
             .record_op_with_descr(opcode, &[array, index], descr.clone());
-        if let (Some(access), Some(array_ptr), Some(index_value)) = (
-            interior_field_access(&descr),
-            concrete_ref_operand_ptr(code, op, 0, array, ctx),
-            known_int_operand(code, op, 1, index, ctx, true),
-        ) && let Some(live) = load_interior_value(array_ptr, index_value, &access)
+        if let (Some(access), Some(array_ptr), Some(index_value)) =
+            (interior_field_access(&descr), live_array_ptr(), index_value)
+            && let Some(live) = load_interior_value(array_ptr, index_value, &access)
         {
             ctx.trace_ctx.set_opref_concrete(resbox, live);
         }
@@ -1149,7 +1171,22 @@ pub(crate) fn getinteriorfield_gc_via_heapcache<Sym: WalkSym>(
         resbox
     };
     let dst = code[op.pc + 5] as usize;
-    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    let mut concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    if matches!(concrete_for_shadow, ConcreteValue::Null)
+        && let (Some(access), Some(array_ptr), Some(index_value)) =
+            (interior_field_access(&descr), live_array_ptr(), index_value)
+        && let Some(live) = load_interior_value(array_ptr, index_value, &access)
+    {
+        ctx.trace_ctx.try_set_opref_concrete(result, live);
+        concrete_for_shadow = match live {
+            majit_ir::Value::Int(value) => ConcreteValue::Int(value),
+            majit_ir::Value::Ref(reference) if reference != majit_ir::GcRef::NO_CONCRETE => {
+                ConcreteValue::Ref(reference.as_usize() as pyre_object::PyObjectRef)
+            }
+            majit_ir::Value::Float(value) => ConcreteValue::Float(value),
+            majit_ir::Value::Ref(_) | majit_ir::Value::Void => ConcreteValue::Null,
+        };
+    }
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
         'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
@@ -1192,6 +1229,8 @@ pub(crate) fn setinteriorfield_gc_via_heapcache<Sym: WalkSym>(
     };
     let descr = read_descr(code, op, 3, ctx)?;
     let descr_index = descr.index();
+    let array_ptr = concrete_ref_operand_ptr(code, op, 0, array, ctx);
+    let array_pin = array_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));
     ctx.trace_ctx
         .profiler()
         .count_ops(OpCode::SetinteriorfieldGc, majit_metainterp::counters::OPS);
@@ -1204,7 +1243,18 @@ pub(crate) fn setinteriorfield_gc_via_heapcache<Sym: WalkSym>(
         &[array, index, value],
         descr.clone(),
     );
-    replay_setinteriorfield(code, op, ctx, array, index, value, &descr, value_bank);
+    let live_array_ptr = array_ptr.map(|p| array_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
+    replay_setinteriorfield(
+        code,
+        op,
+        ctx,
+        array,
+        index,
+        value,
+        &descr,
+        value_bank,
+        live_array_ptr,
+    );
     ctx.trace_ctx
         .heapcache_setarrayitem(array, index, descr_index, value);
     Ok((DispatchOutcome::Continue, op.next_pc))

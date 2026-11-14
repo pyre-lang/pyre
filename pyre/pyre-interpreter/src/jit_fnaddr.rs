@@ -119,13 +119,16 @@ extern "C" fn cache_root_stack_slot_word(cached: i64) {
 
 /// `ShadowStackSlot` is a one-word `*const ShadowStack` handle.
 fn shadow_stack_slot_as_raw(slot: majit_gc::shadow_stack::ShadowStackSlot) -> i64 {
-    unsafe { core::mem::transmute::<_, usize>(slot) as i64 }
+    slot.as_raw() as i64
 }
 
+/// Word ABI for `majit_gc::shadow_stack::slot_from_cached`. The residual
+/// descr is one unsigned word in and an Address word out; wasm32's
+/// in-module `call_indirect` types that as `(i64) -> i64`.
 extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
     majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
-    // SAFETY: residual of `slot_from_cached`; `raw` is 0 or the word
-    // `cache_root_stack_slot` stored for this thread.
+    // SAFETY: residual `raw` is 0 or a word `cache_root_stack_slot` stored
+    // for this thread (`slot_from_cached`).
     shadow_stack_slot_as_raw(unsafe { majit_gc::shadow_stack::slot_from_cached(raw as usize) })
 }
 
@@ -2675,6 +2678,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
+    );
+    // `list_extend_items` inlines `extend_from_tuple`. The look_inside_iff
+    // wrapper residual-calls `<name>_trampoline` when the predicate is
+    // false; a symbolic trampoline poisons `fully_bound_callee_body` of
+    // `list_extend_value` and LIST_EXTEND stays a MayForce residual.
+    // Bind the word-ABI adapter (`getfunctionptr` of the trampoline),
+    // same as `ll_list_*_resize_hint_really_trampoline`.
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::type_methods::extend_from_tuple_trampoline",
+        "pyre_interpreter::extend_from_tuple_trampoline",
+        crate::type_methods::__majit_call_target_extend_from_tuple_trampoline,
     );
     // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
     // The graph is `set_add_value`; this bridge is the one-word address
@@ -5862,33 +5877,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa1!(
         &mut entries,
-        "pyre_object::dict_eq_hook::signal_hash_error",
-        "pyre_object::signal_hash_error",
-        pyre_object::dict_eq_hook::signal_hash_error,
+        "pyre_object::interp_exceptions::rpyexc_raise",
+        "pyre_object::rpyexc_raise",
+        pyre_object::interp_exceptions::rpyexc_raise,
     );
     cpa0!(
         &mut entries,
-        "pyre_object::dict_eq_hook::take_hash_error",
-        "pyre_object::take_hash_error",
-        pyre_object::dict_eq_hook::take_hash_error,
-    );
-    cpa1!(
-        &mut entries,
-        "pyre_object::dict_eq_hook::signal_eq_error",
-        "pyre_object::signal_eq_error",
-        pyre_object::dict_eq_hook::signal_eq_error,
+        "pyre_object::interp_exceptions::rpyexc_occurred",
+        "pyre_object::rpyexc_occurred",
+        pyre_object::interp_exceptions::rpyexc_occurred,
     );
     cpa0!(
         &mut entries,
-        "pyre_object::dict_eq_hook::take_eq_error",
-        "pyre_object::take_eq_error",
-        pyre_object::dict_eq_hook::take_eq_error,
-    );
-    cpa0!(
-        &mut entries,
-        "pyre_object::dict_eq_hook::eq_error_pending",
-        "pyre_object::eq_error_pending",
-        pyre_object::dict_eq_hook::eq_error_pending,
+        "pyre_object::interp_exceptions::rpyexc_fetch",
+        "pyre_object::rpyexc_fetch",
+        pyre_object::interp_exceptions::rpyexc_fetch,
     );
     cpa0!(
         &mut entries,
@@ -7864,12 +7867,12 @@ mod tests {
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
         pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
-        shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        shadow_stack_push_word, shadow_stack_try_pop_to_word, slot_from_cached_word,
+        switch_to_correct_strategy_word, unicode_dict_getitem_str_hashed_word,
+        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
+        w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7978,37 +7981,39 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
-    /// `#[getfunctionptr]` publishes the word-ABI trampoline, not the raw
-    /// `&[PyObjectRef]` / `Result` item (`get_jitcode_calldescr` /
-    /// `getfunctionptr`).
+    /// Look-inside (`descroperation.py get_and_call_function` /
+    /// `baseobjspace.py call_function`): no JIT hint, `*args_w` specialized
+    /// per arity. Same unpublished residual as `funccall_result`: a
+    /// `__majit_call_target_*` trampoline is not the published fnaddr.
     #[test]
-    fn jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals() {
+    fn jit_trace_fnaddrs_looks_inside_call_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let get_and_call: extern "C" fn(i64, i64, i64, i64) -> i64 =
-            crate::baseobjspace::__majit_call_target_get_and_call_function;
-        let get_and_call = get_and_call as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
-            get_and_call
-        );
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            assert!(
+                !desc.path.ends_with("::get_and_call_function"),
+                "get_and_call_function must not publish a getfunctionptr trampoline: {}",
+                desc.path
+            );
+            assert!(
+                !desc.path.ends_with("::call_function_impl_result"),
+                "call_function_impl_result must not publish a getfunctionptr trampoline: {}",
+                desc.path
+            );
+        });
         let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
-        assert_ne!(
-            get_and_call, raw_get,
-            "must not publish the raw slice/Result item"
-        );
-
-        let call_impl: extern "C" fn(i64, i64) -> i64 =
-            crate::call::__majit_call_target_call_function_impl_result;
-        let call_impl = call_impl as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::call::call_function_impl_result"],
-            call_impl
-        );
+        if let Some(&addr) = bindings.get("pyre_interpreter::baseobjspace::get_and_call_function") {
+            assert_eq!(
+                addr, raw_get,
+                "look-inside get_and_call_function must not publish a distinct trampoline"
+            );
+        }
         let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
-        assert_ne!(
-            call_impl, raw_call,
-            "must not publish the raw slice/Result item"
-        );
+        if let Some(&addr) = bindings.get("pyre_interpreter::call::call_function_impl_result") {
+            assert_eq!(
+                addr, raw_call,
+                "look-inside call_function_impl_result must not publish a distinct trampoline"
+            );
+        }
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
@@ -8374,12 +8379,16 @@ mod tests {
                 "majit_gc::shadow_stack::try_pop_to",
                 shadow_stack_try_pop_to_word as *const () as usize as i64,
             ),
+            (
+                "majit_gc::shadow_stack::slot_from_cached",
+                slot_from_cached_word as *const () as usize as i64,
+            ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
         }
     }
 
-    /// The three published addresses answer through the word ABI a residual
+    /// The published addresses answer through the word ABI a residual
     /// call reaches them with, and the round trip preserves the reference.
     ///
     /// Calling each through its registry address, transmuted to the signature
@@ -8405,6 +8414,12 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+
+        let slot_from_cached: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::slot_from_cached")) };
+        let resolved = slot_from_cached(0);
+        assert_ne!(resolved, 0, "zero raw falls back to the live slot");
+        assert_eq!(slot_from_cached(resolved), resolved);
     }
 
     #[test]

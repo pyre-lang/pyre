@@ -4464,6 +4464,10 @@ pub struct CallControl {
     /// and `helper_seed_graphs`. The two-phase prepass drives these as
     /// entry graphs with declared seeds (`annrpython.py` `build_types`).
     bfs_entry_roots: Vec<CallPath>,
+    /// `register_eval_override`'s `FnDef` argument graphs. After
+    /// `rewrite_jit_merge_point`, those graphs become origportal-for-EvalFn
+    /// stubs (`direct_call` of `portal_runner_ptr`).
+    eval_override_graphs: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
@@ -4932,7 +4936,7 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
-        || type_name.starts_with("Vec<")
+        || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
@@ -5418,6 +5422,7 @@ impl CallControl {
             bfs_look_inside_function: Box::new(|_| true),
             helper_seed_graphs: Vec::new(),
             bfs_entry_roots: Vec::new(),
+            eval_override_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
@@ -5466,6 +5471,15 @@ impl CallControl {
             bookkeeper: std::cell::RefCell::new(None),
         };
         cc.stamp_ll_math_llexternal_canraise();
+        cc
+    }
+
+    /// Adopt a live layout table. `new()` writes no layouts, so replacing
+    /// the empty `Rc` here is the first write. Tests that call [`Self::new`]
+    /// keep a fresh table.
+    pub fn with_struct_layouts(handle: StructLayoutTable) -> Self {
+        let mut cc = Self::new();
+        cc.struct_layouts = handle;
         cc
     }
 
@@ -5523,6 +5537,27 @@ impl CallControl {
         field_name: &str,
     ) -> Option<crate::model::ImmutableRank> {
         let owner = owner_root?;
+        if let Some(rank) = self.rank_in(owner, field_name) {
+            return Some(rank);
+        }
+        // `rclass.py _parse_field_list` keys the declaration on the class
+        // object. A marker const's harvest key is the const leaf
+        // (`CodeObject`); the field-read `owner_root` is the interned
+        // path (`bytecode::CodeObject`). `canonical_struct_name` is that
+        // class object once `STRUCT_ORIGIN_REGISTRY` is live.
+        let canon = majit_ir::descr::canonical_struct_name(owner);
+        if canon != owner
+            && let Some(rank) = self.rank_in(&canon, field_name)
+        {
+            return Some(rank);
+        }
+        // `rclass.py _check_for_immutable_hints` reads only this class's
+        // own `_immutable_fields_`. A bare leaf is another type's harvest
+        // key; decline when the owner is not identified exactly.
+        None
+    }
+
+    fn rank_in(&self, owner: &str, field_name: &str) -> Option<crate::model::ImmutableRank> {
         self.immutable_fields_by_struct
             .get(owner)
             .and_then(|fields| {
@@ -5631,6 +5666,24 @@ impl CallControl {
         is_known_by_value_struct(&self.known_struct_names, name)
     }
 
+    /// Field-row owner for ARRAY.OF. Prefer a harvested instantiation
+    /// (`get_ll_dict` DICTENTRY) when interned OF kept `<K,V>`; fall back
+    /// to the TypeDecl template when that key is absent (one-word keys
+    /// share the template layout).
+    fn array_of_field_owner(&self, elem_name: &str) -> Option<String> {
+        let compact = elem_name.replace(", ", ",");
+        if self.struct_fields.fields.contains_key(&compact) {
+            return Some(compact);
+        }
+        let template = majit_ir::descr::strip_generic_args(&compact);
+        if template.as_ref() != compact.as_str()
+            && self.struct_fields.fields.contains_key(template.as_ref())
+        {
+            return Some(template.into_owned());
+        }
+        None
+    }
+
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
     /// The runtime calls this with layouts from `std::mem::offset_of!()` etc.
     pub fn set_struct_layout(
@@ -5638,10 +5691,12 @@ impl CallControl {
         struct_id: majit_ir::descr::StructId,
         layout: StructLayout,
     ) {
-        self.struct_layouts
-            .borrow_mut()
-            .insert(struct_id, std::rc::Rc::new(layout));
-        self.clear_fielddescrof_memo();
+        let mut table = self.struct_layouts.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = table.entry(struct_id) {
+            entry.insert(std::rc::Rc::new(layout));
+            drop(table);
+            self.clear_fielddescrof_memo();
+        }
     }
 
     /// The layout table the annotator seeds from. Same `Rc` `set_struct_layout`
@@ -5700,6 +5755,17 @@ impl CallControl {
     pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
         self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`. No template fallback and no
+    /// positional synthesis: a missing instance is missing, matching
+    /// `descr.py` `get_field_descr(STRUCT, fieldname)` keyed on that
+    /// STRUCT object.
+    pub fn struct_layout_for_id(
+        &self,
+        sid: majit_ir::descr::StructId,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        self.struct_layouts.borrow().get(&sid).cloned()
     }
 
     /// The layout stored under `sid`, whose spelling is `name`. A
@@ -5813,11 +5879,26 @@ impl CallControl {
     /// RPython: ordered `STRUCT._names` + field types for descriptor layout
     /// reconstruction. The order is required to reproduce
     /// `symbolic.get_field_token()`.
+    ///
+    /// Exact harvest key first (`FieldRows::get`), including generic
+    /// instantiations (`option::Option<(usize,usize,bool)>::Some`).
+    /// `lookup_fields` strips `<…>` before the map lookup, so using it
+    /// first collapses every `Option<T>::Some` onto an ambiguous `Some`
+    /// suffix and the census cannot number `__pos_0`.
+    ///
+    /// [`StructFieldRegistry::lookup_fields`] (canonical leaf, then
+    /// crate-prefix suffix) is the fallback: FieldWrite `owner_root`
+    /// `pyobject::PyObject` still finds harvest
+    /// `pyre_object::pyobject::PyObject`. Same resolution
+    /// `field_type` / `field_name_at` use after the exact key.
     pub fn struct_field_entries(&self, owner: &str) -> Option<&[crate::front::semantic::FieldRow]> {
         if let Some(rows) = crate::front::mir::mut_ref_shape_rows(owner) {
             return Some(rows.as_slice());
         }
-        self.struct_fields.fields.get(owner).map(Vec::as_slice)
+        if let Some(rows) = self.struct_fields.fields.get(owner) {
+            return Some(rows.as_slice());
+        }
+        self.struct_fields.field_rows(owner)
     }
 
     /// Harvested `FieldRow.is_atomic`: the field's declared type was a
@@ -6046,8 +6127,9 @@ impl CallControl {
         };
         let array_type_id = &array_type_id;
         // `descr.py get_array_descr`: `isinstance(ARRAY.OF, lltype.Struct)`
-        // is the interned ARRAY's OF when present. Dump-only peels the
-        // TypeDecl path harvest stored on an `[ADT; N]` row.
+        // is the interned ARRAY's OF when present. Dump-only peels
+        // `GcArray<Entry<K,V>>` keeping `<K,V>` (`extract_element_type_from_str`,
+        // `get_ll_dict` DICTENTRYARRAY).
         let interned_of_struct = arr.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
                 Some(s._name)
@@ -6055,13 +6137,15 @@ impl CallControl {
             _ => None,
         });
         let elem_name = interned_of_struct.clone().or_else(|| {
-            array_type_id.as_deref().and_then(|s| {
-                extract_element_type_from_str(s)
-                    .or_else(|| Some(s.to_string()))
-                    .map(|n| majit_ir::descr::strip_generic_args(&n).into_owned())
-            })
+            array_type_id
+                .as_deref()
+                .and_then(|s| extract_element_type_from_str(s).or_else(|| Some(s.to_string())))
         });
-        let elem_ref = elem_name.as_deref();
+        let elem_name = elem_name.map(|n| n.replace(", ", ","));
+        let field_owner = elem_name
+            .as_deref()
+            .and_then(|n| self.array_of_field_owner(n));
+        let elem_ref = field_owner.as_deref().or(elem_name.as_deref());
         // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
         // answer (`descr.py get_array_descr`). Dump-only peels the
         // harvest path; an interned non-Struct OF is not Struct even
@@ -6627,7 +6711,12 @@ impl CallControl {
             })
         };
         let concrete_offset = owner_id.and_then(offset_of);
-        let template_offset = if concrete_offset.is_none() {
+        // `get_field_descr(STRUCT, fieldname)` does not reuse another
+        // STRUCT's token. A distinct `owner_id` is its own STRUCT; the
+        // template spelling's offset is that other type.
+        let template_offset = if concrete_offset.is_none()
+            && owner_id.is_none_or(|id| registry_struct_id == Some(id))
+        {
             registry_struct_id.and_then(offset_of)
         } else {
             None
@@ -6975,19 +7064,19 @@ impl CallControl {
             }
             (None, None) => return None,
         };
-        // ARRAY.OF.fieldname — interned OF is the TypeDecl path harvest
-        // stored on the `[ADT; N]` row. Dump-only peels that path from
-        // the container spelling (`consider_array(ARRAY)`).
+        // ARRAY.OF.fieldname — interned OF is the specialized DICTENTRY
+        // (`get_ll_dict`). Dump-only peels `GcArray<Entry<K,V>>` keeping
+        // `<K,V>` (`extract_element_type_from_str`, `consider_array(ARRAY)`).
         let elem_name = if let Some(name) = interned_of_struct.clone() {
             name
         } else {
-            let raw =
-                extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
-            majit_ir::descr::strip_generic_args(&raw).into_owned()
+            extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string())
         };
+        let elem_name = elem_name.replace(", ", ",");
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
         }
+        let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
@@ -7549,6 +7638,16 @@ impl CallControl {
         self.helper_seed_graphs.push(path);
     }
 
+    /// The EvalFn-family override graphs `discover_eval_override_graphs`
+    /// harvested. Empty when this translation has no `register_eval_override`.
+    pub fn set_eval_override_graphs(&mut self, paths: Vec<CallPath>) {
+        self.eval_override_graphs = paths;
+    }
+
+    pub(crate) fn eval_override_graphs(&self) -> &[CallPath] {
+        &self.eval_override_graphs
+    }
+
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
         let abi = self
             .function_fnaddrs
@@ -7775,17 +7874,63 @@ impl CallControl {
         }
     }
 
+    /// Register an inherent method under the owner-leaf CallPath.
+    ///
+    /// rustc's method-call rule (Reference, "Method-call expressions"):
+    /// `Type::method(..)` / `value.method()` picks the inherent method
+    /// before any trait method of the same name. Owner-leaf therefore
+    /// binds the inherent graph; a trait-impl that occupied the slot is
+    /// replaced. Upstream `codewriter/call.py CallControl.get_jitcode(graph)`
+    /// keys by the graph object; the CallPath must be injective over the
+    /// graphs a direct call can name.
+    pub fn register_inherent_method(
+        &mut self,
+        impl_type: &str,
+        method_name: &str,
+        graph: impl Into<GraphSource>,
+    ) {
+        self.register_function_graph(CallPath::for_impl_method(impl_type, method_name), graph);
+    }
+
+    /// Register a concrete trait-impl method under its trait-impl identity
+    /// (`CallPath::for_trait_impl_method`, `<Impl#{id}>`).
+    ///
+    /// When `fill_owner_leaf` is set, owner-leaf is filled only if vacant:
+    /// an inherent of this leaf on this owner already occupies it. The
+    /// `dyn Trait` PBC family lists the identity path, never the inherent
+    /// that may sit at owner-leaf. Primitive `Self` (no ADT owner) leaves
+    /// owner-leaf unset so two widths do not collapse onto one path.
+    pub fn register_trait_impl_method(
+        &mut self,
+        impl_type: &str,
+        impl_id: u64,
+        method_name: &str,
+        trait_root: Option<&str>,
+        fill_owner_leaf: bool,
+        graph: impl Into<GraphSource>,
+    ) {
+        let graph = graph.into();
+        let identity = CallPath::for_trait_impl_method(impl_type, impl_id, method_name);
+        self.register_function_graph(identity.clone(), graph.clone());
+        if let Some(trait_root) = trait_root {
+            self.register_trait_family_path(method_name, trait_root, identity);
+        }
+        if fill_owner_leaf {
+            let owner_leaf = CallPath::for_impl_method(impl_type, method_name);
+            if !self.function_graphs.names_funcobj(&owner_leaf) {
+                self.register_function_graph(owner_leaf, graph);
+            }
+        }
+    }
+
     /// Add one concrete graph to the PBC row for an indirect trait call,
     /// without also making it a name-based concrete-method candidate.
     ///
     /// RPython keeps these two relations separate: `FunctionReprBase.call`
     /// obtains `c_graphs` from `row_of_graphs.values()`, while concrete
-    /// method lookup follows the receiver's class/MRO.  Pyre's concrete
-    /// trait-impl methods are registered through the inherent-method path to
-    /// preserve that receiver lookup, but they still belong to the PBC row
-    /// used by a `dyn Trait` vtable call.  Required trait methods have no
-    /// default graph, so omitting this membership makes their otherwise
-    /// closed family look unknown to every graph analyzer.
+    /// method lookup follows the receiver's class/MRO.  Required trait
+    /// methods have no default graph, so omitting this membership makes
+    /// their otherwise closed family look unknown to every graph analyzer.
     pub fn register_trait_family_member(
         &mut self,
         method_name: &str,
@@ -7970,8 +8115,30 @@ impl CallControl {
     /// Warmspot creates this helper after the portal graph has been split;
     /// keeping the assignment separate mirrors that construction order and
     /// prevents graph identity from standing in for runner identity.
+    /// Canonicalize to the registered graph spelling once
+    /// (`funcptr is jd.portal_runner_ptr`); later comparisons use that
+    /// identity (`GraphKey` / resolved path), not a CallPath suffix.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
-        self.jitdrivers_sd[index].portal_runner = runner;
+        let runner = runner.map(|path| self.resolved_callable_path(&path));
+        self.jitdrivers_sd[index].portal_runner = runner.clone();
+        if let Some(runner) = runner {
+            self.stamp_portal_runner_dont_look_inside(&runner);
+        }
+    }
+
+    /// `warmspot.py helper_func` annotates `ll_portal_runner` from the FUNC
+    /// lltype (`annhelper.getgraph(func, args_s, s_result)`), so
+    /// `default_specialize` never sees the caller's `access_directly` frame.
+    /// Pyre harvests the runner as an ordinary graph; `_jit_look_inside_ =
+    /// False` is the analogue so `default_specialize` strips the flag instead
+    /// of minting an AccessDirect cachedgraph outside `jit_graphs`
+    /// (`check_access_directly_sanity`).
+    fn stamp_portal_runner_dont_look_inside(&mut self, runner: &CallPath) {
+        for path in self.function_graphs.alias_paths(runner) {
+            if let Some(func) = self.function_graphs.func_mut(&path) {
+                func.jit_look_inside = Some(false);
+            }
+        }
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -8220,13 +8387,47 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
+    /// `funcptr is jd.portal_runner_ptr` is function-object identity.
+    /// Harvest aliases share a `GraphKey`; crate-prefix vs crate-stripped
+    /// spellings resolve to the same registered graph
+    /// (`resolved_callable_path`). An AccessDirect cachedgraph of that
+    /// funcobj (if one were minted) peels to the same origin.
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        self.jitdrivers_sd.iter().find(|sd| {
+            sd.portal_runner
+                .as_ref()
+                .is_some_and(|runner| self.portal_runner_ptr_is(path, runner))
+        })
+    }
+
+    /// `funcptr is jd.portal_runner_ptr` for one driver's runner spelling.
+    fn portal_runner_ptr_is(&self, path: &CallPath, runner: &CallPath) -> bool {
+        let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+        self.same_portal_runner_funcobj(&origin, runner)
+            || self.same_portal_runner_funcobj(path, runner)
+    }
+
+    /// Same funcobj: `GraphKey` of the registered graph, or the resolved
+    /// harvest spelling (`callable_graph_path`).
+    fn same_portal_runner_funcobj(&self, a: &CallPath, b: &CallPath) -> bool {
+        if a == b {
+            return true;
+        }
+        let a_res = self.resolved_callable_path(a);
+        let b_res = self.resolved_callable_path(b);
+        if a_res == b_res {
+            return true;
+        }
+        match (
+            self.function_graphs.key_for(&a_res),
+            self.function_graphs.key_for(&b_res),
+        ) {
+            (Some(ak), Some(bk)) => ak == bk,
+            _ => false,
+        }
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -15078,36 +15279,48 @@ pub fn effectinfo_from_writeanalyze(
             }
         }
     }
-    // `rgc.ll_arraycopy` writeanalyze sees one `setarrayitem` ARRAY.
-    // A residual `OS_ARRAYCOPY` helper has no graph, so recover that
-    // ARRAY from `extradescrs` (`do_fixed_list_ll_arraycopy` already
-    // holds it) and put it in `_write_descrs_arrays` so
-    // `single_write_descr_array` is set (`effectinfo.py`).
+    // `rgc.ll_arraycopy` writeanalyze sees one dest `setarrayitem`
+    // (`copy_item` when `length <= 1`, the head that exists so
+    // `effectinfo.write_descrs_arrays` is that ARRAY). Heapcache then
+    // sets `single_write_descr_array` (`effectinfo.py`) and
+    // `_clear_caches_arraycopy` keeps `quasiimmut_seen`.
     //
-    // No dest ARRAY (`extradescrs` None) is unanalyzable: upstream
-    // `GraphAnalyzer.analyze` returns `WriteAnalyzer.top_result`
-    // (`top_set` in `writeanalyze.py`) when the funcobj has no graph.
-    // `effectinfo_from_writeanalyze` maps `top_set` to
-    // `EF_RANDOM_EFFECTS` (None descr lists), never "writes no array".
-    if array_write_descrs.is_empty() && oopspecindex == OopSpecIndex::Arraycopy {
+    // The residual helper `jit_ll_arraycopy` still has a graph
+    // (`pin_root`, memcpy). Writeanalyze of that body can name extra
+    // ARRAYs that are not dest[di] = source[si]. `do_fixed_list_ll_arraycopy`
+    // already holds dest in `extradescrs`; that ARRAY is the
+    // writeanalyze result of `copy_item`. Replace the write-array set
+    // with it so `single_write_descr_array` is dest.
+    //
+    // No dest ARRAY (`extradescrs` None) and no writeanalyze ARRAY is
+    // unanalyzable: upstream `GraphAnalyzer.analyze` returns
+    // `WriteAnalyzer.top_result` (`top_set` in `writeanalyze.py`) when
+    // the funcobj has no graph. `effectinfo_from_writeanalyze` maps
+    // `top_set` to `EF_RANDOM_EFFECTS` (None descr lists), never
+    // "writes no array".
+    if oopspecindex == OopSpecIndex::Arraycopy {
         match extradescrs.as_ref() {
             Some(extra) => {
-                for d in extra {
-                    if let Some(ad) = d.as_array_descr() {
+                let dest: Vec<(DescrRef, u64)> = extra
+                    .iter()
+                    .filter_map(|d| d.as_array_descr().map(|ad| (d.clone(), ad.cache_key())))
+                    .collect();
+                if !dest.is_empty() {
+                    write_descrs_arrays.clear();
+                    array_write_descrs.clear();
+                    for (d, array_id) in dest {
                         let ei = d.get_ei_index();
                         if ei != u32::MAX {
                             write_descrs_arrays.push(ei);
                         }
                         array_write_descrs.push((
-                            d.clone(),
-                            Some(majit_ir::effectinfo::DescrSetMember::Array {
-                                array_id: ad.cache_key(),
-                            }),
+                            d,
+                            Some(majit_ir::effectinfo::DescrSetMember::Array { array_id }),
                         ));
                     }
                 }
             }
-            None => {
+            None if array_write_descrs.is_empty() => {
                 return effectinfo_random_effects(
                     oopspecindex,
                     extradescrs.clone(),
@@ -15115,6 +15328,7 @@ pub fn effectinfo_from_writeanalyze(
                     call_release_gil_target,
                 );
             }
+            None => {}
         }
     }
     // Sort + dedupe the index lists so the bitstrings match PyPy's
@@ -15748,10 +15962,10 @@ fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
     // that consumers resolve it through `FieldDescr::is_w_class()` rather than
     // by index (`pyre-jit-trace/src/descr.rs new_w_class_field_descr`); answer
     // with the same number so both sides agree on the slot nobody reads.
-    // `ob_header.ob_type` is that word under a containment path
-    // (`is_header_word` last-component rule; upstream `all_fielddescrs`
-    // skips `typeptr` by bare name at every recursion level).
-    if crate::codewriter::heaptracker::is_header_word(owner, field_name) {
+    // `ob_header.ob_type` is that word under an offset-0 first-field
+    // chain (`is_header_word` / `has_gcstruct_a_vtable`). A typeptr at
+    // a non-zero offset is numbered like any other field.
+    if crate::codewriter::heaptracker::is_header_word(cc, owner, field_name) {
         return 0;
     }
     let walked = crate::codewriter::heaptracker::get_fielddescr_index_in(cc, owner, field_name, 0);
@@ -16078,7 +16292,7 @@ pub(crate) fn get_type_flag(
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
-        s if s.starts_with("Vec<") => (
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
             3 * crate::layout::target_word_size(),
@@ -16131,6 +16345,13 @@ pub(crate) fn get_type_flag(
             (flag, item_type, elem_size.saturating_mul(len))
         }
         s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs) => leaf,
+        // descr.py get_type_flag reads FLAG_* off the lltype. A linked
+        // `repr(transparent)` wrapper is that inner scalar; the assembler
+        // peels the same table (`tyref_transparent_inner_value_type` /
+        // `external_transparent_scalar_kinds`).
+        s if let Some(flag) = crate::front::mir::type_flag_for_external_transparent_scalar(s) => {
+            flag
+        }
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,
@@ -17993,6 +18214,32 @@ mod tests {
         assert!(!cc.immutable_array_types.contains("[i64]"));
         assert!(cc.immutable_array_types.contains("[*mut PyObject]"));
     }
+
+    /// `rclass.py _check_for_immutable_hints` keys `_immutable_fields_` on
+    /// the owner class. Harvest also inserts a bare leaf, so `b::Foo.x`
+    /// must not inherit `a::Foo`'s `Foo.x` rank.
+    #[test]
+    fn field_immutability_does_not_borrow_another_types_bare_leaf() {
+        use crate::model::ImmutableRank;
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Foo".to_string(),
+            vec![("x".to_string(), ImmutableRank::Immutable)],
+        );
+        cc.immutable_fields_by_struct.insert(
+            "a::Foo".to_string(),
+            vec![("x".to_string(), ImmutableRank::Immutable)],
+        );
+        assert_eq!(
+            cc.field_immutability(Some("a::Foo"), "x"),
+            Some(ImmutableRank::Immutable)
+        );
+        assert_eq!(
+            cc.field_immutability(Some("Foo"), "x"),
+            Some(ImmutableRank::Immutable)
+        );
+        assert_eq!(cc.field_immutability(Some("b::Foo"), "x"), None);
+    }
     use crate::model::{
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
@@ -19453,6 +19700,29 @@ mod tests {
         assert_eq!(get_type_flag("*mut u8", &empty), fallback);
         assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
         assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
+    }
+
+    /// A linked `repr(transparent)` wrapper uses the same table the
+    /// assembler peels (`external_transparent_scalar_kinds`), not a
+    /// per-leaf string arm in `get_type_flag`.
+    #[test]
+    fn get_type_flag_external_transparent_scalar_is_inner_width() {
+        use majit_ir::descr::ArrayFlag;
+        let expected = (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4);
+        for spelling in [
+            "rustpython_compiler_core::bytecode::CodeFlags",
+            "bytecode::CodeFlags",
+            "CodeFlags",
+        ] {
+            assert_eq!(
+                get_type_flag(spelling, &HashSet::new()),
+                expected,
+                "{spelling}"
+            );
+        }
+        let (flag, ty, _) = get_type_flag("NotALinkedScalar", &HashSet::new());
+        assert_eq!(flag, ArrayFlag::Pointer);
+        assert_eq!(ty, majit_ir::value::Type::Ref);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -24249,6 +24519,236 @@ mod tests {
         }
     }
 
+    /// `Entry<ObjectKey, *mut PyObject>` cannot reuse the typevar-key
+    /// template: ObjectKey is two words, so `f_valid` sits at 16 and the
+    /// item is 40. `interiorfielddescrof` peels `GcArray<Entry<K,V>>` to
+    /// the suffixed element (`extract_element_type_from_str`) and reads
+    /// that instantiation's layout (`get_ll_dict` `DICTENTRYARRAY`).
+    /// Production ARRAY identity uses the `adt_ast_head` leaf `ObjectKey`.
+    #[test]
+    fn interiorfielddescrof_objectkey_entry_f_valid_offset() {
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let atid = format!("GcArray<{elem}>");
+        assert_eq!(extract_element_type_from_str(&atid).as_deref(), Some(elem));
+        let object_key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let entry_template_sid =
+            majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry");
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(object_key_sid)),
+                (
+                    "rordereddict_entries::Entry".to_string(),
+                    Some(entry_template_sid),
+                ),
+            ]));
+        let object_key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let object_key_layout = StructLayout::from_type_strings(
+            &object_key_rows,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(object_key_layout.size, 16);
+        let entry_rows = [
+            ("key".into(), object_key.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([object_key.to_string(), elem.to_string()]);
+        let sizes = std::collections::HashMap::from([(object_key.to_string(), 16)]);
+        let aligns = std::collections::HashMap::from([(object_key.to_string(), 8)]);
+        let entry_layout = StructLayout::from_type_strings(
+            &entry_rows,
+            &names,
+            &sizes,
+            &aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let f_valid_offset = entry_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("f_valid field")
+            .offset;
+        assert_eq!(f_valid_offset, 16);
+        if crate::layout::target_word_size() == 8 {
+            assert_eq!(entry_layout.size, 40);
+        }
+        let entry_size = entry_layout.size;
+        let entry_sid = majit_ir::descr::struct_id_for_name(elem).expect("Entry instantiation id");
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(object_key.to_string(), object_key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), entry_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(object_key_sid, object_key_layout);
+        cc.set_struct_layout(entry_sid, entry_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    (
+                        "key".into(),
+                        LowLevelType::Struct(Box::new(Struct::new(
+                            object_key,
+                            vec![
+                                ("hash".into(), LowLevelType::Signed),
+                                ("obj".into(), GCREF.clone()),
+                            ],
+                        ))),
+                    ),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 16);
+        assert_eq!(interior.array_descr().item_size(), entry_size);
+    }
+
+    /// Intern of `GcEntries<ObjectKey,*mut PyObject>` names ARRAY.OF as
+    /// the specialized DICTENTRY (`get_ll_dict`). `interiorfielddescrof`
+    /// then reads harvest `Entry<ObjectKey,*mut PyObject>` (`ll_valid_from_flag`):
+    /// `f_valid` at 16, item 40. The typevar template is `f_valid` at 8.
+    #[test]
+    fn interned_objectkey_gcentries_interior_f_valid_offset() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let object_key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let entry_template_sid =
+            majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry");
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(object_key_sid)),
+                (
+                    "rordereddict_entries::Entry".to_string(),
+                    Some(entry_template_sid),
+                ),
+            ]));
+        let object_key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let object_key_layout = StructLayout::from_type_strings(
+            &object_key_rows,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(object_key_layout.size, 16);
+        let entry_rows = [
+            ("key".into(), object_key.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            object_key.to_string(),
+            elem.to_string(),
+            "rordereddict_entries::Entry".to_string(),
+        ]);
+        let sizes = std::collections::HashMap::from([(object_key.to_string(), 16)]);
+        let aligns = std::collections::HashMap::from([(object_key.to_string(), 8)]);
+        let entry_layout = StructLayout::from_type_strings(
+            &entry_rows,
+            &names,
+            &sizes,
+            &aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let f_valid_offset = entry_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("f_valid field")
+            .offset;
+        assert_eq!(f_valid_offset, 16);
+        let entry_size = entry_layout.size;
+        let entry_sid = majit_ir::descr::struct_id_for_name(elem).expect("Entry instantiation id");
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(object_key.to_string(), object_key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), entry_rows.to_vec());
+        fields.fields.insert(
+            "rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".into(), "??TypeVar#0".into()),
+                ("f_valid".into(), "bool".into()),
+                ("value".into(), "??TypeVar#1".into()),
+                ("f_hash".into(), "u64".into()),
+            ],
+        );
+        fields.fields.insert(
+            "rordereddict_entries::GcEntries".to_string(),
+            vec![
+                ("length".into(), "usize".into()),
+                (
+                    "items".into(),
+                    "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".into(),
+                ),
+            ],
+        );
+        fields.note_declared_gc_name("PyObject");
+        fields.note_declared_gc_name("rordereddict_entries::GcEntries");
+        let interned = crate::front::mir::struct_item_flexible_gcarray_block_annotation(
+            &fields,
+            "rordereddict_entries::GcEntries<ObjectKey,*mut PyObject>",
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]",
+        )
+        .expect("intern GcEntries<ObjectKey>");
+        let SomeValue::Ptr(ptr) = interned else {
+            panic!("intern must be SomePtr, got {interned:?}")
+        };
+        let PtrTarget::Array(arr) = ptr.ll_ptrtype.TO else {
+            panic!("intern must be Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+        };
+        match &arr.OF {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(st) => {
+                assert_eq!(st._name, elem, "ARRAY.OF must be the specialized DICTENTRY")
+            }
+            other => panic!("ITEM must be STRUCT, got {other:?}"),
+        }
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(object_key_sid, object_key_layout);
+        cc.set_struct_layout(entry_sid, entry_layout);
+        let atid = array_type_id_of_lltype(&arr);
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 16);
+        assert_eq!(interior.array_descr().item_size(), entry_size);
+    }
+
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,
     /// descr.py), while `f64` (`lltype.Float`) keeps the float kind.
@@ -25689,13 +26189,46 @@ mod tests {
             Vec::new(),
             original.clone(),
         );
+        cc.register_function_graph(runner.clone(), FunctionGraph::new("ll_portal_runner_shim"));
+        let harvested = CallPath::from_segments(["pyre_jit", "call_jit", "ll_portal_runner_shim"]);
+        cc.function_graphs_mut()
+            .share_path(harvested.clone(), &runner);
         cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+        assert_eq!(
+            cc.function_graphs()
+                .get(&runner)
+                .expect("runner graph remains registered")
+                .func
+                .jit_look_inside,
+            Some(false),
+            "portal_runner_ptr is residual support code (`helper_func` / `_jit_look_inside_ = False`)"
+        );
 
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                 runner.segments.clone()
             ))),
             CallKind::Recursive
+        );
+        let ad_runner = access_directly_path(&runner);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(&ad_runner))),
+            CallKind::Recursive,
+            "AccessDirect cachedgraph of portal_runner_ptr is still that funcptr"
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                harvested.segments.clone()
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix spelling is still portal_runner_ptr"
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(
+                &access_directly_path(&harvested)
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix AccessDirect spelling is still portal_runner_ptr"
         );
         for non_runner in [portal, original] {
             assert_ne!(
@@ -30151,7 +30684,7 @@ mod tests {
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
         assert_eq!(field_pos_in(&cc, "Method", "w_class"), 3);
         // Containment-path spelling of the skipped vtable word, and of the
-        // counted `w_class` leaf (`is_header_word` last-component rule).
+        // counted `w_class` leaf (`is_header_word` offset-0 header word).
         assert_eq!(field_pos_in(&cc, "Method", "ob.ob_type"), 0);
         assert_eq!(get_fielddescr_index_in(&cc, "Method", "ob.w_class", 0), 0);
         assert_eq!(field_pos_in(&cc, "Method", "ob.w_class"), 0);
@@ -30900,6 +31433,187 @@ mod tests {
             cc.target_to_path(&bare),
             None,
             "a name leaf must not pick either impl"
+        );
+    }
+
+    /// One type with an inherent `bits` that calls an inner type's inherent
+    /// `bits`, and a trait impl `bits` whose body is `Self::bits(self)`.
+    /// rustc picks the inherent at owner-leaf; the trait-impl stays on
+    /// `for_trait_impl_method`. Both registration orders must agree.
+    fn bits_collision_graphs() -> (FunctionGraph, FunctionGraph, FunctionGraph) {
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let inner = FunctionGraph::new("bits")
+            .with_owner_root("InnerFlags")
+            .with_source_identity("InnerFlags::bits");
+        let inherent_call =
+            CallTarget::method("bits", Some("InnerFlags".into())).with_resolved_path(inner_path);
+        let inherent = graph_calling("bits", inherent_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::bits");
+        let trait_call =
+            CallTarget::method("bits", Some("OwnerFlags".into())).with_resolved_path(inherent_path);
+        let trait_impl = graph_calling("bits", trait_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::<impl Flags>::bits");
+        (inner, inherent, trait_impl)
+    }
+
+    fn bits_collision_spec_identity_path() -> CallPath {
+        CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "OwnerFlags",
+            "Flags",
+            "bits",
+        ))
+    }
+
+    fn register_bits_collision_identity(cc: &mut CallControl, trait_impl: FunctionGraph) {
+        cc.register_function_graph(bits_collision_spec_identity_path(), trait_impl);
+    }
+
+    fn assert_bits_collision_bindings(cc: &mut CallControl) {
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let trait_path = CallPath::for_trait_impl_method("OwnerFlags", 18817, "bits");
+        let spec_path = bits_collision_spec_identity_path();
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&trait_path),
+            "owner-leaf and trait-impl identity name distinct graphs"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&spec_path),
+            cc.function_graphs.key_for(&trait_path),
+            "spec_segments identity path names the trait-impl graph"
+        );
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&spec_path),
+            "spec_segments identity path must not steal owner-leaf"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs
+                .get(&inherent_path)
+                .map(|g| g.graph_key()),
+        );
+        let inherent_graph = cc
+            .function_graphs
+            .get(&inherent_path)
+            .expect("inherent owner-leaf");
+        assert_eq!(
+            inherent_graph.source_identity.as_deref(),
+            Some("OwnerFlags::bits"),
+            "owner-leaf must bind the inherent method"
+        );
+        let trait_graph = cc
+            .function_graphs
+            .get(&trait_path)
+            .expect("trait-impl identity");
+        assert_eq!(
+            trait_graph.source_identity.as_deref(),
+            Some("OwnerFlags::<impl Flags>::bits"),
+        );
+        let family = cc.all_impls_for_indirect("Flags", "bits");
+        assert_eq!(
+            family,
+            vec![trait_path.clone()],
+            "dyn Trait family lists the trait-impl identity, never the inherent"
+        );
+        let call_target =
+            |graph: &FunctionGraph| match &graph.block(graph.startblock).operations[0].kind {
+                OpKind::Call { target, .. } => target.clone(),
+                other => panic!("expected a Call, got {other:?}"),
+            };
+        assert_eq!(
+            cc.target_to_path(&call_target(&inherent_graph)),
+            Some(inner_path.clone()),
+            "inherent bits targets the inner type's bits"
+        );
+        assert_eq!(
+            cc.target_to_path(&call_target(&trait_graph)),
+            Some(inherent_path.clone()),
+            "trait-impl body Self::bits targets the inherent, not itself"
+        );
+        let jc_inner = cc.get_jitcode(&inner_path);
+        let jc_inherent = cc.get_jitcode(&inherent_path);
+        let jc_trait = cc.get_jitcode(&trait_path);
+        assert!(
+            !std::sync::Arc::ptr_eq(&jc_inner, &jc_inherent)
+                && !std::sync::Arc::ptr_eq(&jc_inherent, &jc_trait)
+                && !std::sync::Arc::ptr_eq(&jc_inner, &jc_trait),
+            "each of the three graphs gets its own jitcode"
+        );
+        // `get_jitcode` keys shells on CallPath (`call.py` keys on the
+        // graph object). Alias spellings of one funcobj share GraphKey
+        // (`key_for` above); they do not share a shell Arc.
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_trait_impl_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_inherent_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    /// Vacant owner-leaf (no inherent of this leaf) aliases the trait-impl
+    /// graph. The PBC family still lists the identity path
+    /// (`FunctionReprBase.call` / `row_of_graphs.values()`); ICT matching
+    /// splits the identity segment off the owner path.
+    #[test]
+    fn vacant_trait_impl_family_keeps_identity_path() {
+        let mut cc = CallControl::new();
+        let identity = CallPath::for_trait_impl_method("IntDictStrategy", 42, "length");
+        let owner_leaf = CallPath::for_impl_method("IntDictStrategy", "length");
+        let graph = FunctionGraph::new("length")
+            .with_owner_root("IntDictStrategy")
+            .with_source_identity("IntDictStrategy::<impl DictStrategy>::length");
+        cc.register_trait_impl_method(
+            "IntDictStrategy",
+            42,
+            "length",
+            Some("DictStrategy"),
+            true,
+            graph,
+        );
+        assert_eq!(
+            cc.all_impls_for_indirect("DictStrategy", "length"),
+            vec![identity.clone()],
+            "family lists the trait-impl identity"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&identity),
+            cc.function_graphs.key_for(&owner_leaf),
+            "vacant owner-leaf aliases the trait-impl graph"
         );
     }
 
@@ -32540,6 +33254,64 @@ mod tests {
                 .is_some_and(|v| !v.is_empty()),
             "extraef still records the array write, got {ei:?}"
         );
+    }
+
+    /// `rgc.ll_arraycopy` writeanalyze names dest only (`copy_item`). Extra
+    /// ARRAY writes from the residual helper body must not leave
+    /// `single_write_descr_array` unset: heapcache `_clear_caches_arraycopy`
+    /// then `reset_keep_likely_virtuals`.
+    #[test]
+    fn os_arraycopy_dest_extradescr_wins_over_extra_writeanalyze_arrays() {
+        let cc = CallControl::new();
+        let dest = cc.arraydescrof_for_type(
+            &ValueType::Int,
+            &Some("dest_items".to_string()),
+            Type::Int,
+            Some(0),
+        );
+        let mut effects = ReadWriteEffects::Set(Default::default());
+        effects.insert(
+            RwKey::dump_array(RwTag::Array, 1),
+            RwOperand::Array {
+                array: None,
+                array_type_id: Some("dest_items".to_string()),
+                ir_type: Type::Int,
+                len_offset: Some(0),
+                consider: true,
+            },
+        );
+        effects.insert(
+            RwKey::dump_array(RwTag::Array, 2),
+            RwOperand::Array {
+                array: None,
+                array_type_id: Some("pin_root_stack".to_string()),
+                ir_type: Type::Ref,
+                len_offset: Some(0),
+                consider: true,
+            },
+        );
+        let ei = effectinfo_from_writeanalyze(
+            &effects,
+            ExtraEffect::CannotRaise,
+            OopSpecIndex::Arraycopy,
+            false,
+            true,
+            Some(vec![dest.clone()]),
+            "jit_ll_arraycopy",
+            &cc,
+            EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        );
+        assert_eq!(ei.extraeffect, ExtraEffect::CannotRaise);
+        assert_eq!(ei.oopspecindex, OopSpecIndex::Arraycopy);
+        let single = ei
+            .single_write_descr_array
+            .as_ref()
+            .expect("dest ARRAY is single_write_descr_array");
+        assert_eq!(
+            single.as_array_descr().map(|ad| ad.cache_key()),
+            dest.as_array_descr().map(|ad| ad.cache_key()),
+        );
+        assert_eq!(ei._write_descrs_arrays.as_ref().map(|v| v.len()), Some(1));
     }
 
     /// `writeanalyze.py` `_get_effect_for_offset` keys an ArrayItemsOffset

@@ -1178,6 +1178,11 @@ impl UnrollOptimizer {
         // (`compile.py compile_loop`).
         let _p1_ops_live = self.publish_ops_vec(&p1_ops);
         self.clear_compile_snapshot_roots();
+        // Numbered preamble guards live in `p1_ops`. They are VoidOp so they
+        // are not copied into `phase1_emit_ops`. `unroll.py` `optimize_preamble`
+        // / `optimize_peeled_loop` keep that op list on the compiling frame
+        // until assembly (`compile.py` `compile_loop`).
+        let _p1_result_root = self.publish_ops_vec(&p1_ops);
         // unroll.py end_args carry type via Box; export_state already
         // populated `exported_state.end_arg_types` from ctx.
         // RPython parity: Phase 2 needs patchguardop from Phase 1's
@@ -1821,6 +1826,10 @@ impl UnrollOptimizer {
             );
         }
         let mut body_ops = p2_ops;
+        // Phase 2 numbered guards live in `body_ops` after `optimize_peeled_loop`.
+        // Assignments to this binding keep the `Vec` header at the published
+        // address (`publish_vec`).
+        let _p2_result_root = self.publish_ops_vec(&body_ops);
         let mut redirected_tail_ops = Vec::new();
         let jump_was_redirected = {
             let opt_unroll = OptUnroll::new();

@@ -216,16 +216,13 @@ pub mod test_hooks {
 
     /// `baseobjspace.py is_none hash_w` — the single hash entry point,
     /// mirrored for tests via `builtins::try_hash_value`.  On error it
-    /// records the pending exception the same way the production
-    /// trampoline does (`pyre-jit::eval`'s `pyre_object_hash_w_trampoline`).
+    /// publishes through the one ll exception state the same way the
+    /// production trampoline does (`pyre-jit::eval`'s
+    /// `pyre_object_hash_w_trampoline`).
     unsafe fn test_hash_w(obj: PyObjectRef) -> i64 {
         match crate::builtins::try_hash_value(obj) {
             Ok(h) => h,
-            Err(e) => {
-                crate::baseobjspace::set_pending_dict_hash_error(e);
-                pyre_object::dict_eq_hook::signal_hash_error(obj);
-                0
-            }
+            Err(e) => crate::runtime_ops::jit_publish_residual_error(e),
         }
     }
 
@@ -246,6 +243,7 @@ pub mod test_hooks {
         // interpreter directly among the entry points that acquire, and its
         // destructor gives the registration back when the thread exits.
         crate::module::thread::ensure_runtime_thread();
+        crate::runtime_ops::register_interpreter_rpyexc_fallback();
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
         pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }
