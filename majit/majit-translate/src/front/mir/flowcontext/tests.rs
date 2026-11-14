@@ -6,6 +6,7 @@ use super::{
     cast_pointer_marker_op, dont_look_inside_return_token, no_tombstoned_leaves,
     push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
     scalar_replace_named_struct_aggregates, tyref_to_attr_value_type_for_struct_field,
+    tyref_to_value_type,
 };
 
 use crate::flowspace::model::Variable;
@@ -1973,12 +1974,11 @@ fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
 /// A declared-Raw ADT pointer is a raw address word (`history.py`
 /// `getkind` of a raw `Ptr` is `"int"`), so
 /// `dont_look_inside_return_token` is `"raw:Owner"` — the int-bank
-/// token `raw_address_owner_root` names. An ordinary looked-inside
-/// function leaves FUNC.RESULT unstamped; the CFG return of
-/// `get_raw_owner` is a reference (`flatten.py` `make_return`).
+/// token `raw_address_owner_root` names. Look-inside graphs stamp
+/// that token as FUNC.RESULT (`call.py` `RESULT == FUNC.RESULT`).
 /// Residual callees keep the token through `stamp_return_token`.
 #[test]
-fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
+fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
     use std::collections::{HashMap, HashSet};
     let mut owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
     owner["layout"] = c_layout();
@@ -2065,14 +2065,10 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
         "declared-Raw ADT pointer stays an int-bank residual token"
     );
     let ptr_header = header_of(ptr_fd);
-    assert_ne!(
+    assert_eq!(
         ptr_header.return_type.as_deref(),
-        Some("i64"),
-        "ordinary looked-inside declared-Raw ADT pointer must not stamp FUNC.RESULT=i64"
-    );
-    assert!(
-        ptr_header.return_type.is_none(),
-        "CFG kind r is kept by leaving FUNC.RESULT unstamped, got {:?}",
+        Some("raw:Owner"),
+        "look_inside FUNC.RESULT of a raw Ptr is the int-bank token, got {:?}",
         ptr_header.return_type
     );
 
@@ -2092,6 +2088,191 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
         header_of(i64_fd).return_type.as_deref(),
         Some("i64"),
         "a machine i64 result still stamps FUNC.RESULT"
+    );
+}
+
+/// `push_roots() -> RootScope` is a by-value raw ADT (save_point word).
+/// `history.getkind` of that word is int; a `"ref"` token would put the
+/// save_point in a JITFRAME GCREF slot.
+#[test]
+fn by_value_raw_adt_stamps_raw_owner_return_token() {
+    use std::collections::HashSet;
+    let owner = struct_decl(0, ident_path(&["fixture", "RootScope"]), i64_field(), false);
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "push_roots"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [],
+            "output": {"Adt": {"id": 0, "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            }, "builtin": null}}
+        },
+        "body": "Opaque"
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: HashSet<majit_ir::descr::StructId> = HashSet::new();
+    let fd = llbc.fn_by_id(0).expect("push_roots");
+    assert!(
+        matches!(
+            tyref_to_value_type(&fd.signature.output, &llbc),
+            ValueType::Int
+        ),
+        "by-value one-word raw ADT lives in the int bank, matching FUNC.RESULT"
+    );
+    assert_eq!(
+        dont_look_inside_return_token(
+            &fd.signature.output,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &empty_gc,
+            &HashSet::<String>::new(),
+        )
+        .as_deref(),
+        Some("raw:RootScope"),
+        "by-value raw ADT residual stays an int-bank token"
+    );
+}
+
+/// `&RootScope` is the same save_point word: `Rvalue::Ref` is identity, so
+/// a `fn f(&self)` residual receives Int, not a walk-local Ref.
+#[test]
+fn borrowed_raw_adt_stamps_raw_owner_return_token() {
+    use std::collections::HashSet;
+    let mut owner = struct_decl(0, ident_path(&["fixture", "RootScope"]), i64_field(), false);
+    owner["layout"] = c_layout();
+    let adt = serde_json::json!({"Adt": {"id": 0, "generics": {
+        "regions": [], "types": [],
+        "const_generics": [], "trait_refs": []
+    }, "builtin": null}});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "RootScope", "get"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [{"Ref": ["Erased", adt.clone(), "Shared"]}],
+            "output": {"Ref": ["Erased", adt, "Shared"]}
+        },
+        "body": "Opaque"
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: HashSet<majit_ir::descr::StructId> = HashSet::new();
+    let fd = llbc.fn_by_id(0).expect("RootScope::get");
+    assert!(
+        matches!(
+            tyref_to_value_type(&fd.signature.inputs[0], &llbc),
+            ValueType::Int
+        ),
+        "shared borrow of a one-word raw ADT lives in the int bank"
+    );
+    assert!(
+        matches!(
+            tyref_to_value_type(&fd.signature.output, &llbc),
+            ValueType::Int
+        ),
+        "a residual returning `&RootScope` stays in the int bank"
+    );
+    assert_eq!(
+        dont_look_inside_return_token(
+            &fd.signature.output,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &empty_gc,
+            &HashSet::<String>::new(),
+        )
+        .as_deref(),
+        Some("raw:RootScope"),
+        "borrowed raw ADT residual stays an int-bank token"
+    );
+}
+
+/// A depending crate sees `RootScope` as an opaque ADT with no layout.
+/// The residual ABI is still the save_point word, including `&RootScope`.
+#[test]
+fn opaque_rootscope_copy_stamps_int_bank() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 32}
+    }});
+    let owner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": {
+            "name": [{"Ident": ["pyre_object", 0]}, {"Ident": ["gc_roots", 0]}, {"Ident": ["RootScope", 0]}],
+            "span": span,
+            "source_text": "struct RootScope",
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": "Opaque",
+        "layout": []
+    });
+    let adt = serde_json::json!({"Adt": {"id": 0, "generics": {
+        "regions": [], "types": [],
+        "const_generics": [], "trait_refs": []
+    }, "builtin": null}});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["caller", "use_scope"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [{"Ref": ["Erased", adt.clone(), "Shared"]}],
+            "output": adt
+        },
+        "body": "Opaque"
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "caller",
+            "type_decls": [owner],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let fd = llbc.fn_by_id(0).expect("use_scope");
+    assert!(
+        matches!(
+            tyref_to_value_type(&fd.signature.inputs[0], &llbc),
+            ValueType::Int
+        ),
+        "opaque `&RootScope` in a depending crate lives in the int bank"
+    );
+    assert!(
+        matches!(
+            tyref_to_value_type(&fd.signature.output, &llbc),
+            ValueType::Int
+        ),
+        "opaque by-value RootScope in a depending crate lives in the int bank"
     );
 }
 
@@ -12681,8 +12862,11 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });
@@ -12733,8 +12917,11 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
                 _ => None,
             })
             .collect();
+        // The `ob_type` leaf copy is a class-word read feeding only a
+        // `typeptr` store, which `prune_dead_boxing_remnants` sweeps
+        // (`jtransform.py rewrite_op_setfield` `is_typeptr_getset`).
         assert!(
-            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            header_leaves.contains(&"w_class") && !header_leaves.contains(&"ob_type"),
             "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
         );
     });

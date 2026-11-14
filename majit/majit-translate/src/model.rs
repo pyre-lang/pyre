@@ -7691,6 +7691,39 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
         match kind {
             // A dead `same_as` (`IDENTITY_OPS`) is removable.
             OpKind::UnaryOp { op, .. } if op == "same_as" => true,
+            // `lloperation.py` `getfield` has no side effect. A class-word
+            // read whose only reader is a `typeptr` store is dead:
+            // `jtransform.py rewrite_op_setfield` ignores that store.
+            OpKind::FieldRead { field, .. }
+                if crate::codewriter::heaptracker::is_typeptr_field(field) =>
+            {
+                true
+            }
+            // `lloperation.py` `cast_ptr_to_int` has no side effect; a
+            // dead address image of a pointer whose round trip was folded
+            // back to the pointer is removable, and so is the `r_uint`
+            // retype `gen_cast` puts after it for an unsigned destination.
+            OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if args.len() == 1
+                && (segments.iter().map(String::as_str).eq([
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "cast_ptr_to_int",
+                ]) || segments.iter().map(String::as_str).eq([
+                    "rpython",
+                    "rlib",
+                    "rarithmetic",
+                    "r_uint",
+                ])) =>
+            {
+                true
+            }
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
@@ -7748,6 +7781,16 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
+                // `jtransform.py rewrite_op_setfield` `is_typeptr_getset`:
+                // the store is ignored, `new` writes the class word. Its
+                // value is not a read.
+                OpKind::FieldWrite { base, field, .. }
+                    if crate::codewriter::heaptracker::is_typeptr_field(field) =>
+                {
+                    if !fresh_alloc_results.contains(base) {
+                        read_vars.insert(base.clone());
+                    }
+                }
                 // A store into a fresh allocation is live iff the allocation
                 // is live; the `base` is deliberately not rooted, so an unread
                 // allocation's stores die with it (malloc-removal exemption).
@@ -7862,7 +7905,13 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     for block in &mut graph.blocks {
         block.operations.retain(|op| {
             let drop = op.result.as_ref().is_some_and(|r| dead.contains(r))
-                || matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead.contains(base));
+                || matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead.contains(base))
+                || matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, value, .. }
+                        if crate::codewriter::heaptracker::is_typeptr_field(field)
+                            && value.as_variable().is_some_and(|v| dead.contains(v))
+                );
             if drop {
                 removed += 1;
             }
@@ -22813,6 +22862,70 @@ mod tests {
                 )
             }),
             "malloc_typed must remain"
+        );
+    }
+
+    #[test]
+    fn prune_dead_boxing_remnants_drops_class_word_read_feeding_typeptr_store() {
+        // `jtransform.py rewrite_op_setfield` ignores a `typeptr` store, so a
+        // class-word `getfield` read by nothing else is dead. Left in, it
+        // becomes a `guard_class` on a header nothing initialised
+        // (`handle_getfield_typeptr`). A class-word read with another reader
+        // stays.
+        type Var = crate::flowspace::model::Variable;
+        let ob_type = || FieldDescriptor {
+            name: "ob_type".into(),
+            owner_root: Some("pyre_object::pyobject::PyObject".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let read = |base: &Var| OpKind::FieldRead {
+            base: base.clone(),
+            field: ob_type(),
+            ty: ValueType::Int,
+            pure: false,
+        };
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let src = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, src.clone());
+        let dst = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, dst.clone());
+        let copied = graph.push_op_var(entry, read(&src), true).unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: dst.clone(),
+                field: ob_type(),
+                value: LinkArg::Value(copied.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let returned = graph.push_op_var(entry, read(&src), true).unwrap();
+        graph.set_return(entry, Some(returned.clone()));
+
+        prune_dead_boxing_remnants(&mut graph);
+
+        let ops = &graph.block(entry).operations;
+        assert!(
+            !ops.iter().any(|op| op.result.as_ref() == Some(&copied)),
+            "the class-word read feeding only the typeptr store must be swept"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldWrite { .. })),
+            "the typeptr store of a swept value must go with it"
+        );
+        assert!(
+            ops.iter().any(|op| op.result.as_ref() == Some(&returned)),
+            "a class-word read with a real reader must survive"
         );
     }
 

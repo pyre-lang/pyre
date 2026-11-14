@@ -511,6 +511,34 @@ fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
 }
 
 #[test]
+fn list_extend_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let canonical =
+        crate::jitcode_runtime::portal_jitcode_for_key(crate::extend_state::LIST_EXTEND_PORTAL_KEY)
+            .expect("the build-time table registers the list_extend portal");
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the list_extend portal index resolves to a runtime jitcode");
+
+    let scan = portal.reachable_symbolic_residuals();
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
+    );
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the list_extend portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / next / drain residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd3 walk",
+    );
+}
+
+#[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     let mut session = WalkSession::default();
 

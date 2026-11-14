@@ -342,7 +342,11 @@ pub struct RDict<K, V, S = RandomState> {
     /// `d.entries` (`DICTENTRYARRAY`). Null is `len(d.entries) == 0`.
     /// [`Self::num_ever_used_items`] is how far a slot walk reads; the array's
     /// `length` is the allocation.
-    entries: *mut GcEntries<K, V>,
+    ///
+    /// Public so `_ll_dictnext` (`rordereddict.py`) can `getfield(d, "entries")`
+    /// then `entries.valid(index)`. A getter call residualizes as a symbolic
+    /// path with no fnaddr.
+    pub entries: *mut GcEntries<K, V>,
     /// `d.num_live_items`.
     ///
     /// Public so `AbstractTypedStrategy.length` can read the header the way
@@ -350,7 +354,10 @@ pub struct RDict<K, V, S = RandomState> {
     /// A getter call would residualize.
     pub num_live_items: usize,
     /// `d.num_ever_used_items`.
-    num_ever_used_items: usize,
+    ///
+    /// Public so `_ll_dictnext` can `getfield(d, "num_ever_used_items")` the
+    /// same way `num_live_items` is a getfield.
+    pub num_ever_used_items: usize,
     /// `d.resize_counter`.  Signed because upstream tests `rc <= 0` after
     /// subtracting (rordereddict.py:684).
     resize_counter: isize,
@@ -845,14 +852,44 @@ impl<K, V, S> RDict<K, V, S> {
     /// moves.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
+        let slot = self.next_valid_slot_i(from);
+        if slot < 0 { None } else { Some(slot as usize) }
+    }
+
+    /// `_ll_dictnext` (`rordereddict.py`) as a single signed word: the first
+    /// live slot at or after `from`, or `-1` when the walk is exhausted.
+    /// Residual of `i64` is one result register (`ResidualRet`);
+    /// `Option<usize>` is two.
+    #[inline]
+    pub fn next_valid_slot_i(&self, from: usize) -> i64 {
         let mut i = from;
         while i < self.num_ever_used_items {
             if self.entry_valid(i) {
-                return Some(i);
+                return i as i64;
             }
             i += 1;
         }
-        None
+        -1
+    }
+
+    /// `entries[i].key` after `_ll_dictnext` returned `i`.
+    #[inline]
+    pub fn live_key(&self, slot: usize) -> K
+    where
+        K: Copy,
+    {
+        debug_assert!(self.is_valid_slot(slot));
+        self.entry_at(slot).key
+    }
+
+    /// `entries[i].value` after `_ll_dictnext` returned `i`.
+    #[inline]
+    pub fn live_value(&self, slot: usize) -> V
+    where
+        V: Copy,
+    {
+        debug_assert!(self.is_valid_slot(slot));
+        self.entry_at(slot).value
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below

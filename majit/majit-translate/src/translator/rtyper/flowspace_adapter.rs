@@ -6522,6 +6522,14 @@ pub(crate) fn derive_subject_inputcells(
                             cells.push(cell);
                             continue;
                         }
+                        // `RootScope` is the save_point int word. SomeInstance
+                        // here stamped GcRef onto `&self` while FUNC.ARGS of
+                        // `pin_roots` is Int (`history.py` `getkind` of a raw
+                        // `Ptr` / `llmemory.Address`).
+                        if crate::front::mir::is_root_scope_class_root(root) {
+                            cells.push(crate::annotator::model::s_int());
+                            continue;
+                        }
                         let cd = match interned {
                             Some(cd) => cd,
                             None if crate::annotator::bookkeeper::struct_root_is_string_family(
@@ -6609,6 +6617,10 @@ pub(crate) fn derive_subject_inputcells(
                 }
                 if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
                     cells.push(cell);
+                    continue;
+                }
+                if crate::front::mir::is_root_scope_class_root(root) {
+                    cells.push(crate::annotator::model::s_int());
                     continue;
                 }
             }
@@ -9775,6 +9787,41 @@ mod tests {
             },
             other => panic!("suffixed GcEntries must be Ptr(GcArray), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_rootscope_ref_as_int_bank() {
+        let owner = "gc_roots::RootScope";
+        let mut graph = LegacyGraph::new("RootScope::pin_roots");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("RootScope Input must seed");
+        assert!(
+            matches!(cells[0], SomeValue::Integer(_)),
+            "RootScope Input is the save_point int, got {:?}",
+            cells[0]
+        );
     }
 
     #[test]

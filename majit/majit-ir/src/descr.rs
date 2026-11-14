@@ -425,13 +425,69 @@ pub fn is_collector_array_tid(tid: u32) -> bool {
     tid != 0 && !array_tid_is_unresolved(tid)
 }
 
+/// A SizeDescr tid that can index `TypeRegistry`.
+///
+/// `0` is OBJECT (`gctypelayout.py` "don't use typeid 0"). The truncated
+/// low word of a 64-bit STRUCT `cache_key` is not a collector id
+/// ([`struct_tid_is_unresolved`]).
+pub fn is_collector_size_tid(cache_key: u64, tid: u32) -> bool {
+    tid != 0 && tid != UNSET_GC_TYPE_ID && !struct_tid_is_unresolved(cache_key, tid)
+}
+
+/// Compiled `NEW` / `NEW_WITH_VTABLE` / `bh_new` must not bake the
+/// truncated STRUCT `cache_key` or OBJECT's tid 0
+/// (`gctypelayout.py` "don't use typeid 0").
+pub fn assert_size_tid_for_malloc(cache_key: u64, tid: u32, what: &str) {
+    assert!(
+        is_collector_size_tid(cache_key, tid),
+        "{what}: SizeDescr.tid is not a collector id (gc.py \
+         init_size_descr / TypeLayoutBuilder.get_type_id); got {tid}"
+    );
+}
+
+/// `gc.py init_size_descr` then `handle_new_fixedsize` `gen_initialize_tid`
+/// for a descr the rewrite is about to allocate. Headerless and non-GC
+/// descrs have no tid word.
+pub fn stamp_and_assert_size_tid_for_malloc(descr: &DescrRef, what: &str) {
+    gc_cache().lock().ensure_size_collector_tid(descr);
+    if let Some(sd) = descr.as_size_descr()
+        && sd.is_gc_managed()
+        && !sd.headerless()
+    {
+        assert_size_tid_for_malloc(sd.cache_key(), sd.type_id(), what);
+    }
+}
+
 /// Compiled `NEW_ARRAY*` / `bh_new_array` must not bake the mint sentinel.
+///
+/// `gen_malloc_array` also allocates `gc_ll_descr.str_descr` /
+/// `unicode_descr`, which the GC description owns; their tid is whatever
+/// the installed allocator published, and `check_typeid` is the framework
+/// helper's own runtime check, not the rewriter's.
 pub fn assert_array_tid_for_malloc(tid: u32, what: &str) {
     assert!(
         !array_tid_is_unresolved(tid),
         "{what}: ArrayDescr.tid is unresolved (gc.py init_array_descr / \
          TypeLayoutBuilder.get_type_id)"
     );
+}
+
+/// `gc.py init_array_descr` then `malloc_array` `check_typeid` for an
+/// `op.getdescr()` mint the rewrite or leftover assembler is about to
+/// allocate: neither the mint sentinel nor OBJECT's tid 0
+/// (`gctypelayout.py` "don't use typeid 0").
+pub fn stamp_and_assert_array_tid_for_malloc(descr: &DescrRef, what: &str) {
+    gc_cache().lock().ensure_array_collector_tid(descr);
+    if let Some(ad) = descr.as_array_descr()
+        && ad.is_gc_managed()
+    {
+        let tid = ad.type_id();
+        assert!(
+            is_collector_array_tid(tid),
+            "{what}: ArrayDescr.tid is not a collector array id (gc.py \
+             init_array_descr / TypeLayoutBuilder.get_type_id); got {tid}"
+        );
+    }
 }
 
 fn array_len_offset(ad: &dyn ArrayDescr) -> usize {
@@ -585,6 +641,18 @@ pub fn size_descr_same_struct_layout(
     cached_offsets.sort_unstable();
     incoming.sort_unstable();
     cached_offsets == incoming
+}
+
+/// `gc.py init_size_descr` stamps `TypeLayoutBuilder.get_type_id(S)` on
+/// the SizeDescr for STRUCT. A vtable-0 reconstruction of that STRUCT
+/// keeps its own typeptr slot and takes the cached collector tid.
+fn adopt_cached_collector_tid(built: &SimpleSizeDescr, cached: &SimpleSizeDescr) {
+    if is_collector_size_tid(built.cache_key(), built.type_id()) {
+        return;
+    }
+    if is_collector_size_tid(cached.cache_key(), cached.type_id()) {
+        built.set_type_id(cached.type_id());
+    }
 }
 
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
@@ -2213,6 +2281,110 @@ impl GcCache {
             }
         }
         arraydescr.set_type_id(UNSET_GC_TYPE_ID);
+    }
+
+    /// `gc.py GcLLDescr_framework.init_array_descr` for a descr that
+    /// already exists. Compile-time GIL-held stamp so
+    /// `handle_new_array` / leftover `genop_new_array` never bake
+    /// [`UNSET_GC_TYPE_ID`]. TestArrayDescr and other non-Simple
+    /// impls are left alone (`as_any` miss).
+    pub fn ensure_array_collector_tid(&self, descr: &DescrRef) {
+        let Some(ad) = descr
+            .as_any()
+            .and_then(|any| any.downcast_ref::<SimpleArrayDescr>())
+        else {
+            return;
+        };
+        self.stamp_simple_array_descr(ad);
+    }
+
+    /// `gc.py GcLLDescr_framework.init_size_descr` for a descr that
+    /// already exists. Compile-time GIL-held stamp so `handle_new`
+    /// never bakes the truncated STRUCT `cache_key`. TestSizeDescr and
+    /// other non-Simple impls are left alone (`as_any` miss).
+    pub fn ensure_size_collector_tid(&self, descr: &DescrRef) {
+        let Some(sd) = descr
+            .as_any()
+            .and_then(|any| any.downcast_ref::<SimpleSizeDescr>())
+        else {
+            return;
+        };
+        if !sd.is_gc_managed() || sd.headerless() {
+            return;
+        }
+        if is_collector_size_tid(sd.cache_key(), sd.type_id()) {
+            return;
+        }
+        let key = sd.cache_key();
+        if key != 0
+            && let Some((tid, cached_size)) = self.resolve_struct_layout(key)
+            && cached_size == sd.size()
+            && is_collector_size_tid(key, tid)
+        {
+            sd.set_type_id(tid);
+            return;
+        }
+        self.stamp_simple_size_descr_for_malloc(sd);
+    }
+
+    /// Layout half of `TypeLayoutBuilder.get_type_id(S)` when the
+    /// STRUCT identity (`cache_key`) is missing. `register_struct_tid_now`
+    /// `find_fixed_type` reuses the existing collector slot for that
+    /// payload size and `offsets_to_gc_pointers`.
+    pub fn collector_tid_for_size_layout(&self, size: usize, offsets: Vec<usize>) -> u32 {
+        let Some(register) = self.struct_tid_register else {
+            return 0;
+        };
+        let tid = register(size, offsets);
+        if tid != 0 && tid != UNSET_GC_TYPE_ID {
+            tid
+        } else {
+            0
+        }
+    }
+
+    fn stamp_simple_size_descr_for_malloc(&self, sd: &SimpleSizeDescr) {
+        if !sd.is_gc_managed() || sd.headerless() {
+            return;
+        }
+        if is_collector_size_tid(sd.cache_key(), sd.type_id()) {
+            return;
+        }
+        let Some(register) = self.struct_tid_register else {
+            return;
+        };
+        let offsets: Vec<usize> = sd
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        let tid = register(sd.size(), offsets);
+        if tid != 0 && !struct_tid_is_unresolved(sd.cache_key(), tid) {
+            sd.set_type_id(tid);
+        }
+    }
+
+    /// Layout half of `TypeLayoutBuilder.get_type_id(A)` when the
+    /// ARRAY identity (`cache_key`) is missing. `register_array_layout`
+    /// `find_varsize_type` reuses the existing collector slot for the
+    /// ItemsBlock shape.
+    pub fn collector_tid_for_array_layout(
+        &self,
+        base_size: usize,
+        item_size: usize,
+        len_offset: usize,
+        is_ptr: bool,
+    ) -> u32 {
+        let Some(register) = self.array_tid_register else {
+            return UNSET_GC_TYPE_ID;
+        };
+        let offsets = if is_ptr { vec![0] } else { Vec::new() };
+        let tid = register(base_size, item_size, len_offset, offsets, is_ptr);
+        if array_tid_is_unresolved(tid) {
+            UNSET_GC_TYPE_ID
+        } else {
+            tid
+        }
     }
 
     /// `descr.py get_array_descr`: `arraydescr.all_interiorfielddescrs = descrs`
@@ -5954,6 +6126,23 @@ pub trait SizeDescr: Descr {
         false
     }
 
+    /// Whether `NEW` for this descr must allocate as a young non-moving
+    /// rawmalloc (`incminimark.py` `external_malloc(..., alloc_young=True)`),
+    /// skipping the movable nursery.
+    ///
+    /// Distinct from [`SizeDescr::non_moving`]: that flag is the old
+    /// generation (`malloc_big_fixedsize_oldgen_fn`). This flag declines
+    /// the nursery and takes `malloc_big_fixedsize_fn`, whose helper is
+    /// `do_malloc_fixedsize_clear`'s large arm. Use it when the host
+    /// allocator for the type is `try_gc_alloc_young_nonmoving_raw` and a
+    /// residual caller holds a raw pointer across collections without a
+    /// shadowstack rewrite (`pyframe.py PyFrame.__init__` is
+    /// `_always_inline_` and returns the malloc'd `W_Root`; pyre's
+    /// `FrameBox::new` is that malloc).
+    fn young_nonmoving(&self) -> bool {
+        false
+    }
+
     /// Vtable address, if is_object().
     fn vtable(&self) -> usize {
         0
@@ -7487,6 +7676,9 @@ pub struct SimpleSizeDescr {
     /// (`id_of_type`). Set once that id is this descr's tid so
     /// `replay_synthetic_struct_tids` does not assign a new one.
     collector_tid_fixed: AtomicBool,
+    /// Young-rawmalloc bit for `NEW` rewriting; see
+    /// [`SizeDescr::young_nonmoving`].
+    young_nonmoving: AtomicBool,
     /// descr.py `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py `self.gc_fielddescrs = gc_fielddescrs`.
@@ -7520,6 +7712,7 @@ impl Clone for SimpleSizeDescr {
             headerless: self.headerless,
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
             collector_tid_fixed: AtomicBool::new(self.collector_tid_fixed.load(Ordering::Relaxed)),
+            young_nonmoving: AtomicBool::new(self.young_nonmoving.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
             assigned_all_fielddescrs: {
@@ -7562,6 +7755,7 @@ impl SimpleSizeDescr {
             headerless: false,
             non_moving: AtomicBool::new(false),
             collector_tid_fixed: AtomicBool::new(false),
+            young_nonmoving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7584,6 +7778,7 @@ impl SimpleSizeDescr {
             headerless: false,
             non_moving: AtomicBool::new(false),
             collector_tid_fixed: AtomicBool::new(false),
+            young_nonmoving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7639,6 +7834,14 @@ impl SimpleSizeDescr {
     /// it after the descr is already behind an `Arc` and registered.
     pub fn set_non_moving(&self, non_moving: bool) {
         self.non_moving.store(non_moving, Ordering::Relaxed);
+    }
+
+    /// Override the young-rawmalloc flag (default `false`); see
+    /// [`SizeDescr::young_nonmoving`].  Takes `&self` so a frontend can stamp
+    /// it after the descr is already behind an `Arc` and registered.
+    pub fn set_young_nonmoving(&self, young_nonmoving: bool) {
+        self.young_nonmoving
+            .store(young_nonmoving, Ordering::Relaxed);
     }
 
     /// descr.py — `get_size_descr` calls
@@ -7772,6 +7975,9 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn non_moving(&self) -> bool {
         self.non_moving.load(Ordering::Relaxed)
+    }
+    fn young_nonmoving(&self) -> bool {
+        self.young_nonmoving.load(Ordering::Relaxed)
     }
     fn vtable(&self) -> usize {
         self.vtable
@@ -8117,7 +8323,15 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
         {
             cached
         }
-        Ok(_) => built,
+        // Incoming vtable 0 vs a published object vtable: keep the
+        // allocation's typeptr slot and take `init_size_descr`'s tid
+        // from cache[STRUCT] when the positional lists name one layout.
+        Ok(cached) => {
+            if size_descr_same_struct_layout(&*cached, size, &incoming_offsets) {
+                adopt_cached_collector_tid(&built, &cached);
+            }
+            built
+        }
         Err(_) => built,
     };
     SimpleDescrGroup {
@@ -9858,6 +10072,42 @@ mod register_keyed_size_authority_tests {
         assert_eq!(count, 0);
     }
 
+    #[test]
+    fn ensure_array_collector_tid_stamps_a_no_identity_pointer_array() {
+        let mut gc = GcCache::new();
+        gc.set_collector_tid_register(None, Some(test_mint_array_tid));
+        let ad = SimpleArrayDescr::with_flag(
+            u32::MAX,
+            8,
+            8,
+            UNSET_GC_TYPE_ID,
+            Type::Ref,
+            ArrayFlag::Pointer,
+        );
+        let descr: DescrRef = Arc::new(ad);
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), UNSET_GC_TYPE_ID);
+        gc.ensure_array_collector_tid(&descr);
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
+        assert_eq!(gc.collector_tid_for_array_layout(8, 8, 0, true), 99);
+    }
+
+    #[test]
+    fn ensure_size_collector_tid_stamps_a_truncated_cache_key_from_the_slot() {
+        let mut gc = GcCache::new();
+        let cache_key = 0x7482_5ac7_e446_96c6_u64;
+        let unresolved = cache_key as u32;
+        assert!(struct_tid_is_unresolved(cache_key, unresolved));
+        gc.register_keyed_size(
+            LLType::Struct(cache_key),
+            sized_with_cache_key(cache_key, 42, 0x1000, &[16]),
+        );
+        let truncated = sized_with_cache_key(cache_key, unresolved, 0, &[16]);
+        assert_eq!(truncated.as_size_descr().unwrap().type_id(), unresolved);
+        gc.ensure_size_collector_tid(&truncated);
+        assert_eq!(truncated.as_size_descr().unwrap().type_id(), 42);
+        assert_eq!(gc.collector_tid_for_size_layout(24, vec![16]), 0);
+    }
+
     fn test_mint_array_tid_forbidden(
         _base: usize,
         _item: usize,
@@ -10195,6 +10445,52 @@ mod register_keyed_size_authority_tests {
         let expected = (1, 0x1000, 1);
         assert_eq!(survivor(collector(), truncated()), expected);
         assert_eq!(survivor(truncated(), collector()), expected);
+    }
+
+    #[test]
+    fn vtable0_new_adopts_the_cached_collector_tid_when_layouts_match() {
+        let cache_key = 0x7482_5ac7_e446_96c7_u64;
+        let spec = SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "pycode".to_string(),
+            name: "PyFrame.pycode".to_string(),
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Ref,
+            is_immutable: true,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Pointer,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let class = make_simple_descr_group_keyed_with_headerless(
+            7,
+            104,
+            37,
+            cache_key,
+            0x1000,
+            true,
+            false,
+            &[spec.clone()],
+            &[],
+        );
+        let plain = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            104,
+            cache_key as u32,
+            cache_key,
+            0,
+            true,
+            false,
+            &[spec],
+            &[],
+        );
+        assert_eq!(plain.size_descr.vtable(), 0);
+        assert_eq!(plain.size_descr.type_id(), 37);
+        assert!(!Arc::ptr_eq(&class.size_descr, &plain.size_descr));
     }
 
     #[test]

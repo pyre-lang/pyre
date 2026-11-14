@@ -6136,6 +6136,25 @@ impl CallControl {
             None => 0,
             Some(off) => self.array_items_base(off + self.array_header_size, elem_ref, item_size),
         };
+        // `descr.py get_array_descr` always has an ARRAY lltype.
+        // A GC pointer array with the ItemsBlock layout is
+        // `cpu.arraydescrof(GcArray(OBJECTPTR))`
+        // (`OBJECT_REF_GCARRAY_TYPE_ID`). A no-identity mint skipped
+        // `_cache_array` and `register_unresolved_array_tids`, so
+        // rewrite `gen_initialize_tid` baked `UNSET_GC_TYPE_ID`.
+        let object_ref_gcarray_id;
+        let array_type_id = if array_type_id.is_none()
+            && ir_type == majit_ir::value::Type::Ref
+            && flag == majit_ir::descr::ArrayFlag::Pointer
+            && base_size == crate::layout::target_word_size()
+            && item_size == crate::layout::target_word_size()
+            && len_offset == Some(0)
+        {
+            object_ref_gcarray_id = Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+            &object_ref_gcarray_id
+        } else {
+            array_type_id
+        };
         // `descr.py get_array_descr(gccache, ARRAY_OR_STRUCT)`:
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype.
         // After intern, that identity is `array_type_id_of_lltype`
@@ -6328,7 +6347,11 @@ impl CallControl {
                 ad.concrete_type = concrete_type;
                 let arc: std::sync::Arc<majit_ir::descr::SimpleArrayDescr> =
                     std::sync::Arc::new(ad);
-                majit_ir::descr_registry::register_array(arc.clone() as majit_ir::descr::DescrRef);
+                let descr_ref: majit_ir::descr::DescrRef = arc.clone();
+                majit_ir::descr::gc_cache()
+                    .lock()
+                    .ensure_array_collector_tid(&descr_ref);
+                majit_ir::descr_registry::register_array(descr_ref);
                 (arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>, None)
             }
         };
@@ -10578,10 +10601,11 @@ fn calldescr_type_of_value_type(
             if crate::front::llbc_hints::alloc_flavor_raw_contains(
                 raw_alloc_flavor_structs,
                 name,
-            ) =>
+            ) || crate::front::mir::is_root_scope_class_root(name) =>
         {
             // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
-            // Front stays `Ref(Some(flavor))`.
+            // Front stays `Ref(Some(flavor))`. `RootScope` is the same
+            // save_point address word (`llmemory.Address`).
             Some(Type::Int)
         }
         // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
@@ -25008,6 +25032,146 @@ mod tests {
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Ref);
+    }
+
+    #[test]
+    fn getcalldescr_gcref_result_uses_declared_ref_over_front_int() {
+        // `call.py RESULT == FUNC.RESULT`: `llmemory.GCREF` stays Ref even
+        // when the frontend dest is a raw pointer word.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["heapify_gcref"]);
+        let target = CallTarget::function_path(["heapify_gcref"]);
+        let mut graph = simple_graph("heapify_gcref").with_return_type("gcref");
+        graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_type_for_target(&target), Some(Type::Ref));
+        assert_eq!(cc.declared_return_kind(&path), Some('r'));
+
+        let mut caller = FunctionGraph::new("createframe");
+        let result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(result.clone()));
+        let config = crate::jtransform::GraphTransformConfig::default();
+        let transformed = crate::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&caller);
+        assert!(
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::CallResidual { result_kind: 'r', descriptor, .. }
+                        if descriptor.result_ir_type() == Type::Ref
+                )),
+            "GCREF FUNC.RESULT must residual_call *_r against a front Int dest"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::GcRef
+        );
+    }
+
+    #[test]
+    fn getcalldescr_raw_ptr_result_uses_declared_int_over_front_ref() {
+        // `call.py RESULT == FUNC.RESULT`: `history.getkind` of a raw `Ptr`
+        // is `'int'` even when the frontend dest is `*const ()` / Ref.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["w_code_get_ptr"]);
+        let target = CallTarget::function_path(["w_code_get_ptr"]);
+        let mut graph = simple_graph("w_code_get_ptr").with_return_type("i64");
+        graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_type_for_target(&target), Some(Type::Int));
+        assert_eq!(cc.declared_return_kind(&path), Some('i'));
+
+        let mut caller = FunctionGraph::new("try_createframe");
+        let result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target: target.clone(),
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(result.clone()));
+        let config = crate::jtransform::GraphTransformConfig::default();
+        let transformed = crate::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&caller);
+        assert!(
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::CallResidual { result_kind: 'i', descriptor, .. }
+                        if descriptor.result_ir_type() == Type::Int
+                )),
+            "raw Ptr FUNC.RESULT must residual_call *_i against a front Ref dest"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::Signed
+        );
+
+        let mut cc = CallControl::new();
+        let mut graph = simple_graph("w_code_get_ptr").with_return_type("i64");
+        let ret = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(ret));
+        cc.register_function_graph(path.clone(), graph);
+        cc.add_candidate_graph(path);
+        let mut caller = FunctionGraph::new("try_createframe");
+        let result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(result.clone()));
+        let transformed = crate::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&caller);
+        assert!(
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::InlineCall {
+                        result_kind: 'i',
+                        ..
+                    }
+                )),
+            "raw Ptr FUNC.RESULT must inline_call *_i against a front Ref dest"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::Signed
+        );
     }
 
     #[test]

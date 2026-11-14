@@ -471,6 +471,35 @@ impl RootScope {
         self.save_point
     }
 
+    /// Residual ABI: one `save_point` word. The caller owns the bracket and
+    /// closes it with [`root_scope_close`].
+    #[inline]
+    pub fn into_word(self) -> usize {
+        let word = self.save_point;
+        std::mem::forget(self);
+        word
+    }
+
+    /// Residual ABI inverse of [`Self::into_word`].
+    #[inline]
+    pub fn from_word(save_point: usize) -> Self {
+        Self {
+            save_point,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Borrow the save_point word as a scope for one residual. Drop is
+    /// forgotten: the interpreter frame still owns the bracket
+    /// (`root_scope_close` is the closer).
+    #[inline]
+    fn with_save_point<R>(save_point: usize, f: impl FnOnce(&Self) -> R) -> R {
+        let scope = Self::from_word(save_point);
+        let result = f(&scope);
+        std::mem::forget(scope);
+        result
+    }
+
     /// Scope-local [`pin_root`] on this thread's root-stack cell.
     #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
@@ -546,28 +575,6 @@ impl RootScope {
         }
     }
 
-    /// One-word residual ABI for [`Self::publish`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn publish_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.publish(&items) as i64
-    }
-
-    /// One-word residual ABI for [`Self::pin_roots`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn pin_roots_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.pin_roots(&items) as i64
-    }
-
     /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
     #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
@@ -620,17 +627,16 @@ impl RootScope {
 impl Drop for RootScope {
     #[inline]
     fn drop(&mut self) {
-        root_scope_close(self);
+        root_scope_close(self.save_point);
     }
 }
 
 /// Truncate the shadow stack to the length captured at construction time,
 /// mirroring `pop_roots`'s discard of the bracketed `livevars` slots.
 ///
-/// This is the bracket's close spelled as a call taking the guard by
-/// reference. A crate that sees `RootScope` only as an opaque cross-crate
-/// stub cannot read `save_point` to close a bracket inline, but it can name
-/// this function; the field read then happens behind it.
+/// The residual takes the `save_point` word (`history.py` `getkind` of a raw
+/// `Ptr` / `llmemory.Address` is int). A crate that sees `RootScope` only as
+/// an opaque stub cannot read the field inline, but it can name this helper.
 ///
 /// A residual for the same reason `pin_root` and `shadow_stack_cell_truncate`
 /// are: the bracket's helpers are named by the runtime rather than looked
@@ -638,7 +644,7 @@ impl Drop for RootScope {
 /// declaration of it.
 #[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn root_scope_close(scope: &RootScope) {
+pub fn root_scope_close(save_point: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
     let cell = shadow_stack_cell();
@@ -647,12 +653,77 @@ pub fn root_scope_close(scope: &RootScope) {
     // this one's pins: the guard, or a value owning it, outlived that
     // bracket, and every slot it reads back is gone.
     debug_assert!(
-        scope.save_point <= shadow_stack_cell_len(cell),
+        save_point <= shadow_stack_cell_len(cell),
         "a root scope closed after a bracket that enclosed it"
     );
     // `truncate` is a no-op if `save_point >= len()`, which is
     // the steady-state case for an empty bracket.
-    shadow_stack_cell_truncate(cell, scope.save_point);
+    shadow_stack_cell_truncate(cell, save_point);
+}
+
+/// Residual ABI for [`RootScope::publish`]. The receiver is the save_point
+/// word (`history.py` `getkind` of a raw `Ptr` / `llmemory.Address`).
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_publish_jit_abi(
+    save_point: usize,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    let items = gcarray_ref_items(array);
+    RootScope::with_save_point(save_point, |scope| scope.publish(&items) as i64)
+}
+
+/// Residual ABI for [`RootScope::pin_roots`]. The receiver is the save_point
+/// word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_pin_roots_jit_abi(
+    save_point: usize,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    let items = gcarray_ref_items(array);
+    RootScope::with_save_point(save_point, |scope| scope.pin_roots(&items) as i64)
+}
+
+/// Residual ABI for [`RootScope::pin_root`]. The receiver is the save_point
+/// word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_pin_root_jit_abi(save_point: usize, root: PyObjectRef) -> PyObjectRef {
+    RootScope::with_save_point(save_point, |scope| scope.pin_root(root))
+}
+
+/// Residual ABI for [`RootScope::get`]. The receiver is the save_point word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_get_jit_abi(save_point: usize, index: usize) -> PyObjectRef {
+    RootScope::with_save_point(save_point, |scope| scope.get(index))
+}
+
+/// Residual ABI for [`RootScope::normalize`]. The receiver is the save_point
+/// word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_normalize_jit_abi(save_point: usize, base: usize, len: usize) {
+    RootScope::with_save_point(save_point, |scope| scope.normalize(base, len))
+}
+
+/// Residual ABI for [`RootScope::set`]. The receiver is the save_point word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_set_jit_abi(save_point: usize, index: usize, root: PyObjectRef) {
+    RootScope::with_save_point(save_point, |scope| scope.set(index, root))
+}
+
+/// Residual ABI for [`RootScope::base`]. The receiver is the save_point word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_base_jit_abi(save_point: usize) -> usize {
+    save_point
+}
+
+/// Residual ABI for [`RootScope::normalize_moved`]. The receiver is the
+/// save_point word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_normalize_moved_jit_abi(
+    save_point: usize,
+    base: usize,
+    len: usize,
+) -> bool {
+    RootScope::with_save_point(save_point, |scope| scope.normalize_moved(base, len))
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to

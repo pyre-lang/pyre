@@ -3978,10 +3978,11 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
 
 /// The leaked `CodeObject` address stored on a known `PyCode`.
 ///
-/// `CodeObject` is raw (`_alloc_flavor_ = raw`); the result is an Address,
-/// the same kind `history.py getkind` gives a `Ptr` whose `TO._gckind ==
-/// 'raw'`. Erasing to `*const ()` banks the result as a GC ref and makes
-/// callers emit `inline_call_*_r` against a callee that `int_return`s.
+/// `CodeObject` is raw (`_alloc_flavor_ = raw`); the result is an Address.
+/// `history.getkind` of that `Ptr` is `'int'` (`rclass.py` `getgcflavor`,
+/// `TO._gckind == 'raw'`). Erasing to `*const ()` banks the result as a GC
+/// ref and makes callers emit `inline_call_*_r` against a callee that
+/// `int_return`s.
 ///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
@@ -4289,6 +4290,50 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     }
 }
 
+/// `pycode.py frame_stores_global`'s `self.w_globals = w_globals` arm.
+///
+/// Upstream stores under the GIL. The free-threaded publish is a
+/// compare-exchange under the watcher lock, preceded by a barrier that holds
+/// its words in a rooting bracket; none of that has a traced shape (a raw
+/// read of a root slot is `jtransform.py rewrite_op_raw_load`'s refused
+/// `'r'` kind), so it runs as a residual. Returns null when this call
+/// published `w_globals`, otherwise the pointer that won the race.
+///
+/// # Safety
+/// `obj` must point to a valid `PyCode`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_code_publish_first_w_globals(
+    obj: PyObjectRef,
+    w_globals: PyObjectRef,
+) -> PyObjectRef {
+    // Prebuilt-family store (see `w_code_set_w_globals`): the barrier runs
+    // before the publication, so a collection that observes the new child
+    // through this slot finds the slot already remembered. A lost race
+    // leaves only a conservative barrier behind.
+    let rooted = publish_code_slot_store_rooting(obj, &[w_globals]);
+    let obj = rooted.owner();
+    let code = obj as *mut PyCode;
+    let w_globals = rooted.get(0);
+    // `rclass.py hook_setfield` ahead of the store to `pycode.py`
+    // `"w_globals?"`. The null check, the sweep and the store share the
+    // watcher lock. A lost race must not sweep the winner's watcher.
+    match unsafe {
+        pyre_object::quasiimmut::publish_quasi_immut_cas(
+            &(*code).mutate_w_globals,
+            std::ptr::addr_of_mut!((*code).w_globals),
+            pyre_object::PY_NULL,
+            w_globals,
+        )
+    } {
+        Ok(()) => {
+            register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
+            register_w_globals_stamped_code(obj);
+            pyre_object::PY_NULL
+        }
+        Err(winner) => winner,
+    }
+}
+
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
 /// # Safety
@@ -4315,33 +4360,13 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     };
     let mut published = slot.load(std::sync::atomic::Ordering::Acquire);
     if published.is_null() {
-        // Prebuilt-family store (see `w_code_set_w_globals`): the barrier runs
-        // before the publication, so a collection that observes the new child
-        // through this slot finds the slot already remembered. A lost race
-        // leaves only a conservative barrier behind.
-        let rooted =
-            publish_code_slot_store_rooting(roots.get(root_base), &[roots.get(root_base + 1)]);
-        let obj = rooted.owner();
-        let code = obj as *mut PyCode;
-        let w_globals = rooted.get(0);
-        // `rclass.py hook_setfield` ahead of the store to `pycode.py`
-        // `"w_globals?"`. The null check, the sweep and the store share the
-        // watcher lock. A lost race must not sweep the winner's watcher.
-        match unsafe {
-            pyre_object::quasiimmut::publish_quasi_immut_cas(
-                &(*code).mutate_w_globals,
-                std::ptr::addr_of_mut!((*code).w_globals),
-                pyre_object::PY_NULL,
-                w_globals,
-            )
-        } {
-            Ok(()) => {
-                register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
-                register_w_globals_stamped_code(obj);
-                return false;
-            }
-            Err(winner) => published = winner,
+        let winner = unsafe {
+            w_code_publish_first_w_globals(roots.get(root_base), roots.get(root_base + 1))
+        };
+        if winner.is_null() {
+            return false;
         }
+        published = winner;
     }
     // The wrapper may have moved since its first globals stamp. The live frame
     // supplying `obj` is authoritative, so keep the raw-code compatibility
@@ -4802,6 +4827,13 @@ fn live_code_wrappers() -> &'static parking_lot::Mutex<majit_gc::address_dict::A
 /// The frame/function field supplying `wrapper` is the authoritative GC edge.
 /// Refreshing an existing entry is required now that `PyCode` follows
 /// `pycode.py class PyCode(W_Root)` and can move between calls.
+///
+/// `pycode.py frame_stores_global` is a field store of `w_globals`. This
+/// address map is the pyre-only live-wrapper registry for the raw
+/// `CodeObject` / GC `PyCode` split; the HashMap insert loops, so
+/// `look_inside_graph` residualizes the whole body. Residualise it
+/// (`@jit.dont_look_inside`) and bind the fnaddr so the CALL is executable.
+#[majit_macros::dont_look_inside]
 pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     if code_ptr.is_null() || wrapper.is_null() {
         return;
@@ -5543,7 +5575,12 @@ fn w_globals_stamped_codes() -> &'static parking_lot::Mutex<std::collections::Ha
 }
 
 /// Record `obj` as a code object holding a stamped `w_globals` slot.
-fn register_w_globals_stamped_code(obj: PyObjectRef) {
+///
+/// The HashSet insert loops, so `look_inside_graph` residualizes the whole
+/// body. Residualise it (`@jit.dont_look_inside`) and bind the fnaddr;
+/// `pycode.py frame_stores_global` has no such registry.
+#[majit_macros::dont_look_inside]
+pub(crate) fn register_w_globals_stamped_code(obj: PyObjectRef) {
     // A managed PyCode's own custom trace owns this edge.  Only bootstrap
     // wrappers outside the collector need the compatibility registry; making
     // every managed code's globals an independent root would turn

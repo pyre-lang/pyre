@@ -600,6 +600,11 @@ pub(crate) fn list_extend_items(
         extend_from_list(list, other)?;
     } else if unsafe { is_exact_tuple(other) } {
         extend_from_tuple(list, other)?;
+    } else if unsafe { pyre_object::generator::is_generator(other) } {
+        // listobject.py `ListStrategy.extend`: `space.is_generator(w_any)`
+        // then `w_any.unpack_into_w(w_list)`. The drain is
+        // `generator.py unpack_into_w`, not `_do_extend_from_iterable`.
+        crate::baseobjspace::generator_unpack_into_w(other, list)?;
     } else if unsafe {
         pyre_object::is_set_or_frozenset(other)
             && crate::objspace::std::mapdict::instance_getclass(other)
@@ -807,10 +812,10 @@ fn extend_from_frame_locals_proxy(list: PyObjectRef, other: PyObjectRef) -> bool
     crate::pyframe::frame_locals_proxy::extend_bound_entries(list, other, 0)
 }
 
-/// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
-/// through the `_do_extend_jitdriver` portal, so the caller's trace never
-/// inlines the drain; here the whole arm is one residual call with a real
-/// fnaddr.  `FrameLocalsProxy` does not take this arm.
+/// `listobject.py ListStrategy._extend_from_iterable`.  Length-hint and
+/// resize stay in this residual so the caller's trace does not inherit the
+/// drain; `_do_extend_from_iterable` enters the `_do_extend_jitdriver`
+/// portal.  `FrameLocalsProxy` does not take this arm.
 #[majit_macros::dont_look_inside]
 fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     // Hint failures other than TypeError/AttributeError are observable and
@@ -884,47 +889,145 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
     Ok(())
 }
 
-/// `listobject.py _do_extend_from_iterable`.  Returns the number of appended
-/// items (`extended`).  Upstream drains through the
-/// `_do_extend_jitdriver` portal (`greens=['strategy_type', 'greenkey']`),
-/// which is not ported; here the drain runs inside the residual
-/// [`extend_from_iterable`].  A length hint is advisory, so it cannot bound
-/// an unrolled drain either.
+/// `listobject.py _do_extend_from_iterable` prologue: `iter` already ran
+/// in [`extend_from_iterable`]; compute `iterator_greenkey` and enter the
+/// split portal (`warmspot.py rewrite_jit_merge_point` → `portal_runner`).
+/// Returns the number of appended items (`extended`) so the caller can
+/// `_resize_hint` when the hint was too large (`listobject.py`).
 fn do_extend_from_iterable(
     list: PyObjectRef,
     w_iterator: PyObjectRef,
 ) -> Result<usize, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(&[list, w_iterator]);
-    let mut extended = 0usize;
+    let greenkey = crate::baseobjspace::iterator_greenkey(pyre_object::gc_roots::shadow_stack_get(
+        root_base + 1,
+    ));
+    let n = crate::call::list_extend_portal_runner(
+        greenkey,
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+    )?;
+    Ok(n as usize)
+}
+
+/// Append `w_item` to the list published at shadow-stack slot `slot`.
+///
+/// The read has to happen here rather than in the drain's `Ok` arm.
+/// `try_fuse_drain_match` (`majit-translate front/result_exc.rs`) recognises
+/// that arm only when the `Result` payload read is the carrier's sole use and
+/// feeds the arm's single call directly.
+///
+/// # Safety
+/// `slot` must be a live shadow-stack index holding a `W_List`.
+unsafe fn extend_drain_append_at(slot: usize, w_item: PyObjectRef) {
+    unsafe {
+        pyre_object::listobject::drain_list_append(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            w_item,
+        )
+    }
+}
+
+/// `listobject.py` `_do_extend_jitdriver`.
+///
+/// The metainterp recognizes `list_extend_driver.jit_merge_point(...)`
+/// (a `CallTarget::Method` on this receiver type) and lowers it to a
+/// `BC_JIT_MERGE_POINT` once this graph is registered as a portal.
+struct ListExtendJitDriver;
+
+impl ListExtendJitDriver {
+    /// `listobject.py` `_do_extend_from_iterable`
+    /// `_do_extend_jitdriver.jit_merge_point(greenkey=..., strategy_type=...)`.
+    /// `i` is the loop-carried append count (`reds='auto'`). `root_base` is
+    /// the pinned iterator slot (`pin_roots`); the runtime hook must receive
+    /// that usize local rather than reconstruct it from stack depth.
+    #[inline]
+    fn jit_merge_point(
+        &self,
+        strategy_type: i64,
+        greenkey: PyObjectRef,
+        w_iterator: PyObjectRef,
+        w_list: PyObjectRef,
+        i: i64,
+        root_base: i64,
+    ) {
+        crate::call::list_extend_merge_point(
+            strategy_type,
+            greenkey,
+            w_iterator,
+            w_list,
+            i,
+            root_base,
+        );
+    }
+}
+
+/// `listobject.py` `_do_extend_jitdriver`.
+#[allow(non_upper_case_globals)]
+const list_extend_driver: ListExtendJitDriver = ListExtendJitDriver;
+
+/// Split-portal body of `_do_extend_from_iterable`: the loop that starts
+/// at `jit_merge_point`. Pin order `[w_iterator, w_list, greenkey]` matches
+/// `unpackiterable_portal` so `next(shadow_stack_get(root_base))` is the
+/// last op of its block and the Ok arm is only `extend_drain_append_at`.
+/// `i += 1` sits after the match, as in `listobject.py`.
+///
+/// `strategy_type` is re-read each iteration (`type(w_list.strategy)`):
+/// Empty switches to Integer on the first append and the next merge-point
+/// is a new green. The Int discriminant stands in for the strategy class
+/// object. `i` is the loop-carried append count (`listobject.py`).
+pub fn list_extend_portal(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    w_list: PyObjectRef,
+) -> Result<i64, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_iterator, w_list, greenkey]) as i64;
+    let list_slot = root_base + 1;
+    let mut i = 0i64;
     loop {
-        let item =
-            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
-            {
-                Ok(item) => item,
-                Err(err) => {
-                    let (stop, err) = err.matches_stop_iteration_keep();
-                    if stop {
-                        break;
-                    }
-                    return Err(err);
+        let strategy_type = unsafe {
+            pyre_object::listobject::w_list_strategy(pyre_object::gc_roots::shadow_stack_get(
+                list_slot as usize,
+            )) as i64
+        };
+        list_extend_driver.jit_merge_point(
+            strategy_type,
+            pyre_object::gc_roots::shadow_stack_get((root_base + 2) as usize),
+            pyre_object::gc_roots::shadow_stack_get(root_base as usize),
+            pyre_object::gc_roots::shadow_stack_get(list_slot as usize),
+            i,
+            root_base,
+        );
+        // `warmspot.py` `handle_jitexception` `DoneWithThisFrameInt` /
+        // `ExitFrameWithExceptionRef`: the marker is Void, so a compiled
+        // finish is an Int kind parked by the jd3 enter. Extra residual vs
+        // PyPy; the helpers are `dont_look_inside` so the annotator sees i64.
+        let kind = crate::call::list_extend_compiled_kind();
+        if kind == 1 {
+            return Ok(crate::call::list_extend_compiled_i());
+        }
+        if kind == 2 {
+            return Err(crate::call::list_extend_compiled_take_err());
+        }
+        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(root_base as usize))
+        {
+            Ok(w_item) => unsafe { extend_drain_append_at(list_slot as usize, w_item) },
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    break;
                 }
-            };
-        let _item_roots = pyre_object::gc_roots::push_roots();
-        let item_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(item);
-        unsafe {
-            pyre_object::listobject::w_list_append_preallocated(
-                pyre_object::gc_roots::shadow_stack_get(root_base),
-                pyre_object::gc_roots::shadow_stack_get(item_slot),
-            );
+                return Err(e);
+            }
         }
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
-        extended += 1;
+        i += 1;
     }
-    Ok(extended)
+    Ok(i)
 }
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)

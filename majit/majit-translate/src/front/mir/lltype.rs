@@ -2277,10 +2277,13 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 
 /// Declared gckind of the struct or enum `ty` names, after one pointer peel.
 ///
-/// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
-/// the raw-address classifier rejects (exception carrier, a GC-pointer field)
-/// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
-/// [`declared_raw_adt_node`] accepts is Raw.
+/// `None` when `ty` is not a struct or enum. A harvested `_alloc_flavor_ =
+/// "raw"` owner is Raw (`rclass.py getgcflavor` / `STRUCT._gckind`): a
+/// `Vec` field fails [`adt_def_is_raw_storage`] and must not default the
+/// class to Gc. A `GcType` seed is Gc. An owner the raw-address classifier
+/// rejects (exception carrier, a GC-pointer field) stays a GC base unless
+/// that harvest named it raw. Only an owner [`declared_raw_adt_node`]
+/// accepts, or a flavor-raw class, is Raw.
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2587,8 +2590,11 @@ fn adt_fields_are_raw_storage_in(
             None => clone_tyref(&field.ty),
         };
         // A Void field occupies no storage (`lltype.py`
-        // `Struct._names_without_voids`).
-        if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) {
+        // `Struct._names_without_voids`). A zero-sized marker
+        // (`PhantomData`) must not poison a raw owner
+        // (`RootScope.save_point` is the one stored word).
+        if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) || field_is_zst(&ty, llbc)
+        {
             return true;
         }
         if field_ty_is_raw_word(
@@ -2632,6 +2638,88 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
         raw_alloc_flavor_structs,
         &mut Vec::new(),
     )
+}
+
+/// Class-root spelling of a by-value or borrowed `RootScope`.
+///
+/// Name is the fact: PhantomData on the defining crate can look like a
+/// second field, and a depending crate may see Opaque / a published copy.
+/// The residual ABI is one `save_point` word either way
+/// (`history.py` `getkind` of a raw `Ptr` / `llmemory.Address`).
+pub(in crate::front::mir) fn tyref_rootscope_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let src = tyref_shared_borrow_rootscope_pointee(ty, llbc).unwrap_or_else(|| ty.clone());
+    let root = tyref_node(&src, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| adt_node_class_root_with(n, llbc, tombstoned))?;
+    super::gcroot::is_root_scope_class_root(&root).then_some(root)
+}
+
+/// `RootScope` is one `save_point` word (`history.py` `getkind` of a
+/// `Ptr` whose `TO._gckind == 'raw'` is int; `llmemory.Address` is the
+/// same bank). Residual `push_roots` must not occupy a JITFRAME GCREF slot.
+pub(in crate::front::mir) fn tyref_is_rootscope_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    _gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    tyref_shared_borrow_rootscope_pointee(ty, llbc).is_none()
+        && tyref_rootscope_class_root(ty, llbc, tombstoned).is_some()
+}
+
+/// `&RootScope` is the save_point word: `Rvalue::Ref` is identity on a
+/// one-word raw ADT, so a `fn f(&self)` method receives the int
+/// (`history.py` `getkind` of a raw `Ptr` / `llmemory.Address`).
+///
+/// Peels one `Ref` only (`&` / `&mut`), matching
+/// [`tyref_is_borrowed_fieldless_enum_free`]. `*const RootScope` stays an
+/// address other code may compare.
+pub(in crate::front::mir) fn tyref_is_borrowed_rootscope_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    _gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    tyref_shared_borrow_rootscope_pointee(ty, llbc).is_some()
+        && tyref_rootscope_class_root(ty, llbc, tombstoned).is_some()
+}
+
+fn tyref_shared_borrow_rootscope_pointee(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    let mut peeled_ref = false;
+    loop {
+        let obj = v.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            v = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        if obj.get("RawPtr").is_some() {
+            return None;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            if peeled_ref {
+                return None;
+            }
+            peeled_ref = true;
+            v = arr.get(1)?;
+            continue;
+        }
+        break;
+    }
+    peeled_ref.then(|| TyRef::Other(v.clone()))
 }
 
 pub(in crate::front::mir) fn field_ty_is_raw_word(
@@ -2937,7 +3025,8 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
 /// true for a one-word pointer. A flavor-raw pointee (`rclass.py
 /// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
 /// `cast_ptr_to_int` for it. A borrow of a storage-raw struct
-/// (`rffi.py` `CStruct`) stays `Ref`.
+/// (`rffi.py` `CStruct`) stays `Ref`. `&RootScope` is Int through the
+/// identity-borrow arm of [`tyref_to_value_type_with`], not here.
 pub(in crate::front::mir) fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2969,10 +3058,12 @@ pub(in crate::front::mir) fn ty_is_raw_address(
             return true;
         }
         // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-        // struct borrow stays `Ref`. A fieldless enum is the tag integer
-        // (`type_decl_is_fieldless_enum`); `Rvalue::Ref` is the identity
-        // on that word, so the borrow is not an address (`rclass.py` has
-        // no `cast_pointer` of an int).
+        // struct borrow stays `Ref` here; `&RootScope` is Int via
+        // [`tyref_is_borrowed_rootscope_word`] so `RootScope::get` is
+        // `[Int, Int]` called with `[Int, Int]`.
+        // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
+        // `Rvalue::Ref` is the identity on that word, so the borrow is not
+        // an address (`rclass.py` has no `cast_pointer` of an int).
         if is_borrow
             && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs)
         {
@@ -3366,6 +3457,12 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
+    // `&RootScope` is the save_point word, the same identity-borrow as
+    // `&E` above. Leaving it `Ref` puts that word in a residual Ref
+    // register (`refuse_walk_local_ref_args` aborts `RootScope::publish`).
+    if tyref_is_borrowed_rootscope_word(ty, llbc, tombstoned, gc_struct_ids) {
+        return ValueType::Int;
+    }
     // `is_none` / `is_some` take `&self`. The borrow is identity on the
     // Option word (null pointer or tagged enum), so `&Option<P>` uses
     // the same paint as `Option<P>`. `Option<NonZero<_>>` is an integer
@@ -3382,6 +3479,13 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
+    }
+    // `llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`. `history.py`
+    // `getkind` of a `Ptr` with `_gckind != 'raw'` is `'ref'`. Classify
+    // before VOIDP / declared-raw so a Foreign Opaque `*mut GCREFOpaque`
+    // cannot fall into the int bank.
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return ValueType::Ref(None);
     }
     // `rffi.py` `VOIDP` / `VOIDPP`. `history.py` `getkind` of a raw `Ptr`
     // is `'int'`. `*mut u8` stays `Ref` (GC byte erasure); `c_void` is
@@ -3490,6 +3594,12 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         raw_alloc_flavor_structs,
     ) {
         return ValueType::Ref(Some(root));
+    }
+    // `RootScope.save_point` is the shadow-stack depth word
+    // (`shadowstack.py` `root_stack_top`). `history.py` `getkind` of a
+    // raw `Ptr` / `llmemory.Address` is int.
+    if tyref_is_rootscope_word(ty, llbc, tombstoned, gc_struct_ids) {
+        return ValueType::Int;
     }
     ValueType::Ref(None)
 }
@@ -5081,6 +5191,11 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if is_unit_type(kind_src, llbc) {
         return Some("()".to_string());
     }
+    // `llmemory.py` `GCREF`. `history.py` `getkind` of `Ptr(GcOpaqueType)`
+    // is `'ref'` even when an earlier raw-address arm would see a word.
+    if tyref_is_gcref_spelling(kind_src, llbc) {
+        return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
+    }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
     // A byte pointer stays on the `ref` arm below.
@@ -5128,6 +5243,22 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             ) {
+                return Some(format!("raw:{root}"));
+            }
+            // `RootScope` / `&RootScope` is already Int from
+            // `tyref_to_value_type_with`. Name the owner so the stub
+            // keeps it; kind stays int.
+            if (tyref_is_rootscope_word(kind_src, llbc, no_tombstoned_leaves(), gc_struct_ids)
+                || tyref_is_borrowed_rootscope_word(
+                    kind_src,
+                    llbc,
+                    no_tombstoned_leaves(),
+                    gc_struct_ids,
+                ))
+                && let Some(root) = tyref_node(kind_src, llbc)
+                    .and_then(|node| strip_ty_indirections(node, llbc))
+                    .and_then(|node| adt_node_class_root_with(node, llbc, no_tombstoned_leaves()))
+            {
                 return Some(format!("raw:{root}"));
             }
             "i64"
@@ -5705,6 +5836,12 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // must seed Integer so a closure-env capture of `&E` setattr's the
     // int (`rclass.py` `InstanceRepr.setfield`), not `Integer ∪ Instance`.
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
+    // Matching [`tyref_to_value_type`]: `&RootScope` is the save_point
+    // int. FORCE must seed Integer so a capture of `&RootScope` setattr's
+    // the int, not `Integer ∪ Instance`.
+    if tyref_is_borrowed_rootscope_word(ty, llbc, tombstoned, gc_struct_ids) {
         return ValueType::Int;
     }
     // Matching [`tyref_to_value_type`]: a shared borrow of `Option<P>`
@@ -16768,6 +16905,34 @@ pub(crate) fn strip_crate_prefix(path: &str) -> String {
         // single-segment name (rare — top-level item without crate
         // prefix in some Charon outputs): leave as-is.
         None => path.to_string(),
+    }
+}
+
+/// Production exception carrier (`error.rs PyError`). `OperationError`
+/// is the exception instance; the host handle is that one GCREF word.
+/// A fixture of the same leaf stays a struct.
+pub(in crate::front::mir) fn owner_is_error_carrier(owner: &str) -> bool {
+    let Some((parent, leaf)) = owner.rsplit_once("::") else {
+        return false;
+    };
+    leaf == "PyError" && parent.rsplit("::").next() == Some("error")
+}
+
+pub(in crate::front::mir) fn tyref_is_error_carrier(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|path| owner_is_error_carrier(&path))
+}
+
+#[cfg(test)]
+mod error_carrier_owner_tests {
+    use super::owner_is_error_carrier;
+
+    #[test]
+    fn production_pyerror_is_the_carrier_handle() {
+        assert!(owner_is_error_carrier("pyre_interpreter::error::PyError"));
+        assert!(owner_is_error_carrier("error::PyError"));
+        assert!(!owner_is_error_carrier("fixture::PyError"));
+        assert!(!owner_is_error_carrier("PyError"));
+        assert!(!owner_is_error_carrier("error::PyErrorObject"));
     }
 }
 

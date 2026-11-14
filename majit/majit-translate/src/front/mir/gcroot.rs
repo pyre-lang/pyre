@@ -6,10 +6,11 @@ impl<'a> Lowering<'a> {
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
-    /// The call takes the guard by reference rather than the two words the
-    /// rewind needs, so this arm reads no field of it. A crate that only
-    /// imports the guard sees an opaque stub with no fields, and a
-    /// field-keyed close would silently confine itself to the crate that
+    /// The call takes the place itself: after `history.py` `getkind`, a
+    /// `RootScope` is the `save_point` int word, which is also
+    /// `root_scope_close`'s argument. This arm reads no field of the guard. A
+    /// crate that only imports the guard sees an opaque stub with no fields,
+    /// and a field-keyed close would silently confine itself to the crate that
     /// defines one.
     pub(in crate::front::mir) fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
@@ -109,6 +110,8 @@ impl<'a> Lowering<'a> {
         // `Option` that holds it, releases nothing.
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_erased_drop(&place.ty, self.llbc)
+            || frame_box::tyref_is_frame_box(&place.ty, self.llbc)
+            || tyref_is_error_carrier(&place.ty, self.llbc)
         {
             return Ok(true);
         }
@@ -983,6 +986,12 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
+}
+
+/// Class-root / intern-key spelling of [`ROOT_SCOPE_TYPE`]: the module
+/// path `gc_roots::RootScope`, or the harvested leaf.
+pub(crate) fn is_root_scope_class_root(name: &str) -> bool {
+    gc_root_scope_type_path(name) || name == ROOT_SCOPE_TYPE
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.

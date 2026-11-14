@@ -154,6 +154,37 @@ unsafe fn kwargs_storage<'a>(obj: PyObjectRef) -> &'a (Vec<PyObjectRef>, Vec<PyO
     &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>))
 }
 
+/// `len(keys_w)` (`kwargsdict.py`). One word.
+///
+/// Residual, like the two item readers below: `dstorage` is a host
+/// `(Vec, Vec)` box and the front end has no lowering for a borrow of one
+/// of its fields, so the last modellable point is the call.
+///
+/// # Safety
+/// Same as [`kwargs_storage`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_kwargs_len(obj: PyObjectRef) -> usize {
+    kwargs_storage(obj).0.len()
+}
+
+/// `keys_w[i]` (`kwargsdict.py`). One word.
+///
+/// # Safety
+/// Same as [`kwargs_storage`]; `i` is a live index.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_kwargs_key_at(obj: PyObjectRef, i: usize) -> PyObjectRef {
+    kwargs_at(&kwargs_storage(obj).0, i)
+}
+
+/// `values_w[i]` (`kwargsdict.py`). One word.
+///
+/// # Safety
+/// Same as [`w_dict_kwargs_key_at`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_kwargs_value_at(obj: PyObjectRef, i: usize) -> PyObjectRef {
+    kwargs_at(&kwargs_storage(obj).1, i)
+}
+
 #[inline]
 unsafe fn kwargs_storage_mut<'a>(obj: PyObjectRef) -> &'a mut (Vec<PyObjectRef>, Vec<PyObjectRef>) {
     let dict = &mut *(obj as *mut crate::dictmultiobject::W_DictObject);

@@ -3509,11 +3509,23 @@ impl BhDescr {
                 .lock()
                 .resolve_struct_layout(raw)
             {
-                Some((tid, cached_size)) if cached_size == *size => return tid,
-                Some((_tid, _cached_size)) => {
+                Some((tid, cached_size))
+                    if cached_size == *size && majit_ir::descr::is_collector_size_tid(raw, tid) =>
+                {
+                    return tid;
+                }
+                Some((_tid, cached_size)) if cached_size != *size => {
                     panic!("BhDescr GC identity resolves to a foreign allocation layout: {self:?}");
                 }
-                None => return raw as u32,
+                Some(_) | None => {
+                    // A miss (or a cache hit still holding the truncated
+                    // `cache_key`) is not a collector tid. Values above
+                    // `u32::MAX` cannot be dense tids (`init_size_descr`).
+                    if raw > u32::MAX as u64 {
+                        return 0;
+                    }
+                    return raw as u32;
+                }
             }
         }
         if let Some(tid) = self.resolved_gc_tid_checked() {
@@ -3524,12 +3536,37 @@ impl BhDescr {
         // still needs the published descr's tid: the mint sentinel, not
         // a truncated `path_hash`. Compiled malloc asserts the sentinel
         // (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
-        if let BhDescr::Array { .. } = self {
-            let raw = self.get_type_id();
-            if raw != 0
-                && let Some(tid) = majit_ir::descr::gc_cache().lock().resolve_array_tid(raw)
+        if let BhDescr::Array {
+            type_id: cache_key,
+            base_size,
+            itemsize,
+            len_offset,
+            is_array_of_pointers,
+            is_gc_managed,
+            ..
+        } = self
+        {
+            let cache = majit_ir::descr::gc_cache().lock();
+            if *cache_key != 0
+                && let Some(tid) = cache.resolve_array_tid(*cache_key)
+                && majit_ir::descr::is_collector_array_tid(tid)
             {
                 return tid;
+            }
+            // No ARRAY identity (`cache_key` 0): `init_array_descr` still
+            // stamps from layout (`TypeLayoutBuilder.get_type_id` via
+            // `find_varsize_type`). Pointer arrays with the ItemsBlock
+            // shape reuse `PY_OBJECT_ARRAY_GC_TYPE_ID`.
+            if *is_gc_managed && *is_array_of_pointers {
+                let tid = cache.collector_tid_for_array_layout(
+                    *base_size,
+                    *itemsize,
+                    len_offset.unwrap_or(0),
+                    true,
+                );
+                if majit_ir::descr::is_collector_array_tid(tid) {
+                    return tid;
+                }
             }
             return majit_ir::descr::UNSET_GC_TYPE_ID;
         }
@@ -4313,7 +4350,7 @@ mod tests {
         };
 
         assert_eq!(bh.resolved_gc_tid_checked(), None);
-        assert_eq!(bh.resolve_gc_tid(), u32::MAX);
+        assert_eq!(bh.resolve_gc_tid(), 0);
     }
 
     #[test]

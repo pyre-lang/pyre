@@ -6479,6 +6479,100 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `bool::then_some(t)` → `if self { Some(t) } else { None }`.
+    ///
+    /// `core::bool::<Impl>::then_some` is a foreign leaf for every
+    /// instantiation Charon did not extract. An unregistered callee
+    /// Skips the calling graph (`call.py guess_call_kind` residual of a
+    /// funcobj without a graph; [`crate::front::slice_get`] documents
+    /// the same Skip cascade for Opaque `<[T]>::get`). The residual ABI
+    /// of a non-niche `Option<T>` is two registers with the discriminant
+    /// in the first (`ResidualRet`), so a walker that reads one result
+    /// word receives `1` for `Some` and then `getfield_gc` of
+    /// `__discriminant` at address 1 faults.
+    ///
+    /// Synthesize the diamond the extracted body already lowers to,
+    /// via [`crate::front::option_variant::emit_option_variant`]. A
+    /// one-word niche forwards `t` versus a typed null. `bool::then`
+    /// takes a closure and stays a call.
+    pub(in crate::front::mir) fn try_lower_then_some(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let is_then_some =
+            crate::front::mir::fmt_path_ends_with(segments, &["bool", "<Impl>", "then_some"])
+                || (segments.last().is_some_and(|leaf| {
+                    crate::front::clause_spec::unspecialized_leaf(leaf) == "then_some"
+                }) && segments.iter().any(|s| s == "bool"));
+        if !is_then_some {
+            return Ok(false);
+        }
+        let [disc, payload] = args else {
+            return Ok(false);
+        };
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let tagged_owners = if niche {
+            None
+        } else {
+            match self.resolve_option_dest_owners(dest_ty) {
+                Some(owners) => Some(owners),
+                None => return Ok(false),
+            }
+        };
+        let option_owner = tagged_owners.as_ref().map(|(o, _, _)| o.clone());
+        let some_owner = tagged_owners.as_ref().map(|(_, s, _)| s.clone());
+        let payload_ty = tagged_owners.as_ref().map(|(_, _, t)| t.clone());
+        let option_owner_some = option_owner.clone();
+        let payload = payload.clone();
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc.clone(),
+            false,
+            false,
+            std::slice::from_ref(&payload),
+            &[],
+            move |this, some_bb, mapped| {
+                if niche {
+                    mapped[0].clone()
+                } else {
+                    crate::front::option_variant::emit_option_variant(
+                        &mut this.graph,
+                        some_bb,
+                        option_owner_some.as_ref().expect("tagged Option owner"),
+                        1,
+                        Some((
+                            some_owner.as_ref().expect("tagged Some owner").as_str(),
+                            mapped[0].clone(),
+                            payload_ty.clone().expect("tagged Option payload"),
+                        )),
+                    )
+                }
+            },
+            move |this, none_bb, _| {
+                if niche {
+                    let cast = this.option_niche_null_cast(dest_ty);
+                    this.graph.push_niche_null(none_bb, cast.as_ref())
+                } else {
+                    crate::front::option_variant::emit_option_variant(
+                        &mut this.graph,
+                        none_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        0,
+                        None,
+                    )
+                }
+            },
+        )?;
+        Ok(true)
+    }
+
     pub(in crate::front::mir) fn is_const_ptr_as_ref(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;

@@ -1391,6 +1391,92 @@ fn real_main() {
                     split_portal: true,
                     extends: None,
                 },
+                majit_translate::JitDriverSpec {
+                    // `listobject.py` `_do_extend_jitdriver`.
+                    // greens=['strategy_type', 'greenkey'], reds='auto'.
+                    // The portal is the source-level split of
+                    // `_do_extend_from_iterable` at `jit_merge_point`.
+                    portal: majit_translate::CallPath::from_segments([
+                        "type_methods",
+                        "list_extend_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_list_extend_portal_runner_shim",
+                    ])),
+                    greens: vec!["strategy_type".to_string(), "greenkey".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Int, majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    // `warmspot.py split_graph_and_record_jitdriver` copies
+                    // `_do_extend_from_iterable` and cuts at `jit_merge_point`.
+                    // The registered jitcode is `list_extend_portal_portal`.
+                    split_portal: true,
+                    extends: None,
+                },
+                majit_translate::JitDriverSpec {
+                    // `functional.py` `filter_jitdriver`.
+                    // greens=['reverse', 'callable_greenkey', 'greenkey'],
+                    // reds='auto'. The portal is the source-level split of
+                    // `_filter_jitdriver` at `jit_merge_point`.
+                    portal: majit_translate::CallPath::from_segments([
+                        "baseobjspace",
+                        "filter_jitdriver_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_filter_portal_runner_shim",
+                    ])),
+                    greens: vec![
+                        "reverse".to_string(),
+                        "callable_greenkey".to_string(),
+                        "greenkey".to_string(),
+                    ],
+                    reds: vec![],
+                    green_kinds: vec![
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                        majit_ir::Type::Ref,
+                    ],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    // `warmspot.py split_graph_and_record_jitdriver` copies
+                    // `_filter_jitdriver` and cuts at `jit_merge_point`.
+                    // The registered jitcode is `filter_jitdriver_portal_portal`.
+                    split_portal: true,
+                    extends: None,
+                },
+                majit_translate::JitDriverSpec {
+                    // `generator.py` `_create_unpack_into` for `unpack_into_w`.
+                    // greens=['pycode'], reds='auto', name='unpack_into'.
+                    // The portal is the source-level split of
+                    // `unpack_into_w` at `jit_merge_point`.
+                    portal: majit_translate::CallPath::from_segments([
+                        "baseobjspace",
+                        "unpack_into_w_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_unpack_into_w_portal_runner_shim",
+                    ])),
+                    greens: vec!["pycode".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    // `warmspot.py split_graph_and_record_jitdriver` copies
+                    // `unpack_into_w` and cuts at `jit_merge_point`.
+                    // The registered jitcode is `unpack_into_w_portal_portal`.
+                    split_portal: true,
+                    extends: None,
+                },
             ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),

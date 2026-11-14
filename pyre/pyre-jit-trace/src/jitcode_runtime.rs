@@ -2014,6 +2014,12 @@ fn register_struct_tid_now(size: usize, offsets: Vec<usize>) -> u32 {
         return 0;
     }
     majit_gc::gc_sync::gc_op(|gc| {
+        if let Some(tid) = gc.types.find_fixed_type(size, &offsets) {
+            return tid;
+        }
+        if gc.types.is_frozen() {
+            return 0;
+        }
         gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
     })
 }

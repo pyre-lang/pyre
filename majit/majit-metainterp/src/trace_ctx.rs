@@ -5626,6 +5626,73 @@ impl TraceCtx {
         self.virtualizable_info.as_ref()
     }
 
+    /// `jtransform.py Transformer.get_virtualizable_field_descr` stores
+    /// `vinfo.static_field_descrs[index]` as the jitcode `d` operand of
+    /// `getfield_vable_*`. That `vinfo` is `call.py CallControl.get_vinfo`
+    /// of the object's TYPE (`VTYPEPTR`), not `jitdriver_sd.virtualizable_info`
+    /// of the driver currently being traced.
+    ///
+    /// A novable driver (`filter_jitdriver`) leaves
+    /// [`Self::virtualizable_info`] unset. The encoded index still names a
+    /// field of another driver's `VirtualizableInfo` (pypyjit's `PyFrame`).
+    /// `pyjitpl.py MIFrame.opimpl_getfield_vable_*` then runs
+    /// `_nonstandard_virtualizable`, which falls back to getfield_gc when
+    /// the current driver's vinfo is None.
+    ///
+    /// The jitcode index does not name its owning TYPE, so the scan is only
+    /// sound while every registered vinfo is one VTYPE layout; two
+    /// different layouts make the index ambiguous and panic here rather
+    /// than read another TYPE's offsets.
+    fn vable_type_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        if let Some(info) = self.virtualizable_info.as_ref() {
+            return Some(info);
+        }
+        let mut infos = self
+            .metainterp_sd
+            .jitdrivers_sd
+            .iter()
+            .filter_map(|jd| jd.virtualizable_info.as_ref());
+        let first = infos.next()?;
+        assert!(
+            infos.all(|info| first.same_vtype_layout(info)),
+            "vable opcode under a novirtualizable driver: registered drivers carry \
+             different VTYPE layouts, so `fielddescr.get_vinfo()` is ambiguous"
+        );
+        Some(first)
+    }
+
+    /// FieldDescr encoded as the jitcode `d` operand of `getfield_vable_*`.
+    pub fn encoded_vable_static_field_descr(&self, field_idx: usize) -> Option<DescrRef> {
+        self.vable_type_info()?
+            .static_field_descrs()
+            .get(field_idx)
+            .cloned()
+    }
+
+    /// `(arrayfielddescr, arraydescr)` encoded as the jitcode `d` pair of
+    /// `getarrayitem_vable_*`.
+    pub fn encoded_vable_array_descrs(&self, array_idx: usize) -> Option<(DescrRef, DescrRef)> {
+        let pair = |info: &VirtualizableInfo| {
+            let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+            let adescr = info.array_descrs.get(array_idx)?.clone();
+            Some((fdescr, adescr))
+        };
+        pair(self.vable_type_info()?)
+    }
+
+    /// Length of the TYPE vinfo's static-field table, for the absent-descr
+    /// probe. None when no VirtualizableInfo is reachable at all.
+    pub fn encoded_vable_static_field_count(&self) -> Option<usize> {
+        self.vable_type_info()
+            .map(|info| info.static_field_descrs().len())
+    }
+
+    /// Length of the TYPE vinfo's array-field table, for the absent-descr probe.
+    pub fn encoded_vable_array_field_count(&self) -> Option<usize> {
+        self.vable_type_info()
+            .map(|info| info.array_field_descrs().len())
+    }
+
     /// pyjitpl.py `_do_jit_force_virtual` reads
     /// `self.metainterp.jitdriver_sd.greenfield_info` — the current
     /// driver, not the first registered one.
@@ -7851,9 +7918,9 @@ impl TraceCtx {
     ///
     /// `do_residual_call` step 3 runs after the call has already written the
     /// frame. `optimize_VIRTUAL_REF_FINISH` forces the virtual into the trace
-    /// before `direct_call_may_force`; the nonstandard arm
-    /// (`execute_setarrayitem_gc`) already records only, and the standard arm
-    /// skips `write_virtualizable_heap_value_at` / `synchronize_virtualizable_at`.
+    /// before `direct_call_may_force`. The nonstandard arm skips
+    /// `executor.py do_setarrayitem_gc`; the standard arm skips
+    /// `write_virtualizable_heap_value_at` / `synchronize_virtualizable_at`.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -7905,11 +7972,32 @@ impl TraceCtx {
         record_only: bool,
     ) -> VableArrayStore {
         if nonstandard {
-            // `execute_setarrayitem_gc` records `SETARRAYITEM_GC` and updates
-            // the heapcache. It does not write the concrete array.
+            // pyjitpl.py `_opimpl_setarrayitem_vable` nonstandard:
+            // `opimpl_getfield_gc_r` then `_opimpl_setarrayitem_gc_any`
+            // → `execute_setarrayitem_gc` → `execute_and_record`, which
+            // `executor.execute` (`do_setarrayitem_gc`) then records.
+            // Pin the stored ref before the GETFIELD record can collect.
+            let value_pin = match concrete {
+                Value::Ref(gc) if !gc.is_null() && gc != GcRef::NO_CONCRETE => {
+                    let live = majit_gc::gc_current_object_address(gc.0);
+                    (live != 0).then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(live)))
+                }
+                _ => None,
+            };
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+            self.execute_setarrayitem_gc(
+                array_opref,
+                index,
+                index_runtime_value,
+                value,
+                value_pin
+                    .as_ref()
+                    .map(|g| Value::Ref(g.get()))
+                    .unwrap_or(concrete),
+                adescr,
+                !record_only,
+            );
             return VableArrayStore::Stored(None);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -8316,10 +8404,16 @@ impl TraceCtx {
     }
 
     /// `execute_setarrayitem_gc(arraydescr, arraybox, indexbox, itembox)`
-    /// (pyjitpl.py): record the `SETARRAYITEM_GC`, then publish the stored item
-    /// to the heapcache.  `gen_store_back_in_vable` deliberately does NOT come
-    /// through here — it records the op directly — so the raw recording form
-    /// stays available as `vable_setarrayitem_descr`.
+    /// (pyjitpl.py): `execute_and_record` runs `executor.execute`
+    /// (`do_setarrayitem_gc`) then records; `heapcache.setarrayitem` is last.
+    /// `gen_store_back_in_vable` deliberately does NOT come through here —
+    /// it records the op directly — so the raw recording form stays
+    /// available as `vable_setarrayitem_descr`.
+    ///
+    /// pyre's funnel records only (`execute_and_record.rs`), so the store
+    /// is `array_store` (`executor.py do_setarrayitem_gc`) when
+    /// `execute_store`. Residual step 3 (`vable_setarrayitem_record_only`)
+    /// already wrote the array and passes `false`.
     ///
     /// The heapcache write is what keeps a later read of the same slot from
     /// forwarding the value the cache was seeded with: the element cache is the
@@ -8330,9 +8424,49 @@ impl TraceCtx {
         &mut self,
         array_opref: OpRef,
         index: OpRef,
+        index_runtime_value: i64,
         value: OpRef,
+        concrete: Value,
         descr: DescrRef,
+        execute_store: bool,
     ) {
+        let array_pin;
+        let value_pin;
+        if execute_store {
+            // `executor.execute` → `do_setarrayitem_gc` → `cpu.bh_setarrayitem_gc_*`.
+            array_pin = match self.live_ptr_of(array_opref) {
+                Some(ptr) => {
+                    let live = majit_gc::gc_current_object_address(ptr as usize);
+                    (live != 0).then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(live)))
+                }
+                None => None,
+            };
+            value_pin = match concrete {
+                Value::Ref(gc) if !gc.is_null() && gc != GcRef::NO_CONCRETE => {
+                    let live = majit_gc::gc_current_object_address(gc.0);
+                    (live != 0).then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(live)))
+                }
+                _ => None,
+            };
+            if let Some(ptr) = array_pin
+                .as_ref()
+                .map(|p| p.get().0 as i64)
+                .or_else(|| self.live_ptr_of(array_opref))
+            {
+                let store_val = value_pin
+                    .as_ref()
+                    .map(|p| Value::Ref(p.get()))
+                    .unwrap_or(concrete);
+                let skip = matches!(store_val, Value::Void)
+                    || matches!(store_val, Value::Ref(gc) if gc == GcRef::NO_CONCRETE);
+                if !skip {
+                    let _ = self.array_store(ptr, index_runtime_value, &descr, store_val);
+                }
+            }
+        } else {
+            array_pin = None;
+            value_pin = None;
+        }
         let descr_index = descr.index();
         // A store has no `resvalue` and `SETARRAYITEM_GC` is never pure, so
         // the funnel records it without consulting a cpu.
@@ -8345,6 +8479,7 @@ impl TraceCtx {
             0,
         );
         self.heapcache_setarrayitem(array_opref, index, descr_index, value);
+        let _ = (array_pin, value_pin);
     }
 }
 
@@ -9850,6 +9985,65 @@ mod tests {
             ops.iter().any(|op| op.opcode == OpCode::PtrEq),
             "the same vinfo must enter the PTR_EQ arm, got {ops:?}"
         );
+    }
+
+    /// `jtransform.py get_virtualizable_field_descr` encodes the TYPE
+    /// vinfo's `static_field_descrs[index]` in the jitcode. A novable
+    /// driver has no bound `virtualizable_info` on the trace; the lookup
+    /// still finds the FieldDescr on another driver's slot
+    /// (`call.py CallControl.get_vinfo(VTYPEPTR)`).
+    #[test]
+    fn encoded_vable_static_field_descr_uses_another_drivers_vinfo() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pycode", Type::Ref, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        let expected_offset = info
+            .static_field_descr(0)
+            .as_field_descr()
+            .unwrap()
+            .offset();
+
+        let mut jd = JitDriverStaticData::new(vec![], vec![]);
+        jd.virtualizable_info = Some(std::sync::Arc::new(info));
+        let mut sd = crate::MetaInterpStaticData::new();
+        sd.jitdrivers_sd.push(jd);
+
+        let mut recorder = Trace::new();
+        recorder.record_input_arg(Type::Ref);
+        let ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(sd));
+        assert!(ctx.virtualizable_info().is_none());
+        let got = ctx
+            .encoded_vable_static_field_descr(0)
+            .expect("TYPE vinfo FieldDescr");
+        assert_eq!(
+            got.as_field_descr().map(|f| f.offset()),
+            Some(expected_offset)
+        );
+        assert!(ctx.encoded_vable_static_field_descr(99).is_none());
+    }
+
+    /// `descr.py` `ArrayOrFieldDescr.get_vinfo`: an index only names a field
+    /// within one VTYPE. Two registered layouts make the novable fallback
+    /// ambiguous, so it must not pick the first driver's offsets.
+    #[test]
+    #[should_panic(expected = "different VTYPE layouts")]
+    fn encoded_vable_static_field_descr_rejects_two_vtype_layouts() {
+        let vinfo = |offset| {
+            let mut info = VirtualizableInfo::new(0);
+            info.add_field("f", Type::Ref, offset);
+            info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+            std::sync::Arc::new(info)
+        };
+        let mut sd = crate::MetaInterpStaticData::new();
+        for offset in [8, 16] {
+            let mut jd = JitDriverStaticData::new(vec![], vec![]);
+            jd.virtualizable_info = Some(vinfo(offset));
+            sd.jitdrivers_sd.push(jd);
+        }
+        let mut recorder = Trace::new();
+        recorder.record_input_arg(Type::Ref);
+        let ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(sd));
+        let _ = ctx.encoded_vable_static_field_descr(0);
     }
 
     /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`

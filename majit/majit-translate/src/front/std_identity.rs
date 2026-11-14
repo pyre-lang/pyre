@@ -97,6 +97,12 @@ fn is_identity_wrapper_target(
             {
                 return true;
             }
+            // `mem::manually_drop::ManuallyDrop::new` after `std`/`core` is
+            // peeled. `bookkeeper` already strips `ManuallyDrop<T>` to `T`,
+            // so the constructor is identity on that value.
+            if is_manually_drop_new_path(segments) {
+                return true;
+            }
             if !is_std_fn_path(segments) {
                 return false;
             }
@@ -352,6 +358,11 @@ pub(crate) fn lower_std_primitive_op(
         if banks_agree && is_box_as_ref_or_mut(target, receiver_is_thin_box) {
             return same_as(operand, result_ty.clone());
         }
+        // `ManuallyDrop<T>` is `repr(transparent)` over `T`. The dest
+        // layout after peeling is `T`'s fields, not a one-field wrapper.
+        if banks_agree && is_manually_drop_new(target) {
+            return same_as(operand, result_ty.clone());
+        }
         if let Some(fields) = layout {
             if fields.len() == 1 {
                 let (name, field_ty) = &fields[0];
@@ -414,6 +425,36 @@ fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => function_leaf(segments) == Some(leaf),
         CallTarget::Method { name, .. } => name == leaf,
+        _ => false,
+    }
+}
+
+/// `core::mem::manually_drop::ManuallyDrop::new` / the `std` twin /
+/// the prefix-peeled `mem::manually_drop::ManuallyDrop::new`.
+///
+/// `repr(transparent)` over `T`; `bookkeeper` already projects
+/// `ManuallyDrop<T>` as `T`. RPython has no such wrapper: the
+/// constructor is `same_as` of the payload (`jtransform.py
+/// rewrite_op_same_as`).
+pub(crate) fn is_manually_drop_new_path(segments: &[String]) -> bool {
+    if segments.last().map(String::as_str) != Some("new") {
+        return false;
+    }
+    if !segments
+        .iter()
+        .any(|s| s == "ManuallyDrop" || s == "manually_drop")
+    {
+        return false;
+    }
+    matches!(
+        segments.first().map(String::as_str),
+        Some("core" | "std" | "mem")
+    )
+}
+
+fn is_manually_drop_new(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_manually_drop_new_path(segments),
         _ => false,
     }
 }
@@ -869,6 +910,58 @@ mod tests {
         assert!(
             matches!(refcell, OpKind::Call { .. }),
             "RefCell::new is not a one-field identity"
+        );
+    }
+
+    #[test]
+    fn manually_drop_new_is_identity_after_std_prefix_peel() {
+        let v = dummy_var();
+        // Dest layout is the inner `T` after `bookkeeper` peels
+        // `ManuallyDrop<T>` — many fields, not a one-field wrapper.
+        let inner_layout = [
+            ("ob_header".into(), ValueType::Ref(None)),
+            ("pycode".into(), ValueType::Ref(None)),
+        ];
+        for segs in [
+            &["mem", "manually_drop", "ManuallyDrop", "new"][..],
+            &["core", "mem", "manually_drop", "ManuallyDrop", "new"][..],
+            &["std", "mem", "manually_drop", "ManuallyDrop", "new"][..],
+        ] {
+            let lowered = lower_std_primitive_op(
+                call(path(segs), vec![v.clone()], ValueType::Ref(None)),
+                None,
+                Some("pyre_interpreter::pyframe::PyFrame"),
+                None,
+                None,
+                false,
+                true,
+                Some(&inner_layout),
+                false,
+            );
+            assert!(
+                matches!(lowered, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+                "ManuallyDrop::new {segs:?} is same_as of the payload, got {lowered:?}"
+            );
+        }
+
+        let user = lower_std_primitive_op(
+            call(
+                path(&["my_crate", "ManuallyDrop", "new"]),
+                vec![v],
+                ValueType::Ref(None),
+            ),
+            None,
+            Some("my_crate::ManuallyDrop"),
+            None,
+            None,
+            false,
+            true,
+            Some(&inner_layout),
+            false,
+        );
+        assert!(
+            matches!(user, OpKind::Call { .. }),
+            "a user ManuallyDrop::new stays a call, got {user:?}"
         );
     }
 

@@ -181,6 +181,7 @@ pub fn entry_gc_ref_offsets<K: GcRefOffsets, V: GcRefOffsets>() -> Vec<usize> {
 }
 
 /// First item of a `DICTENTRYARRAY`. Null stays null.
+#[inline(always)]
 pub fn entries_item_ptr<K, V>(entries: *mut GcEntries<K, V>) -> *mut Entry<K, V> {
     if entries.is_null() {
         std::ptr::null_mut()

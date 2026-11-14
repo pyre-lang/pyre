@@ -1827,9 +1827,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // `synchronize_virtualizable_at` → `write_box_at`. An inlined
     // callee / reconstructed `callee_shadow` is a second object, so
     // pyre also writes it through `store_live_frame_array_slot` when
-    // `own_frame_array_store_target` hits. A nonstandard store with no
-    // own-frame target records `getfield_gc_r` + `setarrayitem_gc` only
-    // (`vable_setarrayitem_impl`).
+    // `own_frame_array_store_target` hits. A nonstandard store records
+    // `getfield_gc_r` + `setarrayitem_gc` and runs
+    // `executor.py do_setarrayitem_gc` (`vable_setarrayitem_impl`).
     //
     // `walker_nonstandard_virtualizable` records `PTR_EQ` /
     // `GUARD_VALUE` on the PendingEq path (`begin_nonstandard_virtualizable`

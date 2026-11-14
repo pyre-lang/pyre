@@ -2562,11 +2562,12 @@ fn gc_const_keys_of(table: Option<&majit_gc::GcTable>) -> Vec<usize> {
 }
 
 /// rewrite.py `gen_malloc_fixedsize` / gc.py `malloc_big_fixedsize(size, tid)`.
-/// The CALL_R size is `payload + GcHeader::SIZE`; [`wasm_jit_alloc`] takes
-/// `(type_id, payload_size)`.
+/// The CALL_R size is `payload + GcHeader::SIZE`; the helper is
+/// `external_malloc(alloc_young=True)` so a small `young_nonmoving` descr
+/// is not a nursery bump.
 pub extern "C" fn wasm_malloc_big_fixedsize(size: i64, type_id: i64) -> i64 {
     let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
-    wasm_jit_alloc(type_id, payload as i64)
+    oom_signal_if_zero(wasm_alloc_young_nonmoving_typed(type_id as u32, payload).0 as i64)
 }
 
 /// `malloc_big_fixedsize` old-generation twin for a `non_moving` size descr.
@@ -5345,8 +5346,8 @@ impl majit_backend::Backend for WasmBackend {
         // visit shape.  The dynasm and cranelift runners assert the same.
         let type_id = arraydescr.resolve_gc_tid();
         assert!(
-            type_id != 0,
-            "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
+            majit_ir::descr::is_collector_array_tid(type_id),
+            "bh_new_array requires ArrayDescr.tid (descr.py get_type_id) — got {type_id}"
         );
         let Some(payload_size) = itemsize
             .checked_mul(length)

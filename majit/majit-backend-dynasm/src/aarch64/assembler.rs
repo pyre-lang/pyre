@@ -6112,8 +6112,10 @@ impl<'a> AssemblerARM64<'a> {
 
     fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize, save_err: i64) {
         let arg_count = arglocs.len();
-
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
+        // `Aarch64CallBuilder.emit_raw_call` is `BL` / `BLR x8` with no
+        // extra save of `fp`/`lr`. `x29` is the jitframe pointer here;
+        // after a collecting callee the AAPCS restore is stale and
+        // `pop_gcmap` reloads it from the shadow stack.
 
         // aarch64/callbuilder.py:54-60 — if fnloc is a core reg or stack,
         // save it to ip1 (x17) so later remap can clobber its source reg.
@@ -6259,7 +6261,9 @@ impl<'a> AssemblerARM64<'a> {
 
         // llsupport/callbuilder.py `emit_call_release_gil`:
         // write_real_errno(); emit_raw_call(); read_real_errno().
-        let current_sp = 16 + stack_bytes as u32;
+        // `current_sp` is only the outgoing arg area (`callbuilder.py
+        // restore_stack_pointer`); `fp`/`lr` stay in the entry frame.
+        let current_sp = stack_bytes as u32;
         // aarch64/callbuilder.py:67 — restore fnloc from ip1 / emit call.
         if fnloc_in_ip1 {
             self.write_real_errno(save_err, current_sp);
@@ -6282,7 +6286,6 @@ impl<'a> AssemblerARM64<'a> {
         if stack_bytes != 0 {
             dynasm!(self.mc ; .arch aarch64 ; add sp, sp, stack_bytes as u32);
         }
-        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
     fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
@@ -6354,9 +6357,12 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        // aarch64/opassembler.py `_emit_call`:
+        // `if effectinfo is None or effectinfo.check_can_collect(): cb.emit()`
+        // else `cb.emit_no_collect()`. A missing CallDescr is the None arm.
         let can_collect = op
             .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if can_collect && let Some(gcmap) = self.pending_malloc_nursery_gcmap {
             self.push_gcmap(gcmap as *mut usize);
         }
@@ -7125,6 +7131,9 @@ impl<'a> AssemblerARM64<'a> {
         let [len_loc, ..] = arglocs else {
             panic!("varsize allocation expects a length location, got {arglocs:?}");
         };
+        if let Some(descr) = op.getdescr() {
+            majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr, "genop_new_array");
+        }
         let (base_size, item_size, type_id, len_ofs) = op
             .with_array_descr(|ad| {
                 (

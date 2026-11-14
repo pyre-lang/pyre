@@ -94,6 +94,10 @@ fn build_bh_jitdrivers_sd(
                 portal_runner_ptr,
                 mainjitcode_calldescr,
                 handle_jitexc_from_bh: jd.handle_jitexc_from_bh,
+                virtualizable_info: jd
+                    .virtualizable_info
+                    .as_ref()
+                    .map_or(std::ptr::null(), std::sync::Arc::as_ptr),
             }
         })
         .collect()

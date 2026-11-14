@@ -6027,13 +6027,23 @@ impl MiniMarkGC {
             } else {
                 unsafe { (*header_of(holder_addr)).tid_and_flags }
             };
+            let holder_layout = if holder_addr == 0 {
+                "layout=none".to_string()
+            } else {
+                self.debug_describe_type_layout(holder_addr)
+            };
+            let holder_name = match holder_type_id {
+                Some(tid) if holder_addr != 0 => self.debug_object_type_name(holder_addr, tid),
+                _ => "?",
+            };
             let backtrace = std::backtrace::Backtrace::force_capture();
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
                  (minor={}, header_addr={:#x}, nursery_start={:#x}, site={}, \
                  parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
-                 holder_type_id={:?}, holder_offset={:?}, holder_words={}, \
+                 holder_type_id={:?}, holder_name={}, holder_layout={}, \
+                 holder_offset={:?}, holder_words={}, \
                  child_tid_and_flags={:#x}, child_flag_complement={:#x}, \
                  child_words={}, child_vtable_type_id={:?}, \
                  nearest_header={}, \
@@ -6053,6 +6063,8 @@ impl MiniMarkGC {
                 self.nursery.top_ptr() as usize,
                 holder_addr,
                 holder_type_id,
+                holder_name,
+                holder_layout,
                 slot_addr.checked_sub(holder_addr),
                 Self::hex_words(&holder_words),
                 unsafe { (*hdr_ptr).tid_and_flags },
@@ -11173,11 +11185,18 @@ impl GcAllocator for MiniMarkGC {
         if self.do_maybe_collect_for_external_malloc(total_size) {
             return GcRef(0);
         }
-        // incminimark.py `external_malloc(..., alloc_young=True)`; a refused
-        // young birth (weakref type, old-style finalizer,
-        // `MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead.
-        if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
-            return obj;
+        // incminimark.py `external_malloc(..., alloc_young=True)`:
+        // `malloc_fixedsize`'s large arm. A refused young birth
+        // (`type_alloc_may_be_young` / `MAJIT_GC_YOUNG_RAWMALLOC=0`) is the
+        // `alloc_young=False` sibling (`needs_finalizer` uses that). A young
+        // birth that fails is NULL (`MemoryError`), not an old object:
+        // `remember_write_barrier` after `gen_malloc_fixedsize` would
+        // otherwise elide the first store into a born-old result
+        // (`alloc_with_type_slow`).
+        if self.young_birth_allowed(type_id) {
+            return self
+                .try_alloc_young_nonmoving_clear(type_id, total_size)
+                .unwrap_or(GcRef(0));
         }
         self.alloc_oldgen_typed(type_id, size)
     }
@@ -11198,8 +11217,10 @@ impl GcAllocator for MiniMarkGC {
         if self.threshold_reached(total_size) {
             arm_deferred_major_if_wanted();
         }
-        if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
-            return obj;
+        if self.young_birth_allowed(type_id) {
+            return self
+                .try_alloc_young_nonmoving_clear(type_id, total_size)
+                .unwrap_or(GcRef(0));
         }
         self.alloc_oldgen_typed(type_id, size)
     }
@@ -12327,6 +12348,75 @@ mod tests {
             live_after_collect <= one * 4,
             "unrooted young rawmallocs die at the threshold minor, leftover={live_after_collect}"
         );
+    }
+
+    /// `_visit_young_rawmalloced_object` appends a cardless young rawmalloc
+    /// (`TRACK_YOUNG_PTRS` clear at `external_malloc` extra_flags=0) to
+    /// `old_objects_pointing_to_young`; `collect_oldrefs_to_nursery` then
+    /// traces it. `GCBase.trace` walks `offsets_to_gc_pointers` even when
+    /// the custom hook skips the slot — leftover-B: a JIT `PyFrame` born
+    /// young-nonmoving whose `locals_cells_stack_w` is a moving nursery
+    /// array, and whose hook used to skip the field when
+    /// `try_gc_owns_object` was false (`pyframe.py class PyFrame(W_Root)`
+    /// has no custom trace; the list slot is an ordinary offset).
+    #[test]
+    fn young_nonmoving_offset_walk_forwards_nursery_child_when_hook_skips() {
+        unsafe fn skip_all(_obj_addr: usize, _visit: &mut dyn FnMut(*mut GcRef)) {}
+
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let parent_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(word, vec![0]));
+        let holder_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs_and_custom_trace(
+            2 * word,
+            parent_tid,
+            vec![word],
+            skip_all,
+        ));
+        let hook_only_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            2 * word,
+            parent_tid,
+            skip_all,
+        ));
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+
+        let leaf = gc.alloc_with_type(leaf_tid, word);
+        unsafe {
+            *(leaf.0 as *mut usize) = 0xC0FFEE;
+        }
+        let leaf_addr = leaf.0;
+        assert!(gc.is_in_nursery(leaf_addr));
+
+        let mut holder = gc.alloc_young_nonmoving_typed(holder_tid, 2 * word);
+        assert!(gc.is_young_rawmalloced(holder.0));
+        unsafe {
+            *(holder.0 as *mut GcRef) = GcRef::NULL;
+            *((holder.0 + word) as *mut GcRef) = leaf;
+            gc.roots.add(&mut holder);
+        }
+        gc.do_collect_nursery();
+        let kept = unsafe { *((holder.0 + word) as *const GcRef) };
+        assert_ne!(kept.0, leaf_addr);
+        assert!(!gc.is_in_nursery(kept.0));
+        assert!(gc.oldgen.contains(kept.0));
+        assert_eq!(unsafe { *(kept.0 as *const usize) }, 0xC0FFEE);
+        gc.roots.clear();
+
+        let leaf2 = gc.alloc_with_type(leaf_tid, word);
+        let leaf2_addr = leaf2.0;
+        let mut holder2 = gc.alloc_young_nonmoving_typed(hook_only_tid, 2 * word);
+        unsafe {
+            *(holder2.0 as *mut GcRef) = GcRef::NULL;
+            *((holder2.0 + word) as *mut GcRef) = leaf2;
+            gc.roots.add(&mut holder2);
+        }
+        gc.do_collect_nursery();
+        let stale = unsafe { *((holder2.0 + word) as *const GcRef) };
+        assert_eq!(
+            stale.0, leaf2_addr,
+            "a hook-only type whose hook skips the slot leaves the nursery pointer unforwarded"
+        );
+        assert!(!gc.oldgen.contains(stale.0));
+        gc.roots.clear();
     }
 
     /// The compiled-code entry point.  `dynasm_malloc_array` and

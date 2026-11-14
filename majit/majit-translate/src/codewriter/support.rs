@@ -52,12 +52,14 @@
 //! mirror of upstream's `_obj.<callable>.oopspec` access: same
 //! information, different host vehicle.
 
+use std::collections::HashSet;
+
 use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
-use crate::flowspace::model::Variable;
-use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+use crate::flowspace::model::{ConstValue, Variable};
+use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType, getkind};
 use crate::parse::CallPath;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
@@ -273,27 +275,53 @@ pub(crate) fn rewrite_jit_merge_point(
 /// Emit one Input per new inputarg, typed from the pre-split producer
 /// and, for reds, the driver's red-type name. Flagged merge-point reds
 /// are bound next by `inherit_split_portal_access_directly`.
+///
+/// `warmspot.py split_graph_and_record_jitdriver` records
+/// `_portal_args_s = [s_binding(v) for v in args]` off the marker
+/// operands. Loop-carried reds are header phis (`unsimplify.py`
+/// `split_block` inputargs) with no producing op; falling back to
+/// `Ref(None)` unions `SomeInteger` with `SomeObject`. Recover the
+/// kind from `Variable.concretetype`, the phi predecessors, then the
+/// declared banks. `history.py getkind` of Unsigned primitives and
+/// Address is `'int'` (the JIT bank); the annotator still distinguishes
+/// `r_uint` from signed (`binaryop.py` `pairtype(SomeInteger,
+/// SomeInteger).union`). A usize original (`pin_roots`,
+/// `RootScope.save_point`) seeds Unsigned so `mergeinputargs` matches
+/// the predecessor. Loop-carried `i: i64` seeds Int from its ConstInt
+/// pred. `interp_jit.py` `next_instr = r_uint(...)` is rewritten
+/// Unsigned by green name. A signed first green (`listobject.py`
+/// `strategy_type`) stays Int.
 pub(crate) fn seed_split_portal_input_ops(
     graph: &mut FunctionGraph,
     start: BlockId,
+    green_names: &[String],
     green_kinds: &[Type],
     red_kinds: &[Type],
     red_types: &[String],
 ) {
     let inputs = graph.block(start).inputargs.clone();
-    let originals = graph.blocks.iter().find_map(|block| {
-        block
-            .exits
-            .iter()
-            .find(|exit| exit.target == start)
-            .map(|exit| {
-                exit.args
-                    .iter()
-                    .filter_map(LinkArg::as_variable)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-    });
+    let existing_ops = graph.block(start).operations.clone();
+    // `unsimplify.py split_block` copies live vars (`Variable.copy`).
+    // `split_before_jit_merge_point` splits twice, so the immediate
+    // predecessor of the portal start may carry a copy of a loop-header
+    // phi rather than the phi itself. Walk every predecessor.
+    let original_rows: Vec<Vec<Variable>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .exits
+                .iter()
+                .filter(|exit| exit.target == start)
+                .map(|exit| {
+                    exit.args
+                        .iter()
+                        .filter_map(LinkArg::as_variable)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+        })
+        .collect();
     let declared: Vec<ValueType> = green_kinds
         .iter()
         .chain(red_kinds.iter())
@@ -305,19 +333,28 @@ pub(crate) fn seed_split_portal_input_ops(
     let red_start = inputs.len().saturating_sub(declared_reds);
     let mut seeded = Vec::with_capacity(inputs.len());
     for (index, var) in inputs.iter().enumerate() {
-        let produced = originals
-            .as_ref()
-            .and_then(|vars| vars.get(index))
-            .and_then(|original| producer_input_type(graph, original));
-        let (mut ty, mut class_root) = produced.unwrap_or_else(|| {
-            (
-                declared.get(index).cloned().unwrap_or(ValueType::Ref(None)),
-                None,
-            )
-        });
-        // The first green is `next_instr: usize`. The driver kind is the
-        // JIT int bank, which is not the annotator's signedness.
-        if index == 0 && ty == ValueType::Int {
+        let original_candidates: Vec<&Variable> = original_rows
+            .iter()
+            .filter_map(|vars| vars.get(index))
+            .collect();
+        let produced = original_candidates
+            .iter()
+            .find_map(|orig| producer_input_type(graph, orig));
+        let (mut ty, mut class_root) = seed_input_type(
+            graph,
+            &existing_ops,
+            var,
+            &original_candidates,
+            produced,
+            declared.get(index),
+        );
+        // `interp_jit.py` `next_instr = r_uint(self.last_instr)`. The JIT
+        // bank is Int; the annotator is Unsigned. `listobject.py`
+        // `strategy_type` is a signed discriminant and must stay Int.
+        if index == 0
+            && ty == ValueType::Int
+            && green_names.first().map(String::as_str) == Some("next_instr")
+        {
             ty = ValueType::Unsigned;
         }
         if class_root.is_none()
@@ -340,6 +377,205 @@ pub(crate) fn seed_split_portal_input_ops(
     let block = graph.block_mut(start);
     seeded.append(&mut block.operations);
     block.operations = seeded;
+}
+
+/// JIT kinds of autodetected reds when every operand has a known bank.
+/// Empty when any red is still unresolved, so the seed walk infers
+/// per input rather than padding with `Ref(None)`.
+pub(crate) fn ir_kinds_for_seed(graph: &FunctionGraph, reds: &[Variable]) -> Vec<Type> {
+    let kinds: Vec<Type> = reds
+        .iter()
+        .filter_map(|var| ir_kind_known(graph, var))
+        .collect();
+    if kinds.len() == reds.len() {
+        kinds
+    } else {
+        Vec::new()
+    }
+}
+
+fn seed_input_type(
+    graph: &FunctionGraph,
+    existing_ops: &[SpaceOperation],
+    var: &Variable,
+    originals: &[&Variable],
+    produced: Option<(ValueType, Option<String>)>,
+    declared: Option<&ValueType>,
+) -> (ValueType, Option<String>) {
+    let class_root = produced.as_ref().and_then(|(_, cr)| cr.clone());
+    let ty = match produced.as_ref().map(|(t, _)| t.clone()) {
+        Some(t) => t,
+        None => originals
+            .iter()
+            .find_map(|orig| valuetype_from_variable(orig))
+            .or_else(|| {
+                originals
+                    .iter()
+                    .find_map(|orig| valuetype_via_phi_preds(graph, orig))
+            })
+            .or_else(|| declared.cloned())
+            .or_else(|| infer_from_ops(existing_ops, var))
+            .unwrap_or(ValueType::Ref(None)),
+    };
+    (ty, class_root)
+}
+
+fn ir_kind_known(graph: &FunctionGraph, var: &Variable) -> Option<Type> {
+    let ty = producer_input_type(graph, var)
+        .map(|(t, _)| t)
+        .or_else(|| valuetype_from_variable(var))
+        .or_else(|| valuetype_via_phi_preds(graph, var))?;
+    Some(match ty {
+        ValueType::Float => Type::Float,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::State => {
+            Type::Ref
+        }
+        ValueType::Void => Type::Void,
+        _ => Type::Int,
+    })
+}
+
+fn valuetype_from_variable(var: &Variable) -> Option<ValueType> {
+    let ll = var.concretetype()?;
+    // Annotator signedness, not the JIT bank: `history.py getkind` of
+    // Unsigned primitives is `'int'`, but `binaryop.py`
+    // `pairtype(SomeInteger, SomeInteger).union` still distinguishes
+    // `r_uint` from signed. A usize original (`pin_roots`,
+    // `RootScope.save_point`) must seed Unsigned so `mergeinputargs`
+    // matches the predecessor.
+    if matches!(ll, LowLevelType::Unsigned) {
+        return Some(ValueType::Unsigned);
+    }
+    match getkind(&ll) {
+        ConcreteType::Signed => Some(ValueType::Int),
+        ConcreteType::GcRef => Some(ValueType::Ref(None)),
+        ConcreteType::Float => Some(ValueType::Float),
+        ConcreteType::Void => Some(ValueType::Void),
+        ConcreteType::Unknown => None,
+    }
+}
+
+fn valuetype_via_phi_preds(graph: &FunctionGraph, var: &Variable) -> Option<ValueType> {
+    let mut visited = HashSet::new();
+    valuetype_via_phi_preds_rec(graph, var, &mut visited)
+}
+
+fn valuetype_via_phi_preds_rec(
+    graph: &FunctionGraph,
+    var: &Variable,
+    visited: &mut HashSet<u64>,
+) -> Option<ValueType> {
+    if !visited.insert(var.id()) {
+        return None;
+    }
+    let mut found: Option<ValueType> = None;
+    for block in &graph.blocks {
+        let Some(slot) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for exit in &pred.exits {
+                if exit.target != block.id {
+                    continue;
+                }
+                let Some(arg) = exit.args.get(slot) else {
+                    continue;
+                };
+                let Some(ty) = linkarg_valuetype_rec(graph, arg, visited) else {
+                    continue;
+                };
+                match &found {
+                    None => found = Some(ty),
+                    Some(prev) if types_agree(prev, &ty) => {
+                        // Mixed Int/Unsigned preds stay Int:
+                        // `binaryop.py` signedness proof, `history.py`
+                        // `getkind` `'int'` for Unsigned primitives.
+                        match (prev, &ty) {
+                            (ValueType::Unsigned, ValueType::Int)
+                            | (ValueType::Int, ValueType::Unsigned) => {
+                                found = Some(ValueType::Int);
+                            }
+                            _ if matches!(ty, ValueType::Unsigned) => {
+                                found = Some(ValueType::Unsigned);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(_) => return None,
+                }
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    found
+}
+
+fn types_agree(a: &ValueType, b: &ValueType) -> bool {
+    match (a, b) {
+        (
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool,
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool,
+        ) => true,
+        (ValueType::Float, ValueType::Float) => true,
+        (ValueType::Ref(_), ValueType::Ref(_)) => true,
+        (ValueType::Void, ValueType::Void) => true,
+        _ => a == b,
+    }
+}
+
+fn linkarg_valuetype_rec(
+    graph: &FunctionGraph,
+    arg: &LinkArg,
+    visited: &mut HashSet<u64>,
+) -> Option<ValueType> {
+    match arg {
+        LinkArg::Value(var) => producer_input_type(graph, var)
+            .map(|(t, _)| t)
+            .or_else(|| valuetype_from_variable(var))
+            .or_else(|| valuetype_via_phi_preds_rec(graph, var, visited)),
+        LinkArg::Const(c) => match &c.value {
+            ConstValue::Int(_) => Some(ValueType::Int),
+            ConstValue::UInt(_) => Some(ValueType::Unsigned),
+            ConstValue::Bool(_) => Some(ValueType::Bool),
+            ConstValue::Float(_) => Some(ValueType::Float),
+            ConstValue::None | ConstValue::ByteStr(_) => Some(ValueType::Ref(None)),
+            _ => None,
+        },
+    }
+}
+
+fn infer_from_ops(ops: &[SpaceOperation], var: &Variable) -> Option<ValueType> {
+    for op in ops {
+        match &op.kind {
+            OpKind::BinOp {
+                lhs,
+                rhs,
+                result_ty,
+                ..
+            } if lhs == var || rhs == var => {
+                if matches!(
+                    result_ty,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float
+                ) {
+                    return Some(result_ty.clone());
+                }
+            }
+            OpKind::UnaryOp {
+                operand, result_ty, ..
+            } if operand == var => {
+                if matches!(
+                    result_ty,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float
+                ) {
+                    return Some(result_ty.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn ir_type_to_valuetype(kind: Type) -> ValueType {
@@ -1899,5 +2135,219 @@ mod tests {
                 super::NormalizedArg::Pass(v7),
             ]
         );
+    }
+
+    #[test]
+    fn seed_split_portal_types_loop_carried_int_from_phi_preds() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("list_extend_portal_portal");
+        let green_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let green_ref = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let phi = graph.alloc_value_var();
+        let header = graph.startblock;
+        graph.block_mut(header).inputargs = vec![phi.clone()];
+
+        let entry = graph.create_block();
+        let zero = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let to_header = Link::from_variables(&graph, vec![zero], header, None);
+        graph.recloseblock(entry, vec![to_header]);
+
+        let start = graph.create_block();
+        let g2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let r2 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let i2 = graph.alloc_value_var();
+        graph.block_mut(start).inputargs = vec![g2, r2, i2];
+        let to_start = Link::from_variables(&graph, vec![green_int, green_ref, phi], start, None);
+        graph.recloseblock(header, vec![to_start]);
+
+        seed_split_portal_input_ops(
+            &mut graph,
+            start,
+            &["strategy_type".into(), "greenkey".into()],
+            &[Type::Int, Type::Ref],
+            &[],
+            &[],
+        );
+        let OpKind::Input { ty, .. } = &graph.block(start).operations[2].kind else {
+            panic!("third formal must be a seeded Input");
+        };
+        assert_eq!(ty, &ValueType::Int);
+    }
+
+    #[test]
+    fn seed_split_portal_types_loop_carried_int_across_two_splits() {
+        use crate::model::Link;
+
+        // `split_before_jit_merge_point` splits twice. The portal
+        // startblock's predecessor then carries a copy of the header
+        // phi, not the phi whose ConstInt pred lives on the entry.
+        let mut graph = FunctionGraph::new("list_extend_portal_portal");
+        let phi = graph.alloc_value_var();
+        let header = graph.startblock;
+        graph.block_mut(header).inputargs = vec![phi.clone()];
+
+        let entry = graph.create_block();
+        let zero = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let to_header = Link::from_variables(&graph, vec![zero], header, None);
+        graph.recloseblock(entry, vec![to_header]);
+
+        let mid = graph.create_block();
+        let phi_copy = phi.copy();
+        graph.block_mut(mid).inputargs = vec![phi_copy.clone()];
+        let to_mid = Link::from_variables(&graph, vec![phi], mid, None);
+        graph.recloseblock(header, vec![to_mid]);
+
+        let start = graph.create_block();
+        let g2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let r2 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let i2 = graph.alloc_value_var();
+        graph.block_mut(start).inputargs = vec![g2, r2, i2];
+        let green_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let green_ref = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let to_start =
+            Link::from_variables(&graph, vec![green_int, green_ref, phi_copy], start, None);
+        graph.recloseblock(mid, vec![to_start]);
+
+        seed_split_portal_input_ops(
+            &mut graph,
+            start,
+            &["strategy_type".into(), "greenkey".into()],
+            &[Type::Int, Type::Ref],
+            &[],
+            &[],
+        );
+        let OpKind::Input { ty, .. } = &graph.block(start).operations[2].kind else {
+            panic!("third formal must be a seeded Input");
+        };
+        assert_eq!(ty, &ValueType::Int);
+    }
+
+    #[test]
+    fn seed_split_portal_types_usize_original_unsigned() {
+        use crate::model::Link;
+
+        // `pin_roots` / `RootScope.save_point` are usize. The portal
+        // startblock predecessor carries that Unsigned; seeding Int
+        // unions `Unsigned ∪ Int` at `mergeinputargs`.
+        let mut graph = FunctionGraph::new("list_extend_portal_portal");
+        let phi = graph.alloc_value_var();
+        phi.set_concretetype(Some(LowLevelType::Unsigned));
+        let header = graph.startblock;
+        graph.block_mut(header).inputargs = vec![phi.clone()];
+
+        let entry = graph.create_block();
+        let zero = graph.alloc_value_var();
+        zero.set_concretetype(Some(LowLevelType::Unsigned));
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstUInt(0),
+        });
+        let to_header = Link::from_variables(&graph, vec![zero], header, None);
+        graph.recloseblock(entry, vec![to_header]);
+
+        let mid = graph.create_block();
+        let phi_copy = phi.copy();
+        graph.block_mut(mid).inputargs = vec![phi_copy.clone()];
+        let to_mid = Link::from_variables(&graph, vec![phi], mid, None);
+        graph.recloseblock(header, vec![to_mid]);
+
+        let start = graph.create_block();
+        let g2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let r2 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let i2 = graph.alloc_value_var();
+        graph.block_mut(start).inputargs = vec![g2, r2, i2];
+        let green_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let green_ref = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let to_start =
+            Link::from_variables(&graph, vec![green_int, green_ref, phi_copy], start, None);
+        graph.recloseblock(mid, vec![to_start]);
+
+        seed_split_portal_input_ops(
+            &mut graph,
+            start,
+            &["strategy_type".into(), "greenkey".into()],
+            &[Type::Int, Type::Ref],
+            &[],
+            &[],
+        );
+        let OpKind::Input { ty, .. } = &graph.block(start).operations[2].kind else {
+            panic!("third formal must be a seeded Input");
+        };
+        assert_eq!(ty, &ValueType::Unsigned);
+    }
+
+    #[test]
+    fn seed_split_portal_keeps_signed_first_green() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("list_extend_portal_portal");
+        let strategy = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let prefix = graph.startblock;
+        graph.block_mut(prefix).operations.push(SpaceOperation {
+            result: Some(strategy.clone()),
+            kind: OpKind::ConstInt(1),
+        });
+
+        let start = graph.create_block();
+        let strategy2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(start).inputargs = vec![strategy2];
+        let to_start = Link::from_variables(&graph, vec![strategy], start, None);
+        graph.recloseblock(prefix, vec![to_start]);
+
+        seed_split_portal_input_ops(
+            &mut graph,
+            start,
+            &["strategy_type".into()],
+            &[Type::Int],
+            &[],
+            &[],
+        );
+        let OpKind::Input { ty, .. } = &graph.block(start).operations[0].kind else {
+            panic!("first formal must be a seeded Input");
+        };
+        assert_eq!(ty, &ValueType::Int);
+    }
+
+    #[test]
+    fn seed_split_portal_types_next_instr_unsigned() {
+        use crate::model::Link;
+
+        // `interp_jit.py` `next_instr = r_uint(self.last_instr)`. The JIT
+        // bank is Int; the portal startblock is Unsigned.
+        let mut graph = FunctionGraph::new("eval_loop_jit_portal");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let prefix = graph.startblock;
+        graph.block_mut(prefix).operations.push(SpaceOperation {
+            result: Some(next_instr.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+
+        let start = graph.create_block();
+        let next2 = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(start).inputargs = vec![next2];
+        let to_start = Link::from_variables(&graph, vec![next_instr], start, None);
+        graph.recloseblock(prefix, vec![to_start]);
+
+        seed_split_portal_input_ops(
+            &mut graph,
+            start,
+            &["next_instr".into()],
+            &[Type::Int],
+            &[],
+            &[],
+        );
+        let OpKind::Input { ty, .. } = &graph.block(start).operations[0].kind else {
+            panic!("first formal must be a seeded Input");
+        };
+        assert_eq!(ty, &ValueType::Unsigned);
     }
 }

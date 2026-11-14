@@ -2667,8 +2667,21 @@ impl PyError {
         Self::new(PyErrorKind::MemoryError, msg)
     }
 
+    /// `OperationError(space.w_StopIteration, space.w_None)`: the carrier
+    /// has a class and no value, so no message string is built.
     pub fn stop_iteration() -> Self {
-        Self::new(PyErrorKind::StopIteration, String::new())
+        PyError(unsafe {
+            std::ptr::NonNull::new_unchecked(make_pyerror_from_exc_object(
+                PyErrorKind::StopIteration,
+                pyre_object::PY_NULL,
+                true,
+                false,
+                -1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        })
     }
 
     pub fn stop_async_iteration() -> Self {

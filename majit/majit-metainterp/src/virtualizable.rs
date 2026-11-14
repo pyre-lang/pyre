@@ -376,6 +376,30 @@ where
 }
 
 impl VirtualizableInfo {
+    /// Whether a jitcode vable field / array index means the same bytes in
+    /// `self` and `other`: one VTYPE layout (`descr.py`
+    /// `ArrayOrFieldDescr.get_vinfo` names the owning TYPE's vinfo).
+    pub fn same_vtype_layout(&self, other: &VirtualizableInfo) -> bool {
+        std::ptr::eq(self, other)
+            || (self.token_offset == other.token_offset
+                && self.static_fields.len() == other.static_fields.len()
+                && self
+                    .static_fields
+                    .iter()
+                    .zip(&other.static_fields)
+                    .all(|(a, b)| a.offset == b.offset && a.field_type == b.field_type)
+                && self.array_fields.len() == other.array_fields.len()
+                && self
+                    .array_fields
+                    .iter()
+                    .zip(&other.array_fields)
+                    .all(|(a, b)| {
+                        a.field_offset == b.field_offset
+                            && a.item_type == b.item_type
+                            && a.item_size == b.item_size
+                    }))
+    }
+
     /// `virtualizable.py VirtualizableInfo.unwrap_virtualizable_box`.
     ///
     /// `return virtualizable_box.getref(llmemory.GCREF)`.

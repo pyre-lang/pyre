@@ -212,6 +212,12 @@ fn cached_size_descr_is_complete_hit(
 /// identity, matching `bh_new`/`bh_new_with_vtable` dispatch descrs.
 fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrRef {
     let headerless = descr.is_headerless();
+    // `BhDescr::Size.type_id` is the STRUCT `cache_key` (`descr.py`
+    // `get_size_descr`). The collector tid is `init_size_descr`'s
+    // `TypeLayoutBuilder.get_type_id(S)`, recovered by
+    // `resolved_gc_tid_checked`. The truncated low word of the key is
+    // not a tid.
+    let collector_tid = descr.resolved_gc_tid_checked().unwrap_or(0);
     if let crate::blackhole::BhDescr::Size {
         size,
         type_id,
@@ -249,7 +255,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             *size,
-            *type_id as u32,
+            collector_tid,
             *type_id,
             *vtable as usize,
             *is_gc_managed,
@@ -262,11 +268,10 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
     }
     let size = descr.as_size();
     let vtable = descr.get_vtable();
-    let type_id = descr.get_type_id() as u32;
     let mut sd = if vtable != 0 {
-        majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)
+        majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, size, collector_tid, vtable)
     } else {
-        majit_ir::descr::SimpleSizeDescr::new(u32::MAX, size, type_id)
+        majit_ir::descr::SimpleSizeDescr::new(u32::MAX, size, collector_tid)
     };
     sd.set_headerless(headerless);
     let sd: majit_ir::DescrRef = Arc::new(sd);
@@ -2565,7 +2570,15 @@ where
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
     ///
     /// Session vinfo first (`jitdriver_sd.virtualizable_info`), then the
-    /// current frame's driver. Never the first registered driver.
+    /// current frame's driver. Never the first registered driver as the
+    /// primary lookup.
+    ///
+    /// The descr is `jtransform.py get_virtualizable_field_descr` —
+    /// `vinfo.static_field_descrs[index]` of the TYPE. A novable driver
+    /// still executes `getfield_vable_*` when it inlines a virtualizable
+    /// method, then `_nonstandard_virtualizable` falls back to getfield_gc.
+    /// When session and current-driver vinfo are both unset, the encoded
+    /// TYPE descr from another driver's slot still answers.
     fn vable_field_descr(
         &mut self,
         ctx: &TraceCtx,
@@ -2578,6 +2591,7 @@ where
         } else {
             self.current_jitdriver_vinfo(ctx)
                 .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
+                .or_else(|| ctx.encoded_vable_static_field_descr(field_idx))
         };
         match descr {
             Some(descr) => Some((vable_opref, descr)),
@@ -2587,6 +2601,7 @@ where
                 } else {
                     self.current_jitdriver_vinfo(ctx)
                         .map(|info| info.static_field_descrs().len())
+                        .or_else(|| ctx.encoded_vable_static_field_count())
                 };
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
@@ -2678,12 +2693,14 @@ where
                 _ => None,
             }
         } else {
-            self.current_jitdriver_vinfo(ctx).and_then(|info| {
-                Some((
-                    info.array_field_descrs().get(array_idx)?.clone(),
-                    info.array_descrs.get(array_idx)?.clone(),
-                ))
-            })
+            self.current_jitdriver_vinfo(ctx)
+                .and_then(|info| {
+                    Some((
+                        info.array_field_descrs().get(array_idx)?.clone(),
+                        info.array_descrs.get(array_idx)?.clone(),
+                    ))
+                })
+                .or_else(|| ctx.encoded_vable_array_descrs(array_idx))
         };
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
@@ -2693,6 +2710,7 @@ where
                 } else {
                     self.current_jitdriver_vinfo(ctx)
                         .map(|info| info.array_field_descrs().len())
+                        .or_else(|| ctx.encoded_vable_array_field_count())
                 };
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None
@@ -9104,6 +9122,66 @@ mod tests {
         assert!(
             matches!(sbox_val, Some(Value::Ref(r)) if r.as_usize() != 0),
             "list header pointer must be a non-null ref, got {sbox_val:?}"
+        );
+    }
+
+    #[test]
+    fn getfield_vable_on_novable_driver_falls_back_to_getfield_gc() {
+        // pyjitpl.py `opimpl_getfield_vable_i`: the jitcode `d` operand is
+        // `vinfo.static_field_descrs[index]` of the TYPE. A novable driver
+        // (`filter_jitdriver`) has no bound vinfo; `_nonstandard_virtualizable`
+        // falls back to getfield_gc instead of aborting.
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pycode", Type::Int, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            clear_vable_noop as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.virtualizable_info = Some(Arc::new(info));
+        let mut sd = crate::MetaInterpStaticData::new();
+        sd.jitdrivers_sd.push(jd);
+
+        let mut builder = JitCodeBuilder::new();
+        builder.vable_getfield_int_with_base(0, 0, 0);
+        let jitcode = builder.finish();
+
+        let mut recorder = crate::recorder::Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(recorder, 0, Arc::new(sd));
+        assert!(ctx.virtualizable_info().is_none());
+
+        let mut cell: i64 = 0x11;
+        let ptr = &mut cell as *mut i64 as i64;
+        ctx.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(ptr as usize)));
+
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, vable, ptr)],
+        );
+        assert!(
+            matches!(action, TraceAction::Continue),
+            "novable getfield_vable must not abort, got {action:?}"
+        );
+        let recorder = ctx.into_recorder();
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::GetfieldGcI),
+            "nonstandard getfield_vable records GETFIELD_GC_I, got {:?}",
+            recorder
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
         );
     }
 

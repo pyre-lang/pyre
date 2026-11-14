@@ -3886,6 +3886,50 @@ pub(in crate::front::mir) fn is_core_ptr_null_fun_path(path: &str) -> bool {
     )
 }
 
+/// Residual-ABI publisher that *is* a raise: `exceptiontransform.py`
+/// `rpyexc_raise` / `transform_jump_to_except_block`.
+///
+/// The helper writes `BH_LAST_EXC_VALUE` and returns the garbage
+/// residual result (`0` / null). Looking inside a caller records that
+/// as a residual CALL whose target stays a symbolic path hash
+/// (`jit_fnaddr` leaves it unpublished, like `take_call_error`). The
+/// call site lowers as `exc_from_raise` of the carrier instead.
+pub(in crate::front::mir) fn is_residual_error_publisher(path: &str) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    match leaf {
+        "jit_publish_residual_error"
+        | "jit_publish_residual_error_ref"
+        | "jit_publish_exception" => true,
+        "publish_residual" => path.contains("ResidualError") || path.contains("PyError"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod residual_error_publisher_tests {
+    use super::is_residual_error_publisher;
+
+    #[test]
+    fn residual_error_publisher_paths() {
+        assert!(is_residual_error_publisher(
+            "pyre_interpreter::runtime_ops::jit_publish_residual_error"
+        ));
+        assert!(is_residual_error_publisher(
+            "pyre_interpreter::runtime_ops::jit_publish_residual_error_ref"
+        ));
+        assert!(is_residual_error_publisher(
+            "pyre_interpreter::runtime_ops::jit_publish_exception"
+        ));
+        assert!(is_residual_error_publisher(
+            "<PyError as ResidualError>::publish_residual"
+        ));
+        assert!(!is_residual_error_publisher(
+            "pyre_interpreter::runtime_ops::jit_next"
+        ));
+        assert!(!is_residual_error_publisher("some_crate::publish_residual"));
+    }
+}
+
 /// A Rust abort, lowered as `RaiseImplicit(AssertionError)` the way
 /// `TermKind::Abort` is. Declared `Never` / `!` output is that path
 /// (`ll_assert`; `rtyper/debug.py`). A panicking-module callee without
