@@ -8837,13 +8837,18 @@ fn spec_segments_adt_owned_trait_impl_keeps_identity_not_owner_leaf() {
         super::trait_impl_identity_path(&trait_owner.0, &identity, "bits")
     );
     assert_ne!(inherent_path, trait_path);
+    // registered_path_for_fun_decl is the FunDecl identity (identity_segments); spec_segments stays the harvest spelling.
     assert_eq!(
         super::registered_path_for_fun_decl(&llbc, inherent).segments,
-        inherent_path
+        super::identity_segments(&llbc, inherent, "bits")
     );
     assert_eq!(
         super::registered_path_for_fun_decl(&llbc, trait_impl).segments,
-        trait_path
+        super::identity_segments(&llbc, trait_impl, "bits")
+    );
+    assert_ne!(
+        super::registered_path_for_fun_decl(&llbc, inherent).segments,
+        super::registered_path_for_fun_decl(&llbc, trait_impl).segments
     );
     assert_eq!(
         super::fundecl_fn_item_segments(&llbc, inherent),
