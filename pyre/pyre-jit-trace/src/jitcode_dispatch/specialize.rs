@@ -7345,7 +7345,6 @@ const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
 const POS_INNER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::pos_inner",
     commit_label: "pos_inner_commit",
-    call_site_label: "pos_inner_call_site",
     decline_tag: "POS-INNER-SUBWALK",
 };
 

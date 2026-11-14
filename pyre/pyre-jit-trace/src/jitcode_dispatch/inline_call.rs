@@ -16854,7 +16854,6 @@ pub(crate) fn try_walker_inline_get_and_call_index<Sym: WalkSym>(
     code: &[u8],
     funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -16893,9 +16892,7 @@ pub(crate) fn try_walker_inline_get_and_call_index<Sym: WalkSym>(
     if candidate.method != concrete_method {
         return Ok(None);
     }
-    let Some((result, _)) =
-        try_walker_inline_index(ctx, op, code, funcptr, r_args, call_descr, dst, candidate)?
-    else {
+    let Some((result, _)) = try_walker_inline_index(ctx, op, code, dst, candidate)? else {
         return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;

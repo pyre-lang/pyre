@@ -11981,9 +11981,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `get_and_call_function` of `__index__`. Helper-innermost walks that
     // call inside `binary_slice_values_inner`; inline the body with the
     // same `try_walker_inline_index` `range` / `complex` already use.
-    if let Some(inlined) = try_walker_inline_get_and_call_index(
-        ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-    )? {
+    if let Some(inlined) =
+        try_walker_inline_get_and_call_index(ctx, op, code, funcptr, &r_args, dst, dst_bank)?
+    {
         return Ok(inlined);
     }
 
