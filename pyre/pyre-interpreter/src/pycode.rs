@@ -4290,6 +4290,50 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     }
 }
 
+/// `pycode.py frame_stores_global`'s `self.w_globals = w_globals` arm.
+///
+/// Upstream stores under the GIL. The free-threaded publish is a
+/// compare-exchange under the watcher lock, preceded by a barrier that holds
+/// its words in a rooting bracket; none of that has a traced shape (a raw
+/// read of a root slot is `jtransform.py rewrite_op_raw_load`'s refused
+/// `'r'` kind), so it runs as a residual. Returns null when this call
+/// published `w_globals`, otherwise the pointer that won the race.
+///
+/// # Safety
+/// `obj` must point to a valid `PyCode`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_code_publish_first_w_globals(
+    obj: PyObjectRef,
+    w_globals: PyObjectRef,
+) -> PyObjectRef {
+    // Prebuilt-family store (see `w_code_set_w_globals`): the barrier runs
+    // before the publication, so a collection that observes the new child
+    // through this slot finds the slot already remembered. A lost race
+    // leaves only a conservative barrier behind.
+    let rooted = publish_code_slot_store_rooting(obj, &[w_globals]);
+    let obj = rooted.owner();
+    let code = obj as *mut PyCode;
+    let w_globals = rooted.get(0);
+    // `rclass.py hook_setfield` ahead of the store to `pycode.py`
+    // `"w_globals?"`. The null check, the sweep and the store share the
+    // watcher lock. A lost race must not sweep the winner's watcher.
+    match unsafe {
+        pyre_object::quasiimmut::publish_quasi_immut_cas(
+            &(*code).mutate_w_globals,
+            std::ptr::addr_of_mut!((*code).w_globals),
+            pyre_object::PY_NULL,
+            w_globals,
+        )
+    } {
+        Ok(()) => {
+            register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
+            register_w_globals_stamped_code(obj);
+            pyre_object::PY_NULL
+        }
+        Err(winner) => winner,
+    }
+}
+
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
 /// # Safety
@@ -4316,33 +4360,13 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     };
     let mut published = slot.load(std::sync::atomic::Ordering::Acquire);
     if published.is_null() {
-        // Prebuilt-family store (see `w_code_set_w_globals`): the barrier runs
-        // before the publication, so a collection that observes the new child
-        // through this slot finds the slot already remembered. A lost race
-        // leaves only a conservative barrier behind.
-        let rooted =
-            publish_code_slot_store_rooting(roots.get(root_base), &[roots.get(root_base + 1)]);
-        let obj = rooted.owner();
-        let code = obj as *mut PyCode;
-        let w_globals = rooted.get(0);
-        // `rclass.py hook_setfield` ahead of the store to `pycode.py`
-        // `"w_globals?"`. The null check, the sweep and the store share the
-        // watcher lock. A lost race must not sweep the winner's watcher.
-        match unsafe {
-            pyre_object::quasiimmut::publish_quasi_immut_cas(
-                &(*code).mutate_w_globals,
-                std::ptr::addr_of_mut!((*code).w_globals),
-                pyre_object::PY_NULL,
-                w_globals,
-            )
-        } {
-            Ok(()) => {
-                register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
-                register_w_globals_stamped_code(obj);
-                return false;
-            }
-            Err(winner) => published = winner,
+        let winner = unsafe {
+            w_code_publish_first_w_globals(roots.get(root_base), roots.get(root_base + 1))
+        };
+        if winner.is_null() {
+            return false;
         }
+        published = winner;
     }
     // The wrapper may have moved since its first globals stamp. The live frame
     // supplying `obj` is authoritative, so keep the raw-code compatibility

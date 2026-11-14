@@ -4211,6 +4211,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_get_w_globals",
         crate::pycode::w_code_get_w_globals,
     );
+    // `pycode.py frame_stores_global`'s first store: the free-threaded
+    // compare-exchange publish. Two pointers in, the race winner out.
+    up2!(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_publish_first_w_globals",
+        crate::pycode::w_code_publish_first_w_globals,
+    );
     // `pycode.py frame_stores_global` is a field store. These two helpers are
     // the pyre-only live-wrapper / stamped-globals registries for the raw
     // `CodeObject` / GC `PyCode` split; both take a process-global Mutex
