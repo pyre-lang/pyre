@@ -1172,12 +1172,23 @@ impl TypeRegistry {
 
     /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id`.
     ///
-    /// Return the stored id on a hit. On a miss, `register` the `TypeInfo`
-    /// (which asserts `can_add_new_types`), store the id, and return it.
+    /// Return the stored id on a hit. On a miss, assert `can_add_new_types`
+    /// before building the `TypeInfo`, `register` it, store the id, and
+    /// return it.
+    ///
+    /// Upstream derives the shape from `TYPE` itself (`encode_type_shape`), so
+    /// one key cannot carry two layouts. Here the caller still supplies the
+    /// shape, and a hit skips `info` without comparing it: one key must name
+    /// one layout until the shape is derived from the type.
     pub fn get_type_id(&mut self, key: GcTypeKey, info: impl FnOnce() -> TypeInfo) -> u32 {
         if let Some(&type_id) = self.id_of_type.get(&key) {
             return type_id;
         }
+        assert!(
+            self.can_add_new_types,
+            "TypeRegistry::get_type_id: new type after freeze_types \
+             (gctypelayout.can_add_new_types == False)"
+        );
         let type_id = self.register(info());
         self.id_of_type.insert(key, type_id);
         type_id
@@ -1680,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "TypeRegistry::register called after freeze_types")]
+    #[should_panic(expected = "TypeRegistry::get_type_id: new type after freeze_types")]
     fn get_type_id_miss_after_freeze_panics() {
         static KEY: u8 = 0;
         let mut reg = TypeRegistry::new();

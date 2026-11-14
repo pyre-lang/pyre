@@ -73,6 +73,9 @@ pub use majit_rlib::lltypesystem::rlist::{
 /// `items_have_gc_ptrs=true` so the GC walks each item slot as a Ref.
 /// Re-exported from `pyre_jit_trace::descr` for existing call sites.
 pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for list/tuple `ItemsBlock`.
+pub static PY_OBJECT_ARRAY_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(PY_OBJECT_ARRAY_GC_TYPE_ID);
 
 // 41 is `Ptr(GcArray(Signed))` and 42 is `Ptr(GcArray(Float))`, re-exported
 // above: registered after the dictview (39) and getset-property (40) slots, so
@@ -91,6 +94,9 @@ pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 /// Registered at the tail of the tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`)
 /// so no hardcoded constant shifts.
 pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for mapdict `ItemsBlock`.
+pub static W_MAPDICT_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_MAPDICT_STORAGE_GC_TYPE_ID);
 
 /// The `(base_size, item_size, len_offset)` triple describing one varsize
 /// GcArray block, derived from the Rust struct that carries the block's GC type

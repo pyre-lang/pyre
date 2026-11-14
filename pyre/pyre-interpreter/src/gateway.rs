@@ -679,6 +679,9 @@ pub static BUILTIN_CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("builti
 /// asserts the same id is returned by `gc.register_type(...)` so any
 /// drift panics on startup.
 pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `BuiltinCode`.
+pub static BUILTIN_CODE_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(BUILTIN_CODE_GC_TYPE_ID);
 
 /// Signature of a built-in function.
 ///

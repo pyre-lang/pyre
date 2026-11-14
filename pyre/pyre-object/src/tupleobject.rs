@@ -114,9 +114,15 @@ crate::mapdict_mixin_access! {
 /// startup. Re-exported from `pyre_jit_trace::descr` for existing
 /// call sites.
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_TupleObject`.
+pub static W_TUPLE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_TUPLE_GC_TYPE_ID);
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 /// User-subclass tuple layout (`typedef.py` `_getusercls`). Unconditional id 160.
 pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 161;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_TupleObjectUser`.
+pub static W_TUPLE_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_TUPLE_USER_GC_TYPE_ID);
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
 impl crate::lltype::GcType for W_TupleObject {

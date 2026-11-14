@@ -70,6 +70,11 @@ pub struct Utf8LocElem {
 /// as its WTF-8 buffer does.
 pub type Utf8IndexStorage = Vec<Utf8LocElem>;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`Utf8IndexStorage`].
+/// `unicodeobject::set_utf8_index_gc_type_id` publishes the same tid for readers.
+pub static UTF8_INDEX_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// `next_codepoint_pos` (`rutf8.py`) — the position of the code point after
 /// `pos`.  Assumes valid WTF-8 and `pos` before the end.
 #[inline]

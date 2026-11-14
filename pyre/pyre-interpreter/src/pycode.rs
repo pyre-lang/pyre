@@ -1059,6 +1059,9 @@ pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
 /// is still host-allocated and is never GC-registered, so tid 43 only
 /// ever tags a `PyCode` at runtime and the two do not collide.
 pub const W_CODE_GC_TYPE_ID: u32 = 43;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `PyCode`.
+pub static W_CODE_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(W_CODE_GC_TYPE_ID);
 
 impl pyre_object::lltype::GcType for PyCode {
     fn type_id() -> u32 {

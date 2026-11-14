@@ -84,8 +84,17 @@ pub const SPECIALISED_TUPLE_OO_VALUE1_OFFSET: usize =
 /// startup. Re-exported from `pyre_jit_trace::descr` for existing call
 /// sites.
 pub const SPECIALISED_TUPLE_II_GC_TYPE_ID: u32 = 10;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `Cls_ii`.
+pub static SPECIALISED_TUPLE_II_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(SPECIALISED_TUPLE_II_GC_TYPE_ID);
 pub const SPECIALISED_TUPLE_FF_GC_TYPE_ID: u32 = 11;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `Cls_ff`.
+pub static SPECIALISED_TUPLE_FF_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(SPECIALISED_TUPLE_FF_GC_TYPE_ID);
 pub const SPECIALISED_TUPLE_OO_GC_TYPE_ID: u32 = 12;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `Cls_oo`.
+pub static SPECIALISED_TUPLE_OO_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(SPECIALISED_TUPLE_OO_GC_TYPE_ID);
 
 pub const SPECIALISED_TUPLE_II_OBJECT_SIZE: usize =
     std::mem::size_of::<W_SpecialisedTupleObject_ii>();

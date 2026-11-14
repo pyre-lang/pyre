@@ -27,6 +27,10 @@ pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_acces
 /// inline instead, in a [`BytesBlock`].
 pub type BytesDataStorage = Vec<u8>;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`BytesDataStorage`].
+pub static BYTES_DATA_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for [`BytesDataStorage`]. Like the set-items
 /// box, this is published by `pyre-jit::eval` after the fixed-constant type
 /// registrations and is never embedded in a JIT allocation descriptor.
@@ -305,10 +309,16 @@ pub const BYTES_CTYPES_KEEPALIVE_REFS_OFFSET: usize =
 
 /// GC type id assigned to `W_BytesObject` at JitDriver init time.
 pub const W_BYTES_GC_TYPE_ID: u32 = 27;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BytesObject`.
+pub static W_BYTES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BYTES_GC_TYPE_ID);
 /// User-subclass bytes layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (163) ahead of the
 /// target-gated tail.
 pub const W_BYTES_USER_GC_TYPE_ID: u32 = 164;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BytesObjectUser`.
+pub static W_BYTES_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BYTES_USER_GC_TYPE_ID);
 pub const W_BYTES_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytesObjectUser>();
 
 /// Fixed payload size (`framework.py:811`).

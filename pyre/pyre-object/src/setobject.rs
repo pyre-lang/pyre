@@ -383,6 +383,10 @@ impl std::ops::Deref for SetStrategyRef {
     }
 }
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `SetStrategyRef`.
+pub static SET_STRATEGY_REF_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for a `SetStrategyRef` holder.
 static SET_STRATEGY_REF_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -651,6 +655,9 @@ crate::mapdict_mixin_access! {
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
 pub const W_SET_GC_TYPE_ID: u32 = 30;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_SetObject`.
+pub static W_SET_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_SET_GC_TYPE_ID);
 
 /// GC-managed element table shared by `set` and `frozenset` bodies.
 ///
@@ -669,6 +676,10 @@ pub type SetItemsStorage = crate::rordereddict::RDict<
 /// Keys are `i64` (`plain_int_w`); the table hash is [`IntKeyHash`]
 /// (`ll_int_hash`), not a second digest of the key.
 pub type IntSetStorage = crate::rordereddict::RDict<i64, (), crate::dictmultiobject::IntKeyHash>;
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for int-set `DICTENTRYARRAY`.
+pub static INT_SET_ENTRIES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`IntSetStorage`] entries array
 /// (`GcArray` of `i64` keys and unit values; no `PyObjectRef`).
@@ -702,6 +713,10 @@ pub type BytesSetStorage = crate::rordereddict::RDict<
     crate::dictmultiobject::BytesKeyHash,
 >;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for bytes-set `DICTENTRYARRAY`.
+pub static BYTES_SET_ENTRIES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the [`BytesSetStorage`] entries array.
 /// The registration traces the `BytesKey` block pointer
 /// (`BytesKey::GC_REF_OFFSETS`).
@@ -734,6 +749,10 @@ pub type AsciiSetStorage = crate::rordereddict::RDict<
     (),
     crate::dictmultiobject::StrKeyBuildHasher,
 >;
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for ascii-set `DICTENTRYARRAY`.
+pub static ASCII_SET_ENTRIES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`AsciiSetStorage`] entries array.
 /// The registration traces the `StrKey` block pointer
@@ -805,6 +824,10 @@ impl crate::rordereddict::GcRefOffsets for IdentitySetKey {
 /// table's value is `()`.
 pub type IdentitySetStorage =
     crate::rordereddict::RDict<IdentitySetKey, (), crate::dictmultiobject::ObjectKeyBuildHasher>;
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for identity-set `DICTENTRYARRAY`.
+pub static IDENTITY_SET_ENTRIES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`IdentitySetStorage`] entries array.
 /// The registration traces the object pointer on [`IdentitySetKey`]
@@ -2508,6 +2531,9 @@ pub fn set_locks_after_fork_child() {
     SET_LOCKS.after_fork_child();
 }
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`SetItemsStorage`].
+pub static SET_ITEMS_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for [`SetItemsStorage`]. Like the bigint
 /// payload id, this is published by `pyre-jit::eval` after the fixed-constant
 /// type registrations and is never embedded in a JIT allocation descriptor.
@@ -2524,6 +2550,10 @@ pub fn set_items_gc_type_id() -> u32 {
     SET_ITEMS_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`IntSetStorage`].
+pub static INT_SET_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the [`IntSetStorage`] box.
 static INT_SET_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -2538,6 +2568,10 @@ pub fn set_int_set_storage_gc_type_id(id: u32) {
 pub fn int_set_storage_gc_type_id() -> u32 {
     INT_SET_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`BytesSetStorage`].
+pub static BYTES_SET_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`BytesSetStorage`] box.
 static BYTES_SET_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -2554,6 +2588,10 @@ pub fn bytes_set_storage_gc_type_id() -> u32 {
     BYTES_SET_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`AsciiSetStorage`].
+pub static ASCII_SET_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the [`AsciiSetStorage`] box.
 static ASCII_SET_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -2568,6 +2606,10 @@ pub fn set_ascii_set_storage_gc_type_id(id: u32) {
 pub fn ascii_set_storage_gc_type_id() -> u32 {
     ASCII_SET_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`IdentitySetStorage`].
+pub static IDENTITY_SET_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`IdentitySetStorage`] box.
 static IDENTITY_SET_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -2590,6 +2632,9 @@ pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
 /// so its tid sits with the other closed ids (166) ahead of the
 /// target-gated tail. `set` and `frozenset` share it.
 pub const W_SET_USER_GC_TYPE_ID: u32 = 167;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_SetObjectUser`.
+pub static W_SET_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_SET_USER_GC_TYPE_ID);
 pub const W_SET_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObjectUser>();
 
 impl crate::lltype::GcType for W_SetObject {

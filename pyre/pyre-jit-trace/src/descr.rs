@@ -673,6 +673,9 @@ impl<T: FieldDescrGroup> FieldDescrGroup for LazyLock<T> {
 /// (`rclass.py` `ll_issubclass`). `INSTANCE_TYPE` (`W_ObjectObject`) is
 /// a child of this root, at `W_OBJECT_OBJECT_GC_TYPE_ID`.
 pub const OBJECT_GC_TYPE_ID: u32 = 0;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `rclass.OBJECT`.
+pub static OBJECT_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(OBJECT_GC_TYPE_ID);
 // `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID` live in `pyre-object`
 // alongside the `W_IntObject` / `W_FloatObject` structs they describe,
 // so `pyre-object`'s host-side allocators can reach them without a
@@ -681,14 +684,49 @@ pub use pyre_object::floatobject::W_FLOAT_GC_TYPE_ID;
 pub use pyre_object::intobject::W_INT_GC_TYPE_ID;
 /// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
 pub const JITFRAME_GC_TYPE_ID: u32 = 3;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for JITFRAME.
+/// The struct lives in `majit_backend`, which cannot depend on `pyre_object`.
+pub static JITFRAME_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(JITFRAME_GC_TYPE_ID);
 /// GC type id for JitVirtualRef (virtualref.py — JIT_VIRTUAL_REF).
 pub const VREF_GC_TYPE_ID: u32 = 4;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for JIT_VIRTUAL_REF.
+/// The struct lives in `majit_metainterp`, which cannot depend on `pyre_object`.
+pub static VREF_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(VREF_GC_TYPE_ID);
 /// GC type id for W_BoolObject. `bool` inherits from `int` per
 /// `objectobject.py W_BoolObject.typedef`, so this chains to
 /// `W_INT_GC_TYPE_ID` as its parent via `TypeInfo::object_subclass`
 /// (heaptracker.py setup_cache_gcstruct2vtable — one typeid per
 /// distinct STRUCT, not per root layout).
 pub const W_BOOL_GC_TYPE_ID: u32 = 5;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BoolObject`.
+pub static W_BOOL_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(W_BOOL_GC_TYPE_ID);
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `rbigint`.
+/// The payload lives in `majit_rlib`, which cannot depend on `pyre_object`.
+pub static BIGINT_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `rbigint` `tuple2`.
+/// The payload lives in `majit_rlib`, which cannot depend on `pyre_object`.
+pub static BIGINT_PAIR_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `GcArray(Signed)`.
+/// `TypedItemsBlock` lives in `majit_rlib`, which cannot depend on `pyre_object`.
+pub static GC_INT_ARRAY_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `GcArray(Float)`.
+/// `TypedItemsBlock` lives in `majit_rlib`, which cannot depend on `pyre_object`.
+pub static GC_FLOAT_ARRAY_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `virtualizable.py` `_DUMMY`.
+/// The header lives in `majit_metainterp`, which cannot depend on `pyre_object`.
+pub static TRACING_RESCALL_DUMMY_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `compile.py` `AllVirtuals`.
+/// The struct lives in `majit_metainterp`, which cannot depend on `pyre_object`.
+pub static ALL_VIRTUALS_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
 /// GC type id for W_IntRangeIterator. Inherits from `object`
 /// (`RANGE_ITER_TYPE` in functional.rs).
 pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;

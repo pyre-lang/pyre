@@ -42,6 +42,12 @@ const DICT_INITSIZE: usize = 8;
 /// `rdict.py` `HIGHEST_BIT = r_uint(intmask(1 << (LONG_BIT - 1)))`.
 const HIGHEST_BIT: usize = 1usize << (usize::BITS - 1);
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `WEAKDICT`.
+pub static WEAKDICT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `WEAKDICTENTRYARRAY`.
+pub static WEAKDICT_ENTRIES_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 static WEAKDICT_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 static WEAKDICT_ENTRIES_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
 
