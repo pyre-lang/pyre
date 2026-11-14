@@ -9655,6 +9655,31 @@ fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
 }
 
 #[test]
+fn vec_i64_impl_clone_is_list_builtin() {
+    let vec_ty = vec_of(i64_ty());
+    let recv_ty = serde_json::json!({"Ref": ["_", vec_ty.clone(), "Shared"]});
+    let llbc = std_extern_call_fixture_with_types(
+        "clone_vec_i64_impl",
+        &["alloc", "vec", "<Impl>", "clone"],
+        &[recv_ty],
+        vec_ty,
+        vec_type_decls(),
+    );
+    let graph = crate::test_support::lower_function(&llbc, "clone_vec_i64_impl")
+        .expect("lower alloc::vec::<Impl>::clone of Vec<i64>");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        leaves.iter().any(|leaf| *leaf == "list"),
+        "FunDecl Vec<i64>::clone must become the list builtin; ops={ops:?}"
+    );
+    assert!(
+        !leaves.iter().any(|leaf| *leaf == "clone"),
+        "FunDecl Vec<i64>::clone must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn trait_clone_of_user_struct_stays_residual() {
     let user = named_adt(0, vec![]);
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});

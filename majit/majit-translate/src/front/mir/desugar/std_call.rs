@@ -5694,11 +5694,20 @@ impl<'a> Lowering<'a> {
         args: &[Variable],
         target: usize,
     ) -> Result<bool, LowerError> {
-        let CallKind::Trait(_) = &reg.kind else {
-            return Ok(false);
-        };
-        if !self.is_copy_or_trait_clone_call(reg) {
-            return Ok(false);
+        // Charon resolves `Vec<T>::clone` to the impl FunDecl
+        // (`alloc::vec::<Impl>::clone`) the way `deref` becomes
+        // `alloc::vec::<Impl>::deref` (`rust_vec_slice_view`). A
+        // `CallKind::Trait` obligation is the other spelling.
+        let is_vec_impl_clone = regular_call_name_path(reg, self.llbc)
+            .as_deref()
+            .is_some_and(rust_vec_clone_path);
+        if !is_vec_impl_clone {
+            let CallKind::Trait(_) = &reg.kind else {
+                return Ok(false);
+            };
+            if !self.is_copy_or_trait_clone_call(reg) {
+                return Ok(false);
+            }
         }
         let Some(recv) = args.first().cloned() else {
             return Ok(false);

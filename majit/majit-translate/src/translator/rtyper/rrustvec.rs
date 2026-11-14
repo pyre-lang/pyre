@@ -27,8 +27,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::rlist::{
     FixedSizeListRepr, ListIteratorRepr, ListLayout, ll_vec_copy_from_fixed_list_helper,
-    ll_vec_copy_from_fixed_list_into, rtype_delslice_via_ll_listdelslice,
-    rtype_getslice_via_ll_listslice,
+    ll_vec_copy_from_fixed_list_into, rtype_bltn_list_via_ll_copy,
+    rtype_delslice_via_ll_listdelslice, rtype_getslice_via_ll_listslice,
 };
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, hop_arg_const_string, inputconst_from_lltype,
@@ -282,6 +282,22 @@ impl Repr for RustVecRepr {
             v,
             vec![self.lltype.clone(), LowLevelType::Signed],
             self.item_lltype().clone(),
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_bltn_list(self, hop)`
+    /// (`rlist.py`) via `rtype_bltn_list_via_ll_copy`. `list(l)` of a
+    /// one-word Vec copies into a fresh RustVec header of the same item
+    /// (`hop.r_result`). No oopspec; the JIT looks inside `ll_copy`.
+    fn rtype_bltn_list(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.exception_is_here()?;
+        rtype_bltn_list_via_ll_copy(
+            hop,
+            ListLayout::RustVec,
+            self.lltype.clone(),
+            self.item_lltype().clone(),
+            vlist,
         )
     }
 
@@ -1389,6 +1405,60 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "getfield");
         assert_eq!(ops.ops[0].args.len(), 2);
+    }
+
+    /// `list(v)` on a `Vec<i64>` (`VecItemKind::Int`) is
+    /// `gendirectcall(ll_copy, v)` (`rlist.py`
+    /// `AbstractBaseListRepr.rtype_bltn_list`). The helper result is a
+    /// RustVec header of the same item.
+    #[test]
+    fn rtype_bltn_list_int_emits_ll_copy() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use std::cell::RefCell as StdRef;
+        use std::collections::HashMap;
+
+        let (ann, rtyper) = setup_rtyper();
+        let r_vec = rust_vec_repr(&rtyper, VecItemKind::Int);
+        let vec_lltype = r_vec.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(vec_lltype.clone()));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(vec_lltype));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![v_lst_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = std::rc::Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::RustVec(
+            crate::annotator::model::SomeRustVec::for_kind(VecItemKind::Int),
+        ));
+        hop.args_r.borrow_mut().push(Some(r_vec.clone()));
+        *hop.r_result.borrow_mut() = Some(r_vec.clone());
+
+        let out = crate::translator::rtyper::rbuiltin::rtype_builtin_list(&hop, &HashMap::new())
+            .expect("list(RustVec) rtypes")
+            .expect("list returns the fresh Vec Variable");
+        let Hlvalue::Variable(_) = out else {
+            panic!("list must return a Variable (the ll_copy result)");
+        };
+        assert_only_direct_call_to(&hop.llops, "ll_copy");
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_copy"),
+            "list(RustVec) must mint an ll_copy helper graph, got {names:?}"
+        );
     }
 
     /// `v[start:stop]` on a `Vec<PyObjectRef>` (`VecItemKind::Ref`) with

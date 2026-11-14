@@ -224,6 +224,24 @@ fn rust_vec_slice_view_accepts_inherent_and_trait_impl_spellings() {
 }
 
 #[test]
+fn rust_vec_clone_path_accepts_inherent_and_trait_impl_spellings() {
+    for path in [
+        "alloc::vec::<Impl>::clone",
+        "alloc::vec::Vec::clone",
+        "vec::Vec::clone",
+        "vec::Vec::<impl core::clone::Clone<alloc::vec::Vec<v0,v1>>>::clone",
+        "alloc::vec::Vec::<impl core::clone::Clone<alloc::vec::Vec<v0,v1>>>::clone",
+    ] {
+        assert!(super::rust_vec_clone_path(path), "{path}");
+    }
+    assert!(!super::rust_vec_clone_path("alloc::vec::<Impl>::deref"));
+    assert!(!super::rust_vec_clone_path(
+        "core::clone::impls::<Impl>::clone"
+    ));
+    assert!(!super::rust_vec_clone_path("core::clone::<Impl>::clone"));
+}
+
+#[test]
 fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
     let generics = |types: Vec<serde_json::Value>| {
         serde_json::json!({

@@ -2889,7 +2889,17 @@ pub(crate) fn build_ll_arraycopy_helper_graph(
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
     let items_ptr = items_array_ptr_lltype(&item_lltype);
+    build_ll_arraycopy_helper_graph_for_items(name, item_lltype, items_ptr)
+}
 
+/// [`build_ll_arraycopy_helper_graph`] whose source/dest arrays are
+/// `items_ptr` (`Ptr(GcArray(ITEM))` or a raw nolength `Ptr(Array(ITEM))`
+/// for `ListLayout::RustVec`).
+pub(crate) fn build_ll_arraycopy_helper_graph_for_items(
+    name: &str,
+    item_lltype: LowLevelType,
+    items_ptr: LowLevelType,
+) -> Result<PyGraph, TyperError> {
     let src = variable_with_lltype("source", items_ptr.clone());
     let dst = variable_with_lltype("dest", items_ptr.clone());
     let length = variable_with_lltype("length", LowLevelType::Signed);
@@ -7941,12 +7951,14 @@ fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, Type
     }
 }
 
-/// Shared body of `FixedSizeListRepr` / `ListRepr` `rtype_bltn_list`
-/// (`rpython/rtyper/rlist.py` `rtype_bltn_list`): the receiver has
-/// already been threaded into `vlist` and `exception_is_here` declared. Mints
-/// `ll_arraycopy` <- `ll_newlist` <- `ll_copy` in dependency order (the
-/// result `RESLIST` is `hop.r_result`) and `gendirectcall`s `ll_copy`.
-fn rtype_bltn_list_via_ll_copy(
+/// Shared body of `FixedSizeListRepr` / `ListRepr` / `RustVecRepr`
+/// `rtype_bltn_list` (`rpython/rtyper/rlist.py` `rtype_bltn_list`): the
+/// receiver has already been threaded into `vlist` and `exception_is_here`
+/// declared. Mints `ll_arraycopy` <- `ll_newlist` <- `ll_copy` in
+/// dependency order (the result `RESLIST` is `hop.r_result`) and
+/// `gendirectcall`s `ll_copy`. A RustVec source copies through the raw
+/// nolength `ptr` array (`items_array_ptr_lltype_for_layout`).
+pub(crate) fn rtype_bltn_list_via_ll_copy(
     hop: &HighLevelOp,
     source_layout: ListLayout,
     source_ptr_lltype: LowLevelType,
@@ -7961,16 +7973,21 @@ fn rtype_bltn_list_via_ll_copy(
         .ok_or_else(|| TyperError::message("rtype_bltn_list: r_result not populated"))?;
     let result_ptr_lltype = r_result.lowleveltype().clone();
     let result_layout = list_layout_from_lltype(&result_ptr_lltype)?;
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
+    let items_ptr = items_array_ptr_lltype_for_layout(source_layout, &item_lltype);
 
     let arraycopy = {
         let item = item_lltype.clone();
+        let items = items_ptr.clone();
         hop.rtyper.lowlevel_helper_function_with_builder(
             "ll_arraycopy".to_string(),
             vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
             LowLevelType::Void,
             move |_rtyper, _args, _result| {
-                build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+                build_ll_arraycopy_helper_graph_for_items(
+                    "ll_arraycopy",
+                    item.clone(),
+                    items.clone(),
+                )
             },
         )?
     };
