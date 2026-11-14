@@ -916,12 +916,10 @@ impl UnrollOptimizer {
             // live in the imported state's `partial_trace_operations`
             // (export records them there from `phase1_emit_ops`, #104). The
             // non-skip path populates `self.phase1_emit_ops` from `opt_p1`;
-            // restore the same pool here so Phase 2's producer lookup
-            // (`new_operations ∪ phase1_emit_ops ∪ resop_refs`) can reach a
-            // const-folded preamble producer that no other store carries.
-            // RPython keeps box `_forwarded` reachable across the retrace;
-            // this is the pyre analog. (Readers dedup, so double-coverage
-            // with `resop_refs` is idempotent.)
+            // restore the same pool here so Phase 2's `op_at` / `opref_type`
+            // can reach a const-folded preamble producer that no other
+            // store carries. RPython keeps box `_forwarded` reachable
+            // across the retrace; this is the analog.
             self.phase1_emit_ops = pre_imported.partial_trace_operations.clone();
             // RPython: same Optimizer persists patchguardop. Recover here.
             if self.phase1_patchguardop.is_none() {
@@ -1021,9 +1019,9 @@ impl UnrollOptimizer {
             // fresh Box identity set so _forwarded mutations cannot alias
             // across phases.
             //
-            // Const operands are NOT cached: `get_box_replacement_operand_opt`
-            // allocates a fresh const operand per call from `const_pool`
-            // (`history.py` ConstInt(value) per-call-site parity).
+            // Const operands are NOT cached: `ConstInt.__init__` mints a
+            // fresh instance per use (`history.py` ConstInt(value)
+            // per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared
             // `constants` map.
             // unroll.py `optimize_preamble` has no
@@ -1038,8 +1036,7 @@ impl UnrollOptimizer {
             // forwarding yet at Phase 1 setup, so the seed is trivially the
             // authoritative source here.
             // The iterator's reminted ops carry the `inputarg_from_tp`
-            // InputArg Rcs. Seed them so `ensure_inputarg_bindings`
-            // reuses those objects instead of minting a second host.
+            // InputArg Rcs (`OpHelpers.inputarg_from_tp`).
             opt_p1.explicit_input_ops_seed = Some(p1_ops_in.clone());
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
@@ -1151,7 +1148,7 @@ impl UnrollOptimizer {
                     // here for non-peeled traces that return directly.
                     let mut ops = p1_ops;
                     if let Some(terminal) = opt_p1.terminal_op.take() {
-                        ops.push(OpRc::new(terminal));
+                        ops.push(terminal);
                     }
                     // `compile.py` `jitcell_token.target_tokens = [target_token]`
                     // / `:290` `jitcell_token.target_tokens = [start_descr]` —
@@ -1484,7 +1481,7 @@ impl UnrollOptimizer {
                 p2_high_water,
                 // Phase 2 ops are fresh-Rc `TraceIterator` wraps; with no
                 // explicit seed threaded, `input_ops` stays empty and identity
-                // comes from `bind_input_resops` / emit.
+                // comes from emit.
                 false,
             )
         })?;
@@ -2398,10 +2395,8 @@ pub struct ExportedState {
     pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
-    /// forwarded away. `reserve_pos_typed` skips `materialize_operand_at` on the
-    /// zero-inputarg / retrace baselines (`optimizeopt/mod.rs`),
-    /// so capturing `ctx.next_pos` at export is the only reliable
-    /// floor. Phase 2 / retrace seed their TraceIterator namespace
+    /// forwarded away. Capturing `ctx.next_pos` at export is the
+    /// reliable floor. Phase 2 / retrace seed their TraceIterator namespace
     /// strictly above this watermark via `opref_high_water()` to keep
     /// the OpRef set disjoint — RPython's object-identity Boxes get
     /// disjointness from Python identity for free; pyre's numeric
@@ -3426,9 +3421,7 @@ impl OptUnroll {
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
-        // `reserve_pos_typed` skips `materialize_operand_at` on the zero-inputarg /
-        // retrace baselines (`optimizeopt/mod.rs`), so capturing
-        // `ctx.next_pos` at export is the only reliable floor for
+        // Capturing `ctx.next_pos` at export is the reliable floor for
         // `opref_high_water()` to feed retrace's `start_fresh`.
         state.phase1_emit_high_water = ctx.next_pos;
         // `partial_trace.inputargs` / `partial_trace.operations`
@@ -4587,19 +4580,11 @@ impl OptUnroll {
     }
 
     /// resoperation.py `OpHelpers.inputarg_from_tp` — a fresh typed InputArg
-    /// box.
-    ///
-    /// The box is registered as the host of its position. Virtual field lists
-    /// and resume numbering still name it by `OpRef`, and an unregistered
-    /// InputArg position resolves to a freshly minted box on every lookup.
-    /// `register_box` and `_gettagged` would then key two different objects,
-    /// and the guard's resume data would carry `UNASSIGNED` for the field.
+    /// box. The returned Operand holds that object.
     pub(crate) fn inputarg_from_tp(ctx: &mut OptContext, tp: Type) -> Operand {
         let pos = ctx.alloc_op_position_typed(tp).raw();
         let inputarg = majit_ir::InputArg::from_type_rc(tp, pos);
-        let operand = Operand::from_bound_inputarg(&inputarg);
-        ctx.register_carried_host(&operand);
-        operand
+        Operand::from_bound_inputarg(&inputarg)
     }
 
     pub fn import_short_preamble_state(
@@ -7488,15 +7473,10 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
         let mut exported_bounds: crate::FxIndexMap<majit_ir::operand::Operand, IntBound> =
             crate::FxIndexMap::default();
-        // Bind the export-input position at its source (a forced end-arg is a
+        // Bind the export-input at its source (a forced end-arg is a
         // bound box in production); virtualstate.py create_state
         // receives real AbstractValues.
-        ctx.materialize_operand_at(OpRef::int_op(21));
-        // Key by the canonical box identity the consumer resolves `int_op(21)`
-        // to, so the operand-keyed lookup hits by `Rc::ptr_eq`.
-        let box21 = ctx
-            .get_box_replacement_operand_opt(OpRef::int_op(21))
-            .expect("int_op(21) bound to a box");
+        let box21 = rooted_resop_operand(Type::Int, 21);
         exported_bounds.insert(box21.clone(), IntBound::bounded(10, 20));
 
         let exported = export_state(
@@ -7565,12 +7545,9 @@ mod tests {
         const MASK: i64 = 0xFFFF_FFFF;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        // Bind the export-input position at its source (a forced end-arg is a
+        // Bind the export-input at its source (a forced end-arg is a
         // bound box in production).
-        ctx.materialize_operand_at(OpRef::int_op(21));
-        let box21 = ctx
-            .get_box_replacement_operand_opt(OpRef::int_op(21))
-            .expect("int_op(21) bound to a box");
+        let box21 = rooted_resop_operand(Type::Int, 21);
         // The bound lives on the box's `_forwarded` slot (as it does after
         // `IntAnd` narrows it), but it is NOT registered in the side table —
         // exactly the state of a non-jump-arg short-box result.
@@ -7614,10 +7591,7 @@ mod tests {
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        ctx.materialize_operand_at(OpRef::ref_op(21));
-        let box21 = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(21))
-            .expect("ref_op(21) bound to a box");
+        let box21 = rooted_resop_operand(Type::Ref, 21);
         const CLASS: i64 = 0x1234;
         ctx.set_ptr_info(&box21, PtrInfo::instance(None, Some(CLASS)));
 
@@ -7700,14 +7674,8 @@ mod tests {
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        ctx.materialize_operand_at(OpRef::ref_op(21));
-        ctx.materialize_operand_at(OpRef::int_op(22));
-        let obj = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(21))
-            .expect("ref_op(21) bound to a box");
-        let field = ctx
-            .get_box_replacement_operand_opt(OpRef::int_op(22))
-            .expect("int_op(22) bound to a box");
+        let obj = rooted_resop_operand(Type::Ref, 21);
+        let field = rooted_resop_operand(Type::Int, 22);
         ctx.setintbound(&field, &IntBound::bounded(0, 0));
         let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
         fields.push((0, field.clone()));
@@ -7825,8 +7793,8 @@ mod tests {
             op.pos().set(dependent);
             OpRc::new(op)
         };
-        let mask_box = ctx.materialize_operand_at(masked);
-        let dep_box = ctx.materialize_operand_at(dependent);
+        let mask_box = rooted_resop_operand(Type::Int, 58);
+        let dep_box = rooted_resop_operand(Type::Int, 59);
         ctx.setintbound(&mask_box, &IntBound::bounded(0, MASK));
         let short_input = rooted_inputarg_operand(Type::Int, 8);
         ctx.imported_short_preamble_builder = Some(ShortPreambleBuilder::new(
@@ -7867,16 +7835,13 @@ mod tests {
             same_as_source: None,
         };
         let dep_pop = crate::optimizeopt::info::PreambleOp {
-            op: dep_box,
+            op: dep_box.clone(),
             invented_name: false,
             preamble_op: dep_op,
             same_as_source: None,
         };
-        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop).to_opref(), masked);
-        assert_eq!(
-            ctx.force_op_from_preamble_op(&dep_pop).to_opref(),
-            dependent
-        );
+        assert!(ctx.force_op_from_preamble_op(&mask_pop).same_box(&mask_box));
+        assert!(ctx.force_op_from_preamble_op(&dep_pop).same_box(&dep_box));
 
         let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
             0, MASK,
@@ -7915,10 +7880,10 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
         // Forced end-of-preamble args are bound boxes in production
         // (force_box_for_end_of_preamble); bind the fixture's export-input
-        // position at its source so every value reaching export_single_value
+        // at its source so every value reaching export_single_value
         // has a canonical box (virtualstate.py create_state receives
         // real AbstractValues, never bare positions).
-        let forced = ctx.materialize_operand_at(OpRef::int_op(21));
+        let forced = rooted_resop_operand(Type::Int, 21);
         ctx.preamble_end_args = Some(vec![forced.clone()]);
 
         let exported = export_state(
@@ -7967,7 +7932,8 @@ mod tests {
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let source_receiver = ctx.materialize_operand_at(OpRef::int_op(10));
+        let source_receiver = rooted_resop_operand(Type::Int, 10);
+        let box11 = rooted_resop_operand(Type::Int, 11);
         publish_preview_short_state(
             &mut ctx,
             vec![si0.clone(), si1.clone()],
@@ -7991,7 +7957,7 @@ mod tests {
                     op.pos().set(OpRef::int_op(11));
                     OpRc::new(op)
                 }),
-                res: rooted_resop_operand(Type::Int, 11),
+                res: box11.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -7999,11 +7965,10 @@ mod tests {
             }],
         );
         // Bind export-input positions at their source: the GETFIELD receiver
-        // and result are bound boxes in production (label arg / ProducedShortOp.res
-        // = materialize_operand_at, `PreambleOp::add_op_to_short`).
+        // and result are bound boxes in production (label arg / ProducedShortOp.res,
+        // `PreambleOp::add_op_to_short`).
         // virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[source_receiver.clone(), box11],
@@ -8079,7 +8044,7 @@ mod tests {
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let source_receiver = ctx.materialize_operand_at(OpRef::int_op(10));
+        let source_receiver = rooted_resop_operand(Type::Int, 10);
         // The const half rides its own channel, so the published preview
         // carries the renamed short-inputargs and no `short_boxes` — this is
         // the one fixture where the two halves are separable.
@@ -8120,7 +8085,7 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             });
-        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
+        let box11 = rooted_resop_operand(Type::Int, 11);
 
         let exported = export_state(
             &[source_receiver.clone(), box11],
@@ -8181,7 +8146,7 @@ mod tests {
         // ConstPtr.value inline (history.py): the producer seeds the
         // inline variant that carries the pointer directly; the consumer
         // reads it back without any pool lookup.
-        let ptr_box = ctx.materialize_operand_at(OpRef::const_ptr(ptr));
+        let ptr_box = Operand::const_from_value(Value::Ref(ptr));
         ctx.seed_constant(&ptr_box, Value::Ref(ptr));
         // Two Int label args (`int_op(12)` / `int_op(11)`) and no virtuals, so
         // the preview's `create_short_inputargs` mints two Int renames.
@@ -8214,11 +8179,10 @@ mod tests {
             }],
         );
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_operand_at,
-        // `PreambleOp::add_op_to_short`);
+        // ProducedShortOp.res, `PreambleOp::add_op_to_short`);
         // virtualstate.py create_state receives real AbstractValues.
-        let box12 = ctx.materialize_operand_at(OpRef::int_op(12));
-        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
+        let box12 = rooted_resop_operand(Type::Int, 12);
+        let box11 = Operand::from_bound_op(&getfield);
 
         let exported = export_state(&[box12, box11], &[], &mut optimizer, &mut ctx, None);
         // Both label args resolve to Int op slots (12 / 11 = GetfieldGcI base / result).
@@ -8244,7 +8208,7 @@ mod tests {
         let result = ctx2.imported_short_pure_ops[0].result.clone();
         assert!(result.bound_inputarg().is_some());
         assert_ne!(result.to_opref(), OpRef::int_op(11));
-        let source = ctx2.materialize_operand_at(OpRef::int_op(11));
+        let source = Operand::from_bound_op(&getfield);
         let expected = crate::optimizeopt::ImportedShortPureOp::new(
             OpCode::GetfieldGcI,
             Some(field_descr.clone()),
@@ -8261,7 +8225,7 @@ mod tests {
     fn test_import_state_uses_source_inputarg_box_identity() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let box21 = ctx.materialize_operand_at(OpRef::int_op(21));
+        let box21 = rooted_resop_operand(Type::Int, 21);
         let exported = export_state(
             std::slice::from_ref(&box21),
             &[],
@@ -8312,7 +8276,7 @@ mod tests {
         // reads it back without any pool lookup.
         let func_ptr = 0xCAFE;
         let func = OpRef::const_int(func_ptr);
-        let func_box = ctx.materialize_operand_at(func);
+        let func_box = Operand::const_from_value(Value::Int(func_ptr));
         ctx.seed_constant(&func_box, Value::Int(func_ptr));
         // Two Int label args (`int_op(10)` / `int_op(11)`) and no virtuals, so
         // the preview's `create_short_inputargs` mints two Int renames.
@@ -8341,11 +8305,10 @@ mod tests {
         );
 
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_operand_at,
-        // `PreambleOp::add_op_to_short`);
+        // ProducedShortOp.res, `PreambleOp::add_op_to_short`);
         // virtualstate.py create_state receives real AbstractValues.
-        let box10 = ctx.materialize_operand_at(OpRef::int_op(10));
-        let box11 = ctx.materialize_operand_at(OpRef::int_op(11));
+        let box10 = rooted_resop_operand(Type::Int, 10);
+        let box11 = call_box.clone();
 
         let exported = export_state(&[box10, box11], &[], &mut optimizer, &mut ctx, None);
         // CallLoopinvariantI produces an Int at int_op(11); slot 10 is the
@@ -8422,7 +8385,7 @@ mod tests {
             8,
             &[Type::Int, Type::Int, Type::Int, Type::Int],
         );
-        let func_box = ctx.materialize_operand_at(func);
+        let func_box = Operand::const_from_value(Value::Int(func_ptr));
         ctx.seed_constant(&func_box, Value::Int(func_ptr));
 
         import_short_preamble_state(
@@ -8617,7 +8580,7 @@ mod tests {
             ctx.has_potential_extra_op(&src19),
             "force_op_from_preamble_op must seed potential_extra_ops by the body-visible box"
         );
-        let slot14 = ctx.materialize_operand_at(OpRef::ref_op(14));
+        let slot14 = rooted_resop_operand(Type::Ref, 14);
         assert!(
             !ctx.has_potential_extra_op(&slot14),
             "the unrelated replay/body slot must not carry the potential_extra_ops entry"
@@ -8663,6 +8626,9 @@ mod tests {
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
+        let box12 = rooted_resop_operand(Type::Int, 12);
+        let box13 = rooted_resop_operand(Type::Int, 13);
+        let box14 = rooted_resop_operand(Type::Int, 14);
         publish_preview_short_state(
             &mut ctx,
             vec![si0.clone(), si1.clone(), si2.clone()],
@@ -8678,15 +8644,12 @@ mod tests {
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(rooted_resop_operand(Type::Int, 14)),
+                same_as_source: Some(box14.clone()),
             }],
         );
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        let box12 = ctx.materialize_operand_at(OpRef::int_op(12));
-        let box13 = ctx.materialize_operand_at(OpRef::int_op(13));
-        let box14 = ctx.materialize_operand_at(OpRef::int_op(14));
 
         let exported = export_state(&[box12, box13, box14], &[], &mut optimizer, &mut ctx, None);
         // IntAdd producer at int_op(30) consumes Int op slots, so the
@@ -8708,16 +8671,13 @@ mod tests {
         assert!(imported_result.bound_inputarg().is_some());
         assert_ne!(imported_result.to_opref(), OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
-        let forced = ctx2.force_op_from_preamble_op(&pop).to_opref();
+        let forced_box = ctx2.force_op_from_preamble_op(&pop);
         // force_op_from_preamble may return the imported position (not necessarily 30)
         assert_eq!(ctx2.imported_short_pure_ops.len(), 1);
         // RPython parity: extra_same_as is populated lazily by add_preamble_op
         // (called from optimizer.force_box's potential_extra_ops.pop path).
         // shortpreamble.py record the SameAs Box at use-box time, not
         // at produce_op time — verify the lazy population fires.
-        let forced_box = ctx2
-            .get_box_replacement_operand_opt(forced)
-            .unwrap_or_else(|| Operand::bound_from_opref(forced));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(&forced_box, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
@@ -10335,8 +10295,7 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(2, 0);
 
         let short_input_operand = rooted_resop_operand(Type::Int, 11);
-        let jump_arg = OpRef::int_op(12);
-        let jump_arg_box = ctx.materialize_operand_at(jump_arg);
+        let jump_arg_box = rooted_resop_operand(Type::Int, 12);
 
         // A guard carrying the PREAMBLE trace's resume coordinate.
         let guard = Op::new(
@@ -10919,19 +10878,18 @@ mod tests {
         use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, Type, Value};
 
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int]);
-        let passed = ctx.materialize_operand_at(OpRef::input_arg_int(0));
+        let passed = ctx.inputarg_at(0).expect("inputarg 0 must be bound");
         let func = Operand::const_from_value(Value::Int(0x1000));
-        let call = Op::new(OpCode::CallR, &[func, passed]);
+        let mut call = Op::new(OpCode::CallR, &[func, passed.clone()]);
         call.pos().set(OpRef::ref_op(2));
         call.setdescr(make_call_descr(
             vec![Type::Int, Type::Int],
             Type::Ref,
             EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
         ));
-        let i0 = ctx.inputargs[0].clone();
-        let mut sb = ShortBoxes::with_label_args(&[i0.clone()]);
+        let mut sb = ShortBoxes::with_label_args(&[passed.clone()]);
         sb.add_pure_op(&OpRc::new(call));
-        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0]);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[passed]);
         let pure = short_boxes
             .iter()
             .find(|produced| produced.kind == PreambleOpKind::Pure)

@@ -43,7 +43,8 @@ pub enum Forwarded {
     /// reachable from the trace `operations` list, so a forwarding target
     /// is never collected while a chain step still names it. Holding a
     /// `Weak` here instead made that reachability a pyre-side invariant
-    /// spread over `resop_refs` / `phase1_emit_ops` / `new_operations`, and
+    /// spread over the optimizer's live-op lists (`phase1_emit_ops` /
+    /// `new_operations`), and
     /// a target held by none of them died mid-optimization: the walker then
     /// stopped one hop early and handed its caller an operand that was still
     /// forwarding.

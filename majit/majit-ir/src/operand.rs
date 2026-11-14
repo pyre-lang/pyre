@@ -6,9 +6,9 @@
 //! constant — with no integer-position indirection. `Operand` is the Rust
 //! shape of that: a strong-ref union carrying the producer directly, so
 //! operand identity is `Rc::ptr_eq` and forwarding reads straight off the
-//! carried producer's `_forwarded` slot — with no `find_producer_op`
-//! position→producer registry, no `Op::box_cache` memoization, and no
-//! position-only ref fabrication.
+//! carried producer's `_forwarded` slot — with no position→producer
+//! registry, no `Op::box_cache` memoization, and no position-only ref
+//! fabrication.
 //!
 //! Strong `Rc`, as in [`Forwarded`](crate::forwarding::Forwarded):
 //! operands must keep their producers alive. The trace already holds the 1st
@@ -1313,7 +1313,8 @@ mod tests {
     /// in `resoperation.py set_forwarded` and the trace `operations` list — so
     /// `get_box_replacement` never meets a collected target. While this slot
     /// held a `Weak`, only the second of those existed on the pyre side, spread
-    /// over `OptContext`'s `resop_refs` / `phase1_emit_ops` / `new_operations`;
+    /// over the optimizer's live-op lists (`phase1_emit_ops` /
+    /// `new_operations`);
     /// a target held by none of them was dropped, the walk stopped one hop
     /// early, and it handed back an operand that was still forwarding. Its
     /// callers assert that cannot happen — `getnullness` reached an

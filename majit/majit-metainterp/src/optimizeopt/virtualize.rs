@@ -4235,25 +4235,13 @@ mod tests {
     /// `propagate_forward` directly bypass that loop, so they must
     /// canonicalize explicitly before invoking the handler.
     fn resolve_op_args(op: &mut Op, ctx: &mut OptContext) {
+        // optimizer.py setarg loop parity. Direct unit tests that
+        // bypass Optimizer::propagate_from_pass_range still need the same
+        // canonical operand args that production passes receive.
         for i in 0..op.num_args() {
-            // Mirror the production driver's `None` arm
-            // (`optimizer.rs`'s `propagate_from_pass_range`):
-            // an unbound operand whose root is not a sentinel is minted and
-            // registered via `materialize_operand_at`, then walked to its
-            // terminal — cloning the orig arg would skip canonicalization.
-            let canonical = match ctx.resolve_operand_operand_opt(op.arg_ref(i)) {
-                Some(b) => b,
-                None => {
-                    let argref = op.arg_ref(i).to_opref();
-                    if argref.is_none() {
-                        op.arg_ref(i).clone()
-                    } else {
-                        ctx.materialize_operand_at(argref)
-                            .get_box_replacement(false)
-                    }
-                }
-            };
-            op.setarg(i, canonical);
+            let arg = op.arg(i);
+            let resolved = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
+            op.setarg(i, resolved);
         }
     }
 
@@ -4262,21 +4250,9 @@ mod tests {
         for rc in ops {
             for i in 0..rc.num_args() {
                 let arg = rc.arg(i);
-                let canonical = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let argref = arg.to_opref();
-                        if argref.is_none() {
-                            arg
-                        } else {
-                            ctx.materialize_operand_at(argref)
-                                .get_box_replacement(false)
-                        }
-                    }
-                };
+                let canonical = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 rc.setarg(i, canonical);
             }
-            ctx.bind_input_resops(std::slice::from_ref(rc));
             match pass.propagate_forward(rc, rc, &mut None, ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -4370,36 +4346,9 @@ mod tests {
         // args / fail_args at that position carry (`TraceIterator._cache`).
         let wrapped = Optimizer::rebind_wrapped_trace_ops(&owned);
         let snapshots = seed_virtualize_guard_snapshots_rc(&wrapped);
-        let mut leaves: Vec<Operand> = Vec::new();
-        for rc in &wrapped {
-            for i in 0..rc.num_args() {
-                let arg = rc.arg(i);
-                if arg.is_constant() || arg.is_none() {
-                    continue;
-                }
-                let opref = arg.to_opref();
-                if wrapped.iter().any(|p| {
-                    let pos = p.pos().get();
-                    pos == opref && p.opcode.result_type() != Type::Void
-                }) {
-                    continue;
-                }
-                if leaves.iter().any(|leaf| leaf.to_opref() == opref) {
-                    continue;
-                }
-                leaves.push(arg);
-            }
-        }
 
         let mut ctx = OptContext::new(wrapped.len());
         ctx.snapshot_boxes = snapshots;
-        let produced: std::collections::HashSet<OpRef> =
-            wrapped.iter().map(|op| op.pos().get()).collect();
-        let leaf_args: Vec<Operand> = leaves
-            .into_iter()
-            .filter(|arg| !produced.contains(&arg.to_opref()))
-            .collect();
-        ctx.seed_boxes_canonical(&leaf_args);
 
         let pass = OptVirtualize::new();
         pass.setup();
@@ -4409,7 +4358,6 @@ mod tests {
                 let resolved = ctx.resolve_operand_operand(rc.arg_ref(i));
                 rc.setarg(i, resolved);
             }
-            ctx.bind_input_resops(std::slice::from_ref(rc));
             match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -4440,7 +4388,7 @@ mod tests {
         // Virtualizable PtrInfo.
         // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
-        let vable_box = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let vable_box = ctx.inputargs[0].clone();
         ctx.set_ptr_info(
             &vable_box,
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -4466,14 +4414,12 @@ mod tests {
             },
         )));
         let forced = opt.force_box(&vable_box, &mut ctx);
-        assert_eq!(forced.to_opref(), OpRef::input_arg_ref(0));
+        assert!(forced.same_box(&vable_box));
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable should not be forced to raw heap ops by optimizer"
         );
-        let v_box = ctx
-            .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable operand populated");
+        let v_box = vable_box.get_box_replacement(false);
         assert!(
             ctx.is_virtualizable(&v_box),
             "Virtualizable PtrInfo must survive force_box"
@@ -4500,7 +4446,7 @@ mod tests {
         // OptVirtualize must treat the access as an ordinary raw heap read.
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let vable = ctx.inputargs[0].clone();
         let idx = Operand::const_from_value(Value::Int(0));
 
         let get_array_ptr = OpRc::new(Op::with_descr(
@@ -4605,8 +4551,8 @@ mod tests {
         });
         pass.setup();
 
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
-        let get = Op::new(OpCode::GetfieldRawI, &[vable]);
+        let vable = ctx.inputargs[0].clone();
+        let mut get = Op::new(OpCode::GetfieldRawI, &[vable]);
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
@@ -4630,9 +4576,9 @@ mod tests {
         });
         pass.setup();
 
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
-        let value = ctx.materialize_operand_at(OpRef::input_arg_int(1));
-        let set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
+        let vable = ctx.inputargs[0].clone();
+        let value = ctx.inputargs[1].clone();
+        let mut set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
         let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut None, &mut ctx);
@@ -4664,8 +4610,9 @@ mod tests {
             }
         }
         let identity = ctx
-            .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("the identity inputarg must materialize");
+            .inputarg_at(0)
+            .expect("the identity inputarg must materialize")
+            .get_box_replacement(false);
         assert!(
             ctx.is_virtualizable(&identity),
             "ensure_setup must still mark the identity virtualizable so the base is not forced",
@@ -4688,8 +4635,8 @@ mod tests {
         });
         pass.setup();
 
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
-        let index = ctx.materialize_operand_at(OpRef::input_arg_int(1));
+        let vable = ctx.inputargs[0].clone();
+        let index = ctx.inputargs[1].clone();
         let get_field = OpRc::new(Op::new(OpCode::GetfieldRawI, &[vable]));
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos().set(OpRef::int_op(10));
@@ -4719,15 +4666,14 @@ mod tests {
         });
         pass.setup();
 
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
-        let index = ctx.materialize_operand_at(OpRef::input_arg_int(1));
+        let vable = ctx.inputargs[0].clone();
+        let index = ctx.inputargs[1].clone();
         let get_field = OpRc::new(Op::new(OpCode::GetfieldRawI, &[vable]));
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos().set(OpRef::int_op(10));
         drive_bound_ops(&mut pass, &mut ctx, std::slice::from_ref(&get_field));
         let array_ptr = Operand::from_bound_op(&get_field);
         let stored = crate::history::test_support::rooted_resop_operand(Type::Int, 2);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&stored));
 
         let set_item = Op::new(OpCode::SetarrayitemRaw, &[array_ptr, index, stored]);
         set_item.setdescr(array_descr(24));
@@ -4756,7 +4702,7 @@ mod tests {
 
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let vable = ctx.inputargs[0].clone();
         let idx = Operand::const_from_value(Value::Int(0));
         let stored = Operand::const_from_value(Value::Int(42));
 
@@ -4823,12 +4769,11 @@ mod tests {
         let arr_descr = array_descr(20);
         // const index 0 + two stored values; position 60 is a non-constant
         // index for the variable-index write.
-        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let vable = ctx.inputargs[0].clone();
         let idx = Operand::const_from_value(Value::Int(0));
         let stored_const = Operand::const_from_value(Value::Int(42));
         let stored_var = Operand::const_from_value(Value::Int(99));
         let idx_var = crate::history::test_support::rooted_resop_operand(Type::Int, 60);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&idx_var));
 
         let get_array_ptr = OpRc::new(Op::with_descr(OpCode::GetfieldRawI, &[vable], field_descr));
         get_array_ptr.pos().set(OpRef::int_op(0));
@@ -5594,17 +5539,15 @@ mod tests {
         let new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
         new_op.pos().set(OpRef::ref_op(0));
         let new_op_rc = OpRc::new(new_op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
             pass.propagate_forward(&new_op, &new_op_rc, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
         let int_value = crate::history::test_support::rooted_resop_operand(Type::Int, 100);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&int_value));
         let mut set_int = Op::with_descr(
             OpCode::SetfieldGc,
-            &[Operand::from_bound_op(&new_op_rc), int_value],
+            &[Operand::from_bound_op(&new_op_rc), int_value.clone()],
             int_fd,
         );
         set_int.pos().set(OpRef::int_op(1));
@@ -5615,7 +5558,6 @@ mod tests {
         ));
 
         let ref_value = crate::history::test_support::rooted_resop_operand(Type::Ref, 51);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&ref_value));
         let mut set_ref = Op::with_descr(
             OpCode::SetfieldGc,
             &[Operand::from_bound_op(&new_op_rc), ref_value],
@@ -5631,9 +5573,7 @@ mod tests {
             "unlisted Ref SETFIELD must not occupy the Int allocation slot"
         );
 
-        let inputarg_box = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(0))
-            .expect("inputarg operand populated");
+        let inputarg_box = Operand::from_bound_op(&new_op_rc).get_box_replacement(false);
         let info = ctx
             .peek_ptr_info(&inputarg_box)
             .expect("virtual info missing");
@@ -5641,12 +5581,16 @@ mod tests {
             panic!("expected Virtual ptr info, got {info:?}");
         };
         assert_eq!(
-            vinfo
-                .fields
-                .iter()
-                .map(|(i, b)| (*i, b.to_opref()))
-                .collect::<Vec<_>>(),
-            vec![(0, OpRef::int_op(100))],
+            vinfo.fields.len(),
+            1,
+            "Int slot 0 must keep the listed Int write"
+        );
+        assert_eq!(
+            vinfo.fields[0].0, 0,
+            "Int slot 0 must keep the listed Int write"
+        );
+        assert!(
+            vinfo.fields[0].1.same_box(&int_value),
             "Int slot 0 must keep the listed Int write"
         );
     }
@@ -5685,17 +5629,15 @@ mod tests {
         let new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
         new_op.pos().set(OpRef::ref_op(0));
         let new_op_rc = OpRc::new(new_op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
             pass.propagate_forward(&new_op, &new_op_rc, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
         let value = crate::history::test_support::rooted_resop_operand(Type::Int, 100);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&value));
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
-            &[Operand::from_bound_op(&new_op_rc), value],
+            &[Operand::from_bound_op(&new_op_rc), value.clone()],
             fd,
         );
         set_op.pos().set(OpRef::int_op(1));
@@ -5705,23 +5647,16 @@ mod tests {
             OptimizationResult::Remove
         ));
 
-        let inputarg_box = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(0))
-            .expect("inputarg operand populated");
+        let inputarg_box = Operand::from_bound_op(&new_op_rc).get_box_replacement(false);
         let info = ctx
             .peek_ptr_info(&inputarg_box)
             .expect("virtual info missing");
         let PtrInfo::Virtual(vinfo) = info else {
             panic!("expected Virtual ptr info, got {info:?}");
         };
-        assert_eq!(
-            vinfo
-                .fields
-                .iter()
-                .map(|(i, b)| (*i, b.to_opref()))
-                .collect::<Vec<_>>(),
-            vec![(0, OpRef::int_op(100))]
-        );
+        assert_eq!(vinfo.fields.len(), 1);
+        assert_eq!(vinfo.fields[0].0, 0);
+        assert!(vinfo.fields[0].1.same_box(&value));
         // info.py:188 keeps no cached fielddescr list — `descr.get_all_fielddescrs()`
         // is the authoritative view. Round-trip the size descr the same way
         // production consumers (info.rs all_fielddescrs_from_descr) do.
@@ -7271,8 +7206,7 @@ mod tests {
         }
 
         let mut ctx = OptContext::new(wrapped.len());
-        ctx.seed_boxes_canonical(&leaves);
-        let pass = OptVirtualize::new();
+        let mut pass = OptVirtualize::new();
         pass.setup();
 
         for &(opref, size) in raw_bufs {
@@ -7280,7 +7214,7 @@ mod tests {
                 .iter()
                 .find(|leaf| leaf.to_opref() == opref)
                 .cloned()
-                .unwrap_or_else(|| ctx.materialize_operand_at(opref));
+                .expect("raw buffer box must already be an op arg");
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, size, None)),
@@ -7292,7 +7226,6 @@ mod tests {
                 let resolved = ctx.resolve_operand_operand(rc.arg_ref(i));
                 rc.setarg(i, resolved);
             }
-            ctx.bind_input_resops(std::slice::from_ref(rc));
             match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);

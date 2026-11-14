@@ -2002,9 +2002,11 @@ mod tests {
     //! integration.
 
     use super::*;
-    use crate::history::test_support::trace_inputargs_from_ops;
+    use crate::history::test_support::{
+        rooted_inputarg_operand, rooted_resop_operand, trace_inputargs_from_ops,
+    };
     use crate::optimizeopt::optimizer::Optimizer;
-    use majit_ir::{Descr, DescrRef};
+    use majit_ir::{Descr, DescrRef, Type};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -2041,8 +2043,8 @@ mod tests {
 
     /// Create an OptIntBounds with specific bounds pre-set and run it on ops.
     fn run_pass_with_bounds(
-        ops: &[Op],
-        initial_bounds: &[(OpRef, IntBound)],
+        ops: &[OpRc],
+        initial_bounds: &[(Operand, IntBound)],
     ) -> (Vec<Op>, OptContext) {
         let pass = OptIntBounds::new();
         // Compute num_inputs as the highest OpRef referenced anywhere (as
@@ -2066,59 +2068,39 @@ mod tests {
             .unwrap_or(0);
         let max_initial = initial_bounds
             .iter()
-            .map(|(r, _)| r.raw())
+            .map(|(r, _)| r.to_opref().raw())
             .max()
             .unwrap_or(0);
         let num_inputs = (max_arg.max(max_pos).max(max_initial) as usize) + 1;
-        let inputarg_types = vec![majit_ir::Type::Int; num_inputs];
+        let inputarg_types = vec![Type::Int; num_inputs];
         let mut ctx = OptContext::with_inputarg_types(ops.len(), &inputarg_types);
 
         // resume.py:397 parity: each guard must have a snapshot indexed
         // by `rd_resume_position`.  This helper drives the optimizer
         // without going through `Optimizer::optimize_with_constants_and_inputs`,
-        // so seed the snapshots manually.
-        let (seeded_ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        // so seed the snapshots manually. Copy resume positions onto the
+        // live OpRcs the test holds (`seed_empty_guard_snapshots` clones).
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded_ops, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded_ops.iter()) {
+            op.set_rd_resume_position(seed.rd_resume_position());
+        }
         ctx.snapshot_boxes = snapshots;
-        let ops = &seeded_ops;
 
         pass.setup();
-        for (opref, bound) in initial_bounds {
-            // Materialize the canonical host before installing the initial bound.
-            let op_box = ctx.materialize_operand_at(*opref);
-            ctx.setintbound(&op_box, bound);
+        for (op_box, bound) in initial_bounds {
+            ctx.setintbound(op_box, bound);
         }
 
-        for op in ops.iter() {
-            let resolved_op = op.clone();
-            // Keep the op.pos as set by the test (not overriding with index)
-            // optimizer.py:651-652 setarg loop parity. Mirror
-            // `propagate_from_pass_range`'s dispatch-entry rebind: mint +
-            // register a canonical host for producer-less operands (via
-            // `materialize_operand_at`) so the pass's `get_box_replacement`
-            // resolves to a bound terminal instead of an unbound `from_opref`
-            // box.
-            for i in 0..resolved_op.num_args() {
-                let a = resolved_op.arg(i);
-                let ar = a.to_opref();
-                let resolved = if ar.is_none() {
-                    a.clone()
-                } else {
-                    // Mint + register the canonical `_forwarded` host for this
-                    // position FIRST (whether the operand is a bound producer
-                    // box or a position-only ref), so the pass's later
-                    // `get_box_replacement` resolves to that bound terminal
-                    // rather than re-minting an unbound `from_opref` box. Then
-                    // resolve any forwarding box-native.
-                    let canonical = ctx.materialize_operand_at(ar);
-                    ctx.resolve_operand_operand_opt(&canonical)
-                        .unwrap_or_else(|| canonical.get_box_replacement(false))
-                };
-                resolved_op.setarg(i, resolved);
+        for op_rc in ops.iter() {
+            // optimizer.py _emit_operation setarg loop. Args are already the
+            // bound boxes the test holds; resolve forwarding in place.
+            for i in 0..op_rc.num_args() {
+                let arg = op_rc.arg(i);
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
+                op_rc.setarg(i, rb);
             }
-            let op_rc = OpRc::new(resolved_op.clone());
-            ctx.register_extra_producer(&op_rc);
-            let emitted_op = match pass.propagate_forward(&resolved_op, &op_rc, &mut None, &mut ctx)
-            {
+            let emitted_op = match pass.propagate_forward(op_rc, op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emit_op) => {
                     ctx.emit(emit_op.clone());
                     Some(emit_op)
@@ -2129,8 +2111,8 @@ mod tests {
                 }
                 OptimizationResult::Remove => None,
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op.clone());
-                    Some(resolved_op)
+                    ctx.emit_rc(op_rc.clone());
+                    Some((**op_rc).clone())
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -2142,15 +2124,11 @@ mod tests {
                 // condition = CONST_1 before intbounds postprocess runs.
                 match emitted.opcode {
                     OpCode::GuardTrue => {
-                        let a = emitted.arg_ref(0).to_opref();
-                        let cond = ctx.get_replacement_opref(a);
-                        let b = ctx.materialize_operand_at(cond);
+                        let b = emitted.arg(0).get_box_replacement(false);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(1));
                     }
                     OpCode::GuardFalse => {
-                        let a = emitted.arg_ref(0).to_opref();
-                        let cond = ctx.get_replacement_opref(a);
-                        let b = ctx.materialize_operand_at(cond);
+                        let b = emitted.arg(0).get_box_replacement(false);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
                     }
                     _ => {}
@@ -2159,7 +2137,7 @@ mod tests {
                     .new_operations
                     .last()
                     .cloned()
-                    .unwrap_or_else(|| OpRc::new(emitted.clone()));
+                    .unwrap_or_else(|| op_rc.clone());
                 pass.propagate_postprocess(emitted, &emitted_rc, &mut ctx);
             }
         }
@@ -2169,17 +2147,8 @@ mod tests {
         (result, ctx)
     }
 
-    fn make_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        // oparser-faithful (rpython/jit/tool/oparser.py): each position-only
-        // ResOp / InputArg arg is bound to a rooted synthetic producer of the
-        // matching type so it sheds to `Operand::Op` / `Operand::InputArg`;
-        // constant / none refs shed to `Operand::Const` / nothing and never
-        // mint.
-        let op_args: Vec<majit_ir::operand::Operand> = args
-            .iter()
-            .map(|a| crate::history::test_support::rooted_operand_from_opref(*a))
-            .collect();
-        let op = Op::new(opcode, &op_args);
+    fn make_op(opcode: OpCode, args: &[Operand], pos: u32) -> Op {
+        let mut op = Op::new(opcode, args);
         op.pos().set(OpRef::op_typed(pos, op.result_type()));
         op
     }
@@ -2188,8 +2157,8 @@ mod tests {
     /// resulting op — required for guards that act as sharing donors
     /// (optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`).
     /// Sharer guards (descrless) keep using `make_op`.
-    fn make_guard_with_descr(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let op = make_op(opcode, args, pos);
+    fn make_guard_with_descr(opcode: OpCode, args: &[Operand], pos: u32) -> Op {
+        let mut op = make_op(opcode, args, pos);
         assert!(
             opcode.is_guard(),
             "make_guard_with_descr requires a guard opcode"
@@ -2203,25 +2172,21 @@ mod tests {
     #[test]
     fn test_int_add_narrows_bounds() {
         // Set up two operands with known bounds and add them
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 10)),
-            (OpRef::int_op(1), IntBound::bounded(5, 20)),
+            (i0.clone(), IntBound::bounded(0, 10)),
+            (i1.clone(), IntBound::bounded(5, 20)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntAdd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let add = OpRc::new(make_op(OpCode::IntAdd, &[i0, i1], 2));
+        let add_box = Operand::from_bound_op(&add);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[add], &initial_bounds);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
 
         // The result should have bounds [5, 30]
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&add_box).borrow().clone();
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 30);
     }
@@ -2233,16 +2198,16 @@ mod tests {
         // i0 in [10, 20], i1 in [0, 5]
         // INT_LT(i1, i0) is always true (5 < 10)
         // GUARD_TRUE on it should be removable
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(10, 20)),
-            (OpRef::int_op(1), IntBound::bounded(0, 5)),
+            (i0.clone(), IntBound::bounded(10, 20)),
+            (i1.clone(), IntBound::bounded(0, 5)),
         ];
-        let ops = vec![
-            // i2 = INT_LT(i1, i0)  -- i1 < i0 is always true
-            make_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(0)], 2),
-            // GUARD_TRUE(i2)
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
-        ];
+        // i2 = INT_LT(i1, i0)  -- i1 < i0 is always true
+        let lt = OpRc::new(make_op(OpCode::IntLt, &[i1, i0], 2));
+        let lt_box = Operand::from_bound_op(&lt);
+        let ops = vec![lt, OpRc::new(make_op(OpCode::GuardTrue, &[lt_box], 3))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         // INT_LT should be removed (replaced by constant 1)
@@ -2262,16 +2227,16 @@ mod tests {
         // i0 in [10, 20], i1 in [0, 5]
         // INT_GE(i1, i0) is always false (5 < 10, so not >=)
         // GUARD_FALSE on it should be removable
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(10, 20)),
-            (OpRef::int_op(1), IntBound::bounded(0, 5)),
+            (i0.clone(), IntBound::bounded(10, 20)),
+            (i1.clone(), IntBound::bounded(0, 5)),
         ];
-        let ops = vec![
-            // i2 = INT_GE(i1, i0)  -- always false
-            make_op(OpCode::IntGe, &[OpRef::int_op(1), OpRef::int_op(0)], 2),
-            // GUARD_FALSE(i2)
-            make_op(OpCode::GuardFalse, &[OpRef::int_op(2)], 3),
-        ];
+        // i2 = INT_GE(i1, i0)  -- always false
+        let ge = OpRc::new(make_op(OpCode::IntGe, &[i1, i0], 2));
+        let ge_box = Operand::from_bound_op(&ge);
+        let ops = vec![ge, OpRc::new(make_op(OpCode::GuardFalse, &[ge_box], 3))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
@@ -2290,24 +2255,21 @@ mod tests {
     fn test_guard_narrowing_int_lt() {
         // i0 unbounded, i1 in [10, 10] (constant 10)
         // After GUARD_TRUE on INT_LT(i0, i1), i0's upper should be < 10
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::unbounded()),
-            (OpRef::int_op(1), IntBound::from_constant(10)),
+            (i0.clone(), IntBound::unbounded()),
+            (i1.clone(), IntBound::from_constant(10)),
         ];
-        let ops = vec![
-            // i2 = INT_LT(i0, i1)
-            make_op(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            // GUARD_TRUE(i2)
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
-        ];
+        // i2 = INT_LT(i0, i1)
+        let lt = OpRc::new(make_op(OpCode::IntLt, &[i0.clone(), i1], 2));
+        let lt_box = Operand::from_bound_op(&lt);
+        let ops = vec![lt, OpRc::new(make_op(OpCode::GuardTrue, &[lt_box], 3))];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
         // After the guard, i0 should be < 10, meaning upper <= 9
-        let b0 = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b0 = ctx.getintbound_handle(&i0).borrow().clone();
         assert!(
             b0.upper <= 9,
             "After GUARD_TRUE(INT_LT(i0, 10)), i0.upper should be <= 9, got {}",
@@ -2319,21 +2281,19 @@ mod tests {
     fn test_guard_narrowing_int_ge() {
         // i0 unbounded, i1 = 5
         // After GUARD_TRUE on INT_GE(i0, i1), i0.lower >= 5
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::unbounded()),
-            (OpRef::int_op(1), IntBound::from_constant(5)),
+            (i0.clone(), IntBound::unbounded()),
+            (i1.clone(), IntBound::from_constant(5)),
         ];
-        let ops = vec![
-            make_op(OpCode::IntGe, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
-        ];
+        let ge = OpRc::new(make_op(OpCode::IntGe, &[i0.clone(), i1], 2));
+        let ge_box = Operand::from_bound_op(&ge);
+        let ops = vec![ge, OpRc::new(make_op(OpCode::GuardTrue, &[ge_box], 3))];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
-        let b0 = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b0 = ctx.getintbound_handle(&i0).borrow().clone();
         assert!(
             b0.lower >= 5,
             "After GUARD_TRUE(INT_GE(i0, 5)), i0.lower should be >= 5, got {}",
@@ -2348,13 +2308,15 @@ mod tests {
         // i0 in [0, 100], i1 in [0, 100]
         // INT_ADD_OVF(i0, i1) cannot overflow, should be replaced by INT_ADD
         // GUARD_NO_OVERFLOW should be removed
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 100)),
-            (OpRef::int_op(1), IntBound::bounded(0, 100)),
+            (i0.clone(), IntBound::bounded(0, 100)),
+            (i1.clone(), IntBound::bounded(0, 100)),
         ];
         let ops = vec![
-            make_op(OpCode::IntAddOvf, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::GuardNoOverflow, &[], 3),
+            OpRc::new(make_op(OpCode::IntAddOvf, &[i0, i1], 2)),
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 3)),
         ];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2377,13 +2339,15 @@ mod tests {
     fn test_add_ovf_may_overflow() {
         // i0 in [0, i64::MAX - 1], i1 in [0, i64::MAX - 1]
         // INT_ADD_OVF(i0, i1) may overflow, should NOT be replaced
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, i64::MAX - 1)),
-            (OpRef::int_op(1), IntBound::bounded(0, i64::MAX - 1)),
+            (i0.clone(), IntBound::bounded(0, i64::MAX - 1)),
+            (i1.clone(), IntBound::bounded(0, i64::MAX - 1)),
         ];
         let ops = vec![
-            make_op(OpCode::IntAddOvf, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::GuardNoOverflow, &[], 3),
+            OpRc::new(make_op(OpCode::IntAddOvf, &[i0, i1], 2)),
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 3)),
         ];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2399,13 +2363,15 @@ mod tests {
 
     #[test]
     fn test_sub_ovf_cannot_overflow() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 100)),
-            (OpRef::int_op(1), IntBound::bounded(0, 50)),
+            (i0.clone(), IntBound::bounded(0, 100)),
+            (i1.clone(), IntBound::bounded(0, 50)),
         ];
         let ops = vec![
-            make_op(OpCode::IntSubOvf, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::GuardNoOverflow, &[], 3),
+            OpRc::new(make_op(OpCode::IntSubOvf, &[i0, i1], 2)),
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 3)),
         ];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2421,13 +2387,15 @@ mod tests {
 
     #[test]
     fn test_mul_ovf_cannot_overflow() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 10)),
-            (OpRef::int_op(1), IntBound::bounded(0, 10)),
+            (i0.clone(), IntBound::bounded(0, 10)),
+            (i1.clone(), IntBound::bounded(0, 10)),
         ];
         let ops = vec![
-            make_op(OpCode::IntMulOvf, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::GuardNoOverflow, &[], 3),
+            OpRc::new(make_op(OpCode::IntMulOvf, &[i0, i1], 2)),
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 3)),
         ];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2439,29 +2407,37 @@ mod tests {
 
     #[test]
     fn test_second_overflow_guard_survives_after_first_guard() {
-        // Use OpRef::int_op(3) for guard condition so it doesn't affect overflow operands.
-        // GuardTrue(OpRef::int_op(3)) makes OpRef::int_op(3)=1 via rewrite postprocess,
-        // but OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2) remain unbounded.
+        // i3 is the guard condition so it doesn't affect overflow operands.
+        // GuardTrue(i3) makes i3=1 via rewrite postprocess,
+        // but i0, i1, i2 remain unbounded.
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i2 = rooted_resop_operand(Type::Int, 2);
+        let i3 = rooted_resop_operand(Type::Int, 3);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::unbounded()),
-            (OpRef::int_op(1), IntBound::unbounded()),
-            (OpRef::int_op(2), IntBound::unbounded()),
-            (OpRef::int_op(3), IntBound::unbounded()),
+            (i0.clone(), IntBound::unbounded()),
+            (i1.clone(), IntBound::unbounded()),
+            (i2.clone(), IntBound::unbounded()),
+            (i3.clone(), IntBound::unbounded()),
         ];
+        // The first guard becomes the donor for the two descrless
+        // GuardNoOverflow sharers below — give it a real descr per
+        // optimizer.py emit_guard_operation.
+        let sub = OpRc::new(make_op(OpCode::IntSubOvf, &[i0, i1.clone()], 5));
+        let sub_box = Operand::from_bound_op(&sub);
+        let mul = OpRc::new(make_op(OpCode::IntMulOvf, &[i2, i1], 7));
+        let mul_box = Operand::from_bound_op(&mul);
         let ops = vec![
-            // The first guard becomes the donor for the two descrless
-            // GuardNoOverflow sharers below — give it a real descr per
-            // optimizer.py:691.
-            make_guard_with_descr(OpCode::GuardTrue, &[OpRef::int_op(3)], 4),
-            make_op(OpCode::IntSubOvf, &[OpRef::int_op(0), OpRef::int_op(1)], 5),
-            make_op(OpCode::GuardNoOverflow, &[], 6),
-            make_op(OpCode::IntMulOvf, &[OpRef::int_op(2), OpRef::int_op(1)], 7),
-            make_op(OpCode::GuardNoOverflow, &[], 8),
-            make_op(
+            OpRc::new(make_guard_with_descr(OpCode::GuardTrue, &[i3], 4)),
+            sub,
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 6)),
+            mul,
+            OpRc::new(make_op(OpCode::GuardNoOverflow, &[], 8)),
+            OpRc::new(make_op(
                 OpCode::Jump,
-                &[OpRef::int_op(5), OpRef::int_op(5), OpRef::int_op(7)],
+                &[sub_box.clone(), sub_box, mul_box],
                 9,
-            ),
+            )),
         ];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
@@ -2480,105 +2456,85 @@ mod tests {
 
     #[test]
     fn test_int_lt_known_true() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 5)),
-            (OpRef::int_op(1), IntBound::bounded(10, 20)),
+            (i0.clone(), IntBound::bounded(0, 5)),
+            (i1.clone(), IntBound::bounded(10, 20)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntLt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let lt = OpRc::new(make_op(OpCode::IntLt, &[i0, i1], 2));
+        let lt_box = Operand::from_bound_op(&lt);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[lt], &initial_bounds);
         // Should be removed (replaced by constant 1)
         assert!(
             result.is_empty(),
             "INT_LT should be removed when known true"
         );
         // The constant should be set
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&lt_box).borrow().clone();
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
 
     #[test]
     fn test_int_lt_known_false() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(10, 20)),
-            (OpRef::int_op(1), IntBound::bounded(0, 5)),
+            (i0.clone(), IntBound::bounded(10, 20)),
+            (i1.clone(), IntBound::bounded(0, 5)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntLt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let lt = OpRc::new(make_op(OpCode::IntLt, &[i0, i1], 2));
+        let lt_box = Operand::from_bound_op(&lt);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[lt], &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_LT should be removed when known false"
         );
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&lt_box).borrow().clone();
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
     #[test]
     fn test_int_eq_same_arg() {
-        let ops = vec![make_op(
-            OpCode::IntEq,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
-            1,
-        )];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let eq = OpRc::new(make_op(OpCode::IntEq, &[i0.clone(), i0], 1));
+        let eq_box = Operand::from_bound_op(&eq);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, ctx) = run_pass_with_bounds(&[eq], &[]);
         assert!(
             result.is_empty(),
             "INT_EQ(x, x) should be removed (always 1)"
         );
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&eq_box).borrow().clone();
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
 
     #[test]
     fn test_int_ne_same_arg() {
-        let ops = vec![make_op(
-            OpCode::IntNe,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
-            1,
-        )];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let ne = OpRc::new(make_op(OpCode::IntNe, &[i0.clone(), i0], 1));
+        let ne_box = Operand::from_bound_op(&ne);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, ctx) = run_pass_with_bounds(&[ne], &[]);
         assert!(
             result.is_empty(),
             "INT_NE(x, x) should be removed (always 0)"
         );
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&ne_box).borrow().clone();
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
     #[test]
     fn test_int_le_known_true() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 5)),
-            (OpRef::int_op(1), IntBound::bounded(5, 20)),
+            (i0.clone(), IntBound::bounded(0, 5)),
+            (i1.clone(), IntBound::bounded(5, 20)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntLe,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntLe, &[i0, i1], 2))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
@@ -2589,15 +2545,13 @@ mod tests {
 
     #[test]
     fn test_int_ge_known_true() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(10, 20)),
-            (OpRef::int_op(1), IntBound::bounded(0, 10)),
+            (i0.clone(), IntBound::bounded(10, 20)),
+            (i1.clone(), IntBound::bounded(0, 10)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntGe,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntGe, &[i0, i1], 2))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
@@ -2610,22 +2564,18 @@ mod tests {
 
     #[test]
     fn test_int_sub_bounds() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(10, 20)),
-            (OpRef::int_op(1), IntBound::bounded(0, 5)),
+            (i0.clone(), IntBound::bounded(10, 20)),
+            (i1.clone(), IntBound::bounded(0, 5)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntSub,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let sub = OpRc::new(make_op(OpCode::IntSub, &[i0, i1], 2));
+        let sub_box = Operand::from_bound_op(&sub);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[sub], &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&sub_box).borrow().clone();
         // [10, 20] - [0, 5] = [5, 20]
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 20);
@@ -2633,22 +2583,18 @@ mod tests {
 
     #[test]
     fn test_int_mul_bounds() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(2, 5)),
-            (OpRef::int_op(1), IntBound::bounded(3, 7)),
+            (i0.clone(), IntBound::bounded(2, 5)),
+            (i1.clone(), IntBound::bounded(3, 7)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntMul,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let mul = OpRc::new(make_op(OpCode::IntMul, &[i0, i1], 2));
+        let mul_box = Operand::from_bound_op(&mul);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[mul], &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&mul_box).borrow().clone();
         // [2, 5] * [3, 7] = [6, 35]
         assert_eq!(b.lower, 6);
         assert_eq!(b.upper, 35);
@@ -2656,22 +2602,18 @@ mod tests {
 
     #[test]
     fn test_int_and_bounds() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 255)),
-            (OpRef::int_op(1), IntBound::bounded(0, 15)),
+            (i0.clone(), IntBound::bounded(0, 255)),
+            (i1.clone(), IntBound::bounded(0, 15)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntAnd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let and = OpRc::new(make_op(OpCode::IntAnd, &[i0, i1], 2));
+        let and_box = Operand::from_bound_op(&and);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[and], &initial_bounds);
         assert_eq!(result.len(), 1);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&and_box).borrow().clone();
         // AND of [0, 255] and [0, 15] -> [0, 15]
         assert!(b.lower >= 0);
         assert!(b.upper <= 15);
@@ -2681,25 +2623,21 @@ mod tests {
     /// AND of bounds is a single constant => fold to that constant.
     #[test]
     fn test_int_and_known_result_both_const() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::from_constant(0xff)),
-            (OpRef::int_op(1), IntBound::from_constant(0x0f)),
+            (i0.clone(), IntBound::from_constant(0xff)),
+            (i1.clone(), IntBound::from_constant(0x0f)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntAnd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let and = OpRc::new(make_op(OpCode::IntAnd, &[i0, i1], 2));
+        let and_box = Operand::from_bound_op(&and);
+        let (result, ctx) = run_pass_with_bounds(&[and], &initial_bounds);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntAnd),
             "INT_AND of constants should be folded out, got {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&and_box).borrow().clone();
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0x0f);
     }
@@ -2711,11 +2649,8 @@ mod tests {
         // InputArg so the production driver's dispatch-entry rebind resolves
         // it through the OpRef store (no detached bound producer to strand the
         // `_forwarded` chain). Both args share position 0 ⇒ `same_box` holds.
-        let ops = vec![make_op(
-            OpCode::IntAnd,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
-            1,
-        )];
+        let a = rooted_inputarg_operand(Type::Int, 0);
+        let ops = vec![make_op(OpCode::IntAnd, &[a.clone(), a], 1)];
         let result = run_pass(&ops);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntAnd),
@@ -2730,15 +2665,13 @@ mod tests {
     fn test_int_and_x_c_in_range() {
         // Mask = 0xff (low-byte mask). x = bounded(0, 100). 100 < 256 and
         // 100 < 0xff & ~0x100 == 0xff so the rule fires.
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::from_constant(0xff)),
-            (OpRef::int_op(1), IntBound::bounded(0, 100)),
+            (i0.clone(), IntBound::from_constant(0xff)),
+            (i1.clone(), IntBound::bounded(0, 100)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntAnd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntAnd, &[i0, i1], 2))];
         let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntAnd),
@@ -2753,33 +2686,31 @@ mod tests {
     #[test]
     fn test_int_and_mask_prechecks_fold() {
         const MASK: i64 = 0xFFFF_FFFF; // 4294967295
-        // v9 (int_op 0) is an unbounded input; the mask and the comparison
+        // v9 is an unbounded input; the mask and the comparison
         // endpoints are literal Const operands, exactly as in the wasm trace.
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::unbounded())];
+        let v9 = rooted_resop_operand(Type::Int, 0);
+        let mask = Operand::const_from_value(Value::Int(MASK));
+        let zero = Operand::const_from_value(Value::Int(0));
+        let initial_bounds = vec![(v9.clone(), IntBound::unbounded())];
+        // v74 = IntAnd(v9, 0xFFFFFFFF)
+        let and = OpRc::new(make_op(OpCode::IntAnd, &[v9, mask.clone()], 2));
+        let and_box = Operand::from_bound_op(&and);
+        // v340 = IntGe(v74, 0); GuardTrue(v340)
+        let ge = OpRc::new(make_op(OpCode::IntGe, &[and_box.clone(), zero], 3));
+        let ge_box = Operand::from_bound_op(&ge);
+        // v341 = IntLe(v74, 0xFFFFFFFF); GuardTrue(v341)
+        let le = OpRc::new(make_op(OpCode::IntLe, &[and_box.clone(), mask], 6));
+        let le_box = Operand::from_bound_op(&le);
         let ops = vec![
-            // v74 = IntAnd(v9, 0xFFFFFFFF)
-            make_op(
-                OpCode::IntAnd,
-                &[OpRef::int_op(0), OpRef::const_int(MASK)],
-                2,
-            ),
-            // v340 = IntGe(v74, 0); GuardTrue(v340)
-            make_op(OpCode::IntGe, &[OpRef::int_op(2), OpRef::const_int(0)], 3),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(3)], 5),
-            // v341 = IntLe(v74, 0xFFFFFFFF); GuardTrue(v341)
-            make_op(
-                OpCode::IntLe,
-                &[OpRef::int_op(2), OpRef::const_int(MASK)],
-                6,
-            ),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(6)], 8),
+            and,
+            ge,
+            OpRc::new(make_op(OpCode::GuardTrue, &[ge_box], 5)),
+            le,
+            OpRc::new(make_op(OpCode::GuardTrue, &[le_box], 8)),
         ];
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // The AND result must carry the [0, MASK] bound.
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&and_box).borrow().clone();
         assert_eq!(b.lower, 0, "AND result lower should be 0");
         assert_eq!(b.upper, MASK, "AND result upper should be MASK");
         // Both precheck comparisons and their guards must be gone.
@@ -2796,25 +2727,21 @@ mod tests {
     /// of bounds is a single constant => fold to that constant.
     #[test]
     fn test_int_or_known_result_both_const() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::from_constant(0xf0)),
-            (OpRef::int_op(1), IntBound::from_constant(0x0f)),
+            (i0.clone(), IntBound::from_constant(0xf0)),
+            (i1.clone(), IntBound::from_constant(0x0f)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntOr,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let or = OpRc::new(make_op(OpCode::IntOr, &[i0, i1], 2));
+        let or_box = Operand::from_bound_op(&or);
+        let (result, ctx) = run_pass_with_bounds(&[or], &initial_bounds);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntOr),
             "INT_OR of constants should be folded out, got {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&or_box).borrow().clone();
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0xff);
     }
@@ -2824,11 +2751,8 @@ mod tests {
     fn test_int_or_x_x() {
         // `a` is an unproduced header input — model it as an InputArg (see
         // `test_int_and_x_x`) so the production driver resolves it positionally.
-        let ops = vec![make_op(
-            OpCode::IntOr,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
-            1,
-        )];
+        let a = rooted_inputarg_operand(Type::Int, 0);
+        let ops = vec![make_op(OpCode::IntOr, &[a.clone(), a], 1)];
         let result = run_pass(&ops);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntOr),
@@ -2847,15 +2771,13 @@ mod tests {
         // int_or(0xff, 0x0f) collapses; this is also covered by
         // or_known_result as a fold to 0xff. Either rule satisfies the
         // assertion.
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::from_constant(0xff)),
-            (OpRef::int_op(1), IntBound::from_constant(0x0f)),
+            (i0.clone(), IntBound::from_constant(0xff)),
+            (i1.clone(), IntBound::from_constant(0x0f)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntOr,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntOr, &[i0, i1], 2))];
         let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().all(|op| op.opcode != OpCode::IntOr),
@@ -2866,14 +2788,13 @@ mod tests {
 
     #[test]
     fn test_int_force_ge_zero() {
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(-10, 20))];
-        let ops = vec![make_op(OpCode::IntForceGeZero, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(-10, 20))];
+        let force = OpRc::new(make_op(OpCode::IntForceGeZero, &[i0], 1));
+        let force_box = Operand::from_bound_op(&force);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[force], &initial_bounds);
+        let b = ctx.getintbound_handle(&force_box).borrow().clone();
         assert!(
             b.lower >= 0,
             "INT_FORCE_GE_ZERO result should be >= 0, got {}",
@@ -2888,40 +2809,37 @@ mod tests {
 
     #[test]
     fn test_arraylen_nonneg() {
-        let op = make_op(OpCode::ArraylenGc, &[OpRef::int_op(0)], 1);
+        let arr = rooted_resop_operand(Type::Int, 0);
+        let mut op = make_op(OpCode::ArraylenGc, &[arr], 1);
         op.setdescr(descr(1));
-        let ops = vec![op];
+        let op_rc = OpRc::new(op);
+        let len_box = Operand::from_bound_op(&op_rc);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[op_rc], &[]);
+        let b = ctx.getintbound_handle(&len_box).borrow().clone();
         assert!(b.lower >= 0, "ARRAYLEN_GC result should be non-negative");
     }
 
     #[test]
     fn test_strlen_nonneg() {
-        let ops = vec![make_op(OpCode::Strlen, &[OpRef::int_op(0)], 1)];
+        let s = rooted_resop_operand(Type::Int, 0);
+        let strlen = OpRc::new(make_op(OpCode::Strlen, &[s], 1));
+        let len_box = Operand::from_bound_op(&strlen);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[strlen], &[]);
+        let b = ctx.getintbound_handle(&len_box).borrow().clone();
         assert!(b.lower >= 0, "STRLEN result should be non-negative");
     }
 
     #[test]
     fn test_int_neg_bounds() {
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(3, 10))];
-        let ops = vec![make_op(OpCode::IntNeg, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(3, 10))];
+        let neg = OpRc::new(make_op(OpCode::IntNeg, &[i0], 1));
+        let neg_box = Operand::from_bound_op(&neg);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[neg], &initial_bounds);
+        let b = ctx.getintbound_handle(&neg_box).borrow().clone();
         // neg([3, 10]) = [-10, -3]
         assert_eq!(b.lower, -10);
         assert_eq!(b.upper, -3);
@@ -2929,14 +2847,13 @@ mod tests {
 
     #[test]
     fn test_int_invert_bounds() {
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(3, 10))];
-        let ops = vec![make_op(OpCode::IntInvert, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(3, 10))];
+        let inv = OpRc::new(make_op(OpCode::IntInvert, &[i0], 1));
+        let inv_box = Operand::from_bound_op(&inv);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[inv], &initial_bounds);
+        let b = ctx.getintbound_handle(&inv_box).borrow().clone();
         // invert([3, 10]) = [!10, !3] = [-11, -4]
         assert_eq!(b.lower, -11);
         assert_eq!(b.upper, -4);
@@ -2945,19 +2862,14 @@ mod tests {
     #[test]
     fn test_sub_ovf_same_arg() {
         // INT_SUB_OVF(x, x) should be replaced by constant 0
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::unbounded())];
-        let ops = vec![make_op(
-            OpCode::IntSubOvf,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
-            1,
-        )];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::unbounded())];
+        let sub = OpRc::new(make_op(OpCode::IntSubOvf, &[i0.clone(), i0], 1));
+        let sub_box = Operand::from_bound_op(&sub);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[sub], &initial_bounds);
         assert!(result.is_empty(), "INT_SUB_OVF(x, x) should be removed");
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&sub_box).borrow().clone();
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
 
@@ -2965,15 +2877,13 @@ mod tests {
 
     #[test]
     fn test_uint_lt_known_true() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 5)),
-            (OpRef::int_op(1), IntBound::bounded(10, 20)),
+            (i0.clone(), IntBound::bounded(0, 5)),
+            (i1.clone(), IntBound::bounded(10, 20)),
         ];
-        let ops = vec![make_op(
-            OpCode::UintLt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::UintLt, &[i0, i1], 2))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
@@ -2986,21 +2896,17 @@ mod tests {
 
     #[test]
     fn test_int_lshift_bounds() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(1, 4)),
-            (OpRef::int_op(1), IntBound::from_constant(2)),
+            (i0.clone(), IntBound::bounded(1, 4)),
+            (i1.clone(), IntBound::from_constant(2)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntLshift,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let shl = OpRc::new(make_op(OpCode::IntLshift, &[i0, i1], 2));
+        let shl_box = Operand::from_bound_op(&shl);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[shl], &initial_bounds);
+        let b = ctx.getintbound_handle(&shl_box).borrow().clone();
         // [1, 4] << 2 = [4, 16]
         assert_eq!(b.lower, 4);
         assert_eq!(b.upper, 16);
@@ -3010,21 +2916,17 @@ mod tests {
 
     #[test]
     fn test_int_rshift_bounds() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(8, 20)),
-            (OpRef::int_op(1), IntBound::from_constant(2)),
+            (i0.clone(), IntBound::bounded(8, 20)),
+            (i1.clone(), IntBound::from_constant(2)),
         ];
-        let ops = vec![make_op(
-            OpCode::IntRshift,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let shr = OpRc::new(make_op(OpCode::IntRshift, &[i0, i1], 2));
+        let shr_box = Operand::from_bound_op(&shr);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[shr], &initial_bounds);
+        let b = ctx.getintbound_handle(&shr_box).borrow().clone();
         // [8, 20] >> 2 = [2, 5]
         assert_eq!(b.lower, 2);
         assert_eq!(b.upper, 5);
@@ -3035,7 +2937,8 @@ mod tests {
     #[test]
     fn test_int_is_true_passthrough() {
         // RPython: IntIsTrue has no postprocess — just passes through.
-        let ops = vec![make_op(OpCode::IntIsTrue, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let ops = vec![OpRc::new(make_op(OpCode::IntIsTrue, &[i0], 1))];
         let (result, _) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsTrue);
@@ -3044,7 +2947,8 @@ mod tests {
     #[test]
     fn test_int_is_zero_passthrough() {
         // RPython: IntIsZero has no postprocess — just passes through.
-        let ops = vec![make_op(OpCode::IntIsZero, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let ops = vec![OpRc::new(make_op(OpCode::IntIsZero, &[i0], 1))];
         let (result, _) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsZero);
@@ -3054,15 +2958,13 @@ mod tests {
 
     #[test]
     fn test_int_lt_unknown_not_removed() {
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::unbounded()),
-            (OpRef::int_op(1), IntBound::unbounded()),
+            (i0.clone(), IntBound::unbounded()),
+            (i1.clone(), IntBound::unbounded()),
         ];
-        let ops = vec![make_op(
-            OpCode::IntLt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntLt, &[i0, i1], 2))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(
@@ -3078,15 +2980,13 @@ mod tests {
     #[test]
     fn test_int_signext_eliminated() {
         // x in [-100, 100], signext to 2 bytes (-32768..32767) -> identity
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(-100, 100)),
-            (OpRef::int_op(1), IntBound::from_constant(2)), // byte_size = 2
+            (i0.clone(), IntBound::bounded(-100, 100)),
+            (i1.clone(), IntBound::from_constant(2)), // byte_size = 2
         ];
-        let ops = vec![make_op(
-            OpCode::IntSignext,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let ops = vec![OpRc::new(make_op(OpCode::IntSignext, &[i0, i1], 2))];
 
         let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
@@ -3098,24 +2998,20 @@ mod tests {
     #[test]
     fn test_int_signext_kept() {
         // x in [-50000, 50000], signext to 1 byte (-128..127) -> can't eliminate
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(-50000, 50000)),
-            (OpRef::int_op(1), IntBound::from_constant(1)), // byte_size = 1
+            (i0.clone(), IntBound::bounded(-50000, 50000)),
+            (i1.clone(), IntBound::from_constant(1)), // byte_size = 1
         ];
-        let ops = vec![make_op(
-            OpCode::IntSignext,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
+        let signext = OpRc::new(make_op(OpCode::IntSignext, &[i0, i1], 2));
+        let signext_box = Operand::from_bound_op(&signext);
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&[signext], &initial_bounds);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntSignext);
         // Result should have bounds [-128, 127]
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b = ctx.getintbound_handle(&signext_box).borrow().clone();
         assert!(b.lower >= -128);
         assert!(b.upper <= 127);
     }
@@ -3127,23 +3023,25 @@ mod tests {
         // x in [0, 5], y in [0, 5]
         // z = x + y   -> z in [0, 10]
         // z < 100     -> always true
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let i3 = rooted_resop_operand(Type::Int, 3);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(0, 5)),
-            (OpRef::int_op(1), IntBound::bounded(0, 5)),
-            (OpRef::int_op(3), IntBound::from_constant(100)),
+            (i0.clone(), IntBound::bounded(0, 5)),
+            (i1.clone(), IntBound::bounded(0, 5)),
+            (i3.clone(), IntBound::from_constant(100)),
         ];
-        let ops = vec![
-            make_op(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
-            make_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::int_op(3)], 4),
-        ];
+        let add = OpRc::new(make_op(OpCode::IntAdd, &[i0, i1], 2));
+        let add_box = Operand::from_bound_op(&add);
+        let lt = OpRc::new(make_op(OpCode::IntLt, &[add_box, i3], 4));
+        let lt_box = Operand::from_bound_op(&lt);
 
-        let (result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _ctx) = run_pass_with_bounds(&[add, lt], &initial_bounds);
         // INT_ADD should remain, INT_LT should be eliminated as constant true
         assert_eq!(result.len(), 1, "only INT_ADD should remain");
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::int_op(4))
-                .and_then(|b| b.const_value()),
+            lt_box.get_box_replacement(false).const_value(),
             Some(Value::Int(1))
         );
     }
@@ -3156,17 +3054,17 @@ mod tests {
         // i1 = INT_IS_TRUE(i0)
         // GUARD_TRUE(i1)
         // After guard, i0 should have lower > 0
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(0, 100))];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(0, 100))];
+        let is_true = OpRc::new(make_op(OpCode::IntIsTrue, &[i0.clone()], 1));
+        let is_true_box = Operand::from_bound_op(&is_true);
         let ops = vec![
-            make_op(OpCode::IntIsTrue, &[OpRef::int_op(0)], 1),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(1)], 2),
+            is_true,
+            OpRc::new(make_op(OpCode::GuardTrue, &[is_true_box], 2)),
         ];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b0 = ctx.getintbound_handle(&i0).borrow().clone();
         assert!(
             b0.lower >= 1,
             "After GUARD_TRUE(INT_IS_TRUE(i0)), i0.lower should be >= 1, got {}",
@@ -3180,17 +3078,17 @@ mod tests {
         // i1 = INT_IS_TRUE(i0)
         // GUARD_FALSE(i1)
         // After guard, i0 should be 0
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(0, 100))];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(0, 100))];
+        let is_true = OpRc::new(make_op(OpCode::IntIsTrue, &[i0.clone()], 1));
+        let is_true_box = Operand::from_bound_op(&is_true);
         let ops = vec![
-            make_op(OpCode::IntIsTrue, &[OpRef::int_op(0)], 1),
-            make_op(OpCode::GuardFalse, &[OpRef::int_op(1)], 2),
+            is_true,
+            OpRc::new(make_op(OpCode::GuardFalse, &[is_true_box], 2)),
         ];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b0 = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let b0 = ctx.getintbound_handle(&i0).borrow().clone();
         assert!(
             b0.is_constant() && b0.get_constant_int() == 0,
             "After GUARD_FALSE(INT_IS_TRUE(i0)), i0 should be 0, got [{}, {}]",
@@ -3204,18 +3102,13 @@ mod tests {
     #[test]
     fn test_int_add_x_plus_x() {
         // x in [3, 5], x + x -> should be [6, 10]
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::bounded(3, 5))];
-        let ops = vec![make_op(
-            OpCode::IntAdd,
-            &[OpRef::int_op(0), OpRef::int_op(0)],
-            1,
-        )];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::bounded(3, 5))];
+        let add = OpRc::new(make_op(OpCode::IntAdd, &[i0.clone(), i0], 1));
+        let add_box = Operand::from_bound_op(&add);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[add], &initial_bounds);
+        let b = ctx.getintbound_handle(&add_box).borrow().clone();
         assert!(b.lower >= 6, "lower should be >= 6, got {}", b.lower);
         assert!(b.upper <= 10, "upper should be <= 10, got {}", b.upper);
     }
@@ -3227,24 +3120,22 @@ mod tests {
         // i0 unbounded
         // i1 = INT_NEG(i0)  -- i1 in [-5, -1] initially
         // After propagation, i0 should have bounds [1, 5]
-        let initial_bounds = vec![(OpRef::int_op(0), IntBound::unbounded())];
-        let ops = vec![make_op(OpCode::IntNeg, &[OpRef::int_op(0)], 1)];
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let initial_bounds = vec![(i0.clone(), IntBound::unbounded())];
+        let neg = OpRc::new(make_op(OpCode::IntNeg, &[i0.clone()], 1));
+        let i1_box = Operand::from_bound_op(&neg);
 
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (_result, mut ctx) = run_pass_with_bounds(&[neg], &initial_bounds);
         // Manually tighten the result and trigger backward prop. The
         // OptIntBounds pass is stateless except for `last_emitted_*`
         // (everything else lives on `box._forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
-        let pass = OptIntBounds::new();
-        let i1_box = ctx.materialize_operand_at(OpRef::int_op(1));
+        let mut pass = OptIntBounds::new();
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.state
             .borrow_mut()
             .propagate_bounds_backward(&i1_box, &mut ctx);
-        let b0 = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let b0 = ctx.getintbound_handle(&i0).borrow().clone();
         assert!(
             b0.lower >= 1,
             "backward neg: lower should be >= 1, got {}",
@@ -3260,16 +3151,12 @@ mod tests {
     #[test]
     fn test_strgetitem_bounds() {
         // postprocess_STRGETITEM: result should be bounded to [0, 255].
-        let ops = vec![make_op(
-            OpCode::Strgetitem,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        )];
-        let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let s = rooted_resop_operand(Type::Int, 0);
+        let idx = rooted_resop_operand(Type::Int, 1);
+        let getitem = OpRc::new(make_op(OpCode::Strgetitem, &[s, idx], 2));
+        let getitem_box = Operand::from_bound_op(&getitem);
+        let (_result, ctx) = run_pass_with_bounds(&[getitem], &[]);
+        let b = ctx.getintbound_handle(&getitem_box).borrow().clone();
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
     }
@@ -3279,22 +3166,20 @@ mod tests {
         // RPython intbounds.py post_call_INT_PY_DIV:
         //   r.intersect(b1.py_div_bound(b2))
         // This must not use the modulo-style [0, divisor-1] bound.
-        let call = make_op(
-            OpCode::CallPureI,
-            &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        );
+        let func = rooted_resop_operand(Type::Int, 10);
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let mut call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
         call.setdescr(call_descr(12, majit_ir::OopSpecIndex::IntPyDiv));
+        let call_rc = OpRc::new(call);
+        let call_box = Operand::from_bound_op(&call_rc);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(-100, -10)),
-            (OpRef::int_op(1), IntBound::bounded(2, 4)),
+            (i0, IntBound::bounded(-100, -10)),
+            (i1, IntBound::bounded(2, 4)),
         ];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[call_rc], &initial_bounds);
+        let b = ctx.getintbound_handle(&call_box).borrow().clone();
         assert_eq!(b.lower, -50);
         assert_eq!(b.upper, -3);
     }
@@ -3303,22 +3188,20 @@ mod tests {
     fn test_call_int_py_mod_uses_mod_bound_for_negative_divisor() {
         // RPython intbounds.py post_call_INT_PY_MOD:
         //   r.intersect(b1.mod_bound(b2))
-        let call = make_op(
-            OpCode::CallPureI,
-            &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
-            2,
-        );
+        let func = rooted_resop_operand(Type::Int, 10);
+        let i0 = rooted_resop_operand(Type::Int, 0);
+        let i1 = rooted_resop_operand(Type::Int, 1);
+        let mut call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
         call.setdescr(call_descr(14, majit_ir::OopSpecIndex::IntPyMod));
+        let call_rc = OpRc::new(call);
+        let call_box = Operand::from_bound_op(&call_rc);
         let initial_bounds = vec![
-            (OpRef::int_op(0), IntBound::bounded(-100, 100)),
-            (OpRef::int_op(1), IntBound::bounded(-4, -2)),
+            (i0, IntBound::bounded(-100, 100)),
+            (i1, IntBound::bounded(-4, -2)),
         ];
 
-        let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
-        let b = {
-            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb).borrow().clone()
-        };
+        let (_result, ctx) = run_pass_with_bounds(&[call_rc], &initial_bounds);
+        let b = ctx.getintbound_handle(&call_box).borrow().clone();
         assert_eq!(b.lower, -3);
         assert_eq!(b.upper, 0);
     }
@@ -3331,36 +3214,50 @@ mod tests {
     /// propagate_bounds_backward_op() / intbounds.py propagate_bounds_INT_LT.
     #[test]
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
-        use crate::optimizeopt::optimizer::Optimizer;
+        // i0/i1 are header InputArg boxes; GuardTrue's arg is the IntLt
+        // producer itself (`as_operation(op.getarg(0))`), and IntAddOvf
+        // reuses the same i0. Thread the OpRcs through `_oprc` so identity
+        // does not depend on a position→box registry catch-up.
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        let i1 = rooted_inputarg_operand(Type::Int, 1);
+        let int_lt = OpRc::new(Op::new(OpCode::IntLt, &[i0.clone(), i1]));
+        int_lt.pos().set(OpRef::op_typed(2, int_lt.result_type()));
+        let guard_true = OpRc::new(Op::new(
+            OpCode::GuardTrue,
+            &[Operand::from_bound_op(&int_lt)],
+        ));
+        guard_true
+            .pos()
+            .set(OpRef::op_typed(3, guard_true.result_type()));
+        let add_ovf = OpRc::new(Op::new(
+            OpCode::IntAddOvf,
+            &[i0, Operand::const_from_value(majit_ir::Value::Int(1))],
+        ));
+        add_ovf.pos().set(OpRef::op_typed(4, add_ovf.result_type()));
+        let guard_no_ovf = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        guard_no_ovf
+            .pos()
+            .set(OpRef::op_typed(5, guard_no_ovf.result_type()));
+        let jump = OpRc::new(Op::new(OpCode::Jump, &[Operand::from_bound_op(&add_ovf)]));
+        jump.pos().set(OpRef::op_typed(6, jump.result_type()));
 
-        // i0/i1 are unproduced header inputs (modelled as InputArgs so the
-        // production driver resolves them positionally); i2/i4 are produced by
-        // the trace; the addend is ConstInt(1), the object the recorder
-        // would have placed in the arg.
-        let ops = vec![
-            make_op(
-                OpCode::IntLt,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-                2,
-            ),
-            make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
-            make_op(
-                OpCode::IntAddOvf,
-                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
-                4,
-            ),
-            make_op(OpCode::GuardNoOverflow, &[], 5),
-            make_op(OpCode::Jump, &[OpRef::int_op(4)], 6),
-        ];
-
+        let ops: Vec<OpRc> = vec![int_lt, guard_true, add_ovf, guard_no_ovf, jump];
         let mut opt = Optimizer::default_pipeline();
-        // IntLt/IntAddOvf operate on Int-typed inputs — override the
-        // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &vec![majit_ir::Type::Int; 1024]);
+        // Reuse the i0/i1 already on the ops. Snapshot seed copies
+        // rd_resume_position onto the live Rcs.
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &[Type::Int, Type::Int]);
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded.iter()) {
+            op.set_rd_resume_position(seed.rd_resume_position());
+        }
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
+        let result: Vec<Op> = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::default(), 2)
+            .expect("test: unexpected InvalidLoop")
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect();
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

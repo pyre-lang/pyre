@@ -453,19 +453,15 @@ impl PreambleOp {
 pub struct ShortBoxes {
     /// shortpreamble.py:249 self.potential_ops = OrderedDict()
     /// Keyed by the producer's result Box, compared by object identity
-    /// (shortpreamble.py:259/290) — every insert/lookup resolves its
-    /// position through `ctx.materialize_operand_at`, which memoizes one box
-    /// per producer, so the same position yields the same object. Const
-    /// results never key this map (they route to `const_short_boxes`).
+    /// (`shortpreamble.py ShortBoxes.potential_ops`). Const results never
+    /// key this map (they route to `const_short_boxes`).
     /// Values are shared so `materialize_one` can hold a candidate while
     /// it mutates `self`, the way the Python dict hands out the stored object.
     potential_ops: FxIndexMap<majit_ir::operand::Operand, std::rc::Rc<PotentialShortOp>>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by IndexMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
-    /// identity (shortpreamble.py:317/338) — lookups resolve their
-    /// position through `ctx.materialize_operand_at`, which memoizes one
-    /// box per producer, so the same position yields the same object.
+    /// identity (`shortpreamble.py ShortBoxes.produced_short_boxes`).
     produced_short_boxes: FxIndexMap<majit_ir::operand::Operand, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
@@ -1305,10 +1301,10 @@ pub struct ProducedShortOp {
     /// `short_op.res` (shortpreamble.py __init__/110/151/224) — the result operand
     /// this short op produces. `add_preamble_op` reads it back as the
     /// `PreambleOp.op` operand (upstream `produce_op` passes `self.res`).
-    /// Always a producer-bound / const operand (`materialize_operand_at` on
-    /// the preview, `res.bound_op()`-rooted exported entries per #173), never
-    /// position-only — so the same operand reaches the `expand_info`
-    /// boundary, `Rc::ptr_eq`-stable on the producer.
+    /// Always a producer-bound / const operand (`res.bound_op()`-rooted
+    /// exported entries), never position-only — so the same operand
+    /// reaches the `expand_info` boundary, `Rc::ptr_eq`-stable on the
+    /// producer.
     pub res: majit_ir::operand::Operand,
     /// The preamble operation to replay.
     pub preamble_op: majit_ir::OpRc,
@@ -2072,7 +2068,7 @@ pub struct ShortPreambleBuilder {
     /// (produce_arg/use_box/add_op_to_short). #146 re-keyed this from the
     /// flat-OpRef position (which needed a dual source/result_opref key for
     /// invented names) to the single carried res box: `self.res` at the
-    /// cross-peel produce loop, `materialize_operand_at(pos)` at the single-op
+    /// cross-peel produce loop and the bound producer at the single-op
     /// re-export. The carried box is invariant to the replay-position aliasing
     /// the dual key compensated for, so the two entries collapse to one. The
     /// PYRE_S8B_HARNESS census measured this lookup agreeing with the former
@@ -2114,7 +2110,7 @@ impl ShortPreambleBuilder {
             // filters const short boxes (`optimizer.rs`'s
             // `optimize_with_constants_and_inputs_at`) so this is inert
             // for the live path, and the single-op re-export passes the
-            // memoized `materialize_operand_at(pos)` box.
+            // bound producer box.
             if k.to_opref().is_constant() {
                 continue;
             }
@@ -2236,8 +2232,8 @@ impl ShortPreambleBuilder {
     /// compensated for invented-name replay-position aliasing; the carried box
     /// is invariant to that aliasing so the entries collapse to one. The prior
     /// "blocked" verdict (75 agree / 114 diverge) measured the WRONG box:
-    /// `get_box_replacement_operand_opt(source)`, a Phase-2 re-resolution that mints a
-    /// fresh non-`ptr_eq` box. The carried Phase-1 res is shared across the
+    /// a Phase-2 re-resolution that minted a fresh non-`ptr_eq` box. The
+    /// carried Phase-1 res is shared across the
     /// peel boundary (an `Rc::clone` of the exported short-box res), so the
     /// box-identity lookup hits — PYRE_S8B_HARNESS measured 82/82 agreement
     /// with the former position key on every live firing across the corpus.
@@ -3301,16 +3297,6 @@ mod tests {
         rooted_resop_operand(ty, pos)
     }
 
-    /// The context's canonical box for `pos`, so every use of one position
-    /// is the same box.
-    fn crop(ctx: &mut crate::optimizeopt::OptContext, ty: Type, pos: u32) -> Operand {
-        ctx.materialize_operand_at(OpRef::op_typed(pos, ty))
-    }
-
-    fn intern(ctx: &mut crate::optimizeopt::OptContext, opref: OpRef) -> Operand {
-        ctx.materialize_operand_at(opref)
-    }
-
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos()
@@ -3967,35 +3953,27 @@ mod tests {
     #[test]
     fn test_short_boxes() {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
-        let b10 = intern(&mut __ctx, OpRef::int_op(10));
-        let b11 = intern(&mut __ctx, OpRef::int_op(11));
-        let b12 = intern(&mut __ctx, OpRef::int_op(12));
+        let b10 = rop(Type::Int, 10);
+        let b11 = rop(Type::Int, 11);
+        let b12 = rop(Type::Int, 12);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone(), b11.clone(), b12.clone()]);
         assert_eq!(sb.num_label_args, 3);
         // Production seeds a renamed ShortInputArg for every label arg
         // (optimizer.rs preview loop); the pure/heap deps resolve through them.
-        for arg in [b10, b11, b12] {
+        for arg in [b10.clone(), b11.clone(), b12.clone()] {
             sb.add_short_input_arg(&mut __ctx, arg);
         }
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[
-                crop(&mut __ctx, Type::Int, 10),
-                crop(&mut __ctx, Type::Int, 11),
-            ],
-        );
+        let mut pure = Op::new(OpCode::IntAdd, &[b10.clone(), b11.clone()]);
         pure.pos().set(OpRef::int_op(20));
         sb.add_pure_op(&OpRc::new(pure));
         let heap = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crop(&mut __ctx, Type::Int, 10)],
+            &[b10.clone()],
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(21));
-        {
-            let res = __ctx.materialize_operand_at(heap.pos().get());
-            sb.add_heap_op(res, heap);
-        }
+        let heap_res = Operand::from_bound_op(&OpRc::new(heap.clone()));
+        sb.add_heap_op(heap_res, heap);
         let produced = sb.produced_ops(&mut __ctx);
         // 3 ShortInputArgs (one per label arg) + the pure and heap ops.
         let non_input: Vec<_> = produced
@@ -4008,20 +3986,20 @@ mod tests {
     #[test]
     fn test_short_boxes_reject_unknown_nonconstant_dependency() {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
-        let b10 = intern(&mut __ctx, OpRef::int_op(10));
+        let b10 = rop(Type::Int, 10);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone()]);
         sb.add_short_input_arg(&mut __ctx, b10);
         let pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 10), rop(Type::Int, 999)]);
         pure.pos().set(OpRef::int_op(20));
-        sb.add_pure_op(&OpRc::new(pure));
+        let pure_rc = OpRc::new(pure);
+        let pure_res = Operand::from_bound_op(&pure_rc);
+        sb.add_pure_op(&pure_rc);
 
         let produced = sb.produced_ops(&mut __ctx);
-        // The label arg OpRef::int_op(10) itself is produced (as ShortInputArg),
-        // but the pure op depending on unknown OpRef::int_op(999) is rejected.
+        // The label arg itself is produced (as ShortInputArg),
+        // but the pure op depending on unknown pos-999 is rejected.
         assert!(
-            !produced
-                .iter()
-                .any(|(r, _)| r.to_opref() == OpRef::int_op(20)),
+            !produced.iter().any(|(r, _)| r.same_box(&pure_res)),
             "pure op with unknown dependency should be rejected"
         );
     }
@@ -4029,23 +4007,19 @@ mod tests {
     #[test]
     fn test_short_boxes_accept_known_constant_dependency() {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
-        let b10 = intern(&mut __ctx, OpRef::int_op(10));
+        let b10 = rop(Type::Int, 10);
+        let b999 = rop(Type::Int, 999);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone()]);
-        sb.add_short_input_arg(&mut __ctx, b10);
-        sb.note_known_constant(OpRef::int_op(999));
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[
-                crop(&mut __ctx, Type::Int, 10),
-                crop(&mut __ctx, Type::Int, 999),
-            ],
-        );
+        sb.add_short_input_arg(&mut __ctx, b10.clone());
+        sb.note_known_constant(b999.to_opref());
+        let mut pure = Op::new(OpCode::IntAdd, &[b10.clone(), b999.clone()]);
         pure.pos().set(OpRef::int_op(20));
-        sb.add_pure_op(&OpRc::new(pure));
+        let pure_rc = OpRc::new(pure);
+        let pure_res = Operand::from_bound_op(&pure_rc);
+        sb.add_pure_op(&pure_rc);
 
         let produced = sb.produced_ops(&mut __ctx);
-        let renamed10 =
-            sb.create_short_inputargs(&[intern(&mut __ctx, OpRef::int_op(10))])[0].clone();
+        let renamed10 = sb.create_short_inputargs(&[b10.clone()])[0].clone();
         // 1 ShortInputArg (label arg 10) + the accepted pure op.
         let non_input: Vec<_> = produced
             .iter()
@@ -4054,12 +4028,12 @@ mod tests {
         assert_eq!(non_input.len(), 1);
         let pure = produced
             .iter()
-            .find(|(result, _)| result.to_opref() == OpRef::int_op(20))
+            .find(|(result, _)| result.same_box(&pure_res))
             .expect("missing produced pure op");
         // The label-arg dep is renamed to its short_inputargs box; the known
         // constant 999 passes through unchanged.
         assert!(pure.1.preamble_op.arg(0).same_box(&renamed10));
-        assert_eq!(pure.1.preamble_op.arg(1).to_opref(), OpRef::int_op(999));
+        assert!(pure.1.preamble_op.arg(1).same_box(&b999));
     }
 
     #[test]
@@ -4067,39 +4041,28 @@ mod tests {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
         // Only the op DEPENDENCIES (30, 31) are label args; the compound result
         // (pos 10) is an op result, not a label arg.
-        let b30 = intern(&mut __ctx, OpRef::int_op(30));
-        let b31 = intern(&mut __ctx, OpRef::int_op(31));
+        let b30 = rop(Type::Int, 30);
+        let b31 = rop(Type::Int, 31);
+        let res10 = rop(Type::Int, 10);
         let mut sb = ShortBoxes::with_label_args(&[b30.clone(), b31.clone()]);
-        for arg in [b30, b31] {
+        for arg in [b30.clone(), b31.clone()] {
             sb.add_short_input_arg(&mut __ctx, arg);
         }
 
         let heap = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crop(&mut __ctx, Type::Int, 30)],
+            &[b30.clone()],
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(10));
-        {
-            let res = __ctx.materialize_operand_at(heap.pos().get());
-            sb.add_potential_op(None, res, heap, PreambleOpKind::Heap);
-        }
+        sb.add_potential_op(None, res10.clone(), heap, PreambleOpKind::Heap);
 
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[
-                crop(&mut __ctx, Type::Int, 30),
-                crop(&mut __ctx, Type::Int, 31),
-            ],
-        );
+        let mut pure = Op::new(OpCode::IntAdd, &[b30.clone(), b31.clone()]);
         pure.pos().set(OpRef::int_op(10));
         // Second add wraps the first value in CompoundOp (shortpreamble.py
         // add_potential_op). produced_ops must flatten both after the
         // wrap moves `prev` instead of cloning it.
-        {
-            let res = __ctx.materialize_operand_at(pure.pos().get());
-            sb.add_potential_op(None, res, pure, PreambleOpKind::Pure);
-        }
+        sb.add_potential_op(None, res10.clone(), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
         // 2 ShortInputArgs (30, 31) + the compound@10 (Pure chosen + Heap alias).
@@ -4111,32 +4074,34 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| {
-                result.to_opref() == OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| result.same_box(&res10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let alias = produced
             .iter()
-            .find(|(result, p)| {
-                result.to_opref() != OpRef::int_op(10) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| !result.same_box(&res10) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
         // shortpreamble.py HeapOp keeps `getfield_op` beside the remapped
         // `preamble_op`: exported_infos is keyed by the original receiver
         // box, while the replay must read the renamed short-inputarg box.
-        assert_eq!(alias.1.source_op.arg(0).to_opref(), OpRef::int_op(30));
-        assert_ne!(
-            alias.1.preamble_op.arg(0).to_opref(),
-            alias.1.source_op.arg(0).to_opref()
+        assert!(alias.1.source_op.arg(0).same_box(&b30));
+        assert!(
+            !alias
+                .1
+                .preamble_op
+                .arg(0)
+                .same_box(&alias.1.source_op.arg(0))
         );
-        assert_eq!(
-            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
-            Some(OpRef::int_op(10))
+        assert!(
+            alias
+                .1
+                .same_as_source
+                .as_ref()
+                .is_some_and(|b| b.same_box(&res10))
         );
     }
 
@@ -4158,7 +4123,8 @@ mod tests {
         // stores the previous dict value. Cloning PreambleOp clones its
         // OpRc and bumps the strong count; a move leaves the count alone.
         let mut ctx = crate::optimizeopt::OptContext::new(256);
-        let b30 = intern(&mut ctx, OpRef::int_op(30));
+        let b30 = rop(Type::Int, 30);
+        let res10 = rop(Type::Int, 10);
         let mut sb = ShortBoxes::with_label_args(&[b30.clone()]);
         sb.add_short_input_arg(&mut ctx, b30);
 
@@ -4168,10 +4134,7 @@ mod tests {
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(10));
-        {
-            let res = ctx.materialize_operand_at(heap.pos().get());
-            sb.add_potential_op(None, res, heap, PreambleOpKind::Heap);
-        }
+        sb.add_potential_op(None, res10.clone(), heap, PreambleOpKind::Heap);
         let count_before = sb
             .potential_ops
             .values()
@@ -4180,10 +4143,7 @@ mod tests {
 
         let pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 30), rop(Type::Int, 30)]);
         pure.pos().set(OpRef::int_op(10));
-        {
-            let res = ctx.materialize_operand_at(pure.pos().get());
-            sb.add_potential_op(None, res, pure, PreambleOpKind::Pure);
-        }
+        sb.add_potential_op(None, res10, pure, PreambleOpKind::Pure);
         let count_after = sb
             .potential_ops
             .values()
@@ -4200,43 +4160,29 @@ mod tests {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
         // Only the op DEPENDENCIES (30, 31) are label args; the compound result
         // (pos 20) is an op result, not a label arg.
-        let b30 = intern(&mut __ctx, OpRef::int_op(30));
-        let b31 = intern(&mut __ctx, OpRef::int_op(31));
+        let b30 = rop(Type::Int, 30);
+        let b31 = rop(Type::Int, 31);
+        let res20 = rop(Type::Int, 20);
         let mut sb = ShortBoxes::with_label_args(&[b30.clone(), b31.clone()]);
-        for arg in [b30, b31] {
+        for arg in [b30.clone(), b31.clone()] {
             sb.add_short_input_arg(&mut __ctx, arg);
         }
 
         let heap = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crop(&mut __ctx, Type::Int, 30)],
+            &[b30.clone()],
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(20));
-        {
-            let res = __ctx.materialize_operand_at(heap.pos().get());
-            sb.add_potential_op(None, res, heap, PreambleOpKind::Heap);
-        }
+        sb.add_potential_op(None, res20.clone(), heap, PreambleOpKind::Heap);
 
-        let loopinv = Op::new(OpCode::CallI, &[crop(&mut __ctx, Type::Int, 30)]);
+        let mut loopinv = Op::new(OpCode::CallI, &[b30.clone()]);
         loopinv.pos().set(OpRef::int_op(20));
-        {
-            let res = __ctx.materialize_operand_at(loopinv.pos().get());
-            sb.add_potential_op(None, res, loopinv, PreambleOpKind::LoopInvariant);
-        }
+        sb.add_potential_op(None, res20.clone(), loopinv, PreambleOpKind::LoopInvariant);
 
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[
-                crop(&mut __ctx, Type::Int, 30),
-                crop(&mut __ctx, Type::Int, 31),
-            ],
-        );
+        let mut pure = Op::new(OpCode::IntAdd, &[b30.clone(), b31.clone()]);
         pure.pos().set(OpRef::int_op(20));
-        {
-            let res = __ctx.materialize_operand_at(pure.pos().get());
-            sb.add_potential_op(None, res, pure, PreambleOpKind::Pure);
-        }
+        sb.add_potential_op(None, res20.clone(), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
         // 2 ShortInputArgs (30, 31) + the compound@20 (Pure chosen + 2 aliases).
@@ -4248,47 +4194,43 @@ mod tests {
 
         let chosen = produced
             .iter()
-            .find(|(result, p)| {
-                result.to_opref() == OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
-            })
+            .find(|(result, p)| result.same_box(&res20) && p.kind != PreambleOpKind::InputArg)
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::Pure);
         assert!(!chosen.1.invented_name);
 
         let aliases: Vec<_> = produced
             .iter()
-            .filter(|(result, p)| {
-                result.to_opref() != OpRef::int_op(20) && p.kind != PreambleOpKind::InputArg
-            })
+            .filter(|(result, p)| !result.same_box(&res20) && p.kind != PreambleOpKind::InputArg)
             .collect();
         assert_eq!(aliases.len(), 2);
         assert!(aliases.iter().all(|(_, produced)| produced.invented_name));
         assert!(aliases.iter().all(|(_, produced)| {
-            produced.same_as_source.as_ref().map(|b| b.to_opref()) == Some(OpRef::int_op(20))
+            produced
+                .same_as_source
+                .as_ref()
+                .is_some_and(|b| b.same_box(&res20))
         }));
     }
 
     #[test]
     fn test_rpython_create_short_boxes_prefers_short_inputarg_over_heap_result() {
         let mut ctx = crate::optimizeopt::OptContext::new(256);
-        let b10 = intern(&mut ctx, OpRef::int_op(10));
-        let b30 = intern(&mut ctx, OpRef::int_op(30));
+        let b10 = rop(Type::Int, 10);
+        let b30 = rop(Type::Int, 30);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone(), b30.clone()]);
         // pos 10 is both a label arg and a heap result (the case under test);
         // seed both label args (the heap dep 30 must be a ShortInputArg too).
-        sb.add_short_input_arg(&mut ctx, b10);
-        sb.add_short_input_arg(&mut ctx, b30);
+        sb.add_short_input_arg(&mut ctx, b10.clone());
+        sb.add_short_input_arg(&mut ctx, b30.clone());
 
         let heap = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crop(&mut ctx, Type::Int, 30)],
+            &[b30.clone()],
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(10));
-        {
-            let res = ctx.materialize_operand_at(heap.pos().get());
-            sb.add_heap_op(res, heap);
-        }
+        sb.add_heap_op(b10.clone(), heap);
 
         let produced = sb.produced_ops(&mut ctx);
 
@@ -4296,7 +4238,7 @@ mod tests {
         // invented alias. (Label arg 30 is also produced as a ShortInputArg.)
         let chosen = produced
             .iter()
-            .find(|(result, _)| result.to_opref() == OpRef::int_op(10))
+            .find(|(result, _)| result.same_box(&b10))
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
         assert!(!chosen.1.invented_name);
@@ -4306,9 +4248,12 @@ mod tests {
             .find(|(_, p)| p.kind == PreambleOpKind::Heap)
             .unwrap();
         assert!(alias.1.invented_name);
-        assert_eq!(
-            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
-            Some(OpRef::int_op(10))
+        assert!(
+            alias
+                .1
+                .same_as_source
+                .as_ref()
+                .is_some_and(|b| b.same_box(&b10))
         );
     }
 
@@ -4328,12 +4273,8 @@ mod tests {
             majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(constant);
-        let const_box;
-        {
-            let res = ctx.materialize_operand_at(heap.pos().get());
-            const_box = res.clone();
-            sb.add_heap_op(res, heap);
-        }
+        let const_box = Operand::const_from_value(Value::Int(7));
+        sb.add_heap_op(const_box.clone(), heap);
 
         let produced = sb.produced_ops(&mut ctx);
         let produced_const = sb.produced_const_ops(&mut ctx);
@@ -4370,10 +4311,8 @@ mod tests {
 
         let heap = Op::new(OpCode::GetfieldGcI, &[struct_arg.clone()]);
         heap.pos().set(constant);
-        {
-            let res = ctx.materialize_operand_at(heap.pos().get());
-            sb.add_heap_op(res, heap);
-        }
+        let const_box = Operand::const_from_value(Value::Int(7));
+        sb.add_heap_op(const_box, heap);
 
         let produced = sb.produced_ops(&mut ctx);
         let produced_const = sb.produced_const_ops(&mut ctx);
@@ -4398,26 +4337,22 @@ mod tests {
         // so the invented alias is not a label arg. Slot identity belongs only
         // to `ShortInputArg`, so `label_arg_idx` is cleared on the alias.
         let mut ctx = crate::optimizeopt::OptContext::new(256);
-        let b30 = intern(&mut ctx, OpRef::int_op(30));
-        let b31 = intern(&mut ctx, OpRef::int_op(31));
+        let b30 = rop(Type::Int, 30);
+        let b31 = rop(Type::Int, 31);
         // A pure op whose result box is label arg 10, depending on the other
         // two label args (avoids a self-referential in-production cycle).
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[crop(&mut ctx, Type::Int, 30), crop(&mut ctx, Type::Int, 31)],
-        );
+        let mut pure = Op::new(OpCode::IntAdd, &[b30.clone(), b31.clone()]);
         pure.pos().set(OpRef::int_op(10));
         let pure = OpRc::new(pure);
         ctx.emit_rc(pure.clone());
-        // Intern the IntAdd producer after emit so label-arg box identity
-        // is `from_bound_op` of that op — the same box `add_pure_op` keys
-        // (`ShortBoxes.add_potential_op`).
-        let b10 = intern(&mut ctx, OpRef::int_op(10));
+        // Label-arg box identity is `from_bound_op` of the emitted IntAdd —
+        // the same box `add_pure_op` keys (`ShortBoxes.add_potential_op`).
+        let b10 = Operand::from_bound_op(&pure);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone(), b30.clone(), b31.clone()]);
         // pos 10 is both a label arg (slot 0) and a pure result (the case under
         // test); seed all three label args (the pure deps 30/31 are
         // ShortInputargs too).
-        sb.add_short_input_arg(&mut ctx, b10);
+        sb.add_short_input_arg(&mut ctx, b10.clone());
         sb.add_short_input_arg(&mut ctx, b30);
         sb.add_short_input_arg(&mut ctx, b31);
 
@@ -4429,7 +4364,7 @@ mod tests {
         // invented alias.
         let chosen = produced
             .iter()
-            .find(|(result, _)| result.to_opref() == OpRef::int_op(10))
+            .find(|(result, _)| result.same_box(&b10))
             .unwrap();
         assert_eq!(chosen.1.kind, PreambleOpKind::InputArg);
         assert!(!chosen.1.invented_name);
@@ -4441,9 +4376,12 @@ mod tests {
             .find(|(_, p)| p.kind == PreambleOpKind::Pure)
             .unwrap();
         assert!(alias.1.invented_name);
-        assert_eq!(
-            alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
-            Some(OpRef::int_op(10))
+        assert!(
+            alias
+                .1
+                .same_as_source
+                .as_ref()
+                .is_some_and(|b| b.same_box(&b10))
         );
         // THE REGRESSION LOCK: the invented alias must NOT carry the original
         // label slot. Before the fix this was Some(0) and the import collapsed
@@ -4458,8 +4396,8 @@ mod tests {
         // label arg `box`. pyre's old position-identity model reused the label
         // arg's OpRef; this test locks the distinct-renamed-box parity.
         let mut ctx = crate::optimizeopt::OptContext::new(256);
-        let b10 = intern(&mut ctx, OpRef::int_op(10));
-        let b11 = intern(&mut ctx, OpRef::ref_op(11));
+        let b10 = rop(Type::Int, 10);
+        let b11 = rop(Type::Ref, 11);
         let label_args = [b10.clone(), b11.clone()];
         let mut sb = ShortBoxes::with_label_args(&label_args);
         sb.add_short_input_arg(&mut ctx, b10.clone());
@@ -4502,7 +4440,7 @@ mod tests {
         // The SAME box at both slots: the production caller (optimizer.rs preview
         // loop) iterates label_args+virtuals, so a coinciding box reaches
         // add_short_input_arg once per slot.
-        let box50 = intern(&mut ctx, OpRef::ref_op(50));
+        let box50 = rop(Type::Ref, 50);
         let label_args = [box50.clone(), box50.clone()];
         let mut sb = ShortBoxes::with_label_args(&label_args);
         sb.add_short_input_arg(&mut ctx, box50.clone());
@@ -4520,9 +4458,7 @@ mod tests {
         let produced = sb.produced_ops(&mut ctx);
         let inputarg_entries: Vec<_> = produced
             .iter()
-            .filter(|(r, p)| {
-                r.to_opref() == OpRef::ref_op(50) && p.kind == PreambleOpKind::InputArg
-            })
+            .filter(|(r, p)| r.same_box(&box50) && p.kind == PreambleOpKind::InputArg)
             .collect();
         assert_eq!(inputarg_entries.len(), 1);
         // THE REGRESSION LOCK: the overwriting (later) call must record the LAST
@@ -4545,31 +4481,20 @@ mod tests {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
         // The ovf result (pos 10) is an op result; its deps (30, 31) are the
         // label args and become renamed ShortInputargs that the Label carries.
-        let b30 = intern(&mut __ctx, OpRef::int_op(30));
-        let b31 = intern(&mut __ctx, OpRef::int_op(31));
+        let b30 = rop(Type::Int, 30);
+        let b31 = rop(Type::Int, 31);
+        let res10 = rop(Type::Int, 10);
         let mut sb = ShortBoxes::with_label_args(&[b30.clone(), b31.clone()]);
-        for arg in [b30, b31] {
+        for arg in [b30.clone(), b31.clone()] {
             sb.add_short_input_arg(&mut __ctx, arg);
         }
 
-        let ovf = Op::new(
-            OpCode::IntAddOvf,
-            &[
-                crop(&mut __ctx, Type::Int, 30),
-                crop(&mut __ctx, Type::Int, 31),
-            ],
-        );
+        let mut ovf = Op::new(OpCode::IntAddOvf, &[b30.clone(), b31.clone()]);
         ovf.pos().set(OpRef::int_op(10));
-        {
-            let res = __ctx.materialize_operand_at(ovf.pos().get());
-            sb.add_potential_op(None, res, ovf, PreambleOpKind::Pure);
-        }
+        sb.add_potential_op(None, res10.clone(), ovf, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
-        let short_inputargs = sb.create_short_inputargs(&[
-            intern(&mut __ctx, OpRef::int_op(30)),
-            intern(&mut __ctx, OpRef::int_op(31)),
-        ]);
+        let short_inputargs = sb.create_short_inputargs(&[b30.clone(), b31.clone()]);
         // #146: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
@@ -4577,13 +4502,6 @@ mod tests {
             .iter()
             .map(|(_, p)| (p.res.clone(), p.clone()))
             .collect();
-        let res10 = produced
-            .iter()
-            .find(|(r, _)| r.to_opref() == OpRef::int_op(10))
-            .unwrap()
-            .1
-            .res
-            .clone();
         let mut builder = ShortPreambleBuilder::new(&short_inputargs, &entries, &short_inputargs);
         let used = builder.add_op_to_short(&res10).unwrap();
         assert!(builder.add_preamble_op(&res10));
@@ -4615,41 +4533,30 @@ mod tests {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
         // The compound result (pos 20) is an op result; its deps (30, 31) are
         // the label args / renamed ShortInputargs.
-        let b30 = intern(&mut __ctx, OpRef::int_op(30));
-        let b31 = intern(&mut __ctx, OpRef::int_op(31));
+        let b30 = rop(Type::Int, 30);
+        let b31 = rop(Type::Int, 31);
+        let res20 = rop(Type::Int, 20);
         let mut sb = ShortBoxes::with_label_args(&[b30.clone(), b31.clone()]);
-        for arg in [b30, b31] {
+        for arg in [b30.clone(), b31.clone()] {
             sb.add_short_input_arg(&mut __ctx, arg);
         }
 
         let heap = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crop(&mut __ctx, Type::Int, 30)],
+            &[b30.clone()],
             majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
         );
         heap.pos().set(OpRef::int_op(20));
-        {
-            let res = __ctx.materialize_operand_at(heap.pos().get());
-            sb.add_potential_op(None, res, heap, PreambleOpKind::Heap);
-        }
+        sb.add_potential_op(None, res20.clone(), heap, PreambleOpKind::Heap);
 
-        let pure = Op::new(
-            OpCode::IntAdd,
-            &[
-                crop(&mut __ctx, Type::Int, 30),
-                crop(&mut __ctx, Type::Int, 31),
-            ],
-        );
+        let mut pure = Op::new(OpCode::IntAdd, &[b30.clone(), b31.clone()]);
         pure.pos().set(OpRef::int_op(20));
-        {
-            let res = __ctx.materialize_operand_at(pure.pos().get());
-            sb.add_potential_op(None, res, pure, PreambleOpKind::Pure);
-        }
+        sb.add_potential_op(None, res20.clone(), pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
         let (alias_result, alias_res) = produced
             .iter()
-            .find(|(result, pop)| result.to_opref() != OpRef::int_op(20) && pop.invented_name)
+            .find(|(result, pop)| !result.same_box(&res20) && pop.invented_name)
             .map(|(result, pop)| (result.clone(), pop.res.clone()))
             .unwrap();
 
@@ -4671,14 +4578,7 @@ mod tests {
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos().get(), alias_result.to_opref());
-        assert_eq!(
-            extra[0]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(20)]
-        );
+        assert!(extra[0].arg(0).same_box(&res20));
     }
 
     #[test]
@@ -4780,7 +4680,7 @@ mod tests {
     fn extended_builder_keeps_renamed_short_inputargs() {
         let renamed = rooted_inputarg_operand(Type::Int, 51);
         let original = rooted_inputarg_operand(Type::Int, 8);
-        let jump_arg = OpRef::int_op(80);
+        let jump_arg_box = rop(Type::Int, 80);
         let sb = ShortPreambleBuilder::new(
             std::slice::from_ref(&original),
             &[],
@@ -4823,11 +4723,10 @@ mod tests {
 
         // unroll.py inline_short_preamble seeds only
         // mapping[short_inputargs[i]] = jump_args[i].
-        let jump_arg_box = ctx.materialize_operand_at(jump_arg);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let extra = crate::optimizeopt::unroll::OptUnroll::inline_short_preamble(
             &[jump_arg_box.clone()],
-            &[jump_arg_box],
+            &[jump_arg_box.clone()],
             &rebuilt,
             &mut optimizer,
             &mut ctx,
@@ -4836,16 +4735,14 @@ mod tests {
             ctx.take_invalid_loop().is_none(),
             "leg (1) maps the renamed short inputarg"
         );
-        assert_eq!(
-            extra.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
-            vec![jump_arg]
-        );
+        assert_eq!(extra.len(), 1);
+        assert!(extra[0].same_box(&jump_arg_box));
         let replayed = ctx
             .new_operations
             .iter()
             .find(|op| op.opcode == OpCode::IntAdd)
             .expect("replayed int_add");
-        assert_eq!(replayed.arg(0).to_opref(), jump_arg);
+        assert!(replayed.arg(0).same_box(&jump_arg_box));
     }
 
     /// `GetfieldGcR` of a `CALL_PURE` result that is also a loop-label
@@ -4875,23 +4772,19 @@ mod tests {
             EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
         ));
         call.pos().set(OpRef::ref_op(72));
-        let getfield = Op::with_descr(
+        let call_res = Operand::from_bound_op(&OpRc::new(call.clone()));
+        let mut getfield = Op::with_descr(
             OpCode::GetfieldGcR,
-            &[ctx.materialize_operand_at(OpRef::ref_op(72))],
+            &[call_res.clone()],
             majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer),
         );
         getfield.pos().set(OpRef::ref_op(77));
+        let getfield_res = Operand::from_bound_op(&OpRc::new(getfield.clone()));
 
         let mut sb = ShortBoxes::with_label_args(&[i0.clone()]);
         sb.add_short_input_arg(&mut ctx, i0.clone());
-        {
-            let res = ctx.materialize_operand_at(call.pos().get());
-            sb.add_potential_op(None, res, call, PreambleOpKind::Pure);
-        }
-        {
-            let res = ctx.materialize_operand_at(getfield.pos().get());
-            sb.add_potential_op(None, res, getfield, PreambleOpKind::Heap);
-        }
+        sb.add_potential_op(None, call_res, call, PreambleOpKind::Pure);
+        sb.add_potential_op(None, getfield_res, getfield, PreambleOpKind::Heap);
         let produced = sb.produced_ops(&mut ctx);
         let call_prod = produced
             .iter()
@@ -4977,8 +4870,7 @@ mod tests {
         assert_eq!(replayed, vec![OpCode::CallPureR, OpCode::GetfieldGcR]);
 
         ctx.activate_short_preamble_producer(ext);
-        let jump_arg = OpRef::int_op(3);
-        let jump_arg_box = ctx.materialize_operand_at(jump_arg);
+        let jump_arg_box = rop(Type::Int, 3);
         let mut optimizer = Optimizer::new();
         let extra = OptUnroll::inline_short_preamble(
             &[jump_arg_box.clone()],

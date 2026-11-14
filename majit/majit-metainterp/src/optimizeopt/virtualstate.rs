@@ -23,9 +23,11 @@ use std::cell::Cell;
 use std::ops::Deref;
 use std::rc::Rc;
 
+#[cfg(test)]
+use majit_ir::OpRef;
 use majit_ir::descr::descr_identity;
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
@@ -2503,17 +2505,17 @@ pub(crate) struct ExportCache {
     // `self.info` (a plain identity dict) by `get_box_replacement(box)`.
     // A bound producer resolves to its one canonical `Rc` (memoized
     // `from_bound_op`). Constants are *not* stored here: `history.py
-    // ConstInt.__init__` mints a fresh instance per use, while pyre's
-    // `OpRef::ConstInt(n)` / `const_operands` intern by value, so caching
-    // them would make the renum check of `virtualstate.py
+    // ConstInt.__init__` mints a fresh instance per use, so two
+    // `const_from_value(5)` are not `same_box`. Caching them would make
+    // the renum check of `virtualstate.py
     // AbstractVirtualStateInfo.generate_guards` treat a jump-arg 5 and a
     // virtual `W_UnicodeObject.len = 5` as one box.
     //
     // bind-at-alloc invariant: every position reaching export resolves to a
     // bound box (debug-asserted in `export_single_operand`). Production forced
-    // end-args and `ProducedShortOp.res` (`PreambleOp::add_op_to_short`
-    // `materialize_operand_at`) are bound at creation; an unbound position would
-    // mint a fresh operand from the opref per visit and split the cache, so the
+    // end-args and `ProducedShortOp.res` (`PreambleOp::add_op_to_short`)
+    // are bound at creation; an unbound position would mint a fresh
+    // operand from the opref per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
     // mis-deduping. `IndexMap`/`IndexSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
@@ -2599,9 +2601,9 @@ fn export_single_operand(
          must be a bound box; virtualstate.py:711-720)"
     );
     // virtualstate.py:714-716: cache hit returns the cached state directly.
-    // Packed `Operand` constants intern by value (`OpRef::ConstInt`,
-    // `const_operands`); `history.py ConstInt` does not, so a constant is a
-    // fresh `self.info` key per `create_state` call.
+    // Packed `Operand` constants are *not* interned: `history.py ConstInt`
+    // mints a fresh instance per use, so a constant is a fresh `self.info`
+    // key per `create_state` call.
     if !box_.is_constant()
         && let Some(cached) = cache.finished.get(&box_)
     {
@@ -2854,6 +2856,7 @@ fn export_single_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::test_support::rooted_resop_operand;
     use crate::optimizeopt::info::{VirtualArrayInfo, VirtualStructInfo};
     use majit_ir::operand::Operand;
     use majit_ir::{Descr, FieldDescr, GcRef, Type, Value};
@@ -2884,17 +2887,17 @@ mod tests {
 
     /// Bind a `NEW` producer at `virtual_ref` and attach `VirtualStruct` info
     /// on that box (`info.py` `AbstractVirtualPtrInfo.force_box` emits `op`).
-    fn plant_virtual_struct(ctx: &mut OptContext, virtual_ref: OpRef, descr: DescrRef) {
+    fn plant_virtual_struct(ctx: &mut OptContext, virtual_ref: OpRef, descr: DescrRef) -> Operand {
         let alloc = Op::new(OpCode::New, &[]);
         alloc.setdescr(descr.clone());
         alloc.pos().set(virtual_ref);
         let alloc_rc = majit_ir::OpRc::new(alloc);
-        ctx.bind_input_resops(std::slice::from_ref(&alloc_rc));
-        let virtual_box = ctx.materialize_operand_at(virtual_ref);
+        let virtual_box = Operand::from_bound_op(&alloc_rc);
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
         );
+        virtual_box
     }
 
     /// Records opcodes that reach this pass. Used to check that a force-time
@@ -3016,7 +3019,7 @@ mod tests {
         assert!(!expected.generalization_of(&no_bound, &mut ctx));
         assert!(nonnegative.generalization_of(&no_bound, &mut ctx));
 
-        let box_ = ctx.materialize_operand_at(OpRef::ref_op(10));
+        let box_ = rooted_resop_operand(Type::Ref, 10);
         let runtime = Operand::const_from_value(Value::Ref(GcRef(0x100)));
         assert!(
             expected
@@ -3107,7 +3110,6 @@ mod tests {
         let mut ctx = OptContext::new(128);
         let ctx_ia = majit_ir::InputArg::new_int_rc(0);
         ctx.inputargs = vec![Operand::from_bound_inputarg(&ctx_ia)];
-        ctx.ensure_inputarg_bindings();
         let boxes = vec![Operand::from_bound_inputarg(&ctx_ia)];
         let runtime_ia = majit_ir::InputArg::new_int_rc(0);
         runtime_ia.set_value(Value::Int(73));
@@ -3227,8 +3229,8 @@ mod tests {
         let rb0 = Operand::const_from_value(Value::Ref(GcRef(0x200)));
         let rb1 = Operand::const_from_value(Value::Ref(GcRef(0x300)));
         let boxes = vec![
-            ctx.materialize_operand_at(OpRef::ref_op(100)),
-            ctx.materialize_operand_at(OpRef::ref_op(101)),
+            rooted_resop_operand(Type::Ref, 100),
+            rooted_resop_operand(Type::Ref, 101),
         ];
         ctx.set_ptr_info(
             &boxes[0],
@@ -3259,7 +3261,7 @@ mod tests {
         let expected = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(7))]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
         let mut ctx = OptContext::new(128);
-        let boxes = vec![ctx.materialize_operand_at(OpRef::int_op(10))];
+        let boxes = vec![rooted_resop_operand(Type::Int, 10)];
 
         let matching_runtime = Operand::const_from_value(Value::Int(7));
         let guards = expected
@@ -3286,7 +3288,7 @@ mod tests {
         let expected = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(7))]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(8))]);
         let mut ctx = OptContext::new(128);
-        let boxes = vec![ctx.materialize_operand_at(OpRef::int_op(10))];
+        let boxes = vec![rooted_resop_operand(Type::Int, 10)];
         let runtime = Operand::const_from_value(Value::Int(7));
         assert!(
             expected
@@ -3314,7 +3316,7 @@ mod tests {
             ))],
             lenbound: None,
         }]);
-        let boxes = vec![ctx.materialize_operand_at(OpRef::ref_op(10))];
+        let boxes = vec![rooted_resop_operand(Type::Ref, 10)];
         let runtime = Operand::const_from_value(Value::Ref(GcRef(0x1234)));
         assert!(
             expected
@@ -3339,11 +3341,7 @@ mod tests {
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
         assert!(guard.arg(0).same_box(&box_));
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(guard.arg(1).to_opref())
-                .and_then(|cb| cb.const_value()),
-            Some(Value::Ref(expected))
-        );
+        assert_eq!(guard.arg(1).const_value(), Some(Value::Ref(expected)));
     }
 
     #[test]
@@ -3384,8 +3382,7 @@ mod tests {
         // virtualstate.py NotVirtualStateInfoPtr.__init__: the
         // non-virtual ArrayPtrInfo leaf retains getlenbound(None).widen().
         let mut ctx = OptContext::new(32);
-        let array_ref = OpRef::ref_op(10);
-        let array_box = ctx.materialize_operand_at(array_ref);
+        let array_box = rooted_resop_operand(Type::Ref, 10);
         ctx.set_ptr_info(
             &array_box,
             PtrInfo::array(test_descr(20), IntBound::bounded(0, 10)),
@@ -3407,9 +3404,8 @@ mod tests {
         // as absent fieldstate. virtualstate.py:272-280 then gives it neither
         // a forced box nor a position_in_notvirtuals slot.
         let mut ctx = OptContext::new(32);
-        let array_ref = OpRef::ref_op(10);
-        let array_box = ctx.materialize_operand_at(array_ref);
-        let written_box = ctx.materialize_operand_at(OpRef::int_op(11));
+        let array_box = rooted_resop_operand(Type::Ref, 10);
+        let written_box = rooted_resop_operand(Type::Int, 11);
         ctx.set_ptr_info(
             &array_box,
             PtrInfo::VirtualArray(VirtualArrayInfo {
@@ -3445,9 +3441,8 @@ mod tests {
         // virtualstate.py `create_state_or_none`: an unwritten
         // struct fieldbox is None and must not reach not_virtual.
         let mut ctx = OptContext::new(32);
-        let struct_ref = OpRef::ref_op(10);
-        let struct_box = ctx.materialize_operand_at(struct_ref);
-        let written_box = ctx.materialize_operand_at(OpRef::int_op(11));
+        let struct_box = rooted_resop_operand(Type::Ref, 10);
+        let written_box = rooted_resop_operand(Type::Int, 11);
         ctx.set_ptr_info(
             &struct_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3488,9 +3483,9 @@ mod tests {
         // virtualstate.py requires `info.is_virtual()` for the
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
-        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
-        let b11 = ctx.materialize_operand_at(OpRef::ref_op(11));
-        let b12 = ctx.materialize_operand_at(OpRef::ref_op(12));
+        let b10 = rooted_resop_operand(Type::Int, 10);
+        let b11 = rooted_resop_operand(Type::Ref, 11);
+        let b12 = rooted_resop_operand(Type::Ref, 12);
         ctx.set_ptr_info(&b11, PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let inputargs = state
@@ -3520,9 +3515,9 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(16);
-        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
-        let b21 = ctx.materialize_operand_at(OpRef::ref_op(21));
-        let b22 = ctx.materialize_operand_at(OpRef::ref_op(22));
+        let b20 = rooted_resop_operand(Type::Int, 20);
+        let b21 = rooted_resop_operand(Type::Ref, 21);
+        let b22 = rooted_resop_operand(Type::Ref, 22);
         ctx.set_ptr_info(&b21, PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let (inputargs, virtuals) = state
@@ -3560,25 +3555,15 @@ mod tests {
     fn export_state_re_matched_against_its_own_args_cannot_fail() {
         let descr = test_descr(10);
         let mut ctx = OptContext::new(32);
-        let object = OpRef::ref_op(10);
-        let field = OpRef::int_op(11);
-        let scalar = OpRef::int_op(12);
-        ctx.materialize_operand_at(object);
+        let object_box = rooted_resop_operand(Type::Ref, 10);
         // The field box `enum_forced_boxes` walks is this producer, not a
         // second SameAs minted at the same position.
-        let field_box = ctx.materialize_operand_at(field);
-        ctx.materialize_operand_at(scalar);
+        let field_box = rooted_resop_operand(Type::Int, 11);
+        let scalar_box = rooted_resop_operand(Type::Int, 12);
 
-        let object_box = ctx
-            .get_box_replacement_operand_opt(object)
-            .expect("object box is bound");
         let mut info = PtrInfo::virtual_obj(descr, None);
         info.setfield(0, field_box.clone());
         ctx.set_ptr_info(&object_box, info);
-
-        let scalar_box = ctx
-            .get_box_replacement_operand_opt(scalar)
-            .expect("scalar box is bound");
         let boxes = [object_box.clone(), field_box.clone(), scalar_box];
         let state = export_state_operands(&boxes, &ctx);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -3594,10 +3579,9 @@ mod tests {
 
     /// `history.py ConstInt.__init__` mints a fresh instance per use, so
     /// `virtualstate.py create_state` gives two `ConstInt(5)` boxes two
-    /// `enum` positions. `OptContext.const_operands` interns `OpRef::ConstInt(5)`
-    /// onto one `Operand`; without skipping that key in `ExportCache`,
-    /// `generate_guards` renum treats a jump-arg 5 and `W_UnicodeObject.len = 5`
-    /// as one box.
+    /// `enum` positions. Without skipping constants in `ExportCache`,
+    /// `generate_guards` renum would treat a jump-arg 5 and
+    /// `W_UnicodeObject.len = 5` as one box.
     #[test]
     fn independent_const_int_uses_do_not_share_virtualstate_position() {
         let ctx = OptContext::new(32);
@@ -3646,13 +3630,11 @@ mod tests {
         assert_eq!(state.num_boxes(), 1);
 
         let inner_field_op = crate::history::test_support::rooted_resop_operand(Type::Ref, 31);
-        let outer_a_ref = OpRef::ref_op(40);
-        let outer_b_ref = OpRef::ref_op(41);
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
-        let outer_a_box = ctx.materialize_operand_at(outer_a_ref);
-        let outer_b_box = ctx.materialize_operand_at(outer_b_ref);
+        let outer_a_box = rooted_resop_operand(Type::Ref, 40);
+        let outer_b_box = rooted_resop_operand(Type::Ref, 41);
         ctx.set_ptr_info(
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3698,9 +3680,8 @@ mod tests {
             VirtualState::from_shared_rcs(vec![Rc::clone(&shared_leaf), Rc::clone(&shared_leaf)]);
         assert_eq!(state.num_boxes(), 1);
 
-        let outer_ref = OpRef::ref_op(50);
         let mut ctx = OptContext::new(64);
-        let outer_box = ctx.materialize_operand_at(outer_ref);
+        let outer_box = rooted_resop_operand(Type::Ref, 50);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let inputargs = state
             .make_inputargs(
@@ -3769,7 +3750,6 @@ mod tests {
     fn test_make_inputargs_recursively_extracts_virtual_fields() {
         let descr = test_descr(11);
         let field_value_op = crate::history::test_support::rooted_resop_operand(Type::Ref, 21);
-        let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),
             fields: vec![
@@ -3782,7 +3762,7 @@ mod tests {
             field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
-        let virtual_box = ctx.materialize_operand_at(virtual_ref);
+        let virtual_box = rooted_resop_operand(Type::Ref, 20);
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -3840,10 +3820,7 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        plant_virtual_struct(&mut ctx, virtual_ref, descr);
-        let virtual_box = ctx
-            .get_box_replacement_operand_opt(virtual_ref)
-            .expect("planted virtual box");
+        let virtual_box = plant_virtual_struct(&mut ctx, virtual_ref, descr);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
 
         assert!(
@@ -3870,9 +3847,7 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        let forced = ctx
-            .get_box_replacement_operand_opt(virtual_ref)
-            .expect("forced virtual replacement");
+        let forced = virtual_box.get_box_replacement(false);
         assert!(inputargs[0].same_box(&forced));
         assert!(virtuals.is_empty());
         assert_eq!(
@@ -3896,10 +3871,7 @@ mod tests {
         let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        plant_virtual_struct(&mut ctx, virtual_ref, descr);
-        let virtual_box = ctx
-            .get_box_replacement_operand_opt(virtual_ref)
-            .expect("planted virtual box");
+        let virtual_box = plant_virtual_struct(&mut ctx, virtual_ref, descr);
         let before = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let after = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();

@@ -11,8 +11,9 @@ fn const_int(value: i64) -> Operand {
 /// An emitted int box standing in for the op whose result the pure cache
 /// records.
 fn emit_result_box(ctx: &mut OptContext) -> Operand {
-    let pos = ctx.emit(Op::new(OpCode::SameAsI, &[const_int(0)]));
-    ctx.get_box_replacement_operand_opt(pos).unwrap()
+    let op = OpRc::new(Op::new(OpCode::SameAsI, &[const_int(0)]));
+    ctx.emit_rc(op.clone());
+    Operand::from_bound_op(&op).get_box_replacement(false)
 }
 
 #[test]
@@ -50,13 +51,15 @@ fn postponed_boolean_result_is_not_retested_for_truth() {
 fn pure_lookup_keeps_forwarding_and_commutative_matching() {
     let mut ctx = OptContext::new(8);
     let mut pure = OptPure::new();
-    let x_pos = ctx.emit(Op::new(
+    let x_op = OpRc::new(Op::new(
         OpCode::SameAsI,
         &[Operand::const_from_value(Value::Int(9))],
     ));
-    let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
-    let alias_pos = ctx.emit(Op::new(OpCode::SameAsI, std::slice::from_ref(&x)));
-    let alias = ctx.get_box_replacement_operand_opt(alias_pos).unwrap();
+    ctx.emit_rc(x_op.clone());
+    let x = Operand::from_bound_op(&x_op).get_box_replacement(false);
+    let alias_op = OpRc::new(Op::new(OpCode::SameAsI, std::slice::from_ref(&x)));
+    ctx.emit_rc(alias_op.clone());
+    let alias = Operand::from_bound_op(&alias_op).get_box_replacement(false);
     ctx.make_equal_to(&alias, &x);
     let result = emit_result_box(&mut ctx);
     pure.pure_from_args2(OpCode::IntAdd, &x, &const_int(5), &result, &mut ctx);
@@ -84,11 +87,12 @@ fn unchecked_arithmetic_reuses_checked_arithmetic() {
     ] {
         let mut ctx = OptContext::new(8);
         let mut pure = OptPure::new();
-        let x_pos = ctx.emit(Op::new(
+        let x_op = OpRc::new(Op::new(
             OpCode::SameAsI,
             &[Operand::const_from_value(Value::Int(9))],
         ));
-        let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
+        ctx.emit_rc(x_op.clone());
+        let x = Operand::from_bound_op(&x_op).get_box_replacement(false);
         let result = emit_result_box(&mut ctx);
         pure.pure_from_args2(checked, &x, &const_int(5), &result, &mut ctx);
         let query = Op::new(plain, &[x, const_int(5)]);
@@ -108,11 +112,12 @@ fn checked_arithmetic_does_not_reuse_unchecked_arithmetic() {
     ] {
         let mut ctx = OptContext::new(8);
         let mut pure = OptPure::new();
-        let x_pos = ctx.emit(Op::new(
+        let x_op = OpRc::new(Op::new(
             OpCode::SameAsI,
             &[Operand::const_from_value(Value::Int(9))],
         ));
-        let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
+        ctx.emit_rc(x_op.clone());
+        let x = Operand::from_bound_op(&x_op).get_box_replacement(false);
         let result = emit_result_box(&mut ctx);
         pure.pure_from_args2(plain, &x, &const_int(5), &result, &mut ctx);
         let ovf = OpRc::new(Op::new(

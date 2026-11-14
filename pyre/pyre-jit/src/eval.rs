@@ -18279,7 +18279,7 @@ mod tests {
         );
         assert_eq!(&bytes[..baked.len()], baked);
 
-        let mut builder = staticdata.blackholeinterpbuilder.lock();
+        let mut builder = staticdata.blackholeinterpbuilder.borrow_mut();
         builder.setup_cached_control_opcodes(
             staticdata.op_live,
             staticdata.op_catch_exception,

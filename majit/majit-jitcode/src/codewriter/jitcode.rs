@@ -12,7 +12,9 @@
 //! port `BlackholeInterpreter.setup_insns` so the metainterp can consume
 //! this type directly, eliminating the fork.
 
+use std::cell::UnsafeCell;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -296,9 +298,9 @@ pub struct PrebuiltInstanceConstDescriptor {
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
 /// RPython `jitcode.py` `JitCode.setup(...)`. RPython mutates the
-/// JitCode object in place; pyre groups the late-set fields into a body
-/// struct that is committed via `OnceLock::set` so `Arc<JitCode>` shells
-/// handed out by `CallControl::get_jitcode` can be filled while shared.
+/// JitCode object in place; the late-set fields live in this struct so
+/// `Arc<JitCode>` shells handed out by `CallControl::get_jitcode` can
+/// be filled while shared (`JitCode::set_body`).
 /// One `constants_r` slot.
 ///
 /// Interior-mutable because the GC's constant-pool walker forwards these slots
@@ -580,10 +582,17 @@ pub struct JitCode {
     /// this is a graph object; pyre uses an optional CallPath string.
     #[serde(default)]
     pub _called_from: Option<String>,
-    /// Body — set once after assembly via `set_body`. Direct field accesses
-    /// like `jitcode.code` continue to work via `Deref<Target=JitCodeBody>`.
-    #[serde(with = "oncelock_body_serde")]
-    body: OnceLock<JitCodeBody>,
+    /// `jitcode.py` `JitCode.setup` fields (`code`, `constants_*`,
+    /// `c_num_regs_*`, startpoints). Written once by `set_body`.
+    /// `JitCode::new` leaves this unset (`try_body` is `None`).
+    ///
+    /// Resume and `num_regs_*` load these as fields of this `JitCode`.
+    /// The `Arc<JitCode>` held by `BlackholeInterpreter.jitcode` (and the
+    /// `all_jitcodes` table) pins this allocation for that window; the
+    /// `Vec` buffers live on the heap owned by those fields and do not
+    /// move when the `JitCode` value is moved.
+    #[serde(with = "jitcode_setup_serde")]
+    body: JitCodeSetup,
     /// Memoized verdicts derived from `body`, not assembled into it, so they
     /// are recomputed rather than serialized. Each is a static property of the
     /// body, so the memo travels with the body it describes instead of sitting
@@ -676,29 +685,114 @@ mod oncelock_usize_serde {
     }
 }
 
-mod oncelock_body_serde {
-    use std::sync::OnceLock;
+/// `JitCode.setup` payload plus the construction-time shell flag.
+///
+/// The payload sits in this `JitCode` as a field (`jitcode.py`
+/// `self.code` / `self.constants_*` / `self.c_num_regs_*`). `set_body`
+/// is the one write (`JitCode.setup`). Resume loads the field; it does
+/// not go through `OnceLock::get`.
+struct JitCodeSetup {
+    data: UnsafeCell<JitCodeBody>,
+    /// `false` until `set_body`. `try_body` / `body` consult this;
+    /// `num_regs_*` and `get_live_vars_info` load `data` as a field.
+    set: AtomicBool,
+}
 
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::JitCodeBody;
-
-    pub fn serialize<S: Serializer>(
-        lock: &OnceLock<JitCodeBody>,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(&lock.get(), ser)
+impl JitCodeSetup {
+    fn new() -> Self {
+        Self {
+            data: UnsafeCell::new(JitCodeBody::default()),
+            set: AtomicBool::new(false),
+        }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        de: D,
-    ) -> Result<OnceLock<JitCodeBody>, D::Error> {
-        let opt: Option<JitCodeBody> = Option::deserialize(de)?;
-        let lock = OnceLock::new();
-        if let Some(v) = opt {
-            let _ = lock.set(v);
+    fn from_body(body: JitCodeBody) -> Self {
+        Self {
+            data: UnsafeCell::new(body),
+            set: AtomicBool::new(true),
         }
-        Ok(lock)
+    }
+
+    #[inline(always)]
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    /// Field load of the `setup` payload. Reading before `JitCode.setup`
+    /// (`set_body`) is an error: `jitcode.py` `self.code` does not exist
+    /// until `setup`. A caller that must handle a shell uses `try_body`.
+    #[inline(always)]
+    fn published(&self) -> &JitCodeBody {
+        debug_assert!(
+            self.is_set(),
+            "JitCode body not yet set — call set_body() before reading body fields"
+        );
+        // SAFETY: `set_body` writes `data` before any resume reader; the
+        // `Arc<JitCode>` that holds this `JitCode` pins the allocation
+        // (`BlackholeInterpreter.jitcode`). After that write the payload
+        // is immutable except `ConstSlotR` atomics and `&mut` `body_mut`.
+        unsafe { &*self.data.get() }
+    }
+
+    fn published_mut(&mut self) -> &mut JitCodeBody {
+        self.data.get_mut()
+    }
+
+    fn set_once(&self, body: JitCodeBody) {
+        if self.set.load(Ordering::Acquire) {
+            panic!("JitCode body already set");
+        }
+        // SAFETY: no `&JitCodeBody` obtained from this shell exists before
+        // `set_once` returns (enforced in debug builds by `published`'s
+        // `debug_assert!(self.is_set())`). One writer (`JitCode.setup` /
+        // `set_body`) on this shell; `CallControl::get_jitcode` fills the
+        // `Arc` on the assembler thread before compiled code can resume it.
+        unsafe {
+            *self.data.get() = body;
+        }
+        self.set.store(true, Ordering::Release);
+    }
+}
+
+impl Clone for JitCodeSetup {
+    fn clone(&self) -> Self {
+        if self.is_set() {
+            Self::from_body(self.published().clone())
+        } else {
+            Self::new()
+        }
+    }
+}
+
+impl std::fmt::Debug for JitCodeSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_set() {
+            self.published().fmt(f)
+        } else {
+            f.write_str("<unset>")
+        }
+    }
+}
+
+mod jitcode_setup_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{JitCodeBody, JitCodeSetup};
+
+    pub fn serialize<S: Serializer>(setup: &JitCodeSetup, ser: S) -> Result<S::Ok, S::Error> {
+        if setup.is_set() {
+            serde::Serialize::serialize(&Some(setup.published()), ser)
+        } else {
+            serde::Serialize::serialize(&None::<&JitCodeBody>, ser)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<JitCodeSetup, D::Error> {
+        let opt: Option<JitCodeBody> = Option::deserialize(de)?;
+        Ok(match opt {
+            Some(body) => JitCodeSetup::from_body(body),
+            None => JitCodeSetup::new(),
+        })
     }
 }
 
@@ -751,37 +845,42 @@ impl JitCode {
             jitdriver_sd: OnceLock::new(),
             index: OnceLock::new(),
             _called_from: None,
-            body: OnceLock::new(),
+            body: JitCodeSetup::new(),
             derived: DerivedBodyFacts::default(),
         }
     }
 
     /// Body accessor — panics if `set_body` has not run.
     ///
-    /// RPython does not have an explicit body/header split; pyre groups
-    /// late-set fields here so `Arc<JitCode>` shells can be filled while
+    /// RPython does not have an explicit body/header split; late-set
+    /// fields live here so `Arc<JitCode>` shells can be filled while
     /// shared (e.g. when `IndirectCallTargets` already holds clones).
     pub fn body(&self) -> &JitCodeBody {
-        self.body
-            .get()
-            .expect("JitCode body not yet set — call set_body() before reading body fields")
+        if !self.body.is_set() {
+            panic!("JitCode body not yet set — call set_body() before reading body fields");
+        }
+        self.body.published()
     }
 
     /// Optional body accessor — returns `None` while the JitCode is still
     /// a shell awaiting assembly.
     pub fn try_body(&self) -> Option<&JitCodeBody> {
-        self.body.get()
+        if self.body.is_set() {
+            Some(self.body.published())
+        } else {
+            None
+        }
     }
 
     /// Mutable accessor for late post-assembly mutation of body fields.
-    /// RPython mutates `JitCode` fields directly post-`setup()`; pyre
-    /// routes the mutation through `OnceLock::get_mut` so the same
-    /// in-place semantics work on canonical JitCode shells. Panics if
+    /// RPython mutates `JitCode` fields directly post-`setup()`; this
+    /// is that write on a uniquely owned shell (`&mut self`). Panics if
     /// the body has not been committed yet.
     pub fn body_mut(&mut self) -> &mut JitCodeBody {
-        self.body
-            .get_mut()
-            .expect("JitCode body not yet set — call set_body() before body_mut()")
+        if !self.body.is_set() {
+            panic!("JitCode body not yet set — call set_body() before body_mut()");
+        }
+        self.body.published_mut()
     }
 
     /// The un-lowered helpers a descent into this body can reach, computing
@@ -835,10 +934,7 @@ impl JitCode {
     /// call (RPython equivalent: `JitCode.setup` is also called once per
     /// jitcode lifetime).
     pub fn set_body(&self, body: JitCodeBody) {
-        self.body
-            .set(body)
-            .map_err(|_| ())
-            .expect("JitCode body already set");
+        self.body.set_once(body);
     }
 
     /// `Some(idx)` when this jitcode is the portal of jitdriver `idx`.
@@ -970,11 +1066,13 @@ impl JitCode {
 
 /// Allow existing callers to keep `jitcode.code`, `jitcode.constants_i`,
 /// `jitcode.startpoints`, etc. through `Deref<Target=JitCodeBody>`.
-/// Panics if the body has not been committed yet.
+/// Reading those fields before `JitCode.setup` (`set_body`) is an error
+/// (`jitcode.py` `self.code` does not exist until `setup`). `try_body`
+/// is how a caller tells `setup` has not run.
 impl Deref for JitCode {
     type Target = JitCodeBody;
     fn deref(&self) -> &JitCodeBody {
-        self.body()
+        self.body.published()
     }
 }
 
@@ -1031,35 +1129,38 @@ impl JitCode {
 
     /// RPython `jitcode.py` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
     pub fn num_regs_i(&self) -> usize {
-        self.c_num_regs_i as usize
+        self.body.published().c_num_regs_i as usize
     }
 
     /// RPython `jitcode.py` `def num_regs_r(self): return ord(self.c_num_regs_r)`.
     pub fn num_regs_r(&self) -> usize {
-        self.c_num_regs_r as usize
+        self.body.published().c_num_regs_r as usize
     }
 
     /// RPython `jitcode.py` `def num_regs_f(self): return ord(self.c_num_regs_f)`.
     pub fn num_regs_f(&self) -> usize {
-        self.c_num_regs_f as usize
+        self.body.published().c_num_regs_f as usize
     }
 
     /// RPython `jitcode.py` `def num_regs_and_consts_i(self):
     /// return ord(self.c_num_regs_i) + len(self.constants_i)`.
     pub fn num_regs_and_consts_i(&self) -> usize {
-        self.num_regs_i() + self.constants_i.len()
+        let body = self.body.published();
+        body.c_num_regs_i as usize + body.constants_i.len()
     }
 
     /// RPython `jitcode.py` `def num_regs_and_consts_r(self):
     /// return ord(self.c_num_regs_r) + len(self.constants_r)`.
     pub fn num_regs_and_consts_r(&self) -> usize {
-        self.num_regs_r() + self.constants_r.len()
+        let body = self.body.published();
+        body.c_num_regs_r as usize + body.constants_r.len()
     }
 
     /// RPython `jitcode.py` `def num_regs_and_consts_f(self):
     /// return ord(self.c_num_regs_f) + len(self.constants_f)`.
     pub fn num_regs_and_consts_f(&self) -> usize {
-        self.num_regs_f() + self.constants_f.len()
+        let body = self.body.published();
+        body.c_num_regs_f as usize + body.constants_f.len()
     }
 
     /// RPython `jitcode.py` `def follow_jump(self, position)`:
@@ -1143,10 +1244,10 @@ impl JitCode {
         // None` — `pc in None` would raise TypeError; a jitcode whose
         // liveness is consulted was assembled (`_startpoints = Some(set)`).
         //
-        // `self.code` is a field of the body. One `body()` load: `Deref`
-        // would walk the `OnceLock` again on every index.
+        // `self.code` is a field (`jitcode.py` `JitCode.code`). Resume
+        // loads it off this `JitCode`; `Arc<JitCode>` pins the allocation.
         self.assert_startpoint(pc);
-        let code = &self.body().code;
+        let code = &self.body.published().code;
         let mut pc = pc;
         // Translated `get_live_vars_info` indexes `self.code[pc]` after the
         // untranslated `_startpoints` assert. Length is a debug_assert; a

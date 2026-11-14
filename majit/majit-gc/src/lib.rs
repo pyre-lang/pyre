@@ -298,17 +298,30 @@ pub fn gc_freelist_diag_enabled() -> bool {
 /// `MAJIT_GC_NURSERY_POISON` — fill recycled nursery and old-gen memory with a
 /// poison word, and audit the slice the resume-root registration is handed.
 ///
-/// Read once, for the reason [`gc_lifetime_log_enabled`] gives, and with a
-/// sharper case: the gate sits in `shadow_stack::push_resume_ref_roots`, which
-/// every blackhole resume calls once per rebuilt frame and once per virtuals
-/// cache, and `std::env::var_os` takes the environment lock and scans it
-/// linearly whether or not the variable is set.  The arena and old-gen
-/// constructors ask once each and could read the environment directly; routing
-/// them through the same accessor keeps all three readers on one answer.
+/// Cached presence: 0 uninit, 1 absent, 2 present. Same load shape as
+/// `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`. The gate sits in
+/// `shadow_stack::push_resume_ref_roots`, which every blackhole resume
+/// calls once per rebuilt frame and once per virtuals cache. The arena
+/// and old-gen constructors ask once each and could read the environment
+/// directly; routing them through the same accessor keeps all three
+/// readers on one answer.
+static NURSERY_POISON_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline(always)]
 pub fn gc_nursery_poison_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some());
-    *ENABLED
+    match NURSERY_POISON_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => gc_nursery_poison_enabled_init(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn gc_nursery_poison_enabled_init() -> bool {
+    let on = std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some();
+    NURSERY_POISON_FLAG.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    on
 }
 
 /// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before a nursery malloc.

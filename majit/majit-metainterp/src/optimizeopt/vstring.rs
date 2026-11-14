@@ -102,8 +102,7 @@ pub(crate) fn copy_str_content_with(
 
     // vstring.py:341-347: determine inline threshold M using intbound
     // A producer-less operand has no forwarded bound; getintbound returns
-    // unbounded for it, so resolve-or-unbounded matches the prior
-    // materialize_operand_at (mint synthetic → unbounded) behavior without minting.
+    // unbounded for it, so resolve-or-unbounded matches that without minting.
     let srcoffset_bound = ctx
         .resolve_operand_operand_opt(srcoffsetbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
@@ -1883,8 +1882,9 @@ mod tests {
     }
 
     /// Run the OptString pass on a list of ops, with given pre-seeded constants.
-    /// Keeps `ctx` so a test can read virtual chars after the walk.
-    fn run_string_pass(ops: &[Op], constants: &[(u32, i64)]) -> (OptString, OptContext) {
+    /// Keeps `ctx` so a test can read virtual chars after the walk. The wrapped
+    /// ops are the bound result boxes the walk mutated (`from_bound_op`).
+    fn run_string_pass(ops: &[Op], constants: &[(u32, i64)]) -> (OptString, OptContext, Vec<OpRc>) {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptString::new()));
 
@@ -1945,17 +1945,7 @@ mod tests {
         let mut ctx =
             OptContext::with_num_inputs_and_start_pos(wrapped.len(), 0, 0, start_next_pos);
 
-        // Register each leaf arg's own producer. A fresh SameAs stand-in
-        // would be a second object at that position.
-        let produced: std::collections::HashSet<OpRef> =
-            wrapped.iter().map(|op| op.pos().get()).collect();
-        let leaf_args: Vec<Operand> = leaves
-            .into_iter()
-            .filter(|arg| !produced.contains(&arg.to_opref()))
-            .collect();
-        ctx.seed_boxes_canonical(&leaf_args);
-
-        let pass = OptString::new();
+        let mut pass = OptString::new();
         pass.setup();
 
         for rc in &wrapped {
@@ -1965,7 +1955,6 @@ mod tests {
                 let resolved = ctx.resolve_operand_operand(&rc.arg(i));
                 rc.setarg(i, resolved);
             }
-            ctx.bind_input_resops(std::slice::from_ref(rc));
             match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -1986,94 +1975,66 @@ mod tests {
         }
 
         pass.flush(&mut None, &mut ctx);
-        (pass, ctx)
+        (pass, ctx, wrapped)
     }
 
     fn run_with_constants(ops: &[Op], constants: &[(u32, i64)]) -> Vec<Op> {
-        let (_pass, ctx) = run_string_pass(ops, constants);
+        let (_pass, ctx, _wrapped) = run_string_pass(ops, constants);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect()
     }
 
-    fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
+    fn set_vstring_plain(ctx: &mut OptContext, host: &Operand, chars: Vec<Option<Operand>>) {
         let length = chars.len() as i32;
-        let b = ctx.materialize_operand_at(opref);
-        // Materialize each char position so it carries a bound synthetic
-        // producer in `resop_refs`. A later force/emit then resolves the char
-        // arg to that bound box (sheds to `Operand::Op`) instead of a
-        // position-only `from_opref` box (which would mint `Operand::Box`).
-        // `materialize_operand_at` keeps the box's `to_opref()` at the same
-        // position, so the char-identity assertions still hold.
-        let char_boxes: Vec<Option<Operand>> = chars
-            .into_iter()
-            .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
-            .collect();
         ctx.set_ptr_info(
-            &b,
+            host,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
                 mode: 0,
                 length,
                 _is_virtual: true,
-                variant: VStringVariant::Plain(VStringPlainInfo { _chars: char_boxes }),
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: chars }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
     }
 
-    fn set_vstring_concat(ctx: &mut OptContext, opref: OpRef, vleft: OpRef, vright: OpRef) {
-        let b = ctx.materialize_operand_at(opref);
-        // Materialize the child refs so they carry a bound synthetic producer; a
-        // residual emit then sheds them to `Operand::Op` instead of panicking on
-        // a position-only `from_opref` box. `materialize_operand_at` keeps each
-        // box's `to_opref()` at the same position, so identity assertions hold.
-        let vleft_box = ctx.materialize_operand_at(vleft);
-        let vright_box = ctx.materialize_operand_at(vright);
+    fn set_vstring_concat(ctx: &mut OptContext, host: &Operand, vleft: Operand, vright: Operand) {
         ctx.set_ptr_info(
-            &b,
+            host,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
                 mode: 0,
                 length: -1,
                 _is_virtual: true,
-                variant: VStringVariant::Concat(VStringConcatInfo {
-                    vleft: vleft_box,
-                    vright: vright_box,
-                }),
+                variant: VStringVariant::Concat(VStringConcatInfo { vleft, vright }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
     }
 
-    fn set_vstring_slice(ctx: &mut OptContext, opref: OpRef, s: OpRef, start: OpRef, lgtop: OpRef) {
-        let b = ctx.materialize_operand_at(opref);
-        // Materialize the source/start/length refs so they carry a bound
-        // synthetic producer; a residual emit then sheds them to `Operand::Op`
-        // instead of panicking on a position-only `from_opref` box.
-        // `materialize_operand_at` keeps each box's `to_opref()` at the same
-        // position, so identity assertions hold.
-        let s_box = ctx.materialize_operand_at(s);
-        let start_box = ctx.materialize_operand_at(start);
-        let lgtop_box = ctx.materialize_operand_at(lgtop);
+    fn set_vstring_slice(
+        ctx: &mut OptContext,
+        host: &Operand,
+        s: Operand,
+        start: Operand,
+        lgtop: Operand,
+    ) {
         ctx.set_ptr_info(
-            &b,
+            host,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
-                lgtop: Some(lgtop_box.clone()), // vstring.py:223: self.lgtop = length
+                lgtop: Some(lgtop.clone()), // vstring.py VStringSliceInfo.__init__ self.lgtop = length
                 mode: 0,
                 length: -1,
                 _is_virtual: true,
-                variant: VStringVariant::Slice(VStringSliceInfo {
-                    s: s_box,
-                    start: start_box,
-                    lgtop: lgtop_box,
-                }),
+                variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -2200,24 +2161,23 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // Constant length refs
-        let b = ctx.materialize_operand_at(OpRef::int_op(100));
+        let b = iop(100);
         ctx.make_constant_box(&b, Value::Int(3));
-        let b = ctx.materialize_operand_at(OpRef::int_op(101));
+        let b = iop(101);
         ctx.make_constant_box(&b, Value::Int(4));
 
         // Virtual plain strings
-        let left_ref = OpRef::ref_op(10);
-        let right_ref = OpRef::ref_op(11);
-        set_vstring_plain(&mut ctx, left_ref, vec![None; 3]);
-        set_vstring_plain(&mut ctx, right_ref, vec![None; 4]);
+        let left = rop(10);
+        let right = rop(11);
+        set_vstring_plain(&mut ctx, &left, vec![None; 3]);
+        set_vstring_plain(&mut ctx, &right, vec![None; 4]);
 
         // Virtual concat
-        let concat_ref = OpRef::ref_op(12);
-        set_vstring_concat(&mut ctx, concat_ref, left_ref, right_ref);
+        let concat = rop(12);
+        set_vstring_concat(&mut ctx, &concat, left.clone(), right.clone());
 
         // Check total length = 3 + 4 = 7
-        let concat_op = ctx.materialize_operand_at(concat_ref);
-        let total_len = pass.get_known_length(&concat_op, &ctx);
+        let total_len = pass.get_known_length(&concat, &ctx);
         assert_eq!(total_len, Some(7));
     }
 
@@ -2230,39 +2190,31 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // source = "abc" (chars at indices 0, 1, 2)
-        let src_ref = OpRef::ref_op(10);
+        let c200 = iop(200);
+        let c201 = iop(201);
+        let c202 = iop(202);
+        let src = rop(10);
         set_vstring_plain(
             &mut ctx,
-            src_ref,
-            vec![
-                Some(OpRef::int_op(200)),
-                Some(OpRef::int_op(201)),
-                Some(OpRef::int_op(202)),
-            ],
+            &src,
+            vec![Some(c200.clone()), Some(c201.clone()), Some(c202.clone())],
         );
 
         // slice = source[1:3] (start=1, length=2)
-        let b = ctx.materialize_operand_at(OpRef::int_op(300));
-        ctx.make_constant_box(&b, Value::Int(1)); // start
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(2)); // length
-        let slice_ref = OpRef::ref_op(11);
-        set_vstring_slice(
-            &mut ctx,
-            slice_ref,
-            src_ref,
-            OpRef::int_op(300),
-            OpRef::int_op(301),
-        );
+        let start = iop(300);
+        ctx.make_constant_box(&start, Value::Int(1));
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(2));
+        let slice = rop(11);
+        set_vstring_slice(&mut ctx, &slice, src.clone(), start, length);
 
-        let slice_op = ctx.materialize_operand_at(slice_ref);
-        // Get char at index 0 of the slice -> should be source[1] = int_op(201)
-        let ch = pass.strgetitem(&slice_op, 0, mode_string, &mut ctx);
-        assert_eq!(ch.map(|b| b.to_opref()), Some(OpRef::int_op(201)));
+        // Get char at index 0 of the slice -> should be source[1] = c201
+        let ch = pass.strgetitem(&slice, 0, mode_string, &mut ctx);
+        assert!(ch.as_ref().is_some_and(|b| b.same_box(&c201)));
 
-        // Get char at index 1 of the slice -> should be source[2] = int_op(202)
-        let ch = pass.strgetitem(&slice_op, 1, mode_string, &mut ctx);
-        assert_eq!(ch.map(|b| b.to_opref()), Some(OpRef::int_op(202)));
+        // Get char at index 1 of the slice -> should be source[2] = c202
+        let ch = pass.strgetitem(&slice, 1, mode_string, &mut ctx);
+        assert!(ch.as_ref().is_some_and(|b| b.same_box(&c202)));
     }
 
     #[test]
@@ -2272,39 +2224,36 @@ mod tests {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let src_ref = OpRef::ref_op(10);
+        let c200 = iop(200);
+        let c201 = iop(201);
+        let c202 = iop(202);
+        let src = rop(10);
         set_vstring_plain(
             &mut ctx,
-            src_ref,
-            vec![
-                Some(OpRef::int_op(200)),
-                Some(OpRef::int_op(201)),
-                Some(OpRef::int_op(202)),
-            ],
+            &src,
+            vec![Some(c200.clone()), Some(c201.clone()), Some(c202.clone())],
         );
 
         // start is not a literal ConstInt box; it is only known via IntBound.
-        let start_ref = OpRef::int_op(300);
-        let start_box = ctx.materialize_operand_at(start_ref);
-        ctx.with_intbound_mut(&start_box, |b| {
+        let start = iop(300);
+        ctx.with_intbound_mut(&start, |b| {
             *b = IntBound::from_constant(1);
         });
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(2)); // length
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(2));
 
-        let slice_ref = OpRef::ref_op(11);
-        set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
+        let slice = rop(11);
+        set_vstring_slice(&mut ctx, &slice, src.clone(), start, length);
 
-        let slice_op = ctx.materialize_operand_at(slice_ref);
-        assert_eq!(
-            pass.strgetitem(&slice_op, 0, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(201))
+        assert!(
+            pass.strgetitem(&slice, 0, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c201))
         );
-        assert_eq!(
-            pass.strgetitem(&slice_op, 1, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(202))
+        assert!(
+            pass.strgetitem(&slice, 1, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c202))
         );
     }
 
@@ -2317,38 +2266,30 @@ mod tests {
         let pass = OptString::new();
         let mut ctx = OptContext::new(12);
 
-        let src_ref = OpRef::ref_op(10);
-        set_vstring_plain(&mut ctx, src_ref, vec![None; 3]);
+        let src = rop(10);
+        set_vstring_plain(&mut ctx, &src, vec![None; 3]);
 
         // start is a non-constant int box (no constant/bound installed), so the
         // slice can't resolve the char statically and falls to the residual.
-        // Materialize so the residual re-emits start as a bound box.
-        let start_ref = OpRef::int_op(300);
-        ctx.materialize_operand_at(start_ref);
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(2)); // length
+        let start = iop(300);
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(2));
 
-        let slice_ref = OpRef::ref_op(11);
-        set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
+        let slice = rop(11);
+        set_vstring_slice(&mut ctx, &slice, src.clone(), start.clone(), length);
 
-        let slice_op = ctx.materialize_operand_at(slice_ref);
-        let res = pass.strgetitem_emit(&mut None, &slice_op, 0, mode_string, &mut ctx);
+        let res = pass.strgetitem_emit(&mut None, &slice, 0, mode_string, &mut ctx);
 
         let op = ctx
             .new_operations
             .last()
             .expect("strgetitem_emit must emit a residual STRGETITEM");
-        assert_eq!(res, Operand::from_bound_op(op));
+        assert!(res.same_box(&Operand::from_bound_op(op)));
         assert_eq!(op.opcode, OpCode::Strgetitem);
-        // arg0 is the SOURCE (ref_op(10)), not the slice (ref_op(11)); arg1 is
-        // `start + 0`, which collapses back to the start box (int_op(300)).
-        assert_eq!(
-            op.args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![src_ref, start_ref]
-        );
+        // arg0 is the SOURCE, not the slice; arg1 is `start + 0`, which
+        // collapses back to the start box.
+        assert!(op.arg(0).same_box(&src));
+        assert!(op.arg(1).same_box(&start));
     }
 
     #[test]
@@ -2361,34 +2302,33 @@ mod tests {
         let mut ctx = OptContext::new(14);
 
         // vleft: plain length 2, vright: plain length 3; chars unset.
-        let vleft_ref = OpRef::ref_op(10);
-        let vright_ref = OpRef::ref_op(11);
-        set_vstring_plain(&mut ctx, vleft_ref, vec![None; 2]);
-        set_vstring_plain(&mut ctx, vright_ref, vec![None; 3]);
+        let vleft = rop(10);
+        let vright = rop(11);
+        set_vstring_plain(&mut ctx, &vleft, vec![None; 2]);
+        set_vstring_plain(&mut ctx, &vright, vec![None; 3]);
 
-        let concat_ref = OpRef::ref_op(12);
-        set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
+        let concat = rop(12);
+        set_vstring_concat(&mut ctx, &concat, vleft.clone(), vright.clone());
 
         // index 3 lands in vright at offset 3 - len(vleft) = 1.
-        let concat_op = ctx.materialize_operand_at(concat_ref);
-        let res = pass.strgetitem_emit(&mut None, &concat_op, 3, mode_string, &mut ctx);
+        let res = pass.strgetitem_emit(&mut None, &concat, 3, mode_string, &mut ctx);
 
-        let (res_pos, opcode, arg0, arg1) = {
+        let (res_box, opcode, arg0, arg1) = {
             let op = ctx
                 .new_operations
                 .last()
                 .expect("strgetitem_emit must emit a residual STRGETITEM");
             (
-                op.pos().get(),
+                Operand::from_bound_op(op),
                 op.opcode,
-                op.arg(0).to_opref(),
+                op.arg(0),
                 op.arg(1).get_box_replacement(false),
             )
         };
-        assert_eq!(res.to_opref(), res_pos);
+        assert!(res.same_box(&res_box));
         assert_eq!(opcode, OpCode::Strgetitem);
-        // arg0 is the RIGHT child (ref_op(11)), not the concat (ref_op(12)).
-        assert_eq!(arg0, vright_ref);
+        // arg0 is the RIGHT child, not the concat.
+        assert!(arg0.same_box(&vright));
         // arg1 is the rebased index 3 - 2 = 1.
         assert_eq!(ctx.get_constant_int_box(&arg1), Some(1));
     }
@@ -2403,39 +2343,31 @@ mod tests {
         let mut ctx = OptContext::new(20);
 
         // Non-virtual source ref: the residual STRGETITEM reads this box.
-        // Materialize the source / start / index leaf positions so the residual
-        // STRGETITEM (and its INT_ADD index) re-emit them as bound boxes
-        // (`Operand::Op`) rather than position-only `from_opref` boxes.
-        let src_ref = OpRef::ref_op(10);
-        ctx.materialize_operand_at(src_ref);
+        let src = rop(10);
         // Non-constant start so the static fold misses → residual path.
-        let start_ref = OpRef::int_op(300);
-        ctx.materialize_operand_at(start_ref);
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(3)); // slice length
+        let start = iop(300);
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(3));
 
-        let slice_ref = OpRef::ref_op(11);
-        set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
+        let slice = rop(11);
+        set_vstring_slice(&mut ctx, &slice, src.clone(), start, length);
 
         // STRGETITEM(slice, index) with a non-constant index.
-        let index_ref = OpRef::int_op(302);
-        let index_box = ctx.materialize_operand_at(index_ref);
-        let slice_box = ctx.materialize_operand_at(slice_ref);
+        let index = iop(302);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
+        let mut getitem = Op::new(OpCode::Strgetitem, &[slice, index.clone()]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut None, &mut ctx);
 
         match result {
             OptimizationResult::Replace(emitted) => {
                 assert_eq!(emitted.opcode, OpCode::Strgetitem);
-                // arg0 is the SOURCE (ref_op(10)), not the slice (ref_op(11)).
-                assert_eq!(emitted.arg(0).to_opref(), src_ref);
+                // arg0 is the SOURCE, not the slice.
+                assert!(emitted.arg(0).same_box(&src));
                 // arg1 is INT_ADD(start, index), not the original index alone.
-                assert_ne!(emitted.arg(1).to_opref(), index_ref);
+                assert!(!emitted.arg(1).same_box(&index));
                 // The rewritten op keeps the original result position.
                 assert_eq!(emitted.pos().get(), pos);
             }
@@ -2454,46 +2386,35 @@ mod tests {
         let mut ctx = OptContext::new(20);
 
         // concat = vleft(plain len 2) ++ vright(non-virtual source ref).
-        // Materialize the non-virtual child so the residual STRGETITEM re-emits
-        // it as a bound box rather than a position-only `from_opref` box.
-        let vleft_ref = OpRef::ref_op(10);
-        let vright_ref = OpRef::ref_op(11);
-        ctx.materialize_operand_at(vright_ref);
-        set_vstring_plain(&mut ctx, vleft_ref, vec![None; 2]);
-        let concat_ref = OpRef::ref_op(12);
-        set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
+        let vleft = rop(10);
+        let vright = rop(11);
+        set_vstring_plain(&mut ctx, &vleft, vec![None; 2]);
+        let concat = rop(12);
+        set_vstring_concat(&mut ctx, &concat, vleft.clone(), vright.clone());
 
         // slice of the concat: start = 1, length = 3.
-        let b = ctx.materialize_operand_at(OpRef::int_op(300));
-        ctx.make_constant_box(&b, Value::Int(1));
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(3));
-        let slice_ref = OpRef::ref_op(13);
-        set_vstring_slice(
-            &mut ctx,
-            slice_ref,
-            concat_ref,
-            OpRef::int_op(300),
-            OpRef::int_op(301),
-        );
+        let start = iop(300);
+        ctx.make_constant_box(&start, Value::Int(1));
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(3));
+        let slice = rop(13);
+        set_vstring_slice(&mut ctx, &slice, concat, start, length);
 
         // STRGETITEM(slice, 1) → concat[start 1 + 1 = 2] → vright[2 - len 2 = 0].
-        let index_box = ctx.materialize_operand_at(OpRef::int_op(302));
-        ctx.make_constant_box(&index_box, Value::Int(1));
-        let slice_box = ctx.materialize_operand_at(slice_ref);
+        let index = iop(302);
+        ctx.make_constant_box(&index, Value::Int(1));
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
+        let mut getitem = Op::new(OpCode::Strgetitem, &[slice, index]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut None, &mut ctx);
 
         match result {
             OptimizationResult::Replace(emitted) => {
                 assert_eq!(emitted.opcode, OpCode::Strgetitem);
-                // arg0 is the RIGHT child (ref_op(11)), not the slice or concat.
-                assert_eq!(emitted.arg(0).to_opref(), vright_ref);
+                // arg0 is the RIGHT child, not the slice or concat.
+                assert!(emitted.arg(0).same_box(&vright));
                 // arg1 is the fully rebased index (1 + 1) - 2 = 0.
                 assert_eq!(
                     ctx.get_constant_int_box(&emitted.arg(1).get_box_replacement(false)),
@@ -2512,25 +2433,18 @@ mod tests {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let src_ref = OpRef::ref_op(10);
-        set_vstring_plain(&mut ctx, src_ref, vec![None; 5]);
+        let src = rop(10);
+        set_vstring_plain(&mut ctx, &src, vec![None; 5]);
 
-        let b = ctx.materialize_operand_at(OpRef::int_op(300));
-        ctx.make_constant_box(&b, Value::Int(1)); // start
-        let b = ctx.materialize_operand_at(OpRef::int_op(301));
-        ctx.make_constant_box(&b, Value::Int(3)); // length
+        let start = iop(300);
+        ctx.make_constant_box(&start, Value::Int(1));
+        let length = iop(301);
+        ctx.make_constant_box(&length, Value::Int(3));
 
-        let slice_ref = OpRef::ref_op(11);
-        set_vstring_slice(
-            &mut ctx,
-            slice_ref,
-            src_ref,
-            OpRef::int_op(300),
-            OpRef::int_op(301),
-        );
+        let slice = rop(11);
+        set_vstring_slice(&mut ctx, &slice, src, start, length);
 
-        let slice_op = ctx.materialize_operand_at(slice_ref);
-        let len = pass.get_known_length(&slice_op, &ctx);
+        let len = pass.get_known_length(&slice, &ctx);
         assert_eq!(len, Some(3));
     }
 
@@ -2538,16 +2452,13 @@ mod tests {
     fn test_getstrlen_uses_unicodelen_for_unicode() {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
-        let unicode_ref = OpRef::ref_op(7);
+        let unicode_box = rop(7);
         // vstring.py make_nonnull_str(op, mode_unicode) installs a
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
-        // Synthetic-OpRef test fixture: lazy-allocate the operand for the unicode_ref slot.
-        let unicode_box = ctx.materialize_operand_at(unicode_ref);
         ctx.make_nonnull_str(&unicode_box, 1);
 
-        let unicode_op = ctx.materialize_operand_at(unicode_ref);
-        let len_ref = pass.getstrlen(&mut None, &unicode_op, &mut ctx);
+        let len_ref = pass.getstrlen(&mut None, &unicode_box, &mut ctx);
         // getstrlen delegates to ctx.getstrlen_with which emits via
         // emit_for_force (downstream pipeline), so check new_operations.
         let last_op = ctx
@@ -2557,14 +2468,7 @@ mod tests {
 
         assert!(len_ref.same_box(&Operand::from_bound_op(last_op)));
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
-        assert_eq!(
-            last_op
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![unicode_ref]
-        );
+        assert!(last_op.arg(0).same_box(&unicode_box));
     }
 
     // ── Test 7: Non-constant length NEWSTR passes through ──
@@ -2706,8 +2610,8 @@ mod tests {
             (204, b'e' as i64),
         ];
 
-        let (pass, mut ctx) = run_string_pass(&ops, &constants);
-        let s = ctx.get_box_replacement_operand(OpRef::ref_op(0));
+        let (pass, mut ctx, wrapped) = run_string_pass(&ops, &constants);
+        let s = Operand::from_bound_op(&wrapped[0]);
         let want = [
             b'a' as i64,
             b'a' as i64,
@@ -2805,30 +2709,29 @@ mod tests {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let b = ctx.materialize_operand_at(OpRef::int_op(100));
+        let b = iop(100);
         ctx.make_constant_box(&b, Value::Int(2));
-        let b = ctx.materialize_operand_at(OpRef::int_op(101));
+        let b = iop(101);
         ctx.make_constant_box(&b, Value::Int(3));
-        let b = ctx.materialize_operand_at(OpRef::int_op(102));
+        let b = iop(102);
         ctx.make_constant_box(&b, Value::Int(4));
 
-        let a = OpRef::ref_op(10);
-        let b = OpRef::ref_op(11);
-        let c = OpRef::ref_op(12);
-        set_vstring_plain(&mut ctx, a, vec![None; 2]);
-        set_vstring_plain(&mut ctx, b, vec![None; 3]);
-        set_vstring_plain(&mut ctx, c, vec![None; 4]);
+        let a = rop(10);
+        let b = rop(11);
+        let c = rop(12);
+        set_vstring_plain(&mut ctx, &a, vec![None; 2]);
+        set_vstring_plain(&mut ctx, &b, vec![None; 3]);
+        set_vstring_plain(&mut ctx, &c, vec![None; 4]);
 
         // ab = concat(a, b)
-        let ab = OpRef::ref_op(20);
-        set_vstring_concat(&mut ctx, ab, a, b);
+        let ab = rop(20);
+        set_vstring_concat(&mut ctx, &ab, a.clone(), b.clone());
 
         // abc = concat(ab, c)
-        let abc = OpRef::ref_op(21);
-        set_vstring_concat(&mut ctx, abc, ab, c);
+        let abc = rop(21);
+        set_vstring_concat(&mut ctx, &abc, ab, c);
 
-        let abc_op = ctx.materialize_operand_at(abc);
-        assert_eq!(pass.get_known_length(&abc_op, &ctx), Some(9));
+        assert_eq!(pass.get_known_length(&abc, &ctx), Some(9));
     }
 
     // ── Test 15: Concat get char across boundary ──
@@ -2838,51 +2741,54 @@ mod tests {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let b = ctx.materialize_operand_at(OpRef::int_op(100));
+        let b = iop(100);
         ctx.make_constant_box(&b, Value::Int(2));
-        let b = ctx.materialize_operand_at(OpRef::int_op(101));
+        let b = iop(101);
         ctx.make_constant_box(&b, Value::Int(2));
 
-        let left = OpRef::ref_op(10);
-        let right = OpRef::ref_op(11);
+        let c200 = iop(200);
+        let c201 = iop(201);
+        let c202 = iop(202);
+        let c203 = iop(203);
+        let left = rop(10);
+        let right = rop(11);
         set_vstring_plain(
             &mut ctx,
-            left,
-            vec![Some(OpRef::int_op(200)), Some(OpRef::int_op(201))],
+            &left,
+            vec![Some(c200.clone()), Some(c201.clone())],
         );
         set_vstring_plain(
             &mut ctx,
-            right,
-            vec![Some(OpRef::int_op(202)), Some(OpRef::int_op(203))],
+            &right,
+            vec![Some(c202.clone()), Some(c203.clone())],
         );
 
-        let concat = OpRef::ref_op(12);
-        set_vstring_concat(&mut ctx, concat, left, right);
+        let concat = rop(12);
+        set_vstring_concat(&mut ctx, &concat, left, right);
 
-        let concat_op = ctx.materialize_operand_at(concat);
-        // Index 0 -> left[0] = 200
-        assert_eq!(
-            pass.strgetitem(&concat_op, 0, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(200))
+        // Index 0 -> left[0] = c200
+        assert!(
+            pass.strgetitem(&concat, 0, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c200))
         );
-        // Index 1 -> left[1] = 201
-        assert_eq!(
-            pass.strgetitem(&concat_op, 1, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(201))
+        // Index 1 -> left[1] = c201
+        assert!(
+            pass.strgetitem(&concat, 1, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c201))
         );
-        // Index 2 -> right[0] = 202
-        assert_eq!(
-            pass.strgetitem(&concat_op, 2, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(202))
+        // Index 2 -> right[0] = c202
+        assert!(
+            pass.strgetitem(&concat, 2, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c202))
         );
-        // Index 3 -> right[1] = 203
-        assert_eq!(
-            pass.strgetitem(&concat_op, 3, mode_string, &mut ctx)
-                .map(|b| b.to_opref()),
-            Some(OpRef::int_op(203))
+        // Index 3 -> right[1] = c203
+        assert!(
+            pass.strgetitem(&concat, 3, mode_string, &mut ctx)
+                .as_ref()
+                .is_some_and(|b| b.same_box(&c203))
         );
     }
 
@@ -2924,9 +2830,8 @@ mod tests {
 
         // Process NEWSTR → creates virtual Plain
         let left_op_rc = OpRc::new(left_op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
         let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut None, &mut ctx);
-        assert!(pass.is_virtual(&ctx.get_box_replacement_operand(left), &ctx));
+        assert!(pass.is_virtual(&Operand::from_bound_op(&left_op_rc), &ctx));
     }
 
     // ── Box/state parity tests ──
@@ -2936,20 +2841,15 @@ mod tests {
     #[test]
     fn test_lgtop_reuse_plain() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
-        let p0 = OpRef::ref_op(0);
+        let p0 = rop(0);
         set_vstring_plain(
             &mut ctx,
-            p0,
-            vec![
-                Some(OpRef::int_op(10)),
-                Some(OpRef::int_op(11)),
-                Some(OpRef::int_op(12)),
-            ],
+            &p0,
+            vec![Some(iop(10)), Some(iop(11)), Some(iop(12))],
         );
 
-        let p0_box = ctx.materialize_operand_at(p0);
-        let first = ctx.getstrlen_with(&mut None, &p0_box, 0);
-        let second = ctx.getstrlen_with(&mut None, &p0_box, 0);
+        let first = ctx.getstrlen_with(&mut None, &p0, 0);
+        let second = ctx.getstrlen_with(&mut None, &p0, 0);
         // vstring.py VStringPlainInfo.getstrlen: self.lgtop = ConstInt(len(self._chars))
         // Both calls must return the SAME cached box.
         assert!(
@@ -2967,11 +2867,10 @@ mod tests {
     #[test]
     fn test_lgtop_reuse_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
-        let p0 = OpRef::ref_op(0);
+        let p0 = rop(0);
         // Non-virtual Str with unknown length
-        let p0_box = ctx.materialize_operand_at(p0);
         ctx.set_ptr_info(
-            &p0_box,
+            &p0,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2984,8 +2883,8 @@ mod tests {
             }),
         );
 
-        let first = ctx.getstrlen_with(&mut None, &p0_box, 0);
-        let second = ctx.getstrlen_with(&mut None, &p0_box, 0);
+        let first = ctx.getstrlen_with(&mut None, &p0, 0);
+        let second = ctx.getstrlen_with(&mut None, &p0, 0);
         // vstring.py StrPtrInfo.getstrlen: self.lgtop = lengthop — cached STRLEN result
         assert!(
             first.same_box(&second),
@@ -3003,40 +2902,40 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
         let pass = OptString::new();
 
-        let p0 = OpRef::ref_op(0);
-        let p1 = OpRef::ref_op(1);
+        let p0 = rop(0);
+        let p1 = rop(1);
         // Two virtual strings of the same length (3 chars).
         set_vstring_plain(
             &mut ctx,
-            p0,
-            vec![
-                Some(OpRef::int_op(10)),
-                Some(OpRef::int_op(11)),
-                Some(OpRef::int_op(12)),
-            ],
+            &p0,
+            vec![Some(iop(10)), Some(iop(11)), Some(iop(12))],
         );
         set_vstring_plain(
             &mut ctx,
-            p1,
-            vec![
-                Some(OpRef::int_op(20)),
-                Some(OpRef::int_op(21)),
-                Some(OpRef::int_op(22)),
-            ],
+            &p1,
+            vec![Some(iop(20)), Some(iop(21)), Some(iop(22))],
         );
 
-        let p0_op = ctx.materialize_operand_at(p0);
-        let p1_op = ctx.materialize_operand_at(p1);
         // First call caches lgtop on each string.
-        let l1 = pass.getstrlen_if_known(&p0_op, &mut ctx);
-        let l2 = pass.getstrlen_if_known(&p1_op, &mut ctx);
+        let l1 = pass.getstrlen_if_known(&p0, &mut ctx);
+        let l2 = pass.getstrlen_if_known(&p1, &mut ctx);
         assert!(l1.is_some() && l2.is_some());
 
-        // Second call must return the same cached OpRef.
-        let l1_again = pass.getstrlen_if_known(&p0_op, &mut ctx);
-        let l2_again = pass.getstrlen_if_known(&p1_op, &mut ctx);
-        assert_eq!(l1, l1_again, "lgtop identity: p0 must return same box");
-        assert_eq!(l2, l2_again, "lgtop identity: p1 must return same box");
+        // Second call must return the same cached box.
+        let l1_again = pass.getstrlen_if_known(&p0, &mut ctx);
+        let l2_again = pass.getstrlen_if_known(&p1, &mut ctx);
+        assert!(
+            l1.as_ref()
+                .zip(l1_again.as_ref())
+                .is_some_and(|(a, b)| a.same_box(b)),
+            "lgtop identity: p0 must return same box"
+        );
+        assert!(
+            l2.as_ref()
+                .zip(l2_again.as_ref())
+                .is_some_and(|(a, b)| a.same_box(b)),
+            "lgtop identity: p1 must return same box"
+        );
 
         // Both have value 3, and RPython's same_box checks constant equality.
         assert_eq!(l1.and_then(|cb| cb.const_int()), Some(3));
@@ -3053,10 +2952,9 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
 
         // srcbox (p0): non-null string, not virtual
-        let p0 = OpRef::ref_op(0);
-        let p0_box = ctx.materialize_operand_at(p0);
+        let p0 = rop(0);
         ctx.set_ptr_info(
-            &p0_box,
+            &p0,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -3068,28 +2966,24 @@ mod tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        // targetbox: non-virtual. Materialize so the inline force re-emits the
-        // STRSETITEM target arg as a bound box (`Operand::Op`), not a
-        // position-only `from_opref` box.
-        let p1 = OpRef::ref_op(1);
-        let p1_box = ctx.materialize_operand_at(p1);
+        // targetbox: non-virtual bound box so the inline force re-emits the
+        // STRSETITEM target arg as the same producer.
+        let p1 = rop(1);
 
         // lengthbox (i2): int with constant intbound = 2
-        // Use an OpRef with IntBound set (not a literal constant)
-        let i2 = OpRef::int_op(2);
-        let i2_box = ctx.materialize_operand_at(i2);
-        ctx.with_intbound_mut(&i2_box, |b| {
+        // Use a bound int box with IntBound set (not a literal constant)
+        let i2 = iop(2);
+        ctx.with_intbound_mut(&i2, |b| {
             *b = IntBound::from_constant(2);
         });
 
         // offsetbox and srcoffsetbox: constant 0
-        let off = ctx.make_constant_int(0);
-        let off_op = ctx.materialize_operand_at(off);
+        let off_op = Operand::const_from_value(Value::Int(0));
 
         // Call copy_str_content. With intbound-constant length = 2 <= M=2,
         // it should inline to STRGETITEM+STRSETITEM instead of COPYSTRCONTENT.
         let _result = copy_str_content_with(
-            &mut None, &mut ctx, &p0_box, &p1_box, &off_op, &off_op, &i2_box, 0, true,
+            &mut None, &mut ctx, &p0, &p1, &off_op, &off_op, &i2, 0, true,
         );
 
         // Check that STRGETITEM ops were emitted (inline path) instead of
@@ -3119,11 +3013,10 @@ mod tests {
     #[test]
     fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
-        let arg2 = OpRef::ref_op(1);
-        let arg2_box = ctx.materialize_operand_at(arg2);
+        let arg2 = rop(1);
 
         ctx.set_ptr_info(
-            &arg2_box,
+            &arg2,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -3136,25 +3029,18 @@ mod tests {
             }),
         );
 
-        let strlen_ref = ctx.getstrlen_with(&mut None, &arg2_box, 0);
+        let strlen_ref = ctx.getstrlen_with(&mut None, &arg2, 0);
 
         let strlen_op = ctx
             .new_operations
             .last()
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
-        assert_eq!(
-            strlen_op
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            vec![arg2]
-        );
+        assert!(strlen_op.arg(0).same_box(&arg2));
         assert!(strlen_ref.same_box(&Operand::from_bound_op(strlen_op)));
 
         // Subsequent call must return the cached lgtop.
-        let strlen_ref2 = ctx.getstrlen_with(&mut None, &arg2_box, 0);
+        let strlen_ref2 = ctx.getstrlen_with(&mut None, &arg2, 0);
         assert!(strlen_ref.same_box(&strlen_ref2));
     }
 
@@ -3162,25 +3048,20 @@ mod tests {
     fn test_force_then_strlen_reuse() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
 
-        let p0 = OpRef::ref_op(0);
+        let p0 = rop(0);
         // Virtual Plain string with 3 chars.
         set_vstring_plain(
             &mut ctx,
-            p0,
-            vec![
-                Some(OpRef::int_op(10)),
-                Some(OpRef::int_op(11)),
-                Some(OpRef::int_op(12)),
-            ],
+            &p0,
+            vec![Some(iop(10)), Some(iop(11)), Some(iop(12))],
         );
 
         // getstrlen_with should cache lgtop = ConstInt(3).
-        let p0_box = ctx.materialize_operand_at(p0);
-        let len1 = ctx.getstrlen_with(&mut None, &p0_box, 0);
+        let len1 = ctx.getstrlen_with(&mut None, &p0, 0);
         assert_eq!(len1.const_int(), Some(3));
 
         // Query again — must return the same cached box.
-        let len2 = ctx.getstrlen_with(&mut None, &p0_box, 0);
+        let len2 = ctx.getstrlen_with(&mut None, &p0, 0);
         assert!(
             len1.same_box(&len2),
             "force-then-strlen: lgtop must be reused"

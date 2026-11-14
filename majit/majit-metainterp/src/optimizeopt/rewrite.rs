@@ -901,6 +901,8 @@ impl OptRewrite {
             let and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
             let and_op = OpRc::new(and_op);
+            // replace_op_with: forward the CALL box to the rewrite (op.set_forwarded(newop)).
+            OptContext::link_replaced_producer(op_rc, &and_op);
             send_extra_operation_from(opt, &and_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -960,6 +962,7 @@ impl OptRewrite {
                     let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
                     let rshift_op = OpRc::new(rshift_op);
+                    OptContext::link_replaced_producer(op_rc, &rshift_op);
                     send_extra_operation_from(opt, &rshift_op, ctx);
                     ctx.last_op_removed = true;
                     return Some(OptimizationResult::Remove);
@@ -973,6 +976,7 @@ impl OptRewrite {
             let neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
             let neg_op = OpRc::new(neg_op);
+            OptContext::link_replaced_producer(op_rc, &neg_op);
             send_extra_operation_from(opt, &neg_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -996,6 +1000,7 @@ impl OptRewrite {
             let rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
             let rshift_op = OpRc::new(rshift_op);
+            OptContext::link_replaced_producer(op_rc, &rshift_op);
             send_extra_operation_from(opt, &rshift_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
@@ -2393,7 +2398,7 @@ mod tests {
         specs: Vec<OpSpec>,
         target: usize,
         constants: &[(OpRef, Value)],
-    ) -> (OptimizationResult, OptContext) {
+    ) -> (OptimizationResult, OptContext, Vec<OpRc>) {
         let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
         // Emit the producer the args already wrap. A cloned `Op` would be a
@@ -2408,8 +2413,10 @@ mod tests {
         let mut passes = test_pass_chain();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
-        let mut op_rc = OpRc::new(op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        for i in 0..op.num_args() {
+            ops[target].setarg(i, op.arg(i));
+        }
+        let mut op_rc = ops[target].clone();
         let result = loop {
             let mut result = OptimizationResult::PassOn;
             for pass in passes.iter_mut() {
@@ -2423,15 +2430,16 @@ mod tests {
                     // optimizer.py `send_extra_operation`: autogen rewrites
                     // return Restart so chained rules re-fire on the new op
                     // (`sub_const_canonicalize` then `add_zero` / OptPure).
+                    let walked = op_rc;
                     op_rc = OpRc::new(new_op);
+                    crate::optimizeopt::OptContext::link_replaced_producer(&walked, &op_rc);
                     ctx.supersede_restart_producer(&op_rc);
                     op = (*op_rc).clone();
-                    ctx.bind_input_resops(std::slice::from_ref(&op_rc));
                 }
                 other => break other,
             }
         };
-        (result, ctx)
+        (result, ctx, ops)
     }
 
     /// The int-rewrite slice of the production pipeline: integer rule
@@ -2453,7 +2461,7 @@ mod tests {
         specs: Vec<OpSpec>,
         target: usize,
         constants: &[(OpRef, Value)],
-    ) -> (OptimizationResult, OptContext) {
+    ) -> (OptimizationResult, OptContext, Vec<OpRc>) {
         run_one_rewrite_only_with_mul_high(specs, target, constants, &[], true)
     }
 
@@ -2463,7 +2471,7 @@ mod tests {
         constants: &[(OpRef, Value)],
         nonneg: &[OpRef],
         supports_efficient_uint_mul_high: bool,
-    ) -> (OptimizationResult, OptContext) {
+    ) -> (OptimizationResult, OptContext, Vec<OpRc>) {
         let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
         ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
@@ -2485,10 +2493,12 @@ mod tests {
         let pass = OptRewrite::new();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
-        let op_rc = OpRc::new(op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        for i in 0..op.num_args() {
+            ops[target].setarg(i, op.arg(i));
+        }
+        let op_rc = ops[target].clone();
         let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
-        (result, ctx)
+        (result, ctx, ops)
     }
 
     fn resolve_op_args_in_ctx(op: &mut Op, ctx: &mut OptContext) {
@@ -2497,18 +2507,7 @@ mod tests {
         // canonical operand args that production passes receive.
         for i in 0..op.num_args() {
             let arg = op.arg(i);
-            let resolved = match ctx.resolve_operand_operand_opt(&arg) {
-                Some(b) => b,
-                None => {
-                    let argref = arg.to_opref();
-                    if argref.is_none() {
-                        arg.clone()
-                    } else {
-                        ctx.materialize_operand_at(argref)
-                            .get_box_replacement(false)
-                    }
-                }
-            };
+            let resolved = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
             op.setarg(i, resolved);
         }
     }
@@ -2521,16 +2520,22 @@ mod tests {
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
-    fn assert_int_const(ctx: &OptContext, opref: OpRef, expected: i64) {
+    fn assert_int_const(ops: &[OpRc], idx: usize, expected: i64) {
         assert_eq!(
-            ctx.get_box_replacement_operand_opt(opref)
-                .and_then(|cb| cb.const_int()),
+            Operand::from_bound_op(&ops[idx])
+                .get_box_replacement(false)
+                .const_int(),
             Some(expected)
         );
     }
 
-    fn assert_forward(ctx: &OptContext, from: OpRef, to: OpRef) {
-        assert_eq!(ctx.get_replacement_opref(from), to);
+    fn assert_forward(ops: &[OpRc], from: usize, to: usize) {
+        let from_b = Operand::from_bound_op(&ops[from]).get_box_replacement(false);
+        let to_b = Operand::from_bound_op(&ops[to]).get_box_replacement(false);
+        assert!(
+            from_b.same_box(&to_b),
+            "expected ops[{from}] to forward to ops[{to}]"
+        );
     }
 
     /// Imported `Preamble` cache hit: `force_op_from_preamble` then replace
@@ -2539,13 +2544,12 @@ mod tests {
     #[test]
     fn test_call_loopinvariant_preamble_hit_forces_and_caches() {
         let func_val = 0xCAFE_i64;
-        let source = OpRef::int_op(1);
         let mut ctx = OptContext::new(4);
         // `force_op_from_preamble_op` requires a short-preamble producer.
         ctx.initialize_imported_short_preamble_builder(&[], &[], &[]);
-        let source_op = ctx.materialize_operand_at(source);
-        let replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
-        replay.pos().set(ctx.get_replacement_opref(source));
+        let source_op = crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 1);
+        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
+        replay.pos().set(source_op.to_opref());
         let pass = OptRewrite::new();
         pass.loop_invariant_results.borrow_mut().insert(
             func_val,
@@ -2562,7 +2566,6 @@ mod tests {
         op.pos().set(OpRef::int_op(2));
         resolve_op_args_in_ctx(&mut op, &mut ctx);
         let op_rc = OpRc::new(op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         let cached = pass.loop_invariant_results.borrow().get(&func_val).cloned();
@@ -2584,18 +2587,18 @@ mod tests {
         const_val: i64,
         expected_forward_to: u32,
     ) {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
             2,
             &[(OpRef::int_op(const_pos as u32), Value::Int(const_val))],
         );
         assert_remove(&result);
-        assert_forward(&ctx, OpRef::int_op(2), OpRef::int_op(expected_forward_to));
+        assert_forward(&ops, 2, expected_forward_to as usize);
     }
 
     /// Helper: test constant fold → expect Remove + constant result.
     fn assert_binop_const_fold(opcode: OpCode, a: i64, b: i64, expected: i64) {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
             2,
             &[
@@ -2604,15 +2607,15 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), expected);
+        assert_int_const(&ops, 2, expected);
     }
 
     /// Helper: test same-arg binop → expect Remove.
     fn assert_binop_self(opcode: OpCode, expected_const: Option<i64>) {
-        let (result, ctx) = run_one(vec![same_i(), bin_i(opcode, 0, 0)], 1, &[]);
+        let (result, _ctx, ops) = run_one(vec![same_i(), bin_i(opcode, 0, 0)], 1, &[]);
         assert_remove(&result);
         if let Some(val) = expected_const {
-            assert_int_const(&ctx, OpRef::int_op(1), val);
+            assert_int_const(&ops, 1, val);
         }
     }
 
@@ -2639,13 +2642,13 @@ mod tests {
     #[test]
     fn test_int_mul_identities() {
         // x * 0 = 0
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntMul, 0, 1)],
             2,
             &[(OpRef::int_op(1), Value::Int(0))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 0);
+        assert_int_const(&ops, 2, 0);
 
         // x * 1 = x
         assert_binop_identity(OpCode::IntMul, 1, 1, 0);
@@ -2656,7 +2659,7 @@ mod tests {
     #[test]
     fn test_int_mul_power_of_two() {
         // x * 8 → lshift(x, 3)
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntMul, 0, 1)],
             2,
             &[(OpRef::int_op(1), Value::Int(8))],
@@ -2686,7 +2689,7 @@ mod tests {
         oopspecindex: majit_ir::OopSpecIndex,
         divisor: i64,
         supports_efficient_uint_mul_high: bool,
-    ) -> (OptimizationResult, OptContext) {
+    ) -> (OptimizationResult, OptContext, OpRc) {
         let ops = build_specs(&[same_i(), same_i(), same_i()]);
         let mut ctx = OptContext::new(4);
         ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
@@ -2715,10 +2718,9 @@ mod tests {
         )));
         resolve_op_args_in_ctx(&mut call, &mut ctx);
         let op_rc = OpRc::new(call.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let pass = OptRewrite::new();
+        let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&call, &op_rc, &mut None, &mut ctx);
-        (result, ctx)
+        (result, ctx, op_rc)
     }
 
     /// `rewrite.py` / `:758-766` reach `intdiv.modulo_operations` /
@@ -2733,11 +2735,32 @@ mod tests {
             majit_ir::OopSpecIndex::IntPyMod,
         ] {
             for mul_high in [false, true] {
-                let (result, ctx) = run_int_py_call(oopspecindex, 100, mul_high);
+                let (result, ctx, _) = run_int_py_call(oopspecindex, 100, mul_high);
                 assert_remove(&result);
                 assert!(
                     emitted_uint_mul_high(&ctx),
                     "{oopspecindex:?} left the residual call (mul_high={mul_high})"
+                );
+            }
+        }
+        for (oopspecindex, expected) in [
+            (majit_ir::OopSpecIndex::IntPyMod, OpCode::IntAnd),
+            (majit_ir::OopSpecIndex::IntPyDiv, OpCode::IntRshift),
+        ] {
+            for mul_high in [false, true] {
+                let (result, ctx, call_op) = run_int_py_call(oopspecindex, 8, mul_high);
+                assert_remove(&result);
+                let emitted = ctx
+                    .new_operations
+                    .iter()
+                    .find(|op| op.opcode == expected)
+                    .unwrap_or_else(|| {
+                        panic!("{oopspecindex:?} did not emit {expected:?} (mul_high={mul_high})")
+                    });
+                let replacement = Operand::from_bound_op(&call_op).get_box_replacement(false);
+                assert!(
+                    replacement.same_box(&Operand::from_bound_op(emitted)),
+                    "{oopspecindex:?} CALL box did not resolve to the emitted {expected:?} (mul_high={mul_high})"
                 );
             }
         }
@@ -2772,43 +2795,43 @@ mod tests {
     #[test]
     fn test_unary_constant_fold() {
         // neg constant
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), unary_i(OpCode::IntNeg, 0)],
             1,
             &[(OpRef::int_op(0), Value::Int(42))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), -42);
+        assert_int_const(&ops, 1, -42);
 
         // invert constant
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), unary_i(OpCode::IntInvert, 0)],
             1,
             &[(OpRef::int_op(0), Value::Int(0xFF))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), !0xFF);
+        assert_int_const(&ops, 1, !0xFF);
     }
 
     #[test]
     fn test_int_is_zero_and_is_true() {
         // is_zero(0) = 1
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), unary_i(OpCode::IntIsZero, 0)],
             1,
             &[(OpRef::int_op(0), Value::Int(0))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 1);
+        assert_int_const(&ops, 1, 1);
 
         // is_zero(5) = 0
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), unary_i(OpCode::IntIsZero, 0)],
             1,
             &[(OpRef::int_op(0), Value::Int(5))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 0);
+        assert_int_const(&ops, 1, 0);
     }
 
     #[test]
@@ -2824,7 +2847,7 @@ mod tests {
 
     #[test]
     fn test_guard_true_known_true() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(1))],
@@ -2834,7 +2857,7 @@ mod tests {
 
     #[test]
     fn test_guard_true_known_false() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(0))],
@@ -2847,13 +2870,13 @@ mod tests {
 
     #[test]
     fn test_guard_true_unknown() {
-        let (result, _) = run_one(vec![same_i(), op_spec(OpCode::GuardTrue, &[0])], 1, &[]);
+        let (result, _, _) = run_one(vec![same_i(), op_spec(OpCode::GuardTrue, &[0])], 1, &[]);
         assert_pass_on(&result);
     }
 
     #[test]
     fn test_guard_false_known_false() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(0))],
@@ -2863,7 +2886,7 @@ mod tests {
 
     #[test]
     fn test_guard_false_known_true() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(1))],
@@ -2959,7 +2982,7 @@ mod tests {
 
     #[test]
     fn test_guard_value_match() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::GuardValue, 0, 1)],
             2,
             &[
@@ -2974,9 +2997,9 @@ mod tests {
 
     #[test]
     fn test_same_as_i() {
-        let (result, ctx) = run_one(vec![same_i(), op_spec(OpCode::SameAsI, &[0])], 1, &[]);
+        let (result, _ctx, ops) = run_one(vec![same_i(), op_spec(OpCode::SameAsI, &[0])], 1, &[]);
         assert_remove(&result);
-        assert_forward(&ctx, OpRef::int_op(1), OpRef::int_op(0));
+        assert_forward(&ops, 1, 0);
     }
 
     // ── Integration test: full optimizer with OptRewrite ──
@@ -3008,7 +3031,6 @@ mod tests {
                 let resolved_arg = ctx.resolve_operand_operand(op.arg_ref(a));
                 op.setarg(a, resolved_arg);
             }
-            ctx.bind_input_resops(std::slice::from_ref(op));
             let mut result = OptimizationResult::PassOn;
             // The production loop absorbs SameAs* before the passes
             // (optimizer.py:864-867); the argless SameAsI fixtures here
@@ -3051,9 +3073,10 @@ mod tests {
         // the IntAdd was removed and the result is forwarded.
         // op0 is emitted, op1 is emitted (just a constant), op2 is removed.
         // After forwarding, any reference to op2 should resolve to op0.
-        assert_eq!(
-            ctx.get_replacement_opref(OpRef::int_op(2)),
-            OpRef::int_op(0)
+        assert!(
+            Operand::from_bound_op(&ops[2])
+                .get_box_replacement(false)
+                .same_box(&Operand::from_bound_op(&ops[0]).get_box_replacement(false))
         );
     }
 
@@ -3075,7 +3098,6 @@ mod tests {
                     let resolved_arg = ctx.resolve_operand_operand(op.arg_ref(a));
                     op.setarg(a, resolved_arg);
                 }
-                ctx.bind_input_resops(std::slice::from_ref(op));
                 let mut result = OptimizationResult::PassOn;
                 // SameAsI input fixtures bypass the passes, as in the
                 // production loop's SameAs absorption (optimizer.py:864-867).
@@ -3116,7 +3138,7 @@ mod tests {
     #[test]
     fn test_int_add_wrapping() {
         // wrapping
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntAdd, 0, 1)],
             2,
             &[
@@ -3125,38 +3147,38 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), i64::MIN);
+        assert_int_const(&ops, 2, i64::MIN);
     }
 
     // ── Shift of zero constant tests ──
 
     #[test]
     fn test_zero_lshift_anything() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntLshift, 0, 1)],
             2,
             &[(OpRef::int_op(0), Value::Int(0))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 0);
+        assert_int_const(&ops, 2, 0);
     }
 
     #[test]
     fn test_zero_rshift_anything() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntRshift, 0, 1)],
             2,
             &[(OpRef::int_op(0), Value::Int(0))],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 0);
+        assert_int_const(&ops, 2, 0);
     }
 
     // ── Non-optimizable cases (should PassOn) ──
 
     #[test]
     fn test_int_add_no_constants() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntAdd, 0, 1)],
             2,
             &[],
@@ -3168,7 +3190,7 @@ mod tests {
     fn test_unknown_opcode_passthrough() {
         // SETFIELD_GC(struct, value): struct is a Ref producer, value an Int
         // producer. OptRewrite has no rule for it → PassOn.
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_r(), same_i(), op_spec(OpCode::SetfieldGc, &[0, 1])],
             2,
             &[],
@@ -3180,7 +3202,7 @@ mod tests {
 
     #[test]
     fn test_int_and_constant_fold() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntAnd, 0, 1)],
             2,
             &[
@@ -3189,14 +3211,14 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 0x0F);
+        assert_int_const(&ops, 2, 0x0F);
     }
 
     // ── INT_OR constant fold ──
 
     #[test]
     fn test_int_or_constant_fold() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::IntOr, 0, 1)],
             2,
             &[
@@ -3205,25 +3227,25 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 0xFF);
+        assert_int_const(&ops, 2, 0xFF);
     }
 
     // ── UINT_RSHIFT tests ──
 
     #[test]
     fn test_uint_rshift_zero() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::UintRshift, 0, 1)],
             2,
             &[(OpRef::int_op(1), Value::Int(0))],
         );
         assert_remove(&result);
-        assert_forward(&ctx, OpRef::int_op(2), OpRef::int_op(0));
+        assert_forward(&ops, 2, 0);
     }
 
     #[test]
     fn test_uint_rshift_constant_fold() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::UintRshift, 0, 1)],
             2,
             &[
@@ -3233,7 +3255,7 @@ mod tests {
         );
         assert_remove(&result);
         // u64::MAX >> 1 = i64::MAX
-        assert_int_const(&ctx, OpRef::int_op(2), i64::MAX);
+        assert_int_const(&ops, 2, i64::MAX);
     }
 
     // ── Float optimization tests ──
@@ -3245,15 +3267,19 @@ mod tests {
             ("left", OpRef::float_op(0), OpRef::float_op(1)),
         ];
         for (name, const_op, forward_to) in cases {
-            let (result, ctx) = run_one(
+            let (result, _ctx, ops) = run_one(
                 vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
                 2,
                 &[(const_op, Value::Float(1.0))],
             );
             assert!(matches!(result, OptimizationResult::Remove), "case {name}");
-            assert_eq!(
-                ctx.get_replacement_opref(OpRef::float_op(2)),
-                forward_to,
+            let forward_idx = forward_to.raw() as usize;
+            assert!(
+                Operand::from_bound_op(&ops[2])
+                    .get_box_replacement(false)
+                    .same_box(
+                        &Operand::from_bound_op(&ops[forward_idx]).get_box_replacement(false)
+                    ),
                 "case {name}"
             );
         }
@@ -3273,7 +3299,6 @@ mod tests {
         let pass = OptRewrite::new();
         // Process op1 first (pass it through) on the producer the next
         // op's arg already wraps.
-        ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
         let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit_rc(ops[1].clone());
@@ -3283,19 +3308,19 @@ mod tests {
             let resolved = ctx.resolve_operand_operand(&ops[2].arg(i));
             ops[2].setarg(i, resolved);
         }
-        ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
         let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_replacement_opref(OpRef::float_op(2)),
-            OpRef::float_op(0)
+        assert!(
+            Operand::from_bound_op(&ops[2])
+                .get_box_replacement(false)
+                .same_box(&Operand::from_bound_op(&ops[0]))
         );
     }
 
     #[test]
     fn test_float_truediv_power_of_two() {
         // x / 2.0 → x * 0.5
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_f(), same_f(), bin_f(OpCode::FloatTrueDiv, 0, 1)],
             2,
             &[(OpRef::float_op(1), Value::Float(2.0))],
@@ -3306,7 +3331,7 @@ mod tests {
     #[test]
     fn test_float_no_opt_passthrough() {
         // FloatAdd with no constants: no RPython rewrite → PassOn
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_f(), same_f(), bin_f(OpCode::FloatAdd, 0, 1)],
             2,
             &[],
@@ -3319,7 +3344,7 @@ mod tests {
     #[test]
     fn test_cond_call_constant_false_removed() {
         // CondCallN(condition=0, func, arg1) -> removed (dead call)
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![
                 same_i(),
                 same_i(),
@@ -3335,7 +3360,7 @@ mod tests {
     #[test]
     fn test_cond_call_constant_true_to_direct_call() {
         // CondCallN(condition=1, func, arg1) -> CallN(func, arg1)
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![
                 same_i(),
                 same_i(),
@@ -3362,7 +3387,7 @@ mod tests {
     #[test]
     fn test_cond_call_value_nonnull_returns_value() {
         // CondCallValueI(value=42, func, arg1) -> value itself (no call needed)
-        let (result, ctx) = run_one(
+        let (result, ctx, ops) = run_one(
             vec![
                 same_i(),
                 same_i(),
@@ -3373,19 +3398,15 @@ mod tests {
             &[(OpRef::int_op(0), Value::Int(42))],
         );
         assert_remove(&result);
-        let resolved = ctx.get_replacement_opref(OpRef::int_op(3));
+        let resolved = Operand::from_bound_op(&ops[3]).get_box_replacement(false);
         assert!(resolved.is_constant());
-        assert_eq!(
-            ctx.get_box_replacement_operand_opt(resolved)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            Some(42)
-        );
+        assert_eq!(ctx.get_constant_int_box(&resolved), Some(42));
     }
 
     #[test]
     fn test_cond_call_value_null_to_direct_call() {
         // CondCallValueI(value=0, func, arg1) -> CallPureI(func, arg1)
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![
                 same_i(),
                 same_i(),
@@ -3413,33 +3434,35 @@ mod tests {
         // PtrEq(x, x) -> 1
         // resoperation.py InputArgRef / 615 RefOp `type = 'r'`: ptr
         // boxes carry the Ref variant tag, not Int.
-        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::PtrEq, 0, 0)], 1, &[]);
+        let (result, _ctx, ops) = run_one(vec![same_r(), bin_r(OpCode::PtrEq, 0, 0)], 1, &[]);
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 1);
+        assert_int_const(&ops, 1, 1);
     }
 
     #[test]
     fn test_ptr_ne_same_opref() {
         // PtrNe(x, x) -> 0
-        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::PtrNe, 0, 0)], 1, &[]);
+        let (result, _ctx, ops) = run_one(vec![same_r(), bin_r(OpCode::PtrNe, 0, 0)], 1, &[]);
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 0);
+        assert_int_const(&ops, 1, 0);
     }
 
     #[test]
     fn test_instance_ptr_eq_same_opref() {
         // InstancePtrEq(x, x) -> 1
-        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::InstancePtrEq, 0, 0)], 1, &[]);
+        let (result, _ctx, ops) =
+            run_one(vec![same_r(), bin_r(OpCode::InstancePtrEq, 0, 0)], 1, &[]);
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 1);
+        assert_int_const(&ops, 1, 1);
     }
 
     #[test]
     fn test_instance_ptr_ne_same_opref() {
         // InstancePtrNe(x, x) -> 0
-        let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::InstancePtrNe, 0, 0)], 1, &[]);
+        let (result, _ctx, ops) =
+            run_one(vec![same_r(), bin_r(OpCode::InstancePtrNe, 0, 0)], 1, &[]);
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(1), 0);
+        assert_int_const(&ops, 1, 0);
     }
 
     #[test]
@@ -3452,7 +3475,7 @@ mod tests {
         // so the fold has to read the word out of either shape -- the
         // `(Ref, Ref)`-only spelling reached `execute_nonspec_const` with no
         // matching row and panicked as an unregistered opcode.
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_r(), same_r(), bin_r(OpCode::PtrEq, 0, 1)],
             2,
             &[
@@ -3461,12 +3484,12 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 1);
+        assert_int_const(&ops, 2, 1);
     }
 
     #[test]
     fn test_ptr_ne_ref_against_distinct_int_modelled_pointer_folds() {
-        let (result, ctx) = run_one(
+        let (result, _ctx, ops) = run_one(
             vec![same_r(), same_r(), bin_r(OpCode::PtrNe, 0, 1)],
             2,
             &[
@@ -3475,7 +3498,7 @@ mod tests {
             ],
         );
         assert_remove(&result);
-        assert_int_const(&ctx, OpRef::int_op(2), 1);
+        assert_int_const(&ops, 2, 1);
     }
 
     #[test]
@@ -3492,7 +3515,7 @@ mod tests {
         // OptRewrite alone: this asserts the REWRITE pass's behavior; the
         // chained harness would let OptPure fold it, masking a regression
         // where rewrite value-compares ConstPtr.
-        let (result, ctx) = run_one_rewrite_only(
+        let (result, _ctx, ops) = run_one_rewrite_only(
             vec![same_r(), same_r(), bin_r(OpCode::PtrEq, 0, 1)],
             2,
             &[
@@ -3504,8 +3527,9 @@ mod tests {
         // unchanged; it does not fold distinct constants.
         assert_pass_on(&result);
         assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::int_op(2))
-                .and_then(|cb| cb.const_int()),
+            Operand::from_bound_op(&ops[2])
+                .get_box_replacement(false)
+                .const_int(),
             None
         );
     }
@@ -3516,23 +3540,24 @@ mod tests {
     fn test_cast_ptr_to_int_passes_through() {
         // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
         // arg0 is a Ref box (resoperation.py RefOp `type = 'r'`).
-        let (result, _) = run_one(vec![same_r(), unary_r(OpCode::CastPtrToInt, 0)], 1, &[]);
+        let (result, _, _) = run_one(vec![same_r(), unary_r(OpCode::CastPtrToInt, 0)], 1, &[]);
         assert_pass_on(&result);
     }
 
     #[test]
     fn test_cast_int_to_ptr_passes_through() {
         // rewrite.py:811-813: CastIntToPtr registers pure inverse, emits.
-        let (result, _) = run_one(vec![same_i(), unary_i(OpCode::CastIntToPtr, 0)], 1, &[]);
+        let (result, _, _) = run_one(vec![same_i(), unary_i(OpCode::CastIntToPtr, 0)], 1, &[]);
         assert_pass_on(&result);
     }
 
     #[test]
     fn test_cast_opaque_ptr_eliminated() {
         // CastOpaquePtr(x) -> x
-        let (result, ctx) = run_one(vec![same_r(), unary_r(OpCode::CastOpaquePtr, 0)], 1, &[]);
+        let (result, _ctx, ops) =
+            run_one(vec![same_r(), unary_r(OpCode::CastOpaquePtr, 0)], 1, &[]);
         assert_remove(&result);
-        assert_forward(&ctx, OpRef::ref_op(1), OpRef::ref_op(0));
+        assert_forward(&ops, 1, 0);
     }
 
     // ── CONVERT_FLOAT_BYTES tests ──
@@ -3542,7 +3567,7 @@ mod tests {
 
     #[test]
     fn test_convert_float_bytes_to_longlong_passes_through() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_f(), unary_f(OpCode::ConvertFloatBytesToLonglong, 0)],
             1,
             &[],
@@ -3552,7 +3577,7 @@ mod tests {
 
     #[test]
     fn test_convert_longlong_bytes_to_float_passes_through() {
-        let (result, _) = run_one(
+        let (result, _, _) = run_one(
             vec![same_i(), unary_i(OpCode::ConvertLonglongBytesToFloat, 0)],
             1,
             &[],
@@ -3583,13 +3608,11 @@ mod tests {
             let resolved = ctx.resolve_operand_operand(&ops[2].arg(i));
             ops[2].setarg(i, resolved);
         }
-        ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
         let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
         let __pf_rc = OpRc::new((*ops[3]).clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut None, &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
     }
@@ -3607,14 +3630,12 @@ mod tests {
 
         let pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
         let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit_rc(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
         let __pf_rc = OpRc::new((*ops[2]).clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
     }
@@ -3622,7 +3643,7 @@ mod tests {
     #[test]
     fn test_guard_future_condition_records_and_removes() {
         // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
-        let (result, ctx) = run_one(vec![op_spec(OpCode::GuardFutureCondition, &[])], 0, &[]);
+        let (result, ctx, _ops) = run_one(vec![op_spec(OpCode::GuardFutureCondition, &[])], 0, &[]);
         assert_remove(&result);
         assert!(ctx.patchguardop.is_some());
         assert_eq!(

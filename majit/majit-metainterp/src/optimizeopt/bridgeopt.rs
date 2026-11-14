@@ -228,7 +228,7 @@ pub fn deserialize_optimizer_knowledge(
     );
 
     // Class-C once: resume numbering `liveboxes` → the bound InputArg
-    // already in `ctx.inputargs` (setup ran `ensure_inputarg_bindings`).
+    // already in `ctx.inputargs` (`optimizer.py self.inputargs`).
     let livebox_boxes: Vec<Operand> = liveboxes
         .iter()
         .map(|&r| {

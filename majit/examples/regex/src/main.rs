@@ -403,10 +403,15 @@ fn main() {
     let mut sweep: Vec<(usize, [Option<Row>; 3])> = Vec::new();
     for len in lengths() {
         let s = nonmatching(len, N, SEED);
-        assert!(
-            !interp::matches(balanced, &s),
-            "the benchmark input is supposed NOT to match"
-        );
+        // The interpreter row's non-match check. Other selected rows assert
+        // their own answers in `bench`; the input is pinned by
+        // `test_nonmatching_digest_pins_the_cross_port_input`.
+        if row_selected(R_INTERP) {
+            assert!(
+                !interp::matches(balanced, &s),
+                "the benchmark input is supposed NOT to match"
+            );
+        }
 
         let interp_row = bench(NAMES[0], roots[0], &s, None, interp::matches);
         let masking_row = bench(

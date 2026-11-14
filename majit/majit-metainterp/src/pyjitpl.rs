@@ -4826,8 +4826,9 @@ impl<M: Clone> MetaInterp<M> {
     /// sentinel `-1`: the wired builder already has `setup_insns` bytes,
     /// and `setup_cached_control_opcodes(-1, …)` would store `BC_ABSENT`.
     fn bind_blackhole_builder_shared_fields(&self) {
-        let mut builder = self.staticdata.blackholeinterpbuilder.lock();
-        builder.set_cpu(self.blackhole_cpu());
+        let cpu = self.blackhole_cpu();
+        let mut builder = self.staticdata.blackholeinterpbuilder.borrow_mut();
+        builder.set_cpu(cpu);
         if self.staticdata.op_live >= 0 {
             builder.setup_cached_control_opcodes(
                 self.staticdata.op_live,
@@ -9813,7 +9814,7 @@ impl<M: Clone> MetaInterp<M> {
         // `_forwarded`. Cut: `cut_trace_from` remaps ops into a fresh
         // namespace, so no seed can resolve cut-op lookups anyway; an explicit
         // empty seed states that (producer lookup runs off new_operations /
-        // phase1_emit_ops / resop_refs).
+        // phase1_emit_ops).
         // Only the peeling arm below reads this seed. When the jitdriver's
         // `enable_opts` omits `unroll`, the optimize call is `InvalidLoop`
         // before it looks at any of `unroll_opt`, and the retry builds its own
@@ -22033,24 +22034,25 @@ fn default_blackhole_builder() -> crate::blackhole::BlackholeInterpBuilder {
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
 /// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
 /// that one builder. `acquire_interp` mutates `blackholeinterps` under the
-/// GIL; the mutex is that serialisation. The lock covers only builder
-/// operations (`acquire_interp`, `release_interp`, `setup_jitdrivers_sd`,
-/// `blackhole_from_resumedata` chain construction). `set_cpu` and
-/// `setup_cached_control_opcodes` run once at `MetaInterp::new` /
-/// `finish_setup`, matching `BlackholeInterpBuilder.__init__`. It is not
-/// held across `resume_mainloop` / `run` / a residual call, so a nested
-/// resume on the same thread pops another interpreter off this same builder.
+/// GIL; `RefCell` is that unique-owner serialisation. Each `borrow_mut`
+/// covers only builder operations (`acquire_interp`, `release_interp`,
+/// `setup_jitdrivers_sd`, `blackhole_from_resumedata` chain construction).
+/// `set_cpu` and `setup_cached_control_opcodes` run once at `MetaInterp::new`
+/// / `finish_setup`, matching `BlackholeInterpBuilder.__init__`. The borrow
+/// is not held across `resume_mainloop` / `run` / a residual call, so a
+/// nested resume on the same thread pops another interpreter off this same
+/// builder (`blackhole.py` `BlackholeInterpBuilder.acquire_interp`).
 pub struct SharedBlackholeInterpBuilder {
-    inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
-    /// `BlackholeInterpBuilder(codewriter, self)`. Nested `lock` while the
-    /// one builder is held constructs the same table rather than blocking.
+    inner: std::cell::RefCell<crate::blackhole::BlackholeInterpBuilder>,
+    /// `BlackholeInterpBuilder(codewriter, self)`. `install_wired` uses this
+    /// constructor while `staticdata` is uniquely owned.
     wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
 }
 
 impl Default for SharedBlackholeInterpBuilder {
     fn default() -> Self {
         Self {
-            inner: parking_lot::Mutex::new(crate::blackhole::BlackholeInterpBuilder::new()),
+            inner: std::cell::RefCell::new(crate::blackhole::BlackholeInterpBuilder::new()),
             wire: default_blackhole_builder,
         }
     }
@@ -22078,7 +22080,6 @@ impl SharedBlackholeInterpBuilder {
     }
 
     /// Install `wire` as the one `BlackholeInterpBuilder` constructor.
-    /// Nested `lock` while the mutex is held uses the same function.
     /// Call while `staticdata` is uniquely owned (`warmspot.py` `finish_setup`).
     pub fn install_constructor(&mut self, wire: fn() -> crate::blackhole::BlackholeInterpBuilder) {
         self.wire = wire;
@@ -22086,17 +22087,15 @@ impl SharedBlackholeInterpBuilder {
     }
 
     /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
-    /// as a field pointer. Callers clone `MetaInterp.staticdata` first
-    /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
-    /// so the guard does not borrow `MetaInterp`.
+    /// as a field (`blackhole.py` `resume_in_blackhole`).
     ///
-    /// Drop the guard before `resume_mainloop` / `run` / any residual call:
+    /// Drop the `RefMut` before `resume_mainloop` / `run` / any residual call:
     /// `BlackholeInterpreter.__init__` already copied cpu/descrs/dispatch
-    /// off the builder, and holding the mutex across those would deadlock a
-    /// nested resume on this thread. Nested resume uses a second
+    /// off the builder, and holding the borrow across those panics a nested
+    /// `borrow_mut` on this thread. Nested resume uses a second
     /// `acquire_interp` after that drop (`blackhole.py` `acquire_interp`).
-    pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
-        self.inner.lock()
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, crate::blackhole::BlackholeInterpBuilder> {
+        self.inner.borrow_mut()
     }
 
     /// `pyjitpl.py` `MetaInterpStaticData.finish_setup` assigns
@@ -22106,20 +22105,16 @@ impl SharedBlackholeInterpBuilder {
     /// Replaces the builder and drops any previously bound cpu. The
     /// owning MetaInterp rebinds through [`MetaInterp::install_blackhole_builder`].
     pub fn install(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
-        *self.lock() = builder;
-    }
-
-    /// Run `f` with the one builder locked, then drop the guard.
-    pub fn with_locked<R>(
-        &self,
-        f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
-    ) -> R {
-        f(&mut *self.lock())
+        *self.borrow_mut() = builder;
     }
 }
 
-/// [`BlackholeInterpPool`](crate::blackhole::BlackholeInterpPool) adapter that
-/// locks [`SharedBlackholeInterpBuilder`] only for each pool operation.
+/// [`BlackholeInterpPool`](crate::blackhole::BlackholeInterpPool) adapter.
+/// Each `acquire_interp` / `release_interp` is a short `RefCell::borrow_mut`
+/// on [`SharedBlackholeInterpBuilder`] (`blackhole.py`
+/// `BlackholeInterpBuilder.acquire_interp` / `release_interp` under the GIL).
+/// The borrow is not held across `resume_mainloop`, so a nested resume on
+/// this thread can acquire again.
 pub struct SharedBlackholeInterpPool<'a> {
     shared: &'a SharedBlackholeInterpBuilder,
 }
@@ -22135,7 +22130,7 @@ impl crate::blackhole::BlackholeInterpPool for SharedBlackholeInterpPool<'_> {
         &mut self,
         f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
     ) -> R {
-        self.shared.with_locked(f)
+        f(&mut *self.shared.borrow_mut())
     }
 }
 
@@ -30585,7 +30580,10 @@ mod metainterp_static_data_tests {
 
         assert_eq!(meta.staticdata.liveness_info, expected);
         assert!(
-            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            meta.staticdata
+                .blackholeinterpbuilder
+                .borrow_mut()
+                .has_cpu(),
             "finish_setup install_wired rebinds BlackholeInterpBuilder.cpu"
         );
     }
@@ -30598,7 +30596,10 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.install_blackhole_builder_constructor(empty);
         assert!(
-            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            meta.staticdata
+                .blackholeinterpbuilder
+                .borrow_mut()
+                .has_cpu(),
             "install_blackhole_builder_constructor rebinds BlackholeInterpBuilder.cpu"
         );
     }
@@ -30695,7 +30696,7 @@ mod metainterp_static_data_tests {
         // opcode ids `setup_insns` just wrote. `acquire_interp` then
         // sees both without a per-resume rebind.
         {
-            let builder = meta.staticdata.blackholeinterpbuilder.lock();
+            let builder = meta.staticdata.blackholeinterpbuilder.borrow_mut();
             assert!(
                 builder.has_cpu(),
                 "MetaInterp::new binds BlackholeInterpBuilder.cpu"
@@ -30919,14 +30920,14 @@ mod tests {
 
     /// A resume that starts while another resume is running (a residual call
     /// re-entering the driver) acquires from the same builder.
-    /// `blackhole.py` `acquire_interp` pops another interpreter; the lock
-    /// covers only that pop, so the nested resume does not block.
+    /// `blackhole.py` `acquire_interp` pops another interpreter; each
+    /// `borrow_mut` covers only that pop, so the nested resume does not panic.
     #[test]
     fn nested_resume_acquires_from_the_same_builder() {
         let sd = MetaInterpStaticData::new();
-        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
-        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
-        let mut builder = sd.blackholeinterpbuilder.lock();
+        let outer = sd.blackholeinterpbuilder.borrow_mut().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.borrow_mut().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.borrow_mut();
         builder.release_interp(nested);
         builder.release_interp(outer);
     }
@@ -30940,10 +30941,10 @@ mod tests {
         }
         let mut sd = MetaInterpStaticData::new();
         sd.blackholeinterpbuilder.install_constructor(marker);
-        assert_eq!(sd.blackholeinterpbuilder.lock().op_live, 7);
-        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
-        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
-        let mut builder = sd.blackholeinterpbuilder.lock();
+        assert_eq!(sd.blackholeinterpbuilder.borrow_mut().op_live, 7);
+        let outer = sd.blackholeinterpbuilder.borrow_mut().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.borrow_mut().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.borrow_mut();
         builder.release_interp(nested);
         builder.release_interp(outer);
     }

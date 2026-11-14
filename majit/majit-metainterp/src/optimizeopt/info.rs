@@ -306,8 +306,8 @@ pub use majit_ir::ptr_info::{
 /// Extension trait carrying the OptContext-coupled methods that used
 /// to live on `impl StrPtrInfo` in metainterp. The data type itself
 /// is in `majit-ir`; only methods that depend on metainterp-side
-/// helpers (`get_constant_int_or_bound`, `get_box_replacement_operand_opt`,
-/// `getptrinfo`) stay here as a trait.
+/// helpers (`get_constant_int_or_bound`, `getptrinfo`) stay here as a
+/// trait.
 pub trait StrPtrInfoExt {
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64>;
     fn get_constant_string_spec(
@@ -1209,8 +1209,8 @@ fn force_box_emit(
     // `op` is the bound operand of the virtual being forced (callers resolve to
     // the chain terminal before delegating). The OpRef view drives op identity
     // (pos, logging, alloc-vs-original comparisons); the operand drives every
-    // make_equal_to / set_ptr_info receiver, so no `materialize_operand_at` round-trip is
-    // needed for the forwarding writes.
+    // make_equal_to / set_ptr_info receiver, so the forwarding writes
+    // land on the bound box.
     let opref = op.to_opref();
 
     // info.py: subbox = optimizer.force_box(fld) — `fld` is the field's
@@ -2201,13 +2201,13 @@ mod tests {
 
         let mut ctx = OptContext::new(8);
         let mut struct_guards = Vec::new();
-        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(1));
+        let struct_box = field_op(Type::Ref, 1);
         assert!(struct_info.make_guards(&struct_box, &mut struct_guards, &mut ctx));
         assert_eq!(struct_guards[1].opcode, OpCode::GuardGcType);
         assert_eq!(struct_guards[1].arg(1).const_value(), Some(Value::Int(71)));
 
         let mut array_guards = Vec::new();
-        let array_box = ctx.materialize_operand_at(OpRef::ref_op(2));
+        let array_box = field_op(Type::Ref, 2);
         assert!(array_info.make_guards(&array_box, &mut array_guards, &mut ctx));
         assert_eq!(array_guards[1].opcode, OpCode::GuardGcType);
         assert_eq!(array_guards[1].arg(1).const_value(), Some(Value::Int(72)));
@@ -2229,7 +2229,7 @@ mod tests {
         let mut guards = Vec::new();
         let mut ctx = OptContext::new(4);
 
-        let op = ctx.materialize_operand_at(OpRef::ref_op(1));
+        let op = field_op(Type::Ref, 1);
         assert!(!info.make_guards(&op, &mut guards, &mut ctx));
         assert!(guards.is_empty());
     }
@@ -2859,7 +2859,11 @@ mod tests {
 
     #[test]
     fn test_str_ptr_info_virtual_variants() {
-        let mut ctx = OptContext::new(32);
+        let s = field_op(Type::Int, 1);
+        let start = field_op(Type::Int, 2);
+        let lgtop = field_op(Type::Int, 3);
+        let vleft = field_op(Type::Int, 4);
+        let vright = field_op(Type::Int, 5);
         let plain = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
             lgtop: None,
@@ -2876,15 +2880,11 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(3))), // vstring.py:223: self.lgtop = length
+            lgtop: Some(lgtop.clone()), // vstring.py VStringSliceInfo.__init__ self.lgtop = length
             mode: 0,
             length: -1,
             _is_virtual: true,
-            variant: VStringVariant::Slice(VStringSliceInfo {
-                s: ctx.materialize_operand_at(OpRef::int_op(1)),
-                start: ctx.materialize_operand_at(OpRef::int_op(2)),
-                lgtop: ctx.materialize_operand_at(OpRef::int_op(3)),
-            }),
+            variant: VStringVariant::Slice(VStringSliceInfo { s, start, lgtop }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
@@ -2896,10 +2896,7 @@ mod tests {
             mode: 0,
             length: -1,
             _is_virtual: true,
-            variant: VStringVariant::Concat(VStringConcatInfo {
-                vleft: ctx.materialize_operand_at(OpRef::int_op(4)),
-                vright: ctx.materialize_operand_at(OpRef::int_op(5)),
-            }),
+            variant: VStringVariant::Concat(VStringConcatInfo { vleft, vright }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
@@ -2921,12 +2918,12 @@ mod tests {
     #[test]
     fn test_str_ptr_info_constant_string_spec_and_strgetitem() {
         let mut ctx = OptContext::new(16);
-        let b = ctx.materialize_operand_at(OpRef::int_op(10));
-        ctx.make_constant_box(&b, Value::Int(97));
-        let b = ctx.materialize_operand_at(OpRef::int_op(11));
-        ctx.make_constant_box(&b, Value::Int(98));
-        let b = ctx.materialize_operand_at(OpRef::int_op(12));
-        ctx.make_constant_box(&b, Value::Int(99));
+        let b10 = field_op(Type::Int, 10);
+        ctx.make_constant_box(&b10, Value::Int(97));
+        let b11 = field_op(Type::Int, 11);
+        ctx.make_constant_box(&b11, Value::Int(98));
+        let b12 = field_op(Type::Int, 12);
+        ctx.make_constant_box(&b12, Value::Int(99));
 
         let info = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
@@ -2935,11 +2932,7 @@ mod tests {
             length: 3,
             _is_virtual: true,
             variant: VStringVariant::Plain(VStringPlainInfo {
-                _chars: vec![
-                    Some(ctx.materialize_operand_at(OpRef::int_op(10))),
-                    Some(ctx.materialize_operand_at(OpRef::int_op(11))),
-                    Some(ctx.materialize_operand_at(OpRef::int_op(12))),
-                ],
+                _chars: vec![Some(b10), Some(b11.clone()), Some(b12)],
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -2950,22 +2943,17 @@ mod tests {
             Some(vec![97, 98, 99])
         );
         assert_eq!(info.get_known_str_length(&ctx, 0), Some(3));
-        assert_eq!(
-            info.strgetitem(1, &ctx).map(|b| b.to_opref()),
-            Some(OpRef::int_op(11))
-        );
+        assert!(info.strgetitem(1, &ctx).is_some_and(|b| b.same_box(&b11)));
     }
 
     #[test]
     fn test_str_ptr_info_plain_constant_string_spec_rejects_intbound_constant_chars() {
         let mut ctx = OptContext::new(16);
-        let ch = OpRef::int_op(10);
-        let ch_box = ctx.materialize_operand_at(ch);
+        let ch_box = field_op(Type::Int, 10);
         ctx.setintbound(&ch_box, &IntBound::from_constant(97));
 
         assert_eq!(
-            ctx.get_box_replacement_operand_opt(ch)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
+            ctx.get_constant_int_box(&ch_box),
             Some(97),
             "test setup should expose a get_constant_box-style IntBound constant",
         );
@@ -2977,7 +2965,7 @@ mod tests {
             length: 1,
             _is_virtual: true,
             variant: VStringVariant::Plain(VStringPlainInfo {
-                _chars: vec![Some(ctx.materialize_operand_at(ch))],
+                _chars: vec![Some(ch_box)],
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -2991,24 +2979,19 @@ mod tests {
     #[test]
     fn test_str_ptr_info_slice_and_concat_dispatch() {
         let mut ctx = OptContext::new(32);
-        let b = ctx.materialize_operand_at(OpRef::int_op(10));
-        ctx.make_constant_box(&b, Value::Int(97));
-        let b = ctx.materialize_operand_at(OpRef::int_op(11));
-        ctx.make_constant_box(&b, Value::Int(98));
-        let b = ctx.materialize_operand_at(OpRef::int_op(12));
-        ctx.make_constant_box(&b, Value::Int(99));
-        let b = ctx.materialize_operand_at(OpRef::int_op(20));
-        ctx.make_constant_box(&b, Value::Int(1));
-        let b = ctx.materialize_operand_at(OpRef::int_op(21));
-        ctx.make_constant_box(&b, Value::Int(2));
+        let b10 = field_op(Type::Int, 10);
+        ctx.make_constant_box(&b10, Value::Int(97));
+        let b11 = field_op(Type::Int, 11);
+        ctx.make_constant_box(&b11, Value::Int(98));
+        let b12 = field_op(Type::Int, 12);
+        ctx.make_constant_box(&b12, Value::Int(99));
+        let b20 = field_op(Type::Int, 20);
+        ctx.make_constant_box(&b20, Value::Int(1));
+        let b21 = field_op(Type::Int, 21);
+        ctx.make_constant_box(&b21, Value::Int(2));
 
-        let source = OpRef::int_op(1);
-        let source_box = ctx.materialize_operand_at(source);
-        let source_chars = vec![
-            Some(ctx.materialize_operand_at(OpRef::int_op(10))),
-            Some(ctx.materialize_operand_at(OpRef::int_op(11))),
-            Some(ctx.materialize_operand_at(OpRef::int_op(12))),
-        ];
+        let source_box = field_op(Type::Int, 1);
+        let source_chars = vec![Some(b10), Some(b11.clone()), Some(b12.clone())];
         ctx.set_ptr_info(
             &source_box,
             PtrInfo::Str(StrPtrInfo {
@@ -3027,25 +3010,23 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(21))), // vstring.py:223: self.lgtop = length
+            lgtop: Some(b21.clone()), // vstring.py VStringSliceInfo.__init__ self.lgtop = length
             mode: 0,
             length: -1,
             _is_virtual: true,
             variant: VStringVariant::Slice(VStringSliceInfo {
-                s: ctx.materialize_operand_at(source),
-                start: ctx.materialize_operand_at(OpRef::int_op(20)),
-                lgtop: ctx.materialize_operand_at(OpRef::int_op(21)),
+                s: source_box.clone(),
+                start: b20,
+                lgtop: b21,
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
         assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
-        assert_eq!(
-            slice.strgetitem(0, &ctx).map(|b| b.to_opref()),
-            Some(OpRef::int_op(11))
-        );
+        assert!(slice.strgetitem(0, &ctx).is_some_and(|b| b.same_box(&b11)));
 
+        let pos2 = field_op(Type::Int, 2);
         let concat = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
             lgtop: None,
@@ -3053,17 +3034,13 @@ mod tests {
             length: -1,
             _is_virtual: true,
             variant: VStringVariant::Concat(VStringConcatInfo {
-                vleft: ctx.materialize_operand_at(source),
-                vright: ctx.materialize_operand_at(OpRef::int_op(2)),
+                vleft: source_box,
+                vright: pos2.clone(),
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
-        let pos2 = ctx.materialize_operand_at(OpRef::int_op(2));
-        let pos2_chars = vec![
-            Some(ctx.materialize_operand_at(OpRef::int_op(11))),
-            Some(ctx.materialize_operand_at(OpRef::int_op(12))),
-        ];
+        let pos2_chars = vec![Some(b11.clone()), Some(b12)];
         ctx.set_ptr_info(
             &pos2,
             PtrInfo::Str(StrPtrInfo {
@@ -3083,10 +3060,7 @@ mod tests {
             concat.get_constant_string_spec(&ctx, 0),
             Some(vec![97, 98, 99, 98, 99])
         );
-        assert_eq!(
-            concat.strgetitem(3, &ctx).map(|b| b.to_opref()),
-            Some(OpRef::int_op(11))
-        );
+        assert!(concat.strgetitem(3, &ctx).is_some_and(|b| b.same_box(&b11)));
     }
 
     #[test]

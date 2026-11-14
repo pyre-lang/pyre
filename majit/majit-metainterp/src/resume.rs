@@ -5394,7 +5394,7 @@ mod tests {
             None,
             None, // all_virtuals
             &NullAllocator,
-            None,
+            Some(&rd_numb),
         );
 
         assert_eq!(virtualizable_ptr, 0);
@@ -5438,6 +5438,7 @@ mod tests {
             None,
             &NullAllocator,
         );
+        reader.resumecodereader.bind_numbering(&rd_numb);
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
     }
 
@@ -5493,7 +5494,7 @@ mod tests {
                 None,
                 all_virtuals,
                 &NullAllocator,
-                None,
+                Some(&rd_numb),
             )
         };
 
@@ -5562,7 +5563,7 @@ mod tests {
             None, // ginfo
             None, // all_virtuals
             &NullAllocator,
-            None,
+            Some(&rd_numb),
         );
         (virtualizable_ptr, bh.registers_r[0])
     }
@@ -5923,10 +5924,11 @@ pub struct ResumeDataDirectReader<'a> {
     pub virtualizable_ptr: i64,
 }
 
-/// Holds `&mut ResumeDataDirectReader` while `self.deadframe` is a
-/// resume GCREF root. `resume.py` `ResumeDataDirectReader.__init__`
-/// traces the field; the borrow keeps the reader from moving while
-/// the collector can rewrite it in place.
+/// Holds `&mut ResumeDataDirectReader` while `self.deadframe` and
+/// `Reader.code` are resume GCREF roots. `resume.py`
+/// `ResumeDataDirectReader.__init__` traces those fields; the borrow
+/// keeps the reader from moving while the collector can rewrite them
+/// in place.
 #[must_use]
 pub struct DeadframeRootGuard<'r, 'a> {
     reader: &'r mut ResumeDataDirectReader<'a>,
@@ -7077,21 +7079,33 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Root `self.deadframe` after the reader sits in its final stack
-    /// slot. `resume.py` `ResumeDataDirectReader.__init__` traces the
-    /// GCREF field; a collection during `consume_one_section` / virtual
-    /// allocate forwards it in place. The returned guard holds `&mut
-    /// self` so the reader cannot move while registered. Off-heap and
-    /// Slice arms skip the push; the guard still borrows the reader.
+    /// Root `self.deadframe` and `Reader.code` after the reader sits in
+    /// its final stack slot. `resume.py` `ResumeDataDirectReader.__init__`
+    /// traces those GCREF fields; a collection during `consume_one_section`
+    /// / virtual allocate forwards them in place. The returned guard holds
+    /// `&mut self` so the reader cannot move while registered. Off-heap
+    /// and Slice arms skip the deadframe push; a MiniMark numbering is
+    /// still pushed. Host blocks are not GCREFs.
     #[must_use]
     pub fn bind_deadframe_root(&mut self) -> DeadframeRootGuard<'_, 'a> {
-        if self.deadframe_on_heap && self.deadframe != 0 && self.deadframe_root_base_depth.is_none()
-        {
-            self.deadframe_root_base_depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
-                    &mut self.deadframe,
-                ));
+        if self.deadframe_root_base_depth.is_none() {
+            let root_deadframe = self.deadframe_on_heap && self.deadframe != 0;
+            let root_numbering = self.resumecodereader.has_gc_code();
+            if root_deadframe || root_numbering {
+                self.deadframe_root_base_depth =
+                    Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+                if root_deadframe {
+                    unsafe {
+                        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                            &mut self.deadframe,
+                        ));
+                    }
+                }
+                if let Some(code) = self.resumecodereader.gc_code_mut() {
+                    unsafe {
+                        majit_gc::shadow_stack::push_resume_ref_root(code);
+                    }
+                }
             }
         }
         DeadframeRootGuard { reader: self }
@@ -9160,21 +9174,10 @@ where
     let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
     let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let skip_prepare = !resuming_after_guard_not_forced && empty_virtuals && empty_pending;
-    if skip_prepare {
-        // regex leaf: nvirtuals=0 and no pending fields. Skip the
-        // empty `VirtualCache` root and the pending-field walk.
-        // `resumecode.py` `Reader.next_item` / `numb_next_item` load
-        // `numb.code[index]`. `incminimark.py` never moves old objects;
-        // after the first minor, `collect_young_numberings`
-        // (`collect_oldrefs_to_nursery`) has promoted
-        // `compile.py` `ResumeGuardDescr.rd_numb`. A still-young cell
-        // stays on `YOUNG_NUMBERINGS` and can move; pin only when the
-        // cell cannot. `consume_vref_and_vable` may allocate
-        // (`write_from_resume_data_partial`); re-stabilize after it.
-        resumereader.resumecodereader.mark_payload_stable();
-    }
-    // `resume.py` traces `self.deadframe`; bind so a collection
-    // forwards the field. The guard keeps the reader from moving.
+    // `resume.py` traces `self.deadframe` and `Reader.code`; bind so a
+    // collection forwards those fields. The guard keeps the reader from
+    // moving. `numb_next_item` indexes `Reader.code` for the rest of
+    // this window (`ResumeGuardDescr.rd_numb` holds the numbering).
     let mut resumereader = resumereader.bind_deadframe_root();
     let _resume_roots = if resuming_after_guard_not_forced {
         // Virtuals already live in the cache; a collection during
@@ -9196,17 +9199,6 @@ where
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
-    if skip_prepare {
-        resumereader.resumecodereader.mark_payload_stable();
-        #[cfg(debug_assertions)]
-        if let Some(numb) = numb_root {
-            debug_assert!(
-                !resumereader.resumecodereader.payload_is_stable() || !numb.is_young(),
-                "Reader.code pin requires an old or host numbering \
-                 (incminimark.py / collect_oldrefs_to_nursery)"
-            );
-        }
-    }
     drop(_cc_guard);
 
     // consume_vable_info rooted `virtualizable_ptr` before restoring any
@@ -9327,10 +9319,10 @@ pub fn force_from_resumedata<'a>(
     };
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, all_liveness, deadframe, None, allocator);
-    let mut resumereader = resumereader.bind_deadframe_root();
     if let Some(numb) = numb_root {
         resumereader.resumecodereader.bind_numbering(numb);
     }
+    let mut resumereader = resumereader.bind_deadframe_root();
     // resume.py common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
     //

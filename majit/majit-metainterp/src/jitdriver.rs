@@ -279,7 +279,7 @@ pub fn drive_single_frame_blackhole(
     }
 
     let mut bh = {
-        let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
+        let mut builder = metainterp_sd.blackholeinterpbuilder.borrow_mut();
         builder.debug_assert_cpu(cpu);
         for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
             *value = *forwarded;
@@ -347,7 +347,7 @@ pub fn drive_single_frame_blackhole(
     };
     metainterp_sd
         .blackholeinterpbuilder
-        .lock()
+        .borrow_mut()
         .release_interp(bh);
     result
 }
@@ -3585,32 +3585,36 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
-        let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
-        staticdata
+        let cpu = self.meta.blackhole_cpu();
+        self.meta
+            .staticdata
             .blackholeinterpbuilder
-            .lock()
-            .debug_assert_cpu(self.meta_interp().blackhole_cpu());
-        let mut pool =
-            crate::pyjitpl::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
-        let outcome = drive_multi_frame_blackhole(
-            &mut pool,
-            framestack,
-            layout.clone(),
-            vinfo_ptr,
-            virtualizable_ptr,
-            // PyFrame's operand-stack base; a state-field machine's
-            // `[.. ; virt]` array starts at 0 and a heap virtualizable reaches
-            // here with a null vinfo, so the base is never read.
-            0,
-            staticdata.as_ref(),
-            last_exc_value,
-            raising_exception,
-            per_frame,
-            on_enter_level,
-            on_leave_level,
-            jitdrivers_sd,
-            abort_banks.as_mut().map(|banks| banks.as_mut_slice()),
-        );
+            .borrow_mut()
+            .debug_assert_cpu(cpu);
+        let outcome = {
+            let mut pool = crate::pyjitpl::SharedBlackholeInterpPool::new(
+                &self.meta.staticdata.blackholeinterpbuilder,
+            );
+            drive_multi_frame_blackhole(
+                &mut pool,
+                framestack,
+                layout.clone(),
+                vinfo_ptr,
+                virtualizable_ptr,
+                // PyFrame's operand-stack base; a state-field machine's
+                // `[.. ; virt]` array starts at 0 and a heap virtualizable reaches
+                // here with a null vinfo, so the base is never read.
+                0,
+                self.meta.staticdata.as_ref(),
+                last_exc_value,
+                raising_exception,
+                per_frame,
+                on_enter_level,
+                on_leave_level,
+                jitdrivers_sd,
+                abort_banks.as_mut().map(|banks| banks.as_mut_slice()),
+            )
+        };
         let MultiFrameBlackholeResult { outcome, terminal } = outcome;
         if crate::majit_log_enabled() {
             eprintln!("[bh] abort-blackhole: convert_and_run → {:?}", outcome);
@@ -8148,11 +8152,9 @@ impl<S: JitState> JitDriver<S> {
             // retired the dispatch_one BC_INLINE_CALL legacy arm so an
             // empty builder would now panic on byte 17.
             // `convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`
-            // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
-            // the lock does not borrow `self.meta`.
+            // then `metainterp_sd.blackholeinterpbuilder`.
             // `BlackholeInterpBuilder.__init__` already copied cpu and
             // control opcodes; `acquire_interp` copies them. Do not rebind.
-            let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
             // jitframe is re-read through `ShadowRoot`; an off-heap
@@ -8179,25 +8181,27 @@ impl<S: JitState> JitDriver<S> {
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
             // in place. The decode borrows that table; it does not
-            // take a copy. Lock only for `setup_jitdrivers_sd` and the
+            // take a copy. `borrow_mut` only for `setup_jitdrivers_sd` and the
             // `blackhole_from_resumedata` acquire loop; drop it
             // before `resume_mainloop` so a nested resume can acquire
-            // from this same builder.
+            // from this same builder (`blackhole.py`
+            // `BlackholeInterpBuilder.acquire_interp`).
+            if self.state_field_layout.total_live_values() == 0 {
+                self.state_field_layout = state.state_field_layout();
+            }
+            let cpu = self.meta.blackhole_cpu();
+            let jitdrivers_sd = bh_jitdrivers_sd(&self.meta.staticdata);
             let (mut bh, vable_ptr) = {
-                let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-                bh_builder.debug_assert_cpu(self.meta_interp().blackhole_cpu());
+                let mut bh_builder = self.meta.staticdata.blackholeinterpbuilder.borrow_mut();
+                bh_builder.debug_assert_cpu(cpu);
                 // `blackhole_from_resumedata` below acquires one interpreter
                 // per resumed frame, and every frame that still has a caller
                 // takes `bhimpl_jit_merge_point`'s recursive-portal branch
                 // (blackhole.py), which indexes `jitdrivers_sd`
                 // directly. Seed the table from this staticdata; the builder
                 // is the one `finish_setup` installed.
-                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
                 if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                     bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-                }
-                if self.state_field_layout.total_live_values() == 0 {
-                    self.state_field_layout = state.state_field_layout();
                 }
                 if bh_builder.state_field_layout != self.state_field_layout {
                     bh_builder.state_field_layout = self.state_field_layout.clone();
@@ -8257,22 +8261,24 @@ impl<S: JitState> JitDriver<S> {
                     }
                 }
                 // `blackhole.py` `resume_in_blackhole` then `_run_forever`.
-                // The acquire lock above has already dropped, so a nested
+                // The acquire borrow above has already dropped, so a nested
                 // resume can pop another interpreter from this builder.
                 // `on_enter_level` / `on_leave_level` stay None: the compiled
                 // trace's own stores keep the frame chain right on this path.
-                let mut pool = crate::pyjitpl::SharedBlackholeInterpPool::new(
-                    &staticdata.blackholeinterpbuilder,
-                );
                 let mut terminal = self.meta.blackhole_terminal_scratch.take();
-                let outcome = crate::blackhole::resume_in_blackhole(
-                    &mut pool,
-                    bh,
-                    guard_exc,
-                    None,
-                    None,
-                    Some(&mut terminal),
-                );
+                let outcome = {
+                    let mut pool = crate::pyjitpl::SharedBlackholeInterpPool::new(
+                        &self.meta.staticdata.blackholeinterpbuilder,
+                    );
+                    crate::blackhole::resume_in_blackhole(
+                        &mut pool,
+                        bh,
+                        guard_exc,
+                        None,
+                        None,
+                        Some(&mut terminal),
+                    )
+                };
                 // `_run_forever` released the interpreter whose REF bank the
                 // image now owns, so nothing roots it. The arms below can
                 // allocate before they consume it (`restore_banked3` boxing a
@@ -8453,9 +8459,10 @@ impl<S: JitState> JitDriver<S> {
                         majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
                         let mut dest = self.meta.take_portal_resume_scratch();
                         std::mem::swap(&mut dest, args.as_mut());
-                        staticdata
+                        self.meta
+                            .staticdata
                             .blackholeinterpbuilder
-                            .lock()
+                            .borrow_mut()
                             .recycle_merge_point_args(args);
                         Some(continue_with_args(dest))
                     }

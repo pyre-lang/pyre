@@ -3799,7 +3799,7 @@ fn cash_multi_frame_blackhole(
     staged
         .metainterp_sd
         .blackholeinterpbuilder
-        .lock()
+        .borrow_mut()
         .debug_assert_cpu(unsafe { &*staged.cpu });
     let metainterp_sd = std::sync::Arc::clone(&staged.metainterp_sd);
     let mut mf_builder =

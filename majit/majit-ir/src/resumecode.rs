@@ -264,141 +264,80 @@ impl Writer {
 
 /// resumecode.py: Reader
 ///
-/// Holds the numbering slot and an index. Each item re-reads
-/// `numb.code[index]` (`numb_next_item`): one plain load of the payload
-/// cell. The byte pointer is not cached across an item. The consumer of
-/// an item can allocate, and a minor forwards `compile.py`
-/// `ResumeGuardDescr.rd_numb`.
+/// `code` is `Reader.code`, the NUMBERING GCREF. `numb_next_item` indexes
+/// `numb.code[index]` from that pointer. An interior byte pointer lives
+/// only inside one `next_item` (`decode_varint_at` does not allocate).
+/// `ResumeGuardDescr.rd_numb` holds the numbering; `bind_deadframe_root`
+/// pushes this field so a collection forwards it in place
+/// (`ResumeDataDirectReader.deadframe` uses the same protocol). Host
+/// blocks are process memory `NumberingRef` owns until drop, and they
+/// are not pushed.
 pub struct Reader<'a> {
-    code: &'a [u8],
-    /// `NumberingRef`'s slot address, copied at bind time. Zero means
-    /// reads use `code`.
-    slot: usize,
+    unbound: &'a [u8],
+    /// `resumecode.py` `Reader.code`.
+    code: crate::GcRef,
+    bound: bool,
+    from_gc: bool,
     _tie: std::marker::PhantomData<&'a NumberingRef>,
     pub cur_pos: usize,
     pub items_read: usize,
-    /// `resumecode.py` `Reader.code`: the numbering payload `numb_next_item`
-    /// indexes. A moving collection rewrites `NumSlot.addr`; `stable` is
-    /// set only when the rest of this reader's walk does not allocate, so
-    /// the pointer cannot go stale (`resume.py` `blackhole_from_resumedata`
-    /// with empty virtuals and pending fields).
-    payload_ptr: *const u8,
-    payload_len: usize,
-    stable: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(code: &'a [u8]) -> Self {
-        let (payload_ptr, payload_len) = Self::unbound_payload(code);
         Reader {
-            code,
-            slot: 0,
+            unbound: code,
+            code: crate::GcRef(0),
+            bound: false,
+            from_gc: false,
             _tie: std::marker::PhantomData,
             cur_pos: 0,
             items_read: 0,
-            payload_ptr,
-            payload_len,
-            // The unbound slice is not a GC numbering; it does not move.
-            stable: true,
         }
     }
 
-    /// Subsequent reads follow `numb` across a minor.
-    ///
-    /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
-    /// loads `numb.code[index]` from the GC pointer. That pointer is
-    /// `Reader.code`; it is not re-fetched from a side cell unless a
-    /// collection can rewrite it. `mark_payload_stable` pins it when
-    /// the remaining walk does not allocate.
+    /// `resumecode.py` `Reader.__init__`: `self.code = storage.rd_numb`.
+    /// `numb_next_item` then indexes that GCREF. Call before
+    /// `bind_deadframe_root` so the field is the one the collection
+    /// rewrites.
     pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
-        self.slot = numb.slot.as_ptr() as usize;
-        self.refresh_from_slot();
-        self.stable = false;
+        self.code = crate::GcRef(numb.payload_addr());
+        self.bound = true;
+        self.from_gc = !unsafe { numb.slot.as_ref().host };
     }
 
     pub fn from_numbering(numb: &'a NumberingRef) -> Self {
-        let mut reader = Reader {
-            code: &[],
-            slot: numb.slot.as_ptr() as usize,
-            _tie: std::marker::PhantomData,
-            cur_pos: 0,
-            items_read: 0,
-            payload_ptr: std::ptr::null(),
-            payload_len: 0,
-            stable: false,
-        };
-        reader.refresh_from_slot();
+        let mut reader = Reader::new(&[]);
+        reader.bind_numbering(numb);
         reader
     }
 
-    /// Pin `Reader.code` when the numbering cannot move.
-    ///
-    /// `numb_next_item` then indexes this pointer the way translated
-    /// `Reader.next_item` indexes `self.code` after the GC map has
-    /// already forwarded it. `incminimark.py` never moves old objects.
-    /// After the first minor, `collect_young_numberings`
-    /// (`collect_oldrefs_to_nursery`) has promoted
-    /// `compile.py` `ResumeGuardDescr.rd_numb` and the payload is old.
-    /// A still-young cell stays on `YOUNG_NUMBERINGS` and the next minor
-    /// rewrites `NumSlot.addr`; those reads keep following the slot.
-    /// Host blocks do not move.
+    /// MiniMark `NUMBERING` GCREF for `bind_deadframe_root`. Host blocks
+    /// and the unbound slice are not GCREFs.
     #[inline]
-    pub fn mark_payload_stable(&mut self) {
-        if self.slot != 0 {
-            self.refresh_from_slot();
-            let slot = unsafe { &*(self.slot as *const NumSlot) };
-            self.stable = slot.host || slot.young_index.load(Ordering::Relaxed) == usize::MAX;
-            #[cfg(debug_assertions)]
-            if self.stable {
-                let (ptr, len) = self.payload_from_slot();
-                debug_assert_eq!(ptr, self.payload_ptr);
-                debug_assert_eq!(len, self.payload_len);
-            }
+    pub fn has_gc_code(&self) -> bool {
+        self.from_gc && self.code.0 != 0
+    }
+
+    /// The `Reader.code` field `push_resume_ref_root` rewrites.
+    #[inline]
+    pub fn gc_code_mut(&mut self) -> Option<&mut crate::GcRef> {
+        if self.has_gc_code() {
+            Some(&mut self.code)
         } else {
-            self.stable = true;
+            None
         }
     }
 
-    #[inline]
-    pub fn payload_is_stable(&self) -> bool {
-        self.stable
-    }
-
-    #[inline(always)]
-    fn refresh_from_slot(&mut self) {
-        let (ptr, len) = self.payload_from_slot();
-        self.payload_ptr = ptr;
-        self.payload_len = len;
-    }
-
-    /// Payload `(bytes, len)`. Reloads the slot's address word unless
-    /// `stable` holds `Reader.code`. A null payload is the empty numbering.
+    /// `numb.code` when bound (`numb_next_item`); otherwise the slice
+    /// `Reader::new` borrowed.
     #[inline(always)]
     fn payload(&self) -> (*const u8, usize) {
-        if self.stable {
-            return (self.payload_ptr, self.payload_len);
+        if self.bound {
+            payload_parts(self.code.0)
+        } else {
+            (self.unbound.as_ptr(), self.unbound.len())
         }
-        if self.slot != 0 {
-            return self.payload_from_slot();
-        }
-        Self::unbound_payload(self.code)
-    }
-
-    /// `resumecode.py` `numb_next_item`: `numb.code` is the GC numbering.
-    #[inline(always)]
-    fn payload_from_slot(&self) -> (*const u8, usize) {
-        let addr = unsafe {
-            (*(self.slot as *const NumSlot))
-                .addr
-                .load(Ordering::Relaxed)
-        };
-        payload_parts(addr)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn unbound_payload(code: &[u8]) -> (*const u8, usize) {
-        (code.as_ptr(), code.len())
     }
 
     #[inline(always)]
@@ -420,18 +359,19 @@ impl<'a> Reader<'a> {
     }
 
     /// `numb_next_item` after `bind_numbering` / `from_numbering`.
-    /// The unbound slice arm stays on `next_item` for tests.
+    /// An empty numbering never reaches this path.
     #[inline(always)]
     pub fn next_item_bound(&mut self) -> i32 {
+        let addr = self.code.0;
+        debug_assert!(self.bound && addr != 0);
+        // SAFETY: `bind_numbering` stored a live `NUMBERING` payload;
+        // `resumecode.py` `numb_next_item` indexes `numb.code` from that
+        // pointer. An empty numbering never reaches this path.
+        let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
         #[cfg(debug_assertions)]
-        if self.slot == 0 {
-            return self.next_item();
-        }
-        let (ptr, len) = if self.stable {
-            (self.payload_ptr, self.payload_len)
-        } else {
-            self.payload_from_slot()
-        };
+        let len = unsafe { *(addr as *const usize) };
+        #[cfg(not(debug_assertions))]
+        let len = 0usize;
         self.take_item(ptr, len)
     }
 
@@ -953,17 +893,17 @@ mod tests {
     }
 
     #[test]
-    fn reader_stable_payload_matches_per_item_reload() {
-        // `Reader.code` pinned: `numb_next_item` indexes the same bytes
-        // `next_item` reloads from `NumSlot.addr`.
+    fn reader_indexes_numbering_like_numb_next_item() {
+        // `resumecode.py` `Reader.next_item` is `numb_next_item(self.code, self.cur_pos)`.
         let numb = create_numbering(&[1, -2, 3, 64, -128, 255]);
-        let mut moving = Reader::from_numbering(&numb);
-        let mut stable = Reader::from_numbering(&numb);
-        stable.mark_payload_stable();
-        while moving.has_more() {
-            assert_eq!(stable.next_item_bound(), moving.next_item());
+        let mut reader = Reader::from_numbering(&numb);
+        let buf = numb.as_slice();
+        let mut index = 0;
+        while reader.has_more() {
+            let (expected, next) = numb_next_item(buf, index);
+            assert_eq!(reader.next_item_bound(), expected);
+            index = next;
         }
-        assert_eq!(stable.items_read, moving.items_read);
-        assert!(!stable.has_more());
+        assert_eq!(index, buf.len());
     }
 }

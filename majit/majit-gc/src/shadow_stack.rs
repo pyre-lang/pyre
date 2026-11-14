@@ -2134,9 +2134,9 @@ impl ResumeRefRoots {
 ///
 /// # Safety
 /// The slot must remain alive and stationary until `pop_resume_ref_roots_to`.
-#[track_caller]
+#[inline]
 pub unsafe fn push_resume_ref_root(slot: &mut GcRef) {
-    assert!(
+    debug_assert!(
         !crate::gc_is_nursery_object(slot as *mut GcRef as usize),
         "GC BUG: resume root field points inside the movable nursery",
     );
@@ -2165,16 +2165,16 @@ pub unsafe fn push_resume_ref_root(slot: &mut GcRef) {
 /// blackhole frame's `registers_r` are stable after allocation
 /// (`prepare_virtuals` / `setposition` size them once; later fills only
 /// index), so the captured pointer stays valid for the whole window.
+#[inline]
 #[track_caller]
 pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
-    if !slice.is_empty() && crate::gc_is_nursery_object(slice.as_ptr() as usize) {
-        panic!(
-            "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
-            slice.as_ptr() as usize,
-            slice.len(),
-            std::panic::Location::caller(),
-        );
-    }
+    debug_assert!(
+        slice.is_empty() || !crate::gc_is_nursery_object(slice.as_ptr() as usize),
+        "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
+        slice.as_ptr() as usize,
+        slice.len(),
+        std::panic::Location::caller(),
+    );
     if crate::gc_nursery_poison_enabled() {
         const NURSERY_POISON_WORD: i64 = ((usize::MAX / 0xff) * 0xaa) as i64;
         if let Some(index) = slice.iter().position(|&value| value == NURSERY_POISON_WORD) {

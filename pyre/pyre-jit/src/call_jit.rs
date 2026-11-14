@@ -3263,13 +3263,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     use majit_metainterp::resume;
 
     // `blackhole.py` `resume_in_blackhole` uses
-    // `metainterp_sd.blackholeinterpbuilder`. Lock only for acquire/release
-    // and chain construction; `bh.run()` drops it so a nested resume pops
-    // another interpreter off the same builder.
+    // `metainterp_sd.blackholeinterpbuilder`. `borrow_mut` only for
+    // acquire/release and chain construction; `bh.run()` drops it so a
+    // nested resume pops another interpreter off the same builder.
     let (driver, driver_vinfo) = crate::eval::driver_pair();
     let staticdata = std::sync::Arc::clone(&driver.meta_interp().staticdata);
     let release_bh_rd = |bh: Box<majit_metainterp::blackhole::BlackholeInterpreter>| {
-        staticdata.blackholeinterpbuilder.lock().release_interp(bh);
+        staticdata
+            .blackholeinterpbuilder
+            .borrow_mut()
+            .release_interp(bh);
     };
 
     // `resume.py` `blackhole_from_resumedata` indexes `jitcodes[jitcode_pos]`,
@@ -3356,10 +3359,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // per-driver pick is needed. Snapshot once per call so the slice outlives
     // ResumeDataDirectReader.
     let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-    // Lock only for `blackhole_from_resumedata` chain construction;
+    // `borrow_mut` only for `blackhole_from_resumedata` chain construction;
     // `bh.run()` below must not hold it.
     let bh = {
-        let mut builder = staticdata.blackholeinterpbuilder.lock();
+        let mut builder = staticdata.blackholeinterpbuilder.borrow_mut();
         builder.debug_assert_cpu(driver.meta_interp().blackhole_cpu());
         resume::blackhole_from_resumedata_with(
             &mut builder,
@@ -9612,9 +9615,8 @@ pub fn cranelift_resumedata_deopt(
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
     // Keep the `NumberingRef`. The payload slice is taken immediately
-    // before the reader is built: a minor in between would leave the
-    // header decoded from from-space while `bind_numbering` reloads
-    // `numb.code` per item (`resumecode.py` `numb_next_item`).
+    // before the reader is built so the header and `Reader.code` name
+    // the same `NUMBERING` (`resumecode.py` `numb_next_item`).
     let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };
@@ -9658,11 +9660,11 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
-    let mut reader = reader.bind_deadframe_root();
-    // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
-    // collection. `prepare_resume_heap_with_roots` materializes virtuals
-    // and can minor-collect. Same bind as `blackhole_from_resumedata`.
+    // `resumecode.py` `Reader.__init__` stores `storage.rd_numb` before
+    // `_prepare`. `bind_deadframe_root` then traces `Reader.code` so
+    // `prepare_resume_heap_with_roots` can collect.
     reader.resumecodereader.bind_numbering(numb);
+    let mut reader = reader.bind_deadframe_root();
 
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame

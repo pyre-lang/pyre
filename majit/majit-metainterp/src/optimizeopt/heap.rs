@@ -43,7 +43,7 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
 }
 
 use majit_ir::{
-    DescrRef, IndexMapExt, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value, descr::descr_identity,
+    DescrRef, IndexMapExt, OopSpecIndex, Op, OpCode, OpRc, Value, descr::descr_identity,
 };
 use std::sync::Arc;
 
@@ -794,10 +794,10 @@ pub struct OptHeapState {
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
     /// Postponed operation: held back until the next GUARD_NO_EXCEPTION.
-    /// RPython heap.py: `postponed_op` — delays emission of operations
-    /// that may raise (CALL_MAY_FORCE, comparison ops) until we see
-    /// a GUARD_NO_EXCEPTION, ensuring correct exception semantics.
-    postponed_op: Option<Op>,
+    /// `heap.py postponed_op = op` keeps the op object itself
+    /// (`pure.py postponed_op: Option<OpRc>`), so a later
+    /// `emit_extra(postponed_op, emit=False)` appends that same box.
+    postponed_op: Option<OpRc>,
     // ── Aliasing analysis state — RPython: PtrInfo flags ──
     seen_allocation: BitSet,
     /// heapcache.py `_check_flag(box, HF_IS_UNESCAPED)` — the set of
@@ -1879,7 +1879,20 @@ impl OptHeapState {
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
         if needs_postponed && let Some(p) = self.postponed_op.take() {
-            self.emit_extra(opt, OpRc::new(p), ctx);
+            self.emit_extra(opt, p, ctx);
+        }
+    }
+
+    /// `heap.py self.postponed_op = op` keeps the op object itself.
+    /// A previous pass's Replace mints once and `replace_op_with`s the
+    /// walked-in producer onto it (`pure.py postponed_received_nextop`).
+    fn postpone_held_op(op: &Op, op_rc: &OpRc) -> OpRc {
+        if std::ptr::eq(op, op_rc.as_ref()) {
+            op_rc.clone()
+        } else {
+            let created = OpRc::new(op.clone());
+            OptContext::link_replaced_producer(op_rc, &created);
+            created
         }
     }
 
@@ -2395,7 +2408,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 self.emit_lazy_setfield(opt, &lazy_op, ctx);
@@ -2685,7 +2698,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
@@ -2856,7 +2869,7 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        self.emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, p, ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
@@ -3020,7 +3033,7 @@ impl OptHeapState {
                         if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
-                            self.emit_extra(opt, OpRc::new(p), ctx);
+                            self.emit_extra(opt, p, ctx);
                         }
                     }
                     self.emit_lazy_setfield(opt, &lazy_op, ctx);
@@ -3539,7 +3552,7 @@ impl OptHeapState {
                 // residuals carry `effectinfo_from_writeanalyze` descrs.
                 self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
-                self.postponed_op = Some(op.clone());
+                self.postponed_op = Some(Self::postpone_held_op(op, op_rc));
                 if Self::call_has_random_effects(op) {
                     self.force_all_lazy_sets(opt, ctx);
                     self.clean_caches(ctx);
@@ -3605,10 +3618,9 @@ impl OptHeapState {
                 //     structvalue = self.ensure_ptr_info_arg0(op)
                 //     if not structvalue.is_constant():
                 //         return
-                // `get_box_replacement_operand_opt` + `get_constant_ptr_box`
-                // skipped the dep block when the ConstPtr lived on the
-                // replacement chain that `ensure_ptr_info_arg0` already
-                // answers (`optimizer.py` `ensure_ptr_info_arg0`).
+                // A ConstPtr on the replacement chain is already what
+                // `ensure_ptr_info_arg0` answers (`optimizer.py`
+                // `ensure_ptr_info_arg0`).
                 let structvalue = ctx.ensure_ptr_info_arg0(op);
                 let struct_ptr = if structvalue.is_constant() {
                     match structvalue {
@@ -3813,7 +3825,7 @@ impl OptHeapState {
                         op.pos().get()
                     );
                 }
-                self.emit_extra(opt, OpRc::new(postponed), ctx);
+                self.emit_extra(opt, postponed, ctx);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3822,10 +3834,10 @@ impl OptHeapState {
             OptimizationResult::Emit(emit_op)
                 if emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf() =>
             {
-                Some(emit_op.clone())
+                Some(Self::postpone_held_op(emit_op, op_rc))
             }
             OptimizationResult::PassOn if op.opcode.is_comparison() || op.opcode.is_ovf() => {
-                Some(op.clone())
+                Some(Self::postpone_held_op(op, op_rc))
             }
             _ => None,
         };
@@ -3885,7 +3897,7 @@ impl OptHeapState {
         self.corresponding_array_descrs.clear();
         self.force_all_lazy_sets(opt, ctx);
         if let Some(postponed) = self.postponed_op.take() {
-            self.emit_extra(opt, OpRc::new(postponed), ctx);
+            self.emit_extra(opt, postponed, ctx);
         }
     }
 
@@ -4909,7 +4921,6 @@ mod tests {
         let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(Some(size.clone()), None));
         let class_a = Operand::from_opref(OpRef::const_ptr(GcRef(0xaaa)));
         let map_word = Operand::from_opref(OpRef::const_int(0xbbb));
@@ -5014,7 +5025,6 @@ mod tests {
         let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(Some(size.clone()), None));
         let class_b = OpRef::const_ptr(GcRef(0xbbb));
         let tf = OpRef::const_ptr(GcRef(0xccc));
@@ -5114,7 +5124,6 @@ mod tests {
         let heap = OptHeap::new();
         let mut ctx = OptContext::new(256);
         let obj = rooted_resop_operand(Type::Ref, 10);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
         ctx.set_ptr_info(&obj, PtrInfo::instance(None, None));
         let const_code = Operand::from_opref(OpRef::const_ptr(GcRef(0xaaa)));
         let replay = Op::with_descr(
@@ -5166,23 +5175,21 @@ mod tests {
         ctx: &mut OptContext,
         object: &Operand,
         descr: &DescrRef,
-        source: OpRef,
-        resolved: OpRef,
+        source: &Operand,
+        resolved: &Operand,
         opcode: OpCode,
     ) {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
-        ctx.seed_boxes_canonical(std::slice::from_ref(object));
-        let preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
-        preamble_op.pos().set(source);
-        let resolved_box = bound_arg(resolved);
+        let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
+        preamble_op.pos().set(source.to_opref());
         ctx.initialize_imported_short_preamble_builder(
-            &[object.clone(), resolved_box.clone()],
-            &[object.clone(), resolved_box.clone()],
+            &[object.clone(), resolved.clone()],
+            &[object.clone(), resolved.clone()],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: OpRc::new(preamble_op.clone()),
                 source_op: None,
-                res: bound_arg(source),
+                res: source.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -5195,7 +5202,7 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
-                    op: bound_arg(source),
+                    op: source.clone(),
                     invented_name: false,
                     preamble_op: OpRc::new(preamble_op),
                     same_as_source: None,
@@ -5203,7 +5210,7 @@ mod tests {
             );
         })
         .unwrap();
-        heap.import_cached_fields(&[(object.clone(), descr.clone(), resolved_box)], ctx);
+        heap.import_cached_fields(&[(object.clone(), descr.clone(), resolved.clone())], ctx);
     }
 
     /// Call descriptor with default EffectInfo (non-random, non-elidable).
@@ -5333,17 +5340,16 @@ mod tests {
         // `inputarg_from_tp(arg.type)` per opencoder.py:259 — base is a Ref
         // pointer, cached_value is the Int field result of GetfieldGcI.
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Int]);
-        let p0 = OpRef::input_arg_typed(0, Type::Ref);
-        let p0_box = bound_arg(p0);
-        let p1 = OpRef::input_arg_typed(1, Type::Int);
-        let cached_op_key = OpRef::int_op(100);
+        let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        let p1_box = bound_arg(OpRef::input_arg_typed(1, Type::Int));
+        let cached_op_key = rooted_resop_operand(Type::Int, 100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
             &p0_box,
             &d,
-            cached_op_key,
-            p1,
+            &cached_op_key,
+            &p1_box,
             OpCode::GetfieldGcI,
         );
 
@@ -5352,7 +5358,6 @@ mod tests {
         op.pos().set(pos2);
 
         let op_rc = OpRc::new(op.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = heap
             .state
             .borrow_mut()
@@ -5360,7 +5365,11 @@ mod tests {
             .expect("OptHeap state taken")
             .optimize_getfield(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement_opref(pos2), p1);
+        assert!(
+            Operand::from_bound_op(&op_rc)
+                .get_box_replacement(false)
+                .same_box(&p1_box)
+        );
     }
 
     /// shortpreamble.py `HeapOp.add_op_to_short` builds its replay op on
@@ -5375,11 +5384,10 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let p0 = OpRef::input_arg_typed(0, Type::Ref);
         let p0_box = bound_arg(p0);
-        ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
         let outer_pos = OpRef::ref_op(100);
         let inner_pos = OpRef::ref_op(101);
-        let outer_box = ctx.materialize_operand_at(outer_pos);
-        let inner_box = ctx.materialize_operand_at(inner_pos);
+        let outer_box = rooted_resop_operand(Type::Ref, 100);
+        let inner_box = rooted_resop_operand(Type::Ref, 101);
         let heap_entry = |op: Op, res: &Operand| {
             let preamble_op = OpRc::new(op.clone());
             let replay_box = Operand::from_bound_op(&preamble_op);
@@ -5447,17 +5455,16 @@ mod tests {
         // `inputarg_from_tp(arg.type)` per opencoder.py:259 — base and
         // cached_value are both Ref (GetfieldGcR result type).
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
-        let p0 = OpRef::input_arg_typed(0, Type::Ref);
-        let p0_box = bound_arg(p0);
-        let p1 = OpRef::input_arg_typed(1, Type::Ref);
-        let cached_op_key = OpRef::int_op(100);
+        let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        let p1_box = bound_arg(OpRef::input_arg_typed(1, Type::Ref));
+        let cached_op_key = rooted_resop_operand(Type::Int, 100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
             &p0_box,
             &d_head,
-            cached_op_key,
-            p1,
+            &cached_op_key,
+            &p1_box,
             OpCode::GetfieldGcR,
         );
 
@@ -5466,7 +5473,6 @@ mod tests {
         let op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d_head.clone());
         op1.pos().set(pos2);
         let op1_rc = OpRc::new(op1.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
         let result1 = heap
             .state
             .borrow_mut()
@@ -5474,7 +5480,11 @@ mod tests {
             .expect("OptHeap state taken")
             .optimize_getfield(&op1, &op1_rc, &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement_opref(pos2), p1);
+        assert!(
+            Operand::from_bound_op(&op1_rc)
+                .get_box_replacement(false)
+                .same_box(&p1_box)
+        );
 
         // A call invalidates all mutable field caches.
         heap.state
@@ -5615,7 +5625,6 @@ mod tests {
         let heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
-        ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
         ctx.set_ptr_info(&p0_box, seed);
 
         let mut folded = false;
@@ -5624,7 +5633,6 @@ mod tests {
             let op = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d.clone());
             op.pos().set(pos);
             let op_rc = OpRc::new(op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&op_rc));
             folded = matches!(
                 heap.state
                     .borrow_mut()
@@ -6257,7 +6265,6 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, val]);
 
         let pass = OptHeap::new();
         pass.setup();
@@ -6267,17 +6274,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -6309,51 +6306,32 @@ mod tests {
     #[test]
     fn test_getarrayitem_gc_pure_constant_miss_is_not_cached() {
         let d = descr(0);
-        let idx = OpRef::int_op(50);
+        let arr = rooted_resop_operand(Type::Int, 100);
+        let idx = rooted_resop_operand(Type::Int, 50);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetarrayitemGcPureI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcPureI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_operand_at(idx);
         // The index argument is the box the constant is attached to.
-        for op in &mut ops[..2] {
-            op.setarg(1, b.clone());
-        }
-        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let pass = OptHeap::new();
+        ctx.make_constant_box(&idx, majit_ir::Value::Int(3));
+        let mut pass = OptHeap::new();
         pass.setup();
         for op in &ops {
             let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             match pass.propagate_forward(
@@ -6389,20 +6367,14 @@ mod tests {
     #[test]
     fn arrayitem_key_rejects_a_negative_constant_index() {
         let d = descr(0);
-        let idx = OpRef::int_op(50);
-        let op = Op::with_descr(
+        let idx = rooted_resop_operand(Type::Int, 50);
+        let mut op = Op::with_descr(
             OpCode::GetarrayitemGcPureI,
-            &[
-                rooted_resop_operand(Type::Int, 100),
-                rooted_resop_operand(Type::Int, idx.raw()),
-            ],
+            &[rooted_resop_operand(Type::Int, 100), idx.clone()],
             d,
         );
         let mut ctx = OptContext::new(1);
-        let b = ctx.materialize_operand_at(idx);
-        // The index argument is the box the constant is attached to.
-        op.setarg(1, b.clone());
-        ctx.make_constant_box(&b, majit_ir::Value::Int(-1));
+        ctx.make_constant_box(&idx, majit_ir::Value::Int(-1));
         assert!(OptHeapState::arrayitem_key(&op, &mut ctx).is_none());
     }
 
@@ -6440,17 +6412,7 @@ mod tests {
             let resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             match pass.propagate_forward(
@@ -6519,34 +6481,22 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
-        let r1_pos = ops[0].pos().get();
-        let r2_pos = ops[2].pos().get();
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        let r1_box = Operand::from_bound_op(&ops[0]);
+        let r2_box = Operand::from_bound_op(&ops[2]);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, new_val_box.clone()]);
 
         let pass = OptHeap::new();
         pass.setup();
 
-        for op in &ops {
-            let resolved = op.clone();
-            for i in 0..resolved.num_args() {
-                let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
-                resolved.setarg(i, rb);
+        for op_rc in &ops {
+            for i in 0..op_rc.num_args() {
+                let arg = op_rc.arg(i);
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
+                op_rc.setarg(i, rb);
             }
-            let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
+            match pass.propagate_forward(op_rc, op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6555,7 +6505,7 @@ mod tests {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
-                    ctx.emit_rc(op_rc);
+                    ctx.emit_rc(op_rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -6568,10 +6518,10 @@ mod tests {
         // load would have CSE'd r2 → r1 across the write (the read-after-write
         // miscompile `pure_listload_raw.py` guards against), so this `!=` is
         // the decisive non-pure property that keeps list element loads correct.
-        let r2_repl = ctx.get_replacement_opref(r2_pos);
-        let _ = new_val_box;
-        assert_ne!(
-            r2_repl, r1_pos,
+        assert!(
+            !r2_box
+                .get_box_replacement(false)
+                .same_box(&r1_box.get_box_replacement(false)),
             "non-pure getarrayitem must NOT be CSE'd to the pre-write read"
         );
         // A live `GetarrayitemGcR` survives the optimization (the write did not
@@ -6593,7 +6543,6 @@ mod tests {
         let arr = rooted_resop_operand(Type::Ref, 100);
         let idx = rooted_resop_operand(Type::Int, 50);
         let new_val_box = rooted_resop_operand(Type::Int, 102);
-        let new_val = new_val_box.to_opref();
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
@@ -6613,34 +6562,22 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
-        let r1_pos = ops[0].pos().get();
-        let r2_pos = ops[2].pos().get();
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        let r1_box = Operand::from_bound_op(&ops[0]);
+        let r2_box = Operand::from_bound_op(&ops[2]);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, idx, new_val_box]);
 
         let pass = OptHeap::new();
         pass.setup();
 
-        for op in &ops {
-            let resolved = op.clone();
-            for i in 0..resolved.num_args() {
-                let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
-                resolved.setarg(i, rb);
+        for op_rc in &ops {
+            for i in 0..op_rc.num_args() {
+                let arg = op_rc.arg(i);
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
+                op_rc.setarg(i, rb);
             }
-            let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
+            match pass.propagate_forward(op_rc, op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6649,7 +6586,7 @@ mod tests {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
-                    ctx.emit_rc(op_rc);
+                    ctx.emit_rc(op_rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -6657,15 +6594,15 @@ mod tests {
             }
         }
 
-        let r2_repl = ctx.get_replacement_opref(r2_pos);
-        assert_ne!(
-            r2_repl, r1_pos,
+        let r2_repl = r2_box.get_box_replacement(false);
+        assert!(
+            !r2_repl.same_box(&r1_box.get_box_replacement(false)),
             "post-write GetarrayitemGcI must not CSE to the pre-write raw"
         );
         // heap.py cache_varindex_write can replace the load with `new_val`;
         // a surviving GetarrayitemGcI is also correct if SETARRAYITEM emitted.
         assert!(
-            r2_repl == new_val
+            r2_repl.same_box(&new_val_box)
                 || ctx
                     .new_operations
                     .iter()
@@ -6686,6 +6623,7 @@ mod tests {
             d.clone(),
         );
         op.pos().set(OpRef::int_op(200));
+        let op_rc = OpRc::new(op.clone());
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
@@ -6694,14 +6632,15 @@ mod tests {
         let pass = OptHeap::new();
         pass.setup();
 
-        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
+        let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         let arr_box = array_box.get_box_replacement(false);
-        assert_eq!(
+        assert!(
             ctx.peek_ptr_info(&arr_box)
                 .and_then(|info| info.getitem(3))
-                .and_then(|e| e.as_opref()),
-            Some(OpRef::int_op(200))
+                .and_then(|e| e.as_value())
+                .is_some_and(|v| v.same_box(&Operand::from_bound_op(&op_rc))),
+            "getarrayitem must write the result box into ArrayPtrInfo._items[3]"
         );
     }
 
@@ -6723,7 +6662,6 @@ mod tests {
         );
 
         let mut ctx = OptContext::new(256);
-        ctx.seed_boxes_canonical(&[arr.clone(), rhs]);
         ctx.set_ptr_info(&arr, PtrInfo::virtual_array(d.clone(), 8, false));
 
         let pass = OptHeap::new();
@@ -6745,14 +6683,13 @@ mod tests {
         // After flush() the lazy set is forced and PtrInfo._items[3]
         // becomes the rhs value via put_field_back_to_info.
         pass.flush(&mut None, &mut ctx);
-        let arr_box = ctx
-            .get_box_replacement_operand_opt(OpRef::int_op(100))
-            .expect("array box");
-        assert_eq!(
+        let arr_box = arr.get_box_replacement(false);
+        assert!(
             ctx.peek_ptr_info(&arr_box)
                 .and_then(|info| info.getitem(3))
-                .and_then(|e| e.as_opref()),
-            Some(OpRef::int_op(101))
+                .and_then(|e| e.as_value())
+                .is_some_and(|v| v.same_box(&rhs)),
+            "flush must write the rhs box into ArrayPtrInfo._items[3]"
         );
     }
 
@@ -7070,7 +7007,6 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, val1, val2]);
 
         let pass = OptHeap::new();
         pass.setup();
@@ -7080,17 +7016,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -7407,9 +7333,6 @@ mod tests {
             val101.clone(),
         ]);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
-        // Register the objects the cache already names, before
-        // add_short_input_arg consumes those interned boxes.
-        ctx.seed_boxes_canonical(&[pos100.clone(), val101.clone()]);
         sb.add_short_input_arg(&mut ctx, pos100.clone());
         sb.add_short_input_arg(&mut ctx, val101.clone());
         use crate::optimizeopt::info::PtrInfo;
@@ -7785,10 +7708,6 @@ mod tests {
         ops[0] = (*new_array).clone();
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[len, val, func]);
-        // The array operand is the NewArray producer. Register it as the
-        // live synthetic so emit forwards that same object to the emitted op.
-        ctx.bind_input_resops(std::slice::from_ref(&new_array));
 
         let pass = OptHeap::new();
         pass.setup();
@@ -7798,17 +7717,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -8798,26 +8707,13 @@ mod tests {
         ctx.snapshot_boxes = snapshots;
         let pass = OptHeap::new();
         pass.setup();
-        // The variable index is the operand the ops carry, so getintbound
-        // installs its IntBound on that same object.
-        ctx.seed_boxes_canonical(&[arr, idx_box, func]);
 
         for op in &ops {
             let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -8885,24 +8781,13 @@ mod tests {
         ctx.snapshot_boxes = snapshots;
         let pass = OptHeap::new();
         pass.setup();
-        ctx.seed_boxes_canonical(&[arr, idx_box, func]);
 
         for op in &ops {
             let resolved = op.clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -9109,7 +8994,6 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, val]);
 
         let pass = OptHeap::new();
         pass.setup();
@@ -9119,17 +9003,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -9181,7 +9055,6 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        ctx.seed_boxes_canonical(&[arr, val]);
 
         let pass = OptHeap::new();
         pass.setup();
@@ -9191,17 +9064,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -9258,11 +9121,6 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        // The optimizer's real input-op seed makes position lookup resolve to
-        // this same receiver Box. Model that producer edge explicitly; a bare
-        // synthetic ResOp is otherwise absent from the context's OpRef store.
-        let positional_array = ctx.materialize_operand_at(array_box.to_opref());
-        ctx.make_equal_to(&positional_array, &array_box);
         ctx.make_constant_box(&index_box, majit_ir::Value::Int(3));
 
         let pass = OptHeap::new();
@@ -9273,17 +9131,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let __ar = arg.to_opref();
-                        if __ar.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
-                        }
-                    }
-                };
+                let rb = ctx.resolve_operand_operand_opt(&arg).unwrap_or(arg);
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
@@ -9367,11 +9215,9 @@ mod tests {
         use crate::optimizeopt::OptContext;
 
         let mut ctx = OptContext::with_inputarg_types(64, &[Type::Ref]);
-        let first_ref = ctx.make_constant_ref(majit_ir::GcRef(0x1000));
-        let second_ref = ctx.make_constant_ref(majit_ir::GcRef(0x2000));
-        let first = ctx.materialize_operand_at(first_ref);
-        let second = ctx.materialize_operand_at(second_ref);
-        let unknown = ctx.materialize_operand_at(OpRef::input_arg_typed(0, Type::Ref));
+        let first = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
+        let second = Operand::const_from_value(majit_ir::Value::Ref(majit_ir::GcRef(0x2000)));
+        let unknown = ctx.inputargs[0].clone();
 
         assert!(
             super::cannot_alias_via_constants(&mut ctx, &first, &second),
@@ -9401,15 +9247,13 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(64, &[Type::Ref, Type::Ref]);
 
         let arr_descr = descr(50);
-        let op1 = OpRef::input_arg_typed(0, Type::Ref);
-        let op2 = OpRef::input_arg_typed(1, Type::Ref);
 
         let const_10 = ctx.make_constant_int(10);
         let const_20 = ctx.make_constant_int(20);
         let const_30 = ctx.make_constant_int(30);
 
-        let op1_box = ctx.materialize_operand_at(op1);
-        let op2_box = ctx.materialize_operand_at(op2);
+        let op1_box = ctx.inputargs[0].clone();
+        let op2_box = ctx.inputargs[1].clone();
         ctx.set_ptr_info(
             &op1_box,
             PtrInfo::Array(ArrayPtrInfo {
@@ -9552,13 +9396,14 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
+        let op1_rc = OpRc::new(op1.clone());
         assert!(
             !heap
                 .state
                 .borrow_mut()
                 .as_mut()
                 .expect("OptHeap state taken")
-                ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx)
+                ._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx)
         );
 
         // Second lookup with same dict+key — should be cached.
@@ -9576,7 +9421,6 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(
             heap.state
                 .borrow_mut()
@@ -9584,7 +9428,11 @@ mod tests {
                 .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
-        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
+        assert!(
+            Operand::from_bound_op(&op2_rc)
+                .get_box_replacement(false)
+                .same_box(&Operand::from_bound_op(&op1_rc))
+        );
         assert!(
             heap.state
                 .borrow_mut()
@@ -9660,7 +9508,6 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(
             heap.state
                 .borrow_mut()
@@ -9668,7 +9515,11 @@ mod tests {
                 .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
-        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
+        assert!(
+            Operand::from_bound_op(&op2_rc)
+                .get_box_replacement(false)
+                .same_box(&Operand::from_bound_op(&op1_rc))
+        );
     }
 
     /// heap.py parity: clean_caches clears cached_dict_reads.
@@ -9807,13 +9658,14 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
+        let op1_rc = OpRc::new(op1.clone());
         assert!(
             !heap
                 .state
                 .borrow_mut()
                 .as_mut()
                 .expect("OptHeap state taken")
-                ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx)
+                ._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx)
         );
 
         // Same value via a different const slot — must hit the cache.
@@ -9831,7 +9683,6 @@ mod tests {
         op2.setdescr(descr.clone());
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(
             heap.state
                 .borrow_mut()
@@ -9839,7 +9690,11 @@ mod tests {
                 .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
-        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
+        assert!(
+            Operand::from_bound_op(&op2_rc)
+                .get_box_replacement(false)
+                .same_box(&Operand::from_bound_op(&op1_rc))
+        );
     }
 
     /// optimizer.py parity: every Optimization.emit overwrite path —
