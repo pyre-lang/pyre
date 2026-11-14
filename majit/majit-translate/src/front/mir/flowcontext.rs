@@ -2192,6 +2192,7 @@ impl<'a> Lowering<'a> {
                             .split("::")
                             .map(str::to_string)
                             .collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },

@@ -778,6 +778,7 @@ fn emit_ll_arraycopy_call(
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["ll_arraycopy".into()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -976,6 +977,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
@@ -1029,6 +1031,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
@@ -1182,6 +1185,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1208,6 +1212,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1221,6 +1226,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
@@ -1253,6 +1259,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into(), suffix],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1291,6 +1298,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },

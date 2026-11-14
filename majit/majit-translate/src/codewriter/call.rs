@@ -137,6 +137,7 @@ fn call_is_access_directly_identity(kind: &OpKind) -> bool {
     let origin_kind = OpKind::Call {
         target: CallTarget::FunctionPath {
             segments: segments.clone(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: GraphSpecialization::Regular,
         },
@@ -3351,8 +3352,7 @@ impl StoreCore {
     /// The graph of the funcobj `path` names, built on first demand.
     pub(crate) fn get(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
         let slot = self.slot_for(path)?;
-        let graph = self.slot_graph(&slot)?.graph.clone();
-        Some(graph)
+        Some(self.slot_graph(&slot)?.graph.clone())
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
@@ -3440,6 +3440,67 @@ impl StoreCore {
     #[cfg(test)]
     pub(crate) fn keys(&self) -> Vec<CallPath> {
         self.iter().into_iter().map(|(path, _)| path).collect()
+    }
+
+    /// FunctionPath calls whose stamped `resolved_path` is not a graph
+    /// in this store. Spec copies must alias that identity onto the
+    /// harvest graph (`Bookkeeper.getdesc`). Walks already-built slots
+    /// only: `iter` / `get` would build residual funcobjs.
+    ///
+    /// The bool is whether the call's harvest `segments` path *is*
+    /// registered: then identity is missing on a graph that exists
+    /// (a registration gap). Residual externals have harvest unregistered
+    /// too; lookup falls back to `segments` as HEAD did.
+    pub(crate) fn unregistered_function_path_resolved(&self) -> Vec<(Vec<String>, CallPath, bool)> {
+        self.register_declared();
+        let mut seen = std::collections::HashSet::new();
+        let mut built = Vec::new();
+        {
+            let graphs = self.graphs.borrow();
+            for slot in graphs.values() {
+                let Some(Some(built_slot)) = slot.graph.get() else {
+                    continue;
+                };
+                let ptr = std::rc::Rc::as_ptr(&built_slot.graph) as usize;
+                if seen.insert(ptr) {
+                    built.push(built_slot.graph.clone());
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for graph in built {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let crate::model::OpKind::Call {
+                        target:
+                            crate::model::CallTarget::FunctionPath {
+                                segments,
+                                specialization,
+                                resolved_path: Some(resolved),
+                                ..
+                            },
+                        ..
+                    } = &op.kind
+                    else {
+                        continue;
+                    };
+                    if self.names_funcobj(resolved) {
+                        continue;
+                    }
+                    let mut harvest = CallPath::from_segments(segments.iter().cloned());
+                    harvest.specialization = *specialization;
+                    let harvest_registered = self.names_funcobj(&harvest);
+                    rows.push((segments.clone(), resolved.clone(), harvest_registered));
+                }
+            }
+        }
+        rows.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.display_name().cmp(&right.1.display_name()))
+        });
+        rows.dedup();
+        rows
     }
 
     /// `(alias path, shared graph)` for every registered spelling, each
@@ -3794,11 +3855,16 @@ impl StoreCore {
         let Some(key) = self.key_for(&existing) else {
             return Vec::new();
         };
-        let mut paths = aliases;
-        paths.push(identity_path);
-        paths
+        // `identity_path` is the harvest DISPLAY spelling already bound
+        // as this funcobj (`spec_segments`). Propose only extra aliases.
+        // Ambiguous extra aliases stay unbound (`Bookkeeper.getdesc`).
+        aliases
             .into_iter()
-            .filter(|path| !is_access_directly_path(path) && !colliding_inherent(path))
+            .filter(|path| {
+                *path != identity_path
+                    && !is_access_directly_path(path)
+                    && !colliding_inherent(path)
+            })
             .map(|path| (path, key.clone()))
             .collect()
     }
@@ -9053,7 +9119,7 @@ impl CallControl {
             Trait(String, String),
             BuiltinWrappers,
         }
-        let (spelled_function_path, expand) = {
+        let (spelled_function_path, stamped_resolved, expand) = {
             let Some(graph) = self.function_graphs.get(caller) else {
                 return;
             };
@@ -9068,7 +9134,11 @@ impl CallControl {
                 OpKind::Call {
                     target: target @ CallTarget::FunctionPath { .. },
                     ..
-                } => (target.function_call_path(), None),
+                } => (
+                    target.function_call_path(),
+                    target.resolved_path().cloned(),
+                    None,
+                ),
                 OpKind::Call {
                     target:
                         CallTarget::Indirect {
@@ -9079,18 +9149,22 @@ impl CallControl {
                     ..
                 } => (
                     None,
+                    None,
                     Some(ExpandFamily::Trait(trait_root.clone(), method_name.clone())),
                 ),
                 OpKind::IndirectCall {
                     graphs: Some(graphs),
                     ..
-                } if graphs.is_empty() => (None, Some(ExpandFamily::BuiltinWrappers)),
-                _ => (None, None),
+                } if graphs.is_empty() => (None, None, Some(ExpandFamily::BuiltinWrappers)),
+                _ => (None, None, None),
             }
         };
         let function_path_matches = spelled_function_path
             .as_ref()
             .is_some_and(|spelled| from_aliases.contains(&self.resolved_callable_path(spelled)));
+        let resolved_matches = stamped_resolved.as_ref().is_some_and(|path| {
+            path == from || from_aliases.contains(&self.resolved_callable_path(path))
+        });
         let mut expanded = match expand {
             Some(ExpandFamily::Trait(trait_root, method_name)) => {
                 Some(self.all_impls_for_indirect(&trait_root, &method_name))
@@ -9115,11 +9189,15 @@ impl CallControl {
                 CallTarget::FunctionPath {
                     segments,
                     specialization,
+                    resolved_path,
                     ..
                 } => {
                     if function_path_matches {
                         *segments = to.segments.clone();
                         *specialization = to.specialization;
+                    }
+                    if function_path_matches || resolved_matches {
+                        *resolved_path = Some(to.clone());
                     }
                 }
                 CallTarget::Method { resolved_path, .. } => {
@@ -11327,9 +11405,18 @@ impl CallControl {
     /// `def_id` is an index inside one LLBC and never selects a graph.
     pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
-            CallTarget::FunctionPath { .. } => {
+            CallTarget::FunctionPath { resolved_path, .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
+                }
+                // Unique FunDecl key first, harvest `segments` fallback.
+                // Prefer `resolved_path` only when that key names a graph
+                // (`lib.rs` unique_call_path). Spec `cachedgraph` copies
+                // stamp the spec leaf on that key so it aliases the copy.
+                if let Some(path) = resolved_path
+                    && self.has_callable_graph(path)
+                {
+                    return Some(path.clone());
                 }
                 // The spelled path, even when no graph is registered:
                 // `fnaddr_for_target` and oopspec marks key on it.
@@ -18682,6 +18769,63 @@ mod tests {
             store.key_for(&charon),
             store.key_for(&identity),
             "Charon <Impl> token must still share the identity GraphKey"
+        );
+    }
+
+    /// Primitive occupancy harvest (`spec_segments` 4-seg) is this
+    /// funcobj's DISPLAY spelling. Extra aliases of several GraphKeys
+    /// unbind; the harvest path itself is not a proposal.
+    #[test]
+    fn bind_unique_alias_proposals_keeps_occupancy_harvest_path() {
+        let harvest = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+        ));
+        let identity = "core::num::<impl usize>::saturating_sub|usize,usize|usize|/rustc/library/core/src/num/mod.rs:1454:4||";
+        let mut object_graph = FunctionGraph::new("num::<Impl>::<impl usize>::saturating_sub");
+        object_graph.funcobj_identity = Some(identity.into());
+        let mut interpreter_graph = FunctionGraph::new("num::<Impl>::saturating_sub");
+        interpreter_graph.funcobj_identity = Some(identity.into());
+        assert_eq!(
+            object_graph.graph_key(),
+            interpreter_graph.graph_key(),
+            "occupancy and unique-primitive harvest of one item share a GraphKey"
+        );
+        let mut store = GraphStore::new();
+        store.insert(harvest.clone(), object_graph);
+        let object_proposals = store.collect_trait_impl_alias_proposals(
+            None,
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+            false,
+            None,
+        );
+        store.insert(harvest.clone(), interpreter_graph);
+        let bound = store.key_for(&harvest).expect("harvest stays bound");
+        let interpreter_proposals = store.collect_trait_impl_alias_proposals(
+            None,
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+            false,
+            None,
+        );
+        assert!(
+            object_proposals
+                .iter()
+                .chain(interpreter_proposals.iter())
+                .all(|(path, _)| *path != harvest),
+            "canonical harvest is not an alias proposal: {object_proposals:?} {interpreter_proposals:?}"
+        );
+        let mut proposals = object_proposals;
+        proposals.extend(interpreter_proposals);
+        store.bind_unique_alias_proposals(proposals);
+        assert_eq!(
+            store.key_for(&harvest),
+            Some(bound),
+            "occupancy harvest DISPLAY must stay bound"
         );
     }
 

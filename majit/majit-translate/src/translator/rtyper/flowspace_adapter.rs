@@ -10328,6 +10328,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -10421,6 +10422,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -10443,6 +10445,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -10648,6 +10651,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -10819,6 +10823,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -10926,6 +10931,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -11762,6 +11768,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -11803,6 +11810,7 @@ mod tests {
                         "executioncontext".into(),
                         "jit_force_virtualizable".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12013,6 +12021,7 @@ mod tests {
                         "gc_roots".into(),
                         "reload_top_root".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12051,6 +12060,7 @@ mod tests {
                         "gc_hook".into(),
                         "try_gc_current_object_address".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12092,6 +12102,7 @@ mod tests {
                         "gc_hook".into(),
                         "try_gc_current_object_address".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12120,6 +12131,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["pyre_object".into(), "try_gc_current_object_address".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12158,6 +12170,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12194,6 +12207,7 @@ mod tests {
                         "builtins".into(),
                         "try_pyobject_vec_with_capacity".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -12272,6 +12286,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -12328,6 +12343,7 @@ mod tests {
                         segments,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
+                        resolved_path: None,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -12363,6 +12379,7 @@ mod tests {
                     segments: vec!["__delslice_range".into()],
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
+                    resolved_path: None,
                 },
                 args: crate::model::call_args(vec![
                     vars[0].clone(),
@@ -12433,6 +12450,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -12493,6 +12511,7 @@ mod tests {
                 OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -13291,6 +13310,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13330,6 +13350,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13366,6 +13387,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13421,6 +13443,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13499,6 +13522,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13549,6 +13573,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__dyn_call".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13591,6 +13616,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13645,6 +13671,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13696,6 +13723,7 @@ mod tests {
                         "lltype".into(),
                         "cast_ptr_to_int".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13922,6 +13950,7 @@ mod tests {
                         "module".into(),
                         "path".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14382,6 +14411,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: path.split("::").map(String::from).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -14506,6 +14536,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14553,6 +14584,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14602,6 +14634,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14646,6 +14679,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UTF8_ITER.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14689,6 +14723,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14730,6 +14765,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14771,6 +14807,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::CHARP2STR.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14814,6 +14851,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::CHARPSIZE2STR.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14857,6 +14895,7 @@ mod tests {
                     segments: vec![
                         crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST.into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14900,6 +14939,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14933,6 +14973,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14967,6 +15008,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -15021,6 +15063,7 @@ mod tests {
                         "RDict".into(),
                         "insert".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -15096,6 +15139,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -15199,6 +15243,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15281,6 +15326,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -15348,6 +15394,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -16867,6 +16914,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -17152,6 +17200,7 @@ mod tests {
         let core_call = |segs: &[&str], argc: usize| OpKind::Call {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -19088,6 +19137,7 @@ mod tests {
                     "2".to_string(),
                     "-3".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -19131,6 +19181,7 @@ mod tests {
         let str_const = OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "hi".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -19151,6 +19202,7 @@ mod tests {
                     "re.TEMPLATE".to_string(),
                     "re.IGNORECASE".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -19239,6 +19291,7 @@ mod tests {
                     "module".to_string(),
                     "function".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -19402,6 +19455,7 @@ mod tests {
                     crate::model::FN_CONST_HEAD.to_string(),
                     "hook_a".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },

@@ -72,6 +72,24 @@ pub struct SemanticFunction {
     /// lowered from. Threaded onto `FunctionGraph` so `CallControl`
     /// resolves a call site by decl identity rather than a name suffix.
     pub fun_decl_id: Option<u64>,
+    /// Occupancy key of the source function object (`scope_owner_identity`).
+    /// `None` on synthetic test graphs.
+    pub funcobj_identity: Option<String>,
+    /// Call-path segments [`crate::front::mir::registered_path_for_fun_decl`]
+    /// emits for this declaration. Empty on synthetic test graphs.
+    pub call_segments: Vec<String>,
+    /// Display harvest segments [`crate::front::mir::harvest_path_for_fun_decl`]
+    /// / `spec_segments` emit. Call sites stamp this spelling; identity
+    /// lives in [`Self::call_segments`]. Empty on synthetic test graphs.
+    pub harvest_segments: Vec<String>,
+    /// Extra DISPLAY harvest spellings of this same GraphKey from later
+    /// artefacts (`FunctionDesc.cachedgraph` / `Bookkeeper.getdesc`).
+    /// Primitive occupancy stamps Self only when a crate's LLBC shares
+    /// `name_path`; a unique-primitive crate keeps Charon's `<Impl>`
+    /// token. Call sites in an occupancy crate name the occupancy harvest;
+    /// those segments land here when absorb keeps the earlier copy of the
+    /// same function object and specialization key.
+    pub harvest_aliases: Vec<Vec<String>>,
     /// Module path of the defining file, crate-stripped (e.g.
     /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
     /// `front::mir` from the module portion of Charon's `name_path()`.
@@ -162,6 +180,10 @@ impl SemanticFunction {
             trait_impl_id: None,
             trait_impl_identity: None,
             fun_decl_id: None,
+            funcobj_identity: None,
+            call_segments: Vec::new(),
+            harvest_segments: Vec::new(),
+            harvest_aliases: Vec::new(),
             module_path: String::new(),
             hints: Vec::new(),
             trait_root,
@@ -2112,6 +2134,10 @@ mod tests {
             trait_impl_id: None,
             trait_impl_identity: None,
             fun_decl_id: None,
+            funcobj_identity: None,
+            call_segments: Vec::new(),
+            harvest_segments: Vec::new(),
+            harvest_aliases: Vec::new(),
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,
@@ -2376,6 +2402,208 @@ mod tests {
         );
         assert!(acc.struct_fields.fields.contains_key("core::A"));
         assert!(acc.struct_fields.fields.contains_key("alloc::B"));
+    }
+
+    /// Occupancy harvest of a later artefact is another DISPLAY spelling
+    /// of the same funcobj (`Bookkeeper.getdesc`). Identity-dedup keeps
+    /// the first copy; the occupancy path must stay reachable.
+    #[test]
+    fn absorb_keeps_occupancy_harvest_as_alias() {
+        let unique_primitive = {
+            let mut func = free_fn("saturating_sub");
+            func.funcobj_identity = Some("core::num::usize::saturating_sub".into());
+            func.harvest_segments = vec!["num".into(), "<Impl>".into(), "saturating_sub".into()];
+            func
+        };
+        let occupancy = {
+            let mut func = free_fn("saturating_sub");
+            func.funcobj_identity = Some("core::num::usize::saturating_sub".into());
+            func.harvest_segments = vec![
+                "num".into(),
+                "<Impl>".into(),
+                "<impl usize>".into(),
+                "saturating_sub".into(),
+            ];
+            func
+        };
+        let mut first = SemanticProgram::default();
+        first.functions.push(unique_primitive);
+        let mut second = SemanticProgram::default();
+        second.functions.push(occupancy);
+        let mut merged = None;
+        let mut seen_function_keys = std::collections::HashSet::new();
+        let mut seen_struct_names = std::collections::HashSet::new();
+        let mut seen_trait_names = std::collections::HashSet::new();
+        let dedup = crate::front::mir::semantic_function_dedup_key;
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            first,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            second,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        let acc = merged.expect("merged program");
+        assert_eq!(acc.functions.len(), 1);
+        let func = &acc.functions[0];
+        assert_eq!(func.harvest_segments, ["num", "<Impl>", "saturating_sub"]);
+        assert!(
+            func.harvest_aliases.iter().any(
+                |alias| alias.as_slice() == ["num", "<Impl>", "<impl usize>", "saturating_sub"]
+            ),
+            "occupancy harvest must land on harvest_aliases: {:?}",
+            func.harvest_aliases
+        );
+    }
+
+    fn absorb_with_semantic_dedup(
+        first: SemanticProgram,
+        second: SemanticProgram,
+    ) -> SemanticProgram {
+        let mut merged = None;
+        let mut seen_function_keys = std::collections::HashSet::new();
+        let mut seen_struct_names = std::collections::HashSet::new();
+        let mut seen_trait_names = std::collections::HashSet::new();
+        let dedup = crate::front::mir::semantic_function_dedup_key;
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            first,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            second,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        merged.expect("merged program")
+    }
+
+    /// `FunctionDesc.cachedgraph` keeps one graph per specialization key.
+    /// `f`, `f__spec_A`, and `f__spec_B` share a FunDecl identity
+    /// (`Bookkeeper.getdesc`) and must all survive absorb of a later
+    /// artefact.
+    #[test]
+    fn absorb_keeps_distinct_specializations_of_one_funcobj() {
+        let identity = "core::num::usize::f";
+        let first = {
+            let mut func = free_fn("f");
+            func.funcobj_identity = Some(identity.into());
+            let mut prog = SemanticProgram::default();
+            prog.functions.push(func);
+            prog
+        };
+        let second = {
+            let mut prog = SemanticProgram::default();
+            for name in ["f", "f__spec_A", "f__spec_B"] {
+                let mut func = free_fn(name);
+                func.funcobj_identity = Some(identity.into());
+                prog.functions.push(func);
+            }
+            prog
+        };
+        let acc = absorb_with_semantic_dedup(first, second);
+        let names: Vec<&str> = acc
+            .functions
+            .iter()
+            .map(|func| func.name.as_str())
+            .collect();
+        assert_eq!(
+            acc.functions.len(),
+            3,
+            "spec copies of one FunDecl must survive absorb: {names:?}"
+        );
+        assert!(names.contains(&"f"));
+        assert!(names.contains(&"f__spec_A"));
+        assert!(names.contains(&"f__spec_B"));
+    }
+
+    /// The same spec copy in two artefacts, differing only by harvest
+    /// prefix, is one `FunctionDesc.cachedgraph` key. Absorb merges them
+    /// and keeps the later harvest on `harvest_aliases`.
+    #[test]
+    fn absorb_merges_same_spec_copy_with_different_display_prefix() {
+        let identity = "core::num::usize::f";
+        let first = {
+            let mut func = free_fn("num::<Impl>::f__spec_A");
+            func.funcobj_identity = Some(identity.into());
+            func.harvest_segments = vec!["num".into(), "<Impl>".into(), "f__spec_A".into()];
+            let mut prog = SemanticProgram::default();
+            prog.functions.push(func);
+            prog
+        };
+        let second = {
+            let mut func = free_fn("num::<Impl>::<impl usize>::f__spec_A");
+            func.funcobj_identity = Some(identity.into());
+            func.harvest_segments = vec![
+                "num".into(),
+                "<Impl>".into(),
+                "<impl usize>".into(),
+                "f__spec_A".into(),
+            ];
+            let mut prog = SemanticProgram::default();
+            prog.functions.push(func);
+            prog
+        };
+        let acc = absorb_with_semantic_dedup(first, second);
+        assert_eq!(acc.functions.len(), 1);
+        let func = &acc.functions[0];
+        assert_eq!(
+            func.harvest_segments.as_slice(),
+            ["num", "<Impl>", "f__spec_A"]
+        );
+        assert!(
+            func.harvest_aliases.iter().any(|alias| {
+                alias.as_slice() == ["num", "<Impl>", "<impl usize>", "f__spec_A"]
+            }),
+            "occupancy harvest of the same spec copy must land on harvest_aliases: {:?}",
+            func.harvest_aliases
+        );
+    }
+
+    /// `specialize.py default_specialize` builds a distinct graph under
+    /// the `(AccessDirect, None)` `FunctionDesc.cachedgraph` key. Absorb
+    /// keeps that copy beside the Regular graph of the same funcobj.
+    #[test]
+    fn absorb_keeps_access_direct_copy_distinct() {
+        let identity = "core::num::usize::f";
+        let first = {
+            let mut func = free_fn("f");
+            func.funcobj_identity = Some(identity.into());
+            let mut prog = SemanticProgram::default();
+            prog.functions.push(func);
+            prog
+        };
+        let second = {
+            let mut func = free_fn("f");
+            func.funcobj_identity = Some(identity.into());
+            func.graph_mut().specialization = crate::parse::GraphSpecialization::AccessDirect;
+            let mut prog = SemanticProgram::default();
+            prog.functions.push(func);
+            prog
+        };
+        let acc = absorb_with_semantic_dedup(first, second);
+        assert_eq!(acc.functions.len(), 2);
+        let specs: Vec<_> = acc
+            .functions
+            .iter()
+            .map(|func| func.lazy_graph().header().specialization)
+            .collect();
+        assert!(specs.contains(&crate::parse::GraphSpecialization::Regular));
+        assert!(specs.contains(&crate::parse::GraphSpecialization::AccessDirect));
     }
 
     fn exception_hint(enum_path: &str) -> crate::front::llbc_hints::ExceptionClassHint {

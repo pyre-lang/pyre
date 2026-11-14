@@ -477,6 +477,7 @@ pub(crate) fn rewrite_enumerate_to_builtin(graph: &mut FunctionGraph, site: &Enu
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1561,6 +1562,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1579,6 +1581,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1593,6 +1596,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1605,6 +1609,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1617,6 +1622,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1625,6 +1631,7 @@ mod tests {
     fn iter_target() -> CallTarget {
         CallTarget::FunctionPath {
             segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1694,6 +1701,7 @@ mod tests {
                             "container".to_string(),
                             "make".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1925,6 +1933,7 @@ mod tests {
                             "container".to_string(),
                             "make".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1945,6 +1954,7 @@ mod tests {
                             "<Impl>".to_string(),
                             "iter".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2178,6 +2188,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2230,6 +2241,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -2241,6 +2253,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -2274,6 +2287,7 @@ mod tests {
                             "container".to_string(),
                             "make".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2536,6 +2550,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2620,6 +2635,7 @@ mod tests {
                             "container".to_string(),
                             "make".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -3358,6 +3374,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -3378,6 +3395,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -3409,6 +3427,7 @@ mod tests {
                             "container".to_string(),
                             "make".to_string(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -3594,6 +3613,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
