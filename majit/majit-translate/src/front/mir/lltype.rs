@@ -9591,6 +9591,20 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc)
 }
 
+/// `<K,V>` suffix for `rordereddict_entries::GcEntries`. The entries array
+/// header is `DICTENTRYARRAY` of `get_ll_dict`, one per `(DICTKEY, DICTVALUE)`;
+/// the bare class would share one ARRAY across key types.
+pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !name_path.ends_with("::rordereddict_entries::GcEntries") {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
 /// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
 /// arguments split (`bookkeeper.py` `getuniqueclassdef`); an unsuffixed
 /// `Range` unions `start` across instantiations.
@@ -9679,6 +9693,7 @@ pub(in crate::front::mir) fn struct_instantiation_suffix(
     llbc: &Llbc,
 ) -> Option<String> {
     entry_struct_instantiation_suffix(name_path, adt, llbc)
+        .or_else(|| gc_entries_struct_instantiation_suffix(name_path, adt, llbc))
         .or_else(|| range_struct_instantiation_suffix(name_path, adt, llbc))
         .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc))
         .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
@@ -16215,7 +16230,19 @@ fn raw_struct_array_item_lltype_inner(
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, Struct};
     let name = reg.resolved_owner_key(item)?;
-    if !visited.insert(name.clone()) {
+    // ARRAY.OF is the instantiation's own Struct: `get_ll_dict` mints one
+    // `DICTENTRY` per `(DICTKEY, DICTVALUE)`. `cpu.interiorfielddescrof` /
+    // `get_interiorfield_descr` / `get_field_descr` /
+    // `symbolic.get_field_token` read that Struct's offsets. Row lookup
+    // still uses the stripped template (`resolved_owner_key` /
+    // `field_rows`); interned `_name` keeps the balanced `<…>` span.
+    // A span that still names an unbound type variable (`??TypeVar#N`) is
+    // not an instantiation, so the Struct keeps the template name.
+    let intern_name = match majit_ir::descr::generic_args_span(item) {
+        Some(span) if !span.contains("??") => format!("{name}{span}"),
+        _ => name.clone(),
+    };
+    if !visited.insert(intern_name.clone()) {
         return None;
     }
     let out = (|| {
@@ -16236,18 +16263,13 @@ fn raw_struct_array_item_lltype_inner(
             };
             fields.push((row.name.clone(), ll));
         }
-        // ARRAY.OF is the registry key `field_rows` already resolved for
-        // the harvest TypeDecl path stored on the `[ADT; N]` row
-        // (`field_row_struct_identity`). `get_array_descr` /
-        // `interiorfielddescrof` look that path up as `ARRAY.OF`, the same
-        // key a by-value ADT field uses.
         Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
-            &name,
+            &intern_name,
             fields,
             GcKind::Raw,
         ))))
     })();
-    visited.remove(&name);
+    visited.remove(&intern_name);
     out
 }
 

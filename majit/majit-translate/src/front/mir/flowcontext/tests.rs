@@ -13628,7 +13628,7 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         .and_then(|rows| rows.iter().find(|row| row.name == "key"))
         .map(|row| row.ty.as_str());
     assert_eq!(bare_key, Some("??TypeVar#0"));
-    let published: Vec<_> = program
+    let mut published: Vec<_> = program
         .struct_fields
         .fields
         .keys()
@@ -13642,7 +13642,9 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         })
         .cloned()
         .collect();
-    assert_eq!(published, vec![qualified.to_string()]);
+    published.sort();
+    let intern = "rordereddict_entries::Entry<i64,*mut PyObject>";
+    assert_eq!(published, vec![qualified.to_string(), intern.to_string()]);
     assert!(
         program
             .struct_fields

@@ -12949,8 +12949,9 @@ mod tests {
 
     #[test]
     fn project_struct_field_type_struct_item_gcarray_uses_qualified_item_rows() {
-        // Harvest stores `[module::Entry<…>;0]`. Intern looks up that
-        // path; a second same-leaf `Entry` does not steal the rows.
+        // Harvest stores `[module::Entry<…>;0]`. Wrapper args substitute
+        // the TypeVars; intern OF is that instantiation. A second same-leaf
+        // `Entry` does not steal the rows.
         use crate::front::StructFieldRegistry;
 
         let bk = bk();
@@ -12997,8 +12998,9 @@ mod tests {
                             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(
                                 st,
                             ) => assert_eq!(
-                                st._name, "rordereddict_entries::Entry",
-                                "{spelling} ARRAY.OF must keep the harvest TypeDecl path"
+                                st._name,
+                                "rordereddict_entries::Entry<i64,*mut u8>",
+                                "{spelling} ARRAY.OF must be the instantiated Entry"
                             ),
                             other => panic!("{spelling} ITEM must be STRUCT, got {other:?}"),
                         }

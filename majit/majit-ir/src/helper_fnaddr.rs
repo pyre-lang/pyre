@@ -222,6 +222,15 @@ pub trait ResidualError {
     fn publish_residual(self);
 }
 
+/// One-word GC reference a residual trampoline returns by value.
+///
+/// A helper that returns its exception carrier (not `Result<_, E>`) hands
+/// the caller an instance pointer; the result kind is 'r'. The defining
+/// crate implements this for the carrier — `majit` does not name that type.
+pub trait ResidualRefResult {
+    fn into_residual_ref(self) -> i64;
+}
+
 /// Visit every registered trampoline, whichever population the target carries.
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]

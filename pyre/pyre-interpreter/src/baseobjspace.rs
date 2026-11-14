@@ -315,6 +315,7 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 ///
 /// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
 /// is fetched first, matching [`take_pending_dict_key_error`].
+#[majit_macros::dont_look_inside]
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
         return crate::runtime_ops::fetch_memory_error();

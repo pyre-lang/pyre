@@ -1098,7 +1098,15 @@ fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
 fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
     match output {
         ReturnType::Default => HelperCallKind::Void,
-        ReturnType::Type(_, ty) => helper_call_kind_for_type(ty),
+        ReturnType::Type(_, ty) => {
+            // A by-value exception carrier is one Ref word (result kind 'r').
+            // `Result<T, E>` is classified through `result_exc_payload`.
+            if is_project_error_type(ty) {
+                HelperCallKind::Ref
+            } else {
+                helper_call_kind_for_type(ty)
+            }
+        }
     }
 }
 
@@ -1974,6 +1982,11 @@ fn helper_return_to_i64(
     value: proc_macro2::TokenStream,
     ty: &Type,
 ) -> Option<proc_macro2::TokenStream> {
+    if is_project_error_type(ty) {
+        return Some(quote! {
+            ::majit_ir::helper_fnaddr::ResidualRefResult::into_residual_ref(#value)
+        });
+    }
     // A by-value `Vec` result is moved into a header the lowering owns:
     // `raw_malloc_varsize_char` of the three header words, which
     // `ll_vec_free_*` releases together with the buffer.
@@ -5764,6 +5777,7 @@ mod tests {
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
         );
+        assert_eq!(skip("fn f(o: PyObjectRef) -> PyError { todo!() }"), None);
     }
 
     #[test]
@@ -5890,6 +5904,8 @@ mod tests {
         assert_eq!(trampoline_abi_string(&res, &[]), "w>w");
         let rstr = parse_fn("fn f(s: &str) -> i64 { 0 }");
         assert_eq!(trampoline_abi_string(&rstr, &[]), "w>w");
+        let by_value_err = parse_fn("fn f(x: i64) -> PyError { loop {} }");
+        assert_eq!(trampoline_abi_string(&by_value_err, &[]), "w>w");
     }
 
     #[test]
