@@ -814,10 +814,15 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
                 code
             )
         });
+        // `ensure_majit_jitcode` compiles and can collect. The inner
+        // `CodeObject` is immortal; look up by that key after the call
+        // rather than the copied wrapper (`gctransform/shadowstack.py`).
         if !(callbacks.ensure_majit_jitcode)(raw_code, code) {
             return std::ptr::null();
         }
-        if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
+        if let Some(existing) =
+            METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(raw_code as *const ()))
+        {
             return existing;
         }
         return std::ptr::null();
@@ -949,17 +954,21 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
     })
 }
 
-/// `framework.py root_walker.walk_roots` parity for the persistent
-/// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
-/// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
-/// wrapper is recovered from its `payload.code_ptr` via the live-wrapper
-/// registry.
+/// pyre extra-area for the host `LIVE_CODE_WRAPPERS` table (no graph
+/// edge) plus the persistent `MetaInterpStaticData.jitcodes` list
+/// (warmspot.py `self.metainterp_sd.jitcodes = jitcodes`). Each entry's
+/// PyCode wrapper is recovered from its `payload.code_ptr` via the
+/// live-wrapper registry.
 ///
 /// PyCode wrappers are ordinary movable GC objects. The visitor therefore
-/// forwards each `LIVE_CODE_WRAPPERS` value in place on minor collections as
-/// well as marking it on majors. Keeping this walk on the same per-mutator
-/// area as the jitcode constants preserves the owner: RPython reaches both
-/// through `MetaInterpStaticData.jitcodes`.
+/// forwards each nursery-resident `LIVE_CODE_WRAPPERS` value in place on
+/// minor collections, from birth, not only after the jitcode is installed.
+/// Jitcode-retained wrappers are also marked on majors
+/// (`warmspot.py self.metainterp_sd.jitcodes`). Interpreted-only map
+/// entries are not a major mark set: that kept `w_globals` alive across
+/// `finalize_modules`' pre-clear collection. Keeping this walk on the
+/// same per-mutator area as the jitcode constants preserves the owner:
+/// RPython reaches both through `MetaInterpStaticData.jitcodes`.
 pub fn walk_jitcode_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_code_roots_in(&state.borrow(), visitor);
@@ -970,19 +979,30 @@ fn walk_jitcode_code_roots_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
+    let mut visit_one = |wrapper: &mut pyre_object::PyObjectRef| {
+        if *wrapper as usize == 0 {
+            return;
+        }
+        let root =
+            unsafe { &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
+        visitor(root);
+    };
+    // A wrapper is born before its jitcode exists. A minor in that window
+    // copies it through `frame.pycode` / `Function.code` and recycles the
+    // nursery; the map still holds the birth address unless this walk
+    // forwards it (`framework.py root_walker.walk_roots`; `malloc_fixedsize`).
+    // Old-gen entries that no jitcode retains are left to the object graph
+    // so a major can reclaim them (`pycode_destructor` unmaps).
+    pyre_interpreter::pycode::walk_all_live_code_wrappers(&mut |wrapper| {
+        if !majit_gc::gc_is_nursery_object(*wrapper as usize) {
+            return;
+        }
+        visit_one(wrapper);
+    });
     for jc in sd.jitcodes.iter() {
         pyre_interpreter::pycode::walk_live_code_wrapper(
             jc.payload.code_ptr as *const (),
-            &mut |wrapper| {
-                let old = *wrapper as usize;
-                if old == 0 {
-                    return;
-                }
-                let root = unsafe {
-                    &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef)
-                };
-                visitor(root);
-            },
+            &mut |wrapper| visit_one(wrapper),
         );
     }
 }
@@ -2693,7 +2713,7 @@ pub struct PyreJitState {
     /// at construction; a nursery frame moves, and once the old copy is
     /// recycled `gc_current_object_address` cannot recover it.
     /// Readers use [`Self::live_frame`].
-    frame_root: LiveVableFrameRoot,
+    frame_root: OwnerRoot,
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -2720,17 +2740,17 @@ pub struct PyreMeta {
     pub slot_types: Vec<Type>,
 }
 
-/// Owner root for one live virtualizable frame.
+/// Owner root for one GC object the tracer holds by raw word.
 ///
 /// `PyreSym` is `Clone`. Cloning this root takes a second slot at the
 /// address the source names now, so both copies stay forwarded and
 /// neither releases the other's slot.
 #[derive(Default)]
-struct LiveVableFrameRoot {
+struct OwnerRoot {
     inner: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
-impl Clone for LiveVableFrameRoot {
+impl Clone for OwnerRoot {
     fn clone(&self) -> Self {
         let Some(root) = self.inner.as_ref() else {
             return Self { inner: None };
@@ -2744,6 +2764,56 @@ impl Clone for LiveVableFrameRoot {
                 majit_ir::GcRef(now),
             )),
         }
+    }
+}
+
+impl OwnerRoot {
+    fn current(&self, raw: usize) -> usize {
+        if let Some(root) = self.inner.as_ref() {
+            let now = root.get().0;
+            if now != 0 {
+                return now;
+            }
+        }
+        raw
+    }
+
+    fn publish(&mut self, value: usize) -> usize {
+        // `TraceCtx::set_virtualizable_heap_ptr` follows forwarding before
+        // `gc_owns_object`: a nursery corpse fails owns after poisoning, and
+        // dropping the planted root leaves `store_live_frame_array_slot` on
+        // a raw cell whose `locals_cells_stack_w` reads as null
+        // (`virtualizable.py write_boxes` writes every slot).
+        let value = if value == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(value)
+        };
+        if value == 0 {
+            self.inner = None;
+            return 0;
+        }
+        if !majit_gc::gc_owns_object(value) {
+            self.inner = None;
+            return value;
+        }
+        // Extra-area walks hold `lock_mutator_registry`; planting here
+        // would call `mutator_is_registered` and deadlock. Keep a planted
+        // root and only refresh it (`TraceCtx::store_forwarded_virtualizable_heap_ptr`).
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            if let Some(root) = self.inner.as_ref() {
+                root.set(majit_ir::GcRef(value));
+            }
+            return value;
+        }
+        if let Some(root) = self.inner.as_ref() {
+            root.set(majit_ir::GcRef(value));
+        } else {
+            self.inner = Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(value),
+            ));
+        }
+        value
     }
 }
 
@@ -2899,7 +2969,13 @@ pub struct PyreSym {
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
     /// Namespace for global lookups (W_DictObject / W_ModuleDictObject).
+    /// The raw word is the address at publish; a nursery dict moves, and
+    /// once the old copy is poisoned `gc_current_object_address` cannot
+    /// recover it. Readers after a collecting call use
+    /// [`Self::current_concrete_namespace`].
     pub(crate) concrete_namespace: PyObjectRef,
+    /// Forwards [`Self::concrete_namespace`] across a minor.
+    concrete_namespace_root: OwnerRoot,
     /// Execution context pointer (for creating callee frames).
     pub(crate) concrete_execution_context: *const pyre_interpreter::PyExecutionContext,
     /// Virtualizable object pointer (PyFrame).
@@ -2912,7 +2988,7 @@ pub struct PyreSym {
     /// walk runs residual calls concretely, so a minor moves it while this
     /// field still names the old copy.  Once the nursery is reused, a read
     /// through the raw word lands on a new occupant.
-    concrete_vable_root: LiveVableFrameRoot,
+    concrete_vable_root: OwnerRoot,
     /// Live interpreter-owned virtualizable `PyFrame`, or 0 when tracing
     /// runs without one (tests). `pyjitpl.py` `initialize_virtualizable` /
     /// `virtualizable.py` `read_boxes` read this same object.
@@ -2922,7 +2998,7 @@ pub struct PyreSym {
     /// The raw word is the address at trace entry. A nursery frame moves,
     /// and once the old copy is poisoned `gc_current_object_address` cannot
     /// recover it. Readers use [`Self::current_live_vable_frame`].
-    live_vable_frame_root: LiveVableFrameRoot,
+    live_vable_frame_root: OwnerRoot,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py): concrete
@@ -3751,10 +3827,15 @@ pub(crate) fn note_root_trace_too_long(
         // The reason travels with the unwind, never in MetaInterp staging.
         // pyjitpl.py `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
         let huge_fn = meta.find_biggest_function();
-        // pyjitpl.py `self.portal_trace_positions = None` — the log's `_pos`
-        // cursors index the recorder this abort is discarding.
-        meta.retire_portal_trace_positions();
         if let Some((jd_no, huge_key)) = huge_fn.clone() {
+            // Pin the walked `portal_trace_positions` copy before
+            // `retire_portal_trace_positions` drops that root
+            // (`gctransform/shadowstack.py`).
+            let pin = majit_metainterp::GreenRefPin::pin(&huge_key.1);
+            let mut live = pin.live_clone(&huge_key.1);
+            // pyjitpl.py `self.portal_trace_positions = None` — the log's `_pos`
+            // cursors index the recorder this abort is discarding.
+            meta.retire_portal_trace_positions();
             // pyjitpl.py `blackhole_if_trace_too_long`:
             // `jd_sd.warmstate.disable_noninlinable_function(
             // greenkey_of_huge_function)` disables through the warmstate of
@@ -3762,10 +3843,13 @@ pub(crate) fn note_root_trace_too_long(
             // Upstream's `dont_trace_here` (warmstate.py) is handed the greens
             // and reaches its cell through `ensure_jit_cell_at_key`.
             meta.warm_state_for_driver(jd_no)
-                .disable_noninlinable_function_for_key(&huge_key.1);
+                .disable_noninlinable_function_for_key(&pin, &mut live);
             // pyjitpl.py, read by `aborted_tracing`'s `on_trace_abort`.
             meta.aborted_tracing_jitdriver = Some(jd_no);
-            meta.aborted_tracing_greenkey = Some(huge_key);
+            // pyjitpl.py `self.aborted_tracing_greenkey = greenkey_of_huge_function`
+            // holds the greenkey boxes the GC traces. Store the pin-reloaded
+            // key; `disable_noninlinable_function_for_key` may have moved it.
+            meta.aborted_tracing_greenkey = Some((huge_key.0, live));
             // pyjitpl.py `blackhole_if_trace_too_long`:
             // `warmrunnerstate = self.jitdriver_sd.warmstate` then
             // `JitCell.trace_next_iteration` on the outermost merge key.
@@ -3778,21 +3862,35 @@ pub(crate) fn note_root_trace_too_long(
                 meta.warm_state_for_driver(compiling_jd)
                     .trace_next_iteration(*merge_key);
             }
-        } else if let Some((merge_key, merge_key_typed)) = merge_key.as_ref() {
-            // pyjitpl.py `prepare_trace_segmenting`:
-            // `warmrunnerstate = self.jitdriver_sd.warmstate` then
-            // `JitCell.trace_next_iteration` / `mark_force_finish_tracing` /
-            // `dont_trace_here` on the compiling `active_jitdriver_sd`.
-            let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
-            let mut warm_state = meta.warm_state_for_driver(compiling_jd);
-            // pyjitpl.py `warmrunnerstate.JitCell.trace_next_iteration(
-            // greenkey)`, again counter-only.
-            warm_state.trace_next_iteration(*merge_key);
-            // pyjitpl.py `jd_sd.warmstate.mark_force_finish_tracing(greenkey)`
-            // and `dont_trace_here(greenkey)` reach the cell through
-            // `ensure_jit_cell_at_key` on this merge point's greens.
-            warm_state.mark_force_finish_tracing_for_key(merge_key_typed);
-            warm_state.disable_noninlinable_function_for_key(merge_key_typed);
+        } else {
+            meta.retire_portal_trace_positions();
+            // Re-read the merge point from walked TraceCtx. The argument
+            // copy can predate `latch_abort_blackhole`
+            // (`gctransform/shadowstack.py`).
+            let pair = meta
+                .live_history_mut()
+                .and_then(|c| c.current_merge_points_first_green_key_pair())
+                .or_else(|| merge_key.clone());
+            if let Some((mk, mk_typed)) = pair {
+                // pyjitpl.py `prepare_trace_segmenting`:
+                // `warmrunnerstate = self.jitdriver_sd.warmstate` then
+                // `JitCell.trace_next_iteration` / `mark_force_finish_tracing` /
+                // `dont_trace_here` on the compiling `active_jitdriver_sd`.
+                let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
+                let pin = majit_metainterp::GreenRefPin::pin(&mk_typed);
+                let mut live = pin.live_clone(&mk_typed);
+                let mut warm_state = meta.warm_state_for_driver(compiling_jd);
+                // pyjitpl.py `warmrunnerstate.JitCell.trace_next_iteration(
+                // greenkey)`, again counter-only.
+                warm_state.trace_next_iteration(mk);
+                // pyjitpl.py `jd_sd.warmstate.mark_force_finish_tracing(greenkey)`
+                // and `dont_trace_here(greenkey)` reach the cell through
+                // `ensure_jit_cell_at_key` on this merge point's greens.
+                pin.reload(&mut live);
+                warm_state.mark_force_finish_tracing_for_key(&pin, &mut live);
+                pin.reload(&mut live);
+                warm_state.disable_noninlinable_function_for_key(&pin, &mut live);
+            }
         }
         huge_fn
     });
@@ -6839,13 +6937,8 @@ impl PyreSym {
     /// Address of the live virtualizable after any minor that ran since
     /// [`Self::publish_live_vable_frame`].
     pub(crate) fn current_live_vable_frame(&self) -> usize {
-        if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
-            let now = root.get().0;
-            if now != 0 {
-                return now;
-            }
-        }
-        self.live_vable_frame_addr
+        self.live_vable_frame_root
+            .current(self.live_vable_frame_addr)
     }
 
     /// Frame whose `locals_cells_stack_w` a bridge seed writes.
@@ -6863,42 +6956,23 @@ impl PyreSym {
     }
 
     fn publish_live_vable_frame(&mut self, value: usize) {
-        // `TraceCtx::set_virtualizable_heap_ptr` follows forwarding before
-        // `gc_owns_object`: a nursery corpse fails owns after poisoning, and
-        // dropping the planted root leaves `store_live_frame_array_slot` on
-        // a raw cell whose `locals_cells_stack_w` reads as null
-        // (`virtualizable.py write_boxes` writes every slot).
-        let value = if value == 0 {
-            0
-        } else {
-            majit_gc::gc_current_object_address(value)
-        };
-        if value == 0 {
-            self.live_vable_frame_addr = 0;
-            self.live_vable_frame_root.inner = None;
-            return;
-        }
-        self.live_vable_frame_addr = value;
-        if !majit_gc::gc_owns_object(value) {
-            self.live_vable_frame_root.inner = None;
-            return;
-        }
-        // Extra-area walks hold `lock_mutator_registry`; planting here
-        // would call `mutator_is_registered` and deadlock. Keep a planted
-        // root and only refresh it (`TraceCtx::store_forwarded_virtualizable_heap_ptr`).
-        if !majit_gc::shadow_stack::mutator_is_registered() {
-            if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
-                root.set(majit_ir::GcRef(value));
-            }
-            return;
-        }
-        if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
-            root.set(majit_ir::GcRef(value));
-        } else {
-            self.live_vable_frame_root.inner = Some(majit_gc::shadow_stack::OwnerRootGuard::new(
-                majit_ir::GcRef(value),
-            ));
-        }
+        self.live_vable_frame_addr = self.live_vable_frame_root.publish(value);
+    }
+
+    /// Recording-time globals dict for this MIFrame.
+    ///
+    /// `pyframe.py` `get_w_globals` (`debugdata.w_globals` else
+    /// `pycode.w_globals`). The dict is a GC object;
+    /// `gctransform/shadowstack.py` / `framework.py` plant a translated
+    /// livevar root so a minor forwards the slot.
+    pub(crate) fn current_concrete_namespace(&self) -> PyObjectRef {
+        self.concrete_namespace_root
+            .current(self.concrete_namespace as usize) as PyObjectRef
+    }
+
+    fn publish_concrete_namespace(&mut self, value: PyObjectRef) {
+        self.concrete_namespace =
+            self.concrete_namespace_root.publish(value as usize) as PyObjectRef;
     }
 
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
@@ -6929,12 +7003,13 @@ impl PyreSym {
             // jitcode and concrete_namespace initialized below
             jitcode: null_jitcode() as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
+            concrete_namespace_root: OwnerRoot::default(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_raw: std::ptr::null_mut(),
-            concrete_vable_root: LiveVableFrameRoot::default(),
+            concrete_vable_root: OwnerRoot::default(),
             live_vable_frame_addr: 0,
-            live_vable_frame_root: LiveVableFrameRoot::default(),
+            live_vable_frame_root: OwnerRoot::default(),
             last_exc_value: Default::default(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -7110,7 +7185,7 @@ impl PyreSym {
         sym.symbolic_stack_types = state.symbolic_stack_types;
         sym.registers_r.replace(state.registers_r);
         sym.concrete_stack = state.concrete_stack;
-        sym.concrete_namespace = state.concrete_namespace;
+        sym.publish_concrete_namespace(state.concrete_namespace);
         sym.vable_last_instr = state.vable_last_instr;
         sym.vable_pycode = state.vable_pycode;
         sym.vable_valuestackdepth = state.vable_valuestackdepth;
@@ -7323,8 +7398,8 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.jitcode = jitcode_for(frame.pycode);
-            self.concrete_namespace = frame.get_w_globals();
-            self.frame_w_globals = ctx.const_ref(self.concrete_namespace as usize as i64);
+            self.publish_concrete_namespace(frame.get_w_globals());
+            self.frame_w_globals = ctx.const_ref(self.current_concrete_namespace() as usize as i64);
             if self.concrete_execution_context.is_null() {
                 self.concrete_execution_context =
                     pyre_interpreter::call::getexecutioncontext() as *const _;
@@ -7565,7 +7640,7 @@ impl PyreJitState {
         let mut state = Self {
             frame: 0,
             execution_context,
-            frame_root: LiveVableFrameRoot::default(),
+            frame_root: OwnerRoot::default(),
         };
         state.publish_frame(frame);
         state
@@ -8780,9 +8855,13 @@ pub(crate) fn reconstruct_inline_recipe(
     }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
-    let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
+    let Some(raw_code) = raw_code_for_jitcode_index(frame.jitcode_index) else {
         decline!("NoCodeForJitcodeIndex");
     };
+    // Re-read the wrapper from the traced `LIVE_CODE_WRAPPERS` map. The
+    // inner `CodeObject` box never moves; a copied wrapper would go stale
+    // (`gctransform/shadowstack.py`).
+    let w_code = pyre_interpreter::live_code_wrapper(raw_code as *const ());
     if w_code.is_null() {
         decline!("NullWCode");
     }
@@ -13531,13 +13610,17 @@ mod tests {
             assert_eq!(second.index, Some(1));
             meta.finish_setup_descrs_for_jitdrivers();
 
-            let action = meta.bound_reached(
-                portal_hash,
-                (0xC0DE, 7),
-                Some(portal.clone()),
-                Some(std::sync::Arc::new(second)),
-                &[],
-            );
+            let action = {
+                let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
+                meta.bound_reached(
+                    portal_hash,
+                    _zbh_pin.save(),
+                    7,
+                    Some(portal.clone()),
+                    Some(std::sync::Arc::new(second)),
+                    &[],
+                )
+            };
             assert!(matches!(action, BackEdgeAction::StartedTracing));
             assert_eq!(meta.active_jitdriver_sd, Some(idx1));
             assert!(
@@ -13567,10 +13650,13 @@ mod tests {
 
         {
             let meta = pair.0.meta_interp_mut();
-            let callee_cell = meta
-                .warm_state_for_driver(idx1)
-                .lookup_chain_with_key(&callee)
-                .expect("disable_noninlinable_function_for_key installs the callee cell");
+            let callee_cell = {
+                let pin = majit_metainterp::GreenRefPin::pin(&callee);
+                let live = pin.live_clone(&callee);
+                meta.warm_state_for_driver(idx1)
+                    .lookup_chain_with_key(&pin, &live)
+            }
+            .expect("disable_noninlinable_function_for_key installs the callee cell");
             assert!(
                 callee_cell
                     .flags
@@ -13578,10 +13664,13 @@ mod tests {
                     .contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the shipped door must disable the oversized inlined frame"
             );
-            let portal_cell = meta
-                .warm_state_for_driver(idx1)
-                .lookup_chain_with_key(&portal)
-                .expect("bound_reached installed the portal cell");
+            let portal_cell = {
+                let pin = majit_metainterp::GreenRefPin::pin(&portal);
+                let live = pin.live_clone(&portal);
+                meta.warm_state_for_driver(idx1)
+                    .lookup_chain_with_key(&pin, &live)
+            }
+            .expect("bound_reached installed the portal cell");
             assert!(
                 !portal_cell
                     .flags
@@ -13634,8 +13723,17 @@ mod tests {
             assert_eq!(idx0, 0);
             meta.finish_setup_descrs_for_jitdrivers();
 
-            let action =
-                meta.bound_reached(portal_hash, (0xC0DE, 7), Some(portal.clone()), None, &[]);
+            let action = {
+                let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
+                meta.bound_reached(
+                    portal_hash,
+                    _zbh_pin.save(),
+                    7,
+                    Some(portal.clone()),
+                    None,
+                    &[],
+                )
+            };
             assert!(matches!(action, BackEdgeAction::StartedTracing));
             assert_eq!(meta.active_jitdriver_sd, Some(idx0));
 
@@ -13644,8 +13742,16 @@ mod tests {
             meta.warm_state_for_driver(idx0)
                 .memory_manager
                 .keep_loop_alive(&token);
-            meta.warm_state_for_driver(idx0)
-                .attach_procedure_to_interp_for_key(&portal, std::sync::Arc::clone(&token));
+            {
+                let pin = majit_metainterp::GreenRefPin::pin(&portal);
+                let mut live = pin.live_clone(&portal);
+                meta.warm_state_for_driver(idx0)
+                    .attach_procedure_to_interp_for_key(
+                        &pin,
+                        &mut live,
+                        std::sync::Arc::clone(&token),
+                    );
+            }
 
             fn pos(n: usize) -> majit_metainterp::recorder::TracePosition {
                 majit_metainterp::recorder::TracePosition {
@@ -13670,7 +13776,10 @@ mod tests {
         {
             let meta = pair.0.meta_interp_mut();
             meta.abort_trace_live(false);
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
+            let (step, _) = {
+                let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
+                meta.maybe_compile_and_run_step(portal_hash, _zbh_pin.save(), 7, &[])
+            };
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -13709,8 +13818,17 @@ mod tests {
             assert_eq!(idx0, 0);
             meta.finish_setup_descrs_for_jitdrivers();
 
-            let action =
-                meta.bound_reached(portal_hash, (0xC0DE, 7), Some(portal.clone()), None, &[]);
+            let action = {
+                let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
+                meta.bound_reached(
+                    portal_hash,
+                    _zbh_pin.save(),
+                    7,
+                    Some(portal.clone()),
+                    None,
+                    &[],
+                )
+            };
             assert!(matches!(action, BackEdgeAction::StartedTracing));
             assert_eq!(meta.active_jitdriver_sd, Some(idx0));
             assert!(
@@ -13723,8 +13841,16 @@ mod tests {
             meta.warm_state_for_driver(idx0)
                 .memory_manager
                 .keep_loop_alive(&token);
-            meta.warm_state_for_driver(idx0)
-                .attach_procedure_to_interp_for_key(&portal, std::sync::Arc::clone(&token));
+            {
+                let pin = majit_metainterp::GreenRefPin::pin(&portal);
+                let mut live = pin.live_clone(&portal);
+                meta.warm_state_for_driver(idx0)
+                    .attach_procedure_to_interp_for_key(
+                        &pin,
+                        &mut live,
+                        std::sync::Arc::clone(&token),
+                    );
+            }
         }
         let started = note_inline_subwalk_start((names_hash, names.clone()), None, &[], None, 0);
         assert!(
@@ -13750,18 +13876,24 @@ mod tests {
 
         {
             let meta = pair.0.meta_interp_mut();
-            let names_cell = meta
-                .warm_state_for_driver(0)
-                .lookup_chain_with_key(&names)
-                .expect("disable_noninlinable_function_for_key installs the names() cell");
+            let names_cell = {
+                let pin = majit_metainterp::GreenRefPin::pin(&names);
+                let live = pin.live_clone(&names);
+                meta.warm_state_for_driver(0)
+                    .lookup_chain_with_key(&pin, &live)
+            }
+            .expect("disable_noninlinable_function_for_key installs the names() cell");
             assert!(
                 names_cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the shipped abort disables the oversized inlined names() frame"
             );
-            let portal_cell = meta
-                .warm_state_for_driver(0)
-                .lookup_chain_with_key(&portal)
-                .expect("bound_reached installed the portal cell");
+            let portal_cell = {
+                let pin = majit_metainterp::GreenRefPin::pin(&portal);
+                let live = pin.live_clone(&portal);
+                meta.warm_state_for_driver(0)
+                    .lookup_chain_with_key(&pin, &live)
+            }
+            .expect("bound_reached installed the portal cell");
             assert!(
                 !portal_cell
                     .flags
@@ -13776,7 +13908,10 @@ mod tests {
             // pyjitpl.py `blackhole_if_trace_too_long` raises SwitchToBlackhole;
             // the live TraceCtx is gone before the next maybe_compile_and_run.
             meta.abort_trace_live(false);
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
+            let (step, _) = {
+                let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
+                meta.maybe_compile_and_run_step(portal_hash, _zbh_pin.save(), 7, &[])
+            };
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -16725,8 +16860,8 @@ pub(crate) fn assemble_bridge_inline_pending(
         concrete_stack.push(concrete_value_from_slot(recipe_slot_to_pyobj(live)));
     }
     sym.concrete_stack = concrete_stack;
-    sym.concrete_namespace = w_globals;
-    sym.frame_w_globals = ctx.const_ref(w_globals as usize as i64);
+    sym.publish_concrete_namespace(w_globals);
+    sym.frame_w_globals = ctx.const_ref(sym.current_concrete_namespace() as usize as i64);
     sym.concrete_execution_context = execution_context;
     // perform_call threads the caller's `ec` down to every inlined callee
     // (reds=['frame','ec'], interp_jit.py:67), so the callee shares the
@@ -17080,13 +17215,21 @@ fn emit_reconstructed_callee_pyframe(
     let code_ref = unsafe { &*raw_code };
     let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
     let nlocals = code_ref.varnames.len();
-    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr);
+    // Pin the walked wrapper before `recover_inline_callee_globals_from_recipe`
+    // and the two `const_ref` interns (`history.py` `ConstPtr` /
+    // `id_or_identityhash` / `_allocate_shadow`). Re-read each word from
+    // its extra-area slot (`gctransform/shadowstack.py` `push_roots`).
+    let _recon_roots = pyre_object::gc_roots::push_roots();
+    let recon_code_slot = _recon_roots.pin_roots(&[w_code]);
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
     if w_globals.is_null() {
         return None;
     }
-    let pycode_const = ctx.const_ref(w_code as i64);
-    let w_globals_const = ctx.const_ref(w_globals as i64);
+    let _ = _recon_roots.pin_root(w_globals);
+    let recon_ns_slot = recon_code_slot + 1;
+    let pycode_const = ctx.const_ref(_recon_roots.get(recon_code_slot) as i64);
+    let w_globals_const = ctx.const_ref(_recon_roots.get(recon_ns_slot) as i64);
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
     let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
     // The operands live at the guard, at their `locals_cells_stack_w` slots:

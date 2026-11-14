@@ -2738,6 +2738,25 @@ pub struct ResumeDataLoopMemo {
     virtual_worklist_scratch: Vec<majit_ir::operand::Operand>,
 }
 
+/// Live address plus an owner-root pin across `identityhash`.
+///
+/// `resume.py` getconst keys the cache by `identityhash` then `_newconst`
+/// appends `ConstPtr.value`. The hash follows a forwarding stub; storing
+/// the original word leaves `rd_consts` holding a from-space address.
+fn pin_resume_ref(addr: usize) -> (usize, Option<majit_gc::shadow_stack::OwnerRootGuard>) {
+    let pin = (addr != 0 && majit_gc::gc_owns_object(addr))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)));
+    let addr = pin.as_ref().map(|p| p.get().0).unwrap_or(addr);
+    (addr, pin)
+}
+
+fn resume_ref_after_collect(
+    addr: usize,
+    pin: &Option<majit_gc::shadow_stack::OwnerRootGuard>,
+) -> usize {
+    pin.as_ref().map(|p| p.get().0).unwrap_or(addr)
+}
+
 impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
@@ -2941,14 +2960,19 @@ impl ResumeDataLoopMemo {
         if val == 0 {
             return Ok(NULLREF);
         }
-        let key = majit_ir::gc_id_or_identityhash(val as usize) as i64;
+        let (addr, pin) = pin_resume_ref(val as usize);
+        if addr == 0 {
+            return Ok(NULLREF);
+        }
+        let key = majit_ir::gc_id_or_identityhash(addr) as i64;
+        let addr = resume_ref_after_collect(addr, &pin);
         if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
         let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
         unsafe {
             self.consts
-                .push_during_optimization(majit_ir::Const::Ref(majit_ir::GcRef(val as usize)));
+                .push_during_optimization(majit_ir::Const::Ref(majit_ir::GcRef(addr)));
         }
         self.refs.insert(key, tagged);
         Ok(tagged)
@@ -3028,12 +3052,16 @@ impl ResumeDataLoopMemo {
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
                 // `ENCODED_NULLREF` before the positive-index branch.
-                let gcref = *gcref;
-                let raw = gcref.0 as i64;
+                let raw = gcref.0;
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
                 }
-                let key = majit_ir::gc_id_or_identityhash(gcref.0) as i64;
+                let (addr, pin) = pin_resume_ref(raw);
+                if addr == 0 {
+                    return tag_i64(ENCODED_NULLREF, TAGCONST);
+                }
+                let key = majit_ir::gc_id_or_identityhash(addr) as i64;
+                let addr = resume_ref_after_collect(addr, &pin);
                 if let Some(&tagged_i16) = self.refs.get(&key) {
                     let (num, _) = untag(tagged_i16);
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
@@ -3041,7 +3069,7 @@ impl ResumeDataLoopMemo {
                 let pool_index = self.consts.len();
                 unsafe {
                     self.consts
-                        .push_during_optimization(majit_ir::Const::Ref(gcref));
+                        .push_during_optimization(majit_ir::Const::Ref(majit_ir::GcRef(addr)));
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
                 if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {

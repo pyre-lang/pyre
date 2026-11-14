@@ -9943,6 +9943,15 @@ fn try_load_global_descent<Sym: WalkSym>(
         return Ok(None);
     }
     let name_index = (raw as usize) >> 1;
+    // `is_code` is a type check, not a collecting call. Re-read the
+    // ConstPtr box so a later `w_code_getname_w` sees the live operand.
+    let Some(majit_ir::Value::Ref(code)) = ctx.trace_ctx.box_value(w_code) else {
+        return Ok(None);
+    };
+    if code.is_null() || code == majit_ir::GcRef::NO_CONCRETE {
+        return Ok(None);
+    }
+    let code = code.as_usize() as pyre_object::PyObjectRef;
     if !unsafe { pyre_interpreter::pycode::w_code_name_index_covered(code, name_index) } {
         return Ok(None);
     }

@@ -3189,7 +3189,7 @@ fn emit_portal_runner(
             // `execute_assembler`'s DoneWithThisFrame fast path return without
             // entering the portal body.
             {
-                let (__green_hash, __green_values, __green_spec) = #key;
+                let (__green_hash, __green_values, __green_spec, __green_pin) = #key;
                 match #driver.function_entry_runner(
                     __green_hash,
                     &__green_values,
@@ -3197,6 +3197,7 @@ fn emit_portal_runner(
                     #pc,
                     &mut #state,
                     #env,
+                    Some(__green_pin.save()),
                 ) {
                     majit_metainterp::FunctionEntryRunner::Finished(__finish_word) => {
                         #direct
@@ -3813,7 +3814,30 @@ fn rewrite_body(
                     }
                 })
                 .collect();
-            let values: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.0 }).collect();
+            let pin_pushes: Vec<TokenStream> = slots
+                .iter()
+                .map(|slot| {
+                    quote! {
+                        if #slot.1 == majit_ir::GreenType::Ref {
+                            majit_metainterp::green_shadow_push_ref(#slot.0);
+                        }
+                    }
+                })
+                .collect();
+            let reload_elems: Vec<TokenStream> = slots
+                .iter()
+                .map(|slot| {
+                    quote! {
+                        if #slot.1 == majit_ir::GreenType::Ref {
+                            let __v = majit_metainterp::green_shadow_get(__green_ss);
+                            __green_ss += 1;
+                            __v
+                        } else {
+                            #slot.0
+                        }
+                    }
+                })
+                .collect();
             let spec_elems: Vec<TokenStream> =
                 slots.iter().map(|slot| quote! { #slot.2 }).collect();
             let n = slots.len();
@@ -3822,14 +3846,24 @@ fn rewrite_body(
             // these stack arrays with the driver's `GreenSpec`. An owned
             // `GreenKey` is built from the same arrays only where a cell
             // is installed (`JitCell(*greenargs)` / `GreenKey::from_greenargs`).
+            // Pin Ref greens across `green_uhash_step` (`incminimark.py
+            // _find_shadow`) and store the forwarded slot (`gctransform/shadowstack.py`).
             Some(quote! {
                 {
                     #(#bind)*
+                    let __green_pin = majit_metainterp::GreenRefPin::begin();
+                    #(#pin_pushes)*
                     let mut __green_hash: u64 = majit_ir::GREEN_UHASH_SEED;
                     #(#fold)*
-                    let __green_values: [i64; #n] = [#(#values),*];
+                    let mut __green_ss = __green_pin.save();
+                    let __green_values: [i64; #n] = [#(#reload_elems),*];
                     let __green_spec = (#(#spec_elems,)*);
-                    (__green_hash, __green_values, __green_spec)
+                    (
+                        __green_hash,
+                        __green_values,
+                        __green_spec,
+                        __green_pin,
+                    )
                 }
             })
         }
@@ -4312,8 +4346,8 @@ fn rewrite_body(
                             {
                                 quote! {
                                     {
-                                        let (__green_hash, __green_values, __green_spec) = #green_key;
-                                        #driver_expr.back_edge_structured(__green_hash, &__green_values, __green_spec, #target_expr, #state_expr, #env_expr, #pre_run_expr)
+                                        let (__green_hash, __green_values, __green_spec, __green_pin) = #green_key;
+                                        #driver_expr.back_edge_structured(__green_hash, &__green_values, __green_spec, #target_expr, #state_expr, #env_expr, #pre_run_expr, Some(__green_pin.save()))
                                     }
                                 }
                             } else {
@@ -4491,7 +4525,7 @@ fn rewrite_body(
                 if insert_entry_door {
                     quote! {
                         {
-                            let (__green_hash, __green_values, __green_spec) = #key;
+                            let (__green_hash, __green_values, __green_spec, __green_pin) = #key;
                             let __run_dispatch = match #driver.function_entry_structured(
                                 __green_hash,
                                 &__green_values,
@@ -4499,6 +4533,7 @@ fn rewrite_body(
                                 #pc,
                                 &mut #state,
                                 #env,
+                                Some(__green_pin.save()),
                             ) {
                                 Some(__resume) if __resume == usize::MAX => false,
                                 Some(__resume) => {

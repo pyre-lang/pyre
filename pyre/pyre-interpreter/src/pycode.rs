@@ -852,10 +852,11 @@ pub struct PyCode {
     /// Hidden `mutate_w_globals` field `rclass.py InstanceRepr._setup_repr`
     /// synthesizes as `mutate_<name>` for `pycode.py` `"w_globals?"`.
     ///
-    /// Holds no GC pointers. The wrapper is born non-moving
-    /// (`malloc_typed_stable`), which is what lets a recorded watcher keep
-    /// this address. The collector runs no `Drop`, so [`pycode_destructor`]
-    /// reclaims the instance.
+    /// Holds no GC pointers. A recorded watcher keeps the wrapper as a
+    /// GCREF (`quasiimmut.py QuasiImmutDescr.struct`); `walk_const_ptr_refs`
+    /// forwards that word the way a shadowstack GCREF is rewritten. The
+    /// collector runs no `Drop`, so [`pycode_destructor`] reclaims the
+    /// instance.
     pub mutate_w_globals: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
     pub mutate_w_globals_lock:
         std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmutLock>,
@@ -1263,13 +1264,13 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
 ///
-/// `pycode.py` makes `PyCode` an ordinary GC object. Pyre's current JIT seam,
-/// however, still carries raw wrapper addresses alongside `CodeObject*` in
-/// compiled and resume metadata. Keep the wrapper collector-owned but
-/// stable-address until those remaining raw couriers are replaced with GC
-/// references; the collector can still reclaim it and its namespace cycle.
-/// Bootstrap wrappers created before GC installation fall back to the
-/// prebuilt family and use the explicit root walkers.
+/// `pycode.py` makes `PyCode` an ordinary GC object
+/// (`instantiate` → `malloc_fixedsize`). The wrapper is a nursery
+/// `W_Root` (`malloc_typed_managed`); `LIVE_CODE_WRAPPERS` values and
+/// `QuasiImmutDescr.struct` are GCREFs the root walk forwards. The inner
+/// `CodeObject` box stays a host allocation and never moves. Bootstrap
+/// wrappers created before GC installation fall back to the prebuilt
+/// family and use the explicit root walkers.
 #[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // Zero owner: this entry point's contract is that the body is never
@@ -1282,12 +1283,12 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
 ///
 /// `pycode.py self.co_consts_w = consts` as a type-9 `FixedObjectArray`.
 ///
-/// The `co_consts_w` list is a young GC object; a minor that reaches the `PyCode`
-/// copies the list and then scans the items. pyre births `PyCode`
-/// old-gen, so the table is allocated in the nursery — `co_consts_w` is
-/// then an old-to-young edge whose write barrier remembers the wrapper,
-/// and `walk_raw_code_roots` visiting the array pointer is the copy+scan
-/// of that young list.
+/// The `co_consts_w` list is a young GC object; a minor that reaches the
+/// `PyCode` copies the list and then scans the items. The wrapper is a
+/// nursery `W_Root` (`malloc_typed_managed` / `malloc_fixedsize`); a
+/// nursery-full spill is old-gen, and that old-to-young edge is what the
+/// write barrier remembers. `walk_enrolled_code_roots` visiting the array
+/// pointer is the copy+scan of that young list.
 unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
     let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
     let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
@@ -1404,10 +1405,9 @@ fn w_code_new_owned(
         Box::into_raw(Box::new(v))
     };
     // `pycode.py self.co_consts_w = consts`. The table is a young
-    // `FixedObjectArray`; allocate it only after the old-gen wrapper is
-    // rooted, then store with a write barrier. Holding the nursery
-    // pointer in a raw local across `malloc_typed_stable` left it
-    // unforwarded.
+    // `FixedObjectArray`; allocate it only after the wrapper is rooted,
+    // then store with a write barrier. Holding the nursery pointer in a
+    // raw local across `malloc_typed_managed` left it unforwarded.
     let consts_len = if !code_ptr_aligned {
         0
     } else {
@@ -1484,7 +1484,7 @@ fn w_code_new_owned(
     };
     // `pycode.py PyCode.__init__`: `self.w_filename = space.newfilename(filename)`
     // before the code object is published. Realize from `source_path` (the
-    // construction-time spelling) and root it across `malloc_typed_stable`,
+    // construction-time spelling) and root it across `malloc_typed_managed`,
     // which is a `gc_op` wait point: a struct-local GCREF would not be
     // forwarded. `set_filename_bytes` re-realizes if a later writer supplies
     // the filesystem bytes `importing.py update_code_filenames` would store.
@@ -1531,30 +1531,30 @@ fn w_code_new_owned(
         jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
         _signature: std::ptr::null_mut(),
     };
-    // The raw-address JIT compatibility seam described above requires a
-    // stable wrapper address. `malloc_typed_stable` is still a managed
-    // allocation: unlike the prebuilt allocator it can be reclaimed by a
-    // major collection, but it is born in oldgen and never relocates.
-    let obj = pyre_object::lltype::malloc_typed_stable(obj) as PyObjectRef;
+    // `instantiate(PyCode)` → `malloc_fixedsize`: nursery bump, old-gen
+    // spill on overflow. Pin `obj` immediately after the malloc
+    // (`gctransform/shadowstack.py`).
+    let obj = pyre_object::lltype::malloc_typed_managed(obj) as PyObjectRef;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     if code_ptr_aligned {
         // `pycode.py` `PyCode.__init__`: `self._signature = make_signature(self)`.
         // Host box, not a GC reference, so it is stored before the later
         // const and name allocations. `pycode_destructor` frees it on the
         // same path as `filename_bytes`.
+        let published = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let signature = Box::into_raw(Box::new(unsafe {
-            make_signature(&*(obj as *const PyCode))
+            make_signature(&*(published as *const PyCode))
         }));
         unsafe {
-            (*(obj as *mut PyCode))._signature = signature;
+            (*(published as *mut PyCode))._signature = signature;
         }
     }
     // PyPy's ast compiler has already wrapped every entry before PyCode.__init__
-    // (`assemble.py add_const`). Pin the freshly allocated wrapper while
-    // recursive code constants and managed scalar constants allocate, then
+    // (`assemble.py add_const`). The wrapper is already pinned; recursive
+    // code constants and managed scalar constants allocate below, then
     // publish one object in every co_consts_w slot before returning PyCode.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let obj = pyre_object::gc_roots::pin_root(obj);
     if code_ptr_aligned {
         let w_filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
         let published = publish_code_slot_store_rooting(
@@ -2028,10 +2028,10 @@ fn publish_code_slot_store(obj: PyObjectRef) {
     if obj.is_null() {
         return;
     }
-    // The owner is a `malloc_typed_stable` / `try_gc_alloc_stable_raw`
-    // PyCode. The managed barrier skips the hybrid-heap ownership lookup
-    // `try_gc_write_barrier` still pays, and is the one every other
-    // stable allocator uses after writing a young child.
+    // The owner is a `malloc_typed_managed` / `try_gc_alloc` PyCode
+    // (`malloc_fixedsize`). The managed barrier skips the hybrid-heap
+    // ownership lookup `try_gc_write_barrier` still pays, and is the one
+    // every other managed allocator uses after writing a young child.
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
@@ -2715,7 +2715,9 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     }
     add_obj(
         &mut result,
-        pyre_object::bytesobject::w_bytes_from_bytes(&unsafe { code_bytes(obj) }),
+        pyre_object::bytesobject::w_bytes_from_bytes(&unsafe {
+            code_bytes(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        }),
     )?;
     add_obj(
         &mut result,
@@ -2734,7 +2736,10 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     let src_p = src.as_ptr();
     let mut index = 0usize;
     while index < src.len() {
-        let w_constant = unsafe { w_code_const(obj, index) };
+        // `add_obj` / `w_code_const` allocate; re-read the wrapper from its
+        // shadow slot (`gctransform/shadowstack.py`).
+        let w_constant =
+            unsafe { w_code_const(pyre_object::gc_roots::shadow_stack_get(obj_slot), index) };
         let w_constant = if w_constant.is_null() {
             crate::pyframe::pyobject_from_constant(unsafe { &*src_p.add(index) })
         } else {
@@ -3854,10 +3859,10 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     if idx >= unsafe { (&*table).len() } {
         return pyre_object::pyobject::PY_NULL;
     }
-    // Pin the table across the realizing allocation. PyCode is old-gen, so
-    // a shadow-stack visit of the wrapper does not scan `co_consts_w`; the
-    // collector rewrites this pin into the shadow slot and the return value.
-    // `getconstant_w` indexes the live `co_consts_w` array.
+    // Pin the table across the realizing allocation. A shadow-stack visit
+    // of the wrapper forwards the wrapper; the table pin is the live
+    // `co_consts_w` array the collector rewrites into the shadow slot.
+    // `getconstant_w` indexes that array.
     let table_slot = pyre_object::gc_roots::shadow_stack_len();
     let table = roots.pin_root(table as pyre_object::PyObjectRef) as *mut FixedObjectArray;
     let existing = unsafe { (&*table).load_atomic(idx, std::sync::atomic::Ordering::Acquire) };
@@ -3901,6 +3906,11 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
 ///
 /// False for a null object, an empty name array (unusable `code_ptr`), and
 /// for [`crate::pyopcode::NO_NAMEINDEX`].
+///
+/// `w_code_obj` must be the live wrapper from its traced owner
+/// (`frame.pycode`, `Function.code`, `live_code_wrapper`). A copy held
+/// across a collecting call is forwarded by re-reading that owner
+/// (`gctransform/shadowstack.py`).
 pub unsafe fn w_code_name_index_covered(w_code_obj: PyObjectRef, idx: usize) -> bool {
     if w_code_obj.is_null() {
         return false;
@@ -4872,6 +4882,31 @@ pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut 
     let mut root = *wrapper as PyObjectRef;
     forward(&mut root);
     *wrapper = root as usize;
+}
+
+/// Forward every `LIVE_CODE_WRAPPERS` value in place.
+///
+/// A wrapper is born before its jitcode exists, and
+/// `walk_live_code_wrapper` only sees `MetaInterpStaticData.jitcodes`
+/// keys. A minor in that window copies the wrapper through `frame.pycode`
+/// / `Function.code` and recycles the nursery; the map still holds the
+/// birth address, and `gc_current_object_address` then reads a recycled
+/// header as a forwarding stub. The jitcode extra-area walker uses this
+/// for nursery-resident values so a minor forwards them
+/// (pyre extra-area for a host table with no graph edge;
+/// `malloc_fixedsize`). Old-gen interpreted-only entries are not a
+/// major mark set: that kept `w_globals` alive across
+/// `finalize_modules`' pre-clear collection.
+pub fn walk_all_live_code_wrappers(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let mut wrappers = live_code_wrappers().lock();
+    for wrapper in wrappers.values_mut() {
+        let mut root = *wrapper as PyObjectRef;
+        if root.is_null() {
+            continue;
+        }
+        forward(&mut root);
+        *wrapper = root as usize;
+    }
 }
 
 /// One `box_code_object` allocation graph and what still reads it.

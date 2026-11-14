@@ -159,7 +159,6 @@ fn trace_guard_exact_w_class(
 }
 
 use crate::descr::{float_floatval_descr, int_intval_descr, w_float_size_descr, w_int_size_descr};
-use crate::frame_layout::PYFRAME_PYCODE_OFFSET;
 
 /// pyjitpl.py `_opimpl_setfield_vable` parity helper.
 ///
@@ -1472,31 +1471,30 @@ impl MIFrame {
     /// (in pyjitpl.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
-        let frame_addr = self.concrete_frame_addr;
-        // virtualizable.py read_boxes reads statics from the LIVE
-        // virtualizable. Prefer the GC-forwarded live identity
-        // (`current_live_vable_frame`) when this shadow owns it, otherwise
-        // the walk handle (`concrete_frame_addr`). Pointer-valued statics
-        // (`debugdata`) live on that object; a const captured from a
-        // nursery corpse dangles in the compiled trace's resume data, and
-        // the guard-failure vable write (`write_from_resume_data_partial`)
-        // would stamp it into the live frame. `last_instr` /
-        // `valuestackdepth` are plain values that evolve with the trace,
-        // so they stay sourced from `frame_addr` below.
-        let statics_addr = {
-            let live = self.sym().current_live_vable_frame();
-            if live != 0 && self.sym().owns_virtualizable_shadow() {
-                live
-            } else {
-                frame_addr
-            }
-        };
-        let code_ptr = if statics_addr != 0 {
-            unsafe { *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize) }
+        // `pycode.py class PyCode(W_Root)`: intern hashes the referent
+        // (`history.py` `ConstPtr` / `id_or_identityhash` / `_allocate_shadow`).
+        // Take the code from the jitcode-retained wrapper, which the GC walks
+        // (`walk_live_code_wrapper`), not from a `PyFrame.pycode` word read
+        // through the raw `concrete_frame_addr`, which a collection does not
+        // update. Pin wrapper and globals together (`gctransform/shadowstack.py`
+        // `push_roots` / `framework.py` `gct_direct_call`) before the first
+        // intern. A null wrapper interns as `const_ref(0)` / `GcRef(0)`, as a
+        // frame-less MIFrame did before. `last_instr` / `valuestackdepth` stay
+        // sourced from `concrete_frame_addr` below.
+        let wrapper = if !self.sym().jitcode.is_null() {
+            let raw = unsafe { (*self.sym().jitcode).raw_code() as *const () };
+            pyre_interpreter::live_code_wrapper(raw)
         } else {
-            0
+            pyre_object::PY_NULL
         };
-        let ns_ptr = self.sym().concrete_namespace as i64;
+        // Recording-time `get_w_globals` (debugdata.w_globals else
+        // pycode.w_globals), forwarded by the MIFrame owner root.
+        // `exec(code, other)` stamps the override on debugdata, so
+        // interning this dict keeps LOAD_GLOBAL on the frame's namespace.
+        let ns_obj = self.sym().current_concrete_namespace();
+        let _flush_roots = pyre_object::gc_roots::push_roots();
+        let code_slot = _flush_roots.pin_roots(&[wrapper, ns_obj]);
+        let ns_slot = code_slot + 1;
         // Read from the concrete `PyFrame.valuestackdepth` rather than the
         // symbolic mirror. `resume_pc == self.orgpc` (the
         // start PC of the current opcode) so PyFrame holds the correct
@@ -1520,7 +1518,7 @@ impl MIFrame {
         // `cut_trace_from` / `opencoder.py` `TraceIterator._get`).
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
-        let pycode_op = ctx.const_ref(code_ptr as i64);
+        let pycode_op = ctx.const_ref(_flush_roots.get(code_slot) as i64);
         let vsd_op = ctx.const_int(vsd);
         let debugdata_idx = ctx
             .virtualizable_info()
@@ -1529,7 +1527,7 @@ impl MIFrame {
             .and_then(|i| ctx.virtualizable_box_at(i))
             .filter(|&op| !op.is_none() && !ctx.opref_is_void_producer(op))
             .unwrap_or_else(|| self.sym().vable_debugdata);
-        let w_globals_op = ctx.const_ref(ns_ptr);
+        let w_globals_op = ctx.const_ref(_flush_roots.get(ns_slot) as i64);
         let owns = {
             let s = self.sym_mut();
             s.vable_last_instr = last_instr_op;
@@ -1552,7 +1550,12 @@ impl MIFrame {
                 last_instr_op,
                 Value::Int(last_instr_value),
             );
-            mirror_vable_static_to_boxes(ctx, "pycode", pycode_op, Value::Ref(GcRef(code_ptr)));
+            mirror_vable_static_to_boxes(
+                ctx,
+                "pycode",
+                pycode_op,
+                Value::Ref(GcRef(_flush_roots.get(code_slot) as usize)),
+            );
             mirror_vable_static_to_boxes(ctx, "valuestackdepth", vsd_op, Value::Int(vsd));
         }
     }

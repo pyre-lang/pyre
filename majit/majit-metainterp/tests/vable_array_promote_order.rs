@@ -171,13 +171,17 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     meta.staticdata = Arc::new(staticdata);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Ref(majit_ir::GcRef(2))],
-    );
+    {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Ref(majit_ir::GcRef(2))],
+        )
+    };
     let ctx = meta.trace_ctx().expect("force-started fixture trace");
     // This is an IR-shape fixture with symbolic pointer sentinels, as with
     // TraceCtx::for_test_types; do not ask a native CPU to dereference them.

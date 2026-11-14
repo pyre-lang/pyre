@@ -184,6 +184,54 @@ fn live_gc_ptr(gcref: majit_ir::GcRef) -> Option<i64> {
     (ptr != 0 && ptr != usize::MAX as i64).then_some(ptr)
 }
 
+/// One `TraceCtx::inline_frames` entry.
+///
+/// Index paths store a jitcode index in `code_raw` with an empty
+/// retain list. The inlined-portal path retains a `GreenType::Ref`
+/// code key so `live_raw` follows a nursery `W_Code` after a minor
+/// collection, the same way `live_green_key_raw` rereads
+/// `green_key_code`.
+pub(crate) struct InlineFrameEntry {
+    code: majit_ir::RetainedGreens,
+    code_raw: i64,
+    pc: usize,
+}
+
+impl InlineFrameEntry {
+    pub(crate) fn from_index(raw: (usize, usize)) -> Self {
+        Self {
+            code: majit_ir::RetainedGreens::default(),
+            code_raw: raw.0 as i64,
+            pc: raw.1,
+        }
+    }
+
+    pub(crate) fn from_ref(raw: (usize, usize)) -> Self {
+        let (code, fallback) = retain_code_ptr(raw.0);
+        Self {
+            code,
+            code_raw: fallback,
+            pc: raw.1,
+        }
+    }
+
+    pub(crate) fn live_raw(&self) -> (usize, usize) {
+        (self.code.current_value(0, self.code_raw) as usize, self.pc)
+    }
+}
+
+/// Retain a live wrapper address the way `TraceCtx::green_key_code` does.
+pub(crate) fn retain_code_ptr(code: usize) -> (majit_ir::RetainedGreens, i64) {
+    if code == 0 {
+        (majit_ir::RetainedGreens::default(), 0)
+    } else {
+        (
+            majit_ir::RetainedGreens::retain_greenargs(&[code as i64], &[GreenType::Ref]),
+            code as i64,
+        )
+    }
+}
+
 /// pyjitpl.py:2989 box-with-type pair.
 ///
 /// RPython's `Box` carries type implicitly via Python class identity
@@ -308,21 +356,23 @@ pub struct TraceCtx {
     pub(crate) metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     pub(crate) green_key: u64,
     root_green_key: u64,
-    /// Structured `(code_ptr, pc)` counterpart to `green_key`. Keeps
-    /// pyjitpl.py:1396-1401's element-wise `same_constant` parity when
-    /// comparing against inline-frame green keys; the u64 `green_key`
-    /// above is the hash derived from this pair and stays the identity
-    /// key for HashMap lookups (warmstate / pending
-    /// token) while comparisons route through the raw pair.
-    pub(crate) green_key_raw: (usize, usize),
-    pub(crate) root_green_key_raw: (usize, usize),
-    /// Stack of inlined function frames (callee green keys as raw
-    /// `(code_ptr, pc)` pairs). rpython/jit/metainterp/pyjitpl.py:1390
-    /// walks `self.metainterp.framestack` element-wise; pyre mirrors
-    /// that by storing the structured greenkey per inline frame and
-    /// doing tuple-equality comparisons in [`recursive_depth`] and
-    /// [`is_tracing_key`].
-    pub(crate) inline_frames: Vec<(usize, usize)>,
+    /// Portal `W_Code` retained as a walked owner-root (`JitCell` Ref
+    /// greens). `live_green_key_raw` reloads the forwarded bits; a copied
+    /// `(W_Code*, pc)` pair is not a GCREF local (`gctransform/shadowstack.py`).
+    pub(crate) green_key_code: majit_ir::RetainedGreens,
+    pub(crate) green_key_pc: usize,
+    pub(crate) green_key_code_fallback: i64,
+    pub(crate) root_green_key_code: majit_ir::RetainedGreens,
+    pub(crate) root_green_key_pc: usize,
+    pub(crate) root_green_key_code_fallback: i64,
+    /// Stack of inlined function frames. Integer-index entries
+    /// (`push_inline_frame`) keep a plain `(jitcode index, pc)` pair.
+    /// A Ref code key (`push_inline_frame_ref`, the inlined-portal
+    /// `newframe` path) is held on the entry through `RetainedGreens`
+    /// and compared by its live value, matching `green_key_code`.
+    /// rpython/jit/metainterp/pyjitpl.py walks `framestack` greenkeys;
+    /// pyre's `recursive_depth` / `is_tracing_key` walk these entries.
+    pub(crate) inline_frames: Vec<InlineFrameEntry>,
     /// Retired. `JitCodeMachine` writes the portal log through
     /// [`Self::portal_trace_push_fn`] into `MetaInterp.portal_trace_positions`.
     /// Structured green key values (if provided by the interpreter).
@@ -2456,8 +2506,12 @@ impl TraceCtx {
             metainterp_sd,
             green_key,
             root_green_key: green_key,
-            green_key_raw: (0, 0),
-            root_green_key_raw: (0, 0),
+            green_key_code: majit_ir::RetainedGreens::default(),
+            green_key_pc: 0,
+            green_key_code_fallback: 0,
+            root_green_key_code: majit_ir::RetainedGreens::default(),
+            root_green_key_pc: 0,
+            root_green_key_code_fallback: 0,
             inline_frames: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
@@ -2558,8 +2612,12 @@ impl TraceCtx {
             metainterp_sd,
             green_key,
             root_green_key: green_key,
-            green_key_raw: (0, 0),
-            root_green_key_raw: (0, 0),
+            green_key_code: majit_ir::RetainedGreens::default(),
+            green_key_pc: 0,
+            green_key_code_fallback: 0,
+            root_green_key_code: majit_ir::RetainedGreens::default(),
+            root_green_key_pc: 0,
+            root_green_key_code_fallback: 0,
             inline_frames: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,

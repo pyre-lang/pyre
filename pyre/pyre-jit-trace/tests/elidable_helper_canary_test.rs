@@ -62,13 +62,17 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Int(live_x)],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Int(live_x)],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -128,13 +132,17 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_dead_beef;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Int(live_x)],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Int(live_x)],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -188,13 +196,17 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_0bad_cafe_dead_beef;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Int(live_x)],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Int(live_x)],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -236,13 +248,17 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let const_x: i64 = 3;
@@ -320,13 +336,17 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
     // Seed a live Ref inputarg in slot 0 = w_type (the receiver type).
     let live_type: usize = 0x710E_0000;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Ref(GcRef(live_type))],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Ref(GcRef(live_type))],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
@@ -388,13 +408,17 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
@@ -478,13 +502,17 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
     // version_tag guard promotes the receiver type to a constant.
     let live_type: usize = 0x710E_2222;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Ref(GcRef(live_type))],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Ref(GcRef(live_type))],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
@@ -542,13 +570,17 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
@@ -637,13 +669,17 @@ fn instance_getdictvalue_records_residual_call_r_not_pure() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(2, jit_instance_getdictvalue);

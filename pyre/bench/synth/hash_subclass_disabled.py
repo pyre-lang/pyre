@@ -2,6 +2,11 @@
 # A tuple/frozenset subclass that sets __hash__ = None is unhashable: hash()
 # and set insertion both raise TypeError instead of the structural fast path
 # hashing by contents. Output verified against CPython/PyPy.
+# The `fill` allocation runs before `main()` so the lambdas' code objects
+# are already promoted when `kind`'s loop compiles. Otherwise the GuardValue
+# on `Function.code` counts against the live pointer (`compile.py
+# AbstractResumeGuardDescr.must_compile`) and a minor collection inside the
+# eagerness window moves `guard_failures` with the process's startup allocation.
 N = 240000
 
 
@@ -35,4 +40,6 @@ def main():
     print(T.__hash__, n)
 
 
+fill = list(map(str, range(400000)))
+del fill
 main()

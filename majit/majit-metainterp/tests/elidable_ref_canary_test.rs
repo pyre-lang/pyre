@@ -90,13 +90,17 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     // is a Ref bank input (force_start_tracing's record_input_arg).
     let live_p: usize = 0xBEEF_0000;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Ref(GcRef(live_p))],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Ref(GcRef(live_p))],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     // Fold path requires EF_ELIDABLE_CANNOT_RAISE:
@@ -163,13 +167,17 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);

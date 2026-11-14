@@ -7923,7 +7923,15 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     frame_ptr: *mut PyFrame,
     namei: i64,
 ) -> PyObjectRef {
-    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
+    // The wrapper is a nursery `W_Root`; pin it across `w_code_get_ptr` /
+    // `w_code_getname_w_or_new` / `getitem` (`gctransform/shadowstack.py`).
+    let code_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = code_roots.base();
+    let _ = code_roots.pin_root(w_code_ptr);
+    let w_code_ptr = code_roots.get(code_slot);
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
+    };
     let idx = namei as usize;
     if idx >= code.names.len() {
         return PY_NULL;
@@ -7937,11 +7945,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // name through `code.names[idx]`, so it names the key from the same index
     // instead of minting an immortal `w_str` on every execution.
     let key = unsafe {
-        pyre_interpreter::pycode::w_code_getname_w_or_new(
-            w_code_ptr as pyre_object::PyObjectRef,
-            idx,
-            varname,
-        )
+        pyre_interpreter::pycode::w_code_getname_w_or_new(code_roots.get(code_slot), idx, varname)
     };
     match pyre_interpreter::baseobjspace::getitem(dict, key) {
         Ok(val) => return val,
@@ -7957,15 +7961,15 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // The globals lookup below reaches a user `__getitem__` on a non-dict
     // mapping, and the builtins leg after it reads both the frame and the
     // globals again.  The frame is held on the shadow stack and the globals
-    // re-derived from it — a dict is one of the two kinds a minor collection
-    // relocates, and the promoted `w_code` it otherwise comes off does not
-    // move — so neither is carried across the lookup.
+    // re-derived from it. A dict and the nursery `W_Code` wrapper both move,
+    // so neither is carried across the lookup: re-read the wrapper from its
+    // shadow slot (`gctransform/shadowstack.py`).
     let frame_anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr) };
     let live_globals = |frame: *mut PyFrame| unsafe {
         if !frame.is_null() {
             (*frame).get_w_globals()
         } else {
-            pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)
+            pyre_interpreter::w_code_get_w_globals(code_roots.get(code_slot))
         }
     };
     let w_globals = live_globals(frame_anchor.live());

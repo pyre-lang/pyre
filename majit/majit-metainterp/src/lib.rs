@@ -136,6 +136,29 @@ pub mod optimize;
 pub mod optimizeopt;
 mod pyjitpl;
 pub use pyjitpl::{HostHooks, host_hooks, publish_host_hooks};
+pub use warmstate::GreenRefPin;
+
+/// `#[jit_interp]` green-key construction: pin a Ref green across
+/// `green_uhash_step` (`incminimark.py _find_shadow`) and reload it
+/// into `__green_values` (`gctransform/shadowstack.py`).
+#[inline]
+pub fn green_shadow_depth() -> usize {
+    majit_gc::shadow_stack::depth()
+}
+
+/// Pin a Ref green so a collecting `green_uhash_step` (`incminimark.py
+/// _find_shadow`) forwards it (`gctransform/shadowstack.py`).
+#[inline]
+pub fn green_shadow_push_ref(value: i64) {
+    let _ = majit_gc::shadow_stack::push(majit_ir::GcRef(value as usize));
+}
+
+/// Reload a Ref green after a collecting call (`gctransform/shadowstack.py`).
+#[inline]
+pub fn green_shadow_get(index: usize) -> i64 {
+    majit_gc::shadow_stack::get(index).0 as i64
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use pyjitpl::{
     active_backend_jit_exc_value_forward, active_backend_jit_exc_value_peek,
@@ -355,10 +378,10 @@ pub mod loop_census {
     }
 
     thread_local! {
-        /// green key -> `(code_ptr, pc)`, the raw green tuple the hash was
-        /// taken over. Recorded at trace start because that is where the
-        /// untyped pair is in scope; read back when a compile succeeds.
-        static KEYS: RefCell<HashMap<u64, (usize, usize)>> = RefCell::new(HashMap::new());
+        /// green key -> printable location. Snapped at [`note_key`] while the
+        /// `W_Code` pin is live. Compile can collect; a stored wrapper
+        /// address would be a class-(c) copy (`gctransform/shadowstack.py`).
+        static KEYS: RefCell<HashMap<u64, String>> = RefCell::new(HashMap::new());
     }
 
     /// Remember what a green key hashes, so a later compile can be named.
@@ -368,24 +391,29 @@ pub mod loop_census {
     /// never passes through `setup_tracing`, and a back-edge retarget replaces
     /// the key a trace will compile under, so seeding at trace start alone
     /// left the `root` arm's compiles printing `<unnamed>`.
+    ///
+    /// `get_printable_location` runs here, with the live wrapper, not at
+    /// `note_compiled` after the compiling alloc.
     pub fn note_key(green_key: u64, green_key_raw: (usize, usize)) {
-        if !enabled() || green_key_raw.0 == 0 {
+        if !enabled() {
             return;
         }
-        KEYS.with(|keys| keys.borrow_mut().insert(green_key, green_key_raw));
+        let line = match (green_key_raw.0 != 0, PRINTER.get()) {
+            (true, Some(printer)) => printer(green_key_raw.1, false, green_key_raw.0),
+            _ => format!("<unnamed> key={green_key}"),
+        };
+        KEYS.with(|keys| keys.borrow_mut().insert(green_key, line));
     }
 
     /// The printable location for *green_key*, or `None` when the key was
-    /// never seeded or no printer is registered.
+    /// never seeded.
     ///
     /// The guard census is keyed by the same green key this map is, so a
     /// consumer that has one has the other -- see `guard_census_summary`,
     /// which spells a guard as `<name>/0x<descr_id>` when both censuses are
     /// armed and as the bare hash when only the guard one is.
     pub fn name_for(green_key: u64) -> Option<String> {
-        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied())?;
-        let printer = PRINTER.get()?;
-        Some(printer(raw.1, false, raw.0))
+        KEYS.with(|keys| keys.borrow().get(&green_key).cloned())
     }
 
     /// Emit one census line for a trace that just compiled.
@@ -404,11 +432,9 @@ pub mod loop_census {
         if !enabled() {
             return;
         }
-        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied());
-        let line = match (raw, PRINTER.get()) {
-            (Some((w_pycode, pc)), Some(printer)) => printer(pc, false, w_pycode),
-            _ => format!("<unnamed> key={green_key}"),
-        };
+        let line = KEYS
+            .with(|keys| keys.borrow().get(&green_key).cloned())
+            .unwrap_or_else(|| format!("<unnamed> key={green_key}"));
         let record = format!("[loop-census] {kind} {line}\n");
         if ARMED.load(Ordering::Relaxed) {
             RECORDS.lock().push_str(&record);

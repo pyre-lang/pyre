@@ -302,13 +302,17 @@ fn abort_trace_live_clears_live_history_before_blackhole_drive() {
     let _idx = meta.register_jitdriver_sd(sd.clone());
     meta.finish_setup_descrs_for_jitdrivers();
     let key = majit_ir::GreenKey::new(vec![0xab07]);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        Some(std::sync::Arc::new(sd)),
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            Some(std::sync::Arc::new(sd)),
+            &[],
+        )
+    };
     assert!(matches!(
         action,
         majit_metainterp::BackEdgeAction::StartedTracing

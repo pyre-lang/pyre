@@ -29,7 +29,7 @@ use majit_ir::{
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
 use crate::resume::ResumeStorage;
-use crate::trace_ctx::{MergePoint, TraceCtx};
+use crate::trace_ctx::{InlineFrameEntry, MergePoint, TraceCtx};
 
 /// `compile.py` `make_jitcell_token(jitdriver_sd)`.
 ///
@@ -4050,40 +4050,74 @@ impl TraceCtx {
         self.inline_frames.len()
     }
 
+    /// Live `(W_Code*, pc)` from the walked owner-root, not a copied pair.
+    pub fn live_green_key_raw(&self) -> (usize, usize) {
+        (
+            self.green_key_code
+                .current_value(0, self.green_key_code_fallback) as usize,
+            self.green_key_pc,
+        )
+    }
+
+    pub fn live_root_green_key_raw(&self) -> (usize, usize) {
+        (
+            self.root_green_key_code
+                .current_value(0, self.root_green_key_code_fallback) as usize,
+            self.root_green_key_pc,
+        )
+    }
+
     /// Update the green key for this trace.
     ///
     /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
     /// hits a back-edge, the loop must be registered under the back-edge's
     /// green key, not the function-entry key.
+    ///
+    /// `raw.0` must be a live wrapper (pin / owner-root), not
+    /// `state.code_ptr()` copied across a collecting call.
     pub fn set_green_key(&mut self, key: u64, raw: (usize, usize)) {
         self.green_key = key;
-        self.green_key_raw = raw;
-        crate::loop_census::note_key(key, raw);
+        self.green_key_pc = raw.1;
+        let (code, fallback) = crate::trace_ctx::retain_code_ptr(raw.0);
+        self.green_key_code = code;
+        self.green_key_code_fallback = fallback;
+        crate::loop_census::note_key(key, self.live_green_key_raw());
     }
 
     /// Record the structured greenkey for the root trace. Called once
-    /// at trace start to seed `green_key_raw` and `root_green_key_raw`
-    /// from the tracer-side `(code_ptr, pc)`. Subsequent back-edge
-    /// retargeting flows through [`Self::set_green_key`].
+    /// at trace start to seed the walked portal wrapper and pc from a
+    /// live pin. Subsequent back-edge retargeting flows through
+    /// [`Self::set_green_key`].
     pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
-        self.green_key_raw = raw;
-        self.root_green_key_raw = raw;
-        crate::loop_census::note_key(self.green_key, raw);
+        self.green_key_pc = raw.1;
+        self.root_green_key_pc = raw.1;
+        let (code, fallback) = crate::trace_ctx::retain_code_ptr(raw.0);
+        self.green_key_code = code;
+        self.green_key_code_fallback = fallback;
+        let (root, root_fallback) = crate::trace_ctx::retain_code_ptr(raw.0);
+        self.root_green_key_code = root;
+        self.root_green_key_code_fallback = root_fallback;
+        crate::loop_census::note_key(self.green_key, self.live_green_key_raw());
     }
 
     /// pyjitpl.py:1396-1401 element-wise greenkey comparison against
     /// the current trace's greenkey and each inline-frame greenkey.
     pub fn is_tracing_key(&self, target: (usize, usize)) -> bool {
-        self.green_key_raw == target
-            || self.root_green_key_raw == target
-            || self.inline_frames.contains(&target)
+        self.live_green_key_raw() == target
+            || self.live_root_green_key_raw() == target
+            || self
+                .inline_frames
+                .iter()
+                .any(|entry| entry.live_raw() == target)
     }
 
     /// pyjitpl.py:1390-1402 recursion counting only walks portal
     /// frames already pushed on `framestack`; the root trace entry is
     /// not counted unless it has become an actual inline frame.
     pub fn has_inline_frame_for(&self, target: (usize, usize)) -> bool {
-        self.inline_frames.contains(&target)
+        self.inline_frames
+            .iter()
+            .any(|entry| entry.live_raw() == target)
     }
 
     /// pyjitpl.py `_opimpl_recursive_call` element-wise walk:
@@ -4101,26 +4135,44 @@ impl TraceCtx {
     /// Pyre's greenkey is `(code_ptr, pc)` — a fixed-arity pair — so
     /// tuple equality reproduces the element-wise `same_constant`
     /// result without an intermediate hash that could falsely collide.
+    /// A Ref code key is compared by `InlineFrameEntry::live_raw`, not
+    /// a copied nursery address.
     ///
     /// Only inlined portal frames count here. The root frame is
     /// created without a `greenkey` in upstream `initialize_state_from_start`
     /// / `newframe(mainjitcode)`, so counting `root_green_key_raw` would
     /// make self-recursion hit `max_unroll_recursion` one level early.
     pub fn recursive_depth(&self, target: (usize, usize)) -> usize {
-        self.inline_frames.iter().filter(|&&k| k == target).count()
+        self.inline_frames
+            .iter()
+            .filter(|entry| entry.live_raw() == target)
+            .count()
     }
 
-    /// Push an inline frame (entering a callee).
-    /// Returns false if the max inline depth has been exceeded.
-    /// `callee_raw` is the structured `(code_ptr, pc)` greenkey, stored
-    /// in `inline_frames` so `recursive_depth` / `is_tracing_key` can
-    /// walk it element-wise (pyjitpl.py:1396-1401 parity).
-    pub(crate) fn push_inline_frame(&mut self, callee_raw: (usize, usize), max_depth: u32) -> bool {
+    fn push_inline_frame_entry(&mut self, entry: InlineFrameEntry, max_depth: u32) -> bool {
         if (self.inline_frames.len() as u32) >= max_depth {
             return false;
         }
-        self.inline_frames.push(callee_raw);
+        self.inline_frames.push(entry);
         true
+    }
+
+    /// Push an integer-index inline frame (`(jitcode index, pc)`).
+    /// Returns false if the max inline depth has been exceeded.
+    pub(crate) fn push_inline_frame(&mut self, callee_raw: (usize, usize), max_depth: u32) -> bool {
+        self.push_inline_frame_entry(InlineFrameEntry::from_index(callee_raw), max_depth)
+    }
+
+    /// Push a Ref code-key inline frame. `callee_raw.0` is a live
+    /// wrapper (pin / owner-root), retained on the entry so
+    /// `recursive_depth` / `is_tracing_key` compare the forwarded
+    /// address after a minor collection.
+    pub(crate) fn push_inline_frame_ref(
+        &mut self,
+        callee_raw: (usize, usize),
+        max_depth: u32,
+    ) -> bool {
+        self.push_inline_frame_entry(InlineFrameEntry::from_ref(callee_raw), max_depth)
     }
 
     /// Pop an inline frame (returning from a callee).

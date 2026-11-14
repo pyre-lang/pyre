@@ -20800,15 +20800,16 @@ pub fn exec_or_eval(
         }
     };
     // A compiled source has just been boxed, and this local is its only
-    // referrer: the wrapper is `try_gc_alloc_stable`, so it does not move, but
-    // it is swept like any other unreferenced object.  Everything below runs
-    // Python -- the `__getitem__` probes on the namespace arguments, and then
-    // `ensure_*_builtins` through the globals mapping's `setdefault` (exec) or
-    // `__setitem__` (eval) -- and the frame is built from this word at the very
-    // end, so a collection in between leaves `createframe_obj` handing a reused
-    // block to `w_code_frame_stores_global`'s write barrier.  `code_ptr` below
-    // is a host allocation the destructor leaves standing, so only the wrapper
-    // needs the root.
+    // referrer: the wrapper is a nursery `W_Root` (`malloc_typed_managed` /
+    // `malloc_fixedsize`) and is swept like any other unreferenced object.
+    // Everything below runs Python -- the `__getitem__` probes on the
+    // namespace arguments, and then `ensure_*_builtins` through the globals
+    // mapping's `setdefault` (exec) or `__setitem__` (eval) -- and the frame
+    // is built from this word at the very end, so a collection in between
+    // leaves `createframe_obj` handing a reused block to
+    // `w_code_frame_stores_global`'s write barrier.  `code_ptr` below is a
+    // host allocation the destructor leaves standing, so only the wrapper
+    // needs the root (`gctransform/shadowstack.py`).
     let _code_roots = pyre_object::gc_roots::push_roots();
     let code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(code_obj_ref);

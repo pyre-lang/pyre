@@ -1078,7 +1078,8 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
                 7,
                 &mut state,
                 &(),
-                || {}
+                || {},
+                None
             )
             .is_none()
     );
@@ -1094,7 +1095,8 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
                 7,
                 &mut state,
                 &(),
-                || {}
+                || {},
+                None
             )
             .and_then(|resume| resume.resume_pc()),
         Some(7)
@@ -1127,10 +1129,14 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
     // Hash-form `back_edge_keyed` names an installed cell (`warmstate.py`
     // `bound_reached` `JitCell(*greenargs)`). Install the typed cell first;
     // the door itself still passes no structured greens.
-    driver
-        .meta_interp_mut()
-        .warm_state_for_driver(0)
-        .ensure_cell_for_key(&green_key);
+    {
+        let pin = majit_metainterp::GreenRefPin::pin(&green_key);
+        let mut live = pin.live_clone(&green_key);
+        driver
+            .meta_interp_mut()
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&pin, &mut live);
+    }
     let key = green_key.hash_u64();
     let mut state = TestState { frame: 3, stack: 4 };
 
@@ -1143,7 +1149,8 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
                 11,
                 &mut state,
                 &(),
-                || {}
+                || {},
+                None
             )
             .is_none()
     );
@@ -1159,7 +1166,8 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
                 11,
                 &mut state,
                 &(),
-                || {}
+                || {},
+                None
             )
             .and_then(|resume| resume.resume_pc()),
         Some(11)

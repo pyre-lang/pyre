@@ -409,13 +409,17 @@ fn a_header_revisit_after_continue_rereads_kind() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(
-        key.get_uhash(),
-        Some((&key.values, &key.types)),
-        0,
-        &mut state,
-        &program[..],
-    );
+    {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        driver.force_start_tracing(
+            key.get_uhash(),
+            Some((&key.values, &key.types)),
+            _zbh_pin.save(),
+            0,
+            &mut state,
+            &program[..],
+        )
+    };
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"
@@ -484,13 +488,17 @@ fn a_header_revisit_close_matches_label_arity() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(
-        key.get_uhash(),
-        Some((&key.values, &key.types)),
-        0,
-        &mut state,
-        &program[..],
-    );
+    {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        driver.force_start_tracing(
+            key.get_uhash(),
+            Some((&key.values, &key.types)),
+            _zbh_pin.save(),
+            0,
+            &mut state,
+            &program[..],
+        )
+    };
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"

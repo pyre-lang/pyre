@@ -4658,21 +4658,24 @@ pub fn load_super_attr_value(
     name_idx: usize,
     is_two_arg: bool,
 ) -> Result<PyObjectRef, PyError> {
-    let code = unsafe { &*(crate::w_code_get_ptr(w_code)) };
+    // `w_code_getname_w_or_new` interns and can collect.  The code body is not
+    // a GC object; the frame, the wrapper, and the three objects the lookup
+    // still needs are. Anchor before the intern and pass `live()` —
+    // `descriptor.py` `_get_self_location` reads that frame afterwards
+    // (`gctransform/shadowstack.py`).
+    let frame_anchor = unsafe { FrameAnchor::from_raw(frame) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.publish(&[global_super, self_obj, cls, w_code]);
+    let code =
+        unsafe { &*(crate::w_code_get_ptr(roots.get(base + 3)) as *const crate::CodeObject) };
     let Some(name) = code.names.get(name_idx) else {
         return Err(PyError::runtime_error(format!(
             "LOAD_SUPER_ATTR name index {name_idx} out of range"
         )));
     };
-    // `w_code_getname_w_or_new` interns and can collect.  The code body is not
-    // a GC object; the frame and the three objects the lookup still needs are.
-    // Anchor before the intern and pass `live()` — `descriptor.py`
-    // `_get_self_location` reads that frame afterwards.
-    let frame_anchor = unsafe { FrameAnchor::from_raw(frame) };
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.base();
-    let _ = roots.publish(&[global_super, self_obj, cls]);
-    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, name_idx, name) };
+    let w_name =
+        unsafe { crate::pycode::w_code_getname_w_or_new(roots.get(base + 3), name_idx, name) };
     let (self_is_cell, class_slot) = crate::builtins::bare_super_frame_layout_words(code);
     load_super_attr_value_w(
         roots.get(base),

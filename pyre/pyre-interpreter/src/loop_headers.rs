@@ -160,6 +160,8 @@ pub fn backward_jump_is_handler_only_target(
 }
 
 fn handler_only_info_for(code: &CodeObject) -> Option<&'static LoopHeaderInfo> {
+    // Re-read the wrapper from the traced `LIVE_CODE_WRAPPERS` map; the
+    // inner `CodeObject` never moves (`gctransform/shadowstack.py`).
     let w_code = crate::pycode::live_code_wrapper(code as *const CodeObject as *const ());
     let info = ensure_loop_header_info(w_code)?;
     Some(unsafe { &*info })
@@ -218,6 +220,9 @@ fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const Lo
     if w_code.is_null() {
         return None;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let code_slot = roots.base();
+    let w_code = roots.pin_root(w_code);
     let pycode = unsafe { &*(w_code as *const crate::pycode::PyCode) };
     let code_ptr = pycode.code_ptr;
     let align_mask = std::mem::align_of::<CodeObject>() as i64 - 1;
@@ -253,6 +258,9 @@ fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const Lo
         header_pcs,
         handler_only_edges,
     }));
+    // The scan allocated; re-read the wrapper from its shadow slot before
+    // publishing onto `loop_header_info` (`gctransform/shadowstack.py`).
+    let pycode = unsafe { &*(roots.get(code_slot) as *const crate::pycode::PyCode) };
     match pycode.loop_header_info.compare_exchange(
         std::ptr::null_mut(),
         built,

@@ -1,5 +1,13 @@
 # pyre-check: max-pypy-ratio=370
 # pyre-check: trace-shape=main:max=CallMayForceR:6
+# The trip count stays below the 32-minor-collection counter-decay cycle
+# (counter.py JitCounter.invoke_after_minor_collection / decay_all_counters).
+# At N=50000 the run took about 60 minor collections and the decay at the
+# 32nd landed during loop 2's warmup of `_int_sum`; depending on how much the
+# process allocated at startup, `_int_sum`'s ForIter trace then started on the
+# iterator-exhausted arm, every yield failed that guard, and a second bridge
+# compiled (bridges 2, guard_failures 408 instead of 1 and 206). N=10000 takes
+# about 25 minor collections, so no decay runs, and both loops still compile.
 # Slice bounds are evaluated through __index__ in both lowering paths:
 #   * a dynamic slice `seq[a:b]` compiles to BINARY_SLICE, handled by
 #     `binary_slice_values`;
@@ -8,7 +16,7 @@
 # Both must run __index__ on each bound, so a custom __index__ and a bool work
 # while a float (which has no __index__) raises TypeError.  Only the exception
 # type is printed so the line matches across CPython/PyPy/Pyre.
-N = 50000
+N = 10000
 
 
 class Idx:

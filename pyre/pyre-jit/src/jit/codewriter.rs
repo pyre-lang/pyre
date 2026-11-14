@@ -8172,13 +8172,18 @@ impl CodeWriter {
             return None;
         }
         // Recover the live globals-stamped PyCode wrapper for `code` from the
-        // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
-        // per-code wrapper that every compiled code has stamped (during the
-        // warm-up run that queued it) before the drain reaches this point — so
-        // every downstream const-fold / globals-fold site reads the identical
-        // pointer value.
-        let w_code = pyre_interpreter::live_code_wrapper(code as *const CodeObject as *const ())
-            as *const ();
+        // `code_ptr → live wrapper` registry. The inner `CodeObject` box
+        // never moves; the wrapper is a nursery `W_Root`
+        // (`malloc_typed_managed` / `malloc_fixedsize`).
+        // `walk_jitcode_code_roots` forwards every map value on each
+        // collection; the portal compile path also refreshes the entry
+        // from `frame.pycode`. Pin the live word for the whole compile
+        // and re-read the slot at every use (`gctransform/shadowstack.py`).
+        let roots = pyre_object::gc_roots::push_roots();
+        let code_slot = roots.base();
+        let _ = roots.pin_root(pyre_interpreter::live_code_wrapper(
+            code as *const CodeObject as *const (),
+        ) as pyre_object::PyObjectRef);
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
@@ -9674,7 +9679,7 @@ impl CodeWriter {
                     py_pc as i64,
                 );
                 let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                    super::flow::ConstantValue::Signed(w_code as i64),
+                    super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                     Some(Kind::Ref),
                 )
                 .into();
@@ -11042,7 +11047,7 @@ impl CodeWriter {
                         // `jtransform.py promote_greens` skips Constant
                         // greens (`getcode()` is the back-edge's).
                         let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
-                            super::flow::ConstantValue::Signed(w_code as i64),
+                            super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                             Some(Kind::Ref),
                         )
                         .into();
@@ -11373,7 +11378,11 @@ impl CodeWriter {
                             // Do not record the pyre runtime helper as a
                             // SpaceOperation; that helper is walker/backend
                             // adaptation only.
-                            let value = frontend_load_const_flow_value(w_code, code, idx);
+                            let value = frontend_load_const_flow_value(
+                                roots.get(code_slot) as *const (),
+                                code,
+                                idx,
+                            );
                             push_and_bump!(value, py_pc);
                         }
 
@@ -11984,7 +11993,7 @@ impl CodeWriter {
                                     );
                                     let w_name = unsafe {
                                         pyre_interpreter::pycode::w_code_getname_w_or_new(
-                                            w_code as pyre_object::PyObjectRef,
+                                            roots.get(code_slot),
                                             nameindex,
                                             name.as_ref(),
                                         )
@@ -12027,7 +12036,9 @@ impl CodeWriter {
                                         .into();
                                     let code_const: super::flow::FlowValue =
                                         super::flow::Constant::new(
-                                            super::flow::ConstantValue::Signed(w_code as i64),
+                                            super::flow::ConstantValue::Signed(
+                                                roots.get(code_slot) as i64,
+                                            ),
                                             Some(Kind::Ref),
                                         )
                                         .into();
@@ -13243,7 +13254,7 @@ impl CodeWriter {
                                     );
                                     let w_name = unsafe {
                                         pyre_interpreter::pycode::w_code_getname_w_or_new(
-                                            w_code as pyre_object::PyObjectRef,
+                                            roots.get(code_slot),
                                             name_idx,
                                             name.as_ref(),
                                         )
@@ -13418,7 +13429,7 @@ impl CodeWriter {
                             // `co_names` index the helper resolves the name
                             // with.
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -14787,7 +14798,7 @@ impl CodeWriter {
                             // constant and the `co_names` index the helper resolves
                             // the name with.
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -15089,7 +15100,7 @@ impl CodeWriter {
                             // object in this PyCode's `co_names_w` table.
                             let w_name = unsafe {
                                 pyre_interpreter::pycode::w_code_getname_w_or_new(
-                                    w_code as pyre_object::PyObjectRef,
+                                    roots.get(code_slot),
                                     name_idx,
                                     name.as_ref(),
                                 )
@@ -15208,7 +15219,7 @@ impl CodeWriter {
                             // through the TLS execution context (MayForce).
                             let name_idx = namei.get(op_arg) as usize;
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -15323,7 +15334,7 @@ impl CodeWriter {
                             let is_method = (u32::from(op_arg) & 1) != 0;
                             let is_two_arg = (u32::from(op_arg) & 2) != 0;
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -15705,7 +15716,7 @@ impl CodeWriter {
                             let _dict_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let dict_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -15760,7 +15771,7 @@ impl CodeWriter {
                         Instruction::LoadDeref { i } => {
                             let deref_idx = i.get(op_arg).as_usize() as u16;
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -16040,7 +16051,7 @@ impl CodeWriter {
                         Instruction::MakeCell { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
+                                super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
                                 Some(Kind::Ref),
                             )
                             .into();
@@ -16207,7 +16218,9 @@ impl CodeWriter {
                             } else {
                                 let code_const: super::flow::FlowValue =
                                     super::flow::Constant::new(
-                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        super::flow::ConstantValue::Signed(
+                                            roots.get(code_slot) as i64
+                                        ),
                                         Some(Kind::Ref),
                                     )
                                     .into();
@@ -17058,7 +17071,7 @@ impl CodeWriter {
             emit_dispatch_loop_head(
                 code,
                 &mut graph,
-                w_code,
+                roots.get(code_slot) as *const (),
                 frame_var,
                 ec_var,
                 dispatch,
@@ -19412,7 +19425,12 @@ pub fn ensure_trace_jitcode_for_w_code(
     w_code: *const (),
 ) -> Option<std::sync::Arc<PyJitCode>> {
     let pyjit = compile_jitcode_via_raw_code(raw_code, w_code)?;
-    pyre_jit_trace::state::install_jitcode_for(w_code, std::sync::Arc::clone(&pyjit));
+    // `compile_jitcode_via_raw_code` can collect. The inner `CodeObject` is
+    // immortal, so install under that key (`gctransform/shadowstack.py`).
+    pyre_jit_trace::state::install_jitcode_for(
+        raw_code as *const (),
+        std::sync::Arc::clone(&pyjit),
+    );
     Some(pyjit)
 }
 
@@ -19423,6 +19441,11 @@ fn compile_jitcode_via_raw_code(
     if raw_code.is_null() || w_code.is_null() {
         return None;
     }
+    // Pin the wrapper across the compile drain (`gctransform/shadowstack.py`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_slot = roots.base();
+    let _ = roots.pin_root(w_code as pyre_object::PyObjectRef);
+    let w_code = roots.get(w_slot) as *const ();
     assert_eq!(
         unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) },
         raw_code,
@@ -19439,7 +19462,7 @@ fn compile_jitcode_via_raw_code(
     // a frame-stamped wrapper when one already exists.
     pyre_interpreter::register_live_code_wrapper(
         raw_code as *const (),
-        w_code as pyre_object::PyObjectRef,
+        roots.get(w_slot) as pyre_object::PyObjectRef,
     );
     if let Some(existing) = CodeWriter::instance()
         .callcontrol()
@@ -19452,9 +19475,11 @@ fn compile_jitcode_via_raw_code(
     if !drained.is_empty() {
         pyre_jit_trace::state::install_jitcodes(drained);
     }
-    CodeWriter::instance()
+    let found = CodeWriter::instance()
         .callcontrol()
-        .find_compiled_jitcode_arc(code as *const _)
+        .find_compiled_jitcode_arc(code as *const _);
+    drop(roots);
+    found
 }
 
 /// All PCs that are block-entry points: PC 0, every forward jump

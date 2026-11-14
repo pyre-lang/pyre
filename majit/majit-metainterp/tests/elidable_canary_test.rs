@@ -66,13 +66,17 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[Value::Int(live_x)],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[Value::Int(live_x)],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     // EffectInfo: ElidableCannotRaise + OopSpecIndex::None
@@ -142,13 +146,17 @@ fn elidable_canary_all_const_args_fold_to_const_and_cut_call() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    let action = meta.force_start_tracing(
-        key.get_uhash(),
-        (0, 0),
-        Some((&key.values, &key.types)),
-        None,
-        &[],
-    );
+    let action = {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        meta.force_start_tracing(
+            key.get_uhash(),
+            _zbh_pin.save(),
+            0,
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        )
+    };
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);

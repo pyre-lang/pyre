@@ -1848,9 +1848,11 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// of the portal frame itself is the `debugdata` guard
 /// `pyopcode.py dispatch_bytecode`'s `jit.we_are_jitted()` arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
-    GreenKey::with_types(
-        pypyjit_greenargs(pc, is_being_profiled, code_ptr).to_vec(),
-        PYPYJIT_GREEN_TYPES.to_vec(),
+    // `from_greenargs` keeps the 3-tuple in the inline SmallVec; `to_vec`
+    // would heap-allocate and could collect while `code_ptr` is only an i64.
+    GreenKey::from_greenargs(
+        &pypyjit_greenargs(pc, is_being_profiled, code_ptr),
+        &PYPYJIT_GREEN_TYPES,
     )
 }
 

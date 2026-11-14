@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
-use majit_ir::{GREEN_INLINE, GcRef, GreenKey, GreenType, RetainedGreens, Value};
+use majit_ir::{
+    GREEN_INLINE, GcRef, GreenKey, GreenType, PYPYJIT_GREEN_TYPES, RetainedGreens, Value,
+};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -155,13 +157,200 @@ pub struct BaseJitCell {
     pub retained_greens: RetainedGreens,
 }
 
+/// Pin `GreenType::Ref` greens across a collecting `hash_whatever(Ref)` /
+/// `JitCell(*greenargs)` (`incminimark.py _find_shadow`) and reload them
+/// from the shadow stack afterwards (`gctransform/shadowstack.py`).
+///
+/// A copied i64 is not a GCREF local. The pin slot is the walked location.
+/// Always pushes every `GreenType::Ref`, including 0. Owned pins pop with
+/// `pop_to`. Adopted pins name a caller's slots and do not pop.
+pub struct GreenRefPin {
+    save: usize,
+    /// False when this pin names a caller's slots and must not pop them.
+    owned: bool,
+}
+
+/// Portal Ref-green index: `PYPYJIT_GREEN_TYPES` slot 2, or the sole Ref.
+pub(crate) fn code_ref_index(types: &[GreenType]) -> Option<usize> {
+    if types == PYPYJIT_GREEN_TYPES.as_slice() {
+        return Some(2);
+    }
+    let mut found = None;
+    for (i, ty) in types.iter().enumerate() {
+        if *ty == GreenType::Ref {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Live portal `W_Code` from a `GreenRefPin` that outlived `green_uhash_step`.
+///
+/// The collector rewrites that slot in place (`gctransform/shadowstack.py`).
+pub(crate) fn caller_pin_live_code(save: usize, types: &[GreenType]) -> i64 {
+    let Some(idx) = code_ref_index(types) else {
+        return 0;
+    };
+    let mut offset = 0;
+    for ty in types.iter().take(idx) {
+        if *ty == GreenType::Ref {
+            offset += 1;
+        }
+    }
+    majit_gc::shadow_stack::get(save + offset).0 as i64
+}
+
+impl GreenRefPin {
+    /// Record the current depth. The caller then pushes every Ref green
+    /// (`green_shadow_push_ref`). Drop pops back to this depth.
+    #[inline]
+    pub fn begin() -> Self {
+        Self {
+            save: majit_gc::shadow_stack::depth(),
+            owned: true,
+        }
+    }
+
+    #[inline]
+    pub fn save(&self) -> usize {
+        self.save
+    }
+
+    /// Live bits of the first slot. Single-Ref pins (`pin_one`) use this.
+    #[inline]
+    pub fn get(&self) -> usize {
+        majit_gc::shadow_stack::get(self.save).0
+    }
+
+    #[inline]
+    pub fn live(&self) -> i64 {
+        self.get() as i64
+    }
+
+    pub fn pin(key: &GreenKey) -> Self {
+        Self::pin_slices(&key.values, &key.types)
+    }
+
+    pub fn pin_slices(values: &[i64], types: &[GreenType]) -> Self {
+        let save = majit_gc::shadow_stack::depth();
+        for i in 0..values.len() {
+            if types.get(i).copied() == Some(GreenType::Ref) {
+                let _ = majit_gc::shadow_stack::push(GcRef(values[i] as usize));
+            }
+        }
+        Self { save, owned: true }
+    }
+
+    /// Pin one GCREF, including 0 (`gctransform/shadowstack.py`).
+    pub fn pin_one(code: usize) -> Self {
+        let save = majit_gc::shadow_stack::depth();
+        let _ = majit_gc::shadow_stack::push(GcRef(code));
+        Self { save, owned: true }
+    }
+
+    /// Name the Ref greens a caller already pushed on
+    /// `majit_gc::shadow_stack`. Drop does not pop; the caller owns that
+    /// scope (`gctransform/shadowstack.py`).
+    ///
+    /// `save` is `GreenRefPin::save()` (a `majit_gc::shadow_stack` index).
+    /// It is not a `pyre_object::gc_roots` index: that stack is a pyre
+    /// extra-area, and adopting it here reads a different cell.
+    pub fn adopt(save: usize) -> Self {
+        Self { save, owned: false }
+    }
+
+    /// Pin `key`, reload, and run `f`. Tests use this instead of a
+    /// copy-pinning WarmEnterState shim. Production pins at the load
+    /// (`pin` / `pin_slices` / `pin_one` / `adopt`) so the pin, not a
+    /// copied `GreenKey`, is the source (`gctransform/shadowstack.py`).
+    #[cfg(test)]
+    pub fn with<R>(key: &GreenKey, f: impl FnOnce(&Self, &mut GreenKey) -> R) -> R {
+        let pin = Self::pin(key);
+        let mut live = pin.live_clone(key);
+        f(&pin, &mut live)
+    }
+
+    pub fn reload(&self, key: &mut GreenKey) {
+        let mut slot = self.save;
+        for i in 0..key.values.len() {
+            if key.types.get(i).copied() == Some(GreenType::Ref) {
+                key.values[i] = majit_gc::shadow_stack::get(slot).0 as i64;
+                slot += 1;
+            }
+        }
+    }
+
+    pub fn live_clone(&self, key: &GreenKey) -> GreenKey {
+        let mut live = key.clone();
+        self.reload(&mut live);
+        live
+    }
+
+    /// Reload, hash the reloaded bits, reload again. `get_uhash` may
+    /// `id_or_identityhash` a nursery Ref (`incminimark.py _find_shadow`);
+    /// hashing `key` itself would use a copy taken before that call
+    /// (`gctransform/shadowstack.py`).
+    fn live_after_hash(&self, key: &GreenKey) -> (u64, GreenKey) {
+        let mut live = self.live_clone(key);
+        let hash = live.get_uhash();
+        self.reload(&mut live);
+        (hash, live)
+    }
+
+    /// Retain Ref greens from the shadow-stack slots, not from a copied i64.
+    ///
+    /// `JitCell(*greenargs)` stores each Ref as a GC field. A `GreenKey`
+    /// local can hold a pre-move address across `get_uhash` /
+    /// `Box::from` (`gctransform/shadowstack.py`). The frontend retain
+    /// hook (`set_ref_resolver` / production `acquire_owner_root`) sees
+    /// the walked bits.
+    fn retain(&self, live: &GreenKey) -> RetainedGreens {
+        RetainedGreens::retain_greenargs(&self.snapshot_values(live), &live.types)
+    }
+
+    /// `JitCell` field bits: Int greens from `live`, Ref greens from this pin.
+    fn snapshot_values(&self, live: &GreenKey) -> Box<[i64]> {
+        let mut values = live.values.to_vec();
+        let mut slot = self.save;
+        for (i, ty) in live.types.iter().enumerate() {
+            if *ty == GreenType::Ref {
+                if i < values.len() {
+                    values[i] = majit_gc::shadow_stack::get(slot).0 as i64;
+                }
+                slot += 1;
+            }
+        }
+        values.into_boxed_slice()
+    }
+}
+
+impl Drop for GreenRefPin {
+    fn drop(&mut self) {
+        if self.owned {
+            majit_gc::shadow_stack::pop_to(self.save);
+        }
+    }
+}
+
 impl BaseJitCell {
     /// `JitCell(*greenargs)` of the driver `jitdriver_sd`'s class.
+    ///
+    /// Upstream `setattr`s each green onto the GC-managed cell, so a Ref
+    /// green is a field the collector rewrites. `Box::from(greenargs)` is a
+    /// collecting call; retain the Ref greens from `pin` first so that
+    /// allocation forwards them (`gctransform/shadowstack.py`). `greens`
+    /// keeps the install-time bits; `comparekey` reads
+    /// `retained_greens.current_value`.
     pub fn new_for_driver_with_greens(
         jitdriver_sd: usize,
-        greenargs: &[i64],
-        types: &[GreenType],
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
     ) -> Self {
+        let greens = pin.snapshot_values(live);
+        let retained_greens = pin.retain(live);
         BaseJitCell {
             jitdriver_sd,
             flags: Cell::new(JcFlags::empty()),
@@ -172,8 +361,8 @@ impl BaseJitCell {
             next: RefCell::new(None),
             cell_key: Cell::new(None),
             cell_bucket: Cell::new(0),
-            greens: Box::from(greenargs),
-            retained_greens: RetainedGreens::retain_greenargs(greenargs, types),
+            greens,
+            retained_greens,
         }
     }
 
@@ -965,46 +1154,26 @@ impl WarmEnterState {
     /// which the hook fires exactly once per start, which is what upstream
     /// gets by having a single `bound_reached`.
     ///
-    /// `Some(key)` installs `JitCell(*greenargs)` (`warmstate.py
-    /// bound_reached`). `None` names an already-installed cell; a tracing
-    /// start without one needs greens — use the `_for_key` twin.
+    /// The hash form names an already-installed cell. A tracing start
+    /// without one needs greens — use [`Self::start_tracing_cell_for_key`]
+    /// (`warmstate.py` `bound_reached` `JitCell(*greenargs)`).
     fn start_tracing_cell(
         &mut self,
         cell_key: u64,
-        green_key: Option<&GreenKey>,
         green_types: &[GreenType],
         reds: &[Value],
     ) -> HotResult {
-        match green_key {
-            Some(key) => {
-                if !self.confirm_enter_jit_if_available(Some(&key.values), &key.types, reds) {
-                    return HotResult::NotHot;
-                }
-                self.ensure_cell_for_key(key);
-            }
-            None => {
-                let cell = self.cell_by_key(cell_key).expect(
-                    "the hash form names an installed cell; a tracing start without one needs greens, \
-                     warmstate.py bound_reached JitCell(*greenargs) — use the `_for_key` twin",
-                );
-                let greens = cell.current_greens();
-                if !self.confirm_enter_jit_if_available(Some(&greens[..]), green_types, reds) {
-                    return HotResult::NotHot;
-                }
-            }
+        let cell = self.cell_by_key(cell_key).expect(
+            "the hash form names an installed cell; a tracing start without one needs greens, \
+             warmstate.py bound_reached JitCell(*greenargs)",
+        );
+        let greens = cell.current_greens();
+        if !self.confirm_enter_jit_if_available(Some(&greens[..]), green_types, reds) {
+            return HotResult::NotHot;
         }
         self.counter.reset(self.bucket_of(cell_key));
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
-        let cell = match green_key {
-            Some(key) => self
-                .lookup_chain_with_key(key)
-                .expect("ensure_cell_for_key just installed a cell matching this key"),
-            None => self.cell_by_key(cell_key).expect(
-                "the hash form names an installed cell; a tracing start without one needs greens, \
-                 warmstate.py bound_reached JitCell(*greenargs) — use the `_for_key` twin",
-            ),
-        };
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_TRACING | JcFlags::JC_TRACING_OCCURRED));
         cell.tracing_generation.set(current_generation);
@@ -1184,7 +1353,7 @@ impl WarmEnterState {
     #[cfg(test)]
     pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
         match self.maybe_compile_decision(cell_key, &[]) {
-            HotResult::StartTracing => self.start_tracing_cell(cell_key, None, &[], &[]),
+            HotResult::StartTracing => self.start_tracing_cell(cell_key, &[], &[]),
             other => other,
         }
     }
@@ -1208,9 +1377,13 @@ impl WarmEnterState {
     ///
     /// The typed chain-walk variant [`Self::finish_tracing_for_key`] keeps
     /// the typed path's full lifecycle self-consistent on its own buckets.
-    pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
-        match self.maybe_compile_decision_with_key(key, |_| true, &[]) {
-            HotResult::StartTracing => self.start_tracing_cell_for_key(key, &[]),
+    pub fn maybe_compile_with_key(&mut self, pin: &GreenRefPin, key: &mut GreenKey) -> HotResult {
+        let (hash, mut live) = pin.live_after_hash(key);
+        match self.maybe_compile_decision_with_live(pin, hash, &mut live, |_| true, &[]) {
+            HotResult::StartTracing => {
+                pin.reload(&mut live);
+                self.start_tracing_cell_for_key(pin, &mut live, &[])
+            }
             other => other,
         }
     }
@@ -1223,12 +1396,25 @@ impl WarmEnterState {
     /// earlier fast path.
     pub fn maybe_compile_decision_with_key(
         &mut self,
+        pin: &GreenRefPin,
         key: &GreenKey,
         has_compiled_meta: impl FnOnce(u64) -> bool,
         reds: &[Value],
     ) -> HotResult {
-        let hash = key.get_uhash();
-        let cell = self.lookup_chain_with_key(key);
+        let (hash, mut live) = pin.live_after_hash(key);
+        self.maybe_compile_decision_with_live(pin, hash, &mut live, has_compiled_meta, reds)
+    }
+
+    fn maybe_compile_decision_with_live(
+        &mut self,
+        pin: &GreenRefPin,
+        hash: u64,
+        live: &mut GreenKey,
+        has_compiled_meta: impl FnOnce(u64) -> bool,
+        reds: &[Value],
+    ) -> HotResult {
+        pin.reload(live);
+        let cell = self.lookup_chain_with_greenargs(hash, &live.values, &live.types);
         let is_runnable = cell.as_ref().is_some_and(|c| {
             // The procedure token is filed under this cell's assigned key.
             // `install_new_cell` mints `BaseJitCell::cell_key` when
@@ -1238,12 +1424,13 @@ impl WarmEnterState {
             let cell_key = c.cell_key.get().unwrap_or(hash);
             c.is_compiled() && has_compiled_meta(cell_key)
         });
+        pin.reload(live);
         self.maybe_compile_and_run_decision(
             cell.as_deref(),
             hash,
             self.increment_threshold,
-            Some(&key.values),
-            &key.types,
+            Some(&live.values),
+            &live.types,
             reds,
             is_runnable,
             WarmEntryDoor::BackEdge,
@@ -1253,8 +1440,12 @@ impl WarmEnterState {
     /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
     /// Returns `Some` only when a chained cell carries a comparekey
     /// equal (`equal_whatever`) to `key`. The bucket head is not privileged.
-    fn lookup_chain_with_key_mut(&mut self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
-        self.lookup_chain_with_key(key)
+    fn lookup_chain_with_key_mut(
+        &mut self,
+        pin: &GreenRefPin,
+        live: &GreenKey,
+    ) -> Option<Rc<BaseJitCell>> {
+        self.lookup_chain_with_key(pin, live)
     }
 
     /// warmstate.py `WarmEnterState.bound_reached` —
@@ -1265,19 +1456,28 @@ impl WarmEnterState {
     /// `tracing_generation`, rather than the bucket head. Pairs with
     /// [`Self::maybe_compile_with_key`] so a typed greenkey always
     /// transitions its own cell on a hash collision.
-    fn start_tracing_cell_for_key(&mut self, key: &GreenKey, reds: &[Value]) -> HotResult {
-        let hash = key.get_uhash();
+    pub fn start_tracing_cell_for_key(
+        &mut self,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
+        reds: &[Value],
+    ) -> HotResult {
+        pin.reload(live);
+        let hash = live.get_uhash();
+        pin.reload(live);
         // `warmstate.py` `bound_reached` — see `start_tracing_cell`, whose
         // position this is the typed twin of.
-        if !self.confirm_enter_jit(&key.values, &key.types, reds) {
+        if !self.confirm_enter_jit(&live.values, &live.types, reds) {
             return HotResult::NotHot;
         }
+        pin.reload(live);
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
-        self.ensure_cell_for_key(key);
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
         let cell = self
-            .lookup_chain_with_key_mut(key)
+            .lookup_chain_with_greenargs(hash, &live.values, &live.types)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_TRACING | JcFlags::JC_TRACING_OCCURRED));
@@ -1288,8 +1488,8 @@ impl WarmEnterState {
     /// Typed-key variant of [`Self::finish_tracing`]. Walks the bucket
     /// chain by comparekey so a typed green that collides with another
     /// clears `JC_TRACING` on its own cell rather than the bucket head.
-    pub fn finish_tracing_for_key(&mut self, key: &GreenKey) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
+    pub fn finish_tracing_for_key(&mut self, pin: &GreenRefPin, live: &GreenKey) {
+        if let Some(cell) = self.lookup_chain_with_key_mut(pin, live) {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
             // State remains Tracing until attach_procedure_to_interp is called.
         }
@@ -1317,10 +1517,15 @@ impl WarmEnterState {
     /// Typed-key variant of [`Self::disable_noninlinable_function`]:
     /// installs a cell for `key` if absent (`ensure_jit_cell_at_key`), then
     /// sets `DONT_TRACE_HERE` on the cell whose comparekey matches `key`.
-    pub fn disable_noninlinable_function_for_key(&mut self, key: &GreenKey) {
-        self.ensure_cell_for_key(key);
+    pub fn disable_noninlinable_function_for_key(
+        &mut self,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
+    ) {
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
         let cell = self
-            .lookup_chain_with_key_mut(key)
+            .lookup_chain_with_key_mut(pin, live)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
@@ -1361,7 +1566,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell(cell_key, None, green_types, reds)
+        self.start_tracing_cell(cell_key, green_types, reds)
     }
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
@@ -1369,10 +1574,18 @@ impl WarmEnterState {
     /// `Self::start_tracing_cell_for_key`, so a force-started cell
     /// (function-entry / can_enter_jit) carries a `comparekey` like the
     /// [`Self::maybe_compile_with_key`] path.
-    pub fn force_start_tracing_for_key(&mut self, key: &GreenKey, reds: &[Value]) -> HotResult {
-        if let Some(cell) = self.lookup_chain_with_key(key) {
+    pub fn force_start_tracing_for_key(
+        &mut self,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
+        reds: &[Value],
+    ) -> HotResult {
+        let (hash, hashed) = pin.live_after_hash(live);
+        *live = hashed;
+        if let Some(cell) = self.lookup_chain_with_greenargs(hash, &live.values, &live.types) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit(&key.values, &key.types, reds) {
+                pin.reload(live);
+                if !self.confirm_enter_jit(&live.values, &live.types, reds) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1388,7 +1601,8 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell_for_key(key, reds)
+        pin.reload(live);
+        self.start_tracing_cell_for_key(pin, live, reds)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -1461,13 +1675,15 @@ impl WarmEnterState {
     /// on the cell (`ensure_jit_cell_at_key(greenkey)`).
     pub fn attach_procedure_to_interp_for_key(
         &mut self,
-        key: &GreenKey,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
         token: impl Into<Arc<JitCellToken>>,
     ) -> Option<Arc<JitCellToken>> {
         let token = token.into();
-        self.ensure_cell_for_key(key);
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
         let cell = self
-            .lookup_chain_with_key_mut(key)
+            .lookup_chain_with_key_mut(pin, live)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
         cell.set_procedure_token(token, false)
@@ -1580,8 +1796,12 @@ impl WarmEnterState {
     /// [`Self::get_procedure_token`], and callers that need the key as well as
     /// the token should spell it that way so the key they carry onward is the
     /// one this matched on.
-    pub fn get_procedure_token_for_key(&self, key: &GreenKey) -> Option<Arc<JitCellToken>> {
-        self.lookup_chain_with_key(key)
+    pub fn get_procedure_token_for_key(
+        &self,
+        pin: &GreenRefPin,
+        live: &GreenKey,
+    ) -> Option<Arc<JitCellToken>> {
+        self.lookup_chain_with_key(pin, live)
             .and_then(|cell| cell.get_procedure_token())
     }
 
@@ -1655,8 +1875,8 @@ impl WarmEnterState {
     /// **the counter, not the cell**.
     /// That is the line: a hash is enough to find a bucket, never enough to
     /// pick a cell out of one.
-    pub fn get_cell_for_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
-        self.lookup_chain_with_key(key)
+    pub fn get_cell_for_key(&self, pin: &GreenRefPin, live: &GreenKey) -> Option<Rc<BaseJitCell>> {
+        self.lookup_chain_with_key(pin, live)
     }
 
     /// `rpython/jit/metainterp/warmstate.py` `get_assembler_token`.
@@ -1712,14 +1932,18 @@ impl WarmEnterState {
     /// reference words is not.
     pub fn get_assembler_token_with_key<E, F>(
         &mut self,
-        key: &GreenKey,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
         make_token: F,
     ) -> Result<Arc<JitCellToken>, E>
     where
         F: FnOnce(&mut crate::memmgr::MemoryManager) -> Result<Arc<JitCellToken>, E>,
     {
-        self.ensure_cell_for_key(key);
-        let cell_key = self.cell_key_for(key).unwrap_or_else(|| key.get_uhash());
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
+        let cell_key = self
+            .cell_key_for(pin, live)
+            .unwrap_or_else(|| live.get_uhash());
         self.get_assembler_token(cell_key, make_token)
     }
 
@@ -1879,8 +2103,8 @@ impl WarmEnterState {
     /// this door: reading the bucket's hash-form cell can miss the
     /// `DONT_TRACE_HERE` flag that `dont_trace_here(*greenargs)` set on the
     /// typed cell.
-    pub fn can_inline_callable_for_key(&self, key: &GreenKey) -> bool {
-        self.lookup_chain_with_key(key)
+    pub fn can_inline_callable_for_key(&self, pin: &GreenRefPin, live: &GreenKey) -> bool {
+        self.lookup_chain_with_key(pin, live)
             .is_none_or(|cell| !cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE))
     }
 
@@ -1909,11 +2133,12 @@ impl WarmEnterState {
     ///
     /// `tracing_generation` is read before the borrow because the cell
     /// borrows `self.celltable` mutably.
-    pub fn mark_as_being_traced_for_key(&mut self, key: &GreenKey) {
-        self.ensure_cell_for_key(key);
+    pub fn mark_as_being_traced_for_key(&mut self, pin: &GreenRefPin, live: &mut GreenKey) {
+        self.ensure_cell_for_key(pin, live);
         let tracing_generation = self.tracing_generation;
+        pin.reload(live);
         let cell = self
-            .lookup_chain_with_key_mut(key)
+            .lookup_chain_with_key_mut(pin, live)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags.set(cell.flags.get() | (JcFlags::JC_TRACING));
         if !cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED) {
@@ -1965,10 +2190,11 @@ impl WarmEnterState {
     /// `FORCE_FINISH` is sticky and never cleared explicitly, so setting it
     /// on the wrong cell of a bucket is permanent: the key that needs
     /// segmenting keeps aborting while an unrelated key segments forever.
-    pub fn mark_force_finish_tracing_for_key(&mut self, key: &GreenKey) {
-        self.ensure_cell_for_key(key);
+    pub fn mark_force_finish_tracing_for_key(&mut self, pin: &GreenRefPin, live: &mut GreenKey) {
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
         let cell = self
-            .lookup_chain_with_key_mut(key)
+            .lookup_chain_with_key_mut(pin, live)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_FORCE_FINISH));
@@ -1991,8 +2217,8 @@ impl WarmEnterState {
     /// that same cell (`bool(cell.flags.get() & JC_FORCE_FINISH)`). A hash
     /// read of the bucket head misses when the bucket holds more than one
     /// owner.
-    pub fn should_force_finish_tracing_for_key(&self, key: &GreenKey) -> bool {
-        self.lookup_chain_with_key(key)
+    pub fn should_force_finish_tracing_for_key(&self, pin: &GreenRefPin, live: &GreenKey) -> bool {
+        self.lookup_chain_with_key(pin, live)
             .is_some_and(|cell| cell.flags.get().contains(JcFlags::JC_FORCE_FINISH))
     }
 
@@ -2054,7 +2280,7 @@ impl WarmEnterState {
     pub fn function_entry_step(
         &mut self,
         cell_key: u64,
-        green_key: Option<&GreenKey>,
+        pin_live: Option<(&GreenRefPin, &mut GreenKey)>,
         has_compiled_meta: impl FnOnce() -> bool,
         reds: &[Value],
     ) -> FunctionEntryStep {
@@ -2068,20 +2294,31 @@ impl WarmEnterState {
             .and_then(|c| c.get_procedure_token())
             .filter(|token| token.has_compiled_code());
         let hash = self.bucket_of(cell_key);
-        let (greenargs, green_types) = match green_key {
-            Some(key) => (Some(key.values.as_slice()), key.types.as_slice()),
-            None => (None, [].as_slice()),
+        let result = if let Some((pin, live)) = pin_live {
+            pin.reload(live);
+            self.maybe_compile_and_run_decision(
+                cell.as_deref(),
+                hash,
+                self.increment_function_threshold,
+                Some(&live.values),
+                &live.types,
+                reds,
+                runnable_token.is_some(),
+                WarmEntryDoor::FunctionEntry,
+            )
+        } else {
+            self.maybe_compile_and_run_decision(
+                cell.as_deref(),
+                hash,
+                self.increment_function_threshold,
+                None,
+                &[],
+                reds,
+                runnable_token.is_some(),
+                WarmEntryDoor::FunctionEntry,
+            )
         };
-        match self.maybe_compile_and_run_decision(
-            cell.as_deref(),
-            hash,
-            self.increment_function_threshold,
-            greenargs,
-            green_types,
-            reds,
-            runnable_token.is_some(),
-            WarmEntryDoor::FunctionEntry,
-        ) {
+        match result {
             HotResult::RunCompiled => {
                 FunctionEntryStep::RunCompiled(runnable_token.expect("runnable compiled token"))
             }
@@ -2098,16 +2335,22 @@ impl WarmEnterState {
     /// form for this first half and [`Self::force_start_tracing_for_key`] for
     /// the second can inspect two different cells in a chained bucket. Keep
     /// the whole function-entry decision on the matching typed cell instead.
-    pub fn should_trace_function_entry_for_key(&mut self, key: &GreenKey) -> bool {
-        let hash = key.get_uhash();
-        let cell = self.lookup_chain_with_key(key);
+    pub fn should_trace_function_entry_for_key(
+        &mut self,
+        pin: &GreenRefPin,
+        live: &mut GreenKey,
+    ) -> bool {
+        let (hash, hashed) = pin.live_after_hash(live);
+        *live = hashed;
+        let cell = self.lookup_chain_with_greenargs(hash, &live.values, &live.types);
+        pin.reload(live);
         matches!(
             self.maybe_compile_and_run_decision(
                 cell.as_deref(),
                 hash,
                 self.increment_function_threshold,
-                Some(&key.values),
-                &key.types,
+                Some(&live.values),
+                &live.types,
                 &[],
                 false,
                 WarmEntryDoor::FunctionEntry,
@@ -2663,17 +2906,19 @@ impl WarmEnterState {
     /// taken by a different cell — the only state in which there is no u64
     /// that names this key's (absent) cell. Readers must treat it as a miss;
     /// writers call [`Self::ensure_cell_key`], which mints.
-    pub fn cell_key_for(&self, key: &GreenKey) -> Option<u64> {
-        self.cell_key_for_greenargs(key.get_uhash(), &key.values, &key.types)
+    pub fn cell_key_for(&self, pin: &GreenRefPin, live: &GreenKey) -> Option<u64> {
+        let (hash, hashed) = pin.live_after_hash(live);
+        self.cell_key_for_greenargs(hash, &hashed.values, &hashed.types)
     }
 
     /// Resolve greens to their cell key, installing the cell (with its
     /// `comparekey`) if the key owns none — `warmstate.py
     /// _ensure_jit_cell_at_key`, reporting the identity of the cell it
     /// ensured.
-    pub fn ensure_cell_key(&mut self, key: &GreenKey) -> u64 {
-        self.ensure_cell_for_key(key);
-        self.lookup_chain_with_key(key)
+    pub fn ensure_cell_key(&mut self, pin: &GreenRefPin, live: &mut GreenKey) -> u64 {
+        self.ensure_cell_for_key(pin, live);
+        pin.reload(live);
+        self.lookup_chain_with_key(pin, live)
             .and_then(|cell| cell.cell_key.get())
             .expect("ensure_cell_for_key just installed a keyed cell for this key")
     }
@@ -2688,11 +2933,18 @@ impl WarmEnterState {
     /// See [`WarmEnterState`]'s type doc for why the resolve happens at the
     /// producer and the result is carried, rather than each consumer
     /// re-deriving a cell from the slot.
+    ///
+    /// Production doors take [`Self::resolve_cell_key_with_greenargs`] or
+    /// [`Self::cell_key_for`] on a pin loaded at the greens. This copy-taking
+    /// form is the in-crate test helper.
+    #[cfg(test)]
     #[inline]
     pub fn resolve_cell_key(&self, hash: u64, make_key: impl FnOnce() -> GreenKey) -> u64 {
-        self.lookup_chain_with_key(&make_key())
-            .and_then(|cell| cell.cell_key.get())
-            .unwrap_or(hash)
+        GreenRefPin::with(&make_key(), |pin, live| {
+            self.lookup_chain_with_key(pin, live)
+        })
+        .and_then(|cell| cell.cell_key.get())
+        .unwrap_or(hash)
     }
 
     /// [`Self::resolve_cell_key`] against greens already in hand:
@@ -2706,10 +2958,7 @@ impl WarmEnterState {
         greenargs: &[i64],
         types: &[GreenType],
     ) -> u64 {
-        debug_assert_eq!(
-            hash,
-            GreenKey::with_types(greenargs.to_vec(), types.to_vec()).get_uhash()
-        );
+        debug_assert_eq!(hash, GreenKey::from_greenargs(greenargs, types).get_uhash());
         self.lookup_chain_with_greenargs(hash, greenargs, types)
             .and_then(|cell| cell.cell_key.get())
             .unwrap_or(hash)
@@ -3081,8 +3330,13 @@ impl WarmEnterState {
     /// the same cell the token is filed on. That is the
     /// property the `u64` currency previously lacked: it named a bucket, and a
     /// bucket is not a cell.
-    pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
-        self.lookup_chain_with_greenargs(key.get_uhash(), &key.values, &key.types)
+    pub fn lookup_chain_with_key(
+        &self,
+        pin: &GreenRefPin,
+        live: &GreenKey,
+    ) -> Option<Rc<BaseJitCell>> {
+        let (hash, hashed) = pin.live_after_hash(live);
+        self.lookup_chain_with_greenargs(hash, &hashed.values, &hashed.types)
     }
 
     /// `JitCell.get_jitcell(*greenargs)`: walk `lookup_chain(hash)` and
@@ -3125,16 +3379,20 @@ impl WarmEnterState {
     ///
     /// On a miss a new cell carrying the greens is installed and, when the
     /// raw hash is already taken, [`Self::mint_cell_key`] names it.
-    pub fn ensure_cell_for_key(&mut self, key: &GreenKey) {
+    pub fn ensure_cell_for_key(&mut self, pin: &GreenRefPin, live: &mut GreenKey) {
+        pin.reload(live);
+        let hash = live.get_uhash();
+        pin.reload(live);
         if self
-            .lookup_chain_with_key(key)
-            .is_some_and(|cell| cell.comparekey_matches(key))
+            .lookup_chain_with_greenargs(hash, &live.values, &live.types)
+            .is_some_and(|cell| cell.comparekey_matches(live))
         {
             return;
         }
-        let newcell =
-            BaseJitCell::new_for_driver_with_greens(self.jitdriver_sd, &key.values, &key.types);
-        self.install_new_cell(key.get_uhash(), Some(newcell));
+        pin.reload(live);
+        let newcell = BaseJitCell::new_for_driver_with_greens(self.jitdriver_sd, pin, live);
+        pin.reload(live);
+        self.install_new_cell(hash, Some(newcell));
     }
 }
 
@@ -3161,7 +3419,9 @@ mod tests {
     }
 
     fn maybe_compile(ws: &mut WarmEnterState, raw: u64) -> HotResult {
-        ws.maybe_compile_with_key(&gk(raw as i64))
+        GreenRefPin::with(&gk(raw as i64), |__p, __l| {
+            ws.maybe_compile_with_key(__p, __l)
+        })
     }
 
     /// `attach_procedure_to_interp` with the ownership every production attach
@@ -3184,7 +3444,9 @@ mod tests {
     ) -> Arc<JitCellToken> {
         let token: Arc<JitCellToken> = token.into();
         ws.memory_manager.keep_loop_alive(&token);
-        ws.attach_procedure_to_interp_for_key(&gk(raw as i64), Arc::clone(&token));
+        GreenRefPin::with(&gk(raw as i64), |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
         token
     }
 
@@ -3209,7 +3471,9 @@ mod tests {
     ) -> Arc<JitCellToken> {
         let token: Arc<JitCellToken> = token.into();
         ws.memory_manager.keep_loop_alive(&token);
-        ws.attach_procedure_to_interp_for_key(key, Arc::clone(&token));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
         token
     }
 
@@ -3232,14 +3496,18 @@ mod tests {
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         // `compile.py:566-567` order: register the strong owner, then attach.
         let token = attach_alive_for_key(&mut ws, &key, token);
-        ws.cell_key_for(&key).expect("the key now owns a cell");
+        GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("the key now owns a cell");
 
         assert!(
-            ws.get_procedure_token_for_key(&key).is_some(),
+            GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l)).is_some(),
             "fixture: a live token reads back through the weak handle",
         );
         assert!(
-            matches!(ws.maybe_compile_with_key(&key), HotResult::RunCompiled),
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+                HotResult::RunCompiled
+            ),
             "fixture: and the entry decision dispatches to it \
              (warmstate.py:482-483)",
         );
@@ -3260,12 +3528,11 @@ mod tests {
         drop(token);
 
         assert!(
-            ws.get_procedure_token_for_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l)).is_none(),
             "warmstate.py:192-195 `token = self.wref_procedure_token()` — a \
              weakref that no longer resolves is not a procedure token",
         );
-        let cell = ws
-            .get_cell_for_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.get_cell_for_key(__p, __l))
             .expect("the cell outlives the token it pointed at");
         assert!(
             !cell.is_compiled(),
@@ -3278,7 +3545,10 @@ mod tests {
              'never had one'",
         );
         assert!(
-            !matches!(ws.maybe_compile_with_key(&key), HotResult::RunCompiled),
+            !matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+                HotResult::RunCompiled
+            ),
             "and the entry decision falls back to counting (warmstate.py:483-500)",
         );
     }
@@ -3300,37 +3570,45 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
 
         let unregistered_key = GreenKey::new(vec![0x55, 0x66]);
-        let handed_back = ws
-            .get_assembler_token_with_key::<(), _>(&unregistered_key, |_memmgr| {
+        let handed_back = GreenRefPin::with(&unregistered_key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| {
                 Ok(Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED)))
             })
-            .expect("the maker succeeded");
+        })
+        .expect("the maker succeeded");
         assert!(
-            ws.get_procedure_token_for_key(&unregistered_key).is_some(),
+            GreenRefPin::with(&unregistered_key, |__p, __l| ws
+                .get_procedure_token_for_key(__p, __l))
+            .is_some(),
             "fixture: while the caller still holds it, the cell resolves it",
         );
         // The production caller keeps the token only long enough to put it in a
         // descr; `direct_assembler_call` then drops its handle.
         drop(handed_back);
         assert!(
-            ws.get_procedure_token_for_key(&unregistered_key).is_none(),
+            GreenRefPin::with(&unregistered_key, |__p, __l| ws
+                .get_procedure_token_for_key(__p, __l))
+            .is_none(),
             "a maker that skipped `keep_loop_alive` leaves NOTHING owning the \
              token, so the cell it was just installed on reads as never \
              compiled",
         );
 
         let registered_key = GreenKey::new(vec![0x77, 0x88]);
-        let handed_back = ws
-            .get_assembler_token_with_key::<(), _>(&registered_key, |memmgr| {
+        let handed_back = GreenRefPin::with(&registered_key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |memmgr| {
                 let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
                 // `compile.py:1148-1149`.
                 memmgr.keep_loop_alive(&token);
                 Ok(token)
             })
-            .expect("the maker succeeded");
+        })
+        .expect("the maker succeeded");
         drop(handed_back);
         assert!(
-            ws.get_procedure_token_for_key(&registered_key).is_some(),
+            GreenRefPin::with(&registered_key, |__p, __l| ws
+                .get_procedure_token_for_key(__p, __l))
+            .is_some(),
             "with `alive_loops` owning it (`memmgr.py:9-14`), the installed \
              token outlives the call that made it",
         );
@@ -3350,19 +3628,24 @@ mod tests {
         let key = GreenKey::new(vec![0x33, 0x44]);
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         let token = attach_alive_for_key(&mut ws, &key, token);
-        ws.cell_key_for(&key).expect("the key now owns a cell");
+        GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("the key now owns a cell");
         // The fixture's own handle is gone; `alive_loops` is the only owner,
         // exactly as `memmgr.py:9-12` describes production.
         drop(token);
 
         for entry in 0..8 {
             assert!(
-                matches!(ws.maybe_compile_with_key(&key), HotResult::RunCompiled),
+                matches!(
+                    GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+                    HotResult::RunCompiled
+                ),
                 "entry #{entry} must still dispatch: `alive_loops` owns the \
                  token and no sweep has run",
             );
             assert!(
-                ws.get_procedure_token_for_key(&key).is_some(),
+                GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l))
+                    .is_some(),
                 "entry #{entry} must still resolve the token through the cell",
             );
         }
@@ -3455,10 +3738,14 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
-        ws.finish_tracing(ws.cell_key_for(&gk(42)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
             .unwrap();
         assert!(!cell.is_tracing());
         assert!(cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED));
@@ -3472,10 +3759,15 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
-        ws.abort_tracing(ws.cell_key_for(&gk(42)).expect("cell"), true);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            true,
+        );
 
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
             .unwrap();
         assert!(!cell.is_tracing());
         assert!(cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
@@ -3498,13 +3790,16 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         // Abort without DONT_TRACE_HERE
-        ws.abort_tracing(ws.cell_key_for(&gk(42)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         // `maybe_compile_and_run`: a tokenless aborted cell is `cleanup_chain`
         // (was: the cell stayed, so one NotHot then StartTracing). The bucket
         // then recounts from cold (threshold=2).
         assert!(matches!(maybe_compile(&mut ws, 42), HotResult::NotHot));
-        assert!(ws.get_cell_for_key(&gk(42)).is_none());
+        assert!(GreenRefPin::with(&gk(42), |__p, __l| ws.get_cell_for_key(__p, __l)).is_none());
         assert!(matches!(maybe_compile(&mut ws, 42), HotResult::NotHot));
         match maybe_compile(&mut ws, 42) {
             HotResult::StartTracing => {}
@@ -3541,14 +3836,18 @@ mod tests {
     fn test_get_compiled() {
         let mut ws = WarmEnterState::new(1);
         assert!(
-            ws.get_compiled(ws.cell_key_for(&gk(42)).expect("cell"))
-                .is_none()
+            ws.get_compiled(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+            )
+            .is_none()
         );
 
         let token = JitCellToken::new(0);
         attach_alive(&mut ws, 42, token);
 
-        let compiled = ws.get_compiled(ws.cell_key_for(&gk(42)).expect("cell"));
+        let compiled = ws.get_compiled(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         assert!(compiled.is_some());
         assert_eq!(compiled.unwrap().number(), 0);
     }
@@ -3575,7 +3874,9 @@ mod tests {
         ));
 
         // Phase 4: Finish tracing, install compiled code
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
@@ -3612,14 +3913,18 @@ mod tests {
         attach_alive(&mut ws, green_key, token);
         ws.register_quasiimmut_dependency(
             qmut_key,
-            ws.cell_key_for(&gk(green_key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(green_key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                .expect("cell"),
         );
 
         let count = ws.invalidate_quasiimmut(qmut_key);
         assert_eq!(count, 1);
 
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(green_key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(green_key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(resolved_token(&cell).is_invalidated());
     }
@@ -3643,7 +3948,8 @@ mod tests {
             attach_alive(&mut ws, green_key, token);
             ws.register_quasiimmut_dependency(
                 qmut_key,
-                ws.cell_key_for(&gk(green_key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(green_key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
             );
         }
 
@@ -3652,7 +3958,10 @@ mod tests {
 
         for green_key in [10, 20] {
             let cell = ws
-                .get_cell(ws.cell_key_for(&gk(green_key as i64)).expect("cell"))
+                .get_cell(
+                    GreenRefPin::with(&gk(green_key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                        .expect("cell"),
+                )
                 .unwrap();
             assert!(resolved_token(&cell).is_invalidated());
         }
@@ -3670,7 +3979,10 @@ mod tests {
 
         for green_key in [1, 2, 3] {
             let cell = ws
-                .get_cell(ws.cell_key_for(&gk(green_key as i64)).expect("cell"))
+                .get_cell(
+                    GreenRefPin::with(&gk(green_key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                        .expect("cell"),
+                )
                 .unwrap();
             assert!(resolved_token(&cell).is_invalidated());
         }
@@ -3706,11 +4018,16 @@ mod tests {
         }
 
         // Simulate: recorder.is_too_long() was true, so abort with dont_trace.
-        ws.abort_tracing(ws.cell_key_for(&gk(42)).expect("cell"), true);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            true,
+        );
 
         // The key is now blacklisted.
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
             .unwrap();
         assert!(cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
         assert!(!cell.is_tracing());
@@ -3729,12 +4046,18 @@ mod tests {
         let mut ws = WarmEnterState::new(3);
 
         // Fresh cell: can_inline_callable returns true by default.
-        assert!(ws.can_inline_callable(ws.cell_key_for(&gk(42)).expect("cell")));
+        assert!(ws.can_inline_callable(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
 
         // dont_trace_here → JC_DONT_TRACE_HERE flag, can_inline_callable
         // returns false (warmstate.py parity).
-        ws.disable_noninlinable_function_for_key(&gk(42));
-        assert!(!ws.can_inline_callable(ws.cell_key_for(&gk(42)).expect("cell")));
+        GreenRefPin::with(&gk(42), |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        assert!(!ws.can_inline_callable(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
     }
 
     #[test]
@@ -3742,9 +4065,11 @@ mod tests {
         let mut ws = WarmEnterState::new(3);
         let key = GreenKey::new(vec![7, 11]);
 
-        assert!(ws.can_inline_callable_for_key(&key));
-        ws.disable_noninlinable_function_for_key(&key);
-        assert!(!ws.can_inline_callable_for_key(&key));
+        assert!(GreenRefPin::with(&key, |__p, __l| ws.can_inline_callable_for_key(__p, __l)));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        assert!(!GreenRefPin::with(&key, |__p, __l| ws.can_inline_callable_for_key(__p, __l)));
     }
 
     #[test]
@@ -3758,7 +4083,10 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing for key 42"),
         }
-        ws.abort_tracing(ws.cell_key_for(&gk(42)).expect("cell"), true);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            true,
+        );
 
         // Key 99: should still work normally.
         assert!(matches!(maybe_compile(&mut ws, 99), HotResult::NotHot));
@@ -3783,18 +4111,26 @@ mod tests {
         }
 
         // Phase 2: trace is too long, abort without blacklist.
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         // Phase 3: `maybe_compile_and_run` drops the tokenless aborted cell
         // (`cleanup_chain`; was: the cell stayed and one NotHot re-armed it),
         // then the bucket recounts from cold.
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
-        assert!(ws.get_cell_for_key(&gk(key as i64)).is_none());
+        assert!(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.get_cell_for_key(__p, __l)).is_none()
+        );
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         match maybe_compile(&mut ws, key) {
             HotResult::StartTracing => {
                 // Phase 4: this time the trace succeeds.
-                ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+                ws.finish_tracing(
+                    GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                        .expect("cell"),
+                );
                 let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
@@ -3822,27 +4158,40 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing (attempt 1)"),
         }
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         // Second attempt: `maybe_compile_and_run` `cleanup_chain`s the aborted
         // cell (was: the cell stayed, one NotHot then StartTracing), then the
         // bucket recounts from cold.
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
-        assert!(ws.get_cell_for_key(&gk(key as i64)).is_none());
+        assert!(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.get_cell_for_key(__p, __l)).is_none()
+        );
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         match maybe_compile(&mut ws, key) {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing (attempt 2)"),
         }
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         // Third attempt: succeeds and gets compiled.
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
-        assert!(ws.get_cell_for_key(&gk(key as i64)).is_none());
+        assert!(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.get_cell_for_key(__p, __l)).is_none()
+        );
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         match maybe_compile(&mut ws, key) {
             HotResult::StartTracing => {
-                ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+                ws.finish_tracing(
+                    GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                        .expect("cell"),
+                );
                 let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
@@ -3868,14 +4217,23 @@ mod tests {
         }
 
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED));
 
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(!cell.is_tracing());
         assert!(
@@ -3890,7 +4248,10 @@ mod tests {
         let qmut_key = 0xABCD;
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 42, token);
-        ws.register_quasiimmut_dependency(qmut_key, ws.cell_key_for(&gk(42)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut_key,
+            GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         ws.invalidate_quasiimmut(qmut_key);
         // Second invalidation should find no deps.
@@ -4110,9 +4471,13 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = make_token(JitCellToken::NUMBER_UNASSIGNED);
-        ws.attach_procedure_to_interp_for_key(&gk(key as i64), Arc::clone(&token));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
         mgr.keep_loop_alive(&token);
 
         assert!(matches!(
@@ -4129,7 +4494,9 @@ mod tests {
         // warmstate cell records the new procedure token, MemoryManager
         // tracks it under its own pointer identity.
         let token2 = make_token(JitCellToken::NUMBER_UNASSIGNED);
-        ws.attach_procedure_to_interp_for_key(&gk(key as i64), Arc::clone(&token2));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token2))
+        });
         mgr.keep_loop_alive(&token2);
 
         assert!(matches!(
@@ -4232,7 +4599,10 @@ mod tests {
         }
 
         // Abort without blacklisting
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         // Lower threshold for retry
         ws.set_threshold(2);
@@ -4241,11 +4611,16 @@ mod tests {
         // (`cleanup_chain`; was: the cell stayed, so the first is NotHot).
         // Threshold 2 then needs two fresh ticks.
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
-        assert!(ws.get_cell_for_key(&gk(key as i64)).is_none());
+        assert!(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.get_cell_for_key(__p, __l)).is_none()
+        );
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         match maybe_compile(&mut ws, key) {
             HotResult::StartTracing => {
-                ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+                ws.finish_tracing(
+                    GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                        .expect("cell"),
+                );
                 let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
@@ -4266,17 +4641,23 @@ mod tests {
         let key = gk(42);
 
         // Without any ticks, force_start_tracing should start tracing
-        match ws.force_start_tracing_for_key(&key, &[]) {
+        match GreenRefPin::with(&key, |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        }) {
             HotResult::StartTracing => {}
             _ => panic!("force_start_tracing should start tracing immediately"),
         }
 
         // The cell should be in TRACING state
-        let cell = ws.get_cell(ws.cell_key_for(&key).expect("cell")).unwrap();
+        let cell = ws
+            .get_cell(GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"))
+            .unwrap();
         assert!(cell.is_tracing());
 
         // Second call sees AlreadyTracing
-        match ws.force_start_tracing_for_key(&key, &[]) {
+        match GreenRefPin::with(&key, |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        }) {
             HotResult::AlreadyTracing => {}
             _ => panic!("expected AlreadyTracing on second force_start_tracing"),
         }
@@ -4292,7 +4673,10 @@ mod tests {
 
         // Initially no cell → NotHot
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::NotHot
         );
 
@@ -4303,32 +4687,46 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Tracing
         );
 
         // Finish tracing and install → Compiled
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Compiled
         );
 
         // Invalidate via transition_cell → Invalidated
         ws.transition_cell(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             BaseJitCellState::Invalidated,
         );
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
         // The loop_token's invalidated flag should be set
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(resolved_token(&cell).is_invalidated());
         assert!(cell.has_seen_a_procedure_token());
@@ -4346,13 +4744,18 @@ mod tests {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Cell owns the token
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(cell.get_procedure_token().is_some());
         assert!(cell.has_seen_a_procedure_token());
@@ -4361,14 +4764,17 @@ mod tests {
         let qmut_key = 0xFF;
         ws.register_quasiimmut_dependency(
             qmut_key,
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
         );
         ws.invalidate_quasiimmut(qmut_key);
 
         // Token ownership revoked (state is Invalidated); the weak slot
         // still records that a procedure token existed.
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert_eq!(cell.derived_state(), BaseJitCellState::Invalidated);
         // get_procedure_token returns None because the token is invalidated
@@ -4421,7 +4827,9 @@ mod tests {
         assert_eq!(stats.num_tracing, 2);
 
         // Compile key 1
-        ws.finish_tracing(ws.cell_key_for(&gk(1)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(1), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
@@ -4430,7 +4838,10 @@ mod tests {
         assert_eq!(stats.num_tracing, 1);
 
         // Abort key 2 with dont_trace
-        ws.abort_tracing(ws.cell_key_for(&gk(2)).expect("cell"), true);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(2), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            true,
+        );
 
         let stats = ws.get_stats();
         assert_eq!(stats.num_compiled, 1);
@@ -4439,7 +4850,7 @@ mod tests {
 
         // Invalidate key 1
         ws.transition_cell(
-            ws.cell_key_for(&gk(1)).expect("cell"),
+            GreenRefPin::with(&gk(1), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             BaseJitCellState::Invalidated,
         );
 
@@ -4462,13 +4873,19 @@ mod tests {
         }
 
         // Abort with DONT_TRACE_HERE → the cell carries the flag
-        ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), true);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            true,
+        );
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .unwrap()
-                .flags
-                .get()
-                .contains(JcFlags::JC_DONT_TRACE_HERE)
+            ws.get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            )
+            .unwrap()
+            .flags
+            .get()
+            .contains(JcFlags::JC_DONT_TRACE_HERE)
         );
 
         // Future calls return NotHot
@@ -4476,16 +4893,22 @@ mod tests {
 
         // Can manually reset to NotHot
         ws.transition_cell(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             BaseJitCellState::NotHot,
         );
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::NotHot
         );
         // DONT_TRACE_HERE flag should be cleared
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
+            )
             .unwrap();
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
     }
@@ -4497,7 +4920,9 @@ mod tests {
     fn a_disabled_never_traced_cell_retries_immediately() {
         let mut ws = WarmEnterState::new(100);
         let key = 0xD017u64;
-        ws.disable_noninlinable_function_for_key(&gk(key as i64));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
         assert!(matches!(
             maybe_compile(&mut ws, key),
             HotResult::StartTracing
@@ -4514,17 +4939,16 @@ mod tests {
         let hash = key.get_uhash();
 
         for _ in 0..6 {
-            ws.mark_as_being_traced_for_key(&key);
+            GreenRefPin::with(&key, |__p, __l| ws.mark_as_being_traced_for_key(__p, __l));
             ws.decline_tracing(hash);
         }
 
-        let cell = ws
-            .get_cell_for_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.get_cell_for_key(__p, __l))
             .expect("decline keeps the warm-state cell");
         assert_eq!(cell.derived_state(), BaseJitCellState::NotHot);
         assert!(!cell.flags.get().contains(JcFlags::JC_TRACING));
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
-        assert!(ws.can_inline_callable_for_key(&key));
+        assert!(GreenRefPin::with(&key, |__p, __l| ws.can_inline_callable_for_key(__p, __l)));
     }
 
     #[test]
@@ -4538,7 +4962,11 @@ mod tests {
         assert!(matches!(maybe_compile(&mut ws, 1), HotResult::StartTracing));
         assert_eq!(ws.tracing_generation(), 1);
 
-        let cell = ws.get_cell(ws.cell_key_for(&gk(1)).expect("cell")).unwrap();
+        let cell = ws
+            .get_cell(
+                GreenRefPin::with(&gk(1), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
+            .unwrap();
         assert_eq!(cell.tracing_generation.get(), 1);
 
         // Start tracing key 2 → generation 2
@@ -4546,7 +4974,11 @@ mod tests {
         assert!(matches!(maybe_compile(&mut ws, 2), HotResult::StartTracing));
         assert_eq!(ws.tracing_generation(), 2);
 
-        let cell = ws.get_cell(ws.cell_key_for(&gk(2)).expect("cell")).unwrap();
+        let cell = ws
+            .get_cell(
+                GreenRefPin::with(&gk(2), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
+            .unwrap();
         assert_eq!(cell.tracing_generation.get(), 2);
     }
 
@@ -4568,9 +5000,8 @@ mod tests {
         let key_a = GreenKey::new(vec![0xA]);
 
         // Cell A is marked as being traced under the current generation.
-        ws.mark_as_being_traced_for_key(&key_a);
-        let cell = ws
-            .get_cell_for_key(&key_a)
+        GreenRefPin::with(&key_a, |__p, __l| ws.mark_as_being_traced_for_key(__p, __l));
+        let cell = GreenRefPin::with(&key_a, |__p, __l| ws.get_cell_for_key(__p, __l))
             .expect("mark_as_being_traced_for_key installs it");
         assert!(cell.is_tracing(), "fixture: A carries JC_TRACING");
         assert_eq!(
@@ -4583,7 +5014,8 @@ mod tests {
         // case: 65 moves, 66 must not.
         let live_65 = crate::mc_diag(65);
         let live_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry_for_key(&key_a));
+        assert!(!GreenRefPin::with(&key_a, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
         assert!(
             crate::mc_diag(65) > live_65,
             "a decline on the tracing term bumps 65"
@@ -4601,7 +5033,8 @@ mod tests {
             maybe_compile(&mut ws, 0xB),
             HotResult::StartTracing
         ));
-        let cell = ws.get_cell_for_key(&key_a).expect("A is still installed");
+        let cell = GreenRefPin::with(&key_a, |__p, __l| ws.get_cell_for_key(__p, __l))
+            .expect("A is still installed");
         assert!(cell.is_tracing(), "fixture: A's flag was never cleared");
         assert!(
             cell.tracing_generation.get() < ws.tracing_generation(),
@@ -4609,7 +5042,8 @@ mod tests {
         );
 
         let stale_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry_for_key(&key_a));
+        assert!(!GreenRefPin::with(&key_a, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
         assert!(
             crate::mc_diag(66) > stale_66,
             "a stale JC_TRACING at this gate is what slot 66 reports"
@@ -4625,12 +5059,14 @@ mod tests {
         let key = GreenKey::new(vec![100, 200]);
         let hash = key.get_uhash();
 
-        ws.disable_noninlinable_function_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
 
-        ws.mark_as_being_traced_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| ws.mark_as_being_traced_for_key(__p, __l));
         assert_eq!(ws.get_stats().num_cells, 1, "one green key, one cell");
         assert!(
-            ws.lookup_chain_with_key(&key)
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .expect("the cell exists")
                 .is_tracing(),
         );
@@ -4641,7 +5077,7 @@ mod tests {
 
         ws.clear_tracing_flag(hash);
         assert!(
-            !ws.lookup_chain_with_key(&key)
+            !GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .expect("the cell exists")
                 .is_tracing(),
             "clearing the hash key clears the one cell",
@@ -4651,16 +5087,28 @@ mod tests {
     #[test]
     fn test_jitcell_should_remove() {
         // A freshly created cell with no token and no flags should be removable
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         assert!(cell.should_remove_jitcell());
 
         // A cell that is tracing should NOT be removable
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell.flags.set(cell.flags.get() | (JcFlags::JC_TRACING));
         assert!(!cell.should_remove_jitcell());
 
         // A cell with DONT_TRACE_HERE but no token history is removable
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
         assert!(!cell.should_remove_jitcell()); // has_seen_a_procedure_token is false
@@ -4671,7 +5119,11 @@ mod tests {
         // stamping a number: `has_seen_a_procedure_token` reads the weakref
         // slot (warmstate.py), which is what the arm below is a
         // reading of.
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
         {
@@ -4696,7 +5148,11 @@ mod tests {
         assert!(cell.should_remove_jitcell());
 
         // warmstate.py:222-225: FORCE_FINISH must NOT be removed
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell.flags
             .set(cell.flags.get() | (JcFlags::JC_FORCE_FINISH));
         assert!(!cell.should_remove_jitcell());
@@ -4710,7 +5166,9 @@ mod tests {
         // Key 1: compiled (should NOT be removed)
         assert!(matches!(maybe_compile(&mut ws, 1), HotResult::NotHot));
         assert!(matches!(maybe_compile(&mut ws, 1), HotResult::StartTracing));
-        ws.finish_tracing(ws.cell_key_for(&gk(1)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(1), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
@@ -4721,23 +5179,32 @@ mod tests {
         // Key 3: aborted without dont_trace → NotHot, removable
         assert!(matches!(maybe_compile(&mut ws, 3), HotResult::NotHot));
         assert!(matches!(maybe_compile(&mut ws, 3), HotResult::StartTracing));
-        ws.abort_tracing(ws.cell_key_for(&gk(3)).expect("cell"), false);
+        ws.abort_tracing(
+            GreenRefPin::with(&gk(3), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            false,
+        );
 
         assert_eq!(ws.get_stats().num_cells, 3);
         let removed = ws.gc_cells();
         assert_eq!(removed, 1); // key 3 removed
         assert_eq!(ws.get_stats().num_cells, 2);
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(1)).expect("cell"))
-                .is_some()
+            ws.get_cell(
+                GreenRefPin::with(&gk(1), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+            )
+            .is_some()
         );
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(2)).expect("cell"))
-                .is_some()
+            ws.get_cell(
+                GreenRefPin::with(&gk(2), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+            )
+            .is_some()
         );
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(3)).expect("cell"))
-                .is_none()
+            ws.get_cell(
+                GreenRefPin::with(&gk(3), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+            )
+            .is_none()
         );
     }
 
@@ -4753,33 +5220,44 @@ mod tests {
             maybe_compile(&mut ws, key),
             HotResult::StartTracing
         ));
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Compiled
         );
 
         // Invalidate
         ws.transition_cell(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             BaseJitCellState::Invalidated,
         );
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
         // Reset to NotHot and recompile
         ws.transition_cell(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             BaseJitCellState::NotHot,
         );
         let token2 = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token2);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Compiled
         );
         assert!(matches!(
@@ -4829,12 +5307,17 @@ mod tests {
             maybe_compile(&mut ws, key),
             HotResult::StartTracing
         ));
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Register quasi-immutable dependency
-        ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut,
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         // Invalidate
         let invalidated = ws.invalidate_quasiimmut(qmut);
@@ -4842,7 +5325,10 @@ mod tests {
 
         // Loop should now be invalidated state
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
     }
@@ -4858,14 +5344,22 @@ mod tests {
             maybe_compile(&mut ws, key),
             HotResult::StartTracing
         ));
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
-        ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut,
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
@@ -4873,8 +5367,11 @@ mod tests {
         // token cell and resets the counter; following entries count fresh.
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .is_none()
+            ws.get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            )
+            .is_none()
         );
         assert!(matches!(maybe_compile(&mut ws, key), HotResult::NotHot));
         assert!(matches!(
@@ -4903,43 +5400,56 @@ mod tests {
         let qmut = 0xFA12;
 
         assert!(!ws.counter_tick_checked(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             &[GreenType::Int],
             &[],
         ));
         assert!(ws.counter_tick_checked(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             &[GreenType::Int],
             &[],
         ));
-        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        });
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
-        ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut,
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
         assert!(!ws.counter_tick_checked(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             &[GreenType::Int],
             &[],
         ));
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .is_none()
+            ws.get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            )
+            .is_none()
         );
         assert!(!ws.counter_tick_checked(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             &[GreenType::Int],
             &[],
         ));
         assert!(ws.counter_tick_checked(
-            ws.cell_key_for(&gk(key as i64)).expect("cell"),
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
             &[GreenType::Int],
             &[],
         ));
@@ -4952,27 +5462,50 @@ mod tests {
         let key = 0xD00F;
         let qmut = 0xFA13;
 
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        assert!(ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        });
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
-        ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut,
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .is_none()
+            ws.get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            )
+            .is_none()
         );
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        assert!(ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
     }
 
     /// `warmstate.py maybe_compile_and_run`: a dead procedure token
@@ -4985,28 +5518,51 @@ mod tests {
         let key = 0xD010;
         let qmut = 0xFA14;
 
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        assert!(ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        });
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
-        ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        ws.register_quasiimmut_dependency(
+            qmut,
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
 
         assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
         assert_eq!(
-            ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
+            ws.get_cell_state(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            ),
             BaseJitCellState::Invalidated
         );
 
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .is_none(),
+            ws.get_cell(
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell")
+            )
+            .is_none(),
             "a dead token must reach cleanup_chain"
         );
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+        assert!(!ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
+        assert!(ws.should_trace_function_entry(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+        ));
     }
 
     /// The three answers [`WarmEnterState::function_entry_step`] gives, against
@@ -5026,7 +5582,8 @@ mod tests {
         // Cold, no trace running: the counter gate, unchanged.
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
                 None,
                 || false,
                 &[],
@@ -5035,7 +5592,8 @@ mod tests {
         ));
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
                 None,
                 || false,
                 &[],
@@ -5043,14 +5601,19 @@ mod tests {
             FunctionEntryStep::Proceed
         ));
 
-        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
-        ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
+        GreenRefPin::with(&gk(key as i64), |__p, __l| {
+            ws.force_start_tracing_for_key(__p, __l, &[])
+        });
+        ws.finish_tracing(
+            GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+        );
         let token = token_with_compiled_code();
         attach_alive(&mut ws, key, token);
 
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
                 None,
                 || true,
                 &[],
@@ -5059,7 +5622,8 @@ mod tests {
         ));
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(key as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
                 None,
                 || false,
                 &[],
@@ -5081,12 +5645,15 @@ mod tests {
             HotResult::StartTracing
         ));
         assert!(
-            ws.get_cell_for_key(&gk(tracing_key as i64))
-                .is_some_and(|c| c.is_tracing())
+            GreenRefPin::with(&gk(tracing_key as i64), |__p, __l| ws
+                .get_cell_for_key(__p, __l))
+            .is_some_and(|c| c.is_tracing())
         );
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(tracing_key as i64)).expect("cell"),
+                GreenRefPin::with(&gk(tracing_key as i64), |__p, __l| ws
+                    .cell_key_for(__p, __l))
+                .expect("cell"),
                 None,
                 || false,
                 &[],
@@ -5095,7 +5662,8 @@ mod tests {
         ));
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(sibling as i64)).expect("cell"),
+                GreenRefPin::with(&gk(sibling as i64), |__p, __l| ws.cell_key_for(__p, __l))
+                    .expect("cell"),
                 None,
                 || false,
                 &[],
@@ -5115,10 +5683,10 @@ mod tests {
         attach_alive_for_key(&mut ws, &key, Arc::clone(&token));
 
         for _ in 0..50 {
-            assert!(!ws.should_trace_function_entry_for_key(&key));
+            assert!(!GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)));
         }
-        let held = ws
-            .lookup_chain_with_key(&key)
+        let held = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .and_then(|cell| cell.get_procedure_token())
             .expect("the compiled cell still holds a token");
         assert!(
@@ -5133,7 +5701,12 @@ mod tests {
         attach_alive_for_key(&mut ws, &key, token);
         for _ in 0..50 {
             assert!(matches!(
-                ws.function_entry_step(ws.cell_key_for(&key).expect("cell"), None, || false, &[]),
+                ws.function_entry_step(
+                    GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+                    None,
+                    || false,
+                    &[]
+                ),
                 FunctionEntryStep::NotHot
             ));
         }
@@ -5146,19 +5719,34 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         let key = gk(0xA11);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         ws.set_threshold(0);
         for _ in 0..8 {
             assert!(matches!(
-                ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                    __p,
+                    __l,
+                    |_| true,
+                    &[]
+                )),
                 HotResult::NotHot
             ));
         }
         ws.set_threshold(2);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::StartTracing
         ));
 
@@ -5167,7 +5755,12 @@ mod tests {
         attach_alive_for_key(&mut ws, &compiled, JitCellToken::new(1));
         ws.set_threshold(0);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&compiled, |_| true, &[]),
+            GreenRefPin::with(&compiled, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
 
@@ -5175,7 +5768,7 @@ mod tests {
         ws.set_function_threshold(0);
         assert!(matches!(
             ws.function_entry_step(
-                ws.cell_key_for(&gk(0xA12)).expect("cell"),
+                GreenRefPin::with(&gk(0xA12), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
                 None,
                 || true,
                 &[],
@@ -5186,22 +5779,29 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         let aborted = GreenKey::new(vec![0xA13]);
         assert!(matches!(
-            ws.maybe_compile_with_key(&aborted),
+            GreenRefPin::with(&aborted, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_with_key(&aborted),
+            GreenRefPin::with(&aborted, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
             HotResult::StartTracing
         ));
         ws.abort_tracing(aborted.get_uhash(), false);
-        assert!(ws.lookup_chain_with_key(&aborted).is_some());
+        assert!(
+            GreenRefPin::with(&aborted, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some()
+        );
         ws.set_threshold(0);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&aborted, |_| true, &[]),
+            GreenRefPin::with(&aborted, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         assert!(
-            ws.lookup_chain_with_key(&aborted).is_some(),
+            GreenRefPin::with(&aborted, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some(),
             "increment 0 does not cleanup_chain",
         );
     }
@@ -5214,12 +5814,19 @@ mod tests {
         let key = GreenKey::new(vec![0xA21, 0xA22]);
         let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, token);
-        let cell = ws.lookup_chain_with_key(&key).expect("compiled cell");
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+            .expect("compiled cell");
         cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
-        let cell_key = ws.cell_key_for(&key).expect("compiled cell key");
+        let cell_key = GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("compiled cell key");
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
@@ -5227,7 +5834,12 @@ mod tests {
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, &[]),
+            GreenRefPin::with(&key, |p, l| ws.function_entry_step(
+                cell_key,
+                Some((p, l)),
+                || true,
+                &[]
+            )),
             FunctionEntryStep::NotHot
         ));
     }
@@ -5239,19 +5851,34 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![0x7E, 0x11]);
         let token = Arc::new(JitCellToken::new(0x7e11));
-        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
-            .expect("tmp token");
-        ws.disable_noninlinable_function_for_key(&key);
-        let cell = ws.lookup_chain_with_key(&key).expect("tmp cell");
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token.clone()))
+        })
+        .expect("tmp token");
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+            .expect("tmp cell");
         assert!(cell.flags.get().contains(JcFlags::JC_TEMPORARY));
         assert!(cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::StartTracing
         ));
 
@@ -5259,11 +5886,17 @@ mod tests {
         ws.set_function_threshold(2);
         let key = GreenKey::new(vec![0x7E, 0x12]);
         let token = Arc::new(JitCellToken::new(0x7e12));
-        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
-            .expect("tmp token");
-        ws.disable_noninlinable_function_for_key(&key);
-        assert!(!ws.should_trace_function_entry_for_key(&key));
-        assert!(ws.should_trace_function_entry_for_key(&key));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token.clone()))
+        })
+        .expect("tmp token");
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        assert!(!GreenRefPin::with(&key, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
+        assert!(GreenRefPin::with(&key, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
     }
 
     /// `warmstate.py maybe_compile_and_run`: a tokenless aborted cell is
@@ -5272,16 +5905,20 @@ mod tests {
     fn tokenless_aborted_cell_function_entry_runs_cleanup_chain() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![0xC1, 0xEA]);
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
         assert!(matches!(
-            ws.maybe_compile_with_key(&key),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
             HotResult::StartTracing
         ));
         ws.abort_tracing(key.get_uhash(), false);
-        assert!(ws.lookup_chain_with_key(&key).is_some());
-        assert!(!ws.should_trace_function_entry_for_key(&key));
+        assert!(GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some());
+        assert!(!GreenRefPin::with(&key, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
         assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_none(),
             "an ordinary tokenless aborted cell is cleanup_chain",
         );
     }
@@ -5296,14 +5933,14 @@ mod tests {
         let key = GreenKey::new(vec![0xD0C3]);
         let tmp_token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&tmp_token);
-        ws.get_assembler_token_with_key::<(), _>(&key, |_| Ok(tmp_token))
-            .expect("tmp callback token");
-        let cell_key = ws
-            .cell_key_for(&key)
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_| Ok(tmp_token))
+        })
+        .expect("tmp callback token");
+        let cell_key = GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("tmp callback installed a cell");
         {
-            let cell = ws
-                .lookup_chain_with_key_mut(&key)
+            let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key_mut(__p, __l))
                 .expect("tmp callback installed a cell");
             cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
         }
@@ -5338,22 +5975,27 @@ mod tests {
         let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &key, token);
         {
-            let cell = ws
-                .lookup_chain_with_key_mut(&key)
+            let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key_mut(__p, __l))
                 .expect("attach_alive_for_key installed a cell");
             cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
         }
-        assert!(ws.lookup_chain_with_key(&key).is_some_and(|cell| {
-            cell.is_tracing()
-                && !cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-                && cell.get_procedure_token().is_some()
-        }));
         assert!(
-            !ws.should_trace_function_entry_for_key(&key),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some_and(
+                |cell| {
+                    cell.is_tracing()
+                        && !cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+                        && cell.get_procedure_token().is_some()
+                }
+            )
+        );
+        assert!(
+            !GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)),
             "JC_TRACING returns before get_procedure_token"
         );
         assert!(
-            !ws.should_trace_function_entry_for_key(&key),
+            !GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)),
             "the first probe must not have ticked toward bound_reached"
         );
     }
@@ -5366,23 +6008,28 @@ mod tests {
         let key = GreenKey::new(vec![0xD0, 0xC9]);
         let tmp_token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&tmp_token);
-        ws.get_assembler_token_with_key::<(), _>(&key, |_| Ok(tmp_token))
-            .expect("tmp callback token");
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_| Ok(tmp_token))
+        })
+        .expect("tmp callback token");
         {
-            let cell = ws
-                .lookup_chain_with_key_mut(&key)
+            let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key_mut(__p, __l))
                 .expect("tmp callback installed a cell");
             cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
         }
-        assert!(ws.lookup_chain_with_key(&key).is_some_and(|cell| {
-            cell.flags.get().contains(JcFlags::JC_TEMPORARY) && cell.is_tracing()
-        }));
         assert!(
-            !ws.should_trace_function_entry_for_key(&key),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some_and(
+                |cell| { cell.flags.get().contains(JcFlags::JC_TEMPORARY) && cell.is_tracing() }
+            )
+        );
+        assert!(
+            !GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)),
             "JC_TRACING returns before the temporary-cell tick"
         );
         assert!(
-            !ws.should_trace_function_entry_for_key(&key),
+            !GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)),
             "the first probe must not have ticked toward bound_reached"
         );
     }
@@ -5425,13 +6072,21 @@ mod tests {
     /// when the cell's stored greens equal the probe (`JitCell.comparekey`).
     #[test]
     fn comparekey_matches_only_with_stored_key() {
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &[], &[]);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&[], &[]);
+            let mut _zbh_live = GreenKey::from_greenargs(&[], &[]);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         let key = GreenKey::new(vec![1, 2, 3]);
         assert!(
             !cell.comparekey_matches(&key),
             "empty greens must not match a longer probe"
         );
-        let cell = BaseJitCell::new_for_driver_with_greens(0, &key.values, &key.types);
+        let cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key.values, &key.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key.values, &key.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         assert!(
             cell.comparekey_matches(&key),
             "cell with stored comparekey must match equal probe"
@@ -5508,7 +6163,7 @@ mod tests {
 
         {
             let mut ws = WarmEnterState::new(3);
-            ws.ensure_cell_for_key(&key);
+            GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
 
             let retained = RETAIN_LOG.lock().clone();
             assert!(
@@ -5591,12 +6246,11 @@ mod tests {
         let key = GreenKey::new(vec![42, 100]);
 
         assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_none(),
             "no cell for fresh key"
         );
-        ws.ensure_cell_for_key(&key);
-        let cell = ws
-            .lookup_chain_with_key(&key)
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("ensure must install a cell");
         assert_eq!(
             &cell.greens[..],
@@ -5613,7 +6267,9 @@ mod tests {
         let key = GreenKey::new(vec![7, 11]);
 
         let mut typed = WarmEnterState::new(100);
-        typed.disable_noninlinable_function_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            typed.disable_noninlinable_function_for_key(__p, __l)
+        });
         let typed_cell = typed
             .get_cell(key.get_uhash())
             .expect("typed form installs a cell");
@@ -5628,7 +6284,7 @@ mod tests {
         );
 
         let mut hashed = WarmEnterState::new(100);
-        hashed.ensure_cell_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| hashed.ensure_cell_for_key(__p, __l));
         hashed.disable_noninlinable_function(key.get_uhash());
         let hashed_cell = hashed
             .get_cell(key.get_uhash())
@@ -5681,11 +6337,13 @@ mod tests {
         // install. Stays at the back of the chain after the second
         // install per install_new_cell's "prepend new cell, fold
         // existing keepable cells in front" semantics.
-        let cell_first = BaseJitCell::new_for_driver_with_greens(
-            0,
-            &key_head_after_chain.values,
-            &key_head_after_chain.types,
-        );
+        let cell_first = {
+            let _zbh_pin =
+                GreenRefPin::pin_slices(&key_head_after_chain.values, &key_head_after_chain.types);
+            let mut _zbh_live =
+                GreenKey::from_greenargs(&key_head_after_chain.values, &key_head_after_chain.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell_first
             .flags
             .set(cell_first.flags.get() | (JcFlags::JC_TRACING));
@@ -5696,8 +6354,11 @@ mod tests {
         // Wait — install_new_cell folds the EXISTING chain in front of
         // `keep`. So after the second install: head=cell_first (the
         // existing one, since !should_remove), head.next=cell_chained.
-        let cell_chained =
-            BaseJitCell::new_for_driver_with_greens(0, &key_chained.values, &key_chained.types);
+        let cell_chained = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_chained.values, &key_chained.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_chained.values, &key_chained.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         ws.install_new_cell(bucket, Some(cell_chained));
 
         let head = ws
@@ -5709,9 +6370,10 @@ mod tests {
 
         // Fast path: lookup_chain_with_key(key_head_after_chain) finds
         // the head's comparekey on first probe.
-        let hit_head = ws
-            .lookup_chain_with_key(&key_head_after_chain)
-            .expect("walker must find chain head via comparekey");
+        let hit_head = GreenRefPin::with(&key_head_after_chain, |__p, __l| {
+            ws.lookup_chain_with_key(__p, __l)
+        })
+        .expect("walker must find chain head via comparekey");
         assert_eq!(&hit_head.greens[..], &key_head_after_chain.values[..]);
     }
 
@@ -5732,7 +6394,7 @@ mod tests {
             key_miss.get_uhash(),
             "fixture is a full-hash collision"
         );
-        ws.ensure_cell_for_key(&key_hit);
+        GreenRefPin::with(&key_hit, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         attach_alive_for_key(
             &mut ws,
             &key_hit,
@@ -5755,8 +6417,7 @@ mod tests {
             "occupant holds an executable token"
         );
 
-        let occupant_key = ws
-            .cell_key_for(&key_hit)
+        let occupant_key = GreenRefPin::with(&key_hit, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("installed occupant has a cell key");
         assert_eq!(
             ws.resolve_cell_key(hash, || key_hit.clone()),
@@ -5796,11 +6457,14 @@ mod tests {
         let parked_bucket = parked.get_uhash();
         let squatter = GreenKey::new(vec![7300, colliding_last_green(&parked, 7300)]);
         assert_eq!(squatter.get_uhash(), parked_bucket);
-        minted_ws.ensure_cell_for_key(&squatter);
+        GreenRefPin::with(&squatter, |__p, __l| {
+            minted_ws.ensure_cell_for_key(__p, __l)
+        });
         let parked_token = token_with_compiled_code();
-        minted_ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
-        let minted = minted_ws
-            .cell_key_for(&parked)
+        GreenRefPin::with(&parked, |__p, __l| {
+            minted_ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&parked_token))
+        });
+        let minted = GreenRefPin::with(&parked, |__p, __l| minted_ws.cell_key_for(__p, __l))
             .expect("colliding squatter forces a minted key");
         assert_ne!(minted, parked_bucket);
         let arriving = gk_with_uhash(minted, 8100);
@@ -5838,7 +6502,7 @@ mod tests {
             key_miss.get_uhash(),
             "fixture is a full-hash collision"
         );
-        ws.ensure_cell_for_key(&key_hit);
+        GreenRefPin::with(&key_hit, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         attach_alive_for_key(
             &mut ws,
             &key_hit,
@@ -5883,7 +6547,7 @@ mod tests {
             key_miss.get_uhash(),
             "fixture is a full-hash collision"
         );
-        ws.ensure_cell_for_key(&key_hit);
+        GreenRefPin::with(&key_hit, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         let cell = ws.lookup_chain(hash).expect("installed");
         assert!(cell.next.borrow().is_none(), "test needs a unique occupant");
         cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
@@ -5906,12 +6570,20 @@ mod tests {
     fn chain_decoy_then_target(target: &GreenKey, decoy: &GreenKey) -> WarmEnterState {
         let mut ws = WarmEnterState::new(100);
         let bucket = target.get_uhash();
-        let decoy_cell = BaseJitCell::new_for_driver_with_greens(0, &decoy.values, &decoy.types);
+        let decoy_cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&decoy.values, &decoy.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&decoy.values, &decoy.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         decoy_cell
             .flags
             .set(decoy_cell.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(decoy_cell));
-        let target_cell = BaseJitCell::new_for_driver_with_greens(0, &target.values, &target.types);
+        let target_cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&target.values, &target.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&target.values, &target.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         target_cell
             .flags
             .set(target_cell.flags.get() | (JcFlags::JC_TRACING));
@@ -5924,7 +6596,7 @@ mod tests {
         let target = GreenKey::new(vec![5, 6]);
         let decoy = GreenKey::new(vec![7, 8]);
         let mut ws = chain_decoy_then_target(&target, &decoy);
-        ws.finish_tracing_for_key(&target);
+        GreenRefPin::with(&target, |__p, __l| ws.finish_tracing_for_key(__p, __l));
         let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
         assert_eq!(&head.greens[..], &decoy.values[..]);
         assert!(
@@ -5956,23 +6628,26 @@ mod tests {
         let mut make_token_calls = 0;
         let token_clone_1 = {
             let token_for_closure = token.clone();
-            ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| {
-                make_token_calls += 1;
-                Ok(token_for_closure)
+            GreenRefPin::with(&key, |__p, __l| {
+                ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| {
+                    make_token_calls += 1;
+                    Ok(token_for_closure)
+                })
             })
             .expect("install ok")
         };
         assert_eq!(make_token_calls, 1, "first call invokes make_token");
         assert!(std::sync::Arc::ptr_eq(&token_clone_1, &token));
 
-        let token_clone_2 = ws
-            .get_assembler_token_with_key::<(), _>(&key, |_memmgr| {
+        let token_clone_2 = GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| {
                 make_token_calls += 1;
                 Ok(std::sync::Arc::new(JitCellToken::new(
                     0xdead_beef_u64 as i64,
                 )))
             })
-            .expect("re-fetch ok");
+        })
+        .expect("re-fetch ok");
         assert_eq!(
             make_token_calls, 1,
             "second call hits the cached token, does not invoke make_token"
@@ -5983,7 +6658,8 @@ mod tests {
         );
 
         // JC_TEMPORARY must be set since tmp=true.
-        let cell = ws.lookup_chain_with_key(&key).expect("cell installed");
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+            .expect("cell installed");
         assert!(
             cell.flags.get().contains(JcFlags::JC_TEMPORARY),
             "tmp token must set JC_TEMPORARY"
@@ -6023,14 +6699,23 @@ mod tests {
         // Put a comparator-less cell at the bucket head first. This is the
         // production migration shape in which a raw-hash precheck and a typed
         // force-start used to inspect different cells for one green key.
-        ws.disable_noninlinable_function_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
         let token = std::sync::Arc::new(JitCellToken::new(0xcafe));
-        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
-            .expect("temporary token install");
-        ws.disable_noninlinable_function_for_key(&key);
-        ws.mark_force_finish_tracing_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token.clone()))
+        })
+        .expect("temporary token install");
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.mark_force_finish_tracing_for_key(__p, __l)
+        });
 
-        let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
+        let typed = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+            .expect("typed callee cell");
         assert_eq!(
             typed.cell_key.get(),
             Some(bucket),
@@ -6041,15 +6726,21 @@ mod tests {
         assert!(typed.flags.get().contains(JcFlags::JC_FORCE_FINISH));
 
         assert!(
-            ws.should_trace_function_entry_for_key(&key),
+            GreenRefPin::with(&key, |__p, __l| ws
+                .should_trace_function_entry_for_key(__p, __l)),
             "JC_TEMPORARY counts normally despite DONT_TRACE_HERE"
         );
         assert!(matches!(
-            ws.force_start_tracing_for_key(&key, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
+                __p,
+                __l,
+                &[]
+            )),
             HotResult::StartTracing
         ));
 
-        let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
+        let typed = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+            .expect("typed callee cell");
         assert!(typed.is_tracing(), "the matching typed cell starts tracing");
         assert!(
             ws.cell_by_key(bucket).expect("the one cell").is_tracing(),
@@ -6079,12 +6770,14 @@ mod tests {
         let token_a = std::sync::Arc::new(JitCellToken::new(0xaaaa));
         let token_b = std::sync::Arc::new(JitCellToken::new(0xbbbb));
 
-        let got_a = ws
-            .get_assembler_token_with_key::<(), _>(&key_a, |_memmgr| Ok(token_a.clone()))
-            .expect("install a");
-        let got_b = ws
-            .get_assembler_token_with_key::<(), _>(&key_b, |_memmgr| Ok(token_b.clone()))
-            .expect("install b");
+        let got_a = GreenRefPin::with(&key_a, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token_a.clone()))
+        })
+        .expect("install a");
+        let got_b = GreenRefPin::with(&key_b, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| Ok(token_b.clone()))
+        })
+        .expect("install b");
 
         assert!(
             std::sync::Arc::ptr_eq(&got_a, &token_a),
@@ -6101,18 +6794,20 @@ mod tests {
 
         // Repeat fetch must not invoke make_token.
         let mut count = 0;
-        let _ = ws
-            .get_assembler_token_with_key::<(), _>(&key_a, |_memmgr| {
+        let _ = GreenRefPin::with(&key_a, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| {
                 count += 1;
                 Ok(std::sync::Arc::new(JitCellToken::new(0xcccc)))
             })
-            .expect("re-fetch a");
-        let _ = ws
-            .get_assembler_token_with_key::<(), _>(&key_b, |_memmgr| {
+        })
+        .expect("re-fetch a");
+        let _ = GreenRefPin::with(&key_b, |__p, __l| {
+            ws.get_assembler_token_with_key::<(), _>(__p, __l, |_memmgr| {
                 count += 1;
                 Ok(std::sync::Arc::new(JitCellToken::new(0xdddd)))
             })
-            .expect("re-fetch b");
+        })
+        .expect("re-fetch b");
         assert_eq!(count, 0, "cached lookups must not invoke make_token");
     }
 
@@ -6124,7 +6819,7 @@ mod tests {
         let key = GreenKey::new(vec![7, 9]);
         assert_eq!(ws.get_stats().num_cells, 0);
         assert!(ws.get_cell(key.get_uhash()).is_none());
-        ws.ensure_cell_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         assert_eq!(ws.occupied_buckets(), 1, "one hash, so one bucket");
         assert_eq!(ws.get_stats().num_cells, 1, "typed install is one cell");
         ws.disable_noninlinable_function(key.get_uhash());
@@ -6133,8 +6828,7 @@ mod tests {
             1,
             "hash write on an existing cell does not chain a sibling",
         );
-        let typed_cell = ws
-            .lookup_chain_with_key(&key)
+        let typed_cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("typed install is one cell");
         assert_eq!(&typed_cell.greens[..], &key.values[..]);
         assert!(
@@ -6144,9 +6838,14 @@ mod tests {
 
         let mut typed = WarmEnterState::new(3);
         let key2 = GreenKey::new(vec![7, 9]);
-        typed.disable_noninlinable_function_for_key(&key2);
+        GreenRefPin::with(&key2, |__p, __l| {
+            typed.disable_noninlinable_function_for_key(__p, __l)
+        });
         assert!(
-            matches!(typed.maybe_compile_with_key(&key2), HotResult::StartTracing),
+            matches!(
+                GreenRefPin::with(&key2, |__p, __l| typed.maybe_compile_with_key(__p, __l)),
+                HotResult::StartTracing
+            ),
             "the typed mark IS consulted, so the dont-trace-here rule applies              at once instead of waiting for the counter",
         );
         assert_eq!(typed.get_stats().num_cells, 1, "no split on the typed path");
@@ -6157,9 +6856,9 @@ mod tests {
     /// `WarmEnterState::new(3)` needs three ticks; the first two answer
     /// `NotHot` from the counter alone and reach no veto position.
     fn tick_to_threshold(ws: &mut WarmEnterState, key: &GreenKey) -> HotResult {
-        ws.maybe_compile_with_key(key);
-        ws.maybe_compile_with_key(key);
-        ws.maybe_compile_with_key(key)
+        GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l));
+        GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l));
+        GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l))
     }
 
     /// `warmstate.py:427-428` — a hook that refuses stops the trace before the
@@ -6183,7 +6882,7 @@ mod tests {
              upstream — the caller keeps interpreting",
         );
         assert!(
-            ws.lookup_chain_with_key(&key)
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .is_none_or(|cell| !cell.is_tracing()),
             "`cell.flags |= JC_TRACING` is below the veto (warmstate.py:441), \
              so a refused start must leave no cell claiming to be tracing",
@@ -6206,7 +6905,10 @@ mod tests {
         ws.set_confirm_enter_jit(Some(refuse));
         let key = GreenKey::new(vec![41, 43]);
 
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
         assert_eq!(FIRST.load(std::sync::atomic::Ordering::Relaxed), 41);
         assert_eq!(SECOND.load(std::sync::atomic::Ordering::Relaxed), 43);
     }
@@ -6222,18 +6924,31 @@ mod tests {
         let key = GreenKey::new(vec![21, 23]);
         let _token = attach_alive_for_key(&mut ws, &key, JitCellToken::new(1));
         assert!(
-            matches!(ws.maybe_compile_with_key(&key), HotResult::RunCompiled),
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+                HotResult::RunCompiled
+            ),
             "fixture: the cell is compiled and entered before any hook exists",
         );
 
         ws.set_confirm_enter_jit(Some(refuse));
         assert!(
-            matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot),
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+                HotResult::NotHot
+            ),
             "a refusal at :501 leaves the caller interpreting rather than \
              entering the machine code",
         );
         assert!(
-            matches!(ws.force_start_tracing_for_key(&key, &[]), HotResult::NotHot),
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
+                    __p,
+                    __l,
+                    &[]
+                )),
+                HotResult::NotHot
+            ),
             "the force-start door must not turn an already-compiled cell into \
              an unchecked compiled entry",
         );
@@ -6284,15 +6999,26 @@ mod tests {
         let key = GreenKey::new(vec![25, 27]);
         let token = token_with_compiled_code();
         let _token = attach_alive_for_key(&mut ws, &key, token);
-        let cell_key = ws.cell_key_for(&key).expect("fixture installed the cell");
+        let cell_key = GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("fixture installed the cell");
 
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, &[]),
+            GreenRefPin::with(&key, |p, l| ws.function_entry_step(
+                cell_key,
+                Some((p, l)),
+                || true,
+                &[]
+            )),
             FunctionEntryStep::RunCompiled(_),
         ));
         ws.set_confirm_enter_jit(Some(refuse));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, &[]),
+            GreenRefPin::with(&key, |p, l| ws.function_entry_step(
+                cell_key,
+                Some((p, l)),
+                || true,
+                &[]
+            )),
             FunctionEntryStep::NotHot,
         ));
     }
@@ -6338,7 +7064,11 @@ mod tests {
         );
 
         assert!(matches!(
-            ws.force_start_tracing_for_key(&key, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
+                __p,
+                __l,
+                &[]
+            )),
             HotResult::StartTracing
         ));
         assert_eq!(
@@ -6434,7 +7164,8 @@ mod tests {
         let mut ws = WarmEnterState::new(3);
         let token = token_with_compiled_code();
         let _token = attach_alive_for_key(&mut ws, &pos, token);
-        let cell_key = ws.cell_key_for(&pos).expect("fixture installed the cell");
+        let cell_key = GreenRefPin::with(&pos, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("fixture installed the cell");
         ws.set_confirm_enter_jit(Some(record));
 
         SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -6475,27 +7206,32 @@ mod tests {
         // Tick 1, 2: not hot. Cell is NOT yet installed — upstream
         // `maybe_compile_and_run` only allocates at `bound_reached`
         // (warmstate.py).
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
         assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_none(),
             "cold ticks must not install a cell (warmstate.py:466-468)",
         );
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
         assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_none(),
             "second cold tick still no cell",
         );
 
         // Tick 3: threshold reached → `start_tracing_cell_for_key`
         // installs a cell carrying `comparekey = key` (typed) and
         // sets the TRACING flags.
-        match ws.maybe_compile_with_key(&key) {
+        match GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)) {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
 
-        let cell = ws
-            .lookup_chain_with_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("cell installed at threshold tick");
         assert_eq!(
             &cell.greens[..],
@@ -6530,7 +7266,11 @@ mod tests {
 
         // TRACING keeps the head non-removable so the second install chains
         // behind it rather than replacing it (counter.py install_new_cell).
-        let head = BaseJitCell::new_for_driver_with_greens(0, &key_head.values, &key_head.types);
+        let head = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_head.values, &key_head.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_head.values, &key_head.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         head.flags.set(head.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(head));
 
@@ -6539,7 +7279,11 @@ mod tests {
         // `alive_loops` is the token's only strong owner once the cell's
         // handle is weak (`warmstate.py:188`, `memmgr.py:9-14`).
         ws.memory_manager.keep_loop_alive(&chained_token);
-        let tail = BaseJitCell::new_for_driver_with_greens(0, &key_tail.values, &key_tail.types);
+        let tail = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_tail.values, &key_tail.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_tail.values, &key_tail.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         tail.flags.set(tail.flags.get() | (JcFlags::JC_TRACING));
         *tail.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&chained_token));
         ws.install_new_cell(bucket, Some(tail));
@@ -6616,13 +7360,21 @@ mod tests {
         // Pre-install A at B's bucket. JC_TRACING keeps A non-removable
         // (counter.py install_new_cell should_remove gate) so the next install
         // chains B behind A.
-        let cell_a = BaseJitCell::new_for_driver_with_greens(0, &key_a.values, &key_a.types);
+        let cell_a = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_a.values, &key_a.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_a.values, &key_a.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell_a.flags.set(cell_a.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(cell_a));
 
         // Install B at the same bucket. install_new_cell folds A in
         // front; resulting chain shape: head=A (TRACING) → tail=B.
-        let cell_b = BaseJitCell::new_for_driver_with_greens(0, &key_b.values, &key_b.types);
+        let cell_b = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_b.values, &key_b.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_b.values, &key_b.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         // A live token keeps B out of the tokenless `cleanup_chain` arm.
         let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&token_b);
@@ -6647,7 +7399,7 @@ mod tests {
         // contaminating B's lookup with A's tracing state. With the fix
         // it walks the chain by comparekey and reads B's clean state
         // (NotHot path: counter ticks under threshold).
-        match ws.maybe_compile_with_key(&key_b) {
+        match GreenRefPin::with(&key_b, |__p, __l| ws.maybe_compile_with_key(__p, __l)) {
             HotResult::AlreadyTracing => panic!(
                 "maybe_compile_with_key(&key_b) aliased to head A's TRACING flag — \
                  chain walk by comparekey is broken (warmstate.py:455-465 parity)"
@@ -6684,7 +7436,7 @@ mod tests {
         assert_eq!(ws.get_stats().num_cells, 0);
         assert!(ws.get_cell(key.get_uhash()).is_none());
 
-        ws.ensure_cell_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         assert_eq!(ws.occupied_buckets(), 1, "one bucket");
         assert_eq!(ws.get_stats().num_cells, 1, "typed form installs one cell");
         ws.disable_noninlinable_function(key.get_uhash());
@@ -6694,7 +7446,7 @@ mod tests {
             "hash form does not install a sibling",
         );
         assert!(
-            ws.lookup_chain_with_key(&key)
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .unwrap()
                 .flags
                 .get()
@@ -6702,12 +7454,14 @@ mod tests {
             "hash form on an installed cell sets DONT_TRACE_HERE",
         );
         assert!(
-            ws.lookup_chain_with_key(&key)
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .unwrap()
                 .comparekey_matches(&key)
         );
         assert_eq!(
-            &ws.lookup_chain_with_key(&key).unwrap().greens[..],
+            &GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+                .unwrap()
+                .greens[..],
             &key.values[..],
         );
     }
@@ -6726,14 +7480,15 @@ mod tests {
         let key = GreenKey::new(vec![300, 400]);
 
         // A hash-form writer squats the bucket with a comparator-less cell.
-        ws.disable_noninlinable_function_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
 
-        ws.mark_as_being_traced_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| ws.mark_as_being_traced_for_key(__p, __l));
 
         // Delegating to the hash form set TRACING on the comparator-less head
         // and left the key still owning no cell at all.
-        let cell = ws
-            .lookup_chain_with_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("the key must own a cell reachable by comparekey");
         assert!(
             cell.flags.get().contains(JcFlags::JC_TRACING),
@@ -6751,8 +7506,10 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![500, 600]);
 
-        ws.disable_noninlinable_function_for_key(&key);
-        ws.ensure_cell_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         assert_eq!(ws.occupied_buckets(), 1, "one bucket");
         assert_eq!(ws.get_stats().num_cells, 1, "one cell");
 
@@ -6763,7 +7520,8 @@ mod tests {
             "the hash key names the cell the typed key stamped",
         );
 
-        let cell = ws.get_cell_for_key(&key).expect("the key owns a cell");
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.get_cell_for_key(__p, __l))
+            .expect("the key owns a cell");
         assert!(
             cell.comparekey_matches(&key),
             "get_cell_for_key must return the cell that matches the key",
@@ -6783,14 +7541,17 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![700, 800]);
 
-        ws.disable_noninlinable_function_for_key(&key);
-        assert!(ws.lookup_chain_with_key(&key).is_some());
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        assert!(GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some());
 
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
 
-        let cell = ws
-            .lookup_chain_with_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("the key must own a cell reachable by comparekey");
         assert!(
             cell.get_procedure_token().is_some(),
@@ -6815,9 +7576,13 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![1100, 1200]);
 
-        ws.disable_noninlinable_function_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
 
         assert!(!ws.bucket_is_chained(key.get_uhash()));
         assert!(
@@ -6825,8 +7590,7 @@ mod tests {
             "the hash key names the cell that holds the token",
         );
 
-        let found = ws
-            .get_procedure_token_for_key(&key)
+        let found = GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l))
             .expect("the typed form must find the token on the key's own cell");
         assert!(
             Arc::ptr_eq(&found, &token),
@@ -6962,14 +7726,20 @@ mod tests {
         // never `should_remove_jitcell`), so `install_new_cell` folds it in
         // front of the second and it ends up HEADING the bucket.
         let head_token = token_with_compiled_code();
-        let head_cell =
-            BaseJitCell::new_for_driver_with_greens(0, &head_key.values, &head_key.types);
+        let head_cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&head_key.values, &head_key.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&head_key.values, &head_key.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         head_cell.set_procedure_token(Arc::clone(&head_token), false);
         ws.install_new_cell(bucket, Some(head_cell));
 
         let chained_token = token_with_compiled_code();
-        let chained_cell =
-            BaseJitCell::new_for_driver_with_greens(0, &chained_key.values, &chained_key.types);
+        let chained_cell = {
+            let _zbh_pin = GreenRefPin::pin_slices(&chained_key.values, &chained_key.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&chained_key.values, &chained_key.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         chained_cell.set_procedure_token(Arc::clone(&chained_token), false);
         ws.install_new_cell(bucket, Some(chained_cell));
 
@@ -6997,9 +7767,10 @@ mod tests {
 
         // What the driver decides on for `chained_key` — the `comparekey`
         // walk, `has_compiled_loop_for_key`.
-        let decided = ws
-            .get_procedure_token_for_key(&chained_key)
-            .expect("the decision resolves the chain and finds the key's cell");
+        let decided = GreenRefPin::with(&chained_key, |__p, __l| {
+            ws.get_procedure_token_for_key(__p, __l)
+        })
+        .expect("the decision resolves the chain and finds the key's cell");
         assert!(
             Arc::ptr_eq(&decided, &chained_token),
             "the decision is about the chained cell's artifact",
@@ -7048,10 +7819,9 @@ mod tests {
         );
         assert_ne!(head, second, "fixture: and they must be different keys");
 
-        ws.ensure_cell_for_key(&head);
-        ws.ensure_cell_for_key(&second);
-        let minted = ws
-            .cell_key_for(&second)
+        GreenRefPin::with(&head, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        GreenRefPin::with(&second, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        let minted = GreenRefPin::with(&second, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("the second key owns a cell");
         assert_ne!(
             minted, hash,
@@ -7062,14 +7832,19 @@ mod tests {
         let token = token_with_compiled_code();
         attach_alive_for_key(&mut ws, &second, token);
         assert!(
-            ws.lookup_chain_with_key(&second)
+            GreenRefPin::with(&second, |__p, __l| ws.lookup_chain_with_key(__p, __l))
                 .is_some_and(|cell| cell.is_compiled()),
             "fixture: the second cell holds a live compiled token",
         );
 
         assert!(
             matches!(
-                ws.maybe_compile_decision_with_key(&second, |cell_key| cell_key == minted, &[]),
+                GreenRefPin::with(&second, |__p, __l| ws.maybe_compile_decision_with_key(
+                    __p,
+                    __l,
+                    |cell_key| cell_key == minted,
+                    &[]
+                )),
                 HotResult::RunCompiled
             ),
             "the second cell's compiled metadata lives under its minted key",
@@ -7107,10 +7882,9 @@ mod tests {
         // `should_remove_jitcell` gate — a cold, tokenless cell is dropped).
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
-        let first_key = ws
-            .cell_key_for(&first)
+        let first_key = GreenRefPin::with(&first, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("the first key owns the cell it just installed");
-        let second_key = ws.ensure_cell_key(&second);
+        let second_key = GreenRefPin::with(&second, |__p, __l| ws.ensure_cell_key(__p, __l));
         assert!(
             ws.bucket_is_chained(bucket),
             "fixture: the two keys must share a bucket",
@@ -7163,10 +7937,9 @@ mod tests {
         // never reaches the branch under test.
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
-        let first_key = ws
-            .cell_key_for(&first)
+        let first_key = GreenRefPin::with(&first, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("the first key owns the cell it just installed");
-        let _second_key = ws.ensure_cell_key(&second);
+        let _second_key = GreenRefPin::with(&second, |__p, __l| ws.ensure_cell_key(__p, __l));
 
         let (count, first_found) = ws.cell_keys_at(bucket);
         assert!(
@@ -7259,7 +8032,9 @@ mod tests {
         let mut tokens = Vec::new();
         for key in keys {
             let token = token_with_compiled_code();
-            ws.attach_procedure_to_interp_for_key(key, Arc::clone(&token));
+            GreenRefPin::with(key, |__p, __l| {
+                ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+            });
             tokens.push(token);
         }
 
@@ -7289,10 +8064,13 @@ mod tests {
                 "so the greens-less reader still answers, and with this \
                  hash's own cell",
             );
-            assert_eq!(ws.cell_key_for(key), Some(hashes[i]));
-            let token = ws
-                .get_procedure_token_for_key(key)
-                .expect("each key kept the token installed for it");
+            assert_eq!(
+                GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l)),
+                Some(hashes[i])
+            );
+            let token =
+                GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l))
+                    .expect("each key kept the token installed for it");
             assert!(
                 Arc::ptr_eq(&token, &tokens[i]),
                 "and it is that key's token, not a chain neighbour's",
@@ -7332,7 +8110,9 @@ mod tests {
         );
 
         let token = token_with_compiled_code();
-        ws.attach_procedure_to_interp_for_key(&resident, Arc::clone(&token));
+        GreenRefPin::with(&resident, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
         assert_eq!(
             chain_len(&ws, stranger_hash),
             1,
@@ -7355,13 +8135,18 @@ mod tests {
             ws.get_procedure_token(stranger_hash).is_none(),
             "so nothing hands back a loop compiled for different greens",
         );
-        assert!(ws.get_procedure_token_for_key(&stranger).is_none());
+        assert!(
+            GreenRefPin::with(&stranger, |__p, __l| ws
+                .get_procedure_token_for_key(__p, __l))
+            .is_none()
+        );
 
         // The resident is untouched by any of this.
         assert_eq!(ws.sole_cell_key(resident_hash), Some(resident_hash));
         assert!(
-            ws.get_procedure_token_for_key(&resident)
-                .is_some_and(|t| Arc::ptr_eq(&t, &token)),
+            GreenRefPin::with(&resident, |__p, __l| ws
+                .get_procedure_token_for_key(__p, __l))
+            .is_some_and(|t| Arc::ptr_eq(&t, &token)),
         );
     }
 
@@ -7399,7 +8184,7 @@ mod tests {
             let token = token_with_compiled_code();
             attach_alive_for_key(&mut ws, key, token);
             keys.push(
-                ws.cell_key_for(key)
+                GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
                     .expect("each key owns the cell just installed for it"),
             );
         }
@@ -7419,7 +8204,10 @@ mod tests {
                 Some(*cell_key),
                 "each minted key must name its own cell",
             );
-            assert_eq!(ws.cell_key_for(key), Some(*cell_key));
+            assert_eq!(
+                GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l)),
+                Some(*cell_key)
+            );
         }
     }
 
@@ -7466,11 +8254,12 @@ mod tests {
         let occupant = GreenKey::new(vec![7300, colliding_last_green(&parked, 7300)]);
         assert_eq!(occupant.get_uhash(), parked_bucket);
         assert_ne!(occupant, parked);
-        ws.ensure_cell_for_key(&occupant);
+        GreenRefPin::with(&occupant, |__p, __l| ws.ensure_cell_for_key(__p, __l));
         let parked_token = token_with_compiled_code();
-        ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
-        let minted = ws
-            .cell_key_for(&parked)
+        GreenRefPin::with(&parked, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&parked_token))
+        });
+        let minted = GreenRefPin::with(&parked, |__p, __l| ws.cell_key_for(__p, __l))
             .expect("the typed writer's cell is reachable by its own key");
         assert_ne!(
             minted, parked_bucket,
@@ -7489,9 +8278,13 @@ mod tests {
         let sibling = gk_with_uhash(minted, 8200);
         assert_ne!(arriving, sibling, "fixture: two different green keys");
         let arriving_token = token_with_compiled_code();
-        ws.attach_procedure_to_interp_for_key(&arriving, Arc::clone(&arriving_token));
+        GreenRefPin::with(&arriving, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&arriving_token))
+        });
         let sibling_token = token_with_compiled_code();
-        ws.attach_procedure_to_interp_for_key(&sibling, Arc::clone(&sibling_token));
+        GreenRefPin::with(&sibling, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&sibling_token))
+        });
         assert!(
             !Arc::ptr_eq(&arriving_token, &sibling_token),
             "fixture: the two cells hold different artifacts",
@@ -7560,8 +8353,8 @@ mod tests {
             "fixture: one bucket, two keys",
         );
 
-        let cell_a = ws.ensure_cell_key(&key_a);
-        let cell_b = ws.ensure_cell_key(&key_b);
+        let cell_a = GreenRefPin::with(&key_a, |__p, __l| ws.ensure_cell_key(__p, __l));
+        let cell_b = GreenRefPin::with(&key_b, |__p, __l| ws.ensure_cell_key(__p, __l));
         assert_ne!(
             cell_a, cell_b,
             "colliding keys must get distinct cell keys, or one of them has \
@@ -7578,7 +8371,9 @@ mod tests {
         let key = GreenKey::new(vec![1300, 1400]);
 
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(__p, __l, Arc::clone(&token))
+        });
 
         assert!(
             !ws.bucket_is_chained(key.get_uhash()),
@@ -7593,7 +8388,7 @@ mod tests {
             "both forms must name the same token when there is nothing to walk",
         );
         assert!(Arc::ptr_eq(
-            &ws.get_procedure_token_for_key(&key)
+            &GreenRefPin::with(&key, |__p, __l| ws.get_procedure_token_for_key(__p, __l))
                 .expect("the typed form finds it too"),
             &token,
         ));
@@ -7604,13 +8399,16 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![900, 1000]);
 
-        ws.disable_noninlinable_function_for_key(&key);
-        assert!(ws.lookup_chain_with_key(&key).is_some());
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
+        assert!(GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some());
 
-        ws.mark_force_finish_tracing_for_key(&key);
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.mark_force_finish_tracing_for_key(__p, __l)
+        });
 
-        let cell = ws
-            .lookup_chain_with_key(&key)
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("the key must own a cell reachable by comparekey");
         assert!(
             cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
@@ -7649,11 +8447,19 @@ mod tests {
 
         // TRACING keeps the tail non-removable so the second install chains
         // it rather than dropping it (counter.py install_new_cell should_remove gate).
-        let tail = BaseJitCell::new_for_driver_with_greens(0, &key_tail.values, &key_tail.types);
+        let tail = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_tail.values, &key_tail.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_tail.values, &key_tail.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         tail.flags.set(tail.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(tail));
 
-        let head = BaseJitCell::new_for_driver_with_greens(0, &key_head.values, &key_head.types);
+        let head = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_head.values, &key_head.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_head.values, &key_head.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         head.flags.set(head.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(head));
 
@@ -7686,18 +8492,22 @@ mod tests {
         let bucket = key_b.get_uhash();
 
         // Head A: must stay non-removable across B's install.
-        let cell_a = BaseJitCell::new_for_driver_with_greens(0, &key_a.values, &key_a.types);
+        let cell_a = {
+            let _zbh_pin = GreenRefPin::pin_slices(&key_a.values, &key_a.types);
+            let mut _zbh_live = GreenKey::from_greenargs(&key_a.values, &key_a.types);
+            BaseJitCell::new_for_driver_with_greens(0, &_zbh_pin, &mut _zbh_live)
+        };
         cell_a.flags.set(cell_a.flags.get() | (JcFlags::JC_TRACING));
         ws.install_new_cell(bucket, Some(cell_a));
 
         // Tick #1 — counter not at threshold yet, NotHot.
-        match ws.maybe_compile_with_key(&key_b) {
+        match GreenRefPin::with(&key_b, |__p, __l| ws.maybe_compile_with_key(__p, __l)) {
             HotResult::NotHot => {}
             _ => panic!("tick #1 expected NotHot"),
         }
         // Tick #2 — counter fires; start_tracing_cell_for_key must
         // chain-walk and flip B's flags, not the head A.
-        match ws.maybe_compile_with_key(&key_b) {
+        match GreenRefPin::with(&key_b, |__p, __l| ws.maybe_compile_with_key(__p, __l)) {
             HotResult::StartTracing => {}
             _ => panic!("tick #2 expected StartTracing"),
         }
@@ -7707,8 +8517,7 @@ mod tests {
         let head = ws.lookup_chain(bucket).expect("head exists");
         assert_eq!(&head.greens[..], &key_a.values[..]);
         assert!(head.is_tracing(), "A's TRACING flag is its own");
-        let b_cell = ws
-            .lookup_chain_with_key(&key_b)
+        let b_cell = GreenRefPin::with(&key_b, |__p, __l| ws.lookup_chain_with_key(__p, __l))
             .expect("typed lookup finds B in the chain");
         assert!(
             b_cell.is_tracing(),
@@ -7729,12 +8538,17 @@ mod tests {
         // `Some` — which is the state `has_seen_a_procedure_token` reads.
         // Nulling the slot would erase the record and make the cell read as
         // "never had a token".
-        ws.attach_procedure_to_interp_for_key(
-            &gk(42),
-            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
-        );
+        GreenRefPin::with(&gk(42), |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(
+                __p,
+                __l,
+                JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+            )
+        });
         let cell = ws
-            .get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
+            .get_cell(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+            )
             .expect("fixture: the cell is still there");
         assert!(
             cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
@@ -7742,12 +8556,17 @@ mod tests {
         );
 
         assert!(matches!(
-            ws.maybe_compile_decision(ws.cell_key_for(&gk(42)).expect("cell"), &gk(42).types),
+            ws.maybe_compile_decision(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell"),
+                &gk(42).types
+            ),
             HotResult::NotHot
         ));
         assert!(
-            ws.get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
-                .is_none(),
+            ws.get_cell(
+                GreenRefPin::with(&gk(42), |__p, __l| ws.cell_key_for(__p, __l)).expect("cell")
+            )
+            .is_none(),
             "the dead cell must be gone: cleanup_chain dropped it",
         );
     }
@@ -7759,21 +8578,26 @@ mod tests {
     fn a_typed_cell_whose_token_died_is_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![7, 11]);
-        ws.attach_procedure_to_interp_for_key(
-            &key,
-            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
-        );
-        let cell = ws
-            .get_cell_for_key(&key)
+        GreenRefPin::with(&key, |__p, __l| {
+            ws.attach_procedure_to_interp_for_key(
+                __p,
+                __l,
+                JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+            )
+        });
+        let cell = GreenRefPin::with(&key, |__p, __l| ws.get_cell_for_key(__p, __l))
             .expect("fixture: the cell is still there");
         assert!(
             cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
             "fixture: the token must be dead, not merely absent",
         );
 
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
         assert!(
-            ws.get_cell_for_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.get_cell_for_key(__p, __l)).is_none(),
             "the dead cell must be gone: cleanup_chain dropped it",
         );
     }
@@ -7786,10 +8610,16 @@ mod tests {
         let key = GreenKey::new(vec![0xAB, 0xCD]);
         let hash = key.get_uhash();
 
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
         assert!(matches!(
-            ws.maybe_compile_with_key(&key),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_with_key(__p, __l)),
             HotResult::StartTracing
         ));
         ws.abort_tracing(hash, false);
@@ -7799,34 +8629,61 @@ mod tests {
         assert!(!ws.tick_empty_chain(hash));
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
+            GreenRefPin::with(&key, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_none(),
             "a tokenless aborted cell is cleanup_chain",
         );
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
+            GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::StartTracing
         ));
 
         let dnt = GreenKey::new(vec![0xD017, 0x11]);
-        ws.disable_noninlinable_function_for_key(&dnt);
+        GreenRefPin::with(&dnt, |__p, __l| {
+            ws.disable_noninlinable_function_for_key(__p, __l)
+        });
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&dnt, |_| true, &[]),
+            GreenRefPin::with(&dnt, |__p, __l| ws.maybe_compile_decision_with_key(
+                __p,
+                __l,
+                |_| true,
+                &[]
+            )),
             HotResult::StartTracing
         ));
         assert!(
-            ws.lookup_chain_with_key(&dnt).is_some(),
+            GreenRefPin::with(&dnt, |__p, __l| ws.lookup_chain_with_key(__p, __l)).is_some(),
             "a never-traced JC_DONT_TRACE_HERE cell is not cleanup_chain",
         );
     }

@@ -3671,12 +3671,17 @@ pub(crate) fn fbw_mark_callee_dont_trace<Sym: WalkSym>(
     // that bit.  Pass the typed key so the verdict lands on the same
     // comparekey-bearing cell consulted at the next call.
     if let Some((driver, _)) = crate::driver::try_driver_pair() {
-        let key =
-            crate::driver::make_green_key_typed(callee_code_key as *const (), 0, is_being_profiled);
+        let pin = majit_metainterp::GreenRefPin::pin_one(callee_code_key);
+        let mut live = crate::driver::make_green_key_typed(
+            pin.live() as usize as *const (),
+            0,
+            is_being_profiled,
+        );
+        pin.reload(&mut live);
         driver
             .meta_interp_mut()
             .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-            .disable_noninlinable_function_for_key(&key);
+            .disable_noninlinable_function_for_key(&pin, &mut live);
     }
 }
 

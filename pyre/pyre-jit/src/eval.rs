@@ -325,6 +325,37 @@ impl Drop for FrameRoot {
     }
 }
 
+/// Pin a portal `W_Code` green across collecting calls.
+///
+/// `hash_whatever(Ref)` / `id_or_identityhash` may allocate a nursery
+/// shadow (`incminimark.py _find_shadow`), and `JitCell(*greenargs)`
+/// retains the pointer. A copied wrapper would go stale
+/// (`gctransform/shadowstack.py`).
+/// Frame-side pin of the portal `W_Code` (`GreenRefPin::pin_one`).
+/// Always pushes, including null (`gctransform/shadowstack.py`).
+struct PortalPycodeRoot {
+    pin: majit_metainterp::GreenRefPin,
+}
+
+impl PortalPycodeRoot {
+    fn pin(pycode: *const ()) -> Self {
+        Self {
+            pin: majit_metainterp::GreenRefPin::pin_one(pycode as usize),
+        }
+    }
+
+    /// Shadow-stack index of the pinned wrapper. The collector rewrites
+    /// that slot in place (`gctransform/shadowstack.py`); a copied
+    /// `W_Code*` argument is not this index.
+    fn save(&self) -> usize {
+        self.pin.save()
+    }
+
+    fn get(&self) -> *const () {
+        self.pin.get() as *const ()
+    }
+}
+
 /// Access to the caller's top shadow-stack frame root for the portal loop.
 struct FrameView;
 
@@ -7066,23 +7097,15 @@ unsafe fn jitcode_constants_root_walker_area(
 /// The `code_ptr -> wrapper` half of the population the comment above
 /// describes, registered separately so a failing root names it.
 ///
-/// Skipped on a minor collection: `w_code_new_owned` places the wrapper with
-/// `malloc_typed_stable`, so it is born in oldgen and never relocates, and its
-/// managed children are reached through the wrapper's own trace and write
-/// barrier.  The walk is not free -- it iterates every
-/// `MetaInterpStaticData.jitcodes` entry and takes the `LIVE_CODE_WRAPPERS`
-/// lock once per entry -- so running it per nursery cycle would cost a whole
-/// registry scan for nothing.
+/// `walk_jitcode_code_roots` forwards nursery-resident `LIVE_CODE_WRAPPERS`
+/// values on every minor and marks jitcode-retained wrappers on majors:
+/// `PyCode` is a nursery `W_Root` (`malloc_typed_managed` /
+/// `malloc_fixedsize`). This is a pyre extra-area for a host table with
+/// no graph edge; `JitCell` / `ConstPtr` GCREFs are walked separately.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    if !pyre_object::tagged_int::CAN_BE_TAGGED
-        && majit_gc::shadow_stack::extra_root_walk_kind()
-            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
-    {
-        return;
-    }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
 }
 
@@ -7246,6 +7269,9 @@ impl PyPyJitDriver {
     /// `loop_header`, which takes only the driver index
     /// (jtransform.py:1723 `handle_jit_marker__can_enter_jit =
     /// handle_jit_marker__loop_header`).
+    ///
+    /// `pycode` is the copied courier from the marker; the frame is the root.
+    /// The live wrapper is `frame.pycode` via [`PortalPycodeRoot`].
     pub fn can_enter_jit(
         &self,
         next_instr: usize,
@@ -7264,7 +7290,18 @@ impl PyPyJitDriver {
         // root below after possible collection points.
         // `interp_jit.py` `PyFrame.jump_absolute` emits the backward-edge
         // marker without consulting a user-bytecode graph.
-        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(pycode) };
+        // Pin before `w_code_get_ptr` / the green hash: `hash_whatever(Ref)`
+        // may allocate a nursery shadow (`incminimark.py _find_shadow`), and
+        // a copied wrapper would go stale (`gctransform/shadowstack.py`).
+        // Address the red frame by slot so this pin can stay on top across
+        // `maybe_compile_and_run`; `FrameView::reload` would otherwise read
+        // the wrapper as a `PyFrame`.
+        let mut frame_root = FrameRoot::new(frame);
+        let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+        let _ = pycode;
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(pycode_root.get() as pyre_object::PyObjectRef)
+        };
         if code_ptr.is_null() {
             return false;
         }
@@ -7278,34 +7315,36 @@ impl PyPyJitDriver {
         let next_instr = skip_caches(code, next_instr);
         let env = PyreEnv;
         let (driver, info) = driver_pair();
-        let loop_pycode = pycode as *const ();
-        let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
-        let green_key = driver.resolve_cell_key(green_key_hash, || {
-            pyre_jit_trace::driver::make_green_key_typed(loop_pycode, next_instr, is_being_profiled)
-        });
+        let green_key_hash = make_green_key(pycode_root.get(), next_instr, is_being_profiled);
+        let green_key = driver.resolve_cell_key_with_greenargs(
+            green_key_hash,
+            &majit_ir::pypyjit_greenargs(next_instr, is_being_profiled, pycode_root.get() as u64),
+            &majit_ir::PYPYJIT_GREEN_TYPES,
+        );
         // Safe to tally here and nowhere upstream of it: `jtransform` rewrites
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
+        // `drive_portal_metatrace` reloads the top slot as the frame.
+        drop(pycode_root);
         if let Some(result) = portal_metatrace_maybe(
             driver,
             info,
             &env,
             green_key,
             next_instr,
-            frame as *mut PyFrame,
+            frame_root.frame() as *mut PyFrame,
         ) {
             set_pending_loop_exit(ec, result);
             portal_diag_bump(1);
             return true;
         }
-        // Admission and portal setup may collect; reload the caller-owned
-        // root before the legacy compile path reads the frame.
-        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+        let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
         let Some(loop_result) = maybe_compile_and_run(
-            unsafe { &mut *f },
+            &mut frame_root,
             green_key,
             next_instr,
+            &pycode_root,
             driver,
             info,
             &env,
@@ -7790,13 +7829,19 @@ pub fn get_jitcell_at_key(
     // warmstate.py `get_jit_cell_at_key(greenkey)` unwraps the
     // greenkey and hands the green *args* to `get_jitcell`. The green args
     // are this function's own parameters, so the typed key costs no plumbing.
-    let key = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode);
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_pycode as usize);
+    let key = green_key_typed_from_pycode(
+        next_instr,
+        is_being_profiled,
+        pin.live() as pyre_object::PyObjectRef,
+    );
     let (driver, _) = driver_pair();
-    w_bool_from(key.is_some_and(|green_key| {
+    w_bool_from(key.is_some_and(|mut live| {
+        pin.reload(&mut live);
         driver
             .meta_interp_mut()
             .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
-            .get_cell_for_key(&green_key)
+            .get_cell_for_key(&pin, &live)
             .is_some()
     }))
 }
@@ -7812,15 +7857,23 @@ pub fn dont_trace_here(
     // warmstate.py `dont_trace_here(*greenargs)` reaches its cell
     // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
     // args are this function's parameters.
-    let Some(green_key) = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode)
-    else {
+    if w_pycode.is_null() {
+        return;
+    }
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_pycode as usize);
+    let Some(mut live) = green_key_typed_from_pycode(
+        next_instr,
+        is_being_profiled,
+        pin.live() as pyre_object::PyObjectRef,
+    ) else {
         return;
     };
+    pin.reload(&mut live);
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
         .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
-        .disable_noninlinable_function_for_key(&green_key);
+        .disable_noninlinable_function_for_key(&pin, &mut live);
 }
 
 /// interp_jit.py:233 — `@dont_look_inside`
@@ -7834,15 +7887,23 @@ pub fn mark_as_being_traced(
     // warmstate.py `mark_as_being_traced(*greenargs)` reaches its cell
     // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
     // args are this function's parameters.
-    let Some(green_key) = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode)
-    else {
+    if w_pycode.is_null() {
+        return;
+    }
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_pycode as usize);
+    let Some(mut live) = green_key_typed_from_pycode(
+        next_instr,
+        is_being_profiled,
+        pin.live() as pyre_object::PyObjectRef,
+    ) else {
         return;
     };
+    pin.reload(&mut live);
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
         .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
-        .mark_as_being_traced_for_key(&green_key);
+        .mark_as_being_traced_for_key(&pin, &mut live);
 }
 
 /// interp_jit.py:245 — `@dont_look_inside`
@@ -8392,21 +8453,33 @@ fn drive_portal_metatrace(
     let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
         (*canonical).clone(),
     ));
-    let live_frame = FrameView::reload(frame);
-    let profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
-    let pycode = unsafe { &*live_frame }.pycode as usize as i64;
+    // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
+    // in its own slot before `PortalPycodeRoot` pushes `W_Code` above it,
+    // and read the frame through that slot (`can_enter_jit`).
+    let mut frame_root = FrameRoot::new(unsafe { &mut *frame });
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    let profiled = i64::from(frame_root.frame().get_is_being_profiled());
     let ec = pyre_interpreter::call::getexecutioncontext();
-    let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
     // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
-    driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
+    driver.force_start_tracing(
+        green_key,
+        None,
+        pycode_root.save(),
+        loop_header_pc,
+        &mut jit_state,
+        env,
+    );
     if !driver.is_tracing() {
         return None;
     }
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
     let meta = driver.meta_interp_mut();
+    let live_frame = frame_root.frame() as *mut PyFrame;
+    let pycode = pycode_root.get() as i64;
     let args = {
         let ctx = meta.trace_ctx().unwrap();
         [
@@ -8482,7 +8555,7 @@ fn drive_portal_metatrace(
             // The blackhole already performed the remaining frame mutations;
             // only the carried green next_instr becomes the native loop PC.
             let resumed = args.red_ref[0] as *mut PyFrame;
-            assert_eq!(resumed, FrameView::reload(frame));
+            assert_eq!(resumed, frame_root.frame() as *mut PyFrame);
             if let Some(pc) = green_pc_position(args.green_int[0]) {
                 unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
             }
@@ -8578,7 +8651,8 @@ fn unpack_merge_point_jit(
     // singleton, so its address hashes to one stable green key per iterator type
     // (`pc = 0`, novable — no bytecode offset). The jd1 driver has no
     // `is_being_profiled` green, so its pypyjit-shaped key uses false.
-    let green_key = make_green_key(greenkey as *const (), 0, false);
+    let pin = majit_metainterp::GreenRefPin::pin_one(greenkey as usize);
+    let green_key = make_green_key(pin.get() as *const (), 0, false);
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `unpackiterable_driver`'s `jitdriver_sd.warmstate`: `lookup_chain`,
     // then `jitcounter.tick`; `bound_reached` / `EnterJitAssembler` are
@@ -8593,9 +8667,10 @@ fn unpack_merge_point_jit(
                 pyre_jit_trace::unpack_state::jd1_root_base(),
             ),
         );
+        let green_key = make_green_key(pin.get() as *const (), 0, false);
         driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
+            .maybe_compile_and_run_step_on_driver(jd_no, green_key, pin.save(), 0, &reds)
             .0
     };
     if !matches!(
@@ -8644,9 +8719,9 @@ fn genentry_merge_point_jit(
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
-    let pycode = roots.get(base);
-    let w_gen = roots.get(base + 1);
-    let w_arg = roots.get(base + 2);
+    // `GreenRefPin` walks `majit_gc::shadow_stack`, which is not `gc_roots`
+    // (pyre extra-area). Pin the live wrapper from the gc_roots slot.
+    let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) else {
@@ -8660,17 +8735,36 @@ fn genentry_merge_point_jit(
     // pycode)` cell is another driver (`isinstance` /
     // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
     // distinguishes yields.
-    let green_key = genentry_resolved_cell_key(pycode);
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A live session on another key or driver may still
-    // `bound_reached` a nested MetaInterp.
-    {
-        let (driver, _) = driver_pair();
-        let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
-        if driver.cell_is_tracing_on_driver(jd_no, green_key) {
-            return None;
+    let pycode = pin.get() as pyre_object::PyObjectRef;
+    let green_key = match genentry_resolved_cell_key(pycode) {
+        Some(key) => {
+            // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING`
+            // is read only when a cell was found.
+            let (driver, _) = driver_pair();
+            let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+            if driver.cell_is_tracing_on_driver(jd_no, key) {
+                return None;
+            }
+            key
         }
-    }
+        None => {
+            // warmstate.py maybe_compile_and_run: a miss ticks
+            // `JitCell.get_uhash(*greenargs)` and does not create a cell.
+            // A tokenless cell (`BaseJitCell::new_for_driver_with_greens`,
+            // flags empty) would take `cleanup_chain` and never go hot.
+            let mut live = pyre_jit_trace::genentry_state::genentry_green_key(
+                pin.get() as pyre_object::PyObjectRef
+            );
+            let hash = live.get_uhash();
+            pin.reload(&mut live);
+            hash
+        }
+    };
+    // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
+    // `_find_shadow`). Re-read every pycode/w_gen/w_arg from the pins.
+    let _pycode = pin.get() as pyre_object::PyObjectRef;
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
     // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
@@ -8685,7 +8779,7 @@ fn genentry_merge_point_jit(
         );
         driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
+            .maybe_compile_and_run_step_on_driver(jd_no, green_key, pin.save(), 0, &reds)
             .0
     };
     if !matches!(
@@ -8695,6 +8789,9 @@ fn genentry_merge_point_jit(
     ) {
         return None;
     }
+    let pycode = pin.get() as pyre_object::PyObjectRef;
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[generatorentry] {}",
@@ -8709,8 +8806,9 @@ fn genentry_merge_point_jit(
 }
 
 /// Cell key for `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. Resolved on that
-/// driver's `WarmEnterState` (`warmstate.py JitCell`).
-fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
+/// driver's `WarmEnterState` (`warmstate.py JitCell.get_jitcell`,
+/// `create=False`). `None` is a miss.
+fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> Option<u64> {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
         &driver
@@ -8786,31 +8884,39 @@ fn drive_generatorentry_trace(
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
-    let pycode = roots.get(base);
-    let w_gen = roots.get(base + 1);
-    let w_arg = roots.get(base + 2);
-
-    let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
-    let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
     let action = {
         let meta = driver.meta_interp_mut();
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
         descriptor.index = Some(jd_no);
         // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
-        // (`pycode`); `(0, 0)` is the no-raw-pair sentinel.
-        // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
-        // so that pair never rebuilds the pypyjit 3-tuple.
+        // (`pycode`). `GreenRefPin` walks `majit_gc::shadow_stack`; pin
+        // the live wrapper from the gc_roots slot
+        // (`gctransform/shadowstack.py`).
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
+        // `publish_kind0_descrs` / `install_build_time_liveness` can collect.
+        // Re-read the portal greens and reds from the traced owner.
+        let pycode = roots.get(base);
+        let w_gen = roots.get(base + 1);
+        let w_arg = roots.get(base + 2);
+        let pin = majit_metainterp::GreenRefPin::pin_one(pycode as usize);
+        let pycode = pin.get() as pyre_object::PyObjectRef;
+        let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
+        let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
         meta.force_start_tracing(
             green_key,
-            (0, 0),
+            pin.save(),
+            0,
             Some((&gk.values, &gk.types)),
             Some(std::sync::Arc::new(descriptor)),
             &live_values,
         )
     };
+    let pycode = roots.get(base);
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
+    let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
     if dbg {
         let name = match action {
             BackEdgeAction::Interpret => "Interpret",
@@ -9524,17 +9630,15 @@ fn drive_unpack_iterable_trace(
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     descriptor.index = Some(jd_no);
 
-    // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
-    // zero `code_ptr` is the sentinel for "no raw pair available". Passing
-    // `(0, 0)` would skip `with_typed_decision_key`'s rebinding; this pair
-    // reconstructs the pypyjit greens so the cell is `JitCell(*greenargs)`
-    // (`warmstate.py bound_reached`). `green_key` is `make_green_key` at
-    // `(greenkey_raw, 0)` (above), so the pair reconstructs the identical hash.
+    // `GreenRefPin` walks `majit_gc::shadow_stack`; pin the live wrapper
+    // from the gc_roots slot (`gctransform/shadowstack.py`).
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
+    let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
     let action = driver.meta_interp_mut().force_start_tracing(
         green_key,
-        (greenkey_raw as usize, 0),
+        pin.save(),
+        0,
         None,
         Some(std::sync::Arc::new(descriptor)),
         &live_values,
@@ -10126,6 +10230,14 @@ fn cached_unsupported_jit_shape(
             return decode_stored_jit_shape(raw);
         }
     }
+    // Miss path may consult `graph_jit_shapes` / scan the graph. Root the
+    // wrapper across that window and store the latch on the forwarded
+    // address (`gctransform/shadowstack.py`).
+    let _shape_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !w_code.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+    }
     let key = code as *const _ as usize;
     // Assembler overflow is recorded on the writer after a drain fails.
     // Reading it must not construct the writer: `CodeWriter::new` decodes
@@ -10136,6 +10248,11 @@ fn cached_unsupported_jit_shape(
         decode_graph_jit_shape(raw)
     } else {
         unsupported_jit_shape_uncached(code).0
+    };
+    let w_code = if w_code.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(code_slot)
     };
     if !w_code.is_null() {
         let encoded = JIT_SHAPE_STORED_BIAS + shape as u8;
@@ -10676,9 +10793,12 @@ fn eval_with_jit_inner(
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
         return frame_root.frame().execute_frame_plain(resume);
     }
-    let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    let jit_shape = cached_unsupported_jit_shape(w_code, code);
+    // Re-read `frame.pycode` at the gate: `cached_unsupported_jit_shape` may
+    // fill `jit_shape` / consult `graph_jit_shapes`, and a copied `W_Code`
+    // would go stale (`gctransform/shadowstack.py`).
+    let jit_shape =
+        cached_unsupported_jit_shape(frame_root.frame().pycode as pyre_object::PyObjectRef, code);
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
     // predicate that fired, not just the shape — rather than leaving a silent
@@ -10719,7 +10839,7 @@ fn eval_with_jit_inner(
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            tick_function_entry_from_portal(frame_root.frame());
+            tick_function_entry_from_portal(&mut frame_root);
             pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
             return frame_root.frame().execute_frame_plain(resume);
         }
@@ -12440,14 +12560,26 @@ fn jit_is_off() -> bool {
 /// `warmstate.py` `maybe_compile_and_run` looks the cell up and ticks.
 /// The shape walk and `liveness_for` are not on that path. Run them only
 /// once the counter has reached `bound_reached`.
-fn backedge_frame_may_trace(frame: &PyFrame, loop_header_pc: usize) -> bool {
-    let w_code = frame.pycode as pyre_object::PyObjectRef;
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+fn backedge_frame_may_trace(
+    frame: &PyFrame,
+    loop_header_pc: usize,
+    live_w_code: *const (),
+) -> bool {
+    let w_code = if live_w_code.is_null() {
+        frame.pycode
+    } else {
+        live_w_code
+    } as pyre_object::PyObjectRef;
+    let inner = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+    if inner.is_null() {
+        return false;
+    }
+    let code = unsafe { &*inner.cast::<pyre_interpreter::CodeObject>() };
     if cached_unsupported_jit_shape(w_code, code) != UnsupportedJitShape::None {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return false;
     }
-    backedge_vsd_matches(frame, loop_header_pc)
+    backedge_vsd_matches(frame, loop_header_pc, live_w_code)
 }
 
 /// A compiled-loop exit can rewind `next_instr` while the vable stack depth
@@ -12455,9 +12587,14 @@ fn backedge_frame_may_trace(frame: &PyFrame, loop_header_pc: usize) -> bool {
 /// `EnterJitAssembler` with the red frame as it stands; this check is the
 /// pyre stand-in for `MIFrame.pc` plus `ResumeDataDirectReader`, which keep
 /// one depth per bytecode offset. Valid loops pass.
-fn backedge_vsd_matches(frame: &PyFrame, loop_header_pc: usize) -> bool {
+fn backedge_vsd_matches(frame: &PyFrame, loop_header_pc: usize, live_w_code: *const ()) -> bool {
+    let w_code = if live_w_code.is_null() {
+        frame.pycode
+    } else {
+        live_w_code
+    };
     if let Some(expected_vsd) =
-        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
+        pyre_jit_trace::state::depth_based_vsd_for_wcode(w_code as usize, loop_header_pc)
     {
         if frame.valuestackdepth != expected_vsd {
             return false;
@@ -12528,9 +12665,10 @@ fn pypyjit_confirm_reds(driver: &JitDriver<PyreJitState>, frame: &mut PyFrame) -
 #[cold]
 #[majit_macros::dont_look_inside]
 fn maybe_compile_and_run(
-    frame: &mut PyFrame,
+    frame_root: &mut FrameRoot,
     green_key: u64,
     loop_header_pc: usize,
+    pycode_root: &PortalPycodeRoot,
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
@@ -12541,6 +12679,9 @@ fn maybe_compile_and_run(
     if jit_is_off() {
         return None;
     }
+    // The caller's `FrameRoot` is the red-frame pin; `pycode_root` is the
+    // portal wrapper. Do not nest another `FrameRoot` on top
+    // (`gctransform/shadowstack.py`).
 
     // warmstate.py: `cell.flags & JC_TRACING` → skip this key only.
     // A live session on another key or driver must not suppress enter
@@ -12563,7 +12704,7 @@ fn maybe_compile_and_run(
     // a cell the warmstate dropped from a token something revoked.
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
-        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
         let runnable = driver.has_runnable_compiled_loop(green_key);
         let last = driver.last_compiled_key();
         let ws = driver
@@ -12609,27 +12750,40 @@ fn maybe_compile_and_run(
     // The frame-shape walk and `liveness_for` are not on that path: they
     // run only once the counter has reached `bound_reached`, or when a
     // compiled token is about to be entered.
-    let reds = pypyjit_confirm_reds(driver, frame);
-    match driver.maybe_compile_and_run_step(
-        green_key,
-        (frame.pycode as usize, loop_header_pc),
-        &reds,
-    ) {
+    let reds = pypyjit_confirm_reds(driver, frame_root.frame());
+    let step =
+        driver.maybe_compile_and_run_step(green_key, pycode_root.save(), loop_header_pc, &reds);
+    match step {
         (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
-            if !backedge_frame_may_trace(frame, loop_header_pc) {
+            if !backedge_frame_may_trace(frame_root.frame(), loop_header_pc, pycode_root.get()) {
                 return None;
             }
             // `warmstate.py` `maybe_compile_and_run` has already tested
             // this cell's `JC_TRACING`. `is_tracing_key` also matches
             // `inline_frames`, which is `_opimpl_recursive_call`'s unroll
             // test, not that flag.
-            bound_reached(frame, green_key, loop_header_pc, driver, info, env)
+            bound_reached(
+                frame_root.frame(),
+                green_key,
+                loop_header_pc,
+                driver,
+                info,
+                env,
+                pycode_root,
+            )
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
-            if !backedge_vsd_matches(frame, loop_header_pc) {
+            if !backedge_vsd_matches(frame_root.frame(), loop_header_pc, pycode_root.get()) {
                 return None;
             }
-            execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
+            execute_assembler(
+                frame_root.frame(),
+                compiled_key,
+                loop_header_pc,
+                driver,
+                info,
+                env,
+            )
         }
         (majit_metainterp::warmstate::HotResult::NotHot, _) => None,
         (majit_metainterp::warmstate::HotResult::AlreadyTracing, _) => None,
@@ -13685,14 +13839,23 @@ fn compile_and_run_once(
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
+    pycode_root: &PortalPycodeRoot,
 ) -> Option<LoopResult> {
+    // The caller's hashed slot stays live across NestedTraceGuard /
+    // descr-pool install (`gctransform/shadowstack.py`). Re-pushing a
+    // copied wrapper would store a pre-move address.
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let mut frame_root = FrameRoot::new(frame);
     let mut driver = NestedTraceGuard::enter(driver);
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    let inner =
+        unsafe { pyre_interpreter::w_code_get_ptr(pycode_root.get() as pyre_object::PyObjectRef) };
+    if inner.is_null() {
+        return None;
+    }
+    let code = unsafe { &*inner.cast::<pyre_interpreter::CodeObject>() };
     majit_metainterp::mc_diag_bump(match start {
         CompileOnceStart::BackEdge => 18,
         CompileOnceStart::FunctionEntry => 19,
@@ -13707,6 +13870,13 @@ fn compile_and_run_once(
     if portal_interpret_enabled() {
         pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     }
+    // The compile drain recovers the wrapper from `LIVE_CODE_WRAPPERS`.
+    // Publish the walked pin after the descr-pool install (it can allocate),
+    // not a field load of `frame.pycode` (`gctransform/shadowstack.py`).
+    pyre_interpreter::pycode::register_live_code_wrapper(
+        inner as *const (),
+        pycode_root.get() as pyre_object::PyObjectRef,
+    );
     // warmspot/codewriter ordering: the portal and all drained JitCodes are
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
@@ -13715,7 +13885,7 @@ fn compile_and_run_once(
         majit_metainterp::mc_diag_bump(20);
         return None;
     }
-    let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
+    let pjc = pyre_jit_trace::state::pyjitcode_for_code(pycode_root.get())
         .expect("registered portal must have a drained PyJitCode");
     debug_assert_eq!(
         skip_caches(code, target_pc),
@@ -13758,10 +13928,23 @@ fn compile_and_run_once(
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     match start {
         CompileOnceStart::BackEdge => {
-            driver.bound_reached(green_key, target_pc, &mut jit_state, env);
+            driver.bound_reached(
+                green_key,
+                pycode_root.save(),
+                target_pc,
+                &mut jit_state,
+                env,
+            );
         }
         CompileOnceStart::FunctionEntry => {
-            driver.force_start_tracing(green_key, None, target_pc, &mut jit_state, env);
+            driver.force_start_tracing(
+                green_key,
+                None,
+                pycode_root.save(),
+                target_pc,
+                &mut jit_state,
+                env,
+            );
         }
     }
     if !driver.is_tracing() {
@@ -14064,6 +14247,7 @@ fn bound_reached(
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
+    pycode_root: &PortalPycodeRoot,
 ) -> Option<LoopResult> {
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame).len().min(5))
@@ -14102,6 +14286,7 @@ fn bound_reached(
         driver,
         info,
         env,
+        pycode_root,
     )
 }
 
@@ -14129,30 +14314,35 @@ fn dump_bytecode_enabled() -> bool {
 /// dropping the tick left function-entry loops one `function_threshold`
 /// short of `bound_reached` after the parent inlined them.
 #[majit_macros::dont_look_inside]
-fn tick_function_entry_from_portal(frame: &mut PyFrame) {
+fn tick_function_entry_from_portal(frame_root: &mut FrameRoot) {
     if jit_is_off() {
         return;
     }
-    let w_code = frame.pycode as pyre_object::PyObjectRef;
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if cached_unsupported_jit_shape(w_code, code) != UnsupportedJitShape::None {
+    // The caller's `FrameRoot` is the red-frame pin. Do not nest another
+    // (`gctransform/shadowstack.py`). Shape fill may collect; reload
+    // `pycode` from that slot after.
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    if cached_unsupported_jit_shape(frame_root.frame().pycode as pyre_object::PyObjectRef, code)
+        != UnsupportedJitShape::None
+    {
         return;
     }
-    let code_ptr = frame.pycode;
-    let entry_pc = skip_caches(code, frame.next_instr());
-    let is_being_profiled = frame.get_is_being_profiled();
-    let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
+    let entry_pc = skip_caches(code, frame_root.frame().next_instr());
+    let is_being_profiled = frame_root.frame().get_is_being_profiled();
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    let green_key_hash = make_green_key(pycode_root.get(), entry_pc, is_being_profiled);
     let pair = driver_pair();
     let green_key = pair.0.resolve_cell_key_with_greenargs(
         green_key_hash,
-        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, code_ptr as u64),
+        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
-    let reds = pypyjit_confirm_reds(&pair.0, frame);
+    let reds = pypyjit_confirm_reds(&pair.0, frame_root.frame());
     let _ = pair.0.function_entry_step(
         green_key,
         green_key_hash,
-        (code_ptr as usize, entry_pc),
+        pycode_root.save(),
+        entry_pc,
         &reds,
     );
 }
@@ -14188,7 +14378,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if *NO_JIT_FN.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
-    let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     // The other caller, `portal_runner_dispatch`, does not imply a frame that
     // already passed `eval_with_jit_inner`'s classification: the portal entry
@@ -14198,8 +14387,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // the counter tick below starts a trace for such a frame.  Consult the
     // frame-shape gate here as well.  The classification is cached on the
     // `PyCode` wrapper, so this is a field load, not the whole-frame scan
-    // that charged every Python call.
-    if cached_unsupported_jit_shape(w_code, code) != UnsupportedJitShape::None {
+    // that charged every Python call. Re-read `frame.pycode` at the gate
+    // (`gctransform/shadowstack.py`).
+    if cached_unsupported_jit_shape(frame_root.frame().pycode as pyre_object::PyObjectRef, code)
+        != UnsupportedJitShape::None
+    {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
@@ -14219,7 +14411,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let code_ptr = frame_root.frame().pycode;
     let entry_pc = skip_caches(code, frame_root.frame().next_instr());
     if entry_pc != frame_root.frame().next_instr() {
         frame_root.frame().set_last_instr_from_next_instr(entry_pc);
@@ -14229,7 +14420,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point` and
     // `get_portal_runner`. The cell owns both counting and compiled entry.
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
-    let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
+    // Re-read `frame.pycode` after the shape fill and pin it across the
+    // green hash / cell retain (`gctransform/shadowstack.py`).
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    let green_key_hash = make_green_key(pycode_root.get(), entry_pc, is_being_profiled);
     let pair = driver_pair();
 
     // `maybe_compile_and_run` matches the greens with `JitCell.comparekey`
@@ -14242,12 +14436,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `RunCompiled` and refused. Neither side moved, the compiled code was
     // never entered, and every call paid a full trace-start attempt.
     //
-    // `code_ptr` is the PyCode object `frame.pycode` holds, which is the green
-    // `interp_jit.PyPyJitDriver` carries, so the greens compared here name the
-    // cell `green_key_hash` hashes.
+    // `pycode_root` is the PyCode object `frame.pycode` holds, which is the
+    // green `interp_jit.PyPyJitDriver` carries, so the greens compared here
+    // name the cell `green_key_hash` hashes.
     let green_key = pair.0.resolve_cell_key_with_greenargs(
         green_key_hash,
-        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, code_ptr as u64),
+        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
 
@@ -14271,9 +14465,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let step = pair.0.function_entry_step(
         green_key,
         green_key_hash,
-        (code_ptr as usize, entry_pc),
+        pycode_root.save(),
+        entry_pc,
         &reds,
     );
+    // Keep `pycode_root` across `decay_counters` / `compile_and_run_once`:
+    // FrameRoot addresses the frame by slot, so this pin can stay on top
+    // (`gctransform/shadowstack.py`).
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
@@ -14499,6 +14697,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         driver,
         info,
         &env,
+        &pycode_root,
     ) {
         Some(LoopResult::Done(result)) => Some(result),
         // warmspot.py:998-1005: a walk that ended in an uncaught raise, or a
@@ -18141,13 +18340,18 @@ mod tests {
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(driver.meta_interp_mut());
 
-        let outer_action = driver.meta_interp_mut().force_start_tracing(
-            outer,
-            (0, 0),
-            Some((&outer_key.values, &outer_key.types)),
-            None,
-            &[],
-        );
+        let outer_action = {
+            let _zbh_pin =
+                majit_metainterp::GreenRefPin::pin_slices(&outer_key.values, &outer_key.types);
+            driver.meta_interp_mut().force_start_tracing(
+                outer,
+                _zbh_pin.save(),
+                0,
+                Some((&outer_key.values, &outer_key.types)),
+                None,
+                &[],
+            )
+        };
         assert!(
             matches!(outer_action, BackEdgeAction::StartedTracing),
             "outer door start did not begin tracing"
@@ -18168,13 +18372,18 @@ mod tests {
                 driver.cell_is_tracing(outer),
                 "park keeps the outer cell JC_TRACING"
             );
-            let inner_action = driver.meta_interp_mut().force_start_tracing(
-                inner,
-                (0, 0),
-                Some((&inner_key.values, &inner_key.types)),
-                None,
-                &[],
-            );
+            let inner_action = {
+                let _zbh_pin =
+                    majit_metainterp::GreenRefPin::pin_slices(&inner_key.values, &inner_key.types);
+                driver.meta_interp_mut().force_start_tracing(
+                    inner,
+                    _zbh_pin.save(),
+                    0,
+                    Some((&inner_key.values, &inner_key.types)),
+                    None,
+                    &[],
+                )
+            };
             assert!(
                 matches!(inner_action, BackEdgeAction::StartedTracing),
                 "nested door start did not begin tracing"
@@ -18269,13 +18478,18 @@ mod tests {
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(driver.meta_interp_mut());
 
-        let outer_action = driver.meta_interp_mut().force_start_tracing(
-            outer,
-            (0, 0),
-            Some((&outer_key.values, &outer_key.types)),
-            None,
-            &[],
-        );
+        let outer_action = {
+            let _zbh_pin =
+                majit_metainterp::GreenRefPin::pin_slices(&outer_key.values, &outer_key.types);
+            driver.meta_interp_mut().force_start_tracing(
+                outer,
+                _zbh_pin.save(),
+                0,
+                Some((&outer_key.values, &outer_key.types)),
+                None,
+                &[],
+            )
+        };
         assert!(
             matches!(outer_action, BackEdgeAction::StartedTracing),
             "outer door start did not begin tracing"

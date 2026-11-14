@@ -685,13 +685,17 @@ fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
     let mut state = DispatchTestState { a: 0 };
     first.meta_interp_mut().finish_setup_descrs_for_jitdrivers();
     let key = gk(0);
-    first.force_start_tracing(
-        key.get_uhash(),
-        Some((&key.values, &key.types)),
-        0,
-        &mut state,
-        &program[..],
-    );
+    {
+        let _zbh_pin = majit_metainterp::GreenRefPin::pin_slices(&key.values, &key.types);
+        first.force_start_tracing(
+            key.get_uhash(),
+            Some((&key.values, &key.types)),
+            _zbh_pin.save(),
+            0,
+            &mut state,
+            &program[..],
+        )
+    };
     assert_eq!(
         majit_metainterp::current_state_field_fvc_epoch(),
         first.state_field_fvc_epoch(),

@@ -7161,6 +7161,12 @@ pub fn load_name_from_code(code: &CodeObject, idx: usize) -> Option<&str> {
     }
 }
 
+/// Constants of the immortal inner `CodeObject` box.
+///
+/// `code` is that host allocation, never a `W_Code` wrapper. Callers
+/// obtain it from a live wrapper's `code_ptr` (`frame.pycode`,
+/// `Function.code`, `live_code_wrapper`) after any collecting call, then
+/// unwrap immediately (`gctransform/shadowstack.py`).
 pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {
     unsafe {
         std::slice::from_raw_parts(
