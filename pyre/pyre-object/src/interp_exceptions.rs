@@ -642,15 +642,22 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 5] = [
     EXC_W_DICT_OFFSET,
 ];
 
-/// Slim user layout: the base pointers plus mapdict `storage`.
-/// `map` is a GC [`crate::mapdict::MapRef`] walked by
-/// `instance_walk_boxed_storage`, not this offset table.
-pub const W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS: [usize; 6] = [
+/// Slim user layout: the base pointers plus mapdict `map` / `storage`.
+///
+/// A managed instance is traced by `base_exception_user_custom_trace` →
+/// `instance_walk_boxed_storage`. The prebuilt MemoryError singleton is
+/// `malloc_typed`, so that hook never runs: the immortal-exception root
+/// walker (`eval.rs` `walk_raw_exception_roots`) uses this table. `map`
+/// is the class terminator (`_mapdict_init_empty(w_subtype.terminator)`);
+/// after #2567 the node is a GC object and this slot is what keeps it
+/// alive and forwarded.
+pub const W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS: [usize; 7] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET,
     EXC_W_DICT_OFFSET,
+    EXC_USER_MAP_OFFSET,
     EXC_USER_STORAGE_OFFSET,
 ];
 
@@ -1017,8 +1024,8 @@ pub unsafe fn exc_obj_is_user_layout(obj: PyObjectRef) -> bool {
 
 /// GC pointer slots of an unmanaged exception, selected by `ob_type`.
 ///
-/// User layouts include mapdict `storage`. Exact group instances keep a slim
-/// `kind` on the extended struct and stay on the kind table.
+/// User layouts include mapdict `map` and `storage`. Exact group instances
+/// keep a slim `kind` on the extended struct and stay on the kind table.
 ///
 /// # Safety
 /// `obj` must be a live exception (`is_exception`).
@@ -2716,20 +2723,40 @@ pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyO
 /// `compile.py` `memory_error = MemoryError()` parity — module-level
 /// singleton instance the JIT raises through
 /// `PropagateExceptionDescr.handle_fail` when a malloc helper returns
-/// NULL.  RPython allocates the singleton at translation time; pyre
-/// materializes it when `MemoryError` is registered
-/// (`install_default_builtins`), so a MiniMark max-heap breach does not
+/// NULL.  RPython allocates the singleton at translation time
+/// (`exceptiondata.py get_standard_ll_exc_instance` /
+/// `rclass.py get_reusable_prebuilt_instance`; `compile.py` `memory_error`
+/// likewise). pyre keeps `OnceLock::get_or_init` as the accessor;
+/// `install_default_builtins` calls this after `MemoryError` is
+/// registered so the init closure is unreachable at OOM: the type and
+/// its terminator exist, and a MiniMark max-heap breach does not
 /// `malloc_typed` the instance.
+///
+/// Low-level only (`compile.py memory_error` /
+/// `exceptiondata.py get_standard_ll_exc_instance`). The Python carrier is
+/// a fresh `OperationError(w_MemoryError, w_None)`
+/// (`pyopcode.py handle_asynchronous_error`).
 ///
 /// Stored as `usize` because `PyObjectRef` is `*mut PyObject`, which is
 /// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape
 /// hatch.  The `W_BaseException` lives forever: it is cached in the
 /// GC-invisible `OnceLock` and baked into JIT constant pools, so it must
 /// stay immortal (`w_exception_new_empty_immortal`), never GC-swept.
+/// Its map is the class terminator (`mapdict.py user_setup` /
+/// `_mapdict_init_empty(w_subtype.terminator)`); the unmanaged offset
+/// table names that slot so a later collection forwards it.
 pub fn memory_error_singleton() -> PyObjectRef {
     *MEMORY_ERROR_SINGLETON
         .get_or_init(|| w_exception_new_empty_immortal(ExcKind::MemoryError) as usize)
         as PyObjectRef
+}
+
+/// The prebuilt singleton when startup has already materialized it.
+///
+/// Reads the cell only (`OnceLock::get`); does not allocate. None means
+/// the accessor's init closure has not run yet.
+pub fn memory_error_singleton_prebuilt() -> Option<PyObjectRef> {
+    MEMORY_ERROR_SINGLETON.get().map(|&raw| raw as PyObjectRef)
 }
 
 static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -3295,12 +3322,26 @@ mod tests {
         let a = memory_error_singleton();
         let b = memory_error_singleton();
         assert_eq!(a as usize, b as usize, "singleton must be stable");
+        assert_eq!(
+            memory_error_singleton_prebuilt().map(|p| p as usize),
+            Some(a as usize),
+            "get_or_init leaves the cell occupied; prebuilt reads it without allocating"
+        );
         unsafe {
             assert!(is_exception(a));
             assert_eq!(w_exception_get_kind(a), ExcKind::MemoryError);
             // Empty message → no constructor args (`args == ()`).
             assert_eq!(crate::tupleobject::w_tuple_len(w_exception_get_args(a)), 0);
         }
+    }
+
+    #[test]
+    fn user_unmanaged_offsets_include_the_map_slot() {
+        assert!(
+            W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS.contains(&EXC_USER_MAP_OFFSET),
+            "immortal USER MemoryError map is the class terminator; the unmanaged walker must forward it"
+        );
+        assert!(W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS.contains(&EXC_USER_STORAGE_OFFSET));
     }
 
     #[test]

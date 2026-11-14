@@ -3418,13 +3418,16 @@ impl PyError {
         w_object = live[3];
         let mut w_first_line = live[4];
         let mut w_extra_line_obj = live[5];
-        // The hook-args class is created on first use, which allocates, so it
-        // is fetched while the fields are still rooted and before `seq`
-        // exists.
+        // `error.py OperationError.write_unraisable` fetches
+        // `app_hookargs.wget(space, "UnraisableHookArgs")` before its `try`.
+        // An uncaught wget raises out of `write_unraisable`; this signature
+        // is `()`, so that raise is a panic. Instance construction and hook
+        // lookup stay inside the try below.
         let mut w_hook_class = pyre_object::with_roots!(
             space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
             => unraisable_hook_args_type()
-        );
+        )
+        .unwrap_or_else(|e| panic!("UnraisableHookArgs: {e:?}"));
         // `error.py OperationError.write_unraisable`:
         // `space.call_function(w_hook_class, space.newtuple(info_w))` then
         // `space.sys.getdictvalue(space, "unraisablehook")`. Either
@@ -3443,9 +3446,9 @@ impl PyError {
             Err(err) => Err(err),
             Ok(mut hook_args) => {
                 // `error.py write_unraisable`: `space.sys.getdictvalue(space,
-                // "unraisablehook")`. A miss is `None`, not an
-                // `OperationError`; only building `UnraisableHookArgs` is
-                // inside the `try`.
+                // "unraisablehook")` is inside the same `try` as the
+                // instance construction. A miss is `None`, not an
+                // `OperationError`.
                 let w_hook = if let Some(sys_mod) = crate::importing::get_interpreter_sys_module() {
                     pyre_object::with_roots!(
                         hook_args, space, w_object, w_tb, w_type, w_value =>
@@ -3937,21 +3940,34 @@ fn wrap_pos(num: i64) -> PyObjectRef {
     }
 }
 
-fn unraisable_hook_args_type() -> PyObjectRef {
+/// `gateway.py ApplevelClass.getwdict` / `space.fromcache(ApplevelCache)`:
+/// wget of `UnraisableHookArgs` is a memoized, built-once cache, not a
+/// traced graph. Opaque (`import_module_importhook` is the same
+/// `dont_look_inside` `Result<PyObjectRef, PyError>` shape) so the builder
+/// stays off `write_unraisable`. A MemoryError is `Err` so the caller can
+/// let that wget raise.
+#[majit_macros::dont_look_inside]
+fn unraisable_hook_args_type() -> Result<PyObjectRef, crate::PyError> {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
-            "sys.UnraisableHookArgs",
-            &[
-                "exc_type",
-                "exc_value",
-                "exc_traceback",
-                "err_msg",
-                "object",
-            ],
-            &["extra_line"],
-        )
-    })
+    if let Some(existing) = TYPE.get() {
+        return Ok(existing);
+    }
+    // `error.py write_unraisable` reads `UnraisableHookArgs` from
+    // `app_hookargs` (`vm.py`) *before* its `try`. Construction here is
+    // lazy; a MemoryError is `Err` so the caller can let that wget raise.
+    let cls = crate::_structseq::try_make_struct_seq_with_extra(
+        "sys.UnraisableHookArgs",
+        &[
+            "exc_type",
+            "exc_value",
+            "exc_traceback",
+            "err_msg",
+            "object",
+        ],
+        &["extra_line"],
+    )?;
+    TYPE.set(cls);
+    Ok(TYPE.get().unwrap_or(cls))
 }
 
 /// Resolve an exception instance's actual Python class name for display.
@@ -4053,12 +4069,10 @@ pub fn display_through_traceback_module(
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         return false;
     }
-    // A bounded heap has one `MemoryError` to give and aborts on the breach
-    // after it.  Reaching the stdlib renderer imports `traceback`, whose module
-    // body is a nested dispatch loop whose first safepoint collects over a heap
-    // already at its limit -- so the report this route exists to write is
-    // exactly what that abort takes away.  Declining leaves the built-in
-    // renderer below, which reaches stderr without running a module body.
+    // A bounded heap has already raised its one MemoryError. Reaching the
+    // stdlib renderer imports `traceback`, whose module body is a nested
+    // dispatch loop over a heap already at its limit. Decline so the built-in
+    // renderer below reaches stderr without running a module body.
     if majit_gc::gc_max_heap_already_raised() {
         return false;
     }
@@ -5632,11 +5646,11 @@ fn report_through_default_excepthook(failure: &mut PyError) {
 /// original both go through the default hook, which is `display_exception`'s
 /// `originalexcepthook`, so this answers `true` and the caller prints nothing.
 pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
-    // `gc_max_heap_already_raised`: the next breach aborts, and setting
-    // `sys.last_exc` plus calling the hook is a nested dispatch over a heap
-    // already at its limit. Decline so the caller prints through
-    // `eprint_exception`, which writes the report without running Python.
-    // Same question `display_through_traceback_module` already asks.
+    // `gc_max_heap_already_raised`: setting `sys.last_exc` plus calling the
+    // hook is a nested dispatch over a heap already at its limit. Decline so
+    // the caller prints through `eprint_exception`, which writes the report
+    // without running the hook. Same question
+    // `display_through_traceback_module` already asks.
     if majit_gc::gc_max_heap_already_raised() {
         return false;
     }

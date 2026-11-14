@@ -1360,11 +1360,13 @@ pub struct MiniMarkGC {
     /// channel is still holding an undelivered one.
     max_heap_size_already_raised: bool,
     /// Set by `finish_incremental_cycle` when a bounded major collection leaves
-    /// the heap over `max_heap_size`. The allocation that triggered the
-    /// collection (`alloc_with_type`) reads and clears this and returns NULL,
+    /// the heap over `max_heap_size` with an allocation waiting. That
+    /// allocation (`alloc_with_type`) reads and clears this and returns NULL,
     /// so the JIT `CHECK_MEMORY_ERROR` path / interpreter allocation chokepoint
-    /// raises `MemoryError` (incminimark.py:2603-2615 `raise MemoryError`,
-    /// lowered to the NULL-return the backend already understands).
+    /// raises `MemoryError` (incminimark.py `major_collection_step`
+    /// `raise MemoryError`, lowered to the NULL-return the backend already
+    /// understands). The eval-breaker is armed in parallel; the NULL path's
+    /// `take_memory_error` is that raise.
     oom_pending: bool,
     /// Whether the step now running signalled a max-heap `MemoryError`, on
     /// either channel.
@@ -9409,26 +9411,20 @@ impl MiniMarkGC {
         // limit was set.
         //
         // Upstream signals it by raising, which unwinds through whichever of
-        // the many drivers of a collection is on the stack. Pyre has to pick a
-        // channel, because only one of those drivers can carry an exception,
-        // and `reserving_size` already says which case this is: it is the size
-        // of the allocation waiting on this collection, and it is nonzero for
-        // exactly the two collecting nursery allocators.
+        // the many drivers of a collection is on the stack. Pyre cannot unwind
+        // out of the collector, so delivery is deferred:
         //
-        //   * With an allocation waiting, fail it. `oom_pending` is read by
-        //     that allocator the moment the collection returns, and its NULL
-        //     becomes a `MemoryError` at the compiled `CHECK_MEMORY_ERROR`.
-        //   * With none waiting — an explicit `gc.collect()`, a finalizer run,
-        //     and above all the dispatch-loop safepoint, which is where the
-        //     interpreter path's collections happen — there is nothing to fail
-        //     and no frame that can raise, so the eval-breaker bit defers the
-        //     exception to the next bytecode dispatch, exactly as `set_gc`
-        //     defers the collection itself.
+        //   * `reserving_size > 0` — an allocation is waiting. `oom_pending`
+        //     fails that allocation (NULL, then compiled `CHECK_MEMORY_ERROR`
+        //     / interpreter `obj_or_memory_error`). The eval-breaker is armed
+        //     in parallel: the NULL path's `take_memory_error` is the raise
+        //     (`incminimark.py major_collection_step` `raise MemoryError`).
+        //   * `reserving_size == 0` — `gc.collect()`, a finalizer, the
+        //     dispatch-loop safepoint. Nothing to fail, so only the breaker.
         //
-        // The two are mutually exclusive on purpose. Arming both would leave
-        // whichever channel went undelivered latched onto the *next* breach:
-        // an `oom_pending` no allocation was waiting for is taken by the next
-        // unrelated one, failing an allocation that breached nothing.
+        // `oom_pending` is never armed without a waiter, so it cannot latch
+        // onto a later unrelated malloc. The breaker is armed on every first
+        // breach so the waiting malloc's take is the one Python MemoryError.
         //
         // The fatal rung asks whether the program has already had its
         // `MemoryError`. Upstream raises here, so setting the flag and handing
@@ -9443,15 +9439,16 @@ impl MiniMarkGC {
         //     The question is per-thread: an exception owed to another thread
         //     says nothing about this breach, and treating it as this one's
         //     would let this thread allocate past the limit unremarked.
-        //   * The *fatal* rung needs the exception to have landed, not merely
-        //     to have been armed, or it ends the process before the program
-        //     sees what the rung above promised it. So a breach while any
-        //     thread is still owed one falls through and arms this thread too,
-        //     which is what upstream's raise does for whichever thread ran the
-        //     collection.
+        //   * The *fatal* rung needs the exception to have been raised, not
+        //     merely armed, or it ends the process before the program sees
+        //     what the rung above promised it. `take_memory_error` is that
+        //     raise. A later over-limit major aborts, including while the
+        //     MemoryError is being handled or printed: upstream never resets
+        //     `max_heap_size_already_raised`.
         //
         // The eval-breaker bit, `oom_pending`, and `rpyexc_occurred` each
-        // clear as they deliver, so an armed one is the whole test.
+        // clear as they deliver, so an armed one is the whole "not yet raised"
+        // test. There is no post-raise latch.
         if bounded && self.threshold_reached(reserving_size) {
             if self.oom_pending
                 || majit_ir::eval_breaker_word::memory_error_owed_here()
@@ -9477,9 +9474,8 @@ impl MiniMarkGC {
             self.oom_signalled_this_step = true;
             if reserving_size > 0 {
                 self.oom_pending = true;
-            } else {
-                majit_ir::eval_breaker_word::set_memory_error();
             }
+            majit_ir::eval_breaker_word::set_memory_error();
             // incminimark.py: STATE_SCANNING then an
             // immediate `raise MemoryError` exits `major_collection_step`
             // before the finalizing phase. Return before the queue-notification
@@ -13910,8 +13906,9 @@ mod tests {
 
     /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
     /// major collection over `max_heap_size` signals OOM the first time
-    /// (`oom_pending` so the triggering allocation returns NULL) and aborts on
-    /// the second occurrence. `max_heap_size` below `min_heap_size` makes any
+    /// (`oom_pending` so the triggering allocation returns NULL, and the
+    /// eval-breaker so `take_memory_error` is the raise) and aborts on a later
+    /// over-limit major. `max_heap_size` below `min_heap_size` makes any
     /// threshold bounded, so the decision fires on an otherwise empty heap.
     #[test]
     fn bounded_max_heap_size_signals_oom_then_aborts() {
@@ -13925,9 +13922,9 @@ mod tests {
         gc.pending_reserving_size = 4096;
         // The dispatch-loop channel is process-global; start from a known state
         // so the assertion below reads this breach and not an earlier one.
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
 
-        // First bounded breach: flag + signal, no abort.
+        // First bounded breach: flag + both channels, no abort.
         gc.gc_state = GcState::Sweeping;
         gc.finish_incremental_cycle();
         assert!(
@@ -13938,23 +13935,37 @@ mod tests {
             std::mem::take(&mut gc.oom_pending),
             "first bounded breach asks the allocation to fail (NULL)"
         );
-        // The allocation is waiting and will take `oom_pending` the moment this
-        // collection returns, so the deferred channel must stay clear. Arming
-        // both would leave one latched onto an allocation that breached nothing.
         assert!(
-            !majit_ir::eval_breaker_word::take_memory_error(),
-            "an allocation-driven breach owes the dispatch loop nothing"
+            majit_ir::eval_breaker_word::memory_error_owed_here(),
+            "an allocation-driven breach still owes the dispatch loop a MemoryError"
         );
 
-        // Second bounded breach aborts (`out_of_memory` -> `fatalerror`).
-        // The take above is what the waiting allocation does the moment the
-        // collection returns, and it is what makes this a second arrival.
+        // A collection while that exception is still owed is the same arrival.
+        gc.pending_reserving_size = 4096;
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert_eq!(gc.gc_state, GcState::Scanning);
+
+        // `take_memory_error` is the raise (`major_collection_step`
+        // `raise MemoryError`). A later over-limit major aborts.
+        assert!(
+            majit_ir::eval_breaker_word::take_memory_error(),
+            "the undelivered MemoryError is still owed after the same-arrival collection"
+        );
+        assert!(
+            !majit_ir::eval_breaker_word::take_memory_error(),
+            "a nested ticker wrap must not raise a second MemoryError for this arrival"
+        );
         gc.pending_reserving_size = 4096;
         gc.gc_state = GcState::Sweeping;
         let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gc.finish_incremental_cycle();
         }));
-        assert!(second.is_err(), "second bounded breach aborts the process");
+        assert!(
+            second.is_err(),
+            "a breach after delivery takes the fatal rung"
+        );
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
     }
 
     /// Nursery NULL stores MemoryError in `exc_data` (`_ll_malloc_fixedsize`)
@@ -13987,7 +13998,7 @@ mod tests {
         let mut gc = test_gc(4096);
         gc.max_heap_size = 1.0;
         gc.pending_reserving_size = 4096;
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
         PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
 
         gc.gc_state = GcState::Sweeping;
@@ -14009,7 +14020,19 @@ mod tests {
             "a collection while rpyexc_occurred is the same arrival"
         );
 
+        // `obj_or_memory_error`: take then `fetch_memory_error`. Fetch clears
+        // the rpyexc cell; take is the raise, so a later over-limit major
+        // aborts (`max_heap_size_already_raised` is never reset).
         PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !crate::gc_alloc_failed_pending(),
+            "fetch_memory_error cleared the rpyexc cell"
+        );
+        assert!(
+            majit_ir::eval_breaker_word::take_memory_error(),
+            "the NULL-path raise is the delivery"
+        );
+        gc.pending_reserving_size = 4096;
         gc.gc_state = GcState::Sweeping;
         let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gc.finish_incremental_cycle();
@@ -14018,7 +14041,7 @@ mod tests {
             third.is_err(),
             "a breach after delivery takes the fatal rung"
         );
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
     }
 
     /// A breach that lands while the previous `MemoryError` is still owed is
@@ -14040,7 +14063,7 @@ mod tests {
         assert!(!obj.is_null());
         gc.max_heap_size = 1.0;
         gc.pending_reserving_size = 0;
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
 
         gc.gc_state = GcState::Sweeping;
         gc.finish_incremental_cycle();
@@ -14056,7 +14079,7 @@ mod tests {
             "the undelivered MemoryError is still owed after the second breach"
         );
 
-        // Delivered now, so the next breach is a genuine second arrival.
+        // Take is the raise; a later over-limit major aborts.
         gc.gc_state = GcState::Sweeping;
         let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gc.finish_incremental_cycle();
@@ -14066,7 +14089,7 @@ mod tests {
             "a breach after delivery takes the fatal rung"
         );
         // Whatever that breach armed on its way out belongs to no one now.
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
     }
 
     /// A breach on a thread that is owed nothing is new, however loudly another
@@ -14086,7 +14109,7 @@ mod tests {
         let tid = gc.register_type(TypeInfo::simple(4096));
         let obj = gc.alloc_with_type(tid, 4096);
         assert!(!obj.is_null());
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
 
         // Another thread breaches first and has not reached its own dispatch
         // loop yet — the window a stop-the-world collection opens, since its
@@ -14130,9 +14153,10 @@ mod tests {
 
         release_tx.send(()).unwrap();
         other.join().unwrap();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
         assert!(
             !majit_ir::eval_breaker_word::memory_error_armed(),
-            "the last owner to deliver clears the summary"
+            "the last owner to take clears the summary"
         );
     }
 
@@ -14158,7 +14182,7 @@ mod tests {
         assert!(!obj.is_null());
         gc.max_heap_size = 1.0;
         gc.pending_reserving_size = 0;
-        majit_ir::eval_breaker_word::take_memory_error();
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
 
         gc.gc_state = GcState::Sweeping;
         gc.finish_incremental_cycle();

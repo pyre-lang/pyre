@@ -242,8 +242,7 @@ pub fn take_gc() -> bool {
 // memory error (bit5): armed by the collector, raised by the dispatch loop
 
 thread_local! {
-    /// Whether *this* thread armed a `MemoryError` its own dispatch loop has
-    /// not raised yet.
+    /// This thread's half of one max-heap `MemoryError` arrival.
     ///
     /// The exception belongs to the thread whose collection exhausted the
     /// heap, the way upstream's `raise MemoryError` unwinds through whichever
@@ -370,6 +369,11 @@ pub fn memory_error_owed_here() -> bool {
 }
 
 /// Consume the `MemoryError` owed to *this* thread, reporting whether one was.
+///
+/// A true return is the raise (`incminimark.py major_collection_step`
+/// `raise MemoryError`). Pyre cannot unwind out of the collector, so this
+/// take is that raise: the dispatch loop or the NULL-path conversion performs
+/// it, and a later over-limit major is a second arrival.
 ///
 /// A thread that is not owed one leaves the bit alone and deopts again at its
 /// next back edge, until the owner delivers. That window is bounded the way the

@@ -3024,7 +3024,7 @@ pub trait ActionFlagOps {
         pyre_object::gc_interp::on_ticker_wrap();
         if majit_ir::eval_breaker_word::take_memory_error() {
             majit_gc::gc_sync::safepoint_poll();
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::asynchronous_memory_error());
         }
         // executioncontext.py:539-540 — periodic actions iter.
         // Snapshot pointers before iteration; perform() may register
@@ -3107,7 +3107,7 @@ pub(crate) fn service_eval_breaker(
         // The collection that armed the error may have requested STW after
         // the poll above.
         majit_gc::gc_sync::safepoint_poll();
-        return Err(crate::PyError::memory_error(""));
+        return Err(crate::runtime_ops::asynchronous_memory_error());
     }
     if !ec.is_null() && !crate::module::thread::all_thread_hooks_current(unsafe { &*ec }) {
         crate::module::thread::apply_all_thread_hooks(unsafe { &mut *ec })?;

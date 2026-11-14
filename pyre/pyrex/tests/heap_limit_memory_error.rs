@@ -118,6 +118,12 @@ for _ in range(ROUNDS):
 print('completed')
 ";
 
+/// One child at a time: four debug `pyre-dynasm` processes on a 7 GiB
+/// runner make `malloc_typed` of the MemoryError singleton
+/// (`compile.py` `memory_error`) return null, and `handle_alloc_error`
+/// skips the MiniMark middle rung.
+static CHILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// [`run_shape`] at the small shape, which is what every arm but the
 /// large-object one wants.
 fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
@@ -135,7 +141,6 @@ fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
 /// would let one arm read a file another is still writing.
 fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -> Output {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static CHILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     let src = GROW
         .replace("ROUNDS", &rounds.to_string())

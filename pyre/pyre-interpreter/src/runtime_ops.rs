@@ -279,8 +279,8 @@ pub(crate) fn jit_clear_published_exception() {
 /// `BH_LAST_EXC_VALUE` (`object_residual_raise`); the backend type/value
 /// pair is then cleared.  A nonzero saved word is returned even when it
 /// is not `MemoryError`.  A zero saved word is the no-value `MemoryError`
-/// path (`PyFrame.handle_asynchronous_error`): the allocation-free
-/// `memory_error_singleton`.
+/// path (`compile.py memory_error`): the allocation-free low-level
+/// singleton.
 ///
 /// Opaque: it reads a thread-local cell and a OnceLock.
 #[majit_macros::dont_look_inside]
@@ -298,11 +298,59 @@ pub fn rpyexc_fetch_exception() -> PyObjectRef {
     }
 }
 
-/// The pending allocation exception as a `PyError`
-/// ([`rpyexc_fetch_exception`]).
+/// Identity of `compile.py memory_error` / `exceptiondata.py
+/// get_standard_ll_exc_instance` against a fetched rpyexc value.
+///
+/// Opaque with [`rpyexc_fetch_exception`]: the OnceLock static is not a
+/// CallRegistry path. `exception_object_matches_stop_iteration` is the same
+/// `dont_look_inside` identity test against a process cell.
+#[majit_macros::dont_look_inside]
+fn rpyexc_fetched_is_memory_error_singleton(value: PyObjectRef) -> bool {
+    value == pyre_object::interp_exceptions::memory_error_singleton()
+}
+
+/// Consume the MemoryError breaker bit owed to this thread.
+///
+/// `incminimark.py major_collection_step` `raise MemoryError`. Pyre cannot
+/// unwind out of the collector, so this take is that raise.
+///
+/// Opaque with `arm_async_eval_breaker`: the bit lives in the process-global
+/// eval-breaker word (`eval_breaker_word.take_memory_error`), so the tracer
+/// residualises the RMW rather than naming the `majit_ir` path.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_owed_memory_error() -> bool {
+    majit_ir::eval_breaker_word::take_memory_error()
+}
+
+/// `pyopcode.py handle_asynchronous_error(ec, space.w_MemoryError)`:
+/// `OperationError(w_MemoryError, w_None)`, normalized lazily to a fresh
+/// instance (`error.py OperationError.normalize_exception`).
+#[inline]
+pub(crate) fn asynchronous_memory_error() -> crate::PyError {
+    crate::PyError::from_type_and_value(
+        pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+            pyre_object::interp_exceptions::ExcKind::MemoryError,
+        ),
+        pyre_object::w_none(),
+    )
+}
+
+/// The pending rpyexc cell as a `PyError`.
+///
+/// Consumes the cell (`rpyexc_fetch_exception`). The low-level MemoryError
+/// singleton (`compile.py memory_error`, including the zero-word case) is
+/// not the app-level carrier: it becomes a fresh unnormalized
+/// `OperationError(w_MemoryError, w_None)` (`pyopcode.py
+/// handle_asynchronous_error`). Any other pending exception is returned as
+/// is (`from_exc_object`).
 #[inline]
 pub fn fetch_memory_error() -> crate::PyError {
-    unsafe { crate::PyError::from_exc_object(rpyexc_fetch_exception()) }
+    let value = rpyexc_fetch_exception();
+    if rpyexc_fetched_is_memory_error_singleton(value) {
+        asynchronous_memory_error()
+    } else {
+        unsafe { crate::PyError::from_exc_object(value) }
+    }
 }
 
 /// llmodel.py _store_exception: publish `exc_obj` into the
@@ -343,22 +391,21 @@ pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
 ///
 /// `rstr.py` `LLHelpers.ll_strconcat` / `ll_str_mul` and `ll_str.py`
 /// `ll_int2dec` raise MemoryError (`mallocstr` / `ovfcheck`). The helper
-/// here returns null after `interp_exceptions::publish_memory_error`, so
-/// this branch is the interpreter-visible conversion: the same
-/// `PyFrame.handle_bytecode` `except MemoryError:
-/// handle_asynchronous_error(ec, space.w_MemoryError)` turn into an
-/// OperationError.
-///
-/// Clearing the ll exception cells is not in this graph.
-/// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear` run
-/// on catch, and a residual call's raise is taken by
-/// `pyjitpl.py` `handle_possible_exception` (`GUARD_NO_EXCEPTION` /
-/// `GUARD_EXCEPTION`). Interpreter catch is
-/// `handle_exception_with_context`.
+/// returns null after storing the prebuilt singleton
+/// (`publish_memory_error` dual-writes `BH_LAST_EXC_VALUE` and the backend
+/// cells; `allocated_or_raise` → `raise_memory_error` →
+/// `jit_exc_raise(memory_error_singleton_ref())` writes the backend cells,
+/// the `transform.py` `_ll_malloc_fixedsize` / `_ll_malloc_varsize_no_length`
+/// raise shape). This branch is the interpreter-visible conversion:
+/// `take_memory_error` is the raise (`incminimark.py major_collection_step`
+/// `raise MemoryError`), then [`fetch_memory_error`] consumes the rpyexc
+/// cell and returns a fresh `OperationError(w_MemoryError, w_None)`
+/// (`pyopcode.py handle_asynchronous_error`).
 #[inline]
 pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null() {
-        return Err(crate::PyError::memory_error(""));
+        let _ = take_owed_memory_error();
+        return Err(fetch_memory_error());
     }
     Ok(obj)
 }
@@ -367,12 +414,15 @@ pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate
 /// managed allocation. It expands in place so the leaf's own graph holds the
 /// null test on the allocation result, which `fuse_boxing_alloc_with` drops
 /// from the jitcode once the allocation becomes `new_with_vtable`; native
-/// execution keeps it.
+/// execution keeps it. NULL is `_ll_malloc_fixedsize` after
+/// `raise_memory_error` stored the prebuilt singleton; take is the raise
+/// and fetch consumes that cell.
 macro_rules! fresh_alloc_or_memory_error {
     ($obj:expr) => {{
         let obj: pyre_object::PyObjectRef = $obj;
         if obj.is_null() {
-            Err(crate::PyError::memory_error(""))
+            let _ = crate::runtime_ops::take_owed_memory_error();
+            Err(crate::runtime_ops::fetch_memory_error())
         } else {
             Ok(obj)
         }
@@ -2472,19 +2522,175 @@ mod tests {
     use crate::PyExecutionContext;
     use pyre_object::{w_int_get_value, w_int_new};
 
+    static MEMORY_ERROR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn rpyexc_cell_occurred() -> bool {
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get() != 0)
+    }
+
+    struct RestoreRpyexcOccurred;
+    impl Drop for RestoreRpyexcOccurred {
+        fn drop(&mut self) {
+            majit_gc::set_active_exception_occurred(None);
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        }
+    }
+
+    fn plant_pending_memory_error_singleton() -> PyObjectRef {
+        let singleton = pyre_object::interp_exceptions::memory_error_singleton();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(singleton as i64));
+        majit_gc::set_active_exception_occurred(Some(rpyexc_cell_occurred));
+        singleton
+    }
+
+    /// `install_default_builtins` materializes `compile.py memory_error`
+    /// after the class terminator exists. The accessor is still
+    /// `get_or_init`; this asserts the init closure already ran.
+    #[test]
+    fn memory_error_singleton_is_prebuilt_after_space_builtin() {
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
+        let _ctx = PyExecutionContext::default();
+        let prebuilt = pyre_object::interp_exceptions::memory_error_singleton_prebuilt()
+            .expect("install_default_builtins materializes the singleton");
+        let again = pyre_object::interp_exceptions::memory_error_singleton();
+        assert_eq!(prebuilt as usize, again as usize);
+        unsafe {
+            assert!(pyre_object::interp_exceptions::is_exception(prebuilt));
+            assert_eq!(
+                pyre_object::interp_exceptions::w_exception_get_kind(prebuilt),
+                pyre_object::interp_exceptions::ExcKind::MemoryError
+            );
+            let cls = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+                pyre_object::interp_exceptions::ExcKind::MemoryError,
+            );
+            assert!(!cls.is_null(), "MemoryError class is registered");
+            let term = pyre_object::w_type_get_terminator(cls);
+            assert!(
+                !term.is_null(),
+                "install_type_terminator stored w_subtype.terminator"
+            );
+            let map_ptr = (prebuilt as *const u8)
+                .add(pyre_object::interp_exceptions::EXC_USER_MAP_OFFSET)
+                as *const pyre_object::mapdict::MapRef;
+            let map = *map_ptr;
+            assert_eq!(
+                map, term,
+                "user_setup copies the class terminator; the node stays reachable from the type"
+            );
+            assert_eq!(
+                pyre_object::mapdict::map_terminator_w_cls(map),
+                cls,
+                "getclass of the singleton is MemoryError"
+            );
+        }
+    }
+
     #[test]
     fn obj_or_memory_error_converts_null_to_memory_error() {
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
+        let _ctx = PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _restore = RestoreRpyexcOccurred;
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+        let singleton = plant_pending_memory_error_singleton();
+        assert!(
+            majit_gc::gc_alloc_failed_pending(),
+            "allocator stored the singleton in the rpyexc cell"
+        );
         let err = obj_or_memory_error(PY_NULL).expect_err("null is MemoryError");
         assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+        assert_ne!(
+            err.exc_object, singleton,
+            "the Python carrier is a fresh OperationError, not the low-level singleton"
+        );
+        assert!(
+            !majit_gc::gc_alloc_failed_pending(),
+            "fetch_memory_error cleared the rpyexc cell"
+        );
+    }
+
+    /// One arrival raises once: the NULL-path take is the raise, so a later
+    /// ticker wrap's take is not a second MemoryError.
+    #[test]
+    fn obj_or_memory_error_takes_the_owed_breaker_once() {
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
+        let _ctx = PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _restore = RestoreRpyexcOccurred;
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+        majit_ir::eval_breaker_word::set_memory_error();
+        let _ = plant_pending_memory_error_singleton();
+        let err = obj_or_memory_error(PY_NULL).expect_err("null is MemoryError");
+        assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+        assert!(
+            !majit_gc::gc_alloc_failed_pending(),
+            "fetch_memory_error cleared the rpyexc cell"
+        );
+        assert!(
+            !majit_ir::eval_breaker_word::take_memory_error(),
+            "the NULL-path raise already delivered this arrival"
+        );
+        assert!(
+            !majit_ir::eval_breaker_word::memory_error_owed_here(),
+            "take is the raise; nothing remains owed"
+        );
     }
 
     #[test]
     fn fresh_alloc_or_memory_error_maps_null_and_passes_live() {
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
+        let _ctx = PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _restore = RestoreRpyexcOccurred;
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+        let singleton = plant_pending_memory_error_singleton();
+        assert!(majit_gc::gc_alloc_failed_pending());
         let err = fresh_alloc_or_memory_error!(PY_NULL).expect_err("null is MemoryError");
         assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+        assert_ne!(
+            err.exc_object, singleton,
+            "the Python carrier is a fresh OperationError, not the low-level singleton"
+        );
+        assert!(
+            !majit_gc::gc_alloc_failed_pending(),
+            "fetch_memory_error cleared the rpyexc cell"
+        );
         let obj = w_int_new(1);
         let out = fresh_alloc_or_memory_error!(obj).expect("non-null is Ok");
         assert_eq!(out, obj);
+    }
+
+    /// `exceptiontransform.py rpyexc_fetch_exception` returns whatever is
+    /// pending; `pyopcode.py handle_bytecode` turns only an RPython
+    /// MemoryError into `handle_asynchronous_error`. A pending ValueError
+    /// in the cell is that object, and the cell is cleared.
+    #[test]
+    fn fetch_memory_error_propagates_a_pending_non_memory_error() {
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
+        let _ctx = PyExecutionContext::default();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _restore = RestoreRpyexcOccurred;
+        majit_gc::set_active_exception_occurred(Some(rpyexc_cell_occurred));
+        let pending = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let _roots = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(pending);
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(pending as i64));
+        assert!(
+            rpyexc_cell_occurred(),
+            "the non-MemoryError is in the rpyexc cell"
+        );
+        let err = fetch_memory_error();
+        assert_eq!(
+            err.exc_object, pending,
+            "a pending non-MemoryError is that object"
+        );
+        assert!(matches!(err.kind, crate::PyErrorKind::ValueError));
+        assert!(
+            !rpyexc_cell_occurred(),
+            "fetch_memory_error cleared the rpyexc cell"
+        );
     }
 
     #[test]

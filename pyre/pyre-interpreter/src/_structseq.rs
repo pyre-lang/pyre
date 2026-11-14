@@ -482,6 +482,7 @@ pub fn new_instance_with_extra(
 /// allocations route through [`new_instance`].
 pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyObjectRef {
     make_struct_seq_impl(name, field_names, std::iter::empty())
+        .unwrap_or_else(|e| panic!("structseq type {name}: {e:?}"))
 }
 
 /// Like [`make_struct_seq`] but adds named-only fields beyond the tuple
@@ -494,6 +495,20 @@ pub fn make_struct_seq_with_extra(
     field_names: &[&'static str],
     extra_field_names: &[&'static str],
 ) -> PyObjectRef {
+    try_make_struct_seq_with_extra(name, field_names, extra_field_names)
+        .unwrap_or_else(|e| panic!("structseq type {name}: {e:?}"))
+}
+
+/// Same construction as [`make_struct_seq_with_extra`], returning an
+/// allocation failure as `Err` instead of panicking. `error.py
+/// write_unraisable` fetches `UnraisableHookArgs` via `app_hookargs.wget`
+/// before its `try`; a MemoryError from this constructor is that uncaught
+/// wget.
+pub(crate) fn try_make_struct_seq_with_extra(
+    name: &'static str,
+    field_names: &[&'static str],
+    extra_field_names: &[&'static str],
+) -> Result<PyObjectRef, PyError> {
     // `app_posix.py stat_result` numbers the named-only fields past a gap in
     // the indices, which is what makes `structseqtype.__new__` classify them
     // as extra fields rather than positional ones.
@@ -523,6 +538,7 @@ pub fn make_struct_seq_with_indexed_extra(
         "{name}: named-only fields must follow a gap after the sequence fields"
     );
     make_struct_seq_impl(name, field_names, extra_fields.iter().copied())
+        .unwrap_or_else(|e| panic!("structseq type {name}: {e:?}"))
 }
 
 /// Mark a structseq type `Py_TPFLAGS_DISALLOW_INSTANTIATION`, which is how
@@ -539,13 +555,21 @@ fn make_struct_seq_impl(
     name: &'static str,
     field_names: &[&'static str],
     extra_fields: impl Iterator<Item = (usize, &'static str)> + Clone,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, PyError> {
     let (module, short_name) = name
         .rsplit_once('.')
         .map_or((None, name), |(module, short)| (Some(module), short));
     let roots = pyre_object::gc_roots::push_roots();
-    let field_type_slot = roots.pin_roots(&[structseq_app_attr("structseqfield")]);
-    let meta_slot = roots.pin_roots(&[structseq_app_attr("structseqtype")]);
+    let builtin_slot = roots.pin_roots(&[crate::importing::get_builtin_module("_structseq")
+        .expect("the _structseq builtin module is always installed")]);
+    let field_type_slot = roots.pin_roots(&[crate::baseobjspace::getattr_str(
+        roots.get(builtin_slot),
+        "structseqfield",
+    )?]);
+    let meta_slot = roots.pin_roots(&[crate::baseobjspace::getattr_str(
+        roots.get(builtin_slot),
+        "structseqtype",
+    )?]);
     let ns_slot = roots.pin_roots(&[pyre_object::w_dict_new()]);
     let store = |key: &str, value: PyObjectRef| {
         let value_slot = roots.pin_roots(&[value]);
@@ -561,8 +585,7 @@ fn make_struct_seq_impl(
         let w_field = crate::call::call_function_impl_result(
             roots.get(field_type_slot),
             &[pyre_object::w_int_new(index as i64)],
-        )
-        .unwrap_or_else(|e| panic!("structseqfield({index}) for {name}: {e:?}"));
+        )?;
         store(field, w_field);
     }
     // `structseqtype.__new__` takes `_name` from a `name` class attribute,
@@ -610,8 +633,7 @@ fn make_struct_seq_impl(
             roots.get(bases_slot),
             roots.get(ns_slot),
         ],
-    )
-    .unwrap_or_else(|e| panic!("structseqtype for {name}: {e:?}"));
+    )?;
     // CPython's PyStructSequence types publish no BASETYPE flag; tuple's
     // shared TypeDef stays an acceptable base (`check_and_find_best_base`).
     unsafe { pyre_object::w_type_suppress_cpython_basetype(cls) };
@@ -621,11 +643,10 @@ fn make_struct_seq_impl(
             roots.get(cls_slot),
             "_name",
             pyre_object::w_str_new(name),
-        )
-        .unwrap_or_else(|e| panic!("{name}._name: {e:?}"));
-        return roots.get(cls_slot);
+        )?;
+        return Ok(roots.get(cls_slot));
     }
-    cls
+    Ok(cls)
 }
 
 #[cfg(test)]
