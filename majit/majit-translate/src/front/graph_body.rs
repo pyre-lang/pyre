@@ -418,8 +418,10 @@ impl ProviderTables {
             }
             for krate in &crates {
                 while let Some(req) = krate.lowering(self, |lowering| lowering.pop_spec()) {
-                    if let Some(spec) = krate.declare_spec(self, req) {
-                        self.declarations.push(spec);
+                    if let Some(declared) = krate.declare_spec(self, req) {
+                        for item in declared {
+                            self.declarations.push(item);
+                        }
                     }
                 }
             }
@@ -434,7 +436,7 @@ impl ProvidedCrate {
         self: &Rc<Self>,
         tables: &Rc<ProviderTables>,
         req: crate::front::clause_spec::SpecRequest,
-    ) -> Option<DeclaredFuncObj> {
+    ) -> Option<Vec<DeclaredFuncObj>> {
         self.lowering(tables, |lowering| {
             let spec = lowering.declare_spec(req)?;
             let stamp = spec.header.graph_stamp();
@@ -888,8 +890,20 @@ mod tests {
             .iter()
             .filter(|decl| decl.path.segments.iter().any(|seg| seg.contains("__spec_")))
             .collect();
+        let mut unique_graphs: Vec<(&DeclaredFuncObj, Vec<String>)> = Vec::new();
+        for spec in &specs {
+            let name = spec.path.segments.join("::");
+            if let Some((_, names)) = unique_graphs
+                .iter_mut()
+                .find(|(seen, _)| seen.graph.ptr_eq(&spec.graph))
+            {
+                names.push(name);
+            } else {
+                unique_graphs.push((spec, vec![name]));
+            }
+        }
         assert_eq!(
-            specs.len(),
+            unique_graphs.len(),
             2,
             "expected two __spec_ graphs, got {:?}",
             declared
@@ -897,8 +911,16 @@ mod tests {
                 .map(|decl| decl.path.segments.join("::"))
                 .collect::<Vec<_>>()
         );
+        for (spec, names) in &unique_graphs {
+            assert_eq!(
+                names.len(),
+                2,
+                "{} harvest+unique paths, got {names:?}",
+                spec.path.segments.join("::")
+            );
+        }
         let mut kinds = Vec::new();
-        for spec in &specs {
+        for (spec, _) in &unique_graphs {
             let graph = spec
                 .graph
                 .get()

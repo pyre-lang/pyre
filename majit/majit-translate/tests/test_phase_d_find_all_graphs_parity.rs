@@ -43,6 +43,7 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: callee_path.segments.clone(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: majit_translate::GraphSpecialization::Regular,
                 },

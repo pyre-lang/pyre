@@ -6,11 +6,17 @@
 mod common;
 
 use common::{
-    CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named,
+    CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, MODULE_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc,
+    load_llbc_if_present, lower_named, with_shared_lowering,
 };
 use common::{build_semantic_program_from_llbc, lower_function};
-use majit_charon_reader::Llbc;
-use majit_translate::front::mir::LowerError;
+use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, NameSeg, TermKind};
+use majit_charon_reader::{FunDecl, Llbc};
+use majit_translate::front::mir::{
+    LowerError, harvest_path_for_fun_decl, lower_fun_decl, registered_path_for_fun_decl,
+    scope_owner_identity,
+};
+use majit_translate::model::{CallTarget, OpKind};
 
 /// Load `corpus.ullbc` once and share it across every test.
 fn load_corpus() -> &'static Llbc {
@@ -4545,4 +4551,326 @@ fn object_key_field_read_narrows_to_object_key_class() {
         "ObjectKey.hash must narrow onto dictmultiobject::ObjectKey; graph={}",
         graph.dump()
     );
+}
+
+fn last_ident<'a>(fd: &'a FunDecl) -> Option<(&'a str, u64)> {
+    fd.item_meta
+        .template_name()
+        .rev()
+        .find_map(|seg| match seg {
+            NameSeg::Ident {
+                ident: (name, disambiguator),
+            } => Some((name.as_str(), *disambiguator)),
+            _ => None,
+        })
+}
+
+fn ident_disambiguator(fd: &FunDecl, name: &str) -> Option<u64> {
+    fd.item_meta.template_name().find_map(|seg| match seg {
+        NameSeg::Ident {
+            ident: (ident, disambiguator),
+        } if ident == name => Some(*disambiguator),
+        _ => None,
+    })
+}
+
+fn name_path_contains(fd: &FunDecl, needle: &str) -> bool {
+    fd.item_meta.name_path().contains(needle)
+}
+
+fn assert_unique_call_paths(llbc: &Llbc, members: &[&FunDecl], label: &str) {
+    assert!(
+        members.len() >= 2,
+        "{label}: expected a colliding group, got {}",
+        members.len()
+    );
+    let mut by_path: std::collections::HashMap<Vec<String>, Vec<u64>> =
+        std::collections::HashMap::new();
+    let mut by_scope: std::collections::HashMap<String, Vec<u64>> =
+        std::collections::HashMap::new();
+    for fd in members {
+        let path = registered_path_for_fun_decl(llbc, fd).segments;
+        by_path.entry(path).or_default().push(fd.def_id);
+        by_scope
+            .entry(scope_owner_identity(llbc, fd))
+            .or_default()
+            .push(fd.def_id);
+    }
+    let path_collisions: Vec<_> = by_path.iter().filter(|(_, ids)| ids.len() > 1).collect();
+    assert!(
+        path_collisions.is_empty(),
+        "{label}: CallPath still shared by distinct FunDecls: {path_collisions:?}"
+    );
+    let scope_collisions: Vec<_> = by_scope.iter().filter(|(_, ids)| ids.len() > 1).collect();
+    assert!(
+        scope_collisions.is_empty(),
+        "{label}: scope_owner_identity shared by distinct FunDecls: {scope_collisions:?}"
+    );
+}
+
+fn assert_distinct_graph_keys(llbc: &'static Llbc, members: &[&FunDecl], label: &str) {
+    let pair: Vec<&FunDecl> = members.iter().copied().take(2).collect();
+    if pair.len() < 2 {
+        return;
+    }
+    let keys: Vec<_> = with_shared_lowering(llbc, |ctx| {
+        pair.iter()
+            .map(|fd| {
+                lower_fun_decl(ctx, fd)
+                    .unwrap_or_else(|err| {
+                        panic!("{label}: lower FunDecl {} failed: {err}", fd.def_id)
+                    })
+                    .graph_key()
+            })
+            .collect()
+    });
+    assert_ne!(
+        keys[0], keys[1],
+        "{label}: first two FunDecls share a GraphKey"
+    );
+}
+
+/// Distinct FunDecls in the OWNER#k, destructor#k, and `_ast::convert`
+/// closure groups occupy distinct graphs; a Call from OWNER#2::call_mut
+/// names OWNER#2::call.
+///
+/// rustc used to number the ObjectConverter vs Converter pair
+/// `stmt::closure#8::call_mut`. Current interpreter LLBC renders that
+/// pair as a shared `expr::closure::call_once` name_path (`closure#8` is
+/// a singleton `call_once`). Group by name_path and take a size ≥ 2 set.
+#[test]
+fn colliding_fundecl_groups_occupy_distinct_graphs() {
+    let Some(interpreter) = load_llbc_if_present(INTERPRETER_LLBC) else {
+        return;
+    };
+    let Some(module) = load_llbc_if_present(MODULE_LLBC) else {
+        return;
+    };
+
+    let owner_calls: Vec<&FunDecl> = interpreter
+        .iter_local_fns()
+        .filter(|fd| {
+            name_path_contains(fd, "method_owner")
+                && ident_disambiguator(fd, "OWNER").is_some()
+                && last_ident(fd).is_some_and(|(name, _)| name == "call")
+        })
+        .collect();
+    assert_unique_call_paths(interpreter, &owner_calls, "OWNER#k call");
+    assert_distinct_graph_keys(interpreter, &owner_calls, "OWNER#k call");
+
+    let owner_call_muts: Vec<&FunDecl> = interpreter
+        .iter_local_fns()
+        .filter(|fd| {
+            name_path_contains(fd, "method_owner")
+                && ident_disambiguator(fd, "OWNER").is_some()
+                && last_ident(fd).is_some_and(|(name, _)| name == "call_mut")
+        })
+        .collect();
+    assert_unique_call_paths(interpreter, &owner_call_muts, "OWNER#k call_mut");
+    assert_distinct_graph_keys(interpreter, &owner_call_muts, "OWNER#k call_mut");
+
+    let destructors: Vec<&FunDecl> = module
+        .iter_local_fns()
+        .filter(|fd| {
+            name_path_contains(fd, "gc_types")
+                && last_ident(fd).is_some_and(|(name, _)| name == "destructor")
+        })
+        .collect();
+    assert_unique_call_paths(module, &destructors, "gc_types::destructor#k");
+    assert_distinct_graph_keys(module, &destructors, "gc_types::destructor#k");
+
+    let convert_closures: Vec<&FunDecl> = {
+        let mut by_path: std::collections::BTreeMap<String, Vec<&FunDecl>> =
+            std::collections::BTreeMap::new();
+        for fd in interpreter.iter_local_fns().filter(|fd| {
+            name_path_contains(fd, "_ast")
+                && name_path_contains(fd, "convert")
+                && name_path_contains(fd, "closure")
+        }) {
+            by_path
+                .entry(fd.item_meta.name_path())
+                .or_default()
+                .push(fd);
+        }
+        by_path
+            .into_values()
+            .find(|group| group.len() >= 2)
+            .unwrap_or_default()
+    };
+    assert_unique_call_paths(
+        interpreter,
+        &convert_closures,
+        "_ast::convert colliding closures",
+    );
+    assert_distinct_graph_keys(
+        interpreter,
+        &convert_closures,
+        "_ast::convert colliding closures",
+    );
+
+    let owner2_call = owner_calls
+        .iter()
+        .copied()
+        .find(|fd| ident_disambiguator(fd, "OWNER") == Some(2))
+        .expect("OWNER#2::call");
+    let owner2_call_mut = owner_call_muts
+        .iter()
+        .copied()
+        .find(|fd| ident_disambiguator(fd, "OWNER") == Some(2))
+        .expect("OWNER#2::call_mut");
+    let owner2_call_path = registered_path_for_fun_decl(interpreter, owner2_call);
+    let owner2_call_harvest = harvest_path_for_fun_decl(interpreter, owner2_call);
+    assert!(
+        owner2_call_path.segments.iter().any(|seg| seg == "OWNER#2"),
+        "OWNER#2::call path must carry Ident #2: {:?}",
+        owner2_call_path.segments
+    );
+
+    let call_mut_graph = with_shared_lowering(interpreter, |ctx| {
+        lower_fun_decl(ctx, owner2_call_mut).expect("lower OWNER#2::call_mut")
+    });
+    let resolved: Vec<(bool, Vec<String>)> = call_mut_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        resolved_path,
+                        fun_decl_id: Some(id),
+                        ..
+                    },
+                ..
+            } if *id == owner2_call.def_id => Some((
+                true,
+                resolved_path
+                    .as_ref()
+                    .map(|path| path.segments.clone())
+                    .unwrap_or_else(|| segments.clone()),
+            )),
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        resolved_path: Some(path),
+                        fun_decl_id: Some(id),
+                        ..
+                    },
+                ..
+            } if *id == owner2_call.def_id => Some((false, path.segments.clone())),
+            _ => None,
+        })
+        .collect();
+    if resolved.is_empty() {
+        let body = owner2_call_mut
+            .unstructured()
+            .expect("OWNER#2::call_mut has a body");
+        let callee_ids: Vec<u64> = body
+            .body
+            .iter()
+            .filter_map(|bb| {
+                let Ok(TermKind::Call { call, .. }) = bb.term_ref(interpreter) else {
+                    return None;
+                };
+                match &call.func {
+                    CallFunc::Regular(reg) => match &reg.kind {
+                        CallKind::Fun(FunId::Regular { id }) => Some(*id),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(
+            callee_ids.contains(&owner2_call.def_id),
+            "OWNER#2::call_mut MIR must name OWNER#2::call FunDecl {}; callees={callee_ids:?}",
+            owner2_call.def_id
+        );
+        panic!(
+            "OWNER#2::call_mut lowered without a Call to OWNER#2::call {}",
+            owner2_call.def_id
+        );
+    }
+    for (is_function_path, segments) in &resolved {
+        if *is_function_path {
+            assert_eq!(
+                segments, &owner2_call_path.segments,
+                "OWNER#2::call_mut FunctionPath identity must be OWNER#2::call"
+            );
+        } else {
+            assert_eq!(
+                segments, &owner2_call_harvest.segments,
+                "OWNER#2::call_mut Method harvest must be OWNER#2::call"
+            );
+        }
+    }
+}
+
+/// Distinct `scope_owner_identity` values never share a
+/// [`registered_path_for_fun_decl`] CallPath. Occupancy keys on the
+/// identity (`Bookkeeper.getdesc`); the CallPath is the FunDecl name
+/// walk, so two identities on one path would be a renderer collapse.
+#[test]
+fn distinct_scope_owners_never_share_a_registered_call_path() {
+    let artifacts: &[(&str, &str)] = &[
+        ("pyre-object.ullbc", OBJECT_LLBC),
+        ("pyre-interpreter.ullbc", INTERPRETER_LLBC),
+        ("pyre-module.ullbc", MODULE_LLBC),
+        ("pyre-jit.ullbc", JIT_LLBC),
+    ];
+    let mut total_collisions = 0usize;
+    let mut total_span = 0usize;
+    let mut admitted = 0usize;
+    for (label, path) in artifacts {
+        let Some(llbc) = load_llbc_if_present(path) else {
+            continue;
+        };
+        let mut by_path: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut span = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            admitted += 1;
+            let call = registered_path_for_fun_decl(llbc, fd);
+            if call
+                .segments
+                .iter()
+                .any(|s| s.contains("@span") || s.starts_with('@'))
+            {
+                span += 1;
+            }
+            by_path
+                .entry(call.canonical_key())
+                .or_default()
+                .insert(scope_owner_identity(llbc, fd));
+        }
+        let collisions: Vec<_> = by_path
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .map(|(key, ids)| (key.clone(), ids.len()))
+            .collect();
+        total_collisions += collisions.len();
+        total_span += span;
+        if !collisions.is_empty() {
+            let mut samples = Vec::new();
+            for fd in llbc.iter_fun_decls() {
+                let call = registered_path_for_fun_decl(llbc, fd);
+                let key = call.canonical_key();
+                if collisions.iter().any(|(k, _)| k == &key) && samples.len() < 12 {
+                    samples.push((key, call.segments.clone(), scope_owner_identity(llbc, fd)));
+                }
+            }
+            panic!(
+                "{label}: distinct scope_owner_identity sharing CallPath ({n}): {sample:?}\nidentities: {samples:#?}",
+                n = collisions.len(),
+                sample = collisions.iter().take(8).collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(span, 0, "{label}: CallPath contains @span");
+    }
+    eprintln!(
+        "call-path census: admitted={admitted} collisions={total_collisions} @span={total_span}"
+    );
+    assert_eq!(total_collisions, 0);
+    assert_eq!(total_span, 0);
 }

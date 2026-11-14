@@ -796,6 +796,7 @@ pub(crate) fn range_builtin_call(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec![crate::runtime_names::shims::RANGE.to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -814,6 +815,7 @@ pub(crate) fn slice_iter_call(result: Variable, container: Variable) -> SpaceOpe
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },

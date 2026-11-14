@@ -4528,7 +4528,7 @@ fn scope_owner_other_seg(llbc: &Llbc, seg: &NameSeg) -> String {
 
 /// One `Impl` name segment, from that segment's payload. Nested ancestor
 /// impls keep their own Self / trait; the method's impl is not reused.
-fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
+pub(in crate::front::mir) fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
     if let Some(id) = seg.impl_trait_id() {
         let name = crate::front::clause_spec::render_trait_impl(llbc, id)
             .unwrap_or_else(|| "?".to_string());

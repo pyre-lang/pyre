@@ -4402,6 +4402,11 @@ pub(in crate::front::mir) fn rdict_insert_get_cast_root(
 }
 
 /// Call-path segments for a specialized leaf of this declaration.
+///
+/// Graph names, jitcode names, and every call-target `segments` field
+/// keep this spelling so `.jitstats` / snapshots / front-end name
+/// matchers do not move. The unique FunDecl walk lives on
+/// [`identity_segments`].
 pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
         // `method-call-expr`: inherent methods are looked up before trait
@@ -4513,14 +4518,173 @@ pub(in crate::front::mir) fn inherent_impl_self_identity(
     Some(spelling)
 }
 
-/// The `CallPath` `lib.rs` registers for this FunDecl: the same
-/// segments [`spec_segments`] emits, so a Fun call and a Trait call
-/// that resolve to this declaration share one registry key.
-pub(in crate::front::mir) fn registered_path_for_fun_decl(
+/// Unique FunDecl walk (`Bookkeeper.getdesc` / the function object).
+///
+/// One walk of `item_meta.template_name()`. Ident `#N`, every Impl from
+/// its payload, Idents after the last Impl (vtable `getitem` before
+/// `{vtable_method}`), and `FnDef` / `FnPtr` through
+/// `scope_owner_impl_seg` → `spec_type_name`. The last Impl before the
+/// leaf is `<Impl>` plus the trait identity, chosen by position and
+/// `trait_impl_id_for_fundecl`. Used by
+/// [`identity_path_for_fun_decl`], [`registered_path_for_fun_decl`],
+/// and `SemanticFunction.call_segments`.
+pub(in crate::front::mir) fn identity_segments(
     llbc: &Llbc,
     fd: &FunDecl,
-) -> crate::parse::CallPath {
-    let leaf = match instance_leaf(llbc, fd) {
+    leaf: &str,
+) -> Vec<String> {
+    let segs: Vec<&NameSeg> = fd.item_meta.template_name().collect();
+    if segs.is_empty() {
+        return vec![leaf.to_string()];
+    }
+    let leaf_idx = spec_leaf_seg_index(&segs);
+    let last_impl = segs[..leaf_idx].iter().rposition(|seg| seg.is_impl());
+    // Trait identity comes from this Impl segment. `name` can put
+    // Instantiated between Impl and the leaf, so the FunDecl
+    // penultimate (`trait_impl_id_for_fundecl`) misses it.
+    let identity_seg = last_impl.and_then(|i| {
+        segs[i]
+            .impl_trait_id()
+            .and_then(|id| crate::front::clause_spec::render_trait_impl(llbc, id))
+            .map(|identity| format!("<impl {identity}>"))
+    });
+    let mut segments = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        match seg {
+            NameSeg::Ident {
+                ident: (name, disambiguator),
+            } => {
+                let rendered = crate::front::clause_spec::spec_ident_name(name, *disambiguator);
+                if i == leaf_idx {
+                    segments.push(attach_leaf_arg(&rendered, Some(name.as_str()), leaf));
+                } else {
+                    segments.push(rendered);
+                }
+            }
+            _ if seg.is_impl() => {
+                if last_impl == Some(i)
+                    && let Some(identity) = identity_seg.as_ref()
+                {
+                    segments.push("<Impl>".to_string());
+                    segments.push(identity.clone());
+                } else if last_impl == Some(i) {
+                    // Inherent last Impl: Self's last Ident is the owner
+                    // leaf `for_impl_method` harvests from the TypeDecl.
+                    if let Some(owner_leaf) = inherent_impl_self_last_ident(llbc, seg)
+                        && segments.last() != Some(&owner_leaf)
+                    {
+                        segments.push(owner_leaf);
+                    }
+                    // Generic Self (`Atomic<usize>` vs `Atomic<u32>`) is
+                    // not that last Ident. Occupancy keeps the impl type
+                    // when `type_decl_ref_generics` has args (`spec_adt`).
+                    if inherent_impl_self_has_args(llbc, seg) {
+                        segments.push(scope_owner_impl_seg(llbc, seg));
+                    }
+                } else {
+                    segments.push(scope_owner_impl_seg(llbc, seg));
+                }
+            }
+            _ => {
+                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(seg) {
+                    if i == leaf_idx {
+                        segments.push(attach_leaf_arg(&label, None, leaf));
+                    } else {
+                        segments.push(label);
+                    }
+                }
+            }
+        }
+    }
+    // `template_name` drops `Instantiated`. Foreign Opaque copies
+    // (`drop_in_place<T>`) have no `__spec_` leaf; the instantiation
+    // args are the occupancy key (`ItemMeta::instantiation`).
+    if instance_leaf(llbc, fd).is_none() {
+        let (type_args, const_args) = identity_instantiation(llbc, fd.item_meta.instantiation());
+        if (!type_args.is_empty() || !const_args.is_empty())
+            && let Some(last) = segments.last_mut()
+        {
+            *last = format_instantiated_identity(last, &type_args, &const_args);
+        }
+    }
+    segments
+}
+
+/// Last Ident of this inherent Impl's Self type (`TypeDecl.template_name`,
+/// or a primitive `spec_type_name` with no ADT).
+fn inherent_impl_self_last_ident(llbc: &Llbc, seg: &NameSeg) -> Option<String> {
+    if let Some(adt_def_id) = resolve_impl_owner_adt_def_id_free(llbc, seg)
+        && let Some(td) = llbc.type_by_id(adt_def_id)
+    {
+        let mut last = None;
+        for name_seg in td.item_meta.template_name() {
+            if let NameSeg::Ident {
+                ident: (name, disambiguator),
+            } = name_seg
+            {
+                last = Some(crate::front::clause_spec::spec_ident_name(
+                    name,
+                    *disambiguator,
+                ));
+            }
+        }
+        return last;
+    }
+    let ty = seg.impl_ty_skip_binder()?;
+    let name = crate::front::clause_spec::spec_type_name(ty, llbc, 0, false);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether inherent Self carries type or const args.
+///
+/// Same GenericArgs `spec_adt` reads through `type_decl_ref_generics`
+/// (`Adt.generics`, else the TypeDecl `instantiation`).
+fn inherent_impl_self_has_args(llbc: &Llbc, seg: &NameSeg) -> bool {
+    let Some(ty) = seg.impl_ty_skip_binder() else {
+        return false;
+    };
+    instantiation_generic_args(ty, llbc).is_some_and(generic_args_are_nonempty)
+}
+
+/// The callable leaf's index in `template_name`: a trailing Builtin
+/// (`VTableMethod`, `ClosureAsFn`, …) is the leaf and the Idents before
+/// it stay in the path; otherwise the last Ident is the leaf.
+fn spec_leaf_seg_index(segs: &[&NameSeg]) -> usize {
+    if segs
+        .last()
+        .and_then(|seg| majit_charon_reader::ullbc::builtin_path_label(seg))
+        .is_some()
+    {
+        return segs.len() - 1;
+    }
+    segs.iter()
+        .rposition(|seg| matches!(seg, NameSeg::Ident { .. }))
+        .unwrap_or(segs.len() - 1)
+}
+
+/// Attach `instance_leaf`'s specialization suffix to the leaf segment.
+/// `leaf.strip_prefix` of that segment's rendered form (and of an Ident's
+/// own name, so `#N` survives a `name_path` leaf that omitted it).
+fn attach_leaf_arg(rendered: &str, ident_name: Option<&str>, leaf: &str) -> String {
+    if leaf == rendered {
+        return rendered.to_string();
+    }
+    if let Some(suffix) = leaf.strip_prefix(rendered) {
+        return format!("{rendered}{suffix}");
+    }
+    if let Some(name) = ident_name {
+        if leaf == name {
+            return rendered.to_string();
+        }
+        if let Some(suffix) = leaf.strip_prefix(name) {
+            return format!("{rendered}{suffix}");
+        }
+    }
+    leaf.to_string()
+}
+
+pub(in crate::front::mir) fn registered_leaf(llbc: &Llbc, fd: &FunDecl) -> String {
+    match instance_leaf(llbc, fd) {
         Some(leaf) => leaf,
         None => fd
             .item_meta
@@ -4529,8 +4693,69 @@ pub(in crate::front::mir) fn registered_path_for_fun_decl(
             .next()
             .unwrap_or("fn")
             .to_string(),
+    }
+}
+
+/// Identity `CallPath` for this FunDecl under `leaf` and
+/// `specialization` (`description.py FunctionDesc.cachedgraph(key)`).
+/// `attach_leaf_arg` keeps a `__spec_*` suffix on the leaf segment so
+/// a specialized copy is not the base graph.
+pub fn identity_path_for_fun_decl(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    leaf: &str,
+    specialization: crate::parse::GraphSpecialization,
+) -> crate::parse::CallPath {
+    let mut path = crate::parse::CallPath::from_segments(identity_segments(llbc, fd, leaf));
+    path.specialization = specialization;
+    path
+}
+
+/// The `CallPath` `lib.rs` registers for this FunDecl: the unique
+/// [`identity_segments`] walk with [`registered_leaf`] and Regular, so a
+/// Fun call and a Trait call that resolve to this declaration share one
+/// registry key.
+pub fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+    identity_path_for_fun_decl(
+        llbc,
+        fd,
+        &registered_leaf(llbc, fd),
+        crate::parse::GraphSpecialization::Regular,
+    )
+}
+
+/// Harvest `spec_segments` CallPath. `CallTarget::Method.resolved_path`
+/// stays this spelling (`graphs_from` / `cachedgraph` alt_name). Unique
+/// identity lives on `CallTarget::FunctionPath.resolved_path`.
+pub fn harvest_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+    crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &registered_leaf(llbc, fd)))
+}
+
+/// Stamp the FunDecl key that `target_to_path` reads: harvest on Method,
+/// unique identity with the call's own leaf and specialization on
+/// FunctionPath (`FunctionDesc.cachedgraph` key).
+pub fn stamp_call_target_fun_decl(
+    target: crate::model::CallTarget,
+    llbc: &Llbc,
+    fd: &FunDecl,
+) -> crate::model::CallTarget {
+    let path = match &target {
+        crate::model::CallTarget::Method { .. } => harvest_path_for_fun_decl(llbc, fd),
+        crate::model::CallTarget::FunctionPath {
+            segments,
+            specialization,
+            ..
+        } => {
+            let leaf = segments
+                .last()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| registered_leaf(llbc, fd));
+            identity_path_for_fun_decl(llbc, fd, &leaf, *specialization)
+        }
+        _ => registered_path_for_fun_decl(llbc, fd),
     };
-    crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &leaf))
+    target.with_resolved_path(path)
 }
 
 /// The `()` type expected by drop glue.

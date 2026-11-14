@@ -7718,7 +7718,7 @@ fn trait_impl_for_ref_selects_on_double_ref_receiver() {
 fn spec_segments_distinguishes_scalar_trait_impls() {
     // `CallControl.graphs_from`: `impl PartialOrd<char> for char` and
     // `impl PartialOrd<i64> for i64` are distinct function objects.
-    // `name_path` is `cmp::impls::<Impl>::le` for both; the impl's
+    // `name_path` is `core::cmp::impls::<Impl>::le` for both; the impl's
     // trait ref and Self type is the identity (`Bookkeeper.getdesc`).
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
@@ -7799,13 +7799,25 @@ fn spec_segments_distinguishes_scalar_trait_impls() {
     assert_ne!(char_path, i64_path);
     assert_eq!(super::fundecl_fn_item_segments(&llbc, char_le), char_path);
     assert_eq!(super::fundecl_fn_item_segments(&llbc, i64_le), i64_path);
-    assert_eq!(
-        super::registered_path_for_fun_decl(&llbc, char_le).segments,
-        char_path
+    let char_unique = super::registered_path_for_fun_decl(&llbc, char_le).segments;
+    let i64_unique = super::registered_path_for_fun_decl(&llbc, i64_le).segments;
+    assert_ne!(char_unique, i64_unique);
+    assert_ne!(char_unique, char_path);
+    assert!(
+        char_unique.iter().any(|s| s == "core"),
+        "unique path keeps the crate Ident: {char_unique:?}"
     );
-    assert_eq!(
-        super::registered_path_for_fun_decl(&llbc, i64_le).segments,
-        i64_path
+    assert!(
+        char_unique
+            .iter()
+            .any(|s| s == &format!("<impl {char_identity}>")),
+        "unique path keeps the impl identity: {char_unique:?}"
+    );
+    assert!(
+        i64_unique
+            .iter()
+            .any(|s| s == &format!("<impl {i64_identity}>")),
+        "unique path keeps the impl identity: {i64_unique:?}"
     );
     let mut char_fn =
         crate::front::semantic::SemanticFunction::with_empty_graph("le", "le", None, None, None);
@@ -7827,6 +7839,267 @@ fn spec_segments_distinguishes_scalar_trait_impls() {
         super::semantic_function_dedup_key(&char_fn),
         super::semantic_function_dedup_key(&char_other_artifact)
     );
+}
+
+/// `[Impl{Trait}, Ident{getitem}, Builtin{VTableMethod}]` keeps `getitem`
+/// between the impl identity and `{vtable_method}`.
+#[test]
+fn spec_segments_keeps_ident_before_vtable_method() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let owner_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics.clone(), "builtin": null}
+    });
+    let owner_ty = serde_json::json!({"Value": [0, owner_adt.clone()]});
+    let owner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![
+            ident("fixture"), ident("celldict"), ident("Owner")
+        ]),
+        "kind": {"Struct": []}
+    });
+    let vtable = |def_id: u64, method: &str| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("fixture"),
+                ident("celldict"),
+                ident("Owner"),
+                serde_json::json!({"Impl": {"Trait": 0}}),
+                ident(method),
+                serde_json::json!({"Builtin": ["VTableMethod", 0]}),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [owner_ty.clone()],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": "Opaque"
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [null, vtable(1, "getitem"), vtable(2, "setitem")],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![
+                    ident("fixture"), ident("dict"), ident("DictStrategy")
+                ]),
+                "methods": [{"skip_binder": {"name": "getitem"}}]
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {"types": [owner_adt]}
+                },
+                "methods": []
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let getitem = llbc.fn_by_id(1).expect("getitem vtable");
+    let setitem = llbc.fn_by_id(2).expect("setitem vtable");
+    let getitem_path = super::registered_path_for_fun_decl(&llbc, getitem).segments;
+    let setitem_path = super::registered_path_for_fun_decl(&llbc, setitem).segments;
+    assert_eq!(
+        getitem_path.last().map(String::as_str),
+        Some("{vtable_method}")
+    );
+    assert!(
+        getitem_path.iter().any(|s| s == "getitem"),
+        "getitem Ident dropped: {getitem_path:?}"
+    );
+    assert!(
+        setitem_path.iter().any(|s| s == "setitem"),
+        "setitem Ident dropped: {setitem_path:?}"
+    );
+    assert!(!getitem_path.iter().any(|s| s.starts_with('@')));
+    assert_ne!(getitem_path, setitem_path);
+}
+
+/// Ancestor Impl Self types `a::Foo` and `b::Foo` share the last path
+/// component `Foo` and the same last Impl (`parent::Foo`). Rendering each
+/// Impl from its payload keeps the paths distinct.
+#[test]
+fn spec_segments_distinguishes_impls_that_share_a_self_leaf() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str, n: u64| serde_json::json!({"Ident": [s, n]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics.clone(), "builtin": null}
+        })
+    };
+    let ty = |id: u64| serde_json::json!({"Value": [id, adt(id)]});
+    let inherent = |id: u64| {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": ty(id),
+            "kind": "InherentImplBlock"
+        }}})
+    };
+    let td = |id: u64, name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "kind": {"Struct": []}
+        })
+    };
+    let method = |def_id: u64, ancestor: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("parent", 0),
+                ident("Foo", 0),
+                inherent(ancestor),
+                ident("nested", 0),
+                inherent(0),
+                ident("m", 0),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": "Opaque"
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                td(0, vec![ident("parent", 0), ident("Foo", 0)]),
+                td(1, vec![ident("a", 0), ident("Foo", 0)]),
+                td(2, vec![ident("b", 0), ident("Foo", 0)]),
+            ],
+            "fun_decls": [null, method(1, 1), method(2, 2)],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let a = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(1).expect("a::Foo")).segments;
+    let b = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(2).expect("b::Foo")).segments;
+    assert_ne!(a, b, "a::Foo vs b::Foo collapsed: {a:?}");
+    assert!(
+        a.iter().any(|s| s.contains("a::Foo")),
+        "a::Foo missing: {a:?}"
+    );
+    assert!(
+        b.iter().any(|s| s.contains("b::Foo")),
+        "b::Foo missing: {b:?}"
+    );
+    assert!(!a.iter().any(|s| s.starts_with('@')));
+    assert!(!b.iter().any(|s| s.starts_with('@')));
+}
+
+/// Nested closure inside an inherent method: parent Ident `#N` is part of
+/// the FunDecl name and stays in the path.
+#[test]
+fn spec_segments_keeps_disambiguated_parent_of_nested_closure() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str, n: u64| serde_json::json!({"Ident": [s, n]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let owner_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics, "builtin": null}
+    });
+    let owner_ty = serde_json::json!({"Value": [0, owner_adt.clone()]});
+    let inherent = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": owner_ty,
+        "kind": "InherentImplBlock"
+    }}});
+    let owner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![
+            ident("fixture", 0), ident("method_owner", 0), ident("OWNER", 0)
+        ]),
+        "kind": {"Struct": []}
+    });
+    let closure = |def_id: u64, parent_n: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("fixture", 0),
+                ident("method_owner", 0),
+                ident("OWNER", parent_n),
+                inherent.clone(),
+                ident("method", 0),
+                ident("closure", 0),
+                ident("call", 0),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": "Opaque"
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [null, closure(1, 2), closure(2, 3)],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let a = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(1).expect("OWNER#2")).segments;
+    let b = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(2).expect("OWNER#3")).segments;
+    assert_ne!(a, b, "OWNER#2 vs OWNER#3 collapsed: {a:?} {b:?}");
+    assert!(a.iter().any(|s| s == "OWNER#2"), "OWNER#2 missing: {a:?}");
+    assert!(b.iter().any(|s| s == "OWNER#3"), "OWNER#3 missing: {b:?}");
 }
 
 /// Inherent `Owner::setitem` and `impl Store for Owner { fn setitem }`
@@ -8029,9 +8302,16 @@ fn first_call_binding(graph: &crate::model::FunctionGraph) -> (Option<u64>, Vec<
             ),
             CallTarget::FunctionPath {
                 segments,
+                resolved_path,
                 fun_decl_id,
                 ..
-            } => (*fun_decl_id, segments.clone()),
+            } => (
+                *fun_decl_id,
+                resolved_path
+                    .as_ref()
+                    .map(|path| path.segments.clone())
+                    .unwrap_or_else(|| segments.clone()),
+            ),
             other => panic!("expected a FunDecl call, got {other:?}"),
         };
     }
@@ -8070,14 +8350,28 @@ fn spec_segments_distinguishes_inherent_and_trait_impl_methods() {
     assert_ne!(inherent_path, trait_path);
     assert!(!inherent_path.iter().any(|s| s.starts_with("<impl ")));
     assert!(trait_path.iter().any(|s| s.starts_with("<impl ")));
+    let inherent_unique = super::registered_path_for_fun_decl(&llbc, inherent).segments;
+    let trait_unique = super::registered_path_for_fun_decl(&llbc, trait_impl).segments;
     assert_eq!(
-        super::registered_path_for_fun_decl(&llbc, inherent).segments,
-        inherent_path
+        inherent_unique,
+        vec![
+            "fixture".to_string(),
+            "celldict".to_string(),
+            "Owner".to_string(),
+            "setitem".to_string(),
+        ]
     );
     assert_eq!(
-        super::registered_path_for_fun_decl(&llbc, trait_impl).segments,
-        trait_path
+        trait_unique,
+        vec![
+            "fixture".to_string(),
+            "celldict".to_string(),
+            "<Impl>".to_string(),
+            format!("<impl {identity}>"),
+            "setitem".to_string(),
+        ]
     );
+    assert_ne!(inherent_unique, trait_unique);
 
     let inherent_graph =
         crate::test_support::lower_function(&llbc, "call_inherent").expect("lower call_inherent");
@@ -8308,8 +8602,8 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
     );
     assert_eq!(super::impl_method_owner_for_fundecl(&llbc, outer), None);
     assert_eq!(super::impl_method_owner_for_fundecl(&llbc, inner), None);
-    let outer_path = super::registered_path_for_fun_decl(&llbc, outer).segments;
-    let inner_path = super::registered_path_for_fun_decl(&llbc, inner).segments;
+    let outer_path = super::fundecl_fn_item_segments(&llbc, outer);
+    let inner_path = super::fundecl_fn_item_segments(&llbc, inner);
     assert_ne!(outer_path, inner_path);
     assert_eq!(
         outer_path,
@@ -8318,6 +8612,24 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
     assert_eq!(
         inner_path,
         super::trait_impl_identity_path("bytecode::_::<Impl>", "i64", "combine")
+    );
+    let outer_unique = super::registered_path_for_fun_decl(&llbc, outer).segments;
+    let inner_unique = super::registered_path_for_fun_decl(&llbc, inner).segments;
+    assert_ne!(outer_unique, inner_unique);
+    assert_ne!(outer_unique, outer_path);
+    assert_eq!(
+        outer_unique,
+        vec!["fixture", "bytecode", "_#5", "usize", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        inner_unique,
+        vec!["fixture", "bytecode", "_#5", "i64", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
 
     let mut outer_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
@@ -8340,13 +8652,13 @@ fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
         crate::front::mir::lower_fun_decl(&context, outer).expect("lower outer combine");
     let (callee_id, callee_path) = first_call_binding(&outer_graph);
     assert_eq!(callee_id, Some(2));
-    assert_eq!(callee_path, inner_path);
+    assert_eq!(callee_path, inner_unique);
 
     let caller_graph =
         crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
     let (caller_id, caller_path) = first_call_binding(&caller_graph);
     assert_eq!(caller_id, Some(2));
-    assert_eq!(caller_path, inner_path);
+    assert_eq!(caller_path, inner_unique);
 }
 
 fn unique_primitive_inherent_impl_fixture() -> Llbc {
@@ -8496,33 +8808,33 @@ fn spec_segments_keeps_unique_primitive_inherent_impl_name_path() {
         super::inherent_impl_callee_identity(&llbc, method, "combine"),
         None
     );
-    let registered = super::registered_path_for_fun_decl(&llbc, method).segments;
+    let harvest = super::fundecl_fn_item_segments(&llbc, method);
     assert_eq!(
-        registered,
+        harvest,
         vec!["bytecode", "_", "<Impl>", "combine"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
     assert!(
-        !registered
+        !harvest
             .iter()
             .any(|s| crate::front::mir::is_trait_impl_identity_segment(s))
+    );
+    let registered = super::registered_path_for_fun_decl(&llbc, method).segments;
+    assert_eq!(
+        registered,
+        vec!["fixture", "bytecode", "_#5", "i64", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
 
     let caller_graph =
         crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
     let (callee_id, callee_path) = first_call_binding(&caller_graph);
     assert_eq!(callee_id, Some(1));
-    assert_eq!(
-        callee_path,
-        method
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(callee_path, registered);
 }
 
 #[test]

@@ -609,12 +609,13 @@ pub(in crate::front::mir) fn impl_atomic_alias_leaf(
 }
 
 /// Path segments used to *call* a function named by a `FnDef` constant or
-/// type — the same spelling `decode_constant` stores in a function-item
-/// value and `call_target_segments` emits for a direct call.  The leaf is
-/// [`instance_leaf`] when Charon instantiated the declaration, matching
-/// [`registered_path_for_fun_decl`] (`FunctionDesc.cachedgraph`).
+/// type — the same harvest spelling `decode_constant` stores in a
+/// function-item value and `call_target_segments` emits for a direct
+/// call.  The leaf is [`instance_leaf`] when Charon instantiated the
+/// declaration (`FunctionDesc.cachedgraph`). Unique identity lives on
+/// [`registered_path_for_fun_decl`].
 pub(in crate::front::mir) fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
-    registered_path_for_fun_decl(llbc, fd).segments
+    spec_segments(llbc, fd, &registered_leaf(llbc, fd))
 }
 
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
@@ -4682,6 +4683,7 @@ pub(crate) fn unichr_call(arg: Variable) -> OpKind {
     OpKind::Call {
         target: CallTarget::FunctionPath {
             segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },
@@ -14591,9 +14593,10 @@ pub(in crate::front::mir) enum IntoDevirt {
     /// The reflexive `impl<T> From<T> for T` was selected — the call
     /// is a `T -> T` identity conversion.
     Identity,
-    /// A concrete `impl From<T> for U` was selected; the segments are
-    /// its `from` function's path.
-    Target(Vec<String>),
+    /// A concrete `impl From<T> for U` was selected. `segments` are that
+    /// `from` function's harvest path (`spec_segments`); `fn_id` is the
+    /// FunDecl stamp uses (`Bookkeeper.getdesc` of this `from`).
+    Target { segments: Vec<String>, fn_id: u64 },
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to

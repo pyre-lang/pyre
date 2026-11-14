@@ -30894,6 +30894,7 @@ fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
         .filter(|segments| {
             crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
                 segments: (*segments).clone(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             })
@@ -33903,6 +33904,7 @@ pub(in crate::front::mir) fn push_fn_const(
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },

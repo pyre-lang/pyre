@@ -72,6 +72,12 @@ pub struct SemanticFunction {
     /// lowered from. Threaded onto `FunctionGraph` so `CallControl`
     /// resolves a call site by decl identity rather than a name suffix.
     pub fun_decl_id: Option<u64>,
+    /// Occupancy key of the source function object (`scope_owner_identity`).
+    /// `None` on synthetic test graphs.
+    pub funcobj_identity: Option<String>,
+    /// Call-path segments [`crate::front::mir::registered_path_for_fun_decl`]
+    /// emits for this declaration. Empty on synthetic test graphs.
+    pub call_segments: Vec<String>,
     /// Module path of the defining file, crate-stripped (e.g.
     /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
     /// `front::mir` from the module portion of Charon's `name_path()`.
@@ -162,6 +168,8 @@ impl SemanticFunction {
             trait_impl_id: None,
             trait_impl_identity: None,
             fun_decl_id: None,
+            funcobj_identity: None,
+            call_segments: Vec::new(),
             module_path: String::new(),
             hints: Vec::new(),
             trait_root,
@@ -1888,6 +1896,8 @@ mod tests {
             trait_impl_id: None,
             trait_impl_identity: None,
             fun_decl_id: None,
+            funcobj_identity: None,
+            call_segments: Vec::new(),
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,

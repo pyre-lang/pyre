@@ -384,6 +384,7 @@ fn rewire_one_slice_index_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -421,6 +422,7 @@ fn rewire_one_slice_index_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -993,6 +995,7 @@ mod tests {
                 "<Impl>".into(),
                 "index".into(),
             ],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1018,6 +1021,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1184,6 +1188,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1199,6 +1204,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1253,6 +1259,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "push".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1369,6 +1376,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["vec".into(), "Vec".into(), "push".into()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -1436,6 +1444,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["util".into(), "get".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1513,6 +1522,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1528,6 +1538,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1740,6 +1751,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1935,6 +1947,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".into(), "opaque".into(), "mutator".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2736,6 +2749,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },

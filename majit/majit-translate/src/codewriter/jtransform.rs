@@ -8582,6 +8582,7 @@ impl<'a> Transformer<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: path.segments.clone(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -11342,6 +11343,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -11371,6 +11373,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -11398,6 +11401,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -11425,6 +11429,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -11450,6 +11455,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -12091,6 +12097,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21941,11 +21948,13 @@ mod tests {
     fn function_path_override_matches_only_its_own_segmentation() {
         let split = CallTarget::FunctionPath {
             segments: vec!["core".into(), "ptr".into(), "null".into()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let unsplit = CallTarget::FunctionPath {
             segments: vec!["core::ptr".into(), "null".into()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
@@ -21998,11 +22007,13 @@ mod tests {
     fn override_census_names_an_entry_that_matched_nothing() {
         let live = CallTarget::FunctionPath {
             segments: vec!["__probe135".into(), "live".into(), "leaf".into()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let inert = CallTarget::FunctionPath {
             segments: vec!["__probe135::inert".into(), "leaf".into()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
@@ -41380,6 +41391,7 @@ mod tests {
                             "gc_hook".into(),
                             "try_gc_alloc_nursery_raw".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -43437,6 +43449,7 @@ mod tests {
                         "listobject".into(),
                         "int_ll_newlist".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },

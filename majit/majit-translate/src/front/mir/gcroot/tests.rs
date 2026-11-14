@@ -572,6 +572,7 @@ fn root_scope_drop_is_classified_and_live() {
                 "eval".to_string(),
                 "frame_anchor_release".to_string(),
             ],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },
