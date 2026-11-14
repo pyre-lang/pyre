@@ -3735,6 +3735,16 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
     {
         return trait_impl_identity_path(module, &identity, leaf);
     }
+    // Inherent impl Self has no TypeDecl, so `impl_method_owner_for_fundecl`
+    // declines. `ItemMeta::name_path` renders every impl as `<Impl>`, and
+    // two methods of the same leaf in sibling inherent impls share that
+    // path. `spec_fn_name` / `scope_owner_impl_seg` spell Self from the
+    // Impl payload (`spec_type_name`); `Bookkeeper.getdesc` keys on the
+    // function object, and this identity is that spelling. A unique
+    // primitive method keeps the `<Impl>` token std matchers read.
+    if let Some(identity) = inherent_impl_callee_identity(llbc, fd, leaf) {
+        return trait_impl_identity_path(module, &identity, leaf);
+    }
     // Same key `free_function_alias_paths` registers: the module portion
     // of `name_path` is one segment when it contains `<Impl>`, not a
     // split of that token.
@@ -3745,6 +3755,64 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
     };
     segments.push(leaf.to_string());
     segments
+}
+
+/// Self type of an inherent impl, spelled from that Impl segment's
+/// payload. `None` for a trait impl (`trait_impl_id_for_fundecl`) and
+/// when the payload does not name a type. `Bookkeeper.getdesc` keys on
+/// the function object; `spec_fn_name` uses the same `spec_type_name`.
+///
+/// [`inherent_impl_callee_identity`] is the callee-key form used by
+/// both [`spec_segments`] and the function header: a bodyful template
+/// whose `name_path` is shared by another FunDecl. A Charon instance
+/// is already unique via `spec_leaf` (`FunDecl` id). A unique
+/// primitive method, and a bodyless foreign residual, keep the
+/// `<Impl>` token std matchers read. `leaf` is the spelled leaf, so a
+/// translator spec does not take this path.
+pub(in crate::front::mir) fn inherent_impl_callee_identity(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    leaf: &str,
+) -> Option<String> {
+    if instance_leaf(llbc, fd).is_some() {
+        return None;
+    }
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        return None;
+    }
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let (module, path_leaf) = stripped.rsplit_once("::")?;
+    if module.is_empty() || path_leaf != leaf {
+        return None;
+    }
+    let identity = inherent_impl_self_identity(llbc, fd)?;
+    let path = fd.item_meta.name_path_str();
+    llbc.iter_fun_decls()
+        .any(|other| other.def_id != fd.def_id && other.item_meta.name_path_str() == path)
+        .then_some(identity)
+}
+
+pub(in crate::front::mir) fn inherent_impl_self_identity(
+    llbc: &Llbc,
+    fd: &FunDecl,
+) -> Option<String> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|segment| matches!(segment, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_seg = &segs[last_idx - 1];
+    if !impl_seg.is_impl() || impl_seg.impl_trait_id().is_some() {
+        return None;
+    }
+    let ty = impl_seg.impl_ty_skip_binder()?;
+    let spelling = crate::front::clause_spec::spec_type_name(ty, llbc, 0, false);
+    if spelling.is_empty() || spelling == "?dedup" {
+        return None;
+    }
+    Some(spelling)
 }
 
 /// The `CallPath` `lib.rs` registers for this FunDecl: the same

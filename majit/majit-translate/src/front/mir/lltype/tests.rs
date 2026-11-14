@@ -8091,6 +8091,468 @@ fn spec_segments_distinguishes_inherent_and_trait_impl_methods() {
     assert_eq!(trait_bound, trait_path);
 }
 
+/// Two inherent impls in one anonymous const block share `name_path`
+/// (`ItemMeta::name_path` renders every impl as `<Impl>`). Charon
+/// records two FunDeclIds; `Bookkeeper.getdesc` keys on the function
+/// object. The inner call must bind the inner declaration.
+fn colliding_inherent_impl_fixture() -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str, n: u64| serde_json::json!({"Ident": [s, n]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let inherent = |self_ty: &serde_json::Value| {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": self_ty.clone(),
+            "kind": "InherentImplBlock"
+        }}})
+    };
+    let method_name = |self_ty: serde_json::Value| {
+        vec![
+            ident("fixture", 0),
+            ident("bytecode", 0),
+            ident("_", 5),
+            inherent(&self_ty),
+            ident("combine", 0),
+        ]
+    };
+    let method_locals = |self_ty: &serde_json::Value| {
+        serde_json::json!([
+            {"index": 0, "name": null, "span": span.clone(), "ty": self_ty.clone()},
+            {"index": 1, "name": "self", "span": span.clone(), "ty": self_ty.clone()},
+            {"index": 2, "name": "other", "span": span.clone(), "ty": self_ty.clone()}
+        ])
+    };
+    let inner = serde_json::json!({
+        "def_id": 2,
+        "item_meta": meta(method_name(i64_ty.clone())),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [i64_ty.clone(), i64_ty.clone()],
+            "output": i64_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span.clone(),
+            "locals": {"arg_count": 2, "locals": method_locals(&i64_ty)},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "Return"}
+            }]
+        }}
+    });
+    let outer = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(method_name(usize_ty.clone())),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [usize_ty.clone(), usize_ty.clone()],
+            "output": usize_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span.clone(),
+            "locals": {"arg_count": 2, "locals": method_locals(&usize_ty)},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {
+                        "span": span.clone(),
+                        "kind": {
+                            "Call": {
+                                "call": {
+                                    "func": {
+                                        "Regular": {
+                                            "kind": {"Fun": 2},
+                                            "generics": {
+                                                "regions": [],
+                                                "types": [],
+                                                "const_generics": [],
+                                                "trait_refs": []
+                                            }
+                                        }
+                                    },
+                                    "args": [
+                                        {"Read": {
+                                            "kind": {"Local": 1},
+                                            "ty": usize_ty.clone()
+                                        }},
+                                        {"Read": {
+                                            "kind": {"Local": 2},
+                                            "ty": usize_ty.clone()
+                                        }}
+                                    ]
+                                },
+                                "dest": {
+                                    "kind": {"Local": 0},
+                                    "ty": usize_ty.clone()
+                                },
+                                "target": 2,
+                                "on_unwind": 1
+                            }
+                        }
+                    }
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture", 0), ident("call_inner", 0)]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [i64_ty.clone(), i64_ty.clone()],
+            "output": i64_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span.clone(),
+            "locals": {"arg_count": 2, "locals": method_locals(&i64_ty)},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {
+                        "span": span.clone(),
+                        "kind": {
+                            "Call": {
+                                "call": {
+                                    "func": {
+                                        "Regular": {
+                                            "kind": {"Fun": 2},
+                                            "generics": {
+                                                "regions": [],
+                                                "types": [],
+                                                "const_generics": [],
+                                                "trait_refs": []
+                                            }
+                                        }
+                                    },
+                                    "args": [
+                                        {"Read": {
+                                            "kind": {"Local": 1},
+                                            "ty": i64_ty.clone()
+                                        }},
+                                        {"Read": {
+                                            "kind": {"Local": 2},
+                                            "ty": i64_ty.clone()
+                                        }}
+                                    ]
+                                },
+                                "dest": {
+                                    "kind": {"Local": 0},
+                                    "ty": i64_ty.clone()
+                                },
+                                "target": 2,
+                                "on_unwind": 1
+                            }
+                        }
+                    }
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [caller, outer, inner],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("colliding inherent impl fixture parses")
+}
+
+#[test]
+fn spec_segments_distinguishes_inherent_impls_that_share_name_path() {
+    let llbc = colliding_inherent_impl_fixture();
+    let outer = llbc.fn_by_id(1).expect("outer combine");
+    let inner = llbc.fn_by_id(2).expect("inner combine");
+    assert_eq!(outer.item_meta.name_path(), inner.item_meta.name_path());
+    assert_eq!(
+        outer.item_meta.name_path(),
+        "fixture::bytecode::_::<Impl>::combine"
+    );
+    assert_eq!(super::impl_method_owner_for_fundecl(&llbc, outer), None);
+    assert_eq!(super::impl_method_owner_for_fundecl(&llbc, inner), None);
+    let outer_path = super::registered_path_for_fun_decl(&llbc, outer).segments;
+    let inner_path = super::registered_path_for_fun_decl(&llbc, inner).segments;
+    assert_ne!(outer_path, inner_path);
+    assert_eq!(
+        outer_path,
+        super::trait_impl_identity_path("bytecode::_::<Impl>", "usize", "combine")
+    );
+    assert_eq!(
+        inner_path,
+        super::trait_impl_identity_path("bytecode::_::<Impl>", "i64", "combine")
+    );
+
+    let mut outer_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
+        "combine", "combine", None, None, None,
+    );
+    outer_fn.module_path = "bytecode::_::<Impl>".to_string();
+    outer_fn.trait_impl_identity = Some("usize".to_string());
+    let mut inner_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
+        "combine", "combine", None, None, None,
+    );
+    inner_fn.module_path = "bytecode::_::<Impl>".to_string();
+    inner_fn.trait_impl_identity = Some("i64".to_string());
+    assert_ne!(
+        super::semantic_function_dedup_key(&outer_fn),
+        super::semantic_function_dedup_key(&inner_fn)
+    );
+
+    let context = crate::front::mir::LowerContext::new(&llbc);
+    let outer_graph =
+        crate::front::mir::lower_fun_decl(&context, outer).expect("lower outer combine");
+    let (callee_id, callee_path) = first_call_binding(&outer_graph);
+    assert_eq!(callee_id, Some(2));
+    assert_eq!(callee_path, inner_path);
+
+    let caller_graph =
+        crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
+    let (caller_id, caller_path) = first_call_binding(&caller_graph);
+    assert_eq!(caller_id, Some(2));
+    assert_eq!(caller_path, inner_path);
+}
+
+fn unique_primitive_inherent_impl_fixture() -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str, n: u64| serde_json::json!({"Ident": [s, n]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let inherent = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": i64_ty.clone(),
+        "kind": "InherentImplBlock"
+    }}});
+    let method_name = vec![
+        ident("fixture", 0),
+        ident("bytecode", 0),
+        ident("_", 5),
+        inherent,
+        ident("combine", 0),
+    ];
+    let method_locals = serde_json::json!([
+        {"index": 0, "name": null, "span": span.clone(), "ty": i64_ty.clone()},
+        {"index": 1, "name": "self", "span": span.clone(), "ty": i64_ty.clone()},
+        {"index": 2, "name": "other", "span": span.clone(), "ty": i64_ty.clone()}
+    ]);
+    let method = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(method_name),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [i64_ty.clone(), i64_ty.clone()],
+            "output": i64_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span.clone(),
+            "locals": {"arg_count": 2, "locals": method_locals},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture", 0), ident("call_inner", 0)]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [i64_ty.clone(), i64_ty.clone()],
+            "output": i64_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span.clone(),
+            "locals": {"arg_count": 2, "locals": serde_json::json!([
+                {"index": 0, "name": null, "span": span.clone(), "ty": i64_ty.clone()},
+                {"index": 1, "name": "self", "span": span.clone(), "ty": i64_ty.clone()},
+                {"index": 2, "name": "other", "span": span.clone(), "ty": i64_ty.clone()}
+            ])},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {
+                        "span": span.clone(),
+                        "kind": {
+                            "Call": {
+                                "call": {
+                                    "func": {
+                                        "Regular": {
+                                            "kind": {"Fun": 1},
+                                            "generics": {
+                                                "regions": [],
+                                                "types": [],
+                                                "const_generics": [],
+                                                "trait_refs": []
+                                            }
+                                        }
+                                    },
+                                    "args": [
+                                        {"Read": {
+                                            "kind": {"Local": 1},
+                                            "ty": i64_ty.clone()
+                                        }},
+                                        {"Read": {
+                                            "kind": {"Local": 2},
+                                            "ty": i64_ty.clone()
+                                        }}
+                                    ]
+                                },
+                                "dest": {
+                                    "kind": {"Local": 0},
+                                    "ty": i64_ty.clone()
+                                },
+                                "target": 2,
+                                "on_unwind": 1
+                            }
+                        }
+                    }
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span.clone(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [caller, method],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("unique primitive inherent impl fixture parses")
+}
+
+#[test]
+fn spec_segments_keeps_unique_primitive_inherent_impl_name_path() {
+    let llbc = unique_primitive_inherent_impl_fixture();
+    let method = llbc.fn_by_id(1).expect("combine");
+    assert_eq!(
+        method.item_meta.name_path(),
+        "fixture::bytecode::_::<Impl>::combine"
+    );
+    assert_eq!(super::impl_method_owner_for_fundecl(&llbc, method), None);
+    assert_eq!(
+        super::inherent_impl_callee_identity(&llbc, method, "combine"),
+        None
+    );
+    let registered = super::registered_path_for_fun_decl(&llbc, method).segments;
+    assert_eq!(
+        registered,
+        vec!["bytecode", "_", "<Impl>", "combine"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !registered
+            .iter()
+            .any(|s| crate::front::mir::is_trait_impl_identity_segment(s))
+    );
+
+    let caller_graph =
+        crate::test_support::lower_function(&llbc, "call_inner").expect("lower call_inner");
+    let (callee_id, callee_path) = first_call_binding(&caller_graph);
+    assert_eq!(callee_id, Some(1));
+    assert_eq!(
+        callee_path,
+        method
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn num_impl_method_leaf_skips_inherent_identity() {
+    let owned = |segs: &[&str]| segs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        crate::front::mir::num_impl_method_leaf(&owned(&["core", "num", "<Impl>", "wrapping_sub"])),
+        Some("wrapping_sub")
+    );
+    assert_eq!(
+        crate::front::mir::num_impl_method_leaf(&owned(&[
+            "num",
+            "<Impl>",
+            "<impl i64>",
+            "wrapping_sub"
+        ])),
+        Some("wrapping_sub")
+    );
+    assert_eq!(
+        crate::front::checked_arith::checked_arith_callee_leaf(&CallTarget::function_path([
+            "core",
+            "num",
+            "<Impl>",
+            "<impl i64>",
+            "checked_add",
+        ])),
+        Some("checked_add")
+    );
+}
+
 /// Foreign payload-enum associated fn whose FunDecl is Opaque (the
 /// owner crate is not extracted) while the TypeDecl is a full Enum.
 /// Mirrors `majit_gc::GcAllocOutcome::from_hook`: one non-`self`

@@ -399,6 +399,29 @@ pub(crate) fn is_trait_impl_identity_segment(segment: &str) -> bool {
     segment.starts_with("<impl ") && segment.ends_with('>')
 }
 
+/// `segments` with [`is_trait_impl_identity_segment`] entries removed.
+/// Std matchers keyed on Charon's `"<Impl>"` token still see that
+/// spelling after [`spec_segments`] stamps Self (`Bookkeeper.getdesc`).
+pub(crate) fn path_without_impl_identity(segments: &[String]) -> Vec<&str> {
+    segments
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !is_trait_impl_identity_segment(s))
+        .collect()
+}
+
+/// Leaf of a `core::num::<Impl>::{leaf}` call, including the
+/// crate-stripped `num::<Impl>::{leaf}` spelling `spec_segments`
+/// emits. Identity segments are skipped, so a colliding primitive
+/// method keeps the leaf its matcher reads.
+pub(crate) fn num_impl_method_leaf(segments: &[String]) -> Option<&str> {
+    match path_without_impl_identity(segments).as_slice() {
+        ["core", .., "num", "<Impl>", leaf] => Some(*leaf),
+        ["num", "<Impl>", leaf] => Some(*leaf),
+        _ => None,
+    }
+}
+
 pub(crate) fn absorb_semantic_program(
     merged: &mut Option<crate::front::semantic::SemanticProgram>,
     prog: crate::front::semantic::SemanticProgram,
@@ -3614,8 +3637,19 @@ impl SemanticFunctionHeader {
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
         let trait_impl_id = trait_impl_id_for_fundecl(fd);
-        let trait_impl_identity =
-            trait_impl_id.and_then(|id| crate::front::clause_spec::render_trait_impl(llbc, id));
+        let trait_impl_identity = trait_impl_id
+            .and_then(|id| crate::front::clause_spec::render_trait_impl(llbc, id))
+            .or_else(|| {
+                // Inherent non-ADT Self: the same identity `spec_segments`
+                // stamps, so `CallControl.graphs_from` / `Bookkeeper.getdesc`
+                // keep one graph per function object when `name_path` shares
+                // `<Impl>`. `name` is the spelled leaf, so a translator
+                // spec (`spec_leaf`) does not take this path.
+                self_ty_root
+                    .is_none()
+                    .then(|| inherent_impl_callee_identity(llbc, fd, &name))
+                    .flatten()
+            });
         let fn_path = if module_path.is_empty() {
             name.clone()
         } else {
