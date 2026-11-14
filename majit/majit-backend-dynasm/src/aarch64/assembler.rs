@@ -75,6 +75,11 @@ const CALL_FRAME_SIZE: u32 = 64;
 /// `aarch64/callbuilder.py` `write_real_errno` adds `self.current_sp`.
 const SAVED_THREADLOCAL_OFS: u32 = 48;
 
+/// `tlfield_nursery_free` / `tlfield_nursery_top` byte offsets. Adjacent
+/// words; compiled bumps load them off the frame's `threadlocal_addr`.
+const NURSERY_FREE_OFS: u32 = majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as u32;
+const NURSERY_TOP_OFS: u32 = majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS as u32;
+
 const _: () = assert!(
     CALL_FRAME_SIZE.is_multiple_of(16),
     "aarch64 SP stays 16-byte aligned"
@@ -406,10 +411,13 @@ pub(crate) fn build_malloc_slowpath_fixed(
         let ofs = float_base + reg.value as u32 * WORD as u32;
         dynasm!(mc ; .arch aarch64 ; ldr D(reg.value), [x29, ofs]);
     }
-    let (nf_addr, _) = crate::runner::dynasm_nursery_addrs();
-    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, nf_addr as i64);
+    // This helper's `sub sp, 16` LR slot sits below the compiled entry
+    // frame, so `saved_threadlocal_addr` is `SAVED_THREADLOCAL_OFS + 16`
+    // (`write_real_errno` adding `current_sp`).
+    let tls_ofs = SAVED_THREADLOCAL_OFS + 16;
     dynasm!(mc ; .arch aarch64
-        ; ldr x1, [x16]
+        ; ldr x16, [sp, tls_ofs]
+        ; ldr x1, [x16, NURSERY_FREE_OFS]
         ; ldr x30, [sp]
         ; add sp, sp, 16
         ; ret
@@ -1112,6 +1120,13 @@ impl<'a> AssemblerARM64<'a> {
             Some(at) => type_index.opref_type_at(opref, at),
             None => type_index.opref_type(opref),
         }
+    }
+
+    /// Load `pypy_threadlocal_s` from `saved_threadlocal_addr` into x16.
+    fn load_threadlocal_base_to_x16(&mut self) {
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x16, [sp, #SAVED_THREADLOCAL_OFS]
+        );
     }
 
     /// assembler.py:54 __init__
@@ -3801,11 +3816,11 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Reg(sizeloc)) => *sizeloc,
                     _ => panic!("CallMallocNurseryVarsizeFrame expects register size arg"),
                 };
-                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let nursery_bound = crate::runner::dynasm_nursery_is_bound();
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
 
-                if nf_addr == 0 || nt_addr == 0 {
+                if !nursery_bound {
                     if sizeloc.value != 0 {
                         dynasm!(self.mc ; .arch aarch64 ; mov x0, X(sizeloc.value));
                     }
@@ -3818,19 +3833,17 @@ impl<'a> AssemblerARM64<'a> {
                         sizeloc
                     };
                     let gc_header_size = majit_gc::header::GcHeader::SIZE as u32;
-                    self.emit_mov_imm64(0, nf_addr as i64);
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]);
+                    self.load_threadlocal_base_to_x16();
+                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16, NURSERY_FREE_OFS]);
                     dynasm!(self.mc ; .arch aarch64 ; add x1, x0, X(size_reg.value));
                     dynasm!(self.mc ; .arch aarch64 ; add x1, x1, gc_header_size);
-                    self.emit_mov_imm64(16, nt_addr as i64);
                     dynasm!(self.mc ; .arch aarch64
-                        ; ldr x16, [x16]
-                        ; cmp x1, x16
+                        ; ldr x17, [x16, NURSERY_TOP_OFS]
+                        ; cmp x1, x17
                         ; b.hi =>slow_path
                     );
-                    self.emit_mov_imm64(16, nf_addr as i64);
                     dynasm!(self.mc ; .arch aarch64
-                        ; str x1, [x16]
+                        ; str x1, [x16, NURSERY_FREE_OFS]
                         ; str xzr, [x0]
                         ; add x0, x0, gc_header_size
                         ; b =>done
@@ -3838,7 +3851,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
 
                 dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
-                if nf_addr != 0 && nt_addr != 0 {
+                if nursery_bound {
                     // `malloc_cond_varsize_frame`: each probe only loads its
                     // gcmap and calls the one `_build_malloc_slowpath('fixed')`
                     // body cached on the CPU.  x0/x1 still carry old/new
@@ -3911,10 +3924,10 @@ impl<'a> AssemblerARM64<'a> {
                 // by regalloc.  Only the two failing comparisons enter the
                 // collecting helper; a short array commits the bump, stamps
                 // its tid, and returns the payload directly.
-                let (nf_addr, nt_addr) = if headerless {
-                    crate::runner::dynasm_headerless_nursery_addrs()
+                let nursery_bound = if headerless {
+                    crate::runner::dynasm_headerless_nursery_is_bound()
                 } else {
-                    crate::runner::dynasm_nursery_addrs()
+                    crate::runner::dynasm_nursery_is_bound()
                 };
                 let max_young = crate::runner::dynasm_max_size_of_young_obj();
                 let slow_path = self.mc.new_dynamic_label();
@@ -3940,7 +3953,7 @@ impl<'a> AssemblerARM64<'a> {
                         || base_size as usize + majit_gc::header::GcHeader::SIZE
                             >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
                 );
-                if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+                if !nursery_bound || max_length == 0 {
                     dynasm!(self.mc ; .arch aarch64 ; b =>slow_path);
                 } else {
                     match arglocs.first() {
@@ -3963,8 +3976,8 @@ impl<'a> AssemblerARM64<'a> {
                         ; cmp x1, x16
                         ; b.hi =>slow_path
                     );
-                    self.emit_mov_imm64(0, nf_addr as i64);
-                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]);
+                    self.load_threadlocal_base_to_x16();
+                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16, NURSERY_FREE_OFS]);
                     self.emit_mov_imm64(16, itemsize);
                     dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x16);
                     self.emit_mov_imm64(16, base_size + header_size + 7);
@@ -3974,14 +3987,13 @@ impl<'a> AssemblerARM64<'a> {
                         ; and x1, x1, x16
                         ; add x1, x1, x0
                     );
-                    self.emit_mov_imm64(16, nt_addr as i64);
+                    self.load_threadlocal_base_to_x16();
                     dynasm!(self.mc ; .arch aarch64
-                        ; ldr x16, [x16]
-                        ; cmp x1, x16
+                        ; ldr x17, [x16, NURSERY_TOP_OFS]
+                        ; cmp x1, x17
                         ; b.hi =>slow_path
                     );
-                    self.emit_mov_imm64(16, nf_addr as i64);
-                    dynasm!(self.mc ; .arch aarch64 ; str x1, [x16]);
+                    dynasm!(self.mc ; .arch aarch64 ; str x1, [x16, NURSERY_FREE_OFS]);
                     if headerless {
                         dynasm!(self.mc ; .arch aarch64 ; b =>done);
                     } else {
@@ -6395,13 +6407,12 @@ impl<'a> AssemblerARM64<'a> {
     /// emission fences pending setfields before the allocation, so a collector
     /// that walks the interpreter's own structures finds roots that are
     /// current. A collector that is not headerless-aware
-    /// (`dynasm_headerless_nursery_addrs`) gets the residual call alone.
+    /// (`dynasm_headerless_nursery_is_bound`) gets the residual call alone.
     fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: u32 = 16;
 
-        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_headerless_nursery_is_bound() {
             self.genop_call_with_arglocs(op, arglocs);
             return;
         }
@@ -6440,17 +6451,14 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
         dynasm!(self.mc ; .arch aarch64 ; =>bump);
-        self.emit_mov_imm64(16, nf_addr as i64); // x16 = &nursery_free
+        self.load_threadlocal_base_to_x16();
         dynasm!(self.mc ; .arch aarch64
-            ; ldr x17, [x16]                        // x17 = base = *nursery_free
+            ; ldr x17, [x16, NURSERY_FREE_OFS]      // x17 = base = *nursery_free
             ; add x14, x17, NURSERY_ALLOC_NODE_SIZE // x14 = newf = base + 16
-        );
-        self.emit_mov_imm64(15, nt_addr as i64); // x15 = &nursery_top
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x15, [x15]                        // x15 = top = *nursery_top
+            ; ldr x15, [x16, NURSERY_TOP_OFS]       // x15 = top = *nursery_top
             ; cmp x14, x15                          // newf vs top
             ; b.hi =>slow_path                      // newf > top -> exhausted
-            ; str x14, [x16]                        // *nursery_free = newf
+            ; str x14, [x16, NURSERY_FREE_OFS]      // *nursery_free = newf
         );
         dynasm!(self.mc ; .arch aarch64 ; =>init);
         // Init node fields; value/next loaded from ORIGINAL arglocs (no pre-clobber).
@@ -6942,11 +6950,7 @@ impl<'a> AssemblerARM64<'a> {
             )
         });
         let gc_hdr = majit_gc::header::GcHeader::SIZE as i64;
-        // gc.py:525-531 — read nursery slot addresses from the active GC
-        // descriptor (cpu.gc_ll_descr.get_nursery_free_addr() parity), not
-        // from a process-global singleton.
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_nursery_is_bound() {
             self.emit_mov_imm64(0, total_size);
             self.emit_mov_imm64(
                 2,
@@ -6960,8 +6964,8 @@ impl<'a> AssemblerARM64<'a> {
         // aarch64/assembler.py malloc_cond uses only x0/x1 plus the reserved IP
         // scratch registers.  Keep x2..x13 available to regalloc on the fast
         // path; the collecting slow path spills/restores them below.
-        self.emit_mov_imm64(16, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
+        self.load_threadlocal_base_to_x16();
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16, NURSERY_FREE_OFS]);
 
         if total_size < 4096 {
             let ts = total_size as u32;
@@ -6971,18 +6975,18 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(17, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, NURSERY_TOP_OFS]);
         dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        // Fast path: x16 still holds &nursery_free; bump it and return the
-        // payload pointer. `gen_initialize_tid` writes the whole header word.
+        // Fast path: x16 still holds the threadlocal base; bump nursery_free
+        // and return the payload pointer. `gen_initialize_tid` writes the
+        // whole header word.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x16]      // *nursery_free = new_free
+            ; str x1, [x16, NURSERY_FREE_OFS]
         );
         let hs = gc_hdr as u32;
         dynasm!(self.mc ; .arch aarch64
@@ -7015,7 +7019,7 @@ impl<'a> AssemblerARM64<'a> {
     /// over its own object arena supplies.  A headered collector such as
     /// MiniMarkGC must never back this op: its nursery walk reads a `GcHeader`
     /// at `base - GcHeader::SIZE`, which a raw base lacks.
-    /// `dynasm_headerless_nursery_addrs` answers no nursery for such a
+    /// `dynasm_headerless_nursery_is_bound` answers no nursery for such a
     /// collector, so the op goes straight to the slowpath, where
     /// `alloc_nursery_headerless`'s panicking default fails loudly.
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op) {
@@ -7023,8 +7027,7 @@ impl<'a> AssemblerARM64<'a> {
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
             panic!("CallMallocNurseryHeaderless size must be a ConstInt; got {size_ref:?}")
         });
-        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_headerless_nursery_is_bound() {
             self.emit_mov_imm64(0, size);
             self.emit_mov_imm64(
                 2,
@@ -7036,10 +7039,9 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         // As in upstream malloc_cond, x0/x1 are the only managed registers
-        // clobbered by the fast path; nursery addresses live in reserved IP
-        // scratch registers.
-        self.emit_mov_imm64(16, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
+        // clobbered by the fast path; the threadlocal base lives in x16.
+        self.load_threadlocal_base_to_x16();
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16, NURSERY_FREE_OFS]);
 
         if size < 4096 {
             let sz = size as u32;
@@ -7049,28 +7051,17 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        // When the allocator reports the top slot immediately after the free
-        // slot, reuse x16 as the address base; allocators that keep the two
-        // slots independent retain the general path.
-        if nt_addr == nf_addr.wrapping_add(std::mem::size_of::<usize>()) {
-            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, 8]);
-        } else {
-            self.emit_mov_imm64(17, nt_addr as i64);
-            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
-        }
+        dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, NURSERY_TOP_OFS]);
         dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        // x16 still holds nf_addr from the load above: the intervening add,
-        // top load, compare, and branch only write x0, x1, x17, and flags.
-        // Keep that address live on the fast arm instead of materializing the
-        // same 64-bit constant a second time.  The slow arm has its own call
-        // sequence and does not join at this store.
+        // x16 still holds the threadlocal base: the intervening add, top
+        // load, compare, and branch only write x0, x1, x17, and flags.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x16]      // *nursery_free = new_free
+            ; str x1, [x16, NURSERY_FREE_OFS]
             ; b =>done
         );
 

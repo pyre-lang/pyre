@@ -1,5 +1,5 @@
 use super::{
-    DecodedConst, bitflags_trait_empty_const, co_fast_flags_const, decode_literal,
+    ConstLit, DecodedConst, bitflags_trait_empty_const, co_fast_flags_const, decode_literal,
     is_class_pytype_assoc_const, primitive_float_const, scalar_to_const_value, static_key_segments,
 };
 
@@ -163,6 +163,154 @@ fn named_const_merge_restarts_when_a_crate_repeats() {
     super::merge_named_const_folds("pyre_object", one("pyre_object::A", 1));
     assert!(super::named_const_fold_for_path("pyre_object::A").is_some());
     assert!(super::named_const_fold_for_path("pyre_interpreter::B").is_none());
+}
+
+#[test]
+fn harvest_named_const_folds_included_foreign_literal() {
+    let path = ["foreign", "THREADLOCAL_WORDS"];
+    let llbc = const_artifact(
+        "caller",
+        serde_json::json!([null, init_fun(1, &path, literal_init_body("33"))]),
+        serde_json::json!([
+            null,
+            named_const_global(
+                1,
+                &path,
+                "pub const THREADLOCAL_WORDS: u32 = 33;",
+                false,
+                "NamedConst",
+                1
+            )
+        ]),
+    );
+    let harvested = super::harvest_named_const_folds(&llbc);
+    assert_eq!(
+        harvested.get("foreign::THREADLOCAL_WORDS"),
+        Some(&OpKind::ConstUInt(33)),
+        "an --include'd foreign NamedConst with a translated literal init must harvest: {harvested:?}"
+    );
+}
+
+#[test]
+fn const_eval_overflow_intrinsic_folds_mul_with_overflow() {
+    let llbc = const_artifact(
+        "core",
+        serde_json::json!([
+            null,
+            {
+                "def_id": 1,
+                "item_meta": item_meta_json(
+                    &["core", "intrinsics", "mul_with_overflow"],
+                    "",
+                    false
+                ),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [usize_ty(), usize_ty()],
+                    "output": usize_ty()
+                },
+                "body": "Opaque"
+            }
+        ]),
+        serde_json::json!([null]),
+    );
+    assert!(matches!(
+        super::const_eval_overflow_intrinsic(&llbc, 1, &[ConstLit::UInt(25), ConstLit::UInt(8)]),
+        Some(ConstLit::CheckedUInt(200, false))
+    ));
+    assert!(super::const_eval_overflow_intrinsic(&llbc, 1, &[ConstLit::UInt(25)]).is_none());
+}
+
+#[test]
+fn harvest_named_const_folds_included_foreign_overflow_init() {
+    let ty = usize_ty();
+    let init_path = ["foreign", "TLFIELD_OFS"];
+    let pair_local = serde_json::json!({"kind": {"Local": 1}, "ty": ty});
+    let init_body = serde_json::json!({"Unstructured": {
+        "span": span_json(),
+        "locals": {"arg_count": 0, "locals": [
+            {"index": 0, "name": null, "span": span_json(), "ty": ty},
+            {"index": 1, "name": null, "span": span_json(), "ty": ty}
+        ]},
+        "body": [{
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span_json(), "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {
+                        "kind": {"Fun": 1},
+                        "generics": {
+                            "regions": [],
+                            "types": [ty],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    }},
+                    "args": [
+                        {"Const": unsigned_usize_const("25")},
+                        {"Const": unsigned_usize_const("8")}
+                    ]
+                },
+                "dest": {"kind": {"Local": 1}, "ty": ty},
+                "target": 2,
+                "on_unwind": 1
+            }}}
+        }, {
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span_json(), "kind": "UnwindResume"}
+        }, {
+            "statements": [{
+                "span": span_json(),
+                "kind": {"Assign": [
+                    {"kind": {"Local": 0}, "ty": ty},
+                    {"Use": [{"Read": {
+                        "kind": {"Projection": [pair_local, {"Field": [null, 0]}]},
+                        "ty": ty
+                    }}, "No"]}
+                ]}
+            }],
+            "kind": "Regular",
+            "terminator": {"span": span_json(), "kind": "Return"}
+        }]
+    }});
+    let llbc = const_artifact(
+        "caller",
+        serde_json::json!([
+            null,
+            {
+                "def_id": 1,
+                "item_meta": item_meta_json(
+                    &["core", "intrinsics", "mul_with_overflow"],
+                    "",
+                    false
+                ),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [ty, ty],
+                    "output": ty
+                },
+                "body": "Opaque"
+            },
+            init_usize_fun(2, &init_path, init_body)
+        ]),
+        serde_json::json!([
+            null,
+            named_usize_const_global(
+                1,
+                &init_path,
+                "pub const TLFIELD_OFS: usize = 25 * 8;",
+                false,
+                2
+            )
+        ]),
+    );
+    let harvested = super::harvest_named_const_folds(&llbc);
+    assert_eq!(
+        harvested.get("foreign::TLFIELD_OFS"),
+        Some(&OpKind::ConstUInt(200)),
+        "an --include'd foreign NamedConst whose init is mul_with_overflow must harvest: {harvested:?}"
+    );
 }
 
 #[test]

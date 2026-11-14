@@ -1146,11 +1146,6 @@ static NEXT_MINIMARK_ID: AtomicUsize = AtomicUsize::new(1);
 pub struct MiniMarkGC {
     /// The nursery (young generation).
     nursery: Nursery,
-    /// gc.py:525-531 published nursery-top slot read by generated inline
-    /// allocation paths. The atomic publishes limit changes to generated code
-    /// and Rust-side readers. The Box keeps its baked address stable even if
-    /// the containing GC value moves.
-    published_nursery_top: Box<AtomicUsize>,
     /// The old generation.
     oldgen: OldGen,
     /// Type registry for tracing objects.
@@ -1547,10 +1542,8 @@ impl MiniMarkGC {
                     .checked_div(config.large_object_threshold.saturating_mul(2))
                     .unwrap_or(0)
             });
-        let published_nursery_top = Box::new(AtomicUsize::new(nursery.top_ptr() as usize));
         let mut gc = MiniMarkGC {
             nursery,
-            published_nursery_top,
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             jitframe_type_id: None,
@@ -1651,11 +1644,36 @@ impl MiniMarkGC {
         gc
     }
 
-    /// Refresh the gc.py:525-531 published nursery-top slot from the real
-    /// allocator bound.
-    fn refresh_published_nursery_top(&mut self) {
-        self.published_nursery_top
-            .store(self.nursery.top_ptr() as usize, Ordering::Release);
+    /// Copy the live cursor onto this thread's `tlfield_nursery_*` words.
+    pub fn claim_this_thread_cursor(&mut self) {
+        let me = crate::threadlocal::threadlocal_nursery_ptrs();
+        unsafe { self.nursery.claim_cursor(me) };
+        crate::threadlocal::note_cursor_owner();
+        crate::republish_singleton_bump(self);
+    }
+
+    /// Return the live cursor to the GC-owned fallback pair.
+    pub fn release_cursor_to_fallback(&mut self) {
+        self.nursery.release_to_fallback();
+        crate::republish_singleton_bump(self);
+    }
+
+    /// Address of the live cursor words.
+    pub fn nursery_cursor(&self) -> *mut crate::nursery::NurseryPtrs {
+        self.nursery.cursor()
+    }
+
+    /// The live cursor is the GC-owned fallback pair.
+    pub fn nursery_cursor_is_fallback(&self) -> bool {
+        self.nursery.cursor_is_fallback()
+    }
+
+    fn debug_assert_cursor_owner(&self) {
+        debug_assert!(
+            self.nursery.cursor_is_fallback()
+                || self.nursery.cursor() == crate::threadlocal::threadlocal_nursery_ptrs(),
+            "collection must run on the cursor owner or the fallback pair"
+        );
     }
 
     // ── incminimark.py card_marking_words_for_length card marking geometry ──
@@ -2580,7 +2598,6 @@ impl MiniMarkGC {
                 self.nursery.set_top_ptr(next_top as *const u8);
                 self.nursery.set_free_ptr(next_free as *mut u8);
             }
-            self.refresh_published_nursery_top();
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
                 return ptr;
@@ -4288,7 +4305,6 @@ impl MiniMarkGC {
                 (*header_of(obj_addr)).clear_flag(GcFlags::GCFLAG_PINNED_OBJECT_PARENT_KNOWN)
             };
         }
-        self.refresh_published_nursery_top();
 
         // incminimark.py `_minor_collection`: `if self.DEBUG >= 2` — the whole
         // heap is walked, so it is gated a level above the rotating nurseries
@@ -4332,6 +4348,7 @@ impl MiniMarkGC {
     /// 2. Advance the incremental major until both target invariants hold.
     /// 3. Schedule rawrefcount work queued by either collection.
     pub fn do_collect_nursery(&mut self) {
+        self.debug_assert_cursor_owner();
         let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
@@ -9794,6 +9811,7 @@ impl MiniMarkGC {
     /// 2. Mark phase: trace all roots and transitively mark reachable objects.
     /// 3. Sweep phase: free all unmarked old-gen objects.
     pub fn do_collect_full(&mut self) {
+        self.debug_assert_cursor_owner();
         let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
@@ -11481,7 +11499,11 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn nursery_top_addr(&self) -> usize {
-        self.published_nursery_top.as_ptr() as usize
+        self.nursery.top_addr()
+    }
+
+    fn claim_nursery_cursor(&mut self) {
+        self.claim_this_thread_cursor();
     }
 
     fn malloc_fast_bump_addrs(&self) -> Option<(usize, usize, usize)> {
@@ -12225,9 +12247,9 @@ mod tests {
             "allocation resumes at the start of the arena now installed"
         );
         assert_eq!(
-            gc.published_nursery_top.load(Ordering::Relaxed),
+            unsafe { *(gc.nursery_top_addr() as *const usize) },
             after + gc.nursery.size(),
-            "compiled code reads the published top, which must follow"
+            "compiled code reads the live top word, which must follow"
         );
     }
 
@@ -13104,7 +13126,7 @@ mod tests {
         gc.do_add_memory_pressure(1, GcRef::NULL);
         assert_eq!(gc.nursery.free_ptr().cast_const(), top);
         assert_eq!(
-            gc.published_nursery_top.load(Ordering::Acquire),
+            unsafe { *(gc.nursery_top_addr() as *const usize) },
             top as usize
         );
         gc.roots.clear();
@@ -13780,7 +13802,7 @@ mod tests {
         assert!(gc.is_in_nursery(result.0));
         assert!(result.0 < pinned.0);
         assert_eq!(
-            unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }.load(Ordering::Acquire),
+            unsafe { *(gc.nursery_top_addr() as *const usize) },
             pinned.0 - GcHeader::SIZE,
             "compiled allocators must stop at the same pinned barrier",
         );
@@ -14207,22 +14229,17 @@ mod tests {
         let mut gc = test_gc(4096);
         gc.register_type(TypeInfo::simple(16));
 
-        let published_addr = gc.nursery_top_addr();
+        let addr = gc.nursery_top_addr();
         let real_top = gc.nursery_top() as usize;
-        assert_eq!(
-            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
-            real_top
-        );
+        assert_eq!(unsafe { *(addr as *const usize) }, real_top);
 
-        // Prove the collection reset republishes the real limit instead of
-        // merely leaving the construction-time value untouched.
-        unsafe { &*(published_addr as *const AtomicUsize) }.store(0, Ordering::Release);
+        // Prove the collection reset restores the real limit into the live
+        // top word instead of merely leaving the construction-time value
+        // untouched.
+        unsafe { *(addr as *mut usize) = 0 };
         gc.collect_nursery();
-        assert_eq!(gc.nursery_top_addr(), published_addr);
-        assert_eq!(
-            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
-            real_top
-        );
+        assert_eq!(gc.nursery_top_addr(), addr);
+        assert_eq!(unsafe { *(addr as *const usize) }, real_top);
 
         let obj = gc.alloc_nursery(16);
         assert!(!obj.is_null());

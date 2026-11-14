@@ -50,6 +50,10 @@ CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # Opaque, so the named-const harvest has no literal. `majit_jitcode::rffi`
 # holds the `rffi.py` `RFFI_*` flags `rposix._errno_before` /
 # `_errno_after` test, module globals the flow space folds upstream.
+# `majit_gc::threadlocal` holds the `rthread.py` `ThreadLocalField` offsets
+# (`TLFIELD_*_OFS`, `THREADLOCAL_WORDS`) that `threadlocalref_get` /
+# `get_saved_errno` read, module-level constants the flow space folds
+# upstream.
 # Charon name-matcher `--include` of `core` methods whose bodies would
 # otherwise stay `opacity: Foreign` / `body: "Opaque"`. Pattern shape
 # matches `libc::_`: `item::_` is subitems only. Inherent-impl methods
@@ -244,6 +248,12 @@ CHARON_ARGS = [
     "libc::_",
     "--include",
     "majit_jitcode::rffi::_",
+    # `majit_gc::threadlocal` holds the `rthread.py` `ThreadLocalField` offsets
+    # (`TLFIELD_*_OFS`, `THREADLOCAL_WORDS`) that `threadlocalref_get` /
+    # `get_saved_errno` read, module-level constants the flow space folds
+    # upstream.
+    "--include",
+    "majit_gc::threadlocal::_",
     # `rustpython_compiler_core::bytecode` items a crate reaches otherwise
     # stay `opacity: Foreign` / `body: "Opaque"`, so the front end could
     # only hand-lower calls into them. `item::_` translates the reached

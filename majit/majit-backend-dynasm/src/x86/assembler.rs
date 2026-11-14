@@ -711,6 +711,35 @@ mod tests {
         assert_eq!(emitted(asm), expected);
     }
 
+    /// `load_threadlocal_base_to_scratch` writes r11 from `[rsp+THREADLOCAL_OFS]`.
+    /// That value is not the immediate `_load_scratch` last recorded
+    /// (`_call_header_shadowstack` `heap(rst)`). `push_gcmap` must then
+    /// `MOV r11, gcmap`, not `LEA r11, [r11+(gcmap-rst)]`.
+    #[test]
+    fn load_threadlocal_base_forgets_scratch_before_push_gcmap() {
+        let mut asm = bare_assembler();
+        let rst = 0x7fe5_e880_84e0_i64;
+        asm.mc._load_scratch(rst);
+        assert_eq!(asm.mc.get_scratch_register_known_value(), rst);
+        asm.load_threadlocal_base_to_scratch();
+        assert_eq!(asm.mc.get_scratch_register_known_value(), -1);
+        let gcmap = 0x7fe5_d832_8050_usize;
+        assert!(
+            super::rx86::fits_in_32bits((gcmap as i64).wrapping_sub(rst)),
+            "gcmap must be a 32-bit LEA from rst so a stale cache would fire"
+        );
+        asm.push_gcmap(gcmap as *mut usize);
+        let code = emitted(asm);
+        let mut suffix = vec![0x49, 0xBB];
+        suffix.extend_from_slice(&(gcmap as u64).to_le_bytes());
+        let ofs = super::JF_GCMAP_OFS;
+        suffix.extend_from_slice(&[0x4C, 0x89, 0x5D, ofs as u8]);
+        assert!(
+            code.ends_with(&suffix),
+            "push_gcmap after the threadlocal load must MOV r11, gcmap; code={code:02x?}"
+        );
+    }
+
     /// `genop_discard_gc_store_indexed` with the `ImmedLoc` index that
     /// `make_sure_var_in_reg` returns for a `ConstInt`: `AddressLoc` folds
     /// `index << scale` into the displacement. A size-1 store from a register
@@ -7172,6 +7201,37 @@ impl<'a> Assembler386<'a> {
         );
     }
 
+    /// Load this thread's `pypy_threadlocal_s` from the frame slot
+    /// `THREADLOCAL_OFS` into `X86_64_SCRATCH_REG` (r11).
+    ///
+    /// `_call_header` stored the second argument there. The MOV goes
+    /// through `LocationCodeBuilder` so a write of r11 runs
+    /// `forget_scratch_register` (`regloc.py` `INSN`: a MOV whose
+    /// destination is the scratch register). The loaded value is a
+    /// runtime pointer; `_load_scratch` / `push_gcmap` would otherwise
+    /// emit `LEA r11, [r11+d]` from a stale cached immediate such as
+    /// `get_root_stack_top_addr` from `_call_header_shadowstack`.
+    fn load_threadlocal_base_to_scratch(&mut self) {
+        self.mc.MOV(
+            Operand::R(crate::regloc::X86_64_SCRATCH_REG.value),
+            Operand::S(THREADLOCAL_OFS as i32),
+        );
+    }
+
+    fn nursery_free_mem() -> Operand {
+        Operand::M(
+            crate::regloc::X86_64_SCRATCH_REG.value,
+            majit_gc::threadlocal::TLFIELD_NURSERY_FREE_OFS as i64,
+        )
+    }
+
+    fn nursery_top_mem() -> Operand {
+        Operand::M(
+            crate::regloc::X86_64_SCRATCH_REG.value,
+            majit_gc::threadlocal::TLFIELD_NURSERY_TOP_OFS as i64,
+        )
+    }
+
     /// assembler.py `genop_math_sqrt`: `SQRTSD(arglocs[0], resloc)`.
     /// `_consider_math_sqrt` force-results into the source register, so the
     /// input already sits in `resloc`.
@@ -7198,13 +7258,12 @@ impl<'a> Assembler386<'a> {
     /// emission fences pending setfields before the allocation, so a collector
     /// that walks the interpreter's own structures finds roots that are
     /// current. A collector that is not headerless-aware
-    /// (`dynasm_headerless_nursery_addrs`) gets the residual call alone.
+    /// (`dynasm_headerless_nursery_is_bound`) gets the residual call alone.
     fn genop_nursery_alloc_inline_x86(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: i32 = 16;
 
-        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_headerless_nursery_is_bound() {
             self.genop_call_with_arglocs(op, arglocs);
             return;
         }
@@ -7247,8 +7306,6 @@ impl<'a> Assembler386<'a> {
         let base_reg = picked[2].value;
         let new_free_reg = picked[3].value;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        let nf = nf_addr as i64;
-        let nt = nt_addr as i64;
 
         let value_dst = Loc::Reg(crate::regloc::RegLoc::new(value_reg, false));
         let next_dst = Loc::Reg(crate::regloc::RegLoc::new(next_reg, false));
@@ -7293,17 +7350,20 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
         ; =>bump
         );
-        self.mc.MOV(Operand::R(base_reg), heap(nf)); // base = *nursery_free
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Operand::R(base_reg), Self::nursery_free_mem()); // base = *nursery_free
         rx86::lea_rm(
             &mut self.mc,
             new_free_reg,
             (base_reg, NURSERY_ALLOC_NODE_SIZE),
         );
-        self.mc.CMP(Operand::R(new_free_reg), heap(nt));
+        self.mc
+            .CMP(Operand::R(new_free_reg), Self::nursery_top_mem());
         dynasm!(self.mc ; .arch x64
                     ; ja =>slow_path
         );
-        self.mc.MOV(heap(nf), Operand::R(new_free_reg)); // *nursery_free = base + 16
+        self.mc
+            .MOV(Self::nursery_free_mem(), Operand::R(new_free_reg)); // *nursery_free = base + 16
         self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64
                     ; =>init
@@ -7823,10 +7883,10 @@ impl<'a> Assembler386<'a> {
             _ => rx86::ECX,
         };
         let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Operand::R(rx86::ECX), Self::nursery_free_mem());
         rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, total_size as i32));
-        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
+        self.mc.CMP(Operand::R(rx86::EDX), Self::nursery_top_mem());
         let mut sp = self.begin_slow_path(
             Some(CC_A),
             SlowPathKind::MallocCond {
@@ -7835,7 +7895,8 @@ impl<'a> Assembler386<'a> {
                 synthesize: None,
             },
         );
-        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Self::nursery_free_mem(), Operand::R(rx86::EDX));
         rx86::lea_rm(
             &mut self.mc,
             result_reg,
@@ -7871,8 +7932,7 @@ impl<'a> Assembler386<'a> {
         }
         let gc_header_size = majit_gc::header::GcHeader::SIZE as i32;
         let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_nursery_is_bound() {
             let mut sp = self.begin_slow_path(
                 None,
                 SlowPathKind::MallocCond {
@@ -7885,13 +7945,14 @@ impl<'a> Assembler386<'a> {
             self.pending_slowpaths.push(sp);
             return;
         }
-        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Operand::R(rx86::ECX), Self::nursery_free_mem());
         rx86::lea_ra(
             &mut self.mc,
             rx86::EDX,
             (i16::from(rx86::ECX), sv, 0, gc_header_size),
         );
-        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
+        self.mc.CMP(Operand::R(rx86::EDX), Self::nursery_top_mem());
         let mut sp = self.begin_slow_path(
             Some(CC_A),
             SlowPathKind::MallocCond {
@@ -7900,7 +7961,8 @@ impl<'a> Assembler386<'a> {
                 synthesize: None,
             },
         );
-        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Self::nursery_free_mem(), Operand::R(rx86::EDX));
         // `gen_initialize_tid_keep_flags` stores only the type-id half.
         // Clear the whole header word on this fast path so a recycled
         // nursery slot cannot keep `GCFLAG_HAS_SHADOW`, `GCFLAG_PINNED`,
@@ -7944,7 +8006,6 @@ impl<'a> Assembler386<'a> {
             }
         };
         let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
         let max_young = crate::runner::dynasm_max_size_of_young_obj();
         let max_length = max_young.saturating_sub(2 * WORD);
         let slow_kind = || SlowPathKind::MallocCondVarsize {
@@ -7955,7 +8016,7 @@ impl<'a> Assembler386<'a> {
             type_id,
             lengthloc,
         };
-        if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+        if !crate::runner::dynasm_nursery_is_bound() || max_length == 0 {
             let mut sp = self.begin_slow_path(None, slow_kind());
             self.set_continue_here(&mut sp);
             self.pending_slowpaths.push(sp);
@@ -7975,7 +8036,8 @@ impl<'a> Assembler386<'a> {
         self.mc.CMP(Operand::R(varsizeloc), imm(max_length as i64));
         let nursery_ja = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; ja =>nursery_ja);
-        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Operand::R(rx86::ECX), Self::nursery_free_mem());
         let shift = if crate::regalloc::valid_addressing_size(itemsize as usize) {
             crate::regalloc::get_scale(itemsize as usize)
         } else {
@@ -8000,11 +8062,13 @@ impl<'a> Assembler386<'a> {
         if force_realignment {
             rx86::and_ri(&mut self.mc, rx86::EDX, !(WORD as i32 - 1));
         }
-        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.CMP(Operand::R(rx86::EDX), Self::nursery_top_mem());
         dynasm!(self.mc ; .arch x64 ; =>nursery_ja);
         let mut sp = self.begin_slow_path(Some(CC_A), slow_kind());
         self.mc.MOV(Operand::M(rx86::ECX, 0), imm(type_id));
-        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Self::nursery_free_mem(), Operand::R(rx86::EDX));
         rx86::lea_rm(
             &mut self.mc,
             result_reg,
@@ -8032,13 +8096,12 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
             _ => 8,
         };
-        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         let max_young = crate::runner::dynasm_max_size_of_young_obj();
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         let max_length = max_young.saturating_sub(base_size as usize);
         debug_assert!(itemsize > 0);
-        if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+        if !crate::runner::dynasm_headerless_nursery_is_bound() || max_length == 0 {
             dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
             self.mc.forget_scratch_register();
         } else {
@@ -8065,7 +8128,8 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64
                                     ; ja =>slow_path
             );
-            self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
+            self.load_threadlocal_base_to_scratch();
+            self.mc.MOV(Operand::R(rx86::ECX), Self::nursery_free_mem());
             rx86::imul_ri(&mut self.mc, rx86::EDX, itemsize as i32);
             rx86::add_ri(&mut self.mc, rx86::EDX, (base_size + 7) as i32);
             dynasm!(self.mc ; .arch x64
@@ -8074,11 +8138,12 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64
                                     ; add rdx, rcx
             );
-            self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
+            self.load_threadlocal_base_to_scratch();
+            self.mc.CMP(Operand::R(rx86::EDX), Self::nursery_top_mem());
             dynasm!(self.mc ; .arch x64
                                     ; ja =>slow_path
             );
-            self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
+            self.mc.MOV(Self::nursery_free_mem(), Operand::R(rx86::EDX));
             dynasm!(self.mc ; .arch x64
                                     ; jmp =>done
 
@@ -8135,7 +8200,7 @@ impl<'a> Assembler386<'a> {
     /// over its own object arena supplies.  A headered collector such as
     /// MiniMarkGC must never back this op: its nursery walk reads a `GcHeader`
     /// at `base - GcHeader::SIZE`, which a raw base lacks.
-    /// `dynasm_headerless_nursery_addrs` answers no nursery for such a
+    /// `dynasm_headerless_nursery_is_bound` answers no nursery for such a
     /// collector, so the op goes straight to the slowpath, where
     /// `alloc_nursery_headerless`'s panicking default fails loudly.
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op, result_loc: Option<&Loc>) {
@@ -8143,14 +8208,11 @@ impl<'a> Assembler386<'a> {
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
             panic!("CallMallocNurseryHeaderless size must be a ConstInt; got {size_ref:?}")
         });
-        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
-        let nf = nf_addr as i64;
-        let nt = nt_addr as i64;
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
 
-        if nf_addr == 0 || nt_addr == 0 {
+        if !crate::runner::dynasm_headerless_nursery_is_bound() {
             // Mirror the headered inactive-nursery path without touching
             // `[nf]`: seed the slowpath's `rdx - rcx` size contract directly.
             dynasm!(self.mc ; .arch x64
@@ -8163,9 +8225,10 @@ impl<'a> Assembler386<'a> {
             );
             self.mc.forget_scratch_register();
         } else {
-            self.mc.MOV(Operand::R(rx86::ECX), heap(nf));
+            self.load_threadlocal_base_to_scratch();
+            self.mc.MOV(Operand::R(rx86::ECX), Self::nursery_free_mem());
             rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, size as i32));
-            self.mc.CMP(Operand::R(rx86::EDX), heap(nt));
+            self.mc.CMP(Operand::R(rx86::EDX), Self::nursery_top_mem());
 
             dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
         }
@@ -8174,7 +8237,8 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,
         };
-        self.mc.MOV(heap(nf), Operand::R(rx86::EDX));
+        self.load_threadlocal_base_to_scratch();
+        self.mc.MOV(Self::nursery_free_mem(), Operand::R(rx86::EDX));
         self.mc.MOV(Operand::R(result_reg), crate::regloc::ECX);
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
         self.mc.forget_scratch_register();

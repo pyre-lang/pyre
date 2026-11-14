@@ -1361,6 +1361,39 @@ impl<'a> Lowering<'a> {
                         fd.item_meta.name_path_str().ends_with("saturating_add"),
                     );
                 }
+                // Debug-MIR `a * b` is `mul_with_overflow` returning
+                // `(T, bool)`; the product is the same scalar
+                // `MulChecked` BinaryOp lowers to, so `.0` collapses
+                // onto this Variable and the overflow Assert is
+                // stripped (`TermKind::Assert`).
+                if args.len() == 2
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && let Some(op) = overflow_intrinsic_binop(fd.item_meta.name_path().as_str())
+                {
+                    let result_ty = first_arg_ty
+                        .as_ref()
+                        .map(|ty| self.value_type_of(ty))
+                        .unwrap_or(ValueType::Unsigned);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: op.to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty,
+                        },
+                    });
+                    self.binop_result_locals.insert(dest_local);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py); the rtyper folds the surviving
                 // `_we_are_jitted` symbolic to a constant True
@@ -4709,6 +4742,20 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         _ => {}
+                    }
+                }
+                // `llop.threadlocalref_addr` (`lloperation.py`;
+                // `llmodel.py` `threadlocalref_addr(llmemory.Address)`).
+                // Project the 0-arg call by path so that body is never
+                // walked, including when `--include` translates it.
+                // Get/store projection above is unchanged.
+                if args.is_empty()
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let path = fd.item_meta.name_path();
+                    if host_rthread_threadlocalref_llop(&path) == Some(ThreadLocalRefLlop::Addr) {
+                        return self.emit_threadlocalref_addr(mir_bb, dest_local, target);
                     }
                 }
                 // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.

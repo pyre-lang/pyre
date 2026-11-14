@@ -248,8 +248,13 @@ fn modified(self_obj: PyObjectRef) {
 /// the parameter `noalias readonly` and then store through it.
 fn getlock(self_obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
-    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
+    // A contended stripe wait may collect: pin the deque before the wait and reload after it.
+    let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(slot)) };
+    getlock_unlocked(pyre_object::gc_roots::shadow_stack_get(slot))
+}
+
+fn getlock_unlocked(self_obj: PyObjectRef) -> PyObjectRef {
     let base = self_obj as *mut W_Deque;
     if base.is_null() {
         return PY_NULL;
@@ -440,17 +445,19 @@ pub mod deque_iter {
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let deque = pyre_object::gc_roots::pin_root(deque);
+        let deque_slot = pyre_object::gc_roots::pin_roots(&[deque, block_obj]);
+        let block_slot = deque_slot + 1;
+        let lock = getlock(pyre_object::gc_roots::shadow_stack_get(deque_slot));
         W_DequeIter::allocate_stable(W_DequeIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            deque,
-            block: block_obj,
+            deque: pyre_object::gc_roots::shadow_stack_get(deque_slot),
+            block: pyre_object::gc_roots::shadow_stack_get(block_slot),
             index,
             counter,
-            lock: getlock(deque),
+            lock,
         })
     }
 
@@ -584,17 +591,19 @@ pub mod deque_rev_iter {
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let deque = pyre_object::gc_roots::pin_root(deque);
+        let deque_slot = pyre_object::gc_roots::pin_roots(&[deque, block_obj]);
+        let block_slot = deque_slot + 1;
+        let lock = getlock(pyre_object::gc_roots::shadow_stack_get(deque_slot));
         W_DequeRevIter::allocate_stable(W_DequeRevIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            deque,
-            block: block_obj,
+            deque: pyre_object::gc_roots::shadow_stack_get(deque_slot),
+            block: pyre_object::gc_roots::shadow_stack_get(block_slot),
             index,
             counter,
-            lock: getlock(deque),
+            lock,
         })
     }
 
@@ -992,6 +1001,69 @@ pub(crate) fn deque_repeat(
     }
 }
 
+fn reverse_unlocked(self_obj: PyObjectRef) {
+    let len = deque_len(self_obj);
+    for index in 0..(len >> 1) {
+        let (left_block, left_index) = locate(self_obj, index);
+        let (right_block, right_index) = locate(self_obj, len - index - 1);
+        let left = block_get(left_block, left_index);
+        let right = block_get(right_block, right_index);
+        block_set(left_block, left_index, right);
+        block_set(right_block, right_index, left);
+    }
+}
+
+fn getitem_unlocked(self_obj: PyObjectRef, idx: i64) -> Result<PyObjectRef, crate::PyError> {
+    check_index_under_guard(self_obj, idx)?;
+    let (block_obj, block_index) = locate(self_obj, idx);
+    Ok(block_get(block_obj, block_index))
+}
+
+fn setitem_unlocked(
+    self_obj: PyObjectRef,
+    idx: i64,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    check_index_under_guard(self_obj, idx)?;
+    let (block_obj, block_index) = locate(self_obj, idx);
+    block_set(block_obj, block_index, value);
+    Ok(())
+}
+
+fn rotate_unlocked(self_obj: PyObjectRef, n: i64) {
+    let mut items = snapshot(self_obj);
+    let len = items.len() as i64;
+    if len > 1 {
+        let shift = ((n % len) + len) % len;
+        if shift != 0 {
+            items.rotate_right(shift as usize);
+            store(self_obj, items);
+        }
+    }
+}
+
+fn insert_unlocked(
+    self_obj: PyObjectRef,
+    index: i64,
+    x: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let mut items = snapshot(self_obj);
+    if maxlen_bound(self_obj).is_some_and(|m| items.len() >= m) {
+        return Err(crate::PyError::index_error(
+            "deque already at its maximum size",
+        ));
+    }
+    let len = items.len() as i64;
+    let pos = if index < 0 {
+        (index + len).max(0)
+    } else {
+        index.min(len)
+    } as usize;
+    items.insert(pos, x);
+    store(self_obj, items);
+    Ok(())
+}
+
 // [3.14-spec] PyPy `W_Deque.typedef` owns the older constructor-oriented doc;
 // CPython 3.14 `_collectionsmodule.c` `deque_init__doc__` is the observable
 // type doc.  Keep PyPy's TypeDef owner and project only that string.
@@ -1230,20 +1302,11 @@ impl W_Deque {
         Ok(false)
     }
     fn reverse(&mut self) {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
         // `interp_deque.py reverse`: swap entries from both endpoints without
         // invalidating iterators. No Python runs inside the swap loop, so the
         // stripe covers the whole transition.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
-        let len = deque_len(self_obj);
-        for index in 0..(len >> 1) {
-            let (left_block, left_index) = locate(self_obj, index);
-            let (right_block, right_index) = locate(self_obj, len - index - 1);
-            let left = block_get(left_block, left_index);
-            let right = block_get(right_block, right_index);
-            block_set(left_block, left_index, right);
-            block_set(right_block, right_index, left);
-        }
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => reverse_unlocked(self_obj))
     }
     fn rotate(&mut self, n: Option<PyObjectRef>) -> Result<(), crate::PyError> {
         let mut self_obj = self as *mut W_Deque as PyObjectRef;
@@ -1257,17 +1320,7 @@ impl W_Deque {
         // and the stripe held across both is what stops a concurrent mutation
         // in between from being overwritten by the stale snapshot. No Python
         // runs from here on.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
-        let mut items = snapshot(self_obj);
-        let len = items.len() as i64;
-        if len <= 1 {
-            return Ok(());
-        }
-        let shift = ((n % len) + len) % len;
-        if shift != 0 {
-            items.rotate_right(shift as usize);
-            store(self_obj, items);
-        }
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => rotate_unlocked(self_obj, n));
         Ok(())
     }
     fn insert(&mut self, i: PyObjectRef, mut x: PyObjectRef) -> Result<(), crate::PyError> {
@@ -1278,24 +1331,7 @@ impl W_Deque {
         let index = pyre_object::with_roots!(self_obj, x => crate::builtins::getindex_w(i))?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
-        let mut items = snapshot(self_obj);
-        if maxlen_bound(self_obj).is_some_and(|m| items.len() >= m) {
-            return Err(crate::PyError::index_error(
-                "deque already at its maximum size",
-            ));
-        }
-        let len = items.len() as i64;
-        // list.insert clamping: a negative index counts from the end and an
-        // out-of-range index clamps to the near edge.
-        let pos = if index < 0 {
-            (index + len).max(0)
-        } else {
-            index.min(len)
-        } as usize;
-        items.insert(pos, x);
-        store(self_obj, items);
-        Ok(())
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj, x => insert_unlocked(self_obj, index, x))
     }
     fn index(
         &mut self,
@@ -1452,10 +1488,7 @@ impl W_Deque {
         // `locate` walks the chain and the caller then reads through the block
         // it returns, so the pair has to exclude a concurrent `store`. The
         // index conversion runs Python and stays outside.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
-        check_index_under_guard(self_obj, idx)?;
-        let (block_obj, block_index) = locate(self_obj, idx);
-        Ok(block_get(block_obj, block_index))
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => getitem_unlocked(self_obj, idx))
     }
     fn __setitem__(
         &mut self,
@@ -1468,18 +1501,18 @@ impl W_Deque {
         // and deliberately does not call `modified()`: deque iterators remain
         // valid and observe subsequently assigned elements (including after
         // pickle reconstruction).
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
-        check_index_under_guard(self_obj, idx)?;
-        let (block_obj, block_index) = locate(self_obj, idx);
-        block_set(block_obj, block_index, value);
-        Ok(())
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj, value => setitem_unlocked(self_obj, idx, value))
     }
     fn __delitem__(&mut self, index: PyObjectRef) -> Result<(), crate::PyError> {
         let mut self_obj = self as *mut W_Deque as PyObjectRef;
         let idx = pyre_object::with_roots!(self_obj => deque_index(index, self_obj))?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
+        // A contended stripe wait may collect: pin the deque before the wait and reload after it.
+        let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(slot)) };
+        let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
         check_index_under_guard(self_obj, idx as i64)?;
         let mut items = snapshot(self_obj);
         items.remove(idx);
@@ -1565,7 +1598,9 @@ impl W_Deque {
         // Nothing between the snapshot and the write-back runs Python, so the
         // whole read-modify-write fits under one stripe — without it a
         // concurrent `append` lands between them and is dropped by `store`.
-        let _deque_guard = unsafe { w_deque_lock(self_obj) };
+        // A contended stripe wait may collect: pin the deque before the wait and reload after it.
+        let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(roots)) };
+        let self_obj = pyre_object::gc_roots::shadow_stack_get(roots);
         let base = snapshot(self_obj);
         if base.is_empty() || num == 1 {
             return Ok(self_obj);

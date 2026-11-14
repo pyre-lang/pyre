@@ -28688,6 +28688,18 @@ mod tests {
             ),
             Some(crate::front::mir::ThreadLocalRefLlop::Store)
         );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_gc::threadlocal::threadlocalref_addr"
+            ),
+            Some(crate::front::mir::ThreadLocalRefLlop::Addr)
+        );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_rlib::rthread::threadlocalref_addr"
+            ),
+            None
+        );
 
         let mut cc = crate::call::CallControl::new();
         cc.register_macro_helper_trace_fnaddr("majit_metainterp::threadlocalref_get", 0xBEEF);
