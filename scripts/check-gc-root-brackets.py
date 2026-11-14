@@ -84,6 +84,8 @@ PATTERNS = [
      r"pins whose argument the body still reads afterwards: (?P<v>\d+)"),
     ("unbracketed_calls",
      r"unbracketed calls that can collect with a live PyObjectRef: (?P<v>\d+) in (?P<w>\d+) fn"),
+    ("unbracketed_if_host_malloc_collects",
+     r"unbracketed calls if host malloc collected: (?P<v>\d+) in (?P<w>\d+) fn"),
     ("unresolved_collecting_calls",
      r"counting unresolved dispatch as collecting too: (?P<v>\d+) in (?P<w>\d+) fn"),
     ("tier1_calls",
@@ -122,6 +124,7 @@ LIVENESS_KEYS = (
     "short_brackets",
     "unread_brackets",
     "stale_pins",
+    "unbracketed_if_host_malloc_collects",
     "unresolved_collecting_calls",
     "tier15_unresolved_calls",
 )
@@ -131,6 +134,8 @@ LIVENESS_SKIPPED = "liveness scan skipped"
 # record yet is unrecorded and fails until `--update` stores it.
 RATCHET = (
     "unbracketed_calls",
+    "unbracketed_if_host_malloc_collects",
+    "unbracketed_if_host_malloc_collects_fns",
     "frames_across_collecting",
     "brackets_reaching_no_collection",
     "short_brackets",
@@ -274,8 +279,11 @@ def parse(report: str) -> dict:
                 got[key] = 0
                 # The fn-count is the same line.  A skipped scan records it as
                 # zero too, matching the call count above.
-                if key == "unresolved_collecting_calls":
-                    got["unresolved_collecting_calls_fns"] = 0
+                if key in (
+                    "unresolved_collecting_calls",
+                    "unbracketed_if_host_malloc_collects",
+                ):
+                    got[key + "_fns"] = 0
                 continue
             sys.exit(
                 f"error: the analysis report has no `{key}` line after "

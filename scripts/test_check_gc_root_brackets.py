@@ -22,6 +22,7 @@ MODULE_NO_FRAME = """\
        of those withheld: 4 pin every live pointer, 1 are SHORT a root, 2 could not be read
    pins whose argument the body still reads afterwards: 0 (0 reading a local later addressed as a list/dict)
    unbracketed calls that can collect with a live PyObjectRef: 1 in 1 fn
+   unbracketed calls if host malloc collected: 6 in 2 fn
        counting unresolved dispatch as collecting too: 3 in 2 fn(s)
        tier 1 (callee IS a dispatch seed): 0 call(s) in 0 fn
        tier 1.5 (live ptr later addressed as list/dict): 0 call(s) in 0 fn
@@ -38,6 +39,7 @@ INTERPRETER_WITH_FRAMES = """\
        of those withheld: 4396 pin every live pointer, 297 are SHORT a root, 298 could not be read
    pins whose argument the body still reads afterwards: 4 (0 reading a local later addressed as a list/dict)
    unbracketed calls that can collect with a live PyObjectRef: 1 in 1 fn(s)
+   unbracketed calls if host malloc collected: 9 in 4 fn(s)
        counting unresolved dispatch as collecting too: 7452 in 1629 fn(s)
        tier 1 (callee IS a dispatch seed): 0 call(s) in 0 fn(s)
        tier 1.5 (live ptr later addressed as list/dict): 0 call(s) in 0 fn(s)
@@ -55,6 +57,7 @@ MODULE_WITH_LIVENESS = """\
        of those withheld: 1404 pin every live pointer, 131 are SHORT a root, 106 could not be read
    pins whose argument the body still reads afterwards: 0 (0 reading a local later addressed as a list/dict)
    unbracketed calls that can collect with a live PyObjectRef: 3 in 2 fn(s)
+   unbracketed calls if host malloc collected: 5 in 3 fn(s)
        counting unresolved dispatch as collecting too: 3479 in 482 fn(s)
        tier 1 (callee IS a dispatch seed): 0 call(s) in 0 fn(s)
        tier 1.5 (live ptr later addressed as list/dict): 0 call(s) in 0 fn(s)
@@ -87,6 +90,8 @@ class GcRootParseTests(unittest.TestCase):
     def test_module_without_frames_is_zero_frames_not_a_shape_error(self) -> None:
         got = CHECKER.parse(MODULE_NO_FRAME)
         self.assertEqual(got["unbracketed_calls"], 1)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects"], 6)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects_fns"], 2)
         self.assertEqual(got["frames_across_collecting"], 0)
         self.assertEqual(got["frame_tier1_calls"], 0)
         self.assertEqual(got["frames_unresolved_calls"], 0)
@@ -103,6 +108,8 @@ class GcRootParseTests(unittest.TestCase):
         self.assertEqual(got["stale_pins"], 0)
         self.assertEqual(got["unresolved_collecting_calls"], 0)
         self.assertEqual(got["unresolved_collecting_calls_fns"], 0)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects"], 0)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects_fns"], 0)
         self.assertEqual(got["tier15_unresolved_calls"], 0)
         self.assertEqual(got["frames_unresolved_calls"], 0)
         self.assertEqual(got["unbracketed_calls"], 0)
@@ -119,6 +126,8 @@ class RealReportParseTests(unittest.TestCase):
         self.assertEqual(got["stale_pins"], 4)
         self.assertEqual(got["unresolved_collecting_calls"], 7452)
         self.assertEqual(got["unresolved_collecting_calls_fns"], 1629)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects"], 9)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects_fns"], 4)
         self.assertEqual(got["tier15_unresolved_calls"], 3567)
         self.assertEqual(got["frames_unresolved_calls"], 37)
         self.assertEqual(got["frames_across_collecting"], 2)
@@ -133,6 +142,8 @@ class RealReportParseTests(unittest.TestCase):
         self.assertEqual(got["stale_pins"], 0)
         self.assertEqual(got["unresolved_collecting_calls"], 3479)
         self.assertEqual(got["unresolved_collecting_calls_fns"], 482)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects"], 5)
+        self.assertEqual(got["unbracketed_if_host_malloc_collects_fns"], 3)
         self.assertEqual(got["tier15_unresolved_calls"], 832)
         self.assertEqual(got["frames_unresolved_calls"], 0)
         self.assertEqual(got["frames_across_collecting"], 0)
@@ -149,6 +160,8 @@ class RealReportParseTests(unittest.TestCase):
         self.assertEqual(merged["stale_pins"], 4)
         self.assertEqual(merged["unresolved_collecting_calls"], 7452 + 3479)
         self.assertEqual(merged["unresolved_collecting_calls_fns"], 1629 + 482)
+        self.assertEqual(merged["unbracketed_if_host_malloc_collects"], 9 + 5)
+        self.assertEqual(merged["unbracketed_if_host_malloc_collects_fns"], 4 + 3)
         self.assertEqual(merged["tier15_unresolved_calls"], 3567 + 832)
         self.assertEqual(merged["frames_unresolved_calls"], 37)
 
@@ -165,6 +178,8 @@ def measured(**overrides: object) -> dict:
         "stale_pins": 2,
         "unbracketed_calls": 4,
         "unbracketed_calls_fns": 3,
+        "unbracketed_if_host_malloc_collects": 12,
+        "unbracketed_if_host_malloc_collects_fns": 5,
         "unresolved_collecting_calls": 20,
         "unresolved_collecting_calls_fns": 6,
         "tier1_calls": 0,
