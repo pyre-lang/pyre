@@ -358,6 +358,23 @@ pub(crate) fn release_nursery_cursor_to_fallback() {
     }
 }
 
+/// `rthread.py` `gc_thread_die` for the nursery cursor: a dying thread whose
+/// `tlfield_nursery_*` words are the live cursor hands it to the GC-owned
+/// fallback pair before the container is freed. With the GIL initialized
+/// `rgil::release` has already done this; without it the thread that
+/// installed the GC, or ran `gc_thread_run`, can still own it here.
+pub(crate) fn release_nursery_cursor_owned_by(owner: *mut crate::nursery::NurseryPtrs) {
+    if !is_initialized() {
+        return;
+    }
+    // SAFETY: the dying thread owns the cursor, so it is the GIL holder or
+    // the GIL is not initialized.
+    let gc = unsafe { singleton_mut() };
+    if gc.nursery_cursor() == owner {
+        gc.release_cursor_to_fallback();
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn peek_nursery_cursor_is_fallback() -> bool {
     if !is_initialized() {
@@ -991,6 +1008,44 @@ mod tests {
     fn blocking<R>(f: impl FnOnce() -> R) -> R {
         let _blocked = before_external_block();
         f()
+    }
+
+    #[test]
+    fn an_exiting_cursor_owner_hands_the_cursor_back() {
+        const CHILD_ENV: &str = "MAJIT_GC_EXITING_CURSOR_OWNER_TEST";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Other tests initialize the GIL process-wide. Run the body in a
+            // fresh process so the installer / `gc_thread_run` owner can still
+            // hold the cursor when the thread exits.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc_sync::tests::an_exiting_cursor_owner_hands_the_cursor_back",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "exiting cursor owner probe failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        assert!(!crate::rgil::gil_is_initialized());
+        ensure_gc();
+        let t = std::thread::spawn(|| {
+            crate::threadlocal::gc_thread_run();
+            assert!(!peek_nursery_cursor_is_fallback());
+        });
+        t.join().unwrap();
+        assert!(
+            peek_nursery_cursor_is_fallback(),
+            "an exited owner left the cursor in its freed TLS"
+        );
     }
 
     fn load_eval_breaker_word() -> usize {

@@ -23,7 +23,10 @@
 //! `rgil::release` moves the pair to the GC-owned fallback words before the
 //! GIL word is cleared, so only the GIL holder (or a thread parked inside
 //! `rgil::yield_thread`, which re-acquires before it runs again) ever owns
-//! the cursor, and a thread may exit without the GIL.
+//! the cursor, and a thread may exit without the GIL. A thread that exits
+//! while it owns the cursor (the GIL not initialized) hands it back from
+//! a thread-exit hook registered when the thread claims the cursor,
+//! `rthread.py` `gc_thread_die`.
 //!
 //! These two words are `ThreadLocalField`s in the `rthread.py` sense.
 //! Upstream keeps `nursery_free` / `nursery_top` as IncrementalMiniMarkGC
@@ -168,6 +171,32 @@ pub fn try_threadlocal_nursery_ptrs() -> Option<*mut NurseryPtrs> {
                 .cast()
         })
         .ok()
+}
+
+/// `rthread.py` `gc_thread_die` for the nursery cursor. Registered by
+/// [`note_cursor_owner`] when this thread first claims the cursor; its
+/// destructor runs at thread exit and hands a cursor this thread still owns
+/// back to the GC-owned fallback pair. `THREADLOCALS` itself has no
+/// destructor, so its words stay readable for the whole teardown.
+struct CursorOwnerExit;
+
+impl Drop for CursorOwnerExit {
+    fn drop(&mut self) {
+        if let Some(pair) = try_threadlocal_nursery_ptrs() {
+            crate::gc_sync::release_nursery_cursor_owned_by(pair);
+        }
+    }
+}
+
+thread_local! {
+    static CURSOR_OWNER_EXIT: CursorOwnerExit = const { CursorOwnerExit };
+}
+
+/// Register this thread's [`CursorOwnerExit`] hook. Called when the thread
+/// takes the live cursor.
+#[inline]
+pub(crate) fn note_cursor_owner() {
+    CURSOR_OWNER_EXIT.with(|_| {});
 }
 
 /// `rthread.py` `gc_thread_run` / `shadowstack.py thread_run`.

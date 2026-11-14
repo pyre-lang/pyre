@@ -1648,6 +1648,7 @@ impl MiniMarkGC {
     pub fn claim_this_thread_cursor(&mut self) {
         let me = crate::threadlocal::threadlocal_nursery_ptrs();
         unsafe { self.nursery.claim_cursor(me) };
+        crate::threadlocal::note_cursor_owner();
         crate::republish_singleton_bump(self);
     }
 
