@@ -10343,6 +10343,40 @@ fn jump_args_for_close_loop<M: Clone>(
         .unwrap_or(fallback)
 }
 
+/// `pyjitpl.py _compile_and_run_once`: `except SwitchToBlackhole as stb:
+/// self.run_blackhole_interp_to_cancel_tracing(stb)` for a novable drain
+/// walk. The walk executes each residual concretely, so one that stops
+/// mid-iteration has already run that iteration's `space.next`; the
+/// blackhole finishes the iteration from the walk's framestack
+/// (`blackhole.py convert_and_run_from_pyjitpl`). Handing the portal back
+/// its merge point instead calls `next` again and drops the item.
+///
+/// `trace_jitcode_from_merge_point` walks a standalone stack that
+/// `publish_walk_abort_handoff` stages on `aborted_framestack`; adopt it the
+/// way jd2 does (`drive_generatorentry_trace`). `None` when the walk did not
+/// stop on a cancel, when the handoff declined (no residual committed, so the
+/// merge point replays soundly), or when the walk failed an instruction and
+/// so has no executable continuation.
+fn cancel_drain_tracing(
+    meta: &mut majit_metainterp::MetaInterp<PyreMeta>,
+    drove: &Option<majit_metainterp::TraceAction>,
+) -> Option<majit_metainterp::jitexc::JitException> {
+    use majit_metainterp::TraceAction;
+    let carried = match drove {
+        Some(TraceAction::SwitchToBlackhole(stb)) => Some(*stb),
+        Some(TraceAction::Abort) => None,
+        _ => return None,
+    };
+    let ctx = meta.trace_ctx()?;
+    if ctx.abort_after_panic {
+        return None;
+    }
+    let stack = ctx.aborted_framestack.take().filter(|s| !s.is_empty())?;
+    meta.framestack = stack;
+    let stb = carried.unwrap_or_else(|| interpret_abort_switch_to_blackhole(meta));
+    Some(run_blackhole_interp_to_cancel_tracing(meta, stb))
+}
+
 /// Drive one jd3 trace of `list_extend_portal`. Residuals run on the live
 /// iterator and list, `CloseLoop` compiles, `RunCompiled` enters.
 /// A compiled finish parks `DoneWithThisFrameInt` (`park_list_extend_done`)
@@ -10867,6 +10901,31 @@ fn drive_list_extend_trace(
             pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
             pyre_interpreter::call::clear_call_error();
         }
+    } else if let Some(outcome) = cancel_drain_tracing(meta, &drove) {
+        use majit_metainterp::jitexc::JitException;
+        if dbg {
+            eprintln!("[jd3] cancel_tracing outcome={outcome:?}");
+        }
+        match outcome {
+            // The blackhole reached the next `jit_merge_point`; the portal
+            // body goes on from there.
+            JitException::ContinueRunningNormally(_) => {}
+            JitException::DoneWithThisFrameInt(i) => {
+                pyre_interpreter::call::park_list_extend_done(i);
+                pyre_interpreter::eval::set_current_exception(pyre_object::PY_NULL);
+            }
+            JitException::ExitFrameWithExceptionRef(value) => {
+                pyre_interpreter::call::park_list_extend_err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+                });
+            }
+            other => panic!("jd3 cancel_tracing: unexpected portal exit {other:?}"),
+        }
+        meta.clear_exception();
+        crate::call_jit::clear_residual_call_exception();
+        majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.set(0));
+        pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        pyre_interpreter::call::clear_call_error();
     } else {
         meta.abort_trace(false);
     }
@@ -11764,6 +11823,29 @@ fn drive_unpack_into_trace(
                 pyre_interpreter::call::park_unpack_into_done();
                 pyre_interpreter::eval::set_current_exception(pyre_object::PY_NULL);
             }
+        }
+        meta.clear_exception();
+        crate::call_jit::clear_residual_call_exception();
+        majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.set(0));
+        pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        pyre_interpreter::call::clear_call_error();
+    } else if let Some(outcome) = cancel_drain_tracing(meta, &drove) {
+        use majit_metainterp::jitexc::JitException;
+        if dbg {
+            eprintln!("[jd5] cancel_tracing outcome={outcome:?}");
+        }
+        match outcome {
+            JitException::ContinueRunningNormally(_) => {}
+            JitException::DoneWithThisFrameVoid => {
+                pyre_interpreter::call::park_unpack_into_done();
+                pyre_interpreter::eval::set_current_exception(pyre_object::PY_NULL);
+            }
+            JitException::ExitFrameWithExceptionRef(value) => {
+                pyre_interpreter::call::park_unpack_into_err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+                });
+            }
+            other => panic!("jd5 cancel_tracing: unexpected portal exit {other:?}"),
         }
         meta.clear_exception();
         crate::call_jit::clear_residual_call_exception();
