@@ -9790,13 +9790,30 @@ impl<'a> Lowering<'a> {
         };
         // Declined-Method impl-owned callees still name the FunDecl
         // Charon recorded. `spec_segments` is that registry key
-        // (inherent `for_impl_method`, trait-impl identity path) so std
-        // matchers keep `[.., "<Impl>", leaf]` only on the `name_path`
-        // branch below.
-        let segments: Vec<String> = if method_hint.is_none()
-            && let Some((_, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
-        {
-            spec_segments(self.llbc, fd, &leaf)
+        // (inherent `for_impl_method`, trait-impl identity path, inherent
+        // Self identity) so std matchers keep `[.., "<Impl>", leaf]` only
+        // on the `name_path` branch below.
+        let segments: Vec<String> = if method_hint.is_none() {
+            if let Some((_, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd) {
+                spec_segments(self.llbc, fd, &leaf)
+            } else {
+                let leaf = fd
+                    .item_meta
+                    .name_path_str()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("fn")
+                    .to_string();
+                if inherent_impl_callee_identity(self.llbc, fd, &leaf).is_some() {
+                    spec_segments(self.llbc, fd, &leaf)
+                } else {
+                    fd.item_meta
+                        .name_path()
+                        .split("::")
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+            }
         } else {
             fd.item_meta
                 .name_path()

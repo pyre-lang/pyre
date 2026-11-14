@@ -95,14 +95,19 @@ pub(crate) fn checked_arith_callee_leaf(target: &CallTarget) -> Option<&str> {
     let CallTarget::FunctionPath { segments, .. } = target else {
         return None;
     };
-    let [first, .., module, impl_seg, leaf] = segments.as_slice() else {
-        return None;
+    // Same peel as `is_trait_impl_identity_segment`. This module cannot
+    // name `front::mir` (the MIR driver names this module).
+    let segs: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !(s.starts_with("<impl ") && s.ends_with('>')))
+        .collect();
+    let leaf = match segs.as_slice() {
+        ["core", .., "num", "<Impl>", leaf] => *leaf,
+        ["num", "<Impl>", leaf] => *leaf,
+        _ => return None,
     };
-    (first == "core"
-        && module == "num"
-        && impl_seg == "<Impl>"
-        && checked_arith_ovf_opname(leaf).is_some())
-    .then_some(leaf.as_str())
+    checked_arith_ovf_opname(leaf).is_some().then_some(leaf)
 }
 
 /// `true` for the signed width atoms (`{"Scalar": {"Integer": {"Signed": _}}}`) whose

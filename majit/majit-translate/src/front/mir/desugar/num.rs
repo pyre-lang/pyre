@@ -249,12 +249,9 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
+        let Some(leaf) = crate::front::mir::num_impl_method_leaf(segments) else {
             return Ok(false);
         };
-        if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
-            return Ok(false);
-        }
         // `wrapping_div` / `wrapping_rem` are the C-truncating primitives, so
         // they are `llop.int_floordiv` / `llop.int_mod` the same way
         // `wrapping_add` is `llop.int_add`: `rewrite_op_int_floordiv` /
@@ -764,16 +761,10 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return Ok(false);
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "wrapping_neg"
-        {
+        if crate::front::mir::num_impl_method_leaf(segments) != Some("wrapping_neg") {
             return Ok(false);
         }
+        let leaf = "wrapping_neg";
         let [operand] = args else {
             return Ok(false);
         };
@@ -852,14 +843,7 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return Ok(false);
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "rotate_left"
-        {
+        if crate::front::mir::num_impl_method_leaf(segments) != Some("rotate_left") {
             return Ok(false);
         }
         let [value, count] = args else {
@@ -968,16 +952,13 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
+        let Some(leaf) = crate::front::mir::num_impl_method_leaf(segments) else {
             return Ok(false);
         };
-        if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
-            return Ok(false);
-        }
         // `checked_abs` overflows at the same `i64::MIN` as `checked_neg`
         // (`rint.py rtype_abs_ovf` / `ll_int_abs_ovf`).  The Some payload
         // is wrapping `abs`; the None arm never reads it.
-        let unop = match leaf.as_str() {
+        let unop = match leaf {
             "checked_neg" => "neg",
             "checked_abs" => "abs",
             _ => return Ok(false),
@@ -1788,14 +1769,7 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return Ok(false);
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "try_from"
-        {
+        if crate::front::mir::num_impl_method_leaf(segments) != Some("try_from") {
             return Ok(false);
         }
         let [arg] = args else {
@@ -2107,14 +2081,7 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        let [first, .., module, impl_seg, leaf] = segments else {
-            return Ok(false);
-        };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "from"
-        {
+        if crate::front::mir::num_impl_method_leaf(segments) != Some("from") {
             return Ok(false);
         }
         let [arg] = args else {
