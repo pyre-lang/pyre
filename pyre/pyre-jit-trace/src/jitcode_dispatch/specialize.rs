@@ -5229,8 +5229,18 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 );
             }
             Some(raw) => {
+                // The unboxed helper records NewArray + setitem before
+                // NewArrayClear; those can minor-collect. Pin the committed
+                // storage the way `history.py *FrontendOp.value` keeps the
+                // execute result. The int list is read from the storage word
+                // `pin_root` returns, so neither copy predates the pin.
+                let _storage_roots = pyre_object::gc_roots::push_roots();
+                let storage_slot = pyre_object::gc_roots::shadow_stack_len();
+                let storage_ptr =
+                    pyre_object::gc_roots::pin_root(new_block_ptr as pyre_object::PyObjectRef)
+                        as usize as i64;
                 let list_block_value = match ctx.trace_ctx.array_sanity_load(
-                    new_block_ptr,
+                    storage_ptr,
                     add.storageindex as i64,
                     &crate::state::mapdict_storage_gcarray_descr(),
                     majit_ir::Type::Ref,
@@ -5242,13 +5252,6 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                         add.storageindex
                     ),
                 };
-                // The unboxed helper records NewArray + setitem before
-                // NewArrayClear; those can minor-collect. Pin the committed
-                // storage the way `history.py *FrontendOp.value` keeps the
-                // execute result.
-                let _storage_roots = pyre_object::gc_roots::push_roots();
-                let storage_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(new_block_ptr as pyre_object::PyObjectRef);
                 crate::helpers::emit_mapdict_add_unboxed_attr_inline(
                     ctx.trace_ctx,
                     obj,
