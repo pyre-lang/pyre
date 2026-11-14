@@ -16236,9 +16236,11 @@ fn raw_struct_array_item_lltype_inner(
     // `symbolic.get_field_token` read that Struct's offsets. Row lookup
     // still uses the stripped template (`resolved_owner_key` /
     // `field_rows`); interned `_name` keeps the balanced `<…>` span.
+    // A span that still names an unbound type variable (`??TypeVar#N`) is
+    // not an instantiation, so the Struct keeps the template name.
     let intern_name = match majit_ir::descr::generic_args_span(item) {
-        Some(span) => format!("{name}{span}"),
-        None => name.clone(),
+        Some(span) if !span.contains("??") => format!("{name}{span}"),
+        _ => name.clone(),
     };
     if !visited.insert(intern_name.clone()) {
         return None;
