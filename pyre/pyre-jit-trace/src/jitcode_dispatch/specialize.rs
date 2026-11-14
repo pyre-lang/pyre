@@ -11165,6 +11165,14 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
         return Ok(None);
     }
+    // The name pin below is GuardValue of the box. A NewWithVtable unicode
+    // (list-iter ascii wrap, `str.split` in pickle `_getattribute`) is
+    // still virtual then; `optimize_GUARD_VALUE` raises InvalidLoop
+    // ("promote of a virtual"). `get_attribute_name` reads `w_name._utf8`
+    // and does not promote the wrapper.
+    if walker_promote_of_virtual(ctx, r_args[3]) {
+        return Ok(None);
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
     let Some((w_type, _version_tag, w_value, binding)) =
         (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, name) })
@@ -11232,6 +11240,11 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // operand.  Keep the WTF-8 view: PyPy's RPython string carries lone
     // surrogates through the same traced descriptor lookup as ASCII names.
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    // Same virtual-name decline as the type form: pinning `r_args[3]` is
+    // `GUARD_VALUE` of a box `optimize_GUARD_VALUE` still virtualizes.
+    if walker_promote_of_virtual(ctx, r_args[3]) {
         return Ok(None);
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
@@ -14305,6 +14318,20 @@ fn walker_guard_stamped_ref_unless_const<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
     Ok(expected)
+}
+
+/// True when `GUARD_VALUE` of `op` would raise InvalidLoop("promote of a
+/// virtual") (`rewrite.py` `optimize_GUARD_VALUE`).
+///
+/// `NewWithVtable` stays virtual until forced. A store into a virtualizable
+/// array (`PyFrame.locals_cells_stack_w`) runs `_escape_from_write` and
+/// drops `HF_LIKELY_VIRTUAL`, but the optimizer still virtualizes the
+/// allocation. `saw_allocation` survives that escape.
+pub(super) fn walker_promote_of_virtual<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op: OpRef,
+) -> bool {
+    !op.is_constant() && ctx.trace_ctx.heap_cache().saw_allocation(op)
 }
 
 /// [`walker_guard_stamped_ref_unless_const`] without `replace_box`.
