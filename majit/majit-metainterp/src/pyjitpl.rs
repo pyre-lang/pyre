@@ -10849,29 +10849,22 @@ impl<M: Clone> MetaInterp<M> {
         // ConstantPool to snapshot — this typed-constant map starts fresh.
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
-        // Byte-mode bridges number each surviving guard from
-        // `SnapshotIterator` inside `store_final_boxes_in_guard`. Building
-        // the box lists here would allocate them for every snapshot,
-        // including guards the optimizer deletes. The `Vec<Op>` recorder
-        // still passes the lists. Loop compile keeps its own single build
-        // for the phase-2 remap.
+        // resume.py `ResumeDataVirtualAdder.finish` numbers via
+        // `trace.get_snapshot_iter(rd_resume_position)`. Loop compile
+        // materializes those snapshots as maps
+        // (`snapshot_map_from_byte_recorder`) and remaps them through
+        // `TraceIterator._cache`. Bridges use the same maps:
+        // `snapshot_maps_from_ctx` already walks the byte recorder when
+        // it has a buffer. Empty maps would leave
+        // `store_final_boxes_in_guard` numbering from unique_cache only,
+        // which is not `get_snapshot_iter`.
         let (
             mut snapshot_boxes,
             snapshot_frame_sizes,
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = if use_byte_iter {
-            (
-                SnapshotBoxes::new(),
-                SnapshotFrameSizes::new(),
-                SnapshotBoxes::new(),
-                SnapshotBoxes::new(),
-                SnapshotFramePcs::new(),
-            )
-        } else {
-            snapshot_maps_from_ctx(ctx)
-        };
+        ) = snapshot_maps_from_ctx(ctx);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,

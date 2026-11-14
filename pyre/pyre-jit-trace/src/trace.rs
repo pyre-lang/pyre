@@ -8350,9 +8350,18 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         )
                     }
                 };
+                let (py_pc, py_op) = crate::state::pyjitcode_for_code(w_code)
+                    .map(|pjc| {
+                        crate::py_coord::py_op_name_for_jitcode_pc(
+                            &pjc.metadata,
+                            (!pjc.code_ptr.is_null()).then(|| unsafe { &*pjc.code_ptr }),
+                            e.stop_pc(),
+                        )
+                    })
+                    .unwrap_or((start_pc, None));
                 eprintln!(
                     "[fbw-abort] start_pc={start_pc} Err={e:?} \
-                     code={name} src={path} effects={}",
+                     code={name} src={path} py_pc={py_pc} py_op={py_op:?} effects={}",
                     crate::jitcode_dispatch::fbw_executed_effect_count(),
                 );
             }

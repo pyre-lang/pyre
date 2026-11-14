@@ -935,27 +935,48 @@ impl RewriteState {
         replaced
     }
 
-    /// rewrite.py `emit_op` — append `op` itself unless an arg (or a
-    /// guard failarg) was replaced, in which case `copy_and_change`.
+    /// rewrite.py `emit_op` — append `op` itself unless an arg was
+    /// replaced, in which case `copy_and_change`. Guards always copy
+    /// so failargs remap on the new object; the original keeps its pos.
     fn emit_op(&mut self, op: &OpRc) -> Operand {
-        let out = op.clone();
-        let replaced = self.replace_args_in_place(&out, op.opcode == OpCode::JitDebug);
-        let rt = out.result_type();
-        let pos = if replaced {
-            if rt == Type::Void {
-                OpRef::NONE
-            } else if op.pos().get().is_none() {
-                let p = OpRef::op_typed(self.next_pos, rt);
-                self.next_pos += 1;
-                p
-            } else {
-                op.pos().get()
-            }
-        } else {
-            op.pos().get()
+        // rewrite.py:100-126
+        let orig = match Operand::from_bound_op(op)
+            .get_box_replacement(false)
+            .bound_op()
+        {
+            Some(rc) => rc,
+            None => op.clone(),
         };
-        out.pos().set(pos);
-        self.push_emitted(out, pos)
+        let keep = orig.opcode == OpCode::JitDebug;
+        let mint = |src: &OpRc| {
+            let newop = OpRc::new(src.copy_and_change(src.opcode, None, None));
+            src.set_forwarded_op(&newop);
+            newop
+        };
+        let mut out: Option<OpRc> = None;
+        for i in 0..orig.num_args() {
+            let orig_arg = orig.arg(i);
+            let mut arg = self.get_box_replacement(orig_arg.clone());
+            if !keep
+                && let Some(Value::Ref(gcref)) = arg.const_value()
+                && !gcref.is_null()
+            {
+                arg = self.remove_constptr(gcref);
+            }
+            if arg != orig_arg {
+                let dst = out.get_or_insert_with(|| mint(&orig));
+                dst.setarg(i, arg);
+            }
+        }
+        if orig.opcode.is_guard() {
+            let dst = out.get_or_insert_with(|| mint(&orig));
+            dst.map_failargs_in_place(|a| {
+                *a = self.get_box_replacement(a.clone());
+            });
+        }
+        let emit_rc = out.unwrap_or(orig);
+        let pos = emit_rc.pos().get();
+        self.push_emitted(emit_rc, pos)
     }
 
     /// rewrite.py emitting_an_operation_that_can_collect
@@ -5116,9 +5137,12 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_reuses_recorded_rc_when_failargs_are_already_resolved() {
+    fn test_guard_copy_and_change_even_when_failargs_are_resolved() {
+        // rewrite.py emit_op: `if rop.is_guard(opnum): op = copy_and_change`
+        // even when no arg changed, so failargs remap on the copy.
         let rw = make_rewriter();
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]);
+        guard.pos().set(OpRef::void_op(3));
         guard.store_final_boxes(vec![ro(OpRef::int_op(0))]);
         let boxed: Vec<OpRc> = vec![
             OpRc::new(Op::new(
@@ -5135,9 +5159,11 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard survives rewrite");
         assert!(
-            OpRc::ptr_eq(out, &recorded),
-            "emit_op must not mint a second ResOperation when failargs are unchanged"
+            !OpRc::ptr_eq(out, &recorded),
+            "emit_op mints a copy for every guard"
         );
+        assert_eq!(recorded.pos().get(), OpRef::void_op(3));
+        assert_eq!(out.pos().get(), OpRef::void_op(3));
     }
 
     // ── Test 6: Multiple allocations are batched ──
@@ -6147,6 +6173,51 @@ mod tests {
         assert_eq!(
             gv_fa.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
             vec![OpRef::int_op(10), OpRef::int_op(11)]
+        );
+    }
+
+    #[test]
+    fn emit_op_copy_and_change_does_not_wipe_guard_pos() {
+        // rewrite.py emit_op: a guard is always copy_and_change'd so
+        // failargs remap on the copy; the original keeps its pos.
+        let rw = make_rewriter();
+        let alloc = Op::with_descr(OpCode::NewWithVtable, &[], vtable_descr(48, 3, 0xDEAD));
+        alloc.pos().set(OpRef::ref_op(10));
+        let alloc_rc = OpRc::new(alloc);
+        let guard = Op::new(OpCode::GuardNotForced, &[]);
+        guard.pos().set(OpRef::void_op(11));
+        let alloc_box = Operand::from_bound_op(&alloc_rc);
+        guard.setfailargs(
+            vec![
+                alloc_box.clone(),
+                alloc_box.clone(),
+                alloc_box.clone(),
+                alloc_box.clone(),
+                alloc_box.clone(),
+                alloc_box,
+            ]
+            .into(),
+        );
+        let guard_rc = OpRc::new(guard);
+        let boxed = vec![alloc_rc, guard_rc.clone()];
+        let (result, _) = rw.rewrite_for_gc_with_constants(&boxed);
+        assert_eq!(
+            guard_rc.pos().get(),
+            OpRef::void_op(11),
+            "original guard pos must survive emit_op copy_and_change"
+        );
+        let emitted = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardNotForced)
+            .expect("GNF emitted");
+        assert!(
+            !OpRc::ptr_eq(emitted, &guard_rc),
+            "emit_op must mint a copy for guards"
+        );
+        assert_eq!(
+            emitted.pos().get(),
+            OpRef::void_op(11),
+            "emitted guard must keep the original pos, not OpRef::NONE"
         );
     }
 

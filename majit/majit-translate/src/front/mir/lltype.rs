@@ -1011,9 +1011,13 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
 ///
-/// References return `None`. Their flow value stays the address;
-/// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
-/// or a `Rvalue::Ref`, not for a call result.
+/// References return `None`. Inside a looked-inside graph `Rvalue::Ref`
+/// of a primitive aliases the scalar word; [`tyref_scalar_pointee_value_type`]
+/// names the pointee for a parameter or a `Rvalue::Ref`, not for a call
+/// result. A residual (`dont_look_inside`) callee whose declared parameter
+/// is `&prim` / `&mut prim` (including a generic `&Q` instantiated to a
+/// copy scalar) still dereferences an address; [`raw_scalar_borrow_spills`]
+/// spills that word (`scoped_alloc` / `_rewrite_raw_malloc`).
 pub(in crate::front::mir) fn raw_scalar_address_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -1695,15 +1699,17 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
         .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
-    // Only source-local traits participate: std/core trait impls
-    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
-    // are host machinery, not translated-program classes, and keep
-    // their inherent classification.
-    if !td.item_meta.is_local {
-        return None;
-    }
     let trait_path = td.item_meta.name_path();
     if trait_path.is_empty() {
+        return None;
+    }
+    // Charon's `is_local` is per extracted crate. `DictStrategy` is local
+    // in `pyre-object.ullbc` and external in `pyre-interpreter.ullbc`, but
+    // `MapDictStrategy` / `ClassDictStrategySlot` still belong to that
+    // trait's PBC family (`CallControl.graphs_from` / `row_of_graphs`).
+    // Std/core traits stay peeled: their crate is not a loaded LLBC root.
+    let trait_crate = trait_path.split("::").next().unwrap_or("");
+    if !td.item_meta.is_local && !crate::local_crates::is_crate_alias_root(trait_crate) {
         return None;
     }
     Some(trait_path)
@@ -2279,8 +2285,11 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 ///
 /// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
 /// the raw-address classifier rejects (exception carrier, a GC-pointer field)
-/// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
-/// [`declared_raw_adt_node`] accepts is Raw.
+/// stays a GC base: the pointer bank already kept it as `Ref`. An owner
+/// [`declared_raw_adt_node`] accepts is Raw. Harvested `_alloc_flavor_ = raw`
+/// (`rclass.py getgcflavor`) is also Raw: a Vec field fails storage-raw
+/// and would otherwise stamp GC, then `promote_gc_field_bases` would restamp
+/// the Signed address into the ref bank.
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2297,15 +2306,7 @@ pub(in crate::front::mir) fn container_declared_gc(
     // determines STRUCT._gckind even when the struct contains GC-shaped
     // fields. Use the same declaration as the argument/calldescr classifier;
     // jtransform.py rewrite_op_getfield must not promote its Int base to Ref.
-    if adt_node_def_id(pointee)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            crate::front::llbc_hints::alloc_flavor_raw_contains(
-                raw_alloc_flavor_structs,
-                td.item_meta.name_path_str(),
-            )
-        })
-    {
+    if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
         return Some(false);
     }
     // The same raw-storage test as the dest overlay: a GC pointer field
@@ -3366,14 +3367,17 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // `is_none` / `is_some` take `&self`. The borrow is identity on the
-    // Option word (null pointer or tagged enum), so `&Option<P>` uses
-    // the same paint as `Option<P>`. `Option<NonZero<_>>` is an integer
-    // niche: an ordinary `&Option<NonZero<_>>` parameter stays a
-    // pointer (`option_nonzero_word_kind_deref_receiver` peels only
-    // the Discriminant place).
+    // `is_none` / `is_some` take `&self`. The borrow is identity on a
+    // one-word Option (null pointer / niche), so that `&Option<P>` uses
+    // the same paint as `Option<P>`. A tagged multi-word Option is an
+    // aggregate: `&Option<P>` is a real pointer (`ty_is_raw_address`).
+    // `Option<NonZero<_>>` is an integer niche: an ordinary
+    // `&Option<NonZero<_>>` parameter stays a pointer
+    // (`option_nonzero_word_kind_deref_receiver` peels only the
+    // Discriminant place).
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
+        && !ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
     {
         return tyref_to_value_type_with(
             &option_ty,
@@ -4206,15 +4210,17 @@ pub(in crate::front::mir) fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> boo
     }
     // PhantomData / BuildHasherDefault stay Void via the ADT leaf,
     // including a `type T = BuildHasherDefault<H>` alias
-    // (`type_node_peel_aliases`). Uninhabited atoms and `Option<!>`
-    // use TyKind / empty-enum identity (`Struct._names_without_voids`
-    // drops a field whose lowered type IS Void).
+    // (`type_node_peel_aliases`). A published copy may keep the
+    // marker as `{"id": {"Path": "core::marker::PhantomData"}}` when
+    // the dest crate has no matching TypeDecl (`adt_node_name_path`).
+    // Uninhabited atoms and `Option<!>` use TyKind / empty-enum
+    // identity (`Struct._names_without_voids` drops a field whose
+    // lowered type IS Void).
     if tyref_node(ty, llbc)
         .and_then(|n| type_node_peel_aliases(n, llbc))
-        .and_then(adt_node_def_id)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            let path = td.item_meta.name_path_str();
+        .and_then(|n| adt_node_name_path(n, llbc))
+        .is_some_and(|path| {
+            let path = path.as_str();
             let leaf = path
                 .split('<')
                 .next()
@@ -5079,6 +5085,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if is_unit_type(kind_src, llbc) {
         return Some("()".to_string());
     }
+    // A stored `fn` pointer (`get_eval_fn` → `EvalFn`) is `Ptr(FuncType)`.
+    // `history.getkind` banks it as int; the stub shell must stay `SomePtr`
+    // so a caller `simple_call` of the result is callable.
+    if let Some(spelling) = tyref_fn_ptr_spelling(kind_src, llbc) {
+        return Some(format!("fn:{spelling}"));
+    }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
     // A byte pointer stays on the `ref` arm below.
@@ -5178,7 +5190,11 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
 /// mints.  Only instantiations whose type arguments are all by-value ADTs
 /// qualify: a reference, raw-pointer or `Box` argument can make the enum a
 /// null-niche pointer, which has no enum class.  A named struct keys as its
-/// class root.  `None` otherwise.
+/// class root — the same intern spelling [`class_identity_spelling`]
+/// paints, so a residual `prepend` of a withdrawn leaf (`Arguments`)
+/// intern's the crate-relative path and unique-graph `mergeinputargs`
+/// meets the constructor (`annrpython.py` `mergeinputargs`).  `None`
+/// otherwise.
 pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
@@ -5599,10 +5615,12 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // Matching [`tyref_to_value_type`]: a shared borrow of `Option<P>`
-    // is the Option word. `Option<NonZero<_>>` stays a pointer param.
+    // Matching [`tyref_to_value_type`]: a shared borrow of a one-word
+    // `Option<P>` is the Option word. A tagged aggregate stays a pointer
+    // (`ty_is_raw_address`). `Option<NonZero<_>>` stays a pointer param.
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
+        && !ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
     {
         return tyref_to_attr_value_type_with(
             &option_ty,
@@ -5790,6 +5808,23 @@ pub(in crate::front::mir) fn tyref_class_root_with(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
+}
+
+/// A stored fn-ptr argument whose Rust type is a reference or pointer
+/// (or `Option` of one) to a class-backed struct. Those arguments are
+/// `cast_instance_to_base_ptr` at the call site (`annlowlevel.py`).
+pub(in crate::front::mir) fn tyref_is_class_backed_fn_ptr_arg(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc);
+    let inner = payload.as_ref().unwrap_or(ty);
+    let is_ptr = tyref_node(inner, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| n.as_object())
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"));
+    is_ptr && tyref_class_root_with(inner, llbc, tombstoned).is_some()
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
@@ -6803,7 +6838,8 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// [`tyref_one_word_handle_payload_field`], the Field-projection
 /// identity); `all_fielddescrs` does not recurse, so
 /// `PyreDecodeContext.pos_delta` is one
-/// `getfield(PyreDecodeContext, "pos_delta")`.
+/// `getfield(PyreDecodeContext, "pos_delta")`. A `repr(transparent)` scalar wrapper
+/// is that word ([`tyref_transparent_inner_value_type`]); copying its fields would getattr them on Integer and `getfield_raw_r` a marker.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -7525,11 +7561,34 @@ pub(in crate::front::mir) fn container_identity_deref_owner(
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
 /// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
+///
+/// [`apply_published_structs`] remaps a harvested field onto a dest
+/// numeric id when that crate has a matching TypeDecl; otherwise the
+/// id stays `{"Path": ...}`. [`type_decl_ref_adt_id`] reads only a
+/// number, so a Path-form marker would miss
+/// `type_str_leaf_is_void_zst` without this arm.
 pub(in crate::front::mir) fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = tyref_node(ty, llbc)?;
     let node = strip_ty_wrappers(node, llbc)?;
-    let id = adt_node_def_id(node)?;
-    Some(llbc.type_by_id(id)?.item_meta.name_path())
+    adt_node_name_path(node, llbc)
+}
+
+/// Qualified path of an already-stripped ADT node. A numeric `id` is
+/// the TypeDecl `name_path`; a Path-form id is that string when the
+/// dest crate has no matching TypeDecl (`apply_published_structs`).
+fn adt_node_name_path(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => {}
+        Some(_) => return None,
+    }
+    if let Some(id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        return Some(llbc.type_by_id(id)?.item_meta.name_path_str().to_string());
+    }
+    adt.get("id")?
+        .get("Path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// `majit_gc::hook_cell::FnPtrCell<F>` — a `global_hook!` cell. Keyed on
@@ -7929,7 +7988,10 @@ pub(in crate::front::mir) fn unique_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
-    if decl.published_struct_copy {
+    // A published copy keeps the defining crate's `repr(transparent)`
+    // layout and field list (`apply_published_structs`), so its
+    // unique sized field is still that field; any other published copy is refused.
+    if decl.published_struct_copy && !decl.is_repr_transparent() {
         return None;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -8526,8 +8588,16 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     }) {
         return Some(transparent_scalar_value_type(kind));
     }
+    // An unpublished Opaque has no field list; the bank above is its
+    // only peel. A published copy is a Struct that still carries
+    // `repr.transparent` from the foreign layout, so the unique
+    // scalar-word field is the ABI the same way a defining-crate
+    // Struct is.
+    if matches!(&decl.kind, TypeDeclKind::Opaque) {
+        return None;
+    }
     match &decl.kind {
-        TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
+        TypeDeclKind::Struct(fields) => {
             if decl.is_repr_transparent() {
                 let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
                     fields.get(index)?
@@ -13656,15 +13726,23 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
 /// borrow spelling is the parent's (`&[T; N]`, `*const [T; N]`).
+///
+/// `tyref_to_ast_string` strips `&T` / `&mut T` for nominal lookup.
+/// `fixed_array_index_identity` keys the length-prefixed ctor reader
+/// on that prefix (`borrowed_fixed_list_is_gcarray`); without it
+/// `(*mapping)[i]` of `&mut [i64; N]` is spelled `[i64; N]` and shares
+/// the headerless inline-field descr, so a later `mapping[j]` of the
+/// owned ctor value still sees the `-1` init.
 pub(in crate::front::mir) fn index_identity_inputs(place: &Place, llbc: &Llbc) -> (bool, String) {
-    let (value_local, ty) = match &place.kind {
-        PlaceKind::Local(_) => (true, &place.ty),
+    match &place.kind {
+        PlaceKind::Local(_) => (true, tyref_to_ast_string(&place.ty, llbc)),
         PlaceKind::Projection(parent, ProjectionElem::Atom(name)) if name == "Deref" => {
-            (false, &parent.ty)
+            let spelling = tyref_reference_layout_string(&parent.ty, llbc)
+                .unwrap_or_else(|| tyref_to_ast_string(&parent.ty, llbc));
+            (false, spelling)
         }
-        _ => (false, &place.ty),
-    };
-    (value_local, tyref_to_ast_string(ty, llbc))
+        _ => (false, tyref_to_ast_string(&place.ty, llbc)),
+    }
 }
 
 /// Pointee spelling and whether a borrow or pointer prefix was peeled.
@@ -15211,6 +15289,30 @@ pub(in crate::front::mir) fn tyref_positional_aggregate_root(
     node.as_object()
         .is_some_and(|body| body.contains_key("Array"))
         .then(|| format!("Array{suffix}"))
+}
+
+/// ARRAY identity of a `[T; N]` Repeat destination.
+///
+/// `fixed_repeat_identity` recovers ARRAY from a shaped `Array<T;N>`
+/// result. A `Ref(None)` marker depends on `LinkClasses` matching a
+/// later `ArrayRead` / `ArrayWrite` of the same SSA; taking the address
+/// of the local (`&mut mapping`) splits that class and the marker stays
+/// residual. Stamp the dest shape here so the rewrite does not need
+/// that alias.
+pub(in crate::front::mir) fn repeat_array_result_ty(dest_ty: &TyRef, llbc: &Llbc) -> ValueType {
+    if let Some(owner) = tyref_positional_aggregate_root(dest_ty, llbc)
+        && majit_ir::descr::is_shaped_array_name(&owner)
+    {
+        return ValueType::Ref(Some(owner));
+    }
+    let spelling = tyref_to_ast_string(dest_ty, llbc);
+    if let Some((item, n)) = shaped_array_parts(&spelling) {
+        let owner = format!("Array<{item};{n}>");
+        if majit_ir::descr::is_shaped_array_name(&owner) {
+            return ValueType::Ref(Some(owner));
+        }
+    }
+    ValueType::Ref(None)
 }
 
 /// The `TypeDeclRef` (`{"id", "generics", …}`) of a TyRef's ADT, after

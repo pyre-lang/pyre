@@ -1813,6 +1813,52 @@ fn a_handler_abort_is_not_a_later_resume_blocker() {
     assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
 }
 
+/// `GUARD_NOT_FORCED` resumes at the live-after the residual (`blackhole.py`
+/// `setposition`). The catch that guarded that call has already been
+/// passed; a symbolic residual in its handler is not a section the
+/// blackhole still runs.
+#[test]
+fn a_handler_before_the_resume_pc_is_not_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = residual_call_with_funcbox(0);
+    let live_and_return_len = live().len() + void_return().len();
+    let handler = code.len() + catch_exception(0).len() + live_and_return_len;
+    code.extend(catch_exception(handler));
+    let resume_pc = code.len();
+    code.extend(live());
+    code.extend(void_return());
+    assert_eq!(
+        code.len(),
+        handler,
+        "the handler follows the success return"
+    );
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 0, &[real, symbolic], |_| None);
+    assert_eq!(
+        whole.blocker_after_effect,
+        Some(symbolic),
+        "whole-body admission still sees the handler"
+    );
+
+    let resume = super::inline_call::summarize_body_blockers_resume(
+        resume_pc,
+        &code,
+        0,
+        &[real, symbolic],
+        |_| None,
+    );
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+    assert!(
+        !resume.body_not_walked,
+        "the success live-after is reachable from entry"
+    );
+}
+
 /// An `inline_call` whose descr does not resolve to a JitCode is the same
 /// condition one level down: a callee the scan holds nothing about.  Falling
 /// through would read it as executing no effect and holding no blocker — the
@@ -2086,6 +2132,44 @@ fn list_type_call_resume_levels_do_not_reach_a_blocker() {
         !super::inline_call::helper_resume_reaches_blocker(wrap.index(), resume_pc, Some(2)),
         "wrap_list_descr_init resume at the live marker before list_extend_items must not reach a blocker",
     );
+}
+
+/// A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*` natively, so the
+/// callee's own residual blockers and unread regions are not sections the
+/// resume scan walks. Descent still enters that jitcode, so admission keeps
+/// those facts.
+#[test]
+fn a_callable_callees_blockers_are_not_resume_blockers() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        blocker_after_effect: Some(0xdead),
+        body_not_walked: true,
+        may_execute_effect: true,
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(whole.blocker_after_effect, Some(0xdead));
+    assert!(whole.body_not_walked);
+    assert!(whole.may_execute_effect);
+
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[real],
+        |d| (d == 7).then_some(callee),
+        |d| (d == 7).then_some(real),
+    );
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+    assert!(!resume.body_not_walked);
+    assert!(resume.may_execute_effect);
 }
 
 /// Resume does not treat a residual whose funcbox register is a runtime-only
@@ -15726,6 +15810,103 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
     );
 }
 
+#[test]
+fn ref_copy_of_unbound_register_leaves_dest_unbound() {
+    // `pyjitpl.py _opimpl_any_copy` / `copy_constants` `MissingValue`:
+    // copying a never-written register is legal; dest holds the missing
+    // value. A later op that consumes dest still raises
+    // `RegisterReadUnbound`.
+    let ref_copy_byte = *insns_opname_to_byte()
+        .get("ref_copy/r>r")
+        .expect("`ref_copy/r>r` must be in insns table");
+    let raise_byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    // src=0 (unbound), dst=1 (starts bound with a stale concrete).
+    let code = [ref_copy_byte, 0x00, 0x01, raise_byte, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let dest_pre = tc.const_ref(0xC0DE_0001);
+    let registers_r = [OpRef::NONE, dest_pre];
+    let stale = 0xBEEFusize as pyre_object::PyObjectRef;
+    let concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Ref(stale)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_registers_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: dest_pre,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(registers_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).expect("ref_copy of an unbound source must not abort");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        wc.registers_r.get(1),
+        Some(OpRef::NONE),
+        "unbound source leaves dest unbound",
+    );
+    assert_eq!(
+        wc.registers_r.get(0),
+        Some(OpRef::NONE),
+        "src register must remain unbound",
+    );
+    assert_eq!(
+        wc.frame_state.borrow().concrete_registers_r[1],
+        ConcreteValue::Null,
+        "unbound copy must clear dest's stale concrete shadow",
+    );
+    assert_eq!(
+        wc.frame_state.borrow().vstack_last_ref,
+        dest_pre,
+        "a link renaming is not the opcode's result, so ref_copy must leave \
+             the operand-stack TOS candidate alone",
+    );
+    let err = step(&code, 3, &mut wc)
+        .expect_err("a later use of the unbound dest must surface RegisterReadUnbound");
+    assert_eq!(
+        err,
+        DispatchError::RegisterReadUnbound {
+            pc: 3,
+            reg: 1,
+            bank: "r"
+        },
+    );
+}
+
 /// Drive a single `int_<binop>/ii>i` handler: the codewriter
 /// encodes `[opcode, src1, src2, dst]`. Asserts the recorder
 /// captured `OpCode::<expected>` with `[regs_i[src1],
@@ -20824,6 +21005,215 @@ fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() 
     );
     assert!(wc.fbw_mode.class_of_last_exc_is_const);
     drop(wc);
+}
+
+#[test]
+fn residual_call_refused_up_front_may_force_inside_transparent_helper() {
+    // Frameless transparent helper (`helper_chain()` is `NoHelper` with an
+    // empty framestack): `call_opcode.is_call_may_force()` is refused
+    // (`GUARD_NOT_FORCED` would resume at the Python CALL). Extraeffect is
+    // not a second gate. `dont_look_inside_cannot_raise` records because
+    // `select_residual_call_opcode` emits CALL, not CALL_MAY_FORCE
+    // (`call.py getcalldescr` `cannot_raise_effect_info()`). The name
+    // allowlist is not extended.
+    let bindings: std::collections::HashMap<&str, i64> =
+        pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+    let addr = bindings["pyre_interpreter::argument::mapping_contains"];
+    assert!(addr != 0);
+
+    fn refuse(
+        opcode: majit_ir::OpCode,
+        extra: majit_ir::ExtraEffect,
+        addr: i64,
+    ) -> Option<(&'static str, i64, i64)> {
+        let mut tc = fresh_trace_ctx();
+        let func = tc.const_int(addr);
+        let regs_i: Vec<OpRef> = Vec::new();
+        let regs_r: Vec<OpRef> = Vec::new();
+        let descr = call_descr_with_effect(1, extra);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut mode = test_fbw_mode();
+        mode.inline_subwalk = true;
+        mode.transparent_helper_subwalk = true;
+        let wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            fbw_mode: mode,
+            session: &session,
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        super::residual_call::residual_call_refused_up_front(
+            &wc,
+            opcode,
+            &[func],
+            descr.as_call_descr().expect("SimpleCallDescr"),
+        )
+    }
+
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallMayForceR,
+            majit_ir::ExtraEffect::RandomEffects,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        Some("may-force-in-transparent-helper"),
+        "CALL_MAY_FORCE inside a transparent helper is refused"
+    );
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallMayForceR,
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        Some("may-force-in-transparent-helper"),
+    );
+    assert_eq!(
+        refuse(
+            majit_ir::OpCode::CallR,
+            majit_ir::ExtraEffect::CannotRaise,
+            addr
+        )
+        .map(|(r, _, _)| r),
+        None,
+        "harvested cannot_raise is CALL, not CALL_MAY_FORCE"
+    );
+}
+
+#[test]
+fn residual_call_refused_up_front_may_force_inside_numbered_helper_records() {
+    // A numbered helper section is a real `MIFrame` (`capture_resumedata`).
+    // CALL_MAY_FORCE + GUARD_NOT_FORCED resume in that section
+    // (`numbered_helper_guard_resume` / `blackhole.py` `_setup_return_value_*`).
+    // The frameless-transparent refusal does not apply.
+    let bindings: std::collections::HashMap<&str, i64> =
+        pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+    let addr = bindings["pyre_interpreter::argument::mapping_contains"];
+    assert!(addr != 0);
+
+    let mut tc = fresh_trace_ctx();
+    let func = tc.const_int(addr);
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let descr = call_descr_with_effect(1, majit_ir::ExtraEffect::RandomEffects);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: 0,
+        is_being_profiled: false,
+        recursion_greenkey: false,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents: vec![InlineParentFrame {
+            jitcode_index: 1,
+            call_jitcode_pc: Some(0),
+            call_pc: Some(0),
+            resume_pc: Some(0),
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes: Vec::new(),
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Unknown,
+        }],
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::CallerBoundary,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    });
+    let mut mode = test_fbw_mode();
+    mode.inline_subwalk = true;
+    mode.transparent_helper_subwalk = true;
+    mode.allow_numbered_may_force = true;
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(
+        session.borrow().helper_chain(),
+        HelperChain::Numbered,
+        "the pushed level is a numbered helper section"
+    );
+    assert_eq!(
+        super::residual_call::residual_call_refused_up_front(
+            &wc,
+            majit_ir::OpCode::CallMayForceR,
+            &[func],
+            descr.as_call_descr().expect("SimpleCallDescr"),
+        )
+        .map(|(r, _, _)| r),
+        None,
+        "CALL_MAY_FORCE inside a numbered helper records"
+    );
 }
 
 #[test]
@@ -27366,6 +27756,138 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
 }
 
 #[test]
+fn getfield_gc_i_heapcache_hit_serves_no_concrete_receiver() {
+    // A virtual NEW stamps `GcRef::NO_CONCRETE`. `_opimpl_getfield_gc_any_pureornot`
+    // (`pyjitpl.py`) still returns `upd.currfieldbox` on a heapcache hit.
+    let byte = *insns_opname_to_byte()
+        .get("getfield_gc_i/rd>i")
+        .expect("`getfield_gc_i/rd>i` must be in insns table");
+    let code = [byte, 0x02, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let obj = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = obj;
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let cached_field = tc.const_int(0xCAFE);
+    tc.heapcache_getfield_now_known(obj, 1, cached_field);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let _ = step(&code, 0, &mut wc).expect("heapcache hit must ignore NO_CONCRETE");
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before, "cache hit must not record");
+    assert_eq!(dst_post, cached_field);
+}
+
+#[test]
+fn getfield_gc_i_no_concrete_miss_declines_without_deref() {
+    // Miss path: `NO_CONCRETE` cannot run `execute_with_descr`.
+    let byte = *insns_opname_to_byte()
+        .get("getfield_gc_i/rd>i")
+        .expect("`getfield_gc_i/rd>i` must be in insns table");
+    let code = [byte, 0x02, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let obj = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = obj;
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = step(&code, 0, &mut wc).expect_err("NO_CONCRETE miss cannot execute");
+    assert_eq!(
+        err,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+    );
+}
+
+#[test]
 fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
     // GetfieldGcR variant — same flow as
     // GetfieldGcI but result lands in registers_r.
@@ -28395,6 +28917,75 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         dst_post, cached,
         "cache hit must write cached OpRef into registers_r[dst]",
     );
+}
+
+#[test]
+fn getarrayitem_gc_r_heapcache_hit_serves_no_concrete_array() {
+    // Virtual array: `NO_CONCRETE` must not abort before
+    // `_do_getarrayitem_gc_any` (`pyjitpl.py`) returns the cached box.
+    let byte = *insns_opname_to_byte()
+        .get("getarrayitem_gc_r/rid>r")
+        .expect("`getarrayitem_gc_r/rid>r` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
+    let array = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = array;
+    let index = regs_i[3];
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let cached = tc.const_ref(0xCAFE_F00D);
+    tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let _ = step(&code, 0, &mut wc).expect("heapcache hit must ignore NO_CONCRETE");
+    let dst_post = wc.registers_r.get(5).expect("ref register in range");
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before, "cache hit must not record");
+    assert_eq!(dst_post, cached);
 }
 
 #[test]
@@ -30138,7 +30729,6 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         other => panic!("expected CloseLoop from jit_merge_point, got {other:?}"),
     }
 }
-
 #[test]
 fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let byte = *insns_opname_to_byte()
@@ -30851,6 +31441,101 @@ fn residual_preflight_declines_when_callee_locals_cannot_publish() {
         !super::flush_live_virtualizable_before_residual_call(&mut wc, 0),
         "an unpublishable callee locals region must decline the residual"
     );
+}
+
+#[test]
+fn mailbox_live_marker_pcdep_matches_the_following_opcode() {
+    // Producer-fixed mailbox table: first-emission `-live-` (11373), the
+    // jump floor (11376), later unrolled `-live-` (11389). Each assembled
+    // `-live-` ships its own colour→slot row equal to the opcode it
+    // precedes. An absent coordinate inherits the predecessor row.
+    let row = vec![(1u8, 0u16, 19u16)];
+    let table = vec![
+        (11373, row.clone()),
+        (11376, row.clone()),
+        (11389, row.clone()),
+    ];
+    let exact_row = |pc: usize| -> Option<&Vec<(u8, u16, u16)>> {
+        table
+            .binary_search_by_key(&pc, |&(off, _)| off)
+            .ok()
+            .map(|i| &table[i].1)
+    };
+    assert_eq!(exact_row(11373), exact_row(11376));
+    assert!(!exact_row(11373).expect("first-emission -live-").is_empty());
+    assert!(exact_row(11389).is_some());
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11373
+    ));
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11376
+    ));
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11389
+    ));
+    let pred = table[1].1.clone();
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11376, &pred),
+        pred
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11389, &pred),
+        pred
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11400, &pred),
+        pred
+    );
+}
+
+#[test]
+fn none_ref_colors_reload_from_the_callee_slot_shadow() {
+    let keep = OpRef::ref_op(3);
+    let self_box = OpRef::ref_op(11);
+    let line_box = OpRef::ref_op(13);
+    let mut registers = vec![OpRef::NONE, keep, OpRef::NONE, OpRef::NONE, keep];
+    let mut shadow = std::collections::HashMap::new();
+    shadow.insert(0, self_box);
+    shadow.insert(1, line_box);
+    // Loop-header coloring: color 0 = local 0 (`self`), color 3 = local 1
+    // (`line`). The marker's own pcdep row inverts those colours onto
+    // `CalleeLocalsShadow`.
+    let pcdep = vec![(1, 0, 0), (1, 3, 1), (1, 4, 3)];
+    let filled = super::resume_snapshot::fill_none_refs_from_callee_slots(
+        &mut registers,
+        3,
+        1,
+        &pcdep,
+        &shadow,
+        None,
+    );
+    assert_eq!(filled, 2);
+    assert_eq!(registers, vec![self_box, keep, OpRef::NONE, line_box, keep]);
+}
+
+#[test]
+fn none_ref_colors_skip_int_shadow_values() {
+    let keep = OpRef::ref_op(3);
+    let int_box = OpRef::int_op(11);
+    let ref_box = OpRef::ref_op(13);
+    let mut registers = vec![OpRef::NONE, keep, OpRef::NONE];
+    let mut shadow = std::collections::HashMap::new();
+    shadow.insert(0, int_box);
+    shadow.insert(1, ref_box);
+    // color 0 = local 0, color 2 = local 1. `MIFrame.registers_r` is refs
+    // only (`pyjitpl.py` `get_list_of_active_boxes`); an Int sitting in
+    // the slot shadow must not become a TAGBOX failarg.
+    let pcdep = vec![(1, 0, 0), (1, 2, 1)];
+    let filled = super::resume_snapshot::fill_none_refs_from_callee_slots(
+        &mut registers,
+        2,
+        0,
+        &pcdep,
+        &shadow,
+        None,
+    );
+    assert_eq!(filled, 1);
+    assert_eq!(registers, vec![OpRef::NONE, keep, ref_box]);
 }
 
 /// `insert_renamings` routes a cyclic parallel move through the Int scratch

@@ -1622,6 +1622,7 @@ pub unsafe fn alloc_fixed_array_with_header(
 
 /// Allocate a frame locals array in the lifetime regime selected by its owner.
 /// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+#[majit_macros::dont_look_inside]
 unsafe fn alloc_frame_locals_array(
     len: usize,
     fill: pyre_object::PyObjectRef,
@@ -2283,6 +2284,11 @@ impl FrameBox {
 /// Creation therefore walks the live ExecutionContext from its current top
 /// frame, using the PyPy no-hidden-frame traversal, and records summaries in
 /// most-recent-first order.
+///
+/// Residual: `Vec::into_iter().map` is not a registered graph
+/// (`vec::into_iter::IntoIter::map`). Origin tracking is off the CALL_KW
+/// hot path (`sys.set_coroutine_origin_tracking_depth`).
+#[majit_macros::dont_look_inside]
 fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
     if ec.is_null() {
         return w_none();
@@ -2322,12 +2328,12 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         summary_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
         frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(anchor.live());
     }
-    w_tuple_new(
-        summary_slots
-            .into_iter()
-            .map(pyre_object::gc_roots::shadow_stack_get)
-            .collect(),
-    )
+    let n = summary_slots.len();
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        items.push(pyre_object::gc_roots::shadow_stack_get(summary_slots[i]));
+    }
+    w_tuple_new(items)
 }
 
 impl std::ops::Deref for FrameBox {
@@ -4947,7 +4953,7 @@ impl PyFrame {
         // slot to read back.  Same allocation shape as
         // `snapshot_for_generator` below, for the same reason.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc, true)?)?;
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -4962,9 +4968,17 @@ impl PyFrame {
     /// write during recording would leak to the real heap and double-apply
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
+    ///
+    /// `share_debugdata`: a tracing snapshot aliases the live frame's
+    /// `debugdata` object (`pyframe.py` one payload per frame). A clone is a
+    /// different nursery object; capturing it into resume data dangles after
+    /// the snapshot is dropped, and `write_from_resume_data_partial` then
+    /// stamps that pointer into the live frame. Generator snapshots still
+    /// clone so the suspended frame owns an independent payload.
     fn build_snapshot_frame(
         &self,
         allocation: FrameLocalsArrayAllocation,
+        share_debugdata: bool,
     ) -> Result<PyFrame, crate::PyError> {
         // `alloc_frame_locals_array` and `clone_debugdata_ptr` can minor-collect.
         // `FrameAnchor` is the shadow-stack slot the collector rewrites
@@ -4996,7 +5010,16 @@ impl PyFrame {
             }
             remember_frame_locals_array(array);
         }
-        let debugdata = unsafe { clone_debugdata_ptr((*anchor.live()).debugdata, allocation) };
+        let live_debugdata = unsafe { (*anchor.live()).debugdata };
+        let debugdata = if share_debugdata
+            && !live_debugdata.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(
+                live_debugdata as pyre_object::gc_hook::GCREF,
+            ) {
+            live_debugdata
+        } else {
+            unsafe { clone_debugdata_ptr(live_debugdata, allocation) }
+        };
         if pyre_object::gc_hook::gc_alloc_failed_pending() && debugdata.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
@@ -5028,7 +5051,7 @@ impl PyFrame {
         // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
         // and write-barriers the frame before this returns.
         let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc, false)?)?;
         frame.fix_array_ptrs();
         Ok(frame)
     }
@@ -7385,7 +7408,17 @@ pub fn createframe_obj(
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, _roots.get(root_base) as *const ())?;
     }
-    remember_frame_locals_array(frame.locals_cells_stack_w);
+    // `FrameBox::new` and `initialize_frame_scopes` collect; the nursery
+    // locals array may have moved. `pycode.py PyCode.funcrun` reads
+    // `fresh_frame.locals_cells_stack_w` after `hint(frame,
+    // access_directly=True, fresh_virtualizable=True)`.
+    // `jtransform.py is_virtualizable_getset` returns False for that flag,
+    // so the getfield does not enter `vable_array_vars` /
+    // `_check_no_vable_array`.
+    let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(&mut *frame),
+    );
+    remember_frame_locals_array(fresh_frame.locals_cells_stack_w);
 
     Ok(frame)
 }
@@ -8261,7 +8294,7 @@ x = 7
         let _ = roots.pin_root(pyre_object::w_dict_new());
         frame.w_builtin = roots.get(installed_slot);
         let snapshot = frame
-            .build_snapshot_frame(super::FrameLocalsArrayAllocation::StdAlloc)
+            .build_snapshot_frame(super::FrameLocalsArrayAllocation::StdAlloc, false)
             .expect("frame snapshot");
         YOUNG_FRAME_ALLOCS.with(|slots| {
             slots

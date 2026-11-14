@@ -872,6 +872,13 @@ fn cast_insertion_index(block: &crate::model::Block, operand: &Variable) -> usiz
 /// GC successor leaves the other successor's phi `Signed`, and the copy
 /// the other way (`GcRef` into `Signed`) aborts too. Either side being
 /// `GcRef` pulls the pair, then the next pass sees the other edge.
+///
+/// A `raw_store`/`raw_load` cell is an int address (`assembler.py`
+/// `raw_store` base kind `'i'`). A residual one-word handle stored in
+/// that cell is also a GC pointer (`repr(transparent)` peel), so the
+/// same word can feed a GC phi. Stamping the cell `GcRef` then makes
+/// the assembler reject the access. Leave the cell Signed;
+/// [`coerce_cross_bank_links`] casts the link.
 pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
     // Signed/Unknown are raw-address leftovers of a GC pointer.
     // A Void returnblock inputarg of a `Result<(), PyError>` callee
@@ -882,6 +889,7 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
     // leave the void bank so later ops can colour it.
     let returnblock = graph.returnblock;
     let protect_unit_return = graph.return_type.as_deref() == Some("()");
+    let stay_int = raw_int_cell_ids(graph);
     let soft = |ty: &ConcreteType| matches!(ty, ConcreteType::Signed | ConcreteType::Unknown);
     let soft_phi = |ty: &ConcreteType, target: crate::model::BlockId| {
         soft(ty) || (*ty == ConcreteType::Void && !(protect_unit_return && target == returnblock))
@@ -900,9 +908,15 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
                     let arg_ty = FunctionGraph::concretetype_of(var);
                     let in_ty = FunctionGraph::concretetype_of(input);
                     if in_ty == ConcreteType::GcRef && soft(&arg_ty) {
+                        if stay_int.contains(&var.id()) {
+                            continue;
+                        }
                         FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
                         changed = true;
                     } else if arg_ty == ConcreteType::GcRef && soft_phi(&in_ty, link.target) {
+                        if stay_int.contains(&input.id()) {
+                            continue;
+                        }
                         FunctionGraph::set_concretetype_of_inline(input, ConcreteType::GcRef);
                         changed = true;
                     } else if let Some(kind) = hard_reg_kind(in_ty) {
@@ -914,12 +928,18 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
                         // already-kinded dest (`make_dependencies` live
                         // set is considered vars; the link arg is a use).
                         if unset_link_end(arg_ty, link.target, protect_unit_return, returnblock) {
+                            if kind == ConcreteType::GcRef && stay_int.contains(&var.id()) {
+                                continue;
+                            }
                             FunctionGraph::set_concretetype_of_inline(var, kind);
                             changed = true;
                         }
                     } else if let Some(kind) = hard_reg_kind(arg_ty)
                         && unset_link_end(in_ty, link.target, protect_unit_return, returnblock)
                     {
+                        if kind == ConcreteType::GcRef && stay_int.contains(&input.id()) {
+                            continue;
+                        }
                         FunctionGraph::set_concretetype_of_inline(input, kind);
                         changed = true;
                     }
@@ -930,6 +950,65 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
             break;
         }
     }
+}
+
+/// Cells the assembler requires in the int bank: `raw_store`/`raw_load`
+/// addresses and their non-float payloads, and integer `add`/`sub`
+/// operands. Stamping those cells `GcRef` because they also feed a GC
+/// phi emits the unwired `int_add/ri>i` (`blackhole.py` integer ops
+/// are `@arguments("i", "i")`).
+fn raw_int_cell_ids(graph: &FunctionGraph) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    let take_int = |var: &Variable| {
+        matches!(
+            FunctionGraph::concretetype_of(var),
+            ConcreteType::Signed | ConcreteType::Unknown
+        )
+    };
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::RawStore { base, value, .. } => {
+                    ids.insert(base.id());
+                    if FunctionGraph::concretetype_of(value) != ConcreteType::Float {
+                        ids.insert(value.id());
+                    }
+                }
+                OpKind::RawLoad { base, .. } => {
+                    ids.insert(base.id());
+                    if let Some(result) = &op.result
+                        && FunctionGraph::concretetype_of(result) != ConcreteType::Float
+                    {
+                        ids.insert(result.id());
+                    }
+                }
+                OpKind::BinOp {
+                    op: binop,
+                    lhs,
+                    rhs,
+                    ..
+                } if matches!(
+                    binop.as_str(),
+                    "add" | "sub" | "mul" | "int_add" | "int_sub" | "int_mul"
+                ) =>
+                {
+                    if take_int(lhs) {
+                        ids.insert(lhs.id());
+                    }
+                    if take_int(rhs) {
+                        ids.insert(rhs.id());
+                    }
+                    if let Some(result) = &op.result
+                        && take_int(result)
+                    {
+                        ids.insert(result.id());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
 }
 
 fn hard_reg_kind(ty: ConcreteType) -> Option<ConcreteType> {
@@ -1253,6 +1332,17 @@ pub(crate) fn field_owner_is_gc(
     // would cast the FatLen int word through `cast_int_to_ptr`, assembling
     // `getfield_gc_r` of `method_*`.
     if field.is_vtable_method_slot() {
+        return false;
+    }
+    // `rclass.py getgcflavor`: harvested `_alloc_flavor_ = raw` is
+    // `_gckind == 'raw'` even when the front stamped `owner_declared_gc`
+    // from storage-raw only (`declared_raw_adt_node` rejects a Vec field).
+    // `history.getkind` of that Ptr is int; `promote_gc_field_bases` must
+    // not restamp the address into the ref bank.
+    if let Some(owner) = field.owner_root.as_deref()
+        && let Some(cc) = callcontrol
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+    {
         return false;
     }
     // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
@@ -1943,6 +2033,114 @@ mod tests {
     }
 
     #[test]
+    fn align_gc_link_args_leaves_a_rawstore_base_signed() {
+        let mut graph = FunctionGraph::new("rawstore_base_gc_phi");
+        let shared = push_input(&mut graph, "p", ValueType::Int);
+        let offset = push_input(&mut graph, "off", ValueType::Int);
+        let stored = push_input(&mut graph, "v", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&shared, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&offset, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&stored, ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: shared.clone(),
+                    offset,
+                    value: stored,
+                    item_ty: ValueType::Int,
+                    itemsize: 8,
+                    is_item_signed: true,
+                },
+            });
+        let (gc_bb, gc_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&gc_inputs[0], ConcreteType::GcRef);
+        graph.set_return(gc_bb, Some(gc_inputs[0].clone()));
+        graph.set_goto(graph.startblock, gc_bb, vec![shared.clone()]);
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&shared),
+            ConcreteType::Signed,
+            "a RawStore base stays int even when it also feeds a GcRef phi"
+        );
+    }
+
+    #[test]
+    fn align_gc_link_args_leaves_a_rawstore_dest_phi_signed() {
+        let mut graph = FunctionGraph::new("rawstore_dest_phi");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let (dst_bb, dst_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&dst_inputs[0], ConcreteType::Signed);
+        let offset = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(dst_bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base: dst_inputs[0].clone(),
+                offset,
+                value: stored,
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+            },
+        });
+        graph.set_return(dst_bb, None);
+        graph.set_goto(graph.startblock, dst_bb, vec![src.clone()]);
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dst_inputs[0]),
+            ConcreteType::Signed,
+            "a RawStore base phi stays int even when a GcRef predecessor feeds it"
+        );
+    }
+
+    #[test]
+    fn align_gc_link_args_leaves_an_int_add_operand_signed() {
+        let mut graph = FunctionGraph::new("int_add_operand_gc_phi");
+        let shared = push_input(&mut graph, "p", ValueType::Int);
+        let offset = push_input(&mut graph, "off", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&shared, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&offset, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: shared.clone(),
+                    rhs: offset,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("int_add has a result");
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        let (gc_bb, gc_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&gc_inputs[0], ConcreteType::GcRef);
+        graph.set_return(gc_bb, Some(gc_inputs[0].clone()));
+        graph.set_goto(graph.startblock, gc_bb, vec![shared.clone()]);
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&shared),
+            ConcreteType::Signed,
+            "an int_add operand stays int even when it also feeds a GcRef phi"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&sum),
+            ConcreteType::Signed,
+            "the int_add result stays int"
+        );
+    }
+
+    #[test]
     fn stamp_unknown_call_args_stamps_a_ref_list_operand() {
         let mut graph = FunctionGraph::new("stamp_call_arg");
         let obj = graph.alloc_value_var();
@@ -2088,6 +2286,98 @@ mod tests {
         assert!(
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_flavor_raw_is_raw_even_when_declared_gc() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("fixture::RawFlavor".to_string());
+        let field = FieldDescriptor::new("n", Some("fixture::RawFlavor".into()))
+            .with_owner_declared_gc(Some(true));
+        assert!(
+            !field_owner_is_gc(&field, Some(&cc)),
+            "rclass.py getgcflavor raw is not a GC owner"
+        );
+        let gc_field =
+            FieldDescriptor::new("n", Some("Point".into())).with_owner_declared_gc(Some(true));
+        assert!(
+            field_owner_is_gc(&gc_field, Some(&cc)),
+            "a declared-GC owner without a raw harvest stays GC"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_declared_gc_wins_over_layout_raw() {
+        use crate::call::{CallControl, StructLayout};
+
+        let owner = "fixture::GcHandle";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let field =
+            FieldDescriptor::new("0", Some(owner.into())).with_owner_declared_gc(Some(true));
+        assert!(
+            field_owner_is_gc(&field, Some(&cc)),
+            "a GC handle that is not a GcType seed keeps owner_declared_gc"
+        );
+        let raw_field = FieldDescriptor::new("__discriminant", Some(owner.into()))
+            .with_owner_declared_gc(Some(false));
+        assert!(
+            !field_owner_is_gc(&raw_field, Some(&cc)),
+            "the front's Some(false) is a raw owner"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_flavor_raw_signed() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("fixture::RawFlavor".to_string());
+        let mut graph = FunctionGraph::new("raw_flavor_getfield");
+        let base = push_input(
+            &mut graph,
+            "raw",
+            ValueType::Ref(Some("fixture::RawFlavor".into())),
+        );
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("n", Some("fixture::RawFlavor".into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "a flavor-raw FieldRead base stays int even when owner_declared_gc is Some(true)"
         );
     }
 

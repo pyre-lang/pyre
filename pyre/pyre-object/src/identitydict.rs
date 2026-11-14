@@ -13,7 +13,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictmultiobject::DictStrategy;
-use crate::pyobject::{PY_NULL, PyObjectRef};
+use crate::pyobject::{PY_NULL, PyObject, PyObjectRef};
 
 /// `identitydict.py IdentityDictStrategy` key type — identity
 /// comparison + identity hash.  Stored in
@@ -61,6 +61,7 @@ pub type IdentityDictStorage = crate::rordereddict::RDict<
     PyObjectRef,
     crate::dictmultiobject::ObjectKeyBuildHasher,
 >;
+pub const IDENTITY_DICT_STORAGE_SIZE: usize = std::mem::size_of::<IdentityDictStorage>();
 
 /// Runtime-assigned GC type id for the [`IdentityDictStorage`] box.
 static IDENTITY_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -264,11 +265,18 @@ unsafe fn identity_storage_mut<'a>(obj: PyObjectRef) -> &'a mut IdentityDictStor
 ///     def w_keys(self, w_dict):
 ///         return self.space.newlist(self.unerase(w_dict.dstorage).keys())
 /// ```
-pub struct IdentityDictStrategy;
+/// `space.fromcache(IdentityDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct IdentityDictStrategy {
+    ob_header: PyObject,
+}
 
 /// `pypy/objspace/std/identitydict.py IdentityDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(IdentityDictStrategy)`.
-pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
+pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 crate::define_prebuilt_dict_strategy_ref!(
     IDENTITY_DICT_STRATEGY_REF,
@@ -315,11 +323,21 @@ impl DictStrategy for IdentityDictStrategy {
     /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
         // `identitydict.py get_empty_storage`: erased `{}` is a nursery
-        // `dicttable`.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            IdentityDictStorage::new(),
-            identity_dict_storage_gc_type_id(),
-        ) as crate::gc_hook::GCREF
+        // `dicttable`. `ll_newdict`: malloc + field stores.
+        let tid = identity_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            IDENTITY_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<IdentityDictStorage>()
+        } else {
+            raw as *mut IdentityDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as crate::gc_hook::GCREF
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` —

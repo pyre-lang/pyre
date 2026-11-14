@@ -15,7 +15,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictmultiobject::DictStrategy;
-use crate::pyobject::{PY_NULL, PyObjectRef};
+use crate::pyobject::{PY_NULL, PyObject, PyObjectRef};
 
 /// `kwargsdict.py KwargsDictStrategy`.
 ///
@@ -46,7 +46,12 @@ use crate::pyobject::{PY_NULL, PyObjectRef};
 ///   are constant via `jit.look_inside_iff`.
 /// - At size ≥ 16 entries (`kwargsdict.py`) the strategy
 ///   auto-promotes to `UnicodeDictStrategy` to avoid degenerate O(n).
-pub struct KwargsDictStrategy;
+/// `space.fromcache(KwargsDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct KwargsDictStrategy {
+    ob_header: PyObject,
+}
 
 /// `ll_getitem_fast` on the parallel `keys_w` / `values_w` lists
 /// (`kwargsdict.py` `keys_w[i]` / `values_w[i]`).
@@ -60,7 +65,9 @@ fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
 
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
-pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
+pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 crate::define_prebuilt_dict_strategy_ref!(
     KWARGS_DICT_STRATEGY_REF,
@@ -256,6 +263,84 @@ unsafe fn kwargs_setitem_correct_indirection(
     crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
 }
 
+/// `kwargsdict.py` `EmptyKwargsDictStrategy` / `KwargsDictStrategy`
+/// identity as a `getfield` of `dstrategy.kind` (`strategy_is`).
+///
+/// # Safety
+/// `w_dict` is a live `W_DictObject`.
+#[inline]
+pub unsafe fn w_dict_is_kwargs_or_empty_kwargs(w_dict: PyObjectRef) -> bool {
+    let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+    dict.dstrategy.kind == crate::dictmultiobject::StrategyKind::Kwargs
+        || dict.dstrategy.kind == crate::dictmultiobject::StrategyKind::EmptyKwargs
+}
+
+/// `kwargsdict.py KwargsDictStrategy.setitem` for an exact-str key,
+/// including the first store on `EmptyKwargsDictStrategy`
+/// (`switch_to_unicode_strategy` → `KwargsDictStrategy`).
+///
+/// The body is only the kwargs parallel-list overwrite/append
+/// (`_setitem_correct_indirection` without the size-16 unicode
+/// promote). `w_dict_store` / `switch_to_correct_strategy` /
+/// `switch_to_object_strategy` stay out: those graphs contain
+/// `__hash__`/`__eq__` callbacks, so `RandomEffectsAnalyzer` would
+/// stamp `EF_RANDOM_EFFECTS` and `getcalldescr` would ignore the
+/// harvested `cannot_raise` mark (`call.py` random_effects arm
+/// before `_canraise`). The caller
+/// (`argument.py _collect_keyword_args`) takes this path only when
+/// the dict is still kwargs/empty-kwargs and the key is an exact
+/// str (`KwargsDictStrategy.is_correct_type`); otherwise it uses
+/// the general `w_dict_store_checked` residual.
+///
+/// # Safety
+/// `w_dict` is a live dict on kwargs or empty-kwargs strategy,
+/// `w_key` a live exact str, `w_value` a live object.
+pub unsafe fn w_dict_store_kwargs_str(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) {
+    let _roots = crate::gc_roots::push_roots();
+    let dict_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_roots(&[w_dict, w_key, w_value]);
+    let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+    let w_key = crate::gc_roots::shadow_stack_get(dict_slot + 1);
+    let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+    debug_assert!(
+        dict.dstrategy.kind == crate::dictmultiobject::StrategyKind::EmptyKwargs
+            || dict.dstrategy.kind == crate::dictmultiobject::StrategyKind::Kwargs,
+        "w_dict_store_kwargs_str: dict must be kwargs or empty-kwargs"
+    );
+    debug_assert!(
+        KwargsDictStrategy::is_correct_type(w_key),
+        "w_dict_store_kwargs_str: key must be an exact str"
+    );
+    if dict.dstrategy.kind == crate::dictmultiobject::StrategyKind::EmptyKwargs {
+        // `EmptyKwargsDictStrategy.switch_to_kwargs_strategy` — str key
+        // only, no object/identity branch.
+        let storage = KWARGS_DICT_STRATEGY.get_empty_storage();
+        let _ = crate::gc_roots::pin_root(storage as crate::PyObjectRef);
+        let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+        crate::dictmultiobject::install_dict_storage(w_dict, storage, kwargs_dict_strategy_ref());
+    }
+    let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+    let w_key = crate::gc_roots::shadow_stack_get(dict_slot + 1);
+    let w_value = crate::gc_roots::shadow_stack_get(dict_slot + 2);
+    let storage = kwargs_storage_mut(w_dict);
+    crate::dictmultiobject::dict_write_barrier(w_dict);
+    let keys_w = &mut storage.0;
+    let values_w = &mut storage.1;
+    for i in 0..keys_w.len() {
+        if crate::w_str_eq_w(kwargs_at(keys_w, i), w_key) {
+            values_w[i] = w_value;
+            return;
+        }
+    }
+    keys_w.push(w_key);
+    values_w.push(w_value);
+    crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+}
+
 /// `kwargsdict.py KwargsDictStrategy._getitem_correct_indirection`
 /// `@jit.look_inside_iff(lambda self, w_dict, w_key:
 /// jit.isconstant(self.length(w_dict)) and jit.isconstant(w_key))`.
@@ -265,9 +350,11 @@ fn kwargs_getitem_correct_indirection_iff(w_dict: PyObjectRef, w_key: PyObjectRe
 }
 
 /// `kwargsdict.py _getitem_correct_indirection` — linear scan of
-/// `keys_w` / `values_w`.
+/// `keys_w` / `values_w`. `pub` so `jit_fnaddr.rs` can name the
+/// look_inside_iff trampoline adapter (`emit_helper_call_target_fn`
+/// copies this visibility; it is not auto-published).
 #[majit_macros::look_inside_iff(kwargs_getitem_correct_indirection_iff)]
-unsafe fn kwargs_getitem_correct_indirection(
+pub unsafe fn kwargs_getitem_correct_indirection(
     w_dict: PyObjectRef,
     w_key: PyObjectRef,
 ) -> Option<PyObjectRef> {
@@ -281,6 +368,21 @@ unsafe fn kwargs_getitem_correct_indirection(
     }
     None
 }
+
+// `rlib/jit.py look_inside_iff` trampoline is `@dont_look_inside`. The
+// body is `W_UnicodeObject.eq_w` (`kwargsdict.py
+// _getitem_correct_indirection`) and cannot raise or call back into
+// Python. `_jit_cannot_raise_` is the harvest marker
+// `#[dont_look_inside_cannot_raise]` emits (`rpython_attribute_markers`);
+// without it `getcalldescr` keeps `EF_RANDOM_EFFECTS` / CALL_MAY_FORCE
+// (`call.py` non-elidable else). The wrapper residual aliases to the
+// same mark (`user_path_behind_majit_call_target`).
+#[doc(hidden)]
+#[allow(dead_code, non_upper_case_globals)]
+const _jit_cannot_raise_kwargs_getitem_correct_indirection_trampoline: bool = true;
+#[doc(hidden)]
+#[allow(dead_code, non_upper_case_globals)]
+const _jit_cannot_raise_kwargs_getitem_correct_indirection: bool = true;
 
 /// `kwargsdict.py KwargsDictStrategy.getitem_str` for a dict already known to
 /// be on this strategy: `_getitem_correct_indirection` on an exact unicode key.
@@ -598,6 +700,40 @@ mod tests {
                 .map(|&(key, _)| crate::w_str_get_wtf8(key).as_str().unwrap())
                 .collect();
             assert_eq!(keys, ["c", "b", "a"]);
+        }
+    }
+
+    #[test]
+    fn kwargs_or_empty_kwargs_kind_is_a_getfield() {
+        unsafe {
+            let empty = crate::dictmultiobject::w_dict_new_kwargs();
+            assert!(w_dict_is_kwargs_or_empty_kwargs(empty));
+            w_dict_store_kwargs_str(empty, crate::w_str_new("a"), crate::w_int_new(1));
+            assert!(w_dict_is_kwargs_or_empty_kwargs(empty));
+            let object = crate::dictmultiobject::w_dict_new();
+            assert!(!w_dict_is_kwargs_or_empty_kwargs(object));
+        }
+    }
+
+    #[test]
+    fn kwargs_store_str_promotes_empty_kwargs_and_overwrites() {
+        unsafe {
+            let w_dict = crate::dictmultiobject::w_dict_new_kwargs();
+            let w_a = crate::w_str_new("a");
+            w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(1));
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+            assert_eq!(
+                crate::w_int_get_value(w_dict_lookup_or_null_kwargs_strategy(w_dict, w_a).unwrap()),
+                1
+            );
+            w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(9));
+            assert_eq!(
+                crate::w_int_get_value(w_dict_lookup_or_null_kwargs_strategy(w_dict, w_a).unwrap()),
+                9
+            );
         }
     }
 

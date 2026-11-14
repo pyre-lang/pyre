@@ -5171,6 +5171,29 @@ impl StructLayout {
         if let Some(size) = exact_size {
             self.size = size as usize;
         }
+        self.demote_struct_fields_that_exceed_parent();
+    }
+
+    /// `symbolic.get_field_token` sizes the parent including an inlined
+    /// STRUCT (`heaptracker.all_fielddescrs` recurses into
+    /// `isinstance(FIELD, lltype.Struct)`). An exact parent smaller than
+    /// that field is a word slot holding `Ptr(STRUCT)`: `rclass.py`
+    /// `InstanceRepr` `new`s the nested GcStruct and `setfield`s the
+    /// pointer. `rewrite_op_getsubstruct` would otherwise `int_add` into
+    /// the slot and read the pointer as the nested fields.
+    fn demote_struct_fields_that_exceed_parent(&mut self) {
+        let parent = self.size;
+        let word = crate::layout::target_word_size();
+        for fl in &mut self.fields {
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct
+                && fl.size > 0
+                && fl.offset + fl.size > parent
+            {
+                fl.flag = majit_ir::descr::ArrayFlag::Pointer;
+                fl.size = word;
+                fl.field_type = majit_ir::value::Type::Ref;
+            }
+        }
     }
 }
 
@@ -5596,6 +5619,21 @@ impl CallControl {
         is_known_by_value_struct(&self.known_struct_names, name)
     }
 
+    /// ARRAY.OF from a dump-only container spelling.
+    ///
+    /// `get_ll_dict` builds one STRUCT per key/value instantiation
+    /// (`rordereddict.py`). Prefer the extracted element spelling when
+    /// that instantiation is registered; otherwise the generic-stripped
+    /// template (`descr.py` `consider_array(ARRAY)`).
+    fn dump_array_of_name(&self, array_str: &str) -> String {
+        let raw = extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
+        if self.is_known_struct(&raw) || self.struct_fields.fields.get(&raw).is_some() {
+            raw
+        } else {
+            majit_ir::descr::strip_generic_args(&raw).into_owned()
+        }
+    }
+
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
     /// The runtime calls this with layouts from `std::mem::offset_of!()` etc.
     pub fn set_struct_layout(
@@ -6019,13 +6057,9 @@ impl CallControl {
             }
             _ => None,
         });
-        let elem_name = interned_of_struct.clone().or_else(|| {
-            array_type_id.as_deref().and_then(|s| {
-                extract_element_type_from_str(s)
-                    .or_else(|| Some(s.to_string()))
-                    .map(|n| majit_ir::descr::strip_generic_args(&n).into_owned())
-            })
-        });
+        let elem_name = interned_of_struct
+            .clone()
+            .or_else(|| array_type_id.as_deref().map(|s| self.dump_array_of_name(s)));
         let elem_ref = elem_name.as_deref();
         // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
         // answer (`descr.py get_array_descr`). Dump-only peels the
@@ -6939,9 +6973,7 @@ impl CallControl {
         let elem_name = if let Some(name) = interned_of_struct.clone() {
             name
         } else {
-            let raw =
-                extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
-            majit_ir::descr::strip_generic_args(&raw).into_owned()
+            self.dump_array_of_name(array_str)
         };
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
@@ -10544,6 +10576,9 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
         // pointer-to-Raw-T result. `getkind` of that pointer is Signed,
         // so the call banks as int; the annotator shell is SomePtr.
         Some(s) if s.starts_with("raw:") && s.len() > 4 => Type::Int,
+        // `fn:<spelling>` is `Ptr(FuncType)` (`get_eval_fn`). Same int bank;
+        // the stub shell is `SomePtr`.
+        Some(s) if s.starts_with("fn:") => Type::Int,
         _ => Type::Ref,
     }
 }
@@ -12696,6 +12731,24 @@ impl CallControl {
         for block in graph.iterblocks() {
             for op in &block.operations {
                 let reason = match &op.kind {
+                    // Same leaf as `analyze_forces_virtualizable`: the rtyped
+                    // graph still names `jit_force_virtualizable` /
+                    // `jit_force_virtual` before
+                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                    // it. `VableForce` is the already-transformed spelling.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if witness == EffectWitness::ForcesVirtualizable
+                        && segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "jit_force_virtualizable" | "jit_force_virtual"
+                            )
+                        }) =>
+                    {
+                        Some("forces a virtualizable".to_string())
+                    }
                     OpKind::VableForce { .. } if witness == EffectWitness::ForcesVirtualizable => {
                         Some("forces a virtualizable".to_string())
                     }
@@ -12903,9 +12956,18 @@ impl CallControl {
                 // `analyze_random_effects` keeps returning False for it, as
                 // `RandomEffectsAnalyzer.analyze_simple_operation` does
                 // (effectinfo.py).
-                return self
-                    .external_funcobj(path)
-                    .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
+                //
+                // `GraphAnalyzer.analyze` (`graphanalyze.py`): a non-external
+                // funcobj with no `graph` is AttributeError → `top_result()`.
+                // CollectAnalyzer.top_result is True. A registered FunDecl
+                // whose build produced no graph is that funcobj
+                // (`names_funcobj`); a `mark_*` record with no store slot is
+                // the external arm above.
+                let (random_effects, canmallocgc) = match self.external_funcobj(path) {
+                    Some(f) => (f.random_effects_on_gcobjs, f.canmallocgc),
+                    None => (false, false),
+                };
+                return random_effects || canmallocgc || self.function_graphs.names_funcobj(path);
             }
         };
         if !seen.enter(path.clone(), analyzed) {
@@ -18515,6 +18577,58 @@ mod tests {
         assert_eq!(layout.fields[1].size, 0);
     }
 
+    /// The explicit sum shell (`front/mir.rs` `explicit_sum_shell`) is one
+    /// tag word plus one-word payload slots. A by-value GcStruct in that
+    /// slot (`symbolic.get_field_token` FLAG_STRUCT of the nested size)
+    /// does not fit; the producer `new`s it and `setfield`s the pointer.
+    #[test]
+    fn apply_exact_layout_demotes_a_struct_field_that_exceeds_parent() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let mut known = std::collections::HashSet::new();
+        known.insert("ObjectKey".to_string());
+        let mut layout = StructLayout::from_type_strings(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::from([("ObjectKey".to_string(), word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 3 * word);
+        assert_eq!(layout.fields[1].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].size, 2 * word);
+        layout.apply_exact_layout(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &std::collections::HashMap::from([
+                ("__discriminant".to_string(), 0u64),
+                ("__pos_0".to_string(), word as u64),
+            ]),
+            Some(2 * word as u64),
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 2 * word);
+        let payload = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "__pos_0")
+            .expect("__pos_0 row");
+        assert_eq!(payload.offset, word);
+        assert_eq!(payload.flag, ArrayFlag::Pointer);
+        assert_eq!(payload.size, word);
+        assert_eq!(payload.field_type, majit_ir::value::Type::Ref);
+    }
+
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
     /// The unknown-name fallback would bank it as a word-sized Ref.
     #[test]
@@ -24108,6 +24222,75 @@ mod tests {
         }
     }
 
+    /// `get_ll_dict` `Entry<ObjectKey, OBJECTPTR>`: two-word key, then
+    /// `f_valid`, then `value` at 24. The generic TypeVar layout is 16.
+    #[test]
+    fn interiorfielddescrof_object_key_entry_value_offset() {
+        if crate::layout::target_word_size() != 8 {
+            return;
+        }
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let atid = format!("GcArray<{elem}>");
+        let key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let sid = majit_ir::descr::StructId::from_canonical_spelling(elem);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(key_sid)),
+                (elem.to_string(), Some(sid)),
+            ]));
+        let mut fields_by_struct = std::collections::HashMap::new();
+        fields_by_struct.insert(
+            object_key.to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        fields_by_struct.insert(
+            elem.to_string(),
+            vec![
+                ("key".to_string(), object_key.to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let names = std::collections::HashSet::from([object_key.to_string(), elem.to_string()]);
+        let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
+            &fields_by_struct,
+            &names,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let layout = crate::layout::LayoutProvider::get_struct_layout(&provider, elem)
+            .expect("ObjectKey Entry layout");
+        assert_eq!(
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == "value")
+                .map(|field| field.offset),
+            Some(24)
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            elem.to_string(),
+            fields_by_struct.get(elem).cloned().unwrap(),
+        );
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(sid, layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &None, "value")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 24);
+        assert_eq!(interior.array_descr().item_size(), 40);
+    }
+
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,
     /// descr.py), while `f64` (`lltype.Float`) keeps the float kind.
@@ -25996,6 +26179,56 @@ mod tests {
             !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
+        );
+    }
+
+    /// A registered funcobj whose build produced no graph is
+    /// `GraphAnalyzer.analyze`'s AttributeError arm (`graphanalyze.py`):
+    /// CollectAnalyzer.top_result is True. The hop that dropped
+    /// `jit_bigint_add` was that funcobj answering False through the
+    /// external-call arm, so a caller whose only Call is that funcobj
+    /// never reached the `canmallocgc` mark on the real allocator.
+    #[test]
+    fn a_graphless_registered_funcobj_can_collect_its_caller() {
+        let impl_path = CallPath::from_segments(["alloc_impl"]);
+        let wrapper = CallPath::from_segments(["alloc_wrapper"]);
+        let caller = CallPath::from_segments(["top_caller"]);
+
+        let mut cc = CallControl::new();
+        cc.function_graphs.insert_deferred(
+            impl_path.clone(),
+            (None, "alloc_impl".to_string(), GraphSpecialization::Regular),
+            || None,
+        );
+
+        let mut wrapper_graph = FunctionGraph::new("alloc_wrapper");
+        let start = wrapper_graph.startblock;
+        wrapper_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_impl"])));
+        wrapper_graph.set_return(start, None);
+        cc.register_function_graph(wrapper.clone(), wrapper_graph);
+
+        let mut caller_graph = FunctionGraph::new("top_caller");
+        let start = caller_graph.startblock;
+        caller_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_wrapper"])));
+        caller_graph.set_return(start, None);
+        cc.register_function_graph(caller.clone(), caller_graph);
+
+        assert!(
+            cc.function_graphs.get(&impl_path).is_none(),
+            "the impl's build produced no graph"
+        );
+        assert!(
+            cc.function_graphs.names_funcobj(&impl_path),
+            "the impl stays a registered funcobj after the failed build"
+        );
+        assert!(
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "GraphAnalyzer.analyze (graphanalyze.py) — the caller of a non-external \
+             funcobj with no graph collects"
         );
     }
 

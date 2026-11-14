@@ -1,8 +1,9 @@
-# pyre-check: max-pypy-ratio=20.5
+# pyre-check: max-pypy-ratio=18
 #
-# Floor is 20.5 / 4 = 5.125x. CI measured cranelift 12.8x (ubuntu) and
+# Floor is 18 / 4 = 4.5x. CI measured cranelift 12.8x (ubuntu) and
 # 11.8x (macOS arm64), dynasm 7.1x (macOS arm64); local macOS arm64 dynasm
-# 5.7x-5.9x. Ceiling = 1.6 x the largest. Before the recursive call folded
+# 5.3x-5.5x, and 4.7x-4.9x once `UnicodeDictStrategy.setitem_str` is
+# looked inside. Ceiling = 1.4 x the largest. Before the recursive call folded
 # to CALL_ASSEMBLER here, the same workload ran about 8x slower than now,
 # past this ceiling.
 #

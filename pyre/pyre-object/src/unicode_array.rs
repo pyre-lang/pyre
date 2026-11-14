@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::object_array::{
     ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, items_block_capacity,
-    items_block_items_base,
+    items_block_items_base, jit_ll_arraymove,
 };
 use crate::pyobject::PyObjectRef;
 use crate::unicodeobject::UnicodeValueStorage;
@@ -260,14 +260,22 @@ impl UnicodeArray {
 
     pub fn remove(&mut self, index: usize) -> *const UnicodeValueStorage {
         assert!(index < self.len_relaxed());
+        // rlist.py `ll_pop_nonneg`: `ll_getitem_fast` then `ll_delitem_nonneg`.
         let value = self.as_slice()[index];
-        self.before_move_barrier();
+        let newlength = self.len_relaxed() - 1;
+        // rlist.py `ll_delitem_nonneg`: `ll_arraymove(l, index+1, index,
+        // newlength-index)` then `ll_setitem_fast(newlength, null)` then
+        // `_ll_resize_le`. The barrier lives inside `ll_arraymove`.
+        jit_ll_arraymove(
+            self.block as PyObjectRef,
+            (index + 1) as i64,
+            index as i64,
+            (newlength - index) as i64,
+        );
         unsafe {
-            let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
-            *p.add(self.len_relaxed() - index - 1) = std::ptr::null_mut();
+            *self.base().add(newlength) = std::ptr::null_mut();
         }
-        self.set_len_relaxed(self.len_relaxed() - 1);
+        self.set_len_relaxed(newlength);
         value
     }
 

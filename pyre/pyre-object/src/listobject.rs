@@ -747,18 +747,19 @@ impl W_ListObject {
 
     unsafe fn object_remove(&mut self, index: usize, empty_clears: bool) -> PyObjectRef {
         assert!(index < self.length_relaxed());
-        // `list_before_move_barrier` returns the list it was handed; the body
-        // continues on that word.
-        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
-        let this = &mut *(obj as *mut W_ListObject);
-        let base = items_block_items_base(this.items);
-        let value = *base.add(index);
-        let p = base.add(index);
-        std::ptr::copy(p.add(1), p, this.length_relaxed() - index - 1);
+        // rlist.py `ll_pop_nonneg`: `ll_getitem_fast` then `ll_delitem_nonneg`.
+        let value = ll_list_obj_getitem_fast(self, index);
+        let newlength = self.length_relaxed() - 1;
         // `rlist.py ll_delitem_nonneg`: `ll_arraymove` then
         // `ll_setitem_fast(newlength, null)` then `_ll_resize_le`.
-        let newlength = this.length_relaxed() - 1;
-        items_block_set_ref(this.items, newlength, PY_NULL);
+        crate::object_array::jit_ll_arraymove(
+            self.items as PyObjectRef,
+            (index + 1) as i64,
+            index as i64,
+            (newlength - index) as i64,
+        );
+        ll_list_obj_setitem_fast(self, newlength, PY_NULL);
+        let obj = self as *mut W_ListObject as PyObjectRef;
         let roots = crate::gc_roots::push_roots();
         let obj_slot = roots.base();
         let _ = roots.pin_root(obj);
@@ -6439,6 +6440,14 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
 
 /// listobject.py IntegerListStrategy.pop
 /// Strategy-preserving: pops from typed storage, wraps result.
+///
+/// Splits into a guard-taking wrapper and a lock-free
+/// [`w_list_pop_inner`], matching [`w_list_pop_end`] /
+/// [`w_list_pop_end_inner`]: a `w_list_lock` acquire/release pair inside
+/// the descended body declines the DELETE_SUBSCR walk, so the mutation
+/// residualizes as one `CallN` whose EffectInfo does not write the items
+/// array (`heapcache.py` then keeps `GetarrayitemGc` across `del lst[0]`).
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -6449,8 +6458,29 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64, empty_clears: bool) -> Op
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    w_list_pop_inner(obj, index, empty_clears)
+}
+
+/// [`w_list_pop`]'s checked body, run with the list's guard already held.
+///
+/// `#[inline(never)]` keeps a unique Charon leaf so a DELETE_SUBSCR walk
+/// that residualizes the lock can still descend the rlist-shaped mutation
+/// (`ll_pop_nonneg` → `ll_delitem_nonneg`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject` and the caller must hold
+/// `w_list_lock(obj)`.
+#[inline(never)]
+pub unsafe fn w_list_pop_inner(
+    obj: PyObjectRef,
+    index: i64,
+    empty_clears: bool,
+) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let list = &mut *(obj as *mut W_ListObject);
-    let result = match list.strategy {
+    match list.strategy {
         // listobject.py EmptyListStrategy.pop raises IndexError.
         ListStrategy::Empty | ListStrategy::Size => None,
         ListStrategy::SimpleRange => {
@@ -6460,7 +6490,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64, empty_clears: bool) -> Op
             if crate::gc_hook::gc_alloc_failed_pending() && obj.is_null() {
                 return None;
             }
-            return w_list_pop(obj, index, empty_clears);
+            return w_list_pop_inner(obj, index, empty_clears);
         }
         ListStrategy::Range => {
             let len = range_list_length(list) as i64;
@@ -6492,7 +6522,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64, empty_clears: bool) -> Op
                 if crate::gc_hook::gc_alloc_failed_pending() && obj.is_null() {
                     return None;
                 }
-                return w_list_pop(obj, index, empty_clears);
+                return w_list_pop_inner(obj, index, empty_clears);
             }
         }
         ListStrategy::Integer => {
@@ -6596,8 +6626,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64, empty_clears: bool) -> Op
             }
             Some(wrapped)
         }
-    };
-    result
+    }
 }
 
 /// Remove and return the last item. Returns `None` if empty.

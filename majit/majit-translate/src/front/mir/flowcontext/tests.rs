@@ -186,7 +186,10 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     )
     .expect("substituted entries_item_ptr body");
     crate::test_support::with_lowering(llbc, |context| {
-        let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+        let struct_fields = super::struct_field_registry_from_rows(
+            &context.struct_fields,
+            &context.foreign_callables,
+        );
         let accum = super::AccumulatorFacts::build(llbc, &body);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -10364,17 +10367,18 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
     });
 }
 
-/// `complex_add` calls `complex_val(a).unwrap()` / `complex_val(b).unwrap()`.
-/// Each stays one regular call of the extracted core body
+/// `complex_operands` calls `complex_val(roots.get(base)).unwrap()` /
+/// `complex_val(roots.get(base + 1)).unwrap()`. Each stays one regular call
+/// of the extracted core body
 /// `match self { Some(v) => v, None => <diverging Never call> }`.
 /// That body lowers; its None arm is `RaiseImplicit` and
 /// `remove_assertion_errors` prunes it.
 #[test]
-fn complex_add_keeps_regular_call_to_core_unwrap() {
+fn complex_operands_keeps_regular_call_to_core_unwrap() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let caller =
-        crate::test_support::lower_function(llbc, "complex_add").expect("lower complex_add");
+    let caller = crate::test_support::lower_function(llbc, "complex_operands")
+        .expect("lower complex_operands");
     assert_eq!(
         core_impl_call_count(&caller, "unwrap", "option"),
         2,
@@ -10388,11 +10392,11 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
         .any(call_leaf_is_diverging_panic);
     assert!(
         !leftover_divergent,
-        "complex_add must not residualize the Never abort callee"
+        "complex_operands must not residualize the Never abort callee"
     );
     assert!(
         !graph_has_live_assertion_branch(&caller),
-        "complex_add must not keep a live AssertionError raise after simplify"
+        "complex_operands must not keep a live AssertionError raise after simplify"
     );
     assert_extracted_core_body_lowers(llbc, "::option::<Impl>::unwrap");
 }
@@ -13365,7 +13369,13 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         .and_then(|rows| rows.iter().find(|row| row.name == "key"))
         .map(|row| row.ty.as_str());
     assert_eq!(bare_key, Some("??TypeVar#0"));
-    let published: Vec<_> = program
+    let identity = "rordereddict_entries::Entry<i64,*mut PyObject>";
+    assert_eq!(
+        program.struct_fields.fields.get(identity),
+        program.struct_fields.fields.get(qualified),
+    );
+    assert!(program.known_struct_names.contains(identity));
+    let mut published: Vec<_> = program
         .struct_fields
         .fields
         .keys()
@@ -13379,7 +13389,8 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         })
         .cloned()
         .collect();
-    assert_eq!(published, vec![qualified.to_string()]);
+    published.sort();
+    assert_eq!(published, vec![qualified.to_string(), identity.to_string()]);
     assert!(
         program
             .struct_fields
@@ -13387,6 +13398,280 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
             .keys()
             .all(|key| !key.contains("??"))
     );
+}
+
+/// `ObjectDictStorage` is `type T = RDict<ObjectKey, OBJECTPTR, S>`.
+/// Charon names the alias at the `dict_entries_value_at` signature, so
+/// the harvest peels it to the `RDict` arguments (`get_ll_dict`).
+#[test]
+fn concrete_object_key_entry_rows_from_storage_alias() {
+    let obj_ty = 0u64;
+    let object_key = 1u64;
+    let entry = 2u64;
+    let rdict = 3u64;
+    let storage = 4u64;
+    let i64_ty = interior_i64();
+    let bool_ty = interior_bool();
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let typevar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+    let adt = |id: u64, types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": types,
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    };
+    let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+    let struct_decl = |def_id: u64, path: &[&str], fields: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(path, true),
+            "kind": {"Struct": fields}
+        })
+    };
+    let obj_ptr = interior_raw_mut(adt(obj_ty, vec![]));
+    let object_key_adt = adt(object_key, vec![]);
+    let rdict_object_key = adt(rdict, vec![object_key_adt.clone(), obj_ptr.clone()]);
+    let storage_ref = interior_raw_mut(adt(storage, vec![]));
+    let getter = interior_opaque(
+        10,
+        &["pyre_object", "dictmultiobject", "dict_entries_value_at"],
+        vec![storage_ref.clone(), interior_usize()],
+        obj_ptr.clone(),
+    );
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![
+            struct_decl(obj_ty, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            struct_decl(
+                object_key,
+                &["pyre_object", "dictmultiobject", "ObjectKey"],
+                vec![field("hash", i64_ty.clone()), field("obj", obj_ptr.clone())],
+            ),
+            struct_decl(
+                entry,
+                &["pyre_object", "rordereddict_entries", "Entry"],
+                vec![
+                    field("key", typevar(0)),
+                    field("f_valid", bool_ty.clone()),
+                    field("value", typevar(1)),
+                    field("f_hash", u64_ty),
+                ],
+            ),
+            struct_decl(
+                rdict,
+                &["pyre_object", "rordereddict", "RDict"],
+                vec![field("entries", typevar(0))],
+            ),
+            serde_json::json!({
+                "def_id": storage,
+                "item_meta": interior_meta(
+                    &["pyre_object", "dictmultiobject", "ObjectDictStorage"],
+                    true,
+                ),
+                "kind": {"Alias": {"aliased_ty": rdict_object_key}}
+            }),
+        ],
+        vec![getter],
+    );
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let state = super::CrateLoweringState::new(
+        &llbc,
+        &std::collections::HashSet::new(),
+        std::collections::HashMap::new(),
+        Default::default(),
+        &gc,
+        &std::collections::HashSet::new(),
+        None,
+        None,
+    );
+    let program = state.finish(Vec::new());
+    let mut published: Vec<_> = program
+        .struct_fields
+        .fields
+        .keys()
+        .filter(|key| {
+            key.split('<')
+                .next()
+                .and_then(|base| base.rsplit("::").next())
+                == Some("Entry")
+                && key.contains("ObjectKey")
+        })
+        .cloned()
+        .collect();
+    published.sort();
+    assert!(
+        !published.is_empty(),
+        "Entry<ObjectKey,_> from ObjectDictStorage alias; Entry keys={:?}",
+        program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|key| key.contains("Entry"))
+            .collect::<Vec<_>>()
+    );
+    for key in &published {
+        let rows = program.struct_fields.fields.get(key).expect("rows");
+        let key_ty = rows
+            .iter()
+            .find(|row| row.name == "key")
+            .map(|row| row.ty.as_str());
+        assert!(
+            key_ty.is_some_and(|ty| ty.contains("ObjectKey")),
+            "{key} key ty={key_ty:?}"
+        );
+        assert!(
+            program.known_struct_names.contains(key),
+            "{key} must be a known struct"
+        );
+    }
+}
+
+/// `get_ll_dict` builds one `DICTENTRYARRAY` for `ObjectKey` as well as
+/// `i64`. The harvest must publish that flavour so interior `value` is
+/// at offset 24, not the generic TypeVar key's 16.
+#[test]
+fn concrete_object_key_entry_rows_publish_identity_spelling() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let program = super::super::build_semantic_program_from_llbc(llbc).expect("lower pyre-object");
+    let mut published: Vec<_> = program
+        .struct_fields
+        .fields
+        .keys()
+        .filter(|key| {
+            key.split('<')
+                .next()
+                .and_then(|base| base.rsplit("::").next())
+                == Some("Entry")
+                && key.contains("ObjectKey")
+        })
+        .cloned()
+        .collect();
+    published.sort();
+    assert!(
+        !published.is_empty(),
+        "Entry<ObjectKey,_> must be harvested; Entry keys={:?}",
+        program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|key| key.contains("Entry"))
+            .collect::<Vec<_>>()
+    );
+    for key in &published {
+        let rows = program.struct_fields.fields.get(key).expect("rows");
+        let key_ty = rows
+            .iter()
+            .find(|row| row.name == "key")
+            .map(|row| row.ty.as_str());
+        assert!(
+            key_ty.is_some_and(|ty| ty.contains("ObjectKey")),
+            "{key} key ty={key_ty:?}"
+        );
+        assert!(
+            program.known_struct_names.contains(key),
+            "{key} must be a known struct"
+        );
+    }
+    let mut interior = Vec::new();
+    for func in &program.functions {
+        let name = func.name.as_str();
+        if !(name.contains("slot_value")
+            || name.contains("dict_entries_value_at")
+            || name.contains("entry_valid"))
+        {
+            continue;
+        }
+        for block in &func.graph().blocks {
+            for op in &block.operations {
+                if let crate::model::OpKind::InteriorFieldRead {
+                    field,
+                    array_type_id,
+                    ..
+                } = &op.kind
+                {
+                    interior.push((name.to_string(), field.name.clone(), array_type_id.clone()));
+                }
+            }
+        }
+    }
+    assert!(
+        interior.iter().any(|(_, field, atid)| {
+            field == "value" && atid.as_deref().is_some_and(|id| id.contains("ObjectKey"))
+        }),
+        "value interior must name ObjectKey ARRAY.OF; interior={interior:?} published={published:?}"
+    );
+    let object_key_names: Vec<_> = program
+        .known_struct_names
+        .iter()
+        .filter(|key| key.contains("ObjectKey"))
+        .cloned()
+        .collect();
+    assert!(
+        object_key_names
+            .iter()
+            .any(|key| key.rsplit("::").next() == Some("ObjectKey")),
+        "ObjectKey must be a known by-value struct; names={object_key_names:?}"
+    );
+    if crate::layout::target_word_size() == 8 {
+        let mut fields_by_struct = std::collections::HashMap::new();
+        for (name, rows) in program.struct_fields.fields.iter() {
+            fields_by_struct.insert(
+                name.clone(),
+                rows.iter()
+                    .map(|row| (row.name.clone(), row.ty.clone()))
+                    .collect(),
+            );
+        }
+        let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
+            &fields_by_struct,
+            &program.known_struct_names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let object_value: Vec<_> = published
+            .iter()
+            .filter(|key| key.contains("*mut PyObject") || key.contains("PyObjectRef"))
+            .cloned()
+            .collect();
+        assert!(
+            !object_value.is_empty(),
+            "Entry<ObjectKey, OBJECTPTR> flavour; published={published:?} interior={interior:?}"
+        );
+        for key in &object_value {
+            let layout = crate::layout::LayoutProvider::get_struct_layout(&provider, key)
+                .unwrap_or_else(|| panic!("layout for {key}"));
+            let value_off = layout
+                .fields
+                .iter()
+                .find(|field| field.name == "value")
+                .map(|field| field.offset);
+            assert_eq!(
+                value_off,
+                Some(24),
+                "{key} value offset; layout={layout:?} key_known={} interior={interior:?} object_key_names={object_key_names:?}",
+                program.known_struct_names.contains("ObjectKey")
+            );
+        }
+        assert!(
+            interior.iter().any(|(name, field, atid)| {
+                name.contains("slot_value__spec_ObjectKey_PyObject")
+                    && field == "value"
+                    && atid.as_deref().is_some_and(|id| {
+                        id.contains("ObjectKey")
+                            && (id.contains("*mut PyObject") || id.contains("PyObjectRef"))
+                    })
+            }),
+            "spec slot_value must name the object-key ARRAY.OF; interior={interior:?}"
+        );
+    }
 }
 
 fn interior_bool() -> serde_json::Value {

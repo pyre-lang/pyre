@@ -13,7 +13,7 @@ use common::{
 };
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
+use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType, VecFieldPart};
 
 fn object_llbc() -> &'static Llbc {
     load_llbc(OBJECT_LLBC)
@@ -141,11 +141,50 @@ fn kwargs_get_empty_storage_is_newtuple_of_empty_vecs() {
     );
 }
 
-/// `gc_alloc_young_storage_box` is one `dont_look_inside` body
-/// (`monomorphize: false`). Each concrete storage shape must call its
-/// own residual funcptr (`annlowlevel.specialize` / `getfunctionptr`,
-/// an `__inst_` suffix); kwargs Tuple and typed RDict must not share
-/// the unspecialized path.
+fn call_leaf(target: &CallTarget) -> Option<&str> {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn leaf_is(leaf: &str, name: &str) -> bool {
+    leaf == name || leaf.starts_with(&format!("{name}__"))
+}
+
+fn is_typed_rdict_strategy(self_ty_root: Option<&str>) -> bool {
+    let Some(root) = self_ty_root else {
+        return false;
+    };
+    let leaf = root.rsplit("::").next().unwrap_or(root);
+    matches!(
+        leaf,
+        "ObjectDictStrategy"
+            | "UnicodeDictStrategy"
+            | "IntDictStrategy"
+            | "BytesDictStrategy"
+            | "IdentityDictStrategy"
+            | "ModuleDictStrategy"
+    )
+}
+
+fn rdict_field_write(field: &majit_translate::model::FieldDescriptor, ty: &ValueType) -> bool {
+    field
+        .owner_root
+        .as_deref()
+        .is_some_and(|root| root.contains("RDict"))
+        || matches!(ty, ValueType::Ref(Some(root)) if root.contains("RDict"))
+        || field.name == "indexes"
+        || field.name == "entries"
+        || field.name == "num_live_items"
+        || field.name == "num_ever_used_items"
+        || field.name == "resize_counter"
+        || field.name == "generation"
+}
+
+/// Typed `get_empty_storage` records `ll_newdict`: one ResidualSlot malloc
+/// plus FieldWrite of `RDict` fields. Kwargs still uses the by-value
+/// `__inst_` residual until step 4.
 #[test]
 fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
     let llbc = object_llbc();
@@ -157,17 +196,33 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
             "dictmultiobject",
             "gc_storage",
             "identitydict",
+            "celldict",
+            "rordereddict",
         ],
-        &["get_empty_storage"],
+        &[
+            "get_empty_storage",
+            "rdict_ll_newdict_in_place",
+            "try_gc_alloc_young_nonmoving_no_collect_raw",
+        ],
     )
     .expect("lower get_empty_storage callers");
 
     let mut inst_leaves = std::collections::BTreeSet::new();
     let mut unspecialized = 0usize;
+    let mut typed_graphs = 0usize;
+    let mut typed_with_malloc = 0usize;
+    let mut typed_with_old_box = 0usize;
+    let mut labels = Vec::new();
     for function in &program.functions {
         if function.name.rsplit("::").next() != Some("get_empty_storage") {
             continue;
         }
+        labels.push(format!(
+            "{} self={:?}",
+            function.name, function.self_ty_root
+        ));
+        let mut saw_malloc = false;
+        let mut saw_old_box = false;
         for op in function
             .graph()
             .blocks
@@ -186,25 +241,71 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
             };
             if leaf == "gc_alloc_young_storage_box" {
                 unspecialized += 1;
+                saw_old_box = true;
             } else if leaf.starts_with("gc_alloc_young_storage_box__inst_") {
                 inst_leaves.insert(leaf.clone());
+                saw_old_box = true;
+            } else if leaf_is(leaf, "try_gc_alloc_young_nonmoving_no_collect_raw") {
+                saw_malloc = true;
+            }
+        }
+        if is_typed_rdict_strategy(function.self_ty_root.as_deref()) {
+            typed_graphs += 1;
+            if saw_malloc {
+                typed_with_malloc += 1;
+            }
+            if saw_old_box {
+                typed_with_old_box += 1;
+            }
+        }
+    }
+    let mut rdict_write_graphs = 0usize;
+    for function in &program.functions {
+        let leaf = function.name.rsplit("::").next().unwrap_or(&function.name);
+        if leaf_is(leaf, "rdict_ll_newdict_in_place")
+            || is_typed_rdict_strategy(function.self_ty_root.as_deref())
+        {
+            let saw = function.graph().blocks.iter().any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::FieldWrite { field, ty, .. } => rdict_field_write(field, ty),
+                    _ => false,
+                })
+            });
+            if saw {
+                rdict_write_graphs += 1;
             }
         }
     }
     assert_eq!(
         unspecialized, 0,
-        "get_empty_storage must not call the unspecialized residual; inst leaves={inst_leaves:?}"
+        "get_empty_storage must not call the unspecialized residual; inst leaves={inst_leaves:?}; labels={labels:?}"
     );
     assert!(
-        inst_leaves.len() >= 2,
-        "kwargs Tuple and typed RDict must be distinct residual funcptrs, got {inst_leaves:?}"
+        inst_leaves
+            .iter()
+            .any(|leaf| leaf.contains("Vec") || leaf.contains("tuple")),
+        "kwargs still uses a distinct by-value residual until step 4, got {inst_leaves:?}; labels={labels:?}"
+    );
+    assert!(
+        typed_graphs >= 4,
+        "typed get_empty_storage graphs, got {typed_graphs}; labels={labels:?}"
+    );
+    assert_eq!(
+        typed_with_old_box, 0,
+        "typed get_empty_storage must not call gc_alloc_young_storage_box; labels={labels:?}"
+    );
+    assert_eq!(
+        typed_with_malloc, typed_graphs,
+        "typed get_empty_storage records the ResidualSlot malloc; malloc={typed_with_malloc} graphs={typed_graphs}; labels={labels:?}"
+    );
+    assert!(
+        rdict_write_graphs >= 4,
+        "ll_newdict FieldWrites of RDict fields; writes={rdict_write_graphs}; labels={labels:?}"
     );
 }
 
-/// `specialize.py` `specialize_argtype`: each `__inst_` copy of
-/// `gc_alloc_young_storage_box` (`dont_look_inside`, `*mut T`) carries
-/// the residual token of the substituted output. The generic template
-/// stays `None`.
+/// The malloc residual is one-word `ref`. Typed `get_empty_storage`
+/// FieldWrite bases carry the `RDict` class root (gap §4.2.2).
 #[test]
 fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
     let llbc = object_llbc();
@@ -216,44 +317,96 @@ fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
             "dictmultiobject",
             "gc_storage",
             "identitydict",
+            "celldict",
+            "rordereddict",
+            "gc_hook",
         ],
-        &["get_empty_storage", "gc_alloc_young_storage_box"],
+        &[
+            "get_empty_storage",
+            "rdict_ll_newdict_in_place",
+            "try_gc_alloc_young_nonmoving_no_collect_raw",
+            "gc_alloc_young_storage_box",
+        ],
     )
     .expect("lower get_empty_storage callers and young-box residual");
 
-    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
-    let generic = program
+    let names: Vec<String> = program
         .functions
         .iter()
-        .find(|f| f.name.rsplit("::").next() == Some("gc_alloc_young_storage_box"));
-    if let Some(generic) = generic {
+        .map(|f| {
+            format!(
+                "{} ret={:?} root={:?} self={:?}",
+                f.name, f.return_type, f.return_class_root, f.self_ty_root
+            )
+        })
+        .collect();
+    let malloc = program.functions.iter().find(|f| {
+        f.name
+            .rsplit("::")
+            .next()
+            .is_some_and(|leaf| leaf_is(leaf, "try_gc_alloc_young_nonmoving_no_collect_raw"))
+    });
+    if let Some(malloc) = malloc {
+        let ret = malloc.return_type.as_deref();
         assert!(
-            generic.return_class_root.is_none() && generic.graph().return_class_root.is_none(),
-            "generic *mut T has no class root; token={:?} root={:?}; names={names:?}",
-            generic.return_type,
-            generic.return_class_root
+            matches!(ret, Some("ref") | Some("gcref")),
+            "no-collect young malloc is one-word ref; got {ret:?}; names={names:?}"
         );
     }
-    let inst_rdict = program.functions.iter().find(|f| {
-        f.name.rsplit("::").next().is_some_and(|leaf| {
-            leaf.starts_with("gc_alloc_young_storage_box__inst_") && leaf.contains("RDict")
-        })
-    });
-    let inst_rdict = inst_rdict.expect(&format!(
-        "RDict instantiation is an __inst_ subject; names={names:?}"
-    ));
-    assert_eq!(
-        inst_rdict.return_type.as_deref(),
-        Some("ref"),
-        "substituted *mut RDict is ref; names={names:?}"
-    );
-    let root = inst_rdict
-        .return_class_root
-        .as_deref()
-        .or(inst_rdict.graph().return_class_root.as_deref());
+
+    let mut typed_graphs = 0usize;
+    let mut typed_with_rdict_root = 0usize;
+    for function in &program.functions {
+        if function.name.rsplit("::").next() == Some("get_empty_storage")
+            && is_typed_rdict_strategy(function.self_ty_root.as_deref())
+        {
+            typed_graphs += 1;
+        }
+        let leaf = function.name.rsplit("::").next().unwrap_or(&function.name);
+        let is_birth = leaf_is(leaf, "rdict_ll_newdict_in_place")
+            || (function.name.rsplit("::").next() == Some("get_empty_storage")
+                && is_typed_rdict_strategy(function.self_ty_root.as_deref()));
+        if !is_birth {
+            continue;
+        }
+        let fn_root = function
+            .return_class_root
+            .as_deref()
+            .or(function.graph().return_class_root.as_deref());
+        let has_root = fn_root.is_some_and(|root| root.contains("RDict"))
+            || function.graph().blocks.iter().any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::FieldWrite { field, ty, .. } => {
+                        rdict_field_write(field, ty)
+                            && field
+                                .owner_root
+                                .as_deref()
+                                .is_some_and(|root| root.contains("RDict"))
+                    }
+                    OpKind::Call {
+                        target,
+                        result_ty: ValueType::Ref(Some(root)),
+                        ..
+                    } if call_leaf(target)
+                        .is_some_and(|leaf| leaf_is(leaf, "rdict_ll_newdict_in_place"))
+                        && root.contains("RDict") =>
+                    {
+                        true
+                    }
+                    _ => false,
+                })
+            });
+        if has_root {
+            typed_with_rdict_root += 1;
+        }
+    }
     assert!(
-        root.is_some_and(|root| root.contains("RDict")),
-        "RDict class root, got {root:?}; names={names:?}"
+        typed_graphs >= 4,
+        "typed get_empty_storage graphs, got {typed_graphs}; names={names:?}"
+    );
+    assert!(
+        typed_with_rdict_root >= 4,
+        "FieldWrite bases carry the RDict class root; root={typed_with_rdict_root} graphs={typed_graphs}; names={names:?}"
     );
 }
 

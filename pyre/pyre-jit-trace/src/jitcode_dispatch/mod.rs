@@ -46,6 +46,8 @@
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py _do_getarrayitem_gc_any`. All three `_i` / `_r` / `_f` result shapes are wired to this same heapcache body (kind-keyed dst bank, dispatch arms below) and registered in `wellknown_bh_insns()` (`insns.rs`) for blackhole execution + codewriter emission. |
 //! | `setarrayitem_gc_r/rird`, `setarrayitem_gc_r/rcrd` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. The `rcrd` `c`-argcode form (USE_C_FORM `assembler.py/312`) decodes the index as one inline signed byte → ConstInt; same recording body otherwise. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
+//! | `getarrayitem_raw_i/iid>i` | PARITY | `pyjitpl.py opimpl_getarrayitem_raw_i` / `blackhole.py bhimpl_getarrayitem_raw_i` (`iid>i`). Int-bank array pointer + index + descr; records `GetarrayitemRawI`. When both operands are concrete the walk performs the load (`bh_getarrayitem_raw_i`) and stamps the word, same as `raw_load_i`. No heapcache. |
+//! | `getarrayitem_raw_f/iid>f` | PARITY | Float twin of `getarrayitem_raw_i`. Records `GetarrayitemRawF`. The Float bank carries no concrete shadow, matching `raw_load_f`. |
 //! | `strlen/r>i`, `strgetitem/ri>i`, `strgetitem/rc>i` | PARITY | `pyjitpl.py opimpl_strlen` / `opimpl_strgetitem` — `self.execute(rop.STRLEN/STRGETITEM, ...)`. Live result stamped via `cpu.bh_strlen` / `bh_strgetitem` so a later `goto_if_not` can take the observed branch. |
 //! | `newstr/{i,c}>r`, `strsetitem/r{i,c}{i,c}`, `copystrcontent/rr{i,c}{i,c}{i,c}` | PARITY | `pyjitpl.py opimpl_newstr` / `opimpl_strsetitem` / `opimpl_copystrcontent` — `self.execute(rop.NEWSTR/STRSETITEM/COPYSTRCONTENT, ...)`. `cpu.bh_newstr` allocates the live STR; a store or copy runs when every operand is live and in bounds. |
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) libffi via [`direct_libffi_call`] — checked first, on `OopSpecIndex::LibffiCall`; parses the `CIF_DESCRIPTION_P` through [`libffi_call_plan`] and records one `GETARRAYITEM_RAW` per argument slot before the `CALL_RELEASE_GIL_*`, declining to the `resbox is None` fallthrough on an unsupported kind; (2) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (3) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py + 2109`; (4) vable IR bookkeeping (`pyjitpl.py`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap halves of the token protocol (`vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` and the after-call `vinfo.tracing_after_residual_call`, `pyjitpl.py`) are bracketed around the concrete callee execution by [`try_execute_residual_call_via_executor_inner`], which arms TOKEN_TRACING_RESCALL before the call and probe-and-clears it after, surfacing [`DispatchError::VableEscapedDuringResidualCall`] on a detected force (`pyjitpl.py` ABORT_ESCAPE parity). The vref halves of the bracket ARE called by the walker, under the same `is_may_force` gate, and their loops are NOT empty: [`walker_ec_enter`] takes a vref of every seeded callee frame through `TraceCtx::opimpl_virtual_ref` (`ExecutionContext.enter`'s vref), so `virtualref_boxes` carries real pairs. Measured over 431 synth + 93 parity fixtures: 5487 bracket entries, of which 686 (12.5%) saw at least one pair and 66 of 316 emitting fixtures reached a nonzero count, up to 7 pairs. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (pyre-jit's `flatten.rs`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_assembler_call` specialization (`pyjitpl.py` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py → 2586`). |
@@ -2345,6 +2347,13 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// When the prologue itself returns, the Python walk's check at the
     /// callee's first step latches the callee-entry multi-frame image.
     pub helper_return: HelperReturn,
+    /// `_match_signature` (and nested finditem) may record `CALL_MAY_FORCE`:
+    /// `GUARD_NOT_FORCED` resumes in that numbered section (`pyjitpl.py`
+    /// `perform_call` / `newframe`). Builtin wrappers also enter
+    /// `run_orthodox_helper_subwalk` with `HelperReturn::CallResult` and
+    /// keep the frameless refusal — recording may-force there miscompiles
+    /// `str_subscr_hot` / exception residual deopt.
+    pub allow_numbered_may_force: bool,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
     /// again so convert vs residualize is per-CALL
@@ -2422,6 +2431,7 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             transparent_helper_subwalk: self.transparent_helper_subwalk,
             transparent_helper_jitcode_index: self.transparent_helper_jitcode_index,
             helper_return: self.helper_return,
+            allow_numbered_may_force: self.allow_numbered_may_force,
             transparent_helper_effects_at_entry: self.transparent_helper_effects_at_entry,
             transparent_helper_journal_at_entry: self.transparent_helper_journal_at_entry,
             transparent_helper_heap_writing_at_entry: self.transparent_helper_heap_writing_at_entry,
@@ -2458,6 +2468,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             helper_return: HelperReturn::CallResult,
+            allow_numbered_may_force: false,
             transparent_helper_effects_at_entry: None,
             transparent_helper_journal_at_entry: None,
             transparent_helper_heap_writing_at_entry: None,
@@ -2796,10 +2807,16 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
         let vref_box = (concrete != 0)
             .then(|| self.trace_ctx.virtualref_virtual_for_object_ptr(concrete))
             .flatten();
+        // Portal locals are the standard virtualizable (`pyjitpl.py`
+        // `MIFrame._nonstandard_virtualizable` vs `virtualizable_boxes[-1]`).
+        // A vref pair whose virtual is that box is the same frame (live
+        // object vs snapshot copy). `red == obj` is not: `getframe` can
+        // return an inlined callee's virtual, and that MIFrame's locals
+        // are its own shadow, not the portal vable array.
         let portal = vable_box == Some(obj)
             || vable_ptr == Some(concrete)
             || heap_ptr == Some(concrete)
-            || vref_box.is_some_and(|red| vable_box == Some(red) || red == obj);
+            || vref_box.is_some_and(|red| vable_box == Some(red));
         if portal {
             return Some(ReceiverTraceLocals::Portal);
         }
@@ -5755,8 +5772,18 @@ pub fn walk<Sym: WalkSym>(
                 let coordinate_belongs_to_this_frame =
                     walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
+                    let decoded = crate::jitcode_runtime::decode_op_at(code, opcode_position);
+                    let opname = decoded.as_ref().map(|op| op.opname).unwrap_or("?");
+                    let operands = decoded.as_ref().map(|op| {
+                        let end = op.next_pc.min(code.len());
+                        code.get((op.pc + 1)..end).unwrap_or(&[]).to_vec()
+                    });
+                    let bound_r: Vec<usize> = (0..ctx.registers_r.len())
+                        .filter(|&i| ctx.registers_r.get(i).is_some_and(|value| !value.is_none()))
+                        .collect();
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
+                         op={opname} operands={operands:?} bound_r={bound_r:?} \
                          helper={} inline={} claimed={} callee_jc={:?}",
                         error,
                         error.stop_pc(),
@@ -6378,11 +6405,14 @@ fn read_ref_reg<Sym: WalkSym>(
     Ok(value)
 }
 
-/// [`read_ref_reg`] without the unbound-slot check, for the handful of arms
-/// that give an unwritten slot their own, more specific decline — the
-/// `*_vable_*` family reads its object operand this way so an unseeded
-/// virtualizable register still surfaces [`DispatchError::VableBoxNotSeeded`]
-/// instead of the generic [`DispatchError::RegisterReadUnbound`].
+/// [`read_ref_reg`] without the unbound-slot check.
+///
+/// `ref_copy/r>r` uses this so an unwritten source leaves dest unbound —
+/// `pyjitpl.py` `_opimpl_any_copy` / `copy_constants` `MissingValue`
+/// (None when translated). The `*_vable_*` family also reads its object
+/// operand this way so an unseeded virtualizable register still surfaces
+/// [`DispatchError::VableBoxNotSeeded`] instead of the generic
+/// [`DispatchError::RegisterReadUnbound`].
 fn read_ref_reg_raw<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -7078,6 +7108,15 @@ unsafe fn raw_load_int(addr: *const u8, itemsize: usize, signed: bool) -> i64 {
             _ => panic!("raw_load descr itemsize {itemsize} is not a minted width"),
         }
     }
+}
+
+/// Address of item `index` in a raw array whose header is `base_size`
+/// bytes and whose items are `itemsize` bytes. `index` is non-negative;
+/// the caller checks that before this wraps.
+fn raw_array_item_ptr(array: i64, index: i64, base_size: usize, itemsize: usize) -> *mut u8 {
+    (array as usize)
+        .wrapping_add(base_size)
+        .wrapping_add((index as usize).wrapping_mul(itemsize)) as *mut u8
 }
 
 /// Store counterpart of [`raw_load_int`] — `bhimpl_raw_store_i`.
@@ -8458,19 +8497,22 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+    // Plain entries use `pcdep_for_snapshot_entry`: an exact
+    // `pcdep_by_jit_pc` hit is that coordinate's own row; an absent
+    // coordinate inherits the predecessor row (`pcdep_for_jitcode_pc`,
+    // `jitcode.py get_live_vars_info` walking BACK onto a `-live-`).
+    let entry_pcdep_owned: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
-            .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .pcdep_for_snapshot_entry(entry_jitcode_pc as usize),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
-        // Defensive default for a genuinely absent entry coordinate
-        // (marker miss); 0-fire across the corpus.
-        _ => &[],
+            .map(ToOwned::to_owned)
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
+    let entry_pcdep_entries: &[(u8, u16, u16)] = &entry_pcdep_owned;
     let (carried_pcdep_entries, carried_stack_only) = match jc {
         None => (&[] as &[(u8, u16, u16)], 0usize),
         Some(jc) => {
@@ -8501,7 +8543,7 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     // (`bridge_semantic_maps_at_with_jitcode_pc`) already keys Plain pcdep
     // at the carried word.
     let use_carried_map = carried_jitcode_pc >= 0;
-    let valid_stack_only = if use_carried_map {
+    let mut valid_stack_only = if use_carried_map {
         carried_stack_only
     } else {
         valid_stack_only
@@ -8511,6 +8553,18 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         entry_pcdep_entries
     };
+    // Named stack slots stay inside the color→slot window even when the
+    // predecessor depth twin sits below the row (walker already popped a
+    // TOS the `-live-` still holds in `registers_r`).
+    let carried_stack_only = carried_stack_only.max(crate::state::pcdep_ref_stack_span(
+        nlocals,
+        carried_pcdep_entries,
+    ));
+    valid_stack_only = valid_stack_only.max(crate::state::pcdep_ref_stack_span(
+        nlocals,
+        pcdep_entries_ref,
+    ));
+    let published_vsd = resume_snapshot::published_snapshot_valuestackdepth(trace_ctx);
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
@@ -8609,8 +8663,14 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                         // a typed ConstPtr(NULL) through a reused color would
                         // plant NULL on a live Ref, so skip that overlay.
                         if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
-                            active.push(m);
-                            continue;
+                            // A slot at or above the walk `valuestackdepth`
+                            // is leftover `read_boxes` pad, not the live TOS
+                            // at this `-live-`. Fall through to the register.
+                            let leftover = published_vsd.is_some_and(|vsd| sem >= vsd);
+                            if !leftover {
+                                active.push(m);
+                                continue;
+                            }
                         }
                         if m == OpRef::NONE && carried_owned_slot != Some(sem) {
                             let shadow_sources_slot = trace_ctx
@@ -8726,25 +8786,37 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                             // the traced arm has already popped a slot the guard's
                             // resume target still reads.  The shadow under-reports
                             // that slot; the walk register carries its live box.
-                            let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                            let leftover = published_vsd.is_some_and(|vsd| s_idx >= vsd);
+                            let shadow_is_real =
+                                !leftover && vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                             let walk_real = walk_box
                                 .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-                            let shadow_real =
-                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                            let shadow_real = if leftover {
+                                None
+                            } else {
+                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b))
+                            };
                             let carried_pc_proves_slot = carried_owned_slot == Some(s_idx);
                             // A bridge inputarg left in the color is not the
                             // stack temp. The merge point's loop inputargs are
                             // the shadow boxes; naming the inputarg makes the
                             // loop cut decline it. A NULL shadow still loses to
-                            // the register (`nested_break_not_hot`).
+                            // the register (`nested_break_not_hot`). A leftover
+                            // `read_boxes` InputArg above walk vsd is the same
+                            // stale seed in the shadow; the register is
+                            // `registers_r[index]`.
                             if let (Some(w), Some(s)) = (walk_real, shadow_real) {
                                 if w != s && w.is_input_arg() {
                                     s
+                                } else if w != s && s.is_input_arg() {
+                                    w
                                 } else if carried_pc_proves_slot {
                                     w
                                 } else {
                                     s
                                 }
+                            } else if leftover {
+                                walk_real.unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
                             } else if carried_pc_proves_slot {
                                 walk_real.or(vbox).unwrap_or_else(fallback)
                             } else if shadow_is_real {
@@ -9273,13 +9345,12 @@ struct InlineParentBlackhole {
 /// the callee runs. `AbstractResumeDataReader.read_jitcode_pos_pc` restores
 /// that word through `MIFrame.setup_resume_at_op`. The CALL's jitcode pc is
 /// the opcode that ends at that word; the opcode name is not consulted.
-fn jitcode_op_ending_at(
+pub(crate) fn jitcode_op_ending_at(
     code: &[u8],
     resume_pc: usize,
 ) -> Option<crate::jitcode_runtime::DecodedOp> {
     crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
 }
-
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
@@ -16868,6 +16939,7 @@ fn handle<Sym: WalkSym>(
             } else {
                 OpCode::GetarrayitemRawI
             };
+
             let array = read_int_reg(code, op, 0, ctx)?;
             let index = read_int_reg(code, op, 1, ctx)?;
             let descr = read_descr(code, op, 2, ctx)?;
@@ -17464,6 +17536,13 @@ fn handle<Sym: WalkSym>(
             // records *no* IR op for a copy — pure SSA-level rename.
             // Operand layout `i>i`: 1B src + 1B dst.
             //
+            // `copy_constants` fills every register with `MissingValue()`
+            // (None when translated). Copying a never-written register is
+            // legal: dest holds that missing value. `read_int_reg` is the
+            // Int-bank raw reader (no `RegisterReadUnbound` gate). An
+            // unbound source also clears dest's concrete shadow so a stale
+            // Int does not survive. A later USE of dest is the error.
+            //
             // Int-bank concrete shadow: propagate the source slot's Int-bank concrete
             // shadow alongside the symbolic OpRef, mirroring the
             // `ref_copy/r>r` concrete-shadow chain.  Without this, a
@@ -17472,7 +17551,11 @@ fn handle<Sym: WalkSym>(
             // even when the source had a known concrete (e.g. a
             // constant Int seeded by `allocate_callee_register_banks`).
             let src_val = read_int_reg(code, op, 0, ctx)?;
-            let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
+            let src_concrete = if src_val.is_none() {
+                ConcreteValue::Null
+            } else {
+                read_int_reg_concrete(code, op, 0, ctx)
+            };
             let dst = code[op.pc + 2] as usize;
             write_int_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
@@ -17514,6 +17597,13 @@ fn handle<Sym: WalkSym>(
             // Float-bank sibling of `int_copy/i>i` — pure SSA-level
             // rename, no IR op recorded. Operand layout `f>f`: 1B src
             // + 1B dst.
+            //
+            // `pyjitpl.py _opimpl_any_copy` / `copy_constants` `MissingValue`:
+            // copy of a never-written register is legal; dest holds
+            // `OpRef::NONE`. `read_float_reg` is the Float-bank raw reader
+            // (no unbound gate). The Float bank has no per-register
+            // concrete side table (`read_float_reg_concrete` reads the
+            // OpRef itself), so copying the unbound OpRef is the clear.
             let src_val = read_float_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;
             let len = ctx.registers_f.len();
@@ -17630,7 +17720,17 @@ fn handle<Sym: WalkSym>(
             // num_regs_and_consts_r)`, which `setposition` (RPython
             // `pyjitpl.py`) pre-populates with the const OpRef.
             // No IR op recorded.
-            let src_val = read_ref_reg(code, op, 0, ctx)?;
+            //
+            // `pyjitpl.py` `_opimpl_any_copy` is
+            // `@arguments("box") def _opimpl_any_copy(self, box): return box`.
+            // `copy_constants` fills every register with `MissingValue()`
+            // (None when translated). Copying a never-written register is
+            // legal: dest holds the missing value. Read src without the
+            // unbound check (`read_ref_reg_raw`); an unbound source leaves
+            // dest unbound (`OpRef::NONE`) and clears dest's concrete
+            // shadow so a stale Ref does not survive. A later USE of dest
+            // still raises `RegisterReadUnbound`.
+            let src_val = read_ref_reg_raw(code, op, 0, ctx)?;
             // Propagate the source slot's concrete
             // shadow alongside the symbolic OpRef.  This is the
             // critical chain: catch_exception → seeds last_exc_value
@@ -17641,7 +17741,11 @@ fn handle<Sym: WalkSym>(
             // GUARD_CLASS against.  Without this propagation the
             // copy chain wipes the concrete and silently disables
             // the guard.
-            let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
+            let src_concrete = if src_val.is_none() {
+                ConcreteValue::Null
+            } else {
+                read_ref_reg_concrete(code, op, 0, ctx)
+            };
             let dst = code[op.pc + 2] as usize;
             // A copy is a link renaming (`flatten.py insert_renamings`,
             // `same_as`). Restoring TOS after the write is what keeps

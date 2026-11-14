@@ -5,6 +5,8 @@ use majit_charon_reader::ullbc::Operand;
 
 use serde_json::json;
 
+use crate::model::{CallTarget, OpKind};
+
 use crate::front::mir::tests::{
     adt_node, assign_stmt, bb, call_term, const_artifact, deref_place, empty_generics,
     fixture_llbc, fmt_arguments_adt, fmt_arguments_decl, fmt_format_decl,
@@ -47,6 +49,111 @@ fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
                  fnptr_indirect={fnptr_indirect}"
         );
     }
+}
+
+fn fnptr_skip_binder(
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": inputs,
+                "output": output,
+                "is_unsafe": true
+            }
+        }
+    })
+}
+
+fn move_operand_ty(ty: serde_json::Value) -> Operand {
+    serde_json::from_value(json!({
+        "Move": {
+            "kind": {"Local": 0},
+            "ty": ty
+        }
+    }))
+    .expect("operand")
+}
+
+/// Charon may inline the `EqWHookFn` alias so the Dynamic operand is a
+/// bare `FnPtr` (`TyRef::Other`) with no dedup id. Classification is the
+/// skip_binder, not the enclosing body's name.
+#[test]
+fn operand_is_dict_eq_hook_fn_matches_inlined_fnptr_by_signature() {
+    let obj = json!({"RawPtr": [{"Adt": {"id": 0}}, "Mut"]});
+    let eq_fnptr = fnptr_skip_binder(vec![obj.clone(), obj.clone()], json!({"Scalar": "Bool"}));
+    let hash_fnptr =
+        fnptr_skip_binder(vec![obj], json!({"Scalar": {"Integer": {"Signed": "I64"}}}));
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![],
+        vec![json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(
+                &["pyre_object", "dict_eq_hook", "register_eq_w_hook"],
+                "",
+                true,
+            ),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Value": [1, eq_fnptr.clone()]}],
+                "output": {"Tuple": []}
+            },
+            "body": "Opaque"
+        })],
+    );
+    let inlined = move_operand_ty(eq_fnptr);
+    assert!(
+        super::operand_is_dict_eq_hook_fn(&inlined, &llbc),
+        "inlined alias-less FnPtr of register_eq_w_hook's parameter"
+    );
+    let hash_w = move_operand_ty(hash_fnptr);
+    assert!(
+        !super::operand_is_dict_eq_hook_fn(&hash_w, &llbc),
+        "hash_w hook shape is not the eq hook"
+    );
+}
+
+/// `ll_keyeq_custom` is a named body whose `hlinvoke` is `indirect_call`
+/// with `graphs is None` (`rordereddict.py`, `rptr.py`
+/// `PtrRepr.rtype_simple_call`). The TLS hook must lower the same way.
+#[test]
+fn eq_w_hooked_lowers_the_tls_hook_as_indirect_call_with_unknown_family() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+    let graph = crate::test_support::lower_function(llbc, "pyre_object::dict_eq_hook::eq_w_hooked")
+        .expect("lower eq_w_hooked");
+    let mut unknown_family = 0usize;
+    let mut dyn_call = 0usize;
+    let kinds: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .map(|op| {
+            match &op.kind {
+                OpKind::IndirectCall { graphs, .. } if graphs.is_none() => {
+                    unknown_family += 1;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("__dyn_call") => {
+                    dyn_call += 1;
+                }
+                _ => {}
+            }
+            format!("{:?}", op.kind)
+        })
+        .collect();
+    assert_eq!(
+        dyn_call, 0,
+        "eq_w_hooked must not residualize the hook as __dyn_call: {kinds:?}"
+    );
+    assert_eq!(
+        unknown_family, 1,
+        "eq_w_hooked must hlinvoke the stored hook as indirect_call \
+         with graphs is None: {kinds:?}"
+    );
 }
 
 #[test]

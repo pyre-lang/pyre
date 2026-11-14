@@ -832,19 +832,19 @@ impl RegisterManager {
         fm: &mut FrameManager,
     ) {
         if fm.get(v, longevity).is_none() {
-            // regalloc.py:696-704: allocate frame slot and emit move.
-            let reg = self.reg_bindings_get(v, longevity);
+            // regalloc.py:696-704: `reg = self.reg_bindings[v]` then
+            // `to = self.frame_manager.loc(v)` then `regalloc_mov`.
+            let reg = self.reg_bindings_get(v, longevity).unwrap_or_else(|| {
+                panic!("_sync_var_to_stack: {:?} not in reg_bindings", v.to_opref())
+            });
             let to = fm.loc(v, tp, false, longevity);
-            if let Some(r) = reg {
-                // RPython: self.assembler.regalloc_mov(reg, to)
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
-                        v, r, to.position
-                    );
-                }
-                self.spill_moves.push((Loc::Reg(r), Loc::Frame(to)));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
+                    v, reg, to.position
+                );
             }
+            self.spill_moves.push((Loc::Reg(reg), Loc::Frame(to)));
         }
         // otherwise it's clean (already on stack)
     }
@@ -1461,9 +1461,10 @@ impl<'a> RegAlloc<'a> {
         // not alias, so one manager's queue flushes before the other's.
         // `pending_moves` is the out-of-line immediate materialisation from
         // `gc_offset_loc`, queued after those operand moves.
-        let moves = self.rm.spill_moves.drain(..);
-        let moves = moves.chain(self.xrm.spill_moves.drain(..));
-        for (src, dst) in moves.chain(self.pending_moves.drain(..)) {
+        let rm_moves: Vec<_> = self.rm.spill_moves.drain(..).collect();
+        let xrm_moves: Vec<_> = self.xrm.spill_moves.drain(..).collect();
+        let pending: Vec<_> = self.pending_moves.drain(..).collect();
+        for (src, dst) in rm_moves.into_iter().chain(xrm_moves).chain(pending) {
             if majit_ir::debug::have_debug_prints() {
                 majit_ir::debug::log_one("jit-backend", &format!("move: {src:?} → {dst:?}"));
             }
