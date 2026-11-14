@@ -761,6 +761,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },

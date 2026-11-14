@@ -2848,11 +2848,15 @@ impl<'a> Lowering<'a> {
                 } else {
                     (*eq_id, eq_segments.clone(), false)
                 };
+                let mut target = CallTarget::function_path(segments).with_fun_decl_id(fn_id);
+                if let Some(fd) = self.llbc.fn_by_id(fn_id) {
+                    target = stamp_call_target_fun_decl(target, self.llbc, fd);
+                }
                 let val = push_block_op(
                     &mut self.graph,
                     block,
                     OpKind::Call {
-                        target: CallTarget::function_path(segments).with_fun_decl_id(fn_id),
+                        target,
                         args: crate::model::call_args(vec![lhs, rhs]),
                         result_ty: ValueType::Int,
                     },

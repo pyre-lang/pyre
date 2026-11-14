@@ -157,6 +157,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload.to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -169,6 +170,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -186,6 +188,7 @@ mod tests {
         let call = |value: ConstValue| OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -277,6 +280,7 @@ mod tests {
         let original = OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },

@@ -45,6 +45,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1201,6 +1202,7 @@ impl<'a> Lowering<'a> {
                         "longobject".to_string(),
                         "jit_bigint_toint".to_string(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1298,6 +1300,7 @@ impl<'a> Lowering<'a> {
                         "dictmultiobject".to_string(),
                         "wtf8_key_is_utf8".to_string(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1528,6 +1531,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1691,6 +1695,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },

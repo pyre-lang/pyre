@@ -1110,6 +1110,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1758,6 +1759,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1779,6 +1781,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -1941,6 +1944,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }

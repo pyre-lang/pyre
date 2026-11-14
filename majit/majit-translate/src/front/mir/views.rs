@@ -829,6 +829,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: path.split("::").map(str::to_string).collect(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1352,6 +1353,7 @@ impl<'a> Lowering<'a> {
                         .split("::")
                         .map(str::to_string)
                         .collect(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -3463,8 +3465,7 @@ impl<'a> Lowering<'a> {
                 if let Some(id) = fun_decl_id {
                     target = target.with_fun_decl_id(id);
                     if let Some(fd) = self.llbc.fn_by_id(id) {
-                        target =
-                            target.with_resolved_path(registered_path_for_fun_decl(self.llbc, fd));
+                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
                     }
                 }
                 target
@@ -3472,11 +3473,15 @@ impl<'a> Lowering<'a> {
             _ => {
                 let mut target = CallTarget::FunctionPath {
                     segments,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 };
-                if let Some(id) = fun_decl_id {
+                if let Some(id) = self.call_target_fun_decl_id(reg) {
                     target = target.with_fun_decl_id(id);
+                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
+                    }
                 }
                 target
             }

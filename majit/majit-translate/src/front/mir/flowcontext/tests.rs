@@ -3901,6 +3901,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "Argument".to_string(),
                     "new_display".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -3970,6 +3971,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "Arguments".to_string(),
                     "new".to_string(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4154,6 +4156,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4223,6 +4226,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4245,6 +4249,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4388,6 +4393,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4452,6 +4458,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4473,6 +4480,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4635,6 +4643,7 @@ fn single_arg_lower_hex_fmt_fixture(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4705,6 +4714,7 @@ fn single_arg_lower_hex_fmt_fixture(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4726,6 +4736,7 @@ fn single_arg_lower_hex_fmt_fixture(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4863,6 +4874,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_function_scope_cell() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -4976,6 +4988,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_join_phi_cell() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5080,6 +5093,7 @@ fn peel_call_scoped_fmt_arg_spill_sees_loop_carried_cell() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5219,6 +5233,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5283,6 +5298,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5304,6 +5320,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5426,6 +5443,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5490,6 +5508,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5511,6 +5530,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5819,6 +5839,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5883,6 +5904,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5904,6 +5926,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -6017,6 +6040,7 @@ fn collapse_fmt_chains_multi_expands_two_arg_chain() {
 
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
+        resolved_path: None,
         fun_decl_id: None,
         specialization: crate::parse::GraphSpecialization::Regular,
     };
@@ -6298,6 +6322,7 @@ fn collapse_fmt_chains_multi_eliminates_cross_block_local_tuple() {
 
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
+        resolved_path: None,
         fun_decl_id: None,
         specialization: crate::parse::GraphSpecialization::Regular,
     };
@@ -7513,11 +7538,17 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
                     )),
                     CallTarget::FunctionPath {
                         segments,
+                        resolved_path,
                         fun_decl_id,
                         ..
-                    } if segments.last().map(String::as_str) == Some("setitem_str") => {
-                        bindings.push((*fun_decl_id, segments.clone()))
-                    }
+                    } if segments.last().map(String::as_str) == Some("setitem_str") => bindings
+                        .push((
+                            *fun_decl_id,
+                            resolved_path
+                                .as_ref()
+                                .map(|p| p.segments.clone())
+                                .unwrap_or_else(|| segments.clone()),
+                        )),
                     _ => {}
                 }
             }
@@ -7575,7 +7606,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             );
             assert_eq!(
                 bound,
-                super::registered_path_for_fun_decl(llbc, callee).segments
+                super::harvest_path_for_fun_decl(llbc, callee).segments
             );
             assert!(
                 !bound.iter().any(|s| s.starts_with("<impl ")),

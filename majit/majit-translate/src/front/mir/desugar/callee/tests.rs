@@ -1030,10 +1030,82 @@ fn fundecl_fn_item_segments_uses_the_registered_instance_leaf() {
     let fd = llbc.fn_by_id(0).expect("f");
     let registered = super::registered_path_for_fun_decl(&llbc, fd);
     let item = super::fundecl_fn_item_segments(&llbc, fd);
-    assert_eq!(item, registered.segments);
+    let harvest = super::spec_segments(&llbc, fd, &super::registered_leaf(&llbc, fd));
+    assert_eq!(item, harvest);
     let leaf = item.last().expect("leaf");
     assert!(leaf.starts_with("f__spec_"), "{leaf}");
     assert_ne!(leaf.as_str(), "f");
+    assert_eq!(
+        registered.segments.last().map(String::as_str),
+        Some(leaf.as_str())
+    );
+}
+
+/// A call that names a specialized copy stamps identity with that copy's
+/// leaf and `cachedgraph` key, not the base FunDecl leaf.
+#[test]
+fn identity_path_for_fun_decl_uses_the_call_leaf_and_specialization() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": {
+                    "name": [ident("fixture"), ident("load_attr")],
+                    "span": span.clone(),
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [],
+                        "inline": null,
+                        "rename": null,
+                        "public": true
+                    },
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Scalar": "Bool"}
+                },
+                "body": {"Unstructured": {
+                    "span": span,
+                    "locals": {"arg_count": 0, "locals": []},
+                    "body": []
+                }}
+            }],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("load_attr fixture parses");
+    let fd = llbc.fn_by_id(0).expect("load_attr");
+    let base = super::registered_path_for_fun_decl(&llbc, fd);
+    assert_eq!(base.segments.last().map(String::as_str), Some("load_attr"));
+    assert_eq!(
+        base.specialization,
+        crate::parse::GraphSpecialization::Regular
+    );
+    let spec_leaf = "load_attr__spec_PyFrame_ab";
+    let spec = super::identity_path_for_fun_decl(
+        &llbc,
+        fd,
+        spec_leaf,
+        crate::parse::GraphSpecialization::AccessDirect,
+    );
+    assert_eq!(spec.segments.last().map(String::as_str), Some(spec_leaf));
+    assert_eq!(
+        spec.specialization,
+        crate::parse::GraphSpecialization::AccessDirect
+    );
+    assert_ne!(spec.segments, base.segments);
 }
 
 /// A monomorphized vtable keeps its method slots as `*const ()`, so the

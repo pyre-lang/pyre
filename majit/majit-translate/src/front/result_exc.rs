@@ -4797,6 +4797,7 @@ fn emit_fn_item_call(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: segments.to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5818,6 +5819,7 @@ pub(crate) fn apply_foreign_from_residuals(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17618,6 +17620,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                 segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
                     .map(str::to_string)
                     .to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             };
@@ -17754,6 +17757,7 @@ fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
                 segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
                     .map(str::to_string)
                     .to_vec(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             };

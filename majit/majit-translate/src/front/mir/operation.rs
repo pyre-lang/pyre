@@ -500,6 +500,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__string_byte_getitem".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1268,6 +1269,7 @@ impl<'a> Lowering<'a> {
                                     majit_ir::rvec::VecOp::SetItem,
                                     kind,
                                 ),
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -2852,6 +2854,7 @@ impl<'a> Lowering<'a> {
                                             .into_iter()
                                             .map(str::to_string)
                                             .collect(),
+                                        resolved_path: None,
                                         fun_decl_id: None,
                                         specialization: crate::parse::GraphSpecialization::Regular,
                                     },
@@ -3447,6 +3450,7 @@ impl<'a> Lowering<'a> {
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -3727,6 +3731,7 @@ impl<'a> Lowering<'a> {
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec![len_leaf.to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -4830,6 +4835,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -4877,6 +4883,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -5648,6 +5655,7 @@ impl<'a> Lowering<'a> {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -5698,6 +5706,7 @@ impl<'a> Lowering<'a> {
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -6087,6 +6096,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::Str(s) => OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -6131,6 +6141,7 @@ impl<'a> Lowering<'a> {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: synthetic,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -7838,6 +7849,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -11606,6 +11618,7 @@ pub(in crate::front::mir) fn push_direct_ptradd(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -11802,6 +11815,7 @@ pub(in crate::front::mir) fn push_cast_ptr_to_int(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -11836,6 +11850,7 @@ pub(in crate::front::mir) fn rarithmetic_mask(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },
@@ -11881,6 +11896,7 @@ pub(in crate::front::mir) fn push_ptr_to_unsigned_cast(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },
