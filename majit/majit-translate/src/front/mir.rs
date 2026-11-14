@@ -935,13 +935,12 @@ fn ref_enum_instantiation_of_adt(
 ///     these pre-mints the variant subclasses before
 ///     `assign_inheritance_ids`; otherwise the discriminant narrowing mints
 ///     them lazily afterwards, unnumbered (per-graph Skip→legacy walker).
-///   - CONCRETE CALLEE SIGNATURES — a `RegularCall` `Fun { id }` or
-///     `CallKind::Trait` (via `trait_impl_method`) whose generic arguments
-///     are already concrete (`clause_spec::concrete_type_args`) specialises
-///     the callee signature (`substituted_signature`). The caller's locals
-///     need not name the enum: `Option::map`'s first input is `Option<T>`,
-///     and the substituted `T` intern the instantiation the spec copy will
-///     read.
+///   - CONCRETE CALLEE SIGNATURES — a `RegularCall` `Fun { id }` whose
+///     generic arguments are already concrete
+///     (`clause_spec::concrete_type_args`) specialises the callee
+///     signature (`substituted_signature`). The caller's locals need not
+///     name the enum: `Option::map`'s first input is `Option<T>`, and the
+///     substituted `T` intern the instantiation the spec copy will read.
 fn collect_ref_enum_instantiations(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -1262,32 +1261,10 @@ fn intern_enqueue_regular_call(
     queue: &mut Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)>,
     seen: &mut std::collections::HashSet<(u64, String)>,
 ) {
-    match &reg.kind {
-        CallKind::Fun(FunId::Regular { id }) => {
-            intern_enqueue_fun_spec(llbc, *id, &reg.generics, queue, seen);
-        }
-        // `specialized_trait_target`: rustc already selected the impl, and the
-        // lowering specializes that impl method with the impl's generics, so
-        // the harvest queues the same spec copy.
-        CallKind::Trait(payload) => {
-            if let Some((fn_id, generics)) =
-                crate::front::clause_spec::trait_impl_method(payload, llbc)
-            {
-                intern_enqueue_fun_spec(llbc, fn_id, &generics, queue, seen);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn intern_enqueue_fun_spec(
-    llbc: &Llbc,
-    id: u64,
-    generics: &Value,
-    queue: &mut Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)>,
-    seen: &mut std::collections::HashSet<(u64, String)>,
-) {
-    let Some(callee) = llbc.fn_by_id(id) else {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return;
+    };
+    let Some(callee) = llbc.fn_by_id(*id) else {
         return;
     };
     if !crate::front::clause_spec::decl_is_generic(callee) {
@@ -1298,16 +1275,16 @@ fn intern_enqueue_fun_spec(
     // needs `Option<T>` from `types[0]` (`specialize.py`
     // `FunctionDesc.cachedgraph`). A leftover TypeVar suffix is skipped
     // by `intern_enum_from_ty`.
-    let (types, const_generics) = crate::front::clause_spec::generic_args_lists(generics);
+    let (types, const_generics) = crate::front::clause_spec::generic_args_lists(&reg.generics);
     if types.is_empty() && const_generics.is_empty() {
         return;
     }
-    let key = (id, serde_json::to_string(&types).unwrap_or_default());
+    let key = (*id, serde_json::to_string(&types).unwrap_or_default());
     if !seen.insert(key) {
         return;
     }
-    let trait_refs = intern_call_trait_refs(generics);
-    queue.push((id, types, const_generics, trait_refs));
+    let trait_refs = intern_call_trait_refs(&reg.generics);
+    queue.push((*id, types, const_generics, trait_refs));
 }
 
 fn intern_call_trait_refs(generics: &Value) -> Vec<Value> {
@@ -7771,9 +7748,6 @@ pub use shadow_stack_erase::{
 #[path = "owner_root_guard.rs"]
 mod owner_root_guard;
 
-#[path = "frame_anchor.rs"]
-mod frame_anchor;
-
 #[path = "rbigint_gc_root.rs"]
 mod rbigint_gc_root;
 
@@ -7862,13 +7836,6 @@ pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_le
 /// `(graph path, callee path)`.
 pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
     owner_root_guard::residual_escape_census(llbc)
-}
-
-/// Graphs that pass a pointer to `FrameAnchor` (or to an aggregate that
-/// contains one) into a callee that stays residual. Each row is
-/// `(graph path, callee path)`.
-pub fn residual_frame_anchor_escapes(llbc: &Llbc) -> Vec<(String, String)> {
-    frame_anchor::residual_escape_census(llbc)
 }
 
 /// Graphs that pass `RBigIntGcRoot` (or an aggregate that contains one)

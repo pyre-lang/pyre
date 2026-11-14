@@ -685,32 +685,6 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
         .unwrap_or(build_fnaddr)
 }
 
-/// `is_symbolic_fnaddr` → `symbolic_fnaddr_path` → `runtime_fnaddr_by_path`, else `runtime_fnaddr`.
-pub(crate) fn rebind_callinfo_func(func: i64) -> i64 {
-    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(func) {
-        if let Some(path) = symbolic_fnaddr_path(func)
-            && let Some(runtime) = runtime_fnaddr_by_path(path)
-        {
-            return runtime;
-        }
-        return func;
-    }
-    runtime_fnaddr(func)
-}
-
-/// Path recorded for a build-process fnaddr, for `register_func_name`.
-/// Symbolic hashes go through `symbolic_fnaddr_path`; host addresses
-/// through `fnaddr_bindings.bin` (`build_time_fnaddr_bindings`).
-pub(crate) fn path_for_build_fnaddr(fnaddr: i64) -> Option<String> {
-    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr) {
-        return symbolic_fnaddr_path(fnaddr).map(str::to_string);
-    }
-    build_time_fnaddr_bindings()
-        .into_iter()
-        .find(|(_, build)| *build == fnaddr)
-        .map(|(path, _)| path)
-}
-
 /// High 16 bits of a deferred prebuilt-string sentinel (see
 /// [`majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
 /// addresses occupy `0..2^48`, so a real GCREF / host-static address always

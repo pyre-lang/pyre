@@ -93,9 +93,6 @@ impl<'a> Lowering<'a> {
         if self.lower_owner_root_guard_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
-        if self.lower_frame_anchor_call(mir_bb, &call, dest_local, target)? {
-            return Ok(());
-        }
         self.refuse_unresolved_rbigint_gc_root(mir_bb, &call)?;
         if self.lower_rbigint_gc_root_call(mir_bb, &call, dest_local, target, on_unwind)? {
             return Ok(());
@@ -107,7 +104,6 @@ impl<'a> Lowering<'a> {
             return Ok(());
         }
         self.refuse_residual_owner_root_guard(mir_bb, &call)?;
-        self.refuse_residual_frame_anchor(mir_bb, &call)?;
         self.refuse_residual_rbigint_gc_root(mir_bb, &call)?;
         if self.lower_global_initializer_call(mir_bb, &call, dest_local, target)? {
             return Ok(());

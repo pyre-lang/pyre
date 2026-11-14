@@ -578,10 +578,8 @@ fn root_scope_drop_is_classified_and_live() {
         args: Vec::new(),
         result_ty: crate::model::ValueType::Void,
     };
-    assert!(
-        !super::is_shadow_stack_bracket_close(&release),
-        "FrameAnchor release is not a shadow-stack bracket close"
-    );
+    assert!(super::is_frame_anchor_release_call(&release));
+    assert!(super::is_shadow_stack_bracket_close(&release));
     assert!(!super::is_root_scope_drop_glue_call(&release));
 
     // `_1` is written in bb0 and read only by bb1's Drop.

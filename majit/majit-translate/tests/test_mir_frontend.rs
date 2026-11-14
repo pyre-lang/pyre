@@ -4198,9 +4198,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
 /// so those graphs no longer escape either.
 #[test]
 fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
-    use majit_translate::front::mir::{
-        residual_frame_anchor_escapes, residual_owner_root_guard_escapes,
-    };
+    use majit_translate::front::mir::residual_owner_root_guard_escapes;
 
     for (artefact, path) in [
         ("pyre-interpreter.ullbc", INTERPRETER_LLBC),
@@ -4215,13 +4213,6 @@ fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
         assert!(
             escapes.is_empty(),
             "{artefact} residual OwnerRootGuard pointer escapes: {escapes:?}"
-        );
-        let mut anchor_escapes = residual_frame_anchor_escapes(llbc);
-        anchor_escapes.sort();
-        anchor_escapes.dedup();
-        assert!(
-            anchor_escapes.is_empty(),
-            "{artefact} residual FrameAnchor pointer escapes: {anchor_escapes:?}"
         );
     }
 }

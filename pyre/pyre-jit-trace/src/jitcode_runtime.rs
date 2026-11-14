@@ -1777,52 +1777,6 @@ pub fn all_liveness() -> &'static [u8] {
     &ALL_LIVENESS
 }
 
-/// `export_callinfo_rows` snapshot: every
-/// `CallInfoCollection.add` the codewriter recorded.
-/// `pyjitpl.py MetaInterpStaticData.finish_setup` assigns
-/// `codewriter.callcontrol.callinfocollection`; this is that table
-/// frozen across the build/runtime split.
-static ALL_CALLINFO_ROWS: LazyLock<Vec<majit_ir::effectinfo::CallInfoRow>> = LazyLock::new(|| {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/callinfo_rows.bin"));
-    bincode::deserialize(BYTES).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize callinfo_rows.bin \
-                 ({} bytes): {e}",
-            BYTES.len(),
-        )
-    })
-});
-
-/// Frozen `pipeline.callinfo_rows`.
-pub fn callinfo_rows() -> &'static [majit_ir::effectinfo::CallInfoRow] {
-    &ALL_CALLINFO_ROWS
-}
-
-fn rebound_codewriter_callinfo_row(
-    row: &majit_ir::effectinfo::CallInfoRow,
-) -> (majit_ir::OopSpecIndex, majit_ir::DescrRef, u64, String) {
-    let descr = descr_ref_at(row.descr_index as usize).unwrap_or_else(|| {
-        panic!(
-            "callinfo_rows descr_index {} missing from descrs.bin",
-            row.descr_index
-        )
-    });
-    let func = crate::runtime_fnaddr_patch::rebind_callinfo_func(row.func) as u64;
-    let name = crate::runtime_fnaddr_patch::path_for_build_fnaddr(row.func).unwrap_or_default();
-    (row.oopspecindex, descr, func, name)
-}
-
-/// `pyjitpl.py` `MetaInterpStaticData.finish_setup` assignment of
-/// `codewriter.callcontrol.callinfocollection`, rebuilt from frozen
-/// rows. `CallInfoCollection.add` overwrites, so a codewriter row
-/// replaces a walker seed for the same oopspec. Walker-only keys stay.
-pub fn add_codewriter_callinfo_rows<M: Clone>(meta: &mut majit_metainterp::MetaInterp<M>) {
-    for row in callinfo_rows() {
-        let (oopspec, descr, func, name) = rebound_codewriter_callinfo_row(row);
-        meta.add_oopspec_callinfo(oopspec, descr, func, &name);
-    }
-}
-
 fn call_descr_arg_types(arg_classes: &str) -> Vec<majit_ir::Type> {
     arg_classes
         .chars()

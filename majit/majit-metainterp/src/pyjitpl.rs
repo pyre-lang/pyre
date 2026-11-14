@@ -2712,8 +2712,6 @@ pub struct MetaInterp<M: Clone> {
     /// `SwitchToBlackhole`. The bytecode walker leaves this false and keeps
     /// publishing `aborted_framestack` itself.
     pub(crate) interpret_framestack_for_abort: bool,
-    /// virtualizable array values and heap pointer captured by `capture_interpret_abort_values`
-    pub(crate) interpret_abort_virtualizable: Option<(Option<Vec<i64>>, i64)>,
     /// `Counters.ABORT_*` from the interpret walk's `aborted_tracing`.
     /// `None` when that walk did not abort.
     pub last_interpret_abort_reason: Option<i32>,
@@ -2874,7 +2872,6 @@ pub(crate) struct ParkedTraceAttempt<M: Clone> {
     pending_abort_has_merge_points: bool,
     pending_abort_reason: Option<i32>,
     interpret_framestack_for_abort: bool,
-    interpret_abort_virtualizable: Option<(Option<Vec<i64>>, i64)>,
     last_interpret_abort_reason: Option<i32>,
     interpret_bail_residual: Option<String>,
     last_exc_box: Option<OpRef>,
@@ -3489,7 +3486,6 @@ impl<M: Clone> MetaInterp<M> {
             interpret_framestack_for_abort: std::mem::take(
                 &mut self.interpret_framestack_for_abort,
             ),
-            interpret_abort_virtualizable: self.interpret_abort_virtualizable.take(),
             last_interpret_abort_reason: self.last_interpret_abort_reason.take(),
             interpret_bail_residual: self.interpret_bail_residual.take(),
             last_exc_box: self.last_exc_box.take(),
@@ -3572,7 +3568,6 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_has_merge_points = parked.pending_abort_has_merge_points;
         self.pending_abort_reason = parked.pending_abort_reason;
         self.interpret_framestack_for_abort = parked.interpret_framestack_for_abort;
-        self.interpret_abort_virtualizable = parked.interpret_abort_virtualizable;
         self.last_interpret_abort_reason = parked.last_interpret_abort_reason;
         self.interpret_bail_residual = parked.interpret_bail_residual;
         self.last_exc_box = parked.last_exc_box;
@@ -4706,7 +4701,6 @@ impl<M: Clone> MetaInterp<M> {
             pending_abort_reason: None,
             pending_abort_permanent: false,
             interpret_framestack_for_abort: false,
-            interpret_abort_virtualizable: None,
             last_interpret_abort_reason: None,
             interpret_bail_residual: None,
             last_exc_box: None,
@@ -6191,22 +6185,6 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
-        self.add_oopspec_callinfo(oopspec, calldescr, func_addr, name);
-    }
-
-    /// `jtransform.py _handle_oopspec_call`:
-    /// `effectinfo.py CallInfoCollection.add(oopspecindex, calldescr, func)`.
-    /// Always inserts (overwrites). Codewriter rows use this so a
-    /// walker seed for the same oopspec cannot hide the residual's
-    /// own calldescr. [`Self::ensure_oopspec_callinfo`] stays
-    /// skip-if-present for oopspecs that never pass the codewriter.
-    pub fn add_oopspec_callinfo(
-        &mut self,
-        oopspec: majit_ir::OopSpecIndex,
-        calldescr: majit_ir::DescrRef,
-        func_addr: u64,
-        name: &str,
-    ) {
         let mut cic = self
             .callinfocollection
             .as_ref()
@@ -6218,7 +6196,7 @@ impl<M: Clone> MetaInterp<M> {
         // leave `staticdata.callinfocollection` without the row the
         // per-MetaInterp copy has, and nothing downstream could tell.
         let sd = std::sync::Arc::get_mut(&mut self.staticdata)
-            .expect("add_oopspec_callinfo must run before staticdata is shared");
+            .expect("ensure_oopspec_callinfo must run before staticdata is shared");
         sd.callinfocollection.add(oopspec, calldescr, func_addr);
         sd.callinfocollection
             .register_func_name(func_addr, name.to_string());
@@ -7242,7 +7220,6 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_permanent = false;
         self.drop_undriven_abort_blackhole();
         self.interpret_framestack_for_abort = false;
-        self.interpret_abort_virtualizable = None;
         self.last_interpret_abort_reason = None;
         self.interpret_bail_residual = None;
         self.keep_tracing_after_close = false;
@@ -7736,7 +7713,6 @@ impl<M: Clone> MetaInterp<M> {
         // stack still on the metainterp. Later `abort_trace` calls stage
         // it; the bytecode walker does not.
         self.interpret_framestack_for_abort = true;
-        self.interpret_abort_virtualizable = None;
         self.last_interpret_abort_reason = None;
         let _jitted = crate::JittedGuard::enter();
         let cpu = self.cpu.clone();
@@ -7860,7 +7836,6 @@ impl<M: Clone> MetaInterp<M> {
         // This is the runner: `convert_and_run_from_pyjitpl` below consumes
         // `self.framestack`, so `abort_trace` must not stage it for another.
         self.interpret_framestack_for_abort = false;
-        self.interpret_abort_virtualizable = None;
         // Rewrite non-const register boxes to inline Consts while the
         // recorder is still alive so `_copy_data_from_miframe` can read
         // `getint()` / `getref_base()` after `abort_trace` drops it.
@@ -9368,7 +9343,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap()
             .recorder
             .materialize_into_ops();
-        self.capture_interpret_abort_values();
         let ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
@@ -12083,30 +12057,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// The last point where the recorder is reachable before
-    /// `compile_loop_body` detaches it. `pyjitpl.py reached_loop_header`
-    /// keeps `history`, each box's value and `virtualizable_boxes` on the
-    /// MetaInterp across a failed `compile_loop`; here the values the
-    /// `SwitchToBlackhole(ABORT_BAD_LOOP)` blackhole reads are taken while
-    /// `ctx` still owns them. No path after the detach resumes recording,
-    /// so the register boxes are not read as trace operands again.
-    fn capture_interpret_abort_values(&mut self) {
-        if !self.interpret_framestack_for_abort || self.framestack.is_empty() {
-            return;
-        }
-        let Some(ctx) = self.compile_tracing.as_ref() else {
-            return;
-        };
-        ctx.synchronize_virtualizable_after_guard_failure();
-        for frame in self.framestack.frames.iter_mut() {
-            frame.freeze_values_into_const_boxes(ctx);
-        }
-        self.interpret_abort_virtualizable = Some((
-            ctx.collect_virtualizable_element_values(),
-            ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-        ));
-    }
-
     /// `pyjitpl.py compile_loop` / `reached_loop_header` raise
     /// `SwitchToBlackhole` with `self.framestack` still intact.
     /// `run_blackhole_interp_to_cancel_tracing` then runs
@@ -12131,30 +12081,18 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
-        // `run_blackhole_interp_to_cancel_tracing`: the virtualizable is
-        // written back and every register box takes its concrete value
-        // while the recorder is alive, so `_copy_data_from_miframe` reads
-        // `getint()` / `getref_base()` after `abort_trace` drops it.
-        if let Some(ctx) = self.tracing.as_ref() {
-            ctx.synchronize_virtualizable_after_guard_failure();
-            for frame in self.framestack.frames.iter_mut() {
-                frame.freeze_values_into_const_boxes(ctx);
-            }
-        }
-        let raising_exception =
-            self.last_exc_value != 0 && self.pending_abort_reason == Some(counters::ABORT_ESCAPE);
-        let captured = self.interpret_abort_virtualizable.take();
-        let (virt_array_values, virtualizable_ptr) = self
+        let (virt_array_values, virtualizable_ptr, raising_exception) = self
             .tracing
             .as_ref()
             .map(|ctx| {
                 (
                     ctx.collect_virtualizable_element_values(),
                     ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+                    self.last_exc_value != 0
+                        && self.pending_abort_reason == Some(counters::ABORT_ESCAPE),
                 )
             })
-            .or(captured)
-            .unwrap_or((None, 0));
+            .unwrap_or((None, 0, false));
         // `MIFrame.pc` is the cursor after operand decode
         // (`run_blackhole_interp_to_cancel_tracing`). CloseLoop aborts
         // return before `interpret` stamps it.
@@ -28504,7 +28442,6 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.interpret_framestack_for_abort = true;
-        meta.interpret_abort_virtualizable = Some((None, 0x1000));
         let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
         frame.last_opcode_position = start;
         frame.code_cursor = mid;
@@ -28520,8 +28457,6 @@ mod metainterp_static_data_tests {
         assert_eq!(top.pc, start);
         assert!(top.jitcode.is_valid_startpoint(top.pc));
         assert_eq!(top.code_cursor, mid);
-        assert_eq!(pending.virtualizable_ptr, 0x1000);
-        assert!(meta.interpret_abort_virtualizable.is_none());
     }
 
     #[test]
