@@ -16351,7 +16351,9 @@ fn init_type_type(ns: PyObjectRef) {
             // `A.__module__ = "x"` is reflected in `A.__dict__`.
             let mut cls = args[1];
             let mut value = args[2];
-            check_set_special_type_attr(cls, value, "__module__")?;
+            pyre_object::with_roots!(cls, value => {
+                check_set_special_type_attr(cls, value, "__module__")
+            })?;
             unsafe {
                 if pyre_object::is_type(cls) {
                     if pyre_object::w_type_is_cpython_immutabletype(cls) {
@@ -16454,9 +16456,11 @@ fn init_type_type(ns: PyObjectRef) {
     let qualname_setter = make_builtin_function_with_arity(
         "__qualname__",
         |args| {
-            let w_type = args[1];
-            let value = args[2];
-            check_set_special_type_attr(w_type, value, "__qualname__")?;
+            let mut w_type = args[1];
+            let mut value = args[2];
+            pyre_object::with_roots!(w_type, value => {
+                check_set_special_type_attr(w_type, value, "__qualname__")
+            })?;
             if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
                 return Err(crate::PyError::type_error(format!(
                     "can only assign string to {}.__qualname__, not '{}'",
@@ -16689,9 +16693,11 @@ fn special_type_attr_delete(
 pub fn __majit_wrap_type_descr_set_name(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_type = args[1];
-    let w_value = args[2];
-    check_set_special_type_attr(w_type, w_value, "__name__")?;
+    let mut w_type = args[1];
+    let mut w_value = args[2];
+    pyre_object::with_roots!(w_type, w_value => {
+        check_set_special_type_attr(w_type, w_value, "__name__")
+    })?;
     // typeobject.py descr_set__name__ `space.isinstance_w(w_value, space.w_text)`
     // accepts str and any str subclass, not only the exact type.
     if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
@@ -16711,7 +16717,7 @@ pub fn __majit_wrap_type_descr_set_name(
     // exception type is observable, so `_check_surrogate` runs first;
     // both checks stay before `w_type.name = name`. U+0000 is a
     // single 0x00 byte in WTF-8.
-    crate::builtins::check_surrogate(w_value)?;
+    pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
     if wtf8.as_bytes().contains(&0) {
         return Err(crate::error::oefmt_noargs(
@@ -16757,10 +16763,12 @@ fn type_del_type_params(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// bases.
 fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
-        let w_type = args[1];
-        let w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let mut w_type = args[1];
+        let mut w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        pyre_object::with_roots!(w_type, w_value => {
+            check_set_special_type_attr(w_type, w_value, "__bases__")
+        })?;
         let type_name = pyre_object::w_type_get_name(w_type);
-        check_set_special_type_attr(w_type, w_value, "__bases__")?;
         if w_value.is_null() || !pyre_object::is_tuple(w_value) {
             return Err(crate::PyError::type_error(format!(
                 "can only assign tuple to {type_name}.__bases__, not {}",
