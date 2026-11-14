@@ -20749,14 +20749,9 @@ pub(crate) fn count_next_w(obj: PyObjectRef) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
         // A contended stripe wait may collect: pin the count before the wait and reload after it.
-        let lock_word = if pyre_object::gil_ready::gil_ready_word() != 0 {
-            pyre_object::interp_itertools::w_count_lock_acquire(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            )
-        } else {
-            0
-        };
-        let _guard = pyre_object::objlock::ObjectLockGuard::from_word(lock_word);
+        let _guard = pyre_object::interp_itertools::w_count_lock(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        );
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_c = pyre_object::interp_itertools::w_count_get_c(w_self);
         let _ = pyre_object::gc_roots::pin_root(w_c);

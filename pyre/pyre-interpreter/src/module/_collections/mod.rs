@@ -250,12 +250,7 @@ fn getlock(self_obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
     // A contended stripe wait may collect: pin the deque before the wait and reload after it.
-    let lock_word = if pyre_object::gil_ready::gil_ready_word() != 0 {
-        unsafe { w_deque_lock_acquire(pyre_object::gc_roots::shadow_stack_get(slot)) }
-    } else {
-        0
-    };
-    let _deque_guard = unsafe { pyre_object::objlock::ObjectLockGuard::from_word(lock_word) };
+    let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(slot)) };
     getlock_unlocked(pyre_object::gc_roots::shadow_stack_get(slot))
 }
 
@@ -1307,22 +1302,11 @@ impl W_Deque {
         Ok(false)
     }
     fn reverse(&mut self) {
-        let self_obj = self as *mut W_Deque as PyObjectRef;
+        let mut self_obj = self as *mut W_Deque as PyObjectRef;
         // `interp_deque.py reverse`: swap entries from both endpoints without
         // invalidating iterators. No Python runs inside the swap loop, so the
         // stripe covers the whole transition.
-        if pyre_object::gil_ready::gil_ready_word() != 0 {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
-            let _deque_guard = unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                ))
-            };
-            reverse_unlocked(pyre_object::gc_roots::shadow_stack_get(slot));
-            return;
-        }
-        reverse_unlocked(self_obj);
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => reverse_unlocked(self_obj))
     }
     fn rotate(&mut self, n: Option<PyObjectRef>) -> Result<(), crate::PyError> {
         let mut self_obj = self as *mut W_Deque as PyObjectRef;
@@ -1336,18 +1320,7 @@ impl W_Deque {
         // and the stripe held across both is what stops a concurrent mutation
         // in between from being overwritten by the stale snapshot. No Python
         // runs from here on.
-        if pyre_object::gil_ready::gil_ready_word() != 0 {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
-            let _deque_guard = unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                ))
-            };
-            rotate_unlocked(pyre_object::gc_roots::shadow_stack_get(slot), n);
-            return Ok(());
-        }
-        rotate_unlocked(self_obj, n);
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => rotate_unlocked(self_obj, n));
         Ok(())
     }
     fn insert(&mut self, i: PyObjectRef, mut x: PyObjectRef) -> Result<(), crate::PyError> {
@@ -1358,21 +1331,7 @@ impl W_Deque {
         let index = pyre_object::with_roots!(self_obj, x => crate::builtins::getindex_w(i))?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
-        if pyre_object::gil_ready::gil_ready_word() != 0 {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::pin_roots(&[self_obj, x]);
-            let _deque_guard = unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                ))
-            };
-            return insert_unlocked(
-                pyre_object::gc_roots::shadow_stack_get(slot),
-                index,
-                pyre_object::gc_roots::shadow_stack_get(slot + 1),
-            );
-        }
-        insert_unlocked(self_obj, index, x)
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj, x => insert_unlocked(self_obj, index, x))
     }
     fn index(
         &mut self,
@@ -1529,17 +1488,7 @@ impl W_Deque {
         // `locate` walks the chain and the caller then reads through the block
         // it returns, so the pair has to exclude a concurrent `store`. The
         // index conversion runs Python and stays outside.
-        if pyre_object::gil_ready::gil_ready_word() != 0 {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
-            let _deque_guard = unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                ))
-            };
-            return getitem_unlocked(pyre_object::gc_roots::shadow_stack_get(slot), idx);
-        }
-        getitem_unlocked(self_obj, idx)
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj => getitem_unlocked(self_obj, idx))
     }
     fn __setitem__(
         &mut self,
@@ -1552,21 +1501,7 @@ impl W_Deque {
         // and deliberately does not call `modified()`: deque iterators remain
         // valid and observe subsequently assigned elements (including after
         // pickle reconstruction).
-        if pyre_object::gil_ready::gil_ready_word() != 0 {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::pin_roots(&[self_obj, value]);
-            let _deque_guard = unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                ))
-            };
-            return setitem_unlocked(
-                pyre_object::gc_roots::shadow_stack_get(slot),
-                idx,
-                pyre_object::gc_roots::shadow_stack_get(slot + 1),
-            );
-        }
-        setitem_unlocked(self_obj, idx, value)
+        pyre_object::with_objlock!(w_deque_lock_acquire; self_obj, value => setitem_unlocked(self_obj, idx, value))
     }
     fn __delitem__(&mut self, index: PyObjectRef) -> Result<(), crate::PyError> {
         let mut self_obj = self as *mut W_Deque as PyObjectRef;
@@ -1576,12 +1511,7 @@ impl W_Deque {
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
         // A contended stripe wait may collect: pin the deque before the wait and reload after it.
-        let lock_word = if pyre_object::gil_ready::gil_ready_word() != 0 {
-            unsafe { w_deque_lock_acquire(pyre_object::gc_roots::shadow_stack_get(slot)) }
-        } else {
-            0
-        };
-        let _deque_guard = unsafe { pyre_object::objlock::ObjectLockGuard::from_word(lock_word) };
+        let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(slot)) };
         let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
         check_index_under_guard(self_obj, idx as i64)?;
         let mut items = snapshot(self_obj);
@@ -1668,15 +1598,8 @@ impl W_Deque {
         // Nothing between the snapshot and the write-back runs Python, so the
         // whole read-modify-write fits under one stripe — without it a
         // concurrent `append` lands between them and is dropped by `store`.
-        let _deque_guard = if pyre_object::gil_ready::gil_ready_word() != 0 {
-            unsafe {
-                pyre_object::objlock::ObjectLockGuard::from_word(w_deque_lock_acquire(
-                    pyre_object::gc_roots::shadow_stack_get(roots),
-                ))
-            }
-        } else {
-            unsafe { pyre_object::objlock::ObjectLockGuard::from_word(0) }
-        };
+        // A contended stripe wait may collect: pin the deque before the wait and reload after it.
+        let _deque_guard = unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(roots)) };
         let self_obj = pyre_object::gc_roots::shadow_stack_get(roots);
         let base = snapshot(self_obj);
         if base.is_empty() || num == 1 {
