@@ -173,7 +173,7 @@ fn const_ptr_is_null(value: OpRef) -> bool {
         .is_some_and(|r| r.is_null() || r == majit_ir::GcRef::NO_CONCRETE)
 }
 
-/// A vstack/pcdep `ConstPtr(NULL)` fills a hole only for a stored live NULL.
+/// A pcdep `ConstPtr(NULL)` fills a hole only for a stored live NULL.
 /// Any other NULL is a dead color (`vstack_last_ref`).
 pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef> {
     if opref_is_null_const_ptr(value) {
@@ -193,7 +193,7 @@ pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef>
 ///
 /// The frame-array SSA wins, including `read_boxes` wrapping a null `lst[i]`
 /// as `ConstPtr(NULL)`. Register liveness never blanks that item. A
-/// vstack/pcdep `ConstPtr(NULL)` fills a hole only when
+/// pcdep `ConstPtr(NULL)` fills a hole only when
 /// `virtualizable_slot_stored_live_null` (`PUSH_NULL` / resume `NULLREF`)
 /// and does not replace a real vable box (`vstack_last_ref` dead color).
 /// A real `ConstPtr(NULL)` stays; `MetaInterp.capture_resumedata` /
@@ -208,7 +208,7 @@ pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef>
 /// force_from_resumedata` write the vable image back while the call is
 /// still running, so that result home must not be published as a Ref.
 /// The skipped slot keeps its existing vable box, neither filled from
-/// the mirror / pcdep nor cleared. `async_force_result_color` is that
+/// pcdep nor cleared. `async_force_result_color` is that
 /// call's result register: no pcdep entry fills a slot from it
 /// (`pyjitpl.py` `MIFrame.get_list_of_active_boxes` clears it via
 /// `_result_argcode`).
@@ -223,11 +223,6 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
 ) -> Vec<(usize, Option<OpRef>)> {
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     let stack_end = nlocals + depth;
-    let vstack: Vec<OpRef> = if ctx.vstack_valid {
-        ctx.frame_state.borrow().vstack_boxes.clone()
-    } else {
-        Vec::new()
-    };
     let mut saved = Vec::with_capacity(stack_end);
     for slot in 0..stack_end {
         let vable_index = nvs + slot;
@@ -252,28 +247,22 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
             value = Some(existing);
         }
         if value.is_none() && slot >= nlocals {
-            // Non-null tracer SSA in the stack mirror / pcdep may fill a
-            // hole. A ConstPtr(NULL) fills only a stored live NULL
-            // (`PUSH_NULL`); a dead color (`vstack_last_ref`) must not.
-            value = vstack
-                .get(slot - nlocals)
-                .copied()
-                .and_then(|v| snapshot_stack_box(v, live_null));
-            if value.is_none() {
-                for &(bank, color, mapped) in pcdep_entries {
-                    if bank == 1
-                        && mapped as usize == slot
-                        && Some(color as u8) != async_force_result_color
-                        && live_ref_colors.contains(&(color as u32))
+            // A pcdep Ref register may fill a hole. A ConstPtr(NULL) fills
+            // only a stored live NULL (`PUSH_NULL`); a dead color
+            // (`vstack_last_ref`) must not.
+            for &(bank, color, mapped) in pcdep_entries {
+                if bank == 1
+                    && mapped as usize == slot
+                    && Some(color as u8) != async_force_result_color
+                    && live_ref_colors.contains(&(color as u32))
+                {
+                    if let Some(reg) = ctx
+                        .registers_r
+                        .get(color as usize)
+                        .and_then(|v| snapshot_stack_box(v, live_null))
                     {
-                        if let Some(reg) = ctx
-                            .registers_r
-                            .get(color as usize)
-                            .and_then(|v| snapshot_stack_box(v, live_null))
-                        {
-                            value = Some(reg);
-                            break;
-                        }
+                        value = Some(reg);
+                        break;
                     }
                 }
             }
@@ -1267,11 +1256,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // set through the floor's color→slot map.
                 (resolved_offset as i32, OuterActiveBoxesEntryTwin::Plain)
             };
-            let vstack_boxes = if ctx.vstack_valid {
-                Some(ctx.frame_state.borrow().vstack_boxes.clone())
-            } else {
-                None
-            };
             collect_outer_active_boxes_into(
                 sym,
                 ctx.trace_ctx,
@@ -1282,7 +1266,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 guard_jitcode_pc,
                 entry_jitcode_pc,
                 entry_twin,
-                vstack_boxes.as_deref(),
                 &mut scratch.active,
             );
             let pc_word = resolved_offset as u32;
@@ -1464,36 +1447,27 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
         Some(regs) => regs.get(color)?,
         None => ctx.registers_r.get(color)?,
     };
+    // `history.py` `CONST_NULL` is a `ConstPtr` of the null gcref. A live
+    // register that holds that constant is the operand's value — the same
+    // box `MIFrame.registers_r` / `get_list_of_active_boxes` and
+    // `do_residual_call` `argboxes` read. A kept `LOAD_GLOBAL` `PUSH_NULL`
+    // below a nested CALL is that constant, not an unresolved hole.
+    if let OpRef::ConstPtr(index) = opref {
+        return Some(
+            majit_ir::const_ptr_table::resolve(index).as_usize() as pyre_object::PyObjectRef
+        );
+    }
+    let null_is_a_value = null_ref_is_a_value(opref);
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
+        Some(Value::Ref(r))
+            if r != majit_ir::GcRef::NO_CONCRETE && (null_is_a_value || !r.is_null()) =>
+        {
+            Some(r.as_usize() as pyre_object::PyObjectRef)
+        }
         _ => None,
     }
 }
 
-/// Resolve a recorded box to the concrete ref it stands for.
-///
-/// `GcRef::NO_CONCRETE` is the sentinel for "no runtime value is known for
-/// this box" (`value.rs:51-59`), and `heapcache_ops` stamps it on a box whose
-/// load could not be replayed, so it never answers a slot.  A stamped NULL is
-/// judged by what carries it:
-///
-/// * A box [`null_ref_is_a_value`] accepts carries the operand's own null.
-///   Answering unresolved for one left the portal virtualizable's operand
-///   stack one slot short and `capture_root_vable_stack_image` declined it.
-/// * Any other box may read back `Ref(0)` while the walk still holds the
-///   operand symbolically — a deferred `LOAD_ATTR name + NULL|self` pair is
-///   the shape that reaches here.  Answer unresolved, as
-///   [`concrete_ref_for_color`] and the virtualizable-shadow fallback in
-///   [`collect_call_stack_overrides`] already do, so the slot stays ABSENT and
-///   the outer-call flush declines to the legacy replay.  Publishing it
-///   instead writes a null into a live operand-stack slot, and the interpreter
-///   resumed there dispatches through it: `out.append(f(i))` in an `except`
-///   handler faulted in `classify_callable` on the method-load slot this used
-///   to hand back as a resolved value.
-///
-/// The one operand whose correct value IS null whatever carries it — a
-/// `CALL`'s own `null_or_self` — is named and supplied separately by
-/// [`collect_call_stack_overrides`].
 /// Whether a NULL carried by `opref` is the operand's VALUE rather than a slot
 /// whose value is simply unknown.
 ///
@@ -1509,33 +1483,6 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
 /// symbolically, which is a different fact and answers false here.
 pub(crate) fn null_ref_is_a_value(opref: OpRef) -> bool {
     matches!(opref, OpRef::InputArgRef(_))
-}
-
-pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    opref: OpRef,
-) -> Option<pyre_object::PyObjectRef> {
-    // RPython history.py defines CONST_NULL as a real
-    // `ConstPtr(lltype.nullptr(llmemory.GCREF.TO))`.  Preserve that typed
-    // constant before consulting the runtime-concrete table: an inline
-    // ConstPtr(NULL) is positive proof that this operand-stack slot contains
-    // Python's call sentinel.  LOAD_SPECIAL records exactly that constant for
-    // its `self_or_null` half, including the `__exit__` pair retained below a
-    // nested CALL inside a `with` body.
-    if let OpRef::ConstPtr(index) = opref {
-        return Some(
-            majit_ir::const_ptr_table::resolve(index).as_usize() as pyre_object::PyObjectRef
-        );
-    }
-    let null_is_a_value = null_ref_is_a_value(opref);
-    match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(Value::Ref(r))
-            if r != majit_ir::GcRef::NO_CONCRETE && (null_is_a_value || !r.is_null()) =>
-        {
-            Some(r.as_usize() as pyre_object::PyObjectRef)
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
@@ -1569,7 +1516,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
         .unwrap_or(&[]);
     let nlocals = caller_sym.nlocals();
-    match assemble_call_stack_overrides(
+    let assembled = assemble_call_stack_overrides(
         caller_sym,
         ctx,
         call_jitcode_pc,
@@ -1577,7 +1524,8 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         depth,
         pcdep_entries,
         const_ref_slots,
-    ) {
+    );
+    match assembled {
         Ok(overrides) => Some(overrides),
         Err(AssembleFail::NoShape) => {
             if fbw_debug_abort_enabled() {
@@ -1591,8 +1539,6 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
                 let depth = gap.depth;
                 let stack_end = gap.stack_end;
                 let proof_slot = gap.proof_slot;
-                let vstack_valid = ctx.vstack_valid;
-                let vstack_depth = ctx.vstack_depth;
                 let pcdep_color = pcdep_entries.iter().find_map(|&(bank, color, slot)| {
                     (bank == 1 && slot as usize == proof_slot).then_some(color)
                 });
@@ -1609,18 +1555,10 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
                         bank == 1 && (slot as usize) >= nlocals && (slot as usize) < stack_end
                     })
                     .collect();
-                let vstack_box = (vstack_valid && vstack_depth == depth && depth > 0).then(|| {
-                    ctx.frame_state
-                        .borrow()
-                        .vstack_boxes
-                        .get(depth - 1)
-                        .copied()
-                });
                 eprintln!(
                     "[call-overrides-proof] pc={call_jitcode_pc} nlocals={nlocals} \
                      depth={depth} stack_end={stack_end} proof_slot={proof_slot} \
-                     vstack_valid={vstack_valid} vstack_depth={vstack_depth} \
-                     vstack_box={vstack_box:?} pcdep_color={pcdep_color:?} reg={reg:?} \
+                     pcdep_color={pcdep_color:?} reg={reg:?} \
                      const_has_proof={const_has_proof} const_n={const_n} pcdep_n={pcdep_n} \
                      stack_pcdep={stack_pcdep:?}"
                 );
@@ -1643,9 +1581,9 @@ struct ProofGap {
 
 /// Record `value` for `slot`.
 ///
-/// A null already stored is the hole `emit_popvalue_ref` leaves in the vstack
-/// mirror while `pcdep_slot_var_resume` / `const_ref_slots_at_pc` still name
-/// the opcode-entry owner. With `replace_null`, that owner replaces the hole.
+/// A null already stored is the hole `emit_popvalue_ref` leaves while
+/// `pcdep_slot_var_resume` / `const_ref_slots_at_pc` still name the
+/// opcode-entry owner. With `replace_null`, that owner replaces the hole.
 /// A resolved object stays, and a null never replaces one: the virtualizable
 /// shadow must not overwrite `PUSH_NULL`'s sentinel.
 fn note_stack_override(
@@ -1677,19 +1615,6 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         return Ok(Vec::new());
     }
     let mut overrides = Vec::new();
-    if ctx.vstack_valid
-        && ctx.vstack_depth == depth
-        && ctx.frame_state.borrow().vstack_boxes.len() >= depth
-    {
-        for d in 0..depth {
-            let slot = nlocals + d;
-            if let Some(value) =
-                concrete_ref_for_opref(ctx, ctx.frame_state.borrow().vstack_boxes[d])
-            {
-                overrides.push((slot, value));
-            }
-        }
-    }
     if pcdep_entries.is_empty() {
         for slot in nlocals..stack_end {
             if overrides.iter().any(|&(present, _)| present == slot) {
@@ -1704,22 +1629,20 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
             let slot = slot as usize;
             if bank == 1 && slot >= nlocals && slot < stack_end {
                 if let Some(value) = concrete_ref_for_color(ctx, color as usize) {
-                    // The vstack mirror can already hold the NULL
-                    // `emit_popvalue_ref` wrote for this slot. That hole is
-                    // not the opcode-entry owner `pcdep_slot_var_resume`
-                    // recorded, and `CallStack::ProofSlotUnresolved` declines
+                    // A null already stored is the hole `emit_popvalue_ref`
+                    // left, not the opcode-entry owner `pcdep_slot_var_resume`
+                    // recorded. `CallStack::ProofSlotUnresolved` declines
                     // `load_attr_fn` on `Attrs.cm(i)` when the hole wins.
                     note_stack_override(&mut overrides, slot, value, true);
                 }
             }
         }
     }
-    // Use the virtualizable shadow only after the live register/vstack
+    // Use the virtualizable shadow only after the live register/color
     // sources, and only for slots those sources left unresolved.  A mid-opcode
-    // shadow stack slot can be NULL because it was not mirrored, while the
-    // corresponding live color still holds the value — so a NULL reaching this
-    // fallback is an UNRESOLVED slot, not a proven null (see the per-slot note
-    // below), and is dropped rather than committed.
+    // shadow stack slot can be NULL because it was not written, while the
+    // corresponding live color still holds the value. An unwritten NULL stays
+    // unresolved; a stored live NULL is the operand (see the per-slot note).
     let base = ctx
         .trace_ctx
         .virtualizable_info()
@@ -1729,22 +1652,25 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         if overrides.iter().any(|&(present, _)| present == slot) {
             continue;
         }
-        if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
+        if let Some((opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
         {
-            // Only a positively-resolved (non-null) shadow value is a faithful
-            // stack slot.  The live vstack/color sources above emit a genuine
-            // null-or-self sentinel only where they hold a box for the slot at
-            // all — the `PUSH_NULL` position has none, which is what the
-            // CALL operand resolution below exists to cover.  A slot that
-            // reaches this shadow fallback with a NULL Ref is one the walk could
-            // not resolve — e.g. an
-            // unmaterialized `LOAD_CONST` operand whose concrete value was
-            // never mirrored — not a real null.  Leaving it ABSENT makes the
-            // outer-call flush validation decline, so the legacy replay
-            // rebuilds the frame from its start state instead of resuming the
-            // interpreter over a NULL where a live object belongs.
+            // A non-null shadow value is a faithful stack slot. A NULL is the
+            // operand's value only when the last `setarrayitem_vable` was a
+            // live stack push of `CONST_NULL` (`virtualizable_slot_stored_live_null`,
+            // `PUSH_NULL` / `resume.py` `decode_box` `NULLREF` → `CONST_NULL`)
+            // or the box itself is an input whose bound value is null
+            // (`null_ref_is_a_value`). Any other NULL is an unwritten hole
+            // (an unmaterialized `LOAD_CONST`, a pop-clear) and stays ABSENT
+            // so the outer-call flush declines rather than resuming over a
+            // NULL where a live object belongs. The CALL's own `null_or_self`
+            // is still named and synthesized below.
+            let live_null = ctx
+                .trace_ctx
+                .virtualizable_slot_stored_live_null(base + slot);
             if value.as_usize() != 0 {
                 overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
+            } else if live_null || null_ref_is_a_value(opref) {
+                overrides.push((slot, std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef));
             }
         }
     }
@@ -1800,7 +1726,7 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         }
     }
     // Ref(0) is valid only for the synthesized null_or_self sentinel.  A null
-    // proof value means the sparse vstack/color reconstruction is incomplete;
+    // proof value means the sparse color reconstruction is incomplete;
     // decline instead of publishing an invalid operand region.
     if let Some(proof_slot) = proof_slot {
         let proof_value = overrides
@@ -1824,12 +1750,6 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
             if overrides.iter().any(|&(present, _)| present == slot) {
                 continue;
             }
-            let vstack_box = (ctx.vstack_valid
-                && ctx.vstack_depth == depth
-                && ctx.frame_state.borrow().vstack_boxes.len() >= depth)
-                .then(|| ctx.frame_state.borrow().vstack_boxes[slot - nlocals]);
-            let vstack_concrete =
-                vstack_box.map(|opref| concrete_ref_for_opref(ctx, opref).is_some());
             let pcdep_color = pcdep_entries
                 .iter()
                 .find_map(|&(bank, color, s)| (bank == 1 && s as usize == slot).then_some(color));
@@ -1841,7 +1761,6 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
             );
             eprintln!(
                 "[call-overrides-absent] slot={slot} nlocals={nlocals} depth={depth} \
-                 vstack_box={vstack_box:?} vstack_concrete={vstack_concrete:?} \
                  pcdep_color={pcdep_color:?} shadow={shadow:?} \
                  proof_slot={proof_slot:?}"
             );
@@ -2782,7 +2701,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         caller_liveness_word,
         caller_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
-        None,
     );
     restore_in_a_call_result(banks, saved);
     Ok(InlineParentFrame {
@@ -3256,8 +3174,6 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         )
         .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
     } else {
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
         // SAFETY: checked non-null above and valid for this full-body walk.
         let caller_sym = unsafe { &*caller_sym_ptr };
@@ -3271,7 +3187,6 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
             resume_marker_jit_pc as i32,
             call_jit_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            vstack,
         )
     };
     Ok(InlineParentFrame {
@@ -4330,23 +4245,9 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             }
         }
     }
-    // Portal `collect_outer_active_boxes` overlays `vstack_boxes` onto live
-    // Ref colors that map to operand-stack slots.  Fill NONE / NULL-const
-    // holes on this callee frame after shadow recovery so a kept COPY /
-    // MATCH_CLASS slot the walk mirror holds is the box the snapshot
-    // encodes.  A color that already holds a real box stays on the
-    // register / shadow path (the resume pcdep and the walk mirror are
-    // not the same coordinate).
-    if ctx.vstack_valid {
-        let vstack = ctx.frame_state.borrow().vstack_boxes.clone();
-        overlay_callee_vstack_on_ref_regs(
-            &mut recovered_regs_r,
-            stack_base,
-            maps.stack_depth_at_pc,
-            &maps.pcdep_entries,
-            &vstack,
-        );
-    }
+    // `get_list_of_active_boxes` (`pyjitpl.py`) reads `registers_r` at the
+    // resume `-live-`. The inlined callee is not the virtualizable owner, so
+    // the live set is this bank after the callee-shadow recovery above.
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         &recovered_regs_r,

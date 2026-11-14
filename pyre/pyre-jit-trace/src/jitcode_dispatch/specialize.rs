@@ -169,7 +169,6 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 
 const TRUTH_VALUE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::truth_value",
-    commit_label: "truth_value_commit",
     decline_tag: "TRUTH-VALUE-SUBWALK",
 };
 
@@ -1245,15 +1244,12 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
 /// coordinate, so this resolves per level exactly as
 /// [`LiveLastInstrGuard::enter`] retargets its publication: inside an inline
 /// sub-walk the callee's own jitcode pc resolved through the callee's
-/// metadata, at the portal the walk's `vstack_cur_pypc`.
+/// metadata, at the portal the virtualizable `last_instr` static
+/// (`pyopcode.py dispatch_bytecode`, `pyjitpl.py _opimpl_setfield_vable`).
 ///
-/// The virtualizable boxes are NOT a source here, which a probe against the
-/// residual's own answers settled rather than an argument: at three portal
-/// sites the boxes' `last_instr` entry read 110/165/185 against executing
-/// pcs of 115/170/197, and at an inlined-callee site it read 232 -- the
-/// caller's CALL boundary -- against the callee's own 22.  They describe the
-/// PORTAL frame and carry whichever of the field's two conventions their last
-/// writer left.
+/// The portal boxes describe the PORTAL frame, so an inlined callee answers
+/// from its own jitcode metadata (`inline_callee_py_pc`) rather than that
+/// static.
 ///
 /// A receiver that is not this level's own frame declines, which is what keeps
 /// a suspended generator's frame, a traceback node's frame and a caller's
@@ -1398,13 +1394,13 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     if current_inline_concrete_frame() != 0 {
         return Some((frame_box, residual_call::inline_callee_py_pc(ctx, op_pc)?));
     }
-    // An inline sub-walk with no concrete callee frame has no level-local
-    // coordinate to answer with: `vstack_cur_pypc` is the outer walk's mirror
-    // and a sub-walk never advances it.
-    if !ctx.vstack_valid {
-        return None;
-    }
-    Some((frame_box, ctx.vstack_cur_pypc))
+    // `dispatch_bytecode` writes `last_instr` before the opcode body;
+    // `_opimpl_setfield_vable` keeps the virtualizable box equal. A missing
+    // box means this portal has no current opcode.
+    Some((
+        frame_box,
+        residual_call::portal_vable_last_instr_py_pc(ctx)?,
+    ))
 }
 
 /// Pin a frame-attribute receiver to the frame type's getset.
@@ -1590,9 +1586,7 @@ extern "C" fn jit_frame_f_lineno_at(
 /// through `virtualizable_entry_at`, where the neighbouring `locals()` fold
 /// reads `debugdata`.  Neither slot has a `setfield_vable` writer
 /// (`virtualizable_spec.rs` names the ones that do), so memory holds the live
-/// value while compiled code runs, while the recording-time shadow's
-/// `debugdata` is a `clone_debugdata_ptr` copy of it.  Memory answers the same
-/// at both times; the shadow does not.
+/// value while compiled code runs.
 ///
 /// The receiver is pinned by [`walker_prove_owned_frame_pc`].
 fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
@@ -5690,7 +5684,6 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 
 const SPECIALISED_TUPLE2_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::tupleobject::makespecialisedtuple2",
-    commit_label: "specialised_tuple2_commit",
     decline_tag: "TUPLE2-SUBWALK",
 };
 
@@ -6742,17 +6735,15 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
 
 const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::tupleobject::w_tuple_getitem",
-    commit_label: "subscr_tuple_item_commit",
     decline_tag: "SUBSCR-TUPLE-SUBWALK",
 };
 
-/// An operator's descent: which body to enter and how the trace names the
-/// site.
+/// An operator's descent: which body to enter and the tag its decline
+/// reports.
 pub(crate) struct HelperDescent {
     /// Canonical path of the operator's own body -- `descroperation::pos`,
     /// `opcode_ops::binary_value_from_tag` -- not a split of it.
     pub(crate) path: &'static str,
-    pub(crate) commit_label: &'static str,
     pub(crate) decline_tag: &'static str,
 }
 
@@ -6760,7 +6751,6 @@ pub(crate) struct HelperDescent {
 /// `dictmultiobject.py allocate_and_init_instance` kwargs branch.
 const W_DICT_NEW_KWARGS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::dictmultiobject::w_dict_new_kwargs",
-    commit_label: "w_dict_new_kwargs_commit",
     decline_tag: "KWARGS-DICT-NEW-SUBWALK",
 };
 
@@ -6768,7 +6758,6 @@ const W_DICT_NEW_KWARGS_DESCENT: HelperDescent = HelperDescent {
 /// — `dictmultiobject.py W_DictMultiObject.setitem`.
 const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::dictmultiobject::w_dict_store",
-    commit_label: "w_dict_store_commit",
     decline_tag: "KWARGS-DICT-SETITEM-SUBWALK",
 };
 
@@ -6776,7 +6765,6 @@ const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
 /// so its `match` folds and only the selected operator's body is traced.
 const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::binary_value_from_tag",
-    commit_label: "binary_op_commit",
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
@@ -6798,7 +6786,6 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
 /// `binary_slice_getitem_fallback` (`dont_look_inside`). Not a spec-fold row.
 const BINARY_SLICE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::runtime_ops::binary_slice_values_inner",
-    commit_label: "binary_slice_commit",
     decline_tag: "BINARY-SLICE-SUBWALK",
 };
 
@@ -6854,7 +6841,6 @@ pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
 /// (`f` on `comprehension_param_range_call_flush`). Not a spec-fold row.
 const GET_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_range_iter",
-    commit_label: "get_iter_commit",
     decline_tag: "GET-ITER-SUBWALK",
 };
 
@@ -6908,7 +6894,6 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
 /// `comprehension_param_range_call_flush`). Not a spec-fold row.
 const NEWLIST_EMPTY_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::listobject::w_list_make_empty",
-    commit_label: "newlist_empty_commit",
     decline_tag: "NEWLIST-EMPTY-SUBWALK",
 };
 
@@ -6946,13 +6931,11 @@ pub(crate) fn try_walker_orthodox_empty_newlist<Sym: WalkSym>(
 
 const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "write_cell",
-    commit_label: "write_cell_commit",
     decline_tag: "WRITE-CELL-SUBWALK",
 };
 
 const UNWRAP_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "unwrap_cell",
-    commit_label: "unwrap_cell_commit",
     decline_tag: "UNWRAP-CELL-SUBWALK",
 };
 
@@ -7005,7 +6988,6 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        descent.commit_label,
         &[],
         &[],
         &ref_oprefs,
@@ -7193,7 +7175,6 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
 /// and hung `listcomp_float_element_regression`.
 const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_truediv",
-    commit_label: "int_truediv_commit",
     decline_tag: "INT-TRUEDIV-SUBWALK",
 };
 
@@ -7202,7 +7183,6 @@ const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
 /// `FloatAdd`+`wrapfloat` hand emit.
 const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_add",
-    commit_label: "float_add_commit",
     decline_tag: "FLOAT-ADD-SUBWALK",
 };
 
@@ -7212,7 +7192,6 @@ const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
 /// [`_int_add`]'s `dont_look_inside` arm.
 const INT_ADD_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_add",
-    commit_label: "int_add_commit",
     decline_tag: "INT-ADD-SUBWALK",
 };
 
@@ -7221,7 +7200,6 @@ const INT_ADD_DESCENT: HelperDescent = HelperDescent {
 /// and overflow stays `_int_sub_ovf`.
 const INT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_sub",
-    commit_label: "int_sub_commit",
     decline_tag: "INT-SUB-SUBWALK",
 };
 
@@ -7230,25 +7208,21 @@ const INT_SUB_DESCENT: HelperDescent = HelperDescent {
 /// and overflow stays `_int_mul_ovf`.
 const INT_MUL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_mul",
-    commit_label: "int_mul_commit",
     decline_tag: "INT-MUL-SUBWALK",
 };
 
 const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_sub",
-    commit_label: "float_sub_commit",
     decline_tag: "FLOAT-SUB-SUBWALK",
 };
 
 const FLOAT_MUL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_mul",
-    commit_label: "float_mul_commit",
     decline_tag: "FLOAT-MUL-SUBWALK",
 };
 
 const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_truediv",
-    commit_label: "float_truediv_commit",
     decline_tag: "FLOAT-TRUEDIV-SUBWALK",
 };
 
@@ -7256,51 +7230,43 @@ const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
 /// [`FLOAT_POW_DESCENT`], which is the `math.pow` leaf.
 const FLOAT_DESCR_POW_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::float_pow_impl",
-    commit_label: "float_descr_pow_commit",
     decline_tag: "FLOAT-DESCR-POW-SUBWALK",
 };
 
 /// floatobject.py `_compare` after `_to_float` for two floats.
 const FLOAT_LT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_lt",
-    commit_label: "float_lt_commit",
     decline_tag: "FLOAT-LT-SUBWALK",
 };
 
 const FLOAT_LE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_le",
-    commit_label: "float_le_commit",
     decline_tag: "FLOAT-LE-SUBWALK",
 };
 
 const FLOAT_GT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_gt",
-    commit_label: "float_gt_commit",
     decline_tag: "FLOAT-GT-SUBWALK",
 };
 
 const FLOAT_GE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_ge",
-    commit_label: "float_ge_commit",
     decline_tag: "FLOAT-GE-SUBWALK",
 };
 
 const FLOAT_EQ_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_eq",
-    commit_label: "float_eq_commit",
     decline_tag: "FLOAT-EQ-SUBWALK",
 };
 
 const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_ne",
-    commit_label: "float_ne_commit",
     decline_tag: "FLOAT-NE-SUBWALK",
 };
 
 /// intobject.py `descr_invert`.
 const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_invert",
-    commit_label: "int_invert_commit",
     decline_tag: "INT-INVERT-SUBWALK",
 };
 
@@ -7744,7 +7710,6 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "list_getitem_commit",
         &[raw_index],
         &[ConcreteValue::Int(index)],
         &[list_op],
@@ -7877,7 +7842,6 @@ fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
 
 const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::compare_value_from_tag",
-    commit_label: "compare_op_commit",
     decline_tag: "COMPARE-OP-SUBWALK",
 };
 
@@ -8063,7 +8027,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
         sym,
         &prep.body,
         prep.nested,
-        descent.commit_label,
         &int_oprefs,
         &int_concretes,
         &ref_oprefs,
@@ -10072,7 +10035,6 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "str_getitem_commit",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10193,7 +10155,6 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "bytes_getitem_commit",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10327,7 +10288,6 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "frame_locals_getitem_commit",
         &[],
         &[],
         &[seq_op, key_op],
@@ -10456,7 +10416,6 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "frame_locals_setitem_commit",
         &[],
         &[],
         &[seq_op, key_op, value_op],
@@ -10562,7 +10521,6 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "list_iter_descr_next_commit",
         &[],
         &[],
         &[iter_op],
@@ -12192,12 +12150,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     };
     // Read the mapping through the SHADOW's payload, which is what the emitted
     // `getfield_gc_r` reads, and require it to be the one the residual would
-    // have used.  The two payloads are not the same object: a root portal seed
-    // bakes the vable identity against the live frame but expands the shadow
-    // from the `snapshot_for_tracing` copy, whose `clone_debugdata_ptr` hands
-    // out a fresh `FrameDebugData` around the same `w_locals`.  Comparing the
-    // holders would decline every portal trace; comparing the mapping is the
-    // invariant that actually has to hold.
+    // have used.  Comparing the `FrameDebugData` holders is not the invariant:
+    // `w_locals` is the mapping `fast2locals` writes. Comparing the mapping
+    // is what has to hold.
     let shadow_debugdata =
         debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
     let w_locals = if shadow_debugdata.is_null() {
@@ -14883,7 +14838,6 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
-    commit_label: "newfloat_commit",
     decline_tag: "NEWFLOAT-SUBWALK",
 };
 
@@ -14974,19 +14928,16 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
 
 const NEWCOMPLEX_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::newcomplex",
-    commit_label: "newcomplex_commit",
     decline_tag: "NEWCOMPLEX-SUBWALK",
 };
 
 const COMPLEX_REAL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::complex_descr_get_real",
-    commit_label: "complex_real_commit",
     decline_tag: "COMPLEX-REAL-SUBWALK",
 };
 
 const COMPLEX_IMAG_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::complexobject::complex_descr_get_imag",
-    commit_label: "complex_imag_commit",
     decline_tag: "COMPLEX-IMAG-SUBWALK",
 };
 
@@ -15203,7 +15154,6 @@ pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
 
 const TRACEBACK_LINENO_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::pytraceback::descr_get_tb_lineno",
-    commit_label: "tb_lineno_commit",
     decline_tag: "TB-LINENO-SUBWALK",
 };
 
@@ -15259,7 +15209,6 @@ pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(
 
 const FRAME_F_BACK_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::pyframe::descr_get_f_back",
-    commit_label: "f_back_commit",
     decline_tag: "F-BACK-SUBWALK",
 };
 
@@ -15395,7 +15344,6 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
 
 const INT_DESCR_STR_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::intobject::descr_str",
-    commit_label: "int_descr_str_commit",
     decline_tag: "INT-DESCR-STR-SUBWALK",
 };
 
@@ -15453,7 +15401,6 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
 
 const NEWUTF8_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::unicodeobject::w_str_from_storage_and_length",
-    commit_label: "newutf8_commit",
     decline_tag: "NEWUTF8-SUBWALK",
 };
 
@@ -15511,7 +15458,6 @@ fn spec_is_decimal_int_format(spec: &str) -> bool {
 /// `intobject::format_int_decimal`: `ll_int2dec`, then `_fill_number`.
 const FORMAT_INT_DECIMAL_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::intobject::format_int_decimal",
-    commit_label: "format_int_decimal_commit",
     decline_tag: "FORMAT-INT-DECIMAL-SUBWALK",
 };
 
@@ -16589,7 +16535,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     sym: &Sym,
     sub_body: &SubJitCodeBody,
     nested_entry: HelperEntry,
-    _fallback_label: &'static str,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
@@ -16614,8 +16559,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -16626,7 +16569,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             call_site_word,
             op_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            vstack,
         )
     };
 
@@ -16824,7 +16766,6 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         sym,
         sub_body,
         nested_entry,
-        "codewriter_helper_inline_commit",
         int_args,
         int_arg_concretes,
         ref_args,
@@ -17026,7 +16967,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         sym,
         sub_body,
         nested_entry,
-        "list_append_commit",
         &[],
         &[],
         &[self_ref, value_op],
@@ -17319,7 +17259,6 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         sym,
         sub_body,
         nested_entry,
-        "list_pop_commit",
         &[],
         &[],
         &[self_ref],
@@ -19331,7 +19270,6 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "list_setitem_commit",
         &[raw_index],
         &[ConcreteValue::Int(index)],
         &[list_op, value_op],
@@ -19834,7 +19772,6 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "for_iter_range_step_one_commit",
         &[],
         &[],
         &[iter_op],
@@ -20640,7 +20577,6 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
 
 const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
     path: "pyframe::PyFrame::get_w_globals",
-    commit_label: "get_w_globals_commit",
     decline_tag: "GET-W-GLOBALS-SUBWALK",
 };
 

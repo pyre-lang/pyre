@@ -21,7 +21,7 @@ use pyre_object::{PY_NULL, PyObjectRef};
 
 use majit_ir::GcRef;
 use majit_ir::operand::Operand;
-use pyre_interpreter::pyframe::PyFrame;
+use pyre_interpreter::pyframe::{FrameBox, PyFrame};
 use pyre_jit_trace::trace::trace_bytecode;
 
 // Force cache removed: CallAssemblerI + bridge handles recursion
@@ -4997,18 +4997,13 @@ fn trace_and_compile_from_bridge_body(
     // that whole-loop interpreter; calling it once preserves the concrete PC
     // updates across branches/back-edges. Re-invoking it in a synthetic
     // `pc + 1` loop diverges from RPython and corrupts nested-loop bridges.
-    // The bridge tracer must leave the real frame exactly at the guard
-    // resume state so that a `BridgeCompiled` outcome re-enters
-    // `eval_loop_jit` there — the `ContinueRunningNormally` arm does NOT
-    // reconstruct the frame, it runs the interpreter forward from the live
-    // frame's `last_instr` / value stack as-is. The full-body walker runs from
-    // a private `snapshot_for_tracing` copy, but may-force residual calls use
-    // the shared execution context during the walk, which advances the live frame's
-    // `last_instr` AND its locals (e.g. a loop counter) to the walked
-    // opcode's concrete state.  Snapshot the resume state here and restore it
-    // after the walk so the post-bridge interpreter resumes at the guard
-    // point rather than mid-body or past a dropped loop iteration (a
-    // value-stack underflow / off-by-one-iteration result otherwise).
+    // `pyjitpl.py` `handle_guard_failure` traces the bridge over the same
+    // live virtualizable (`virtualizable.py` `write_boxes` / `write_box_at`).
+    // Pin that frame the way the portal walk does; a bootstrap frame the
+    // collector does not own cannot move, so `FrameBox::non_owning` names
+    // it without a copy. An uncommitted walk still restores this pre-walk
+    // `resume_state` so a declined retrace replays from the guard
+    // coordinate (today's decline/replay contract).
     let resume_state = match bridge_frame_root.frame().snapshot_for_tracing() {
         Ok(frame) => frame,
         Err(mut err) => {
@@ -5055,7 +5050,6 @@ fn trace_and_compile_from_bridge_body(
         let (driver, _) = crate::eval::driver_pair();
         driver.set_bridge_entered_at_guard_resume(true);
     }
-    let mut snapshot_error = None;
     let first_segment = std::cell::Cell::new(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -5066,31 +5060,21 @@ fn trace_and_compile_from_bridge_body(
             &env,
             || {},
             |meta, sym| {
-                // pyjitpl.py:1571-1578: a merge point that only appends to
-                // `current_merge_points` restores `self.pc` and goes on
-                // interpreting, so the driver re-enters this walk instead of
-                // handing the guest back.  Each entry starts from the frame
-                // as the previous segment left it, so the snapshot is taken
-                // here rather than once outside — `FrameBox` owns a shadow
-                // stack root guard and cannot be cloned.
-                let trace_frame = match bridge_frame_root.frame().snapshot_for_tracing() {
-                    Ok(frame) => frame,
-                    Err(mut err) => {
-                        snapshot_error = Some(pyre_jit_trace::state::ConcreteValue::Ref(
-                            err.to_exc_object(),
-                        ));
-                        return majit_metainterp::TraceAction::Abort;
-                    }
-                };
+                // `pyjitpl.py` `handle_guard_failure`: a merge point that
+                // only appends to `current_merge_points` restores `self.pc`
+                // and continues `interpret()`, so the driver re-enters this
+                // walk. Each entry pins (or borrows) the live frame as the
+                // previous segment left it — `FrameBox` owns a shadow-stack
+                // root guard and cannot be cloned.
+                let frame_ptr = bridge_frame_root.frame() as *mut PyFrame;
+                let trace_frame = FrameBox::pin_existing(frame_ptr)
+                    .unwrap_or_else(|| FrameBox::non_owning(frame_ptr));
                 // `sym.set_live_vable_frame_addr` records this word as the
-                // virtualizable the walk writes back through, so it has to be
-                // the frame's address as of this entry: the driver re-enters
-                // the closure per merge point and `snapshot_for_tracing`
-                // allocates, either of which can have moved the frame since the
-                // root was taken.  Read it back out of the root, the same way
-                // `trace_frame` above is.
+                // virtualizable identity. Re-read it from the root: the
+                // driver re-enters per merge point and a collection can
+                // have moved the frame.
                 let live_frame_addr = bridge_frame_root.frame() as *const PyFrame as usize;
-                let (action, executed, walk_end_flushed) = trace_bytecode(
+                let (action, walk_end_flushed) = trace_bytecode(
                     meta,
                     sym,
                     code,
@@ -5100,17 +5084,11 @@ fn trace_and_compile_from_bridge_body(
                     false,
                     first_segment.replace(false),
                 );
-                // pyjitpl.py raise_continue_running_normally:
-                // a bridge walk that closed at a merge point and committed
-                // its end-of-walk state into the trace snapshot
-                // (`flush_walk_end_state_to_frame`) hands the LIVE frame
-                // that end state — the walked region's residual calls
-                // executed concretely, so resuming at the guard would
-                // re-apply every side effect.  Uncommitted → fall through
-                // to the guard-state restore below (legacy replay).
+                // `pyjitpl.py` `raise_continue_running_normally` /
+                // `virtualizable.py` `write_boxes`: a committed walk already
+                // wrote the live object. Uncommitted → fall through to the
+                // guard-state restore below (legacy replay).
                 if walk_end_flushed {
-                    let frame = bridge_frame_root.frame();
-                    frame.restore_resume_state_from(&executed);
                     adopted_walk_end_state = true;
                 }
                 action
@@ -5125,17 +5103,6 @@ fn trace_and_compile_from_bridge_body(
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
 
-    if let Some(err) = snapshot_error {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
-            driver.meta_interp_mut().abort_trace(false);
-        }
-        // `merge_point` stages `pending_abort_blackhole` on Abort
-        // (`run_blackhole_interp_to_cancel_tracing`). Snapshot failure
-        // returns before that convert, so drop the parked handoff.
-        driver.discard_pending_abort_blackhole();
-        return BridgeResolution::FinishedException(err);
-    }
     if let Some(mut err) = pyre_jit_trace::trace::take_walk_end_propagated_exception() {
         let (driver, _) = crate::eval::driver_pair();
         if driver.is_tracing() {

@@ -1,5 +1,7 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot_instance,hot_returns_int,hot_instance_in_loop,hot_returns_int_in_loop,entry-bridge:__init__,loop:__init__
+# pyre-check: selfcheck-compiles=entry-bridge:__init__,loop:__init__,loop:warmup_instance,loop:warmup_raises
+# The `hot_*` drivers abort every recording of a loop
+# (`vable_after_residual_call` → `SwitchToBlackhole(ABORT_ESCAPE)`).
 # A loop-bearing `__init__` cut into CALL_ASSEMBLER that forces the caller
 # while that residual is still recording must resume in descr_call's tail:
 # `C()` is the instance, and a non-None `__init__` return raises TypeError.

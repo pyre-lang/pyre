@@ -424,8 +424,6 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
     FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
-    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
-    FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
@@ -470,8 +468,6 @@ pub struct ParkedWalkTls {
     executed_effect_count: usize,
     heap_writing_effect_count: usize,
     opcode_entry_effects: Option<(usize, usize)>,
-    qmut_abort_stack: Option<(usize, Vec<OpRef>)>,
-    branch_abort_stack: Option<(usize, Vec<OpRef>)>,
     structural_abort_opcode_effects: Option<(usize, usize)>,
     abort_call_resume: Option<super::InlineAbortCarrier>,
     built_exc: std::collections::HashSet<OpRef>,
@@ -490,12 +486,9 @@ pub struct ParkedWalkTls {
     // Nested `compile_and_run_once` (`warmstate.py bound_reached` builds a
     // fresh MetaInterp). The inner `discard_escape_flush_undo` /
     // `reset_unflushed_escaped_callee` start that attempt clean; these
-    // three hold the outer capture until `restore_walk_tls`.
-    // Also parks ESCAPE_OPCODE_WINDOW and COMMITTED_FRAME_ESCAPE_PC.
+    // hold the outer capture until `restore_walk_tls`.
     escape_flush_undo: Option<super::EscapeFlushUndo>,
     escape_flush_undo_pending: bool,
-    escape_opcode_window: Option<(usize, bool)>,
-    committed_frame_escape_pc: Option<(usize, super::EscapeResumeKind)>,
     unflushed_escaped_callee: usize,
     inline_frame: super::residual_call::ParkedInlineFrameTls,
     /// Raw pointer to the outer `SubWalkExchange`. Not a GC edge; the
@@ -554,8 +547,6 @@ pub fn park_walk_tls() {
         executed_effect_count: super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.replace(0)),
         heap_writing_effect_count: super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.replace(0)),
         opcode_entry_effects: super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.take()),
-        qmut_abort_stack: super::FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take()),
-        branch_abort_stack: super::FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take()),
         structural_abort_opcode_effects: super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
             .with(|c| c.take()),
         abort_call_resume: super::FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take()),
@@ -571,8 +562,6 @@ pub fn park_walk_tls() {
         foriter_inflight_pending: FORITER_INFLIGHT_PENDING.with(|c| c.take()),
         escape_flush_undo: super::ESCAPE_FLUSH_UNDO.with(|c| c.borrow_mut().take()),
         escape_flush_undo_pending: super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.replace(false)),
-        escape_opcode_window: super::ESCAPE_OPCODE_WINDOW.with(|c| c.replace(None)),
-        committed_frame_escape_pc: super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.take()),
         unflushed_escaped_callee: super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.replace(0)),
         inline_frame: super::residual_call::take_inline_frame_tls(),
         // Nested attempt gets its own sub-walk driver, as `bound_reached`
@@ -608,8 +597,6 @@ pub fn restore_walk_tls() {
     super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(parked.executed_effect_count));
     super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(parked.heap_writing_effect_count));
     super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(parked.opcode_entry_effects));
-    super::FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = parked.qmut_abort_stack);
-    super::FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = parked.branch_abort_stack);
     super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
         .with(|c| c.set(parked.structural_abort_opcode_effects));
     super::FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = parked.abort_call_resume);
@@ -624,8 +611,6 @@ pub fn restore_walk_tls() {
     FORITER_INFLIGHT_PENDING.with(|c| c.set(parked.foriter_inflight_pending));
     super::ESCAPE_FLUSH_UNDO.with(|c| *c.borrow_mut() = parked.escape_flush_undo);
     super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.set(parked.escape_flush_undo_pending));
-    super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(parked.escape_opcode_window));
-    super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(parked.committed_frame_escape_pc));
     super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(parked.unflushed_escaped_callee));
     super::residual_call::restore_inline_frame_tls(parked.inline_frame);
     super::set_subwalk_driver(parked.subwalk_driver);
@@ -858,7 +843,6 @@ mod parked_walk_tls_root_tests {
             c.set(Some(super::super::residual_call::PublishedLastInstr {
                 frame: 1,
                 saved: 2,
-                resume_flushed: false,
             }));
         });
 
@@ -879,11 +863,7 @@ mod parked_walk_tls_root_tests {
         );
         assert_eq!(
             super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.get()),
-            Some(super::super::residual_call::PublishedLastInstr {
-                frame: 1,
-                saved: 2,
-                resume_flushed: false,
-            })
+            Some(super::super::residual_call::PublishedLastInstr { frame: 1, saved: 2 })
         );
         super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(std::ptr::null_mut()));
         super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
@@ -949,47 +929,6 @@ mod parked_walk_tls_root_tests {
     }
 
     #[test]
-    fn park_walk_tls_restores_the_outer_escape_window_and_committed_pc() {
-        struct RestoreOnDrop;
-        impl Drop for RestoreOnDrop {
-            fn drop(&mut self) {
-                restore_walk_tls();
-                super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(None));
-                super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(None));
-            }
-        }
-        let _restore = RestoreOnDrop;
-        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(Some((11, true))));
-        super::super::COMMITTED_FRAME_ESCAPE_PC
-            .with(|c| c.set(Some((22, EscapeResumeKind::Exact))));
-        park_walk_tls();
-        assert!(
-            super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.get().is_none()),
-            "nested walk starts with an empty escape opcode window"
-        );
-        assert!(
-            super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.get().is_none()),
-            "nested walk starts with no committed frame escape pc"
-        );
-        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(Some((33, false))));
-        super::super::COMMITTED_FRAME_ESCAPE_PC
-            .with(|c| c.set(Some((44, EscapeResumeKind::RerunsOpcode))));
-        restore_walk_tls();
-        assert_eq!(
-            super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.get()),
-            Some((11, true)),
-            "outer escape opcode window must survive the nested walk"
-        );
-        assert_eq!(
-            super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.get()),
-            Some((22, EscapeResumeKind::Exact)),
-            "outer committed frame escape pc must survive the nested walk"
-        );
-        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(None));
-        super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(None));
-    }
-
-    #[test]
     fn walk_parked_walk_tls_stack_forwards_namespace_written() {
         struct RestoreOnDrop;
         impl Drop for RestoreOnDrop {
@@ -1047,7 +986,6 @@ mod parked_walk_tls_root_tests {
             c.set(Some(super::super::residual_call::PublishedLastInstr {
                 frame: old_frame,
                 saved: 2,
-                resume_flushed: false,
             }));
         });
         super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
@@ -1127,7 +1065,6 @@ mod parked_walk_tls_root_tests {
             c.set(Some(super::super::residual_call::PublishedLastInstr {
                 frame: old_frame,
                 saved: 2,
-                resume_flushed: false,
             }));
         });
         super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
@@ -2272,9 +2209,9 @@ pub(crate) fn fbw_mark_foriter_body_effect_since_consume() {
     });
 }
 
-/// Drop every in-flight FOR_ITER entry (#32 S2): a committed branch-flush has
-/// adopted the walk's end state and owns the iteration count, so no item may be
-/// delivered afterward.
+/// Drop every in-flight FOR_ITER entry. Blackhole adoption
+/// (`convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`) holds the
+/// item in a register, so the legacy deliver must not re-apply it.
 pub fn fbw_foriter_inflight_clear() {
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
 }
@@ -2285,79 +2222,6 @@ pub fn fbw_foriter_inflight_clear() {
 /// none of its FOR_ITER items is left to deliver. Other frames' entries stay.
 pub(crate) fn fbw_foriter_inflight_popframe(owner: InflightForiterOwner) {
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().retain(|e| e.owner != owner));
-}
-
-/// #32 S2 deliver selector for the branch-flush leg.  Returns
-/// `Some((item, body_pc))` to push at the body ONLY when `resume_py_pc` is the
-/// logical start of a FOR_ITER whose consumed item is in flight (`body_pc` is
-/// that instruction's opcode pc + 1) — Shape A, the abort parked on the
-/// FOR_ITER before its body ran, so the item is not yet on the flushed header
-/// stack and must be delivered.  Returns `None` when the resume pc is not such
-/// a header, or when the matching entry carries a body-effect signal (the R1
-/// never-double guard: re-running the body would re-apply an irreversible
-/// mutation).  Read-only — the caller drops the stash via
-/// [`fbw_foriter_inflight_clear`] only after the flush commits, so a declined
-/// flush leaves the in-flight items intact for the legacy deliver.
-pub fn fbw_foriter_inflight_take_for_resume(
-    frame: usize,
-    resume_py_pc: usize,
-) -> Option<(pyre_object::PyObjectRef, usize)> {
-    let body_pc = foriter_body_pc_at(frame, resume_py_pc)?;
-    FBW_FORITER_INFLIGHT.with(|c| {
-        let stack = c.borrow();
-        let at = stack.iter().position(|e| {
-            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
-        })?;
-        // R1 never-double guard (cross-checks #33): an irreversible body effect
-        // committed since this consume means re-running the body on delivery
-        // would double it — refuse delivery.  A body-COMPLETED entry (the walk
-        // re-reached the consume, so this item's body already ran) must never
-        // be delivered either — that is the header-flush-without-delivery
-        // shape ([`fbw_foriter_inflight_completed_at_resume`]).  Also refuse if
-        // either journal is non-empty or an unjournaled effect stands. Unlike
-        // legacy replay delivery, this branch adopts the walk's end state, so
-        // recorded-but-unexecuted residual work also makes it unsafe to flush.
-        if stack[at].body_effect_since_consume
-            || stack[at].body_completed
-            || fbw_store_journal_len() != 0
-            || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
-            || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
-            || fbw_has_unjournaled_effect()
-        {
-            return None;
-        }
-        Some((stack[at].item, body_pc))
-    })
-}
-
-/// #493 selector for the header-flush-without-delivery shape: `resume_py_pc`
-/// is a FOR_ITER header whose in-flight entry is body-COMPLETED — the abort
-/// fired during the NEXT consume attempt (a kept-stack guard on the FOR_ITER
-/// arms after the `for_iter_next` residual), so the consumed item's body
-/// already ran during the walk.  The walk end state at the header is then the
-/// complete post-body state: the flush adopts it WITHOUT delivering the item
-/// and the interpreter re-attempts the consume against the advanced iterator.
-/// Refuses when an effect committed since the consume (re-attempting the
-/// consume could re-apply the failed attempt's effect) — same signals as the
-/// delivery selector above.
-pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usize) -> bool {
-    let Some(body_pc) = foriter_body_pc_at(frame, resume_py_pc) else {
-        return false;
-    };
-    FBW_FORITER_INFLIGHT.with(|c| {
-        let stack = c.borrow();
-        let Some(at) = stack.iter().position(|e| {
-            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
-        }) else {
-            return false;
-        };
-        stack[at].body_completed
-            && !stack[at].body_effect_since_consume
-            && fbw_store_journal_len() == 0
-            && FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) == 0
-            && FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) == 0
-            && !fbw_has_unjournaled_effect()
-    })
 }
 
 /// Whether a body effect committed since the most-recent in-flight FOR_ITER
@@ -3716,52 +3580,10 @@ pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
 }
 
-/// Latch the resume coordinate + operand-stack mirror for an
-/// `ABORT_FORCE_QUASIIMMUT` abort (see [`FBW_QMUT_ABORT_STACK`]).
-pub(crate) fn fbw_qmut_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
-    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = Some((py_pc, stack)));
-}
-
-/// Take the latch above.  `None` when the abort could not offer a mirror (a
-/// sub-walk, a bridge walk, or an invalidated mirror), which leaves the flush
-/// leg to decline and the legacy replay to stand.
-pub(crate) fn fbw_qmut_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
-    FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take())
-}
-
-/// Preserve the complete MIFrame-equivalent operand stack for a kept-stack
-/// branch abort.  The caller has already proved the mirror valid and trims it
-/// to the depth on entry to `py_pc`.
-pub(crate) fn fbw_branch_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
-    FBW_BRANCH_ABORT_STACK.with(|c| {
-        let mut slot = c.borrow_mut();
-        if slot.is_none() {
-            *slot = Some((py_pc, stack));
-        }
-    });
-}
-
-/// Consume the kept-stack branch-abort carrier above.
-pub(crate) fn fbw_branch_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
-    FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take())
-}
-
 /// Record the executed-effect odometer as the walk enters Python opcode
 /// `py_pc` (see [`FBW_OPCODE_ENTRY_EFFECTS`]).
 pub(crate) fn fbw_note_opcode_entry_effects(py_pc: usize) {
     FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(Some((py_pc, fbw_executed_effect_count()))));
-}
-
-/// The odometer sampled on entry to `py_pc`, for a leg that resumes the
-/// interpreter there.  `None` — no sample, or one taken at a different opcode —
-/// leaves the rewind unproven, which [`walk_end_resume_provable`] declines.
-///
-/// [`walk_end_resume_provable`]: crate::trace::walk_end_resume_provable
-pub(crate) fn fbw_opcode_entry_effects_at(py_pc: usize) -> Option<usize> {
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| match c.get() {
-        Some((sampled_py_pc, effects)) if sampled_py_pc == py_pc => Some(effects),
-        _ => None,
-    })
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).

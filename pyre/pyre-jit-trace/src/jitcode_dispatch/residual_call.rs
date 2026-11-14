@@ -352,32 +352,13 @@ fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym
     false
 }
 
-/// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
-/// pc.  They differ in exactly the way the walk-end commit contract cares
-/// about, so the epilogue cannot classify the leg without being told.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum EscapeResumeKind {
-    /// The latched mid-expression operand stack resolved.  The resume pc still
-    /// re-runs the escaping opcode — both flushes take the same `py_pc` and the
-    /// same `last_instr = py_pc - 1` — but this path is gated:
-    /// [`escape_opcode_window_clean`] ran at the residual before the latch.
-    Exact,
-    /// The latch did not resolve and the flush fell back to the merge-point
-    /// state.  Same resume pc, but NO gate ran on this path at any point.
-    RerunsOpcode,
-}
-
 thread_local! {
-    static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, Option<usize>)>> =
+    static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
-        const { std::cell::RefCell::new(None) };
-    /// Step-0 attribution probe: classification of the most recent matched
-    /// escape, read at the force site to attribute the token clear (and hence
-    /// the abort) to the portal or the published-callee disjunct.
+    /// Classification of the most recent matched escape, read at the force
+    /// site to attribute the token clear (and hence the abort) to the portal
+    /// or the published-callee disjunct.
     static LAST_ESCAPE_WAS_CALLEE_ONLY: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-    pub(crate) static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
     /// The concrete frame a residual forced that the escape flush did NOT
     /// write: an inline callee published on the execution context, matched by
@@ -397,13 +378,12 @@ thread_local! {
     /// `reset_unflushed_escaped_callee` must not drop the outer record.
     pub(crate) static UNFLUSHED_ESCAPED_CALLEE: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
-    /// post-call commit withdrawal can put the live frame back.  The legacy
-    /// replay's correctness contract is "the live frame still holds pre-walk
-    /// state"; a committed force-flush breaks it, so the replay leg restores
-    /// this before re-entering.  Which leg runs is only known at walk end, so
-    /// the withdrawal arms `ESCAPE_FLUSH_UNDO_PENDING` and the epilogue
-    /// decides.
+    /// Pre-force frame snapshot so a legacy replay can put the live frame
+    /// back.  `virtualizable.py force_now` on TOKEN_TRACING_RESCALL writes
+    /// nothing, so this capture is identity for the stack and scalars; it
+    /// still arms [`LiveLastInstrGuard`] to keep the executing `last_instr`
+    /// after the residual, and the walk-end epilogue restores it only on the
+    /// replay leg (`mark_escape_flush_undo_pending`).
     ///
     /// Nested `compile_and_run_once` parks the armed capture on
     /// `ParkedWalkTls`; the inner walk's `discard_escape_flush_undo` then
@@ -415,30 +395,6 @@ thread_local! {
     /// `mark_escape_flush_undo_pending`).  Parked with the capture above.
     pub(crate) static ESCAPE_FLUSH_UNDO_PENDING: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
-    /// for the Python opcode currently being walked.  Re-executing a committed
-    /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
-    /// EARLIER residual of the same opcode could have done something — not just
-    /// the escaping one (rich-compare fallback chains run two residuals in one
-    /// opcode).
-    ///
-    /// The verdict comes from each residual's DECLARED effect class
-    /// ([`escape_opcode_window_note`], `EffectInfo::check_is_elidable` or
-    /// `LoopInvariant`), not from counting what happened.  That is the axis
-    /// upstream decides on: the licence to place a resume pc behind an executed
-    /// residual is the codewriter-time `EF_ELIDABLE_CANNOT_RAISE` registration
-    /// (`jtransform.py:620-630`), and upstream's only op counters are
-    /// profiling-only and gate nothing (`jitprof.py`, `count_ops` is
-    /// `pass`).
-    ///
-    /// Reset at walk start.  Residuals are the only executor that can put
-    /// something irreversible between two points of ONE opcode: the eager
-    /// journaled folds (`fbw_store_journal_push` / `fbw_list_journal_push_append` /
-    /// `fbw_cell_store_journal_push`) each terminate their own opcode
-    /// (STORE_SUBSCR, the `append` CALL, STORE_NAME/STORE_GLOBAL), so no
-    /// residual of the same opcode instance can follow one.
-    pub(crate) static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, bool)>> =
-        const { std::cell::Cell::new(None) };
     /// Force-time image of the single live tracing frame.  The
     /// color-indexed concrete banks cease to exist when dispatch unwinds, so
     /// the MIFrame must be assembled beside `tracing_after_residual_call` and
@@ -469,6 +425,23 @@ pub(crate) fn current_inline_concrete_frame() -> usize {
             .as_ref()
             .map_or(0, |owner_root| owner_root.get().0)
     })
+}
+
+/// Concrete executing Python pc from the portal virtualizable's `last_instr`
+/// static. `pyopcode.py dispatch_bytecode` writes
+/// `self.last_instr = intmask(next_instr)` before every opcode;
+/// `pyjitpl.py _opimpl_setfield_vable` records that store into
+/// `virtualizable_boxes`.
+pub(crate) fn portal_vable_last_instr_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<u32> {
+    let op = ctx
+        .trace_ctx
+        .virtualizable_box_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)?;
+    match ctx.trace_ctx.concrete_of_opref(op) {
+        Some(majit_ir::Value::Int(v)) if (0..=i64::from(u32::MAX)).contains(&v) => Some(v as u32),
+        _ => None,
+    }
 }
 
 pub(crate) struct EscapeFlushUndo {
@@ -579,7 +552,7 @@ impl PinnedConcretes {
 ///
 /// The call collects. Afterwards the nursery word is poison, and
 /// `gc_current_object_address` cannot recover the new address. Drop
-/// publishes the forwarded word back onto the snapshot so the next
+/// publishes the forwarded word onto `live_vable_frame_addr` so the next
 /// residual does not start from the abandoned address.
 struct LiveFrameRoot<Sym: WalkSym> {
     root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
@@ -607,39 +580,31 @@ impl<Sym: WalkSym> Drop for LiveFrameRoot<Sym> {
     }
 }
 
-/// The operand stack an abort image publishes, resolved from the walker's
-/// OpRef mirror while the walk's concrete side tables are still live.
+/// The operand stack an abort image publishes, resolved from the
+/// virtualizable's boxes at the latched jitcode pc.
 ///
-/// The detached tracing snapshot cannot supply it.  A root walk's
-/// `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy, so that
-/// copy's `locals_cells_stack_w` still holds the stack from before the walk
-/// ran. Walk-owned frames are stored through `own_frame_array_store_target`;
-/// the portal live frame is flushed only at nested-trace / residual
-/// boundaries. This abort image still comes from the walker mirror because
-/// the snapshot is not that live frame. The locals half has no such gap:
-/// `write_back_outer_locals` publishes those from the virtualizable shadow.
+/// `synchronize_virtualizable` (`pyjitpl.py`, `virtualizable.py`
+/// `write_box_at`) writes `virtualizable_boxes` to the frame before
+/// `run_blackhole_interp_to_cancel_tracing` → `convert_and_run_from_pyjitpl`
+/// / `_copy_data_from_miframe` (`blackhole.py`). Slots the opcode already
+/// popped are gone; nothing reconstructs the stack as of opcode entry.
+/// Locals come from `write_back_outer_locals` of the same shadow.
 pub(crate) struct MirrorStackImage {
-    /// Python pc of the opcode the walk stopped inside.  Pairs with the slots:
-    /// the mirror reflects the depth ON ENTRY to this opcode, which is the
-    /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
+    /// Python pc of the opcode the walk stopped inside. Diagnostic only;
+    /// publish uses [`Self::last_instr`] from the virtualizable.
     pub(crate) py_pc: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
     /// The virtualizable's `valuestackdepth` (absolute) at the latch.  A walk
     /// that stops inside an opcode may already have run that opcode's
     /// `emit_popvalue_ref!`; the MIFrame resumes past it, so the frame must
     /// carry the popped depth, as `synchronize_virtualizable` leaves it after
-    /// every `opimpl_setfield_vable`.  `None` publishes the entry depth.
+    /// every `opimpl_setfield_vable`.
     pub(crate) valuestackdepth: Option<usize>,
     /// The virtualizable's `last_instr` at the latch: the opcode's own pc, or
     /// one of its cache words once it has advanced over them.  The walk stops
     /// inside the opcode after those stores and the MIFrame resumes past them,
-    /// so a callee reading `f_lasti` must see them.  `None` publishes the entry
-    /// coordinate.
+    /// so a callee reading `f_lasti` must see them.
     pub(crate) last_instr: Option<isize>,
-    /// True when `slots` are the virtualizable's live operand stack at the
-    /// latched jitcode pc (`valuestackdepth == nlocals + slots.len()`).  False
-    /// when they are the on-entry stack of the opcode at `py_pc`.
-    pub(crate) synchronized: bool,
 }
 
 impl MirrorStackImage {
@@ -647,22 +612,12 @@ impl MirrorStackImage {
         &self,
         live_frame: usize,
     ) -> Option<crate::state::CapturedFrameStack> {
-        if self.synchronized {
-            crate::state::capture_frame_stack_from_vable(
-                live_frame,
-                &self.slots,
-                self.valuestackdepth?,
-                self.last_instr?,
-            )
-        } else {
-            crate::state::capture_frame_stack_from_mirror(
-                live_frame,
-                self.py_pc,
-                &self.slots,
-                self.valuestackdepth,
-                self.last_instr,
-            )
-        }
+        crate::state::capture_frame_stack_from_vable(
+            live_frame,
+            &self.slots,
+            self.valuestackdepth?,
+            self.last_instr?,
+        )
     }
 }
 
@@ -726,14 +681,14 @@ pub(crate) fn take_single_frame_blackhole() -> Option<LatchedSingleFrameBlackhol
 }
 
 /// Read-only counterpart of the single-frame adopter's operand-stack gate, for
-/// the legs that publish from the walker mirror instead of from the tracing
-/// snapshot's slot array.
+/// the legs that publish from the virtualizable boxes instead of from the
+/// tracing snapshot's slot array.
 ///
 /// [`latch_abort_blackhole`] proves every capability the snapshot-array source
-/// needs, ending at `can_publish_frame_stack`. The mirror carries a condition of
-/// its own: `capture_frame_stack_from_mirror` declines when the recorded height
-/// disagrees with the forward analysis at the mirror's `py_pc`, rather than
-/// publish a shifted stack. A leg whose adopt treats a decline as an assert has
+/// needs, ending at `can_publish_frame_stack`. The vable image carries a
+/// condition of its own: `capture_frame_stack_from_vable` declines when
+/// `valuestackdepth` is not `nlocals + slots.len()`, rather than publish a
+/// shifted stack. A leg whose adopt treats a decline as an assert has
 /// to answer that here, before it commits to the abort.
 pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
     FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
@@ -1085,81 +1040,14 @@ macro_rules! latchdbg {
     };
 }
 
-/// Snapshot the live meta-interpreter framestack for an abort at `resume_pc`.
-/// RPython's `run_blackhole_interp_to_cancel_tracing` routes every
-/// `SwitchToBlackhole` through `convert_and_run_from_pyjitpl`, which copies the
-/// current frame and all paused callers at their current program counters.
-/// [`WalkContext`] and [`WalkSession::framestack`] own the corresponding banks.
-///
-/// The caller must supply the next instruction for a completed step, or the
-/// stopped instruction for a capability gap.  Propagation through enclosing
-/// `walk()` calls must preserve the first image; otherwise the caller would
-/// replace the innermost frame where execution stopped.
-///
-/// Return `false` without publishing a partial image when any live value is
-/// unresolved.  A zero-effect walk may then use the legacy entry replay;
-/// an effectful walk must keep recording until a complete image can be built,
-/// because replaying it would apply the effect twice.
-/// Resolve `WalkFrameStateData::vstack_boxes` — the walker's counterpart of
-/// `MIFrame.registers_r` snapshotted by `get_list_of_active_boxes`
-/// (`pyjitpl.py`) — into the concrete operand stack an abort image publishes.
-///
-/// Same resolution [`flush_escape_state_with_latched_stack`] performs for the
-/// escape flush, and for the same reason: the walk-abort latch and the
-/// vable-escape latch both stop inside a Python opcode, where no other source
-/// describes the operand stack.  The tracing snapshot's array is not it — a
-/// root walk mirrors nothing into that frame (see [`MirrorStackImage`]).
-///
-/// A recorded concrete NULL is a REAL operand — it is `PUSH_NULL`'s
-/// `self_or_null` sentinel — so only `GcRef::NO_CONCRETE`, which is what
-/// "unavailable" looks like, rejects a slot.  Any unresolved slot declines the
-/// whole image, leaving the abort on the legacy entry replay.
-fn capture_vstack_mirror_image<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    origin: &'static str,
-) -> Option<MirrorStackImage> {
-    if !ctx.vstack_valid {
-        latchdbg!("origin={origin} mirror-invalid");
-        return None;
-    }
-    let mut slots = Vec::with_capacity(ctx.frame_state.borrow().vstack_boxes.len());
-    for &opref in ctx.frame_state.borrow().vstack_boxes.iter() {
-        match ctx.trace_ctx.concrete_of_opref(opref) {
-            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
-                slots.push(value.as_usize() as pyre_object::PyObjectRef);
-            }
-            other => {
-                latchdbg!(
-                    "origin={origin} mirror-slot {}/{} unresolved opref={opref:?} \
-                     concrete={other:?} pypc={} boxes={:?}",
-                    slots.len(),
-                    ctx.frame_state.borrow().vstack_boxes.len(),
-                    ctx.vstack_cur_pypc,
-                    ctx.frame_state.borrow().vstack_boxes,
-                );
-                return None;
-            }
-        }
-    }
-    let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
-    Some(MirrorStackImage {
-        py_pc: ctx.vstack_cur_pypc as usize,
-        slots,
-        valuestackdepth,
-        last_instr,
-        synchronized: false,
-    })
-}
-
 /// The operand stack of the frame at the latched jitcode pc as the
 /// virtualizable holds it.  `synchronize_virtualizable` (`pyjitpl.py`) writes
 /// these boxes to the frame before `convert_and_run_from_pyjitpl` copies the
 /// registers, so slots the opcode already popped are gone and nothing is
 /// reconstructed from Python pcs.
-fn capture_vable_shadow_stack_image<Sym: WalkSym>(
+pub(crate) fn capture_vable_shadow_stack_image<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable_frame: usize,
-    py_pc: usize,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
     let (Some(valuestackdepth), Some(last_instr)) = latched_vable_scalars(ctx) else {
@@ -1192,11 +1080,13 @@ fn capture_vable_shadow_stack_image<Sym: WalkSym>(
         }
     }
     Some(MirrorStackImage {
-        py_pc,
+        // Diagnostic only (`capture_for` publishes `last_instr`). The
+        // executing coordinate is the virtualizable static
+        // `dispatch_bytecode` wrote (`_opimpl_setfield_vable`).
+        py_pc: usize::try_from(last_instr).unwrap_or(0),
         slots,
         valuestackdepth: Some(valuestackdepth),
         last_instr: Some(last_instr),
-        synchronized: true,
     })
 }
 
@@ -1224,6 +1114,40 @@ fn latched_vable_scalar_pair(ctx: &TraceCtx) -> (Option<usize>, Option<isize>) {
         vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
     let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
     (valuestackdepth, last_instr)
+}
+
+/// Live portal PyFrame `latch_abort_blackhole` validates as the
+/// virtualizable (`initialize_virtualizable` / `read_boxes`): the forwarded
+/// red frame, else `tracing_vable_frame_addr`.
+fn portal_vable_frame_for_shadow<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    let forwarded_live_root = match ctx.trace_ctx.lookup_opref_concrete(sym.frame()) {
+        Some(majit_ir::Value::Ref(value)) if value.0 != 0 => value.0,
+        _ => sym.live_vable_frame_addr(),
+    };
+    let cf_addr = sym.tracing_vable_frame_addr();
+    let root = if forwarded_live_root != 0 {
+        forwarded_live_root
+    } else {
+        cf_addr
+    };
+    (root != 0).then_some(root)
+}
+
+/// Portal red-frame register word, accepted only when it equals the live root
+/// `latch_abort_blackhole` publishes.
+fn portal_vable_frame_from_banks<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jitcode_index: i32,
+    banks: &majit_metainterp::BlackholeAbortBanks,
+) -> Option<usize> {
+    let root = portal_vable_frame_for_shadow(ctx)?;
+    let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+    let vable_frame = banks.ref_word(frame_reg as usize).unwrap_or(0) as usize;
+    (vable_frame != 0 && vable_frame == root).then_some(vable_frame)
 }
 
 /// Frame `_opimpl_setfield_vable` last wrote for the paused portal parent
@@ -1263,39 +1187,6 @@ fn stack_slots_from_vable_boxes(
                 slots.push(value.as_usize() as pyre_object::PyObjectRef);
             }
             _ => return None,
-        }
-    }
-    Some(slots)
-}
-
-fn resolve_operand_boxes<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    boxes: &[OpRef],
-    height: usize,
-    origin: &'static str,
-) -> Option<Vec<pyre_object::PyObjectRef>> {
-    if boxes.len() < height {
-        latchdbg!(
-            "origin={origin} paused-portal-mirror stack short \
-             have={} need={height}",
-            boxes.len(),
-        );
-        return None;
-    }
-    let mut slots = Vec::with_capacity(height);
-    for &opref in &boxes[..height] {
-        match ctx.trace_ctx.concrete_of_opref(opref) {
-            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
-                slots.push(value.as_usize() as pyre_object::PyObjectRef);
-            }
-            other => {
-                latchdbg!(
-                    "origin={origin} paused-portal-mirror slot {}/{height} unresolved \
-                     opref={opref:?} concrete={other:?}",
-                    slots.len(),
-                );
-                return None;
-            }
         }
     }
     Some(slots)
@@ -1358,7 +1249,9 @@ fn capture_root_vable_stack_image<Sym: WalkSym>(
             ) as usize
         }
     };
-    capture_vable_shadow_stack_image(ctx, vable_frame, resume_py_pc, origin)
+    let mut image = capture_vable_shadow_stack_image(ctx, vable_frame, origin)?;
+    image.py_pc = resume_py_pc;
+    Some(image)
 }
 
 /// Runtime `JitCode` for a translated helper at `MetaInterpStaticData.jitcodes[index]`.
@@ -1437,7 +1330,6 @@ pub(crate) fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
         slots,
         valuestackdepth: Some(valuestackdepth),
         last_instr,
-        synchronized: true,
     })
 }
 
@@ -1725,23 +1617,16 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             return false;
         }
         // Keep the per-frame red identity seeded by `frame_box`.  The
-        // authoritative walk executed against `snapshot_for_tracing`, but the
-        // adopter validates this identity and publishes that snapshot's locals
-        // to the matching live frame before driving the blackhole. Replacing
-        // the register with the snapshot address would collapse those two
-        // identities and fail the live-root check.
+        // walk traces the live virtualizable (`initialize_virtualizable` /
+        // `read_boxes`); the adopter validates this identity before
+        // driving the blackhole.
         // `ctx` IS the root walk on this arm, so the virtualizable's boxes describe
         // the very frame whose operand stack the adopter publishes.  The MIFrame
         // resumes at a jitcode pc that may sit inside a Python opcode, after that
         // opcode's pops; `synchronize_virtualizable` (`pyjitpl.py`) hands the
         // blackhole the virtualizable as it stands there, so the stack comes from
         // those boxes, not from an opcode-entry reconstruction.
-        let mirror_stack = capture_vable_shadow_stack_image(
-            ctx,
-            vable_frame,
-            ctx.vstack_cur_pypc as usize,
-            origin,
-        );
+        let mirror_stack = capture_vable_shadow_stack_image(ctx, vable_frame, origin);
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[latch-accept] origin={origin} single-frame pc={} jitcode={:?} index={:?}",
@@ -1796,14 +1681,14 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // The MIFrame stack is the convert image (`pyjitpl.py`
         // `run_blackhole_interp_to_cancel_tracing`, `blackhole.py`
         // `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`).
-        // The mirror is only the adopter's live-frame operand-stack publish
-        // (`capture_frame_stack_from_mirror`). A reconstructed bridge-root
-        // parent has no CALL offset (`call_jitcode_pc: None`), so the mirror
+        // Frame 0's operand stack is the adopter's live-frame publish
+        // (`capture_frame_stack_from_vable`). A reconstructed bridge-root
+        // parent has no CALL offset (`call_jitcode_pc: None`), so the image
         // is missing; that is not an incomplete MIFrame.
         // `build_multi_frame_miframe` / `multi_frame_blackhole_preflight`
         // already returned above. Latch the stack anyway (same as the
         // escape-flush arm). Adopt of WalkAbort / VableEscape / TraceTooLong
-        // declines and relatches when the mirror is missing; convert still
+        // declines and relatches when the image is missing; convert still
         // copies the walk pcs.
         let mirror_stack = if ctx.session.borrow().at_portal() {
             capture_paused_portal_mirror_stack(ctx, origin)
@@ -1871,8 +1756,11 @@ pub(crate) fn helper_too_long_result<Sym: WalkSym>(
 /// `opimpl_jit_force_quasi_immutable`; `convert_and_run_from_pyjitpl` therefore
 /// resumes after the qmut marker.  Pyre synthesizes that marker immediately
 /// before the residual operation it protects, so `resume_pc` is the same
-/// next-to-run position.  Inline aborts capture the whole framestack; root
-/// aborts retain the operand stack for `flush_qmut_abort_state`.
+/// next-to-run position.  Inline aborts capture the whole framestack; a root
+/// walk latches the portal MIFrame at this jitcode pc
+/// (`latch_abort_blackhole`). `convert_and_run_from_pyjitpl` (`blackhole.py`)
+/// resumes that image; there is no opcode-entry stack and no Python-opcode
+/// re-dispatch.
 pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -1892,11 +1780,12 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
                 super::inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
             let _ = finish_helper_abort_latch(ctx.session, splice_ok);
         }
-    } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(
-            ctx.vstack_cur_pypc as usize,
-            ctx.frame_state.borrow().vstack_boxes.clone(),
-        );
+    } else {
+        // Root walk, including a bridge: `opimpl_jit_force_quasi_immutable`
+        // raises `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` and
+        // `convert_and_run_from_pyjitpl` resumes this MIFrame at the jitcode
+        // pc already advanced past the marker.
+        let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
     }
     // The session flag survives recovered sub-walks; always overwrite it at
     // the raise site so a later root-frame abort cannot inherit `true`.
@@ -2898,10 +2787,11 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
 /// Whether the operator-tail resume image can be captured at all.
 ///
 /// `capture_resumedata` (`pyjitpl.py`) requires the live framestack, the
-/// vstack mirror, and every paused parent to be copyable before a call is
-/// entered. The same gates are what [`latch_operator_tail_return`] would
-/// refuse after the dunder ran; testing them first lets the walk take the
-/// ordinary residual instead of replaying an effectful body.
+/// virtualizable operand stack, and every paused parent to be copyable
+/// before a call is entered. The same gates are what
+/// [`latch_operator_tail_return`] would refuse after the dunder ran;
+/// testing them first lets the walk take the ordinary residual instead of
+/// replaying an effectful body.
 pub(crate) fn operator_tail_resume_image_capturable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     tail: crate::operator_continuation::OperatorTail,
@@ -2968,9 +2858,10 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
     receiver: Option<OpRef>,
 ) -> Option<LatchedMultiFrameBlackhole> {
     let origin = "operator-tail-return";
-    // `try_adopt_multi_frame_blackhole` requires the mirror for WalkAbort.
-    // Capture it first so a missing image publishes nothing, rather than a
-    // latch whose adopt then declines into entry replay of the dunder.
+    // `try_adopt_multi_frame_blackhole` requires the operand-stack image
+    // for WalkAbort. Capture the virtualizable's boxes first so a missing
+    // image publishes nothing, rather than a latch whose adopt then
+    // declines into entry replay of the dunder.
     let mirror_stack = if ctx.fbw_mode.inline_subwalk {
         let Some(mirror_stack) = capture_root_vable_stack_image(ctx, origin) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
@@ -2978,8 +2869,10 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
         };
         mirror_stack
     } else {
-        let Some(mirror_stack) = capture_vstack_mirror_image(ctx, origin) else {
-            latchdbg!("origin={origin} mirror");
+        let Some(mirror_stack) = portal_vable_frame_for_shadow(ctx)
+            .and_then(|frame| capture_vable_shadow_stack_image(ctx, frame, origin))
+        else {
+            latchdbg!("origin={origin} shadow");
             return None;
         };
         mirror_stack
@@ -3182,8 +3075,10 @@ fn latch_assembler_continuation_escape<Sym: WalkSym>(
         };
         mirror_stack
     } else {
-        let Some(mirror_stack) = capture_vstack_mirror_image(ctx, origin) else {
-            latchdbg!("origin={origin} mirror");
+        let Some(mirror_stack) = portal_vable_frame_for_shadow(ctx)
+            .and_then(|frame| capture_vable_shadow_stack_image(ctx, frame, origin))
+        else {
+            latchdbg!("origin={origin} shadow");
             return false;
         };
         mirror_stack
@@ -3647,10 +3542,6 @@ pub(super) struct PublishedLastInstr {
     pub(super) frame: usize,
     /// What the guard writes back when the residual returns.
     pub(super) saved: isize,
-    /// An escape flush committed `saved` as the frame's resume coordinate
-    /// ([`defer_escape_resume_last_instr`]), so the guard writes it back even
-    /// though the frame is heap-authoritative.
-    pub(super) resume_flushed: bool,
 }
 
 /// The four inline-frame slots of the attempt being parked
@@ -3699,8 +3590,7 @@ pub(crate) fn unflushed_escaped_callee_cell_ptr() -> *const std::cell::Cell<usiz
     UNFLUSHED_ESCAPED_CALLEE.with(|c| c as *const _)
 }
 
-pub(crate) fn active_frame_escape_cell_ptr()
--> *const std::cell::Cell<Option<(usize, Option<usize>)>> {
+pub(crate) fn active_frame_escape_cell_ptr() -> *const std::cell::Cell<Option<usize>> {
     ACTIVE_FRAME_ESCAPE.with(|c| c as *const _)
 }
 
@@ -3764,7 +3654,7 @@ pub(crate) fn walk_live_inline_frame_addr_cells(
     published_shadow: *const std::cell::RefCell<Option<PublishedInlineShadow>>,
     published_last_instr: *const std::cell::Cell<Option<PublishedLastInstr>>,
     unflushed_escaped_callee: *const std::cell::Cell<usize>,
-    active_frame_escape: *const std::cell::Cell<Option<(usize, Option<usize>)>>,
+    active_frame_escape: *const std::cell::Cell<Option<usize>>,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     // SAFETY: the owner is synchronously collecting or STW-quiesced; each
@@ -3777,7 +3667,7 @@ pub(crate) fn walk_live_inline_frame_addr_cells(
     walk_published_last_instr(last_instr, visitor);
     let unflushed = unsafe { &mut *(*unflushed_escaped_callee).as_ptr() };
     visit_raw_gc_addr(unflushed, visitor);
-    if let Some((frame, _)) = unsafe { &mut *(*active_frame_escape).as_ptr() }.as_mut() {
+    if let Some(frame) = unsafe { &mut *(*active_frame_escape).as_ptr() }.as_mut() {
         visit_raw_gc_addr(frame, visitor);
     }
 }
@@ -3832,17 +3722,13 @@ struct LiveLastInstrGuard {
 impl LiveLastInstrGuard {
     /// Publishes onto the frame `py_pc` indexes.  Inside an inline sub-walk
     /// that is the callee's concrete frame, NOT the walk's virtualizable: a
-    /// sub-walk's pc is in the callee's code (the same reason `escape_stack`
-    /// declines to latch a sub-walk's mirror), and writing it onto the outer
+    /// sub-walk's pc is in the callee's code, and writing it onto the outer
     /// frame strands that frame's replay on a stack depth it never had.
     fn enter(live_frame: usize, py_pc: u32, inline_py_pc: Option<u32>) -> Option<Self> {
         let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         // The frame and the pc have to name the same code.  Retargeting the
-        // frame to the callee while keeping the outer walk's `vstack_cur_pypc`
-        // publishes a pc from the CALLER's code onto the callee's frame — and
-        // for a sub-walk that mirror is never advanced (`vstack_valid` is
-        // false), so the published value is a constant 0 and a frame reader
-        // inside the callee reports the function's first line.
+        // frame to the callee while keeping the caller's executing pc
+        // publishes a pc from the CALLER's code onto the callee's frame.
         let (frame, py_pc) = match (inline.is_null(), inline_py_pc) {
             (false, Some(callee_pc)) => (inline, callee_pc),
             (false, None) => (inline, py_pc),
@@ -3869,7 +3755,6 @@ impl LiveLastInstrGuard {
             slot.replace(Some(PublishedLastInstr {
                 frame: frame as usize,
                 saved,
-                resume_flushed: false,
             }))
         });
         Some(Self {
@@ -3883,30 +3768,21 @@ impl LiveLastInstrGuard {
 
 impl Drop for LiveLastInstrGuard {
     fn drop(&mut self) {
-        let (restore, resume_flushed) = PUBLISHED_LAST_INSTR.with(|slot| {
+        let restore = PUBLISHED_LAST_INSTR.with(|slot| {
             let current = slot.replace(self.prev);
             current
                 .filter(|published| published.frame == self.frame as usize)
-                .map_or((self.saved, false), |published| {
-                    (published.saved, published.resume_flushed)
-                })
+                .map_or(self.saved, |published| published.saved)
         });
-        // A flush that committed onto this frame chose the resume coordinate,
-        // and the guard writes it now that the residual has returned
-        // ([`defer_escape_resume_last_instr`]).  Its undo capture holds the
-        // value this guard displaced (see [`capture_escape_flush_undo`]), so a
-        // later commit withdrawal still restores the resume pc rather than the
-        // executing one.
-        // The test is "did an escape happen on THIS frame", not "did a flush
-        // write a resume pc".  Both legs arm the capture and both leave the
-        // frame heap-authoritative at the published executing coordinate, so
-        // narrowing this to the committing leg restores the PRE-call coordinate
-        // on the locals-only escapes — the withdrawn-too-early defect
-        // `getframe_caller_resume_coord_two_call_sites` measures and prints.
+        // An armed [`capture_escape_flush_undo`] means this residual forced
+        // the portal.  `virtualizable.py force_now` on TOKEN_TRACING_RESCALL
+        // writes nothing, so the executing `last_instr` the guard published
+        // stays; restoring the pre-call resume pc would move the live frame
+        // off the jitcode-pc image `write_box_at` already stored.
         let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
-        if !flushed || resume_flushed {
+        if !flushed {
             let frame = self
                 .frame_root
                 .as_ref()
@@ -4178,20 +4054,14 @@ impl Drop for ResidualFrameChainGuard {
 }
 
 struct ActiveFrameEscapeGuard {
-    prev: Option<(usize, Option<usize>)>,
-    prev_stack: Option<Vec<OpRef>>,
+    prev: Option<usize>,
 }
 
 impl ActiveFrameEscapeGuard {
-    fn enter(frame: usize, py_pc: Option<usize>, stack: Option<Vec<OpRef>>) -> Self {
-        let current = (frame != 0).then_some((frame, py_pc));
-        COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
-        let latched = if current.is_some() { stack } else { None };
-        let prev_stack = ACTIVE_FRAME_ESCAPE_STACK
-            .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), latched));
+    fn enter(frame: usize) -> Self {
+        let current = (frame != 0).then_some(frame);
         Self {
             prev: ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)),
-            prev_stack,
         }
     }
 }
@@ -4199,7 +4069,6 @@ impl ActiveFrameEscapeGuard {
 impl Drop for ActiveFrameEscapeGuard {
     fn drop(&mut self) {
         ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.prev));
-        ACTIVE_FRAME_ESCAPE_STACK.with(|slot| *slot.borrow_mut() = self.prev_stack.take());
     }
 }
 
@@ -4214,6 +4083,17 @@ pub fn attribute_last_escape_force() {
             fbw_diag::ESCAPE_FORCE_BY_PORTAL
         });
     }
+}
+
+/// `pyjitpl.py vable_after_residual_call`: after a residual that may force,
+/// `vinfo.tracing_after_residual_call(virtualizable_boxes[-1])`. A cleared
+/// token is `SwitchToBlackhole(Counters.ABORT_ESCAPE, raising_exception=True)`.
+fn vable_after_residual_call(vable_obj: usize) -> bool {
+    if vable_obj == 0 {
+        return false;
+    }
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    unsafe { info.tracing_after_residual_call(vable_obj as *mut u8) }
 }
 
 /// The frame [`flush_active_frame_escape`] forced without writing, if any.
@@ -4339,9 +4219,9 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
 /// rather than resuming on the unwritten array (`UNFLUSHED_ESCAPED_CALLEE`).
 /// That decline is not a trace-kind test.
 ///
-/// Any other frame a residual callee inspects returns false.  The walk-end
-/// resume pc is committed only when the portal flush succeeds; a directly
-/// matched portal frame that cannot flush still escaped and must be forced.
+/// Any other frame a residual callee inspects returns false.  A matched
+/// portal frame escaped and must be forced; `virtualizable.py force_now` on
+/// TOKEN_TRACING_RESCALL writes nothing.
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     // `pyjitpl.py vable_after_residual_call` aborts only on the portal
     // virtualizable (`virtualizable_boxes[-1]`). An inlined frame is a
@@ -4360,7 +4240,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
         !published.is_null() && std::ptr::eq(published, frame)
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
-        let Some((expected, portal_py_pc)) = slot.get() else {
+        let Some(expected) = slot.get() else {
             return false;
         };
         let escaped_portal = expected == frame as usize;
@@ -4388,93 +4268,20 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_ONLY);
             }
             LAST_ESCAPE_WAS_CALLEE_ONLY.with(|c| c.set(Some(false)));
-            // Force #2+ within this residual (`enter` resets the committed pc
-            // per residual): the live frame is already heap-authoritative
-            // from the first flush, and the callee may have legitimately
-            // mutated it since (an `f_locals` write-through) — re-flushing
-            // would overwrite that mutation with the same walk-end values.
-            // The token force is a no-op then too (`force_now` on
-            // TOKEN_NONE, virtualizable.py).
-            if COMMITTED_FRAME_ESCAPE_PC
-                .with(|committed| committed.get())
-                .is_some()
-            {
-                return true;
-            }
-            capture_escape_flush_undo(expected);
-            let executing_last_instr = PUBLISHED_LAST_INSTR
-                .with(|slot| slot.get())
-                .filter(|published| published.frame == expected)
-                .map(|_| unsafe { (*(expected as *const pyre_interpreter::PyFrame)).last_instr });
-            let (latched, flushed) = if let Some(py_pc) = portal_py_pc {
-                let latched = flush_escape_state_with_latched_stack(ctx, expected, py_pc);
-                let flushed =
-                    latched || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
-                (latched, flushed)
-            } else {
-                (false, false)
-            };
-            // Reachability probe: the latched-stack path is gated on
-            // `escape_opcode_window_clean`, the plain fallback is not, and this
-            // resume pc re-runs the whole escaping opcode.
-            if let Some(py_pc) = portal_py_pc
-                && !latched
-                && flushed
-            {
-                use crate::trace::fbw_diag;
-                fbw_diag::bump(fbw_diag::ESCAPE_PLAIN_FALLBACK);
-                if !escape_opcode_window_clean(py_pc) {
-                    fbw_diag::bump(fbw_diag::ESCAPE_PLAIN_FALLBACK_UNCLEAN);
-                }
-            }
-            if flushed {
-                record_escape_flush_image(expected);
-                if let Some(executing) = executing_last_instr {
-                    defer_escape_resume_last_instr(expected, executing);
-                }
-                let kind = if latched {
-                    EscapeResumeKind::Exact
-                } else {
-                    EscapeResumeKind::RerunsOpcode
-                };
-                if let Some(py_pc) = portal_py_pc {
-                    COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
-                }
-            } else if crate::state::flush_locals_region_to_frame(ctx, expected) {
-                record_escape_flush_image(expected);
-                // The locals write claims no resume pc (`flush_locals_region_to_frame`
-                // leaves `last_instr` alone) but `LiveLastInstrGuard` still keeps
-                // the executing opcode, because this capture is armed. A walk
-                // that later commits a resume overwrites that coordinate. One
-                // that does not must get the pre-flush frame back: the
-                // executing opcode of a `raise` inside `for` is followed by
-                // `END_FOR`, and the interpreter pops an iterator the entry
-                // stack does not hold. The epilogue restores only when no
-                // resume-past leg committed (`take_escape_flush_undo_pending`).
-                mark_escape_flush_undo_pending();
-            } else {
-                // All-or-nothing decline: nothing was written, nothing to undo.
-                discard_escape_flush_undo();
-            }
-            // A declined full flush still escaped the virtualizable, so the
-            // locals region is written anyway (`virtualizable.py write_boxes
-            // write_boxes` has no decline) — otherwise the callee reads an
-            // array of nulls.  That write claims no resume pc.  The capture
-            // stays armed and `mark_escape_flush_undo_pending` asks the
-            // walk-end epilogue to put the pre-flush frame back when no
-            // resume-past leg commits.  Restoring here, inside the residual,
-            // would rewind `last_instr` before a later `sys._getframe` read
-            // in the same walk (`getframe_caller_resume_coord_two_call_sites`).
+            // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL writes
+            // nothing: `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable`
+            // already `synchronize_virtualizable_at` → `write_box_at`, so the
+            // live frame already holds the stack and scalars at this jitcode
+            // pc.  Returning true is the matched-guard report
+            // `tracing_after_residual_call` / `pyjitpl.py
+            // vable_after_residual_call` use to clear the token and raise
+            // `SwitchToBlackhole(ABORT_ESCAPE)`.
             //
-            // Upstream reports the escape from the vable token state alone,
-            // independent of any resume-image write.  See
-            // `virtualizable.py` (`tracing_after_residual_call` /
-            // `force_now`), `virtualizable.py` (token states),
-            // `virtualref.py` (vref'd inlined callee), and
-            // `pyjitpl.py vable_after_residual_call` (unconditional ABORT_ESCAPE).  Runtime
-            // forcing also resets the token before writing fields
-            // (`resume.py:1405-1408`).  Therefore a matched guard reports the
-            // escape even when the flush declined.
+            // The capture arms [`LiveLastInstrGuard`] to keep the executing
+            // `last_instr` after the residual (the guard would otherwise
+            // restore the pre-call resume pc) and gives the walk-end replay
+            // leg a restore image.  It does not rewrite the live frame.
+            capture_escape_flush_undo(expected);
             return true;
         }
         false
@@ -4735,62 +4542,6 @@ pub(crate) fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     }
 }
 
-/// Record the locals region as the flush just left it, for the frame the
-/// pending capture holds.  Runs after the flush and before the residual's
-/// user Python can touch the region, so any later difference from this image
-/// is that user code's own write.  A second flush for the same frame supersedes
-/// the image: the restore must undo the flush that is actually standing.
-fn record_escape_flush_image(frame: usize) {
-    ESCAPE_FLUSH_UNDO.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(undo) = slot.as_mut() else {
-            return;
-        };
-        if undo.frame != frame && undo.current_frame() != frame {
-            return;
-        }
-        // The flush boxes Int/Float locals and can collect. The captured
-        // address is not reloaded: the nursery stub is gone once the
-        // collection finishes. Read the owner root instead.
-        let frame_now = undo.current_frame();
-        let pf = unsafe { &*(frame_now as *const pyre_interpreter::PyFrame) };
-        undo.flush_image = locals_w!(pf).as_slice().to_vec();
-    });
-}
-
-/// Hand the resume coordinate an escape flush wrote to the
-/// [`LiveLastInstrGuard`] on `frame`, and put the executing pc back for the
-/// rest of the residual.
-///
-/// The flush stores `resume_py_pc - 1` so that `next_instr()` re-enters the
-/// escaping opcode, but the residual that forced the frame is still running
-/// inside that opcode, and a frame reader there (`f_lasti`, `f_lineno`) has to
-/// see the opcode itself.  `virtualizable.py force_now` leaves a tracing-time
-/// virtualizable's fields as they are ("The values in the virtualizable are
-/// always correct during tracing") and only resets `vable_token`, so the
-/// callee keeps reading what the dispatch loop's `last_instr` store left.
-fn defer_escape_resume_last_instr(frame: usize, executing: isize) {
-    let Some(current) =
-        ESCAPE_FLUSH_UNDO.with(|slot| slot.borrow().as_ref().map(EscapeFlushUndo::current_frame))
-    else {
-        return;
-    };
-    let pf = current as *mut pyre_interpreter::PyFrame;
-    let resume = unsafe { (*pf).last_instr };
-    unsafe { (*pf).last_instr = executing };
-    PUBLISHED_LAST_INSTR.with(|slot| {
-        if let Some(published) = slot.get()
-            && published.frame == frame
-        {
-            slot.set(Some(PublishedLastInstr {
-                saved: resume,
-                resume_flushed: true,
-                ..published
-            }));
-        }
-    });
-}
-
 /// Put the pre-flush frame state back so the legacy replay re-enters a
 /// pristine frame.  Called from the unforced / rootless continuation (where
 /// the walk goes on and must not see the moved frame) and, for a withdrawn
@@ -4888,305 +4639,6 @@ fn mark_escape_flush_undo_pending() {
 /// Consume the deferred-restore request armed by the force arm.
 pub(crate) fn take_escape_flush_undo_pending() -> bool {
     ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.replace(false))
-}
-
-/// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
-/// every earlier residual of the CURRENT Python opcode is declared re-runnable.
-/// A pure query — the window is written only by [`escape_opcode_window_note`],
-/// so the residual asking the question never disqualifies itself.
-///
-/// Keyed on `py_pc` alone: an opcode revisited across walked inner-loop
-/// iterations still sees the FIRST visit's verdict, so every revisit after any
-/// non-re-runnable residual declines the latch — conservative (decline →
-/// legacy).  An unexplained latch-decline spike on nested-loop shapes is this;
-/// the refinement would reset the window on back-edge re-entry.
-fn escape_opcode_window_clean(py_pc: usize) -> bool {
-    ESCAPE_OPCODE_WINDOW.with(|slot| match slot.get() {
-        Some((pc, clean)) if pc == py_pc => clean,
-        _ => true,
-    })
-}
-
-/// Declare this residual's re-runnability into the opcode window (see
-/// [`ESCAPE_OPCODE_WINDOW`]).  Called for every residual that reaches
-/// execution, AFTER the latch gate has read the window.
-///
-/// `reentrant` is the declared effect class, `EF_ELIDABLE_*`
-/// (`check_is_elidable`) or `EF_LOOPINVARIANT`.  It is deliberately STRICTER
-/// than `provably_side_effect_free`, which additionally exempts
-/// [`majit_ir::RuntimeHelperKind::ForIterNext`]: that exemption answers a
-/// different question (the consume is the SOURCE of an in-flight item, not a
-/// body effect for it), and a user-defined `__next__` runs user bytecode that
-/// re-executing the opcode would re-run.
-fn escape_opcode_window_note(py_pc: usize, reentrant: bool) {
-    ESCAPE_OPCODE_WINDOW.with(|slot| {
-        let clean = match slot.get() {
-            Some((pc, clean)) if pc == py_pc => clean,
-            _ => true,
-        };
-        slot.set(Some((py_pc, clean && reentrant)));
-    });
-}
-
-/// Reset the opcode window at walk start so a prior trace's sample cannot
-/// alias a same-pc opcode of the new walk.
-pub(crate) fn escape_opcode_window_reset() {
-    ESCAPE_OPCODE_WINDOW.with(|slot| slot.set(None));
-}
-
-/// Resolve the latched operand-stack mirror (`ActiveFrameEscapeGuard::enter`)
-/// to concrete refs and flush the walk-end state with the mid-expression
-/// stack the vable shadow cannot provide (its stack region is only valid at
-/// merge points).  The `_run_forever` continue-forward analog
-/// (`blackhole.py`) for the escape abort: the resume state is the exact
-/// abort-point frame, so the walk's applied effects stand and nothing
-/// replays.  Returns false (no frame mutation) when no stack was latched or
-/// any slot lacks a concrete non-null Ref — the caller then falls back to the
-/// plain merge-point flush.
-fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize) -> bool {
-    ACTIVE_FRAME_ESCAPE_STACK.with(|slot| {
-        let latched = slot.borrow();
-        let Some(oprefs) = latched.as_ref() else {
-            return false;
-        };
-        flush_with_latched_stack(ctx, frame, py_pc, oprefs)
-    })
-}
-
-/// Resolve a latched operand-stack OpRef mirror to concrete refs and flush the
-/// walk-end state with it, keeping the resolved refs rooted across the call.
-///
-/// Shared by the escape flush above and the `ABORT_FORCE_QUASIIMMUT` leg
-/// ([`flush_qmut_abort_state`]): both resume the interpreter
-/// mid-expression, where the vable shadow's stack region reads NULL and only the
-/// walk's own mirror can say what the operands are.
-pub(crate) fn flush_with_latched_stack(
-    ctx: &TraceCtx,
-    frame: usize,
-    py_pc: usize,
-    oprefs: &[OpRef],
-) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::TosOnly)
-}
-
-/// How much of the latch may disagree with the vable shadow because the
-/// in-progress opcode has already popped it into registers — see
-/// [`flush_with_latched_stack_inner`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConsumedOperands {
-    /// One slot, the opcode's TOS.
-    TosOnly,
-    /// The whole operand run, however deep.
-    WholeRun,
-}
-
-/// Resume a FOR_ITER body from the complete header stack plus the item the
-/// authoritative walk already consumed.  RPython keeps both pieces in the
-/// live MIFrame register image; pyre records the item in the FOR_ITER carrier
-/// separately from the operand-stack mirror, so they must be reunited before
-/// converting the frame to interpreter state.
-pub(crate) fn flush_with_latched_stack_and_item(
-    ctx: &TraceCtx,
-    frame: usize,
-    header_py_pc: usize,
-    oprefs: &[OpRef],
-    push: (pyre_object::PyObjectRef, usize),
-) -> bool {
-    flush_with_latched_stack_inner(
-        ctx,
-        frame,
-        header_py_pc,
-        oprefs,
-        Some(push),
-        ConsumedOperands::TosOnly,
-    )
-}
-
-fn flush_with_latched_stack_inner(
-    ctx: &TraceCtx,
-    frame: usize,
-    py_pc: usize,
-    oprefs: &[OpRef],
-    push: Option<(pyre_object::PyObjectRef, usize)>,
-    consumed_operands: ConsumedOperands,
-) -> bool {
-    {
-        let mut stack = Vec::with_capacity(oprefs.len() + usize::from(push.is_some()));
-        for &opref in oprefs.iter() {
-            match ctx.concrete_of_opref(opref) {
-                Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-                    // A recorded concrete NULL is a real operand, not an absent
-                    // one — `NO_CONCRETE` is what "unavailable" looks like.  It
-                    // is the `self_or_null` sentinel `PUSH_NULL` puts under a
-                    // callable, so refusing it made every `CALL` /
-                    // `CALL_FUNCTION_EX` escape fall through to the plain flush,
-                    // which then declines on that same NULL slot and leaves the
-                    // portal replaying the frame from its entry.
-                    stack.push(r.as_usize() as pyre_object::PyObjectRef);
-                }
-                other => {
-                    if fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {} of {} \
-                             opref={opref:?} concrete={other:?}",
-                            stack.len(),
-                            oprefs.len(),
-                        );
-                    }
-                    return false;
-                }
-            }
-        }
-        let resume_py_pc = if let Some((item, body_pc)) = push {
-            stack.push(item);
-            body_pc
-        } else {
-            py_pc
-        };
-        // Why this latch exists, checkable at runtime.  A slot that disagrees
-        // with the vable shadow holds a compile-time NULL *constant* rather
-        // than a stale or absent value: exactly what `popvalue_maybe_none`
-        // writes (`pyframe.py` →
-        // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
-        // via `jtransform.py do_fixed_list_setitem`).  The opcode had already popped the slot
-        // before its residual forced.
-        //
-        // So the array is correct and upstream agrees — RPython's `popvalue`
-        // NULLs the slot the same way.  What this latch holds is the operand
-        // the in-flight opcode already consumed, which is what upstream keeps
-        // in `MIFrame.registers_r` and what `convert_and_run_from_pyjitpl`
-        // resumes a blackhole from.  Emitting more vable stores does not
-        // remove the need for it: `LOAD_ATTR` already emits the push mirror
-        // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
-        // pop follows the push.
-        //
-        // How much of that run may disagree is [`ConsumedOperands`], and the
-        // two answers are about WHEN the leg's resume pc runs, not about the
-        // latch.
-        //
-        // `WholeRun` is the qmut abort's: it fires BEFORE its residual
-        // executes, so the opcode is entirely ahead of the walk and resuming
-        // at it re-runs nothing.  A `CALL` pops its whole callable/self/args
-        // run into registers before that residual — for a class statement the
-        // jitcode nulls four operand slots between the `LOAD_CONST` of the
-        // class name and the `CallFn` the abort fires at — so every one of
-        // them reads NULL here and a one-slot exemption declines on the first.
-        //
-        // `TosOnly` is the escape leg's, and it is a restriction rather than a
-        // measurement: that leg's opcode is IN PROGRESS (its residual is what
-        // forced), so its `last_instr = pc - 1` says "about to run the CALL"
-        // while the callee doing the forcing is already inside it.  Admitting
-        // the deeper run there turned `caller_f_lasti_across_residual_call`
-        // red — 2 of 20000 reads answered 42, the `LOAD_GLOBAL` ahead of the
-        // call, instead of the `CALL` at 52.  Widening it is part of that
-        // fixture's own epic, not of this check.
-        //
-        // Pops run top-down, so the consumed operands are a SUFFIX of the
-        // latch.  What stays refused either way is a disagreement against a
-        // non-NULL shadow, and a live operand sitting ABOVE a consumed one.
-        // Both say the latch is not this frame's continuation.
-        let base = ctx
-            .virtualizable_info()
-            .map_or(usize::MAX, |info| info.num_static_extra_boxes);
-        let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
-        // Lowest slot the in-progress opcode has already popped, once one is
-        // seen: everything from here up is its own operand run.
-        let mut consumed_from: Option<usize> = None;
-        for (rel, &obj) in stack.iter().enumerate() {
-            let entry =
-                ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
-            let shadow = entry.map(|(_opref, value)| value);
-            let shadow_ptr = match shadow {
-                Some(majit_ir::Value::Ref(r)) => Some(r.as_usize()),
-                _ => None,
-            };
-            let agrees = shadow_ptr == Some(obj as usize);
-            if !agrees && fbw_debug_abort_enabled() {
-                // Report the OpRef too: a live box with a NULL value means
-                // the symbolic write landed and only the concrete mirror is
-                // absent, which is a different defect from no write at all.
-                eprintln!(
-                    "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
-                    stack.len(),
-                    obj as usize,
-                    entry.map(|(opref, _)| opref),
-                );
-            }
-            // The orthodox disagreement: the vable slot is NULL while the
-            // MIFrame register image still carries the object this opcode
-            // consumed out of it.
-            let consumed = !agrees
-                && obj as usize != 0
-                && shadow_ptr == Some(0)
-                && (consumed_operands == ConsumedOperands::WholeRun || rel + 1 == stack.len());
-            let refusal = if consumed {
-                consumed_from.get_or_insert(rel);
-                None
-            } else if !agrees {
-                Some("disagrees against a shadow that is not a consumed NULL")
-            } else if consumed_from.is_some() && shadow_ptr != Some(0) {
-                Some("is a live operand above the consumed run")
-            } else {
-                None
-            };
-            if let Some(refusal) = refusal {
-                if fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} {refusal}",
-                        stack.len(),
-                    );
-                }
-                return false;
-            }
-        }
-        // The flush's Int/Float local boxing can trigger a minor collection;
-        // register the resolved refs as resume roots so they are forwarded in
-        // place across it (the same discipline as the vable root above).
-        let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
-                stack.as_mut_ptr() as *mut i64,
-                stack.len(),
-            ));
-        }
-        let committed = crate::state::flush_walk_end_state_to_frame_with_full_stack(
-            ctx,
-            frame,
-            resume_py_pc,
-            &stack,
-        );
-        majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
-        committed
-    }
-}
-
-/// The `ABORT_FORCE_QUASIIMMUT` leg's flush: resume the interpreter at the
-/// opcode carrying the forcing write, with the operand stack the walk mirrored
-/// on entry to it ([`fbw_qmut_abort_stack_take`]).
-pub(crate) fn flush_qmut_abort_state(
-    ctx: &TraceCtx,
-    frame: usize,
-    py_pc: usize,
-    oprefs: &[OpRef],
-) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::WholeRun)
-}
-
-/// Take the committed escape resume pc and which flush produced it (the
-/// walk-end commit contract turns on the difference — see [`EscapeResumeKind`]).
-pub(crate) fn take_committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
-    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.take())
-}
-
-fn committed_frame_escape_pc() -> Option<(usize, EscapeResumeKind)> {
-    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.get())
-}
-
-/// Withdraw a committed escape resume pc: the residual that escaped also ran
-/// user bytecode, so resuming AT its opcode would re-execute that user body —
-/// the legacy replay (whose journals roll back) is the never-double fallback.
-fn cancel_committed_frame_escape_pc() {
-    COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
 }
 
 /// Reject a residual_call whose `allboxes` (funcbox + permuted args)
@@ -5596,81 +5048,6 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
          reg_shadow={shadow:?} nargs={}",
         allboxes.len() - 1,
     );
-}
-
-/// Resolve a Ref register through the rebuilt carrier frame's semantic
-/// operand-stack slot. RPython's MIFrame stores the Box at that slot; the flat
-/// post-regalloc color is only an encoding detail and can name a freshly
-/// recorded load whose runtime value was lost after heapcache invalidation.
-fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    arg: OpRef,
-) -> Option<OpRef> {
-    if !ctx.fbw_mode.carrier_resume || !ctx.vstack_valid {
-        return None;
-    }
-    let consts = ctx.inline_callee_consts?;
-    let color = ctx.registers_r.iter().position(|value| value == arg)?;
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(ctx.inline_w_code() as pyre_object::PyObjectRef)
-    };
-    if raw_code.is_null() {
-        return None;
-    }
-    let nlocals = unsafe { (&(*raw_code).varnames).len() };
-    let maps =
-        crate::state::bridge_semantic_maps_from_jitcode_pc(consts.jitcode_index, op_pc as i32);
-    let semantic = crate::state::semantic_ref_slot_for_reg_color(
-        nlocals,
-        maps.stack_depth_at_pc,
-        &maps.pcdep_entries,
-        color,
-    )?;
-    let stack_slot = semantic.checked_sub(nlocals)?;
-    ctx.frame_state
-        .borrow()
-        .vstack_boxes
-        .get(stack_slot)
-        .copied()
-        .filter(|&value| value != OpRef::NONE)
-}
-
-/// Make a carrier-resumed `CallFn` consume the Box objects owned by its
-/// reconstructed MIFrame, as `pyjitpl.py do_residual_call` does. Prefer the
-/// semantic color-to-stack mapping; for a post-regalloc color whose mapping is
-/// stale, use the CALL operand suffix only when the encoded box has lost its
-/// concrete value and the frame box still has one. Keeping an already-concrete
-/// encoded box preserves its SSA identity for the optimizer.
-fn repair_carrier_call_ref_args<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    helper: majit_ir::RuntimeHelperKind,
-    r_args: &mut [OpRef],
-) {
-    if !ctx.fbw_mode.carrier_resume || helper != majit_ir::RuntimeHelperKind::CallFn {
-        return;
-    }
-    for arg in r_args.iter_mut() {
-        if let Some(frame_box) = carrier_stack_box_for_ref_arg(ctx, op_pc, *arg) {
-            *arg = frame_box;
-        }
-    }
-    if !ctx.vstack_valid || ctx.frame_state.borrow().vstack_boxes.len() < r_args.len() {
-        return;
-    }
-    let start = ctx.frame_state.borrow().vstack_boxes.len() - r_args.len();
-    for (arg, &frame_box) in r_args
-        .iter_mut()
-        .zip(&ctx.frame_state.borrow().vstack_boxes[start..])
-    {
-        if ctx.trace_ctx.concrete_of_opref(*arg).is_none()
-            && frame_box != OpRef::NONE
-            && ctx.trace_ctx.concrete_of_opref(frame_box).is_some()
-        {
-            *arg = frame_box;
-        }
-    }
 }
 
 /// Whether a residual call is a self-recursive call to the walk's own code —
@@ -6744,10 +6121,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // traced, mirroring RPython's separate-state isolation.
     let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
     // The call can allocate, and a minor collection moves a nursery frame.
-    // The token object (`vable_obj_root`, the live identity) and the
-    // synchronization target (`saved_vable_heap_ptr`, the snapshot) are
-    // separate objects, and each is rooted on its own. Restore writes the
-    // forwarded snapshot address (`pyjitpl.py` holds the virtualizable in a
+    // `saved_vable_heap_ptr` is the live virtualizable
+    // (`initialize_virtualizable` / `read_boxes`). Restore writes the
+    // forwarded address (`pyjitpl.py` holds the virtualizable in a
     // box the GC traces).
     let mut saved_vable_root = Some(SavedVableRoot::push(
         saved_vable_heap_ptr.filter(|p| !p.is_null()),
@@ -6801,7 +6177,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // The declared re-runnability class, the axis `EffectInfo` is decided on at
     // codewriter time (`jtransform.py:620-630`): re-executing the opcode that
     // contains this residual re-executes the residual, which is harmless only
-    // for an elidable or loop-hoisted one.  Feeds [`ESCAPE_OPCODE_WINDOW`].
+    // for an elidable or loop-hoisted one.
     let reentrant_residual =
         ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
     // PyPy traces through `str_descr_new` -> `space.str` and therefore knows
@@ -7038,13 +6414,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
     // accounting so an escaping residual later in the same body does not
     // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
-    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
-    // the PREVIOUS opcode), so at this residual it names the opcode being
-    // walked.  `inflight_foriter_body_pc` is `semantic_fallthrough_pc` of the
+    // The store's executing Python pc is the jitcode pc of this residual
+    // mapped through the live MIFrame (`walk_executing_py_pc`).
+    // `inflight_foriter_body_pc` is `semantic_fallthrough_pc` of the
     // owning `FOR_ITER` (`handle_jit_marker__jit_merge_point` only at
     // instruction starts), so the loop-var store is the opcode at `body_pc`.
-    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
+    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper, op_pc);
     // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
     // alone counts it.  The slot it writes exists only to keep a propagating
     // exception rooted for the collector — nothing reads it back as a value —
@@ -7102,20 +6477,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         sym: ctx.fbw_mode.snapshot_sym as *mut Sym,
     };
     // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: "The values in
-    // the virtualizable are always correct during tracing." RPython keeps
-    // that true because `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable`
-    // call `synchronize_virtualizable` onto the real object (`write_boxes`:
-    // every static, then every array item). pyre traces a
-    // `snapshot_for_tracing` copy and `synchronize_virtualizable` writes
-    // that copy (`virtualizable_heap_ptr`), so a residual that runs Python
-    // would `extract_live` from the interpreter frame and see pre-walk
-    // statics (`last_instr`, `valuestackdepth`) and any array slot the walk
-    // had not already mirrored. Write the boxes onto the live frame at the
-    // same moment `vable_and_vrefs_before_residual_call` arms the token.
+    // the virtualizable are always correct during tracing."
+    // `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` already
+    // `write_box_at` the live object (`synchronize_virtualizable_at`).
+    // An inlined callee frame is not that object: publish its
+    // `CalleeLocalsShadow` locals region before the residual may read it.
     // Nested `bound_reached` during that residual parks without a second
     // write: `force_now` only clears the token, and `vable_after_residual_call`
-    // reloads `load_fields_from_virtualizable`. An unreadable slot declines
-    // the residual (`ResidualDecline::ValueUnavailable`) before the token
+    // reloads `load_fields_from_virtualizable`. An unpublishable callee
+    // region declines (`ResidualDecline::ValueUnavailable`) before the token
     // is armed, so a declined residual never strands TOKEN_TRACING_RESCALL.
     if !flush_live_virtualizable_before_residual_call(ctx, live_frame_root.current(live_frame)) {
         return Ok(ResidualExecOutcome::Declined(
@@ -7161,11 +6531,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         }
         ctx.trace_ctx.vrefs_before_residual_call();
     }
-    // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
-    // the outer walk's mirror and a sub-walk never advances it.
+    // Resolved against the callee's OWN metadata; a callee jit_pc has no
+    // meaning in the outer jitcode's py_pc tables.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
-    let mut armed_snapshot = false;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -7173,34 +6542,19 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // the executing line rather than the one the last resume point left
         // behind.
         //
-        // Only while the pc indexes the walk's own virtualizable.  Inside an
-        // inline sub-walk `vstack_cur_pypc` is in the CALLEE's code, and both
-        // halves below name the outer frame, so publishing there stamps a
-        // foreign pc onto it — `offset2lineno` then resolves it against the
-        // outer code object and reports whatever line that byte happens to sit
-        // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
+        // Only while the pc indexes the walk's own virtualizable.  An inline
+        // sub-walk's executing pc is in the CALLEE's code, and both halves
+        // below name the outer frame, so publishing there stamps a foreign pc
+        // onto it — `offset2lineno` then resolves it against the outer code
+        // object and reports whatever line that byte happens to sit on.
+        // [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
-            // A transparent helper is not a Python frame: its
-            // `vstack_cur_pypc` stays 0.  Publish the CALL-site opcode
-            // instead of writing last_instr=0 over the portal coordinate.
-            let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
-                ctx.fbw_mode
-                    .inline_caller_py_pc
-                    .unwrap_or(ctx.vstack_cur_pypc)
-            } else if !ctx.fbw_mode.inline_subwalk {
-                // The dispatch's trace callback runs before the opcode's
-                // stack mirror advances. Publish its own JitCode coordinate,
-                // as LiveLastInstrGuard does for the heap half below.
-                // Otherwise a force in the callback writes the previous
-                // opcode back over the executing last_instr.
-                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
-            } else {
-                ctx.vstack_cur_pypc
-            };
-            if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
-                // Keep the last portal store rather than clobber it with 0.
-            } else {
+            // A transparent helper is not a Python frame. Publish the CALL-site
+            // opcode instead of writing last_instr=0 over the portal coordinate.
+            if let Some(py_pc) = portal_residual_last_instr_py_pc(ctx, op_pc)
+                && !(ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0)
+            {
                 let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
                 // Scope the box half to the residual just as
                 // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
@@ -7257,20 +6611,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
             // Upstream has one virtualizable object and one token
-            // (`vable_and_vrefs_before_residual_call`). A walk carries it as the
-            // live frame plus the tracing snapshot; a callee can force either
-            // (`f_locals` the live frame, `sys._getframe`/`_current_frames` the
-            // snapshot) → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
-            let identity = **obj as usize;
-            if let Some(snapshot_ptr) = saved_vable_root
-                .as_ref()
-                .and_then(SavedVableRoot::forwarded)
-                .or_else(|| ctx.trace_ctx.virtualizable_heap_ptr())
-                .filter(|p| !p.is_null() && *p as usize != identity)
-            {
-                info.tracing_before_residual_call(snapshot_ptr as *mut u8);
-                armed_snapshot = true;
-            }
+            // (`vable_and_vrefs_before_residual_call`). Portal/bridge walks
+            // pin that same live object (`initialize_virtualizable` /
+            // `read_boxes`); a callee that forces it
+            // (`f_locals` / `sys._getframe` / `_current_frames`)
+            // → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
         }
         Some(root_depth)
     } else {
@@ -7380,69 +6725,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     }
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
-        // Latch the operand-stack mirror for the escape flush: at force time
-        // the walk-end flush needs the caller's mid-expression stack, which
-        // the vable shadow cannot provide.
-        //
-        // A WRITING residual is latched too, but never to resume AT this
-        // opcode: the withdrawal below cancels its commit and restores the
-        // pre-flush frame unconditionally, so the interpreter never
-        // re-executes it and never re-applies the write.  What the commit
-        // leaves behind for it is a WITNESS — it proves every mirror slot
-        // resolved to a concrete non-null Ref, i.e. the walk holds a complete
-        // mid-expression stack image, which is exactly the precondition for
-        // building the blackhole resume PAST the residual.  Forcing is NOT
-        // limited to frame-introspection reads (`hook_access_field`,
-        // rvirtualizable.py, forces on every redirected-field access,
-        // reads AND writes), and every Python-visible frame MUTATOR (the
-        // `f_lineno`/`f_trace` setters, `sys.settrace`, `_warnings.warn`,
-        // which forces the caller frame for `__name__` and then mutates
-        // `__warningregistry__` with no user frame entered) is a
-        // Void-returning store or a CALL-shaped helper, so all of them land
-        // on the writing side and take that withdrawal.
-        //
-        // A non-writing residual that entered no user frame keeps its commit
-        // and the resume-AT-opcode semantics: what survives the gates there
-        // is attribute/item READS of frame-family objects, which are
-        // idempotently re-executable (re-execution reads the same flushed
-        // values the first execution saw; a token re-force is a no-op).
-        //
-        // Why the licence is `!writes_live_heap` and not the effect class the
-        // rewound residual declares: BOTH upstream-shaped static licences are
-        // empty on this path.  `check_is_elidable()`/`EF_LOOPINVARIANT` is
-        // disjoint from forcing by construction — `pyjitpl.py:2007` takes the
-        // forcing arm iff `check_forces_virtual_or_virtualizable()`
-        // (`extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, effectinfo.py)
-        // and routes elidable/loop-invariant down the `else` arm at `:2084`.
-        // An empty declared write set is unavailable too: every residual that
-        // reaches this gate carries `EF_RANDOM_EFFECTS`, whose write-descr sets
-        // are `None` — top, not bottom — by upstream's own assertion
-        // (effectinfo.py).  So no `EffectInfo` predicate can license
-        // this rewind, and the licence has to come from the shape gates above.
-        // Measured over `pyre/bench/synth` (312 files, 115 forces): the only
-        // shape that commits an `EscapeResumeKind::Exact` is a `LoadAttr`/`Ref`
-        // frame-family read, 10 of them, from `getframe_stored_fback_walk` and
-        // `getframe_force_cancel_journal`; 5 enter a user frame and have the
-        // commit withdrawn below, 5 do not and are re-executed.  Every other
-        // force either commits nothing or takes the merge-point fallback, whose
-        // `RerunsOpcode` kind `commit_walk_end` refuses outright.
-        //
-        // A sub-walk's mirror describes the callee frame, not the escape
-        // frame, so it is never latched (the nested unjournaled-residual
-        // decline above already aborts before this).
-        // Not latched on a bridge walk: its abort path bypasses the
-        // run_perfn_walk epilogue that adopts (or restores) a committed
-        // escape flush, so a commit there would strand a moved frame.
-        let escape_py_pc = (!ctx.fbw_mode.inline_subwalk && ctx.vstack_valid)
-            .then_some(ctx.vstack_cur_pypc as usize);
-        let escape_stack = escape_py_pc
-            .filter(|py_pc| {
-                escape_frame != 0
-                    && !ctx.trace_ctx.is_bridge_trace
-                    && escape_opcode_window_clean(*py_pc)
-            })
-            .map(|_| ctx.frame_state.borrow().vstack_boxes.clone());
-        let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame, escape_py_pc, escape_stack);
+        // `virtualizable.py tracing_before_residual_call` stamps
+        // TOKEN_TRACING_RESCALL; a force inside the callee is then
+        // `flush_active_frame_escape` matching this frame.  The live
+        // virtualizable already holds the jitcode-pc image
+        // (`synchronize_virtualizable_at` / `write_box_at`).
+        let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame);
         // `executioncontext.py enter` for the inlined callee this residual
         // runs inside of.
         // RPython's residual executes against `metainterp.framestack[-1]`:
@@ -7486,16 +6774,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         let portal_frame_chain = portal_call_frame
             .and_then(|(frame, vref)| Some((concrete_ref(ctx, frame)?, concrete_ref(ctx, vref)?)))
             .and_then(|(frame, vref)| ResidualFrameChainGuard::enter_chain_only(frame, vref));
-        let live_py_pc = if ctx.fbw_mode.inline_subwalk {
-            ctx.vstack_cur_pypc
-        } else {
-            live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
-        };
-        let _callee_last_instr = LiveLastInstrGuard::enter(
-            live_frame_root.current(live_frame),
-            live_py_pc,
-            inline_callee_pc,
-        );
+        let live_py_pc = walk_executing_py_pc(ctx, op_pc);
+        let _callee_last_instr = live_py_pc.and_then(|py_pc| {
+            LiveLastInstrGuard::enter(live_frame_root.current(live_frame), py_pc, inline_callee_pc)
+        });
         let _caller_last_instr = ctx.fbw_mode.inline_caller_py_pc.map(|py_pc| {
             LiveLastInstrGuard::enter_frame(
                 live_frame_root.current(live_frame) as *mut pyre_interpreter::PyFrame,
@@ -7571,16 +6853,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             recorded = record_call(ctx, value)?;
         }
     }
-    // Declared only now, so this residual constrains the residuals that FOLLOW
-    // it inside the same opcode and never itself: the gate above read the
-    // window, and a force inside the callee reads it again from
-    // `flush_active_frame_escape` while it is still the gate's view.
-    escape_opcode_window_note(ctx.vstack_cur_pypc as usize, reentrant_residual);
     if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
     }
-    // Restore the synchronization target (snapshot), not the token object
-    // (identity). The two are separate and each was rooted on its own.
+    // Restore `virtualizable_heap_ptr` from the rooted slot: a collection
+    // during the residual forwards the live virtualizable.
     let restored_vable_heap_ptr = saved_vable_root
         .as_ref()
         .and_then(SavedVableRoot::forwarded)
@@ -7635,19 +6912,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // later cleanup cannot restore pre-force fields.  An intact token is
     // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
-        let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced_identity =
-            unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
-        let snapshot_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
-        let forced_snapshot = if armed_snapshot {
-            snapshot_ptr
-                .filter(|p| !p.is_null() && *p as usize != **obj as usize)
-                .map(|p| unsafe { info.tracing_after_residual_call(p as *mut u8) })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        let forced = forced_identity || forced_snapshot;
+        let forced = vable_after_residual_call(**obj as usize);
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
@@ -7672,15 +6937,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[force-shape] helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
-                     reentrant={reentrant_residual} commit={} entered_frame={} bh={} \
+                     reentrant={reentrant_residual} entered_frame={} bh={} \
                      fs={} subwalk={} bridge={} wf={:?} wa={:?} wi={:?} rnd={} fn=0x{:x} \
                      pc={op_pc}",
                     call_descr.result_type(),
-                    match committed_frame_escape_pc() {
-                        None => "none",
-                        Some((_, EscapeResumeKind::Exact)) => "exact",
-                        Some((_, EscapeResumeKind::RerunsOpcode)) => "reruns",
-                    },
                     heap_write_odometer_before
                         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
                     blackhole_result.is_some() || assembler_continuation_escape.is_some(),
@@ -7707,7 +6967,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 || heap_write_odometer_before
                     .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
             {
-                cancel_committed_frame_escape_pc();
                 // The restore is DEFERRED to the walk-end epilogue, which is
                 // where the legacy replay is actually chosen.  Undoing it here
                 // also undid `write_boxes`' locals materialization on the
@@ -7715,8 +6974,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 // frame whose fastlocals were back to their unwritten nulls
                 // (`x = 1; a = sys._getframe(0); return x` returned NULL).
                 // The capture stays armed; `run_perfn_walk` restores it only
-                // when neither the force blackhole nor a committed escape pc
-                // takes over the continuation.
+                // when the force blackhole does not take over the continuation.
                 mark_escape_flush_undo_pending();
             }
             // The writes-live-heap force shape cannot safely resume AT
@@ -7731,11 +6989,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
                     "[s2-gate] inline_subwalk fs={} writes_live={} odo_unchanged={} \
-                     committed_none={} not_bridge={} bh_result_some={} sym_nonnull={}",
+                     not_bridge={} bh_result_some={} sym_nonnull={}",
                     ctx.session.borrow().framestack.len(),
                     writes_live_heap,
                     odometer_unchanged,
-                    committed_frame_escape_pc().is_none(),
                     !ctx.trace_ctx.is_bridge_trace,
                     blackhole_result.is_some() || assembler_continuation_escape.is_some(),
                     !ctx.fbw_mode.snapshot_sym.is_null(),
@@ -7775,15 +7032,10 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // (`pyjitpl.py` → `blackhole.py convert_and_run_from_pyjitpl`),
             // which converts the framestack and runs FORWARD, never replays.
             //
-            // An already-committed escape pc does not gate it either.  The
-            // withdraw above cancels the commit but only MARKS the frame
-            // restore pending, so the image is built over the forced frame it
-            // describes; `run_perfn_walk`'s epilogue runs the restore later and
-            // only when neither this image nor an escape pc claimed the
-            // continuation.  Requiring `committed_frame_escape_pc().is_none()`
-            // here instead left the shapes that DID commit — a re-entry guard
-            // plus a non-idempotent store ahead of the escaping call — on the
-            // replay path.
+            // The withdraw above only MARKS the frame restore pending, so the
+            // image is built over the forced frame it describes;
+            // `run_perfn_walk`'s epilogue runs the restore later and only when
+            // this image did not claim the continuation.
             if !ctx.fbw_mode.snapshot_sym.is_null()
                 && let Some(escape) = assembler_continuation_escape
             {
@@ -7887,8 +7139,17 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         // stops inside the residual call, and the resumed
                         // blackhole can reach a `getarrayitem_vable_r` that
                         // reloads an operand from the virtualizable array, so
-                        // publish the root stack from the walker's mirror.
-                        let mirror_stack = capture_vstack_mirror_image(ctx, "escape-flush");
+                        // publish the root stack from the virtualizable's
+                        // boxes (`synchronize_virtualizable` /
+                        // `write_box_at`).
+                        let vable_frame = i32::try_from(handoff.miframe.jitcode.index())
+                            .ok()
+                            .and_then(|idx| {
+                                portal_vable_frame_from_banks(ctx, idx, &handoff.banks)
+                            });
+                        let mirror_stack = vable_frame.and_then(|frame| {
+                            capture_vable_shadow_stack_image(ctx, frame, "escape-flush")
+                        });
                         if fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[latch-accept] origin=escape-flush single-frame pc={} \
@@ -7975,22 +7236,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // consumes it — discard on adoption, restore when the flush is
             // not adopted.  On the cancel arm the restore is only MARKED
             // pending, so no restore has run by the time this refresh does.
-            // The reload is `load_fields_from_virtualizable()` on the object
-            // whose token the callee cleared: the live identity when
-            // `forced_identity`, otherwise the tracing snapshot. That object
+            // The reload is `load_fields_from_virtualizable()` on the live
+            // virtualizable whose token the callee cleared. That object
             // holds the callee's writes.
             if let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() {
-                let reload_ptr = if forced_identity {
-                    ctx.trace_ctx.standard_virtualizable_ptr()
-                } else if forced_snapshot {
-                    ctx.trace_ctx
-                        .virtualizable_heap_ptr()
-                        .map(|p| p as usize)
-                        .filter(|&p| p != 0)
-                } else {
-                    None
-                };
-                if let Some(ptr) = reload_ptr {
+                if forced && let Some(ptr) = ctx.trace_ctx.standard_virtualizable_ptr() {
                     ctx.trace_ctx
                         .load_fields_from_virtualizable(&info, ptr as *const u8);
                 }
@@ -8625,61 +7875,23 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Write tracing boxes onto the live virtualizable before a residual that
-/// may run Python.
+/// Publish an inlined callee's locals region before a residual that may
+/// run Python.
 ///
-/// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` assumes the
-/// real object already holds the boxes (`synchronize_virtualizable` /
-/// `write_boxes` after every `_opimpl_setfield_vable` /
-/// `_opimpl_setarrayitem_vable`). pyre's walker steps a
-/// `snapshot_for_tracing` copy and points `virtualizable_heap_ptr` at that
-/// copy, so the live interpreter frame lags until this write.
+/// The standard virtualizable is already the live object:
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` call
+/// `synchronize_virtualizable_at` (`virtualizable.py write_box_at`).
+/// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` only clears
+/// the token. An inlined callee frame is not that object; it is built
+/// with `vable_token: 0` and its locals live in `CalleeLocalsShadow`
+/// until this write (`write_boxes` of that frame).
 ///
-/// Root `setfield_vable` does not store `last_instr` / `valuestackdepth`
-/// onto the live frame (`store_live_frame_static_int` follows
-/// `current_inline_vable_target` only). Array items are mirrored on each
-/// `setarrayitem_vable` (`own_frame_array_store_target`); this write still
-/// covers every array item `0..len(lst)` (`write_boxes`) so a slot that
-/// lived only in the boxes — including above `valuestackdepth` — is not
-/// left behind. [`LiveLastInstrGuard`] then overwrites `last_instr` with
-/// the executing pc for the residual's duration.
-///
-/// Returns `false` when a declared slot is unreadable (`Void` /
-/// `NO_CONCRETE` / missing). Nothing was written; the caller declines
-/// the residual (`ResidualDecline::ValueUnavailable`).
-fn flush_live_virtualizable_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
-    if frame == 0 {
-        return true;
-    }
-    // `fbw_note_last_instr_undo` is first-write-wins and is already armed
-    // at walk start (`trace_bytecode`); noting again is a no-op that keeps
-    // the pre-walk coordinate the non-commit epilogue restores.
-    fbw_note_last_instr_undo(frame);
-    fbw_note_frame_vsd_undo(frame);
-    // Locals undo stays the `nlocals` prefix. `write_boxes` also writes
-    // cells and the whole value stack (`0..len(lst)`), including slots
-    // above `valuestackdepth`. Those stack slots are already written by
-    // `setarrayitem_vable` without a stack-region undo
-    // (`fbw_note_locals_mirror_undo` leaves that region out so rollback
-    // cannot revert a slot another walk-time write owns), and first-write
-    // wins cannot extend an earlier nlocals capture. Completing the array
-    // write here does not add undo entries: a declined walk keeps the
-    // walk's array image, matching those stores. `last_instr` and
-    // `valuestackdepth` already have first-write-wins undos; the other
-    // statics are frame identity (`pycode`, `debugdata`).
-    if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
-        fbw_note_locals_mirror_undo(frame, nlocals);
-    }
-    crate::state::flush_known_virtualizable_to_frame(ctx, frame)
-}
-
+/// Returns `false` when the shadow cannot reproduce every locals slot.
+/// The caller declines (`ResidualDecline::ValueUnavailable`).
 pub(crate) fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     live_frame: usize,
 ) -> bool {
-    if !flush_live_virtualizable_to_frame(ctx.trace_ctx, live_frame) {
-        return false;
-    }
     let callee_frame = {
         let state = ctx.frame_state.borrow();
         match state.callee_shadow.as_ref() {
@@ -8805,6 +8017,43 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
     Some(executing_py_pc(&jc.payload, jit_pc))
 }
 
+/// Python pc of the opcode this walk's current MIFrame is executing at
+/// `jit_pc`. An inlined Python callee uses that body's metadata
+/// (`inline_callee_py_pc`); the portal uses the snapshot symbol. A helper
+/// jitcode has no Python pc. `inline_subwalk` is not the discriminator:
+/// `run_orthodox_helper_subwalk` sets it on the parent before the child
+/// helper context is built.
+pub(super) fn walk_executing_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
+    if ctx.inline_callee_consts.is_some() {
+        return inline_callee_py_pc(ctx, jit_pc);
+    }
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return None;
+    }
+    live_py_pc_from_snapshot(ctx, jit_pc)
+}
+
+/// Python pc published onto the portal virtualizable for a residual that
+/// hands that frame to Python (`current_inline_concrete_frame()==0`).
+/// A sub-walk's executing pc is in the callee; the portal stays at the
+/// CALL that entered this level (`inline_caller_py_pc`) or the vable
+/// `last_instr` `dispatch_bytecode` already wrote.
+fn portal_residual_last_instr_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
+    if ctx.fbw_mode.inline_subwalk {
+        ctx.fbw_mode
+            .inline_caller_py_pc
+            .or_else(|| portal_vable_last_instr_py_pc(ctx))
+    } else {
+        live_py_pc_from_snapshot(ctx, jit_pc)
+    }
+}
+
 fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) -> u32 {
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
@@ -8897,8 +8146,8 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
     // `last_instr + 1` and its operand stack from `valuestackdepth`; the walk
     // keeps the operand stack symbolic, so `valuestackdepth` stays at whatever
     // the frame was built with while `last_instr` advances per opcode.
-    // `capture_frame_scalars` and `correct_resume_vsd` move the two words
-    // together; this site moves one, and nothing downstream re-pairs them.
+    // `capture_frame_scalars` moves the two words together; this site
+    // moves one, and nothing downstream re-pairs them.
     // Pairing it here with the forward analysis's depth at `callee_py_pc + 1`
     // was measured and does not fix
     // `bench/synth/_pending/loop_callee_for_header_resume.py`; it does not fix
@@ -9325,19 +8574,16 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
 /// Publish the opcode this walk is inside onto the portal frame before a
 /// residual that hands that frame to Python.
 ///
-/// `try_execute_residual_call_via_executor_inner` does this ahead of a may-force
-/// call. `dispatch_bytecode` writes `last_instr` before every opcode; a
-/// portal loop carries only the merge point's coordinate in its
-/// virtualizable, and a reader inside the residual (`f_lineno` from an
-/// audit hook) otherwise reports that line. The mirror keeps the
-/// tracing-time shadow and live frame on this opcode.
-/// `vable_setfield_descr` is the store compiled code executes: the
-/// following call receives the frame, so the heap cache flushes the lazy
-/// store before the call.
+/// `pyopcode.py dispatch_bytecode` writes `self.last_instr = intmask(next_instr)`
+/// before every opcode; `pyjitpl.py _opimpl_setfield_vable` records that
+/// store. The residual that hands the frame to Python (`f_lineno` from an
+/// audit hook) reads the heap, so this republishes the virtualizable
+/// `last_instr` static onto the live frame and records the matching
+/// `vable_setfield_descr` for compiled execution. The heap cache flushes
+/// the lazy store before the call.
 ///
 /// Returns `None` when this walk is inside an inline callee — that frame's
-/// coordinate is [`record_and_publish_inline_callee_last_instr`], and
-/// `vstack_cur_pypc` indexes the outer code.
+/// coordinate is [`record_and_publish_inline_callee_last_instr`].
 pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_op: OpRef,
@@ -9353,9 +8599,9 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
         ctx.fbw_mode
             .inline_caller_py_pc
-            .unwrap_or(ctx.vstack_cur_pypc)
+            .or_else(|| portal_vable_last_instr_py_pc(ctx))?
     } else {
-        ctx.vstack_cur_pypc
+        portal_vable_last_instr_py_pc(ctx)?
     };
     if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
         return None;
@@ -9393,19 +8639,18 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
 /// `_find_nearby_operation(+1)` requires that guard at +1. The matching
 /// shadow write stays in `try_execute_residual_call_via_executor` so the
 /// pre-residual merge-point box can still be restored after the call.
-fn record_portal_last_instr_before_residual_call<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+fn record_portal_last_instr_before_residual_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
     if current_inline_concrete_frame() != 0 {
         return;
     }
     let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box() else {
         return;
     };
-    let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
-        ctx.fbw_mode
-            .inline_caller_py_pc
-            .unwrap_or(ctx.vstack_cur_pypc)
-    } else {
-        ctx.vstack_cur_pypc
+    let Some(py_pc) = portal_residual_last_instr_py_pc(ctx, jit_pc) else {
+        return;
     };
     if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
         return;
@@ -9425,7 +8670,7 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     jit_pc: usize,
 ) {
     record_and_publish_inline_callee_last_instr(ctx, jit_pc);
-    record_portal_last_instr_before_residual_call(ctx);
+    record_portal_last_instr_before_residual_call(ctx, jit_pc);
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -9677,12 +8922,14 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 fn is_loop_var_binding_store<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     helper: majit_ir::RuntimeHelperKind,
+    op_pc: usize,
 ) -> bool {
     matches!(
         helper,
         majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
-    ) && fbw_foriter_inflight_top_body_pc()
-        .is_some_and(|body_pc| body_pc == ctx.vstack_cur_pypc as usize)
+    ) && fbw_foriter_inflight_top_body_pc().is_some_and(|body_pc| {
+        walk_executing_py_pc(ctx, op_pc).is_some_and(|py| body_pc == py as usize)
+    })
 }
 
 /// Journal the namespace binding a `STORE_NAME` / `STORE_GLOBAL` /
@@ -9701,6 +8948,7 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     helper: majit_ir::RuntimeHelperKind,
     r_args: &[OpRef],
+    op_pc: usize,
 ) -> Option<()> {
     use majit_ir::RuntimeHelperKind as K;
     if !ctx.is_authoritative_executor {
@@ -9758,7 +9006,7 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     // `body_pc`, recognised the way the R1 in-flight accounting recognises it.
     // An in-flight delivery re-runs the body from that pc, so this one binding
     // is re-applied by the delivery itself and its rollback closes no road.
-    let loop_var = is_loop_var_binding_store(ctx, helper);
+    let loop_var = is_loop_var_binding_store(ctx, helper, op_pc);
     fbw_namespace_store_journal_push(namespace, name, displaced, loop_var, None);
     Some(())
 }
@@ -10204,8 +9452,10 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     }
     // This helper only raises where the root flush can adopt its operand stack.
     // Otherwise the optimizer's `is_still_valid_for` check discards a loop
-    // whose recorded qmut value changed.
-    if !ctx.vstack_valid || ctx.fbw_mode.inline_subwalk || ctx.trace_ctx.is_bridge_trace {
+    // whose recorded qmut value changed. `opimpl_jit_force_quasi_immutable`
+    // has no operand-stack condition; `inline_subwalk` / `is_bridge_trace`
+    // stay because flush adoption is a root-walk property.
+    if ctx.fbw_mode.inline_subwalk || ctx.trace_ctx.is_bridge_trace {
         return None;
     }
 
@@ -11040,7 +10290,7 @@ fn post_recorded_residual_call<Sym: WalkSym>(
 /// first, then [`record_ordinary_residual_after_execute`]
 /// (`_record_helper_varargs`, and `record_result_of_call_pure` when an
 /// elidable call returned normally). The hook runs as soon as the helper
-/// returns, before `escape_opcode_window_note`. A non-forces call has no
+/// returns. A non-forces call has no
 /// `vrefs_after_residual_call`, so the executor records no op between the
 /// call and that hook. An error before that hook (the inline-subwalk
 /// symbolic-funcptr gate, an unbound void argument) still records the
@@ -11104,7 +10354,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     // No IR. The displaced binding is journaled while the write is still
     // entirely ahead of the walk, before the concrete call.
     let namespace_write_journaled =
-        journal_walker_namespace_write(ctx, ei.runtime_helper, r_args).is_some();
+        journal_walker_namespace_write(ctx, ei.runtime_helper, r_args, op_pc).is_some();
 
     // `posted`: the hook already invalidated and, when the result has a
     // value, wrote the dst. The Ok arm refreshes that box after
@@ -11325,7 +10575,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     note_residual_pc_advanced(ctx, op.next_pc);
 
     let ei = call_descr.get_extra_info();
-    repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
     // Resolve LOAD_GLOBAL's semantic namespace before any specialization reads
     // the ref args and before `_build_allboxes` copies them.  PyPy's
     // `LOAD_GLOBAL` asks the live MIFrame for `get_w_globals()`; keeping that
@@ -12616,7 +11865,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // descr` reassignment, which the live `original_call_descr` borrow would
     // otherwise forbid (E0506).
     let runtime_helper_kind = original_call_descr.get_extra_info().runtime_helper;
-    repair_carrier_call_ref_args(ctx, op.pc, runtime_helper_kind, &mut r_args);
     // Do this before the fold block below and before `_build_allboxes`: both
     // consumers must observe the same per-MIFrame namespace.  In particular,
     // the portal codewriter deliberately supplies NULL as a hint placeholder;

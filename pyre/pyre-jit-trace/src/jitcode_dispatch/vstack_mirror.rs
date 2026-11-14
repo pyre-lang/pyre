@@ -907,8 +907,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // hole; the shadow-backed hole-fill below sources each slot from
             // the virtualizable shadow the exception lowering just wrote.  An
             // unsourceable slot (genuine NULL exc-info / Int temp) stays NONE
-            // and `mirror_covers_kept` declines for it — the conservative
-            // fallback, never a corrupt box.
+            // rather than receiving a corrupt box.
             ctx.frame_state.borrow_mut().vstack_boxes.clear();
             ctx.frame_state
                 .borrow_mut()
@@ -1844,8 +1843,7 @@ fn land_vstack_at_handler<Sym: WalkSym>(
 /// the handler depth, so those slots are unchanged at the raise point).
 /// Subsequent in-handler exception opcodes reconcile via
 /// [`VstackOpClass::ShadowReseed`], re-reading the shadow the lowering keeps
-/// current.  A survivor slot the shadow cannot source stays a NONE hole and
-/// the guard's `mirror_covers_kept` declines for it (safe fallback).
+/// current.  A survivor slot the shadow cannot source stays a NONE hole.
 ///
 /// `handler_jit_pc` is the catch target: an OUTER full-body jitcode pc, or a
 /// CALLEE coordinate when the catch happens inside an inline sub-walk.  No-op
@@ -1964,8 +1962,8 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
         py_stack_depth(code_ptr, handler_py)
     };
     // Truncate to the handler's setup depth, keeping the tracked survivors; a
-    // mirror shallower than the handler depth pads with NONE holes, which
-    // `mirror_covers_kept` declines per slot rather than latching invalid.
+    // mirror shallower than the handler depth pads with NONE holes rather
+    // than latching invalid.
     land_vstack_at_handler(
         ctx,
         "callee",

@@ -1337,10 +1337,10 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
                         || info.array_field_by_descr(&descr).is_some()
                 });
             if !vable_managed {
-                // The standard virtualizable's box names the
-                // `snapshot_for_tracing` copy, so a non-virtualizable field
-                // store is executed on the live frame
-                // `own_frame_array_store_target` resolves, which is
+                // Ordinary fields on the standard virtualizable (for example
+                // `flags`) live on the interpreter frame
+                // `own_frame_array_store_target` resolves
+                // (`live_vable_frame_addr` after a minor), which is
                 // `_opimpl_setfield_gc_any` → `execute_and_record`.
                 let (offset, size, ty) = (fd.offset(), fd.field_size(), fd.field_type());
                 let obj_ptr = if is_vable {
@@ -1424,8 +1424,8 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
                 || info.array_field_by_descr(&descr).is_some()
         });
     // Ordinary fields on the standard virtualizable (for example `flags`)
-    // live on the interpreter frame `own_frame_array_store_target` resolves,
-    // not on the `snapshot_for_tracing` copy `box_value` names.
+    // live on the interpreter frame `own_frame_array_store_target` resolves
+    // (`virtualizable.py` the live virtualizable is a GC pointer).
     let concrete_obj_ptr = if is_vable && !vable_managed {
         super::vable_ops::own_frame_array_store_target(ctx, obj).map(|p| p as i64)
     } else {

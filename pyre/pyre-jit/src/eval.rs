@@ -817,11 +817,11 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     reclaimed.  The condition covers the pre-hook bootstrap frame
 ///     (`FrameBox::new`'s `new_boxed` fallback), whose address the
 ///     collector does not own and must never be handed; such a pointer
-///     is left alone and is never dereferenced.  A tracer snapshot used
-///     to land here too — the walk records tracebacks against it
-///     (`pyjitpl.rs record_application_traceback` unwraps the standard vable)
-///     — but `snapshot_for_tracing` is GC-owned now, so that traceback
-///     keeps its frame alive instead of dangling.
+///     is left alone and is never dereferenced.  A walk records
+///     tracebacks against the live virtualizable
+///     (`pyjitpl.rs record_application_traceback` unwraps the
+///     standard vable), which is GC-owned (`FrameBox::pin_existing`
+///     / `FrameBox::new`), so that traceback keeps its frame alive.
 unsafe fn pytraceback_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -6769,13 +6769,24 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // Clearing the portal token for any other frame raises a spurious
         // escape with no committed resume pc, so the walk replays from entry
         // and double-applies the residual's non-journaled body effects.
-        if traced_frame_escaped && let Some(ptr) = tracing_frame {
-            // Step-0 attribution probe: this clear of the PORTAL's token is
-            // what the post-residual probe reads as an escape and turns into
-            // `VableEscapedDuringResidualCall`, so attributing it names which
-            // disjunct actually owns each abort.
+        //
+        // `tracing_before_residual_call` stamps the identity box
+        // (`standard_virtualizable_ptr` / the live frame). A root portal seed
+        // can point `virtualizable_heap_ptr` at the `snapshot_for_tracing`
+        // copy, which still holds an Active compiled-loop token, so the heap
+        // filter above misses TOKEN_TRACING_RESCALL. `force_now` on the frame
+        // Python handed over clears the stamped token.
+        if traced_frame_escaped {
             pyre_jit_trace::jitcode_dispatch::attribute_last_escape_force();
-            force(ptr);
+            let frame_rescall = matches!(
+                info.read_token(frame.cast()),
+                majit_metainterp::virtualizable::VableToken::TracingRescall
+            );
+            if frame_rescall {
+                force(frame.cast());
+            } else if let Some(ptr) = tracing_frame {
+                force(ptr);
+            }
         }
         if live_frame_armed {
             force(frame.cast());
@@ -12691,26 +12702,6 @@ pub(crate) fn green_pc_position(pc: i64) -> Option<usize> {
     usize::try_from(pc).ok()
 }
 
-/// Shrink `frame.valuestackdepth` to the liveness-table depth at `resume_pc`
-/// when that table is strictly smaller than the live field.
-///
-/// ContinueRunningNormally legs do not call this: `handle_jitexception`
-/// (`warmspot.py`) forwards to `portal_ptr(*args)` and leaves the vsd
-/// `bhimpl_setfield_vable_i` already wrote. Remaining callers are the
-/// non-CRN `walk_end_restart_pc` and interpret-abort sites in
-/// `compile_and_run_once`.
-#[majit_macros::dont_look_inside]
-pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
-    if let Some(corrected) =
-        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, resume_pc)
-    {
-        if corrected < frame.valuestackdepth {
-            frame.valuestackdepth = corrected;
-            frame.clear_stack_above(corrected);
-        }
-    }
-}
-
 /// Blackhole `ContinueRunningNormally` handoff: stamp `last_instr` from the
 /// merge-point next_instr in `green_int[0]` so `eval_loop_jit` resumes there.
 ///
@@ -13577,11 +13568,10 @@ pub(crate) fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>)
     if !driver.has_live_metainterp_attempt() {
         return false;
     }
-    // The before-residual write is `flush_live_virtualizable_before_residual_call`,
-    // the same moment `pyjitpl.py vable_and_vrefs_before_residual_call` arms
-    // the token. `virtualizable.py force_now` only clears the token. After
-    // the residual, changed fields are reloaded (`vable_after_residual_call`
-    // / `load_fields_from_virtualizable`).
+    // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL only clears the
+    // token: `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` already
+    // `write_box_at` the live object. After the residual, changed fields are
+    // reloaded (`vable_after_residual_call` / `load_fields_from_virtualizable`).
     pyre_jit_trace::jitcode_dispatch::park_walk_tls();
     pyre_jit_trace::trace::park_walk_end();
     driver.park_nested_trace();
@@ -13764,8 +13754,6 @@ fn compile_and_run_once(
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
-    let mut snapshot_error = None;
-    let mut snapshot_saved_last_instr = None;
     let mut published_abort_image = false;
     let first_segment = std::cell::Cell::new(true);
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
@@ -13821,34 +13809,19 @@ fn compile_and_run_once(
                 action
             } else {
                 // RPython MetaInterp traces the live virtualizable
-                // (`virtualizable.py` `read_boxes`). Pin that frame instead of
-                // allocating `snapshot_for_tracing` on every too-long abort.
-                // Array stores already land on the live frame
-                // (`own_frame_array_store_target`); only `last_instr` /
-                // `valuestackdepth` need a start-of-trace copy for a declined
-                // abort that replays from the merge point.
-                //
-                // `handle_operation_error` looks up the exception table at
-                // `last_instr`. Save it before `snapshot_for_tracing` so a
-                // failed allocation can restore the hot-backedge instruction
-                // and `bound_reached` can return into that dispatch.
+                // (`pyjitpl.py` `initialize_virtualizable` /
+                // `virtualizable.py` `read_boxes`). Pin that frame; a
+                // bootstrap frame the collector does not own cannot move,
+                // so `FrameBox::non_owning` names it without a copy.
+                // `last_instr` / `valuestackdepth` still need a start-of-trace
+                // copy for a declined abort that replays from the merge point.
+                let frame_ptr = frame_root.frame() as *mut PyFrame;
+                let concrete_frame = FrameBox::pin_existing(frame_ptr)
+                    .unwrap_or_else(|| FrameBox::non_owning(frame_ptr));
                 let saved_last_instr = frame_root.frame().last_instr;
                 let saved_valuestackdepth = frame_root.frame().valuestackdepth;
-                let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
-                let traced_on_live = pinned.is_some();
-                let concrete_frame = match pinned {
-                    Some(frame) => frame,
-                    None => match frame_root.frame().snapshot_for_tracing() {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            snapshot_saved_last_instr = Some(saved_last_instr);
-                            snapshot_error = Some(err);
-                            return majit_metainterp::TraceAction::Abort;
-                        }
-                    },
-                };
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-                let (action, executed_frame, walk_end_flushed) = trace_bytecode(
+                let (action, walk_end_flushed) = trace_bytecode(
                     meta,
                     sym,
                     code,
@@ -13863,33 +13836,29 @@ fn compile_and_run_once(
                 // (`run_blackhole_interp_to_cancel_tracing` order:
                 // `aborted_tracing` then `convert_and_run_from_pyjitpl`).
                 // Leave the live frame as the walk published it. The Abort
-                // arm runs after this closure.
+                // arm runs after this closure. A committed walk-end flush
+                // already advanced the real frame.
                 if meta
                     .trace_ctx()
                     .map_or(true, |ctx| ctx.aborted_framestack.is_none())
                 {
-                    if walk_end_flushed {
-                        if !traced_on_live {
-                            frame_root
-                                .frame()
-                                .restore_resume_state_from(&executed_frame);
+                    if !walk_end_flushed {
+                        if let Some(restart_pc) = walk_end_restart_pc {
+                            // A marker inside a super-instruction closes the loop at
+                            // `loop_header_pc + 1`. The walk already advanced
+                            // `valuestackdepth` through the super-instruction, so
+                            // the handed-back frame keeps that producer depth.
+                            // Stamp only `last_instr`, matching
+                            // `apply_blackhole_crn_handoff` (`warmspot.py
+                            // handle_jitexception` leaves the vsd
+                            // `bhimpl_setfield_vable_i` wrote).
+                            let frame = frame_root.frame();
+                            frame.set_last_instr_from_next_instr(restart_pc);
+                        } else if matches!(action, majit_metainterp::TraceAction::Abort) {
+                            let frame = frame_root.frame();
+                            frame.last_instr = saved_last_instr;
+                            frame.valuestackdepth = saved_valuestackdepth;
                         }
-                    } else if let Some(restart_pc) = walk_end_restart_pc {
-                        // A marker inside a super-instruction closes the loop at
-                        // `loop_header_pc + 1`, and the walk already advanced
-                        // `valuestackdepth` through the super-instruction. Set both the
-                        // resume pc and its operand depth so the handed-back frame is
-                        // self-consistent, mirroring the flush leg above and the
-                        // blackhole legs (`apply_blackhole_crn_handoff`).
-                        let frame = frame_root.frame();
-                        frame.set_last_instr_from_next_instr(restart_pc);
-                        correct_resume_vsd(frame, restart_pc);
-                    } else if traced_on_live
-                        && matches!(action, majit_metainterp::TraceAction::Abort)
-                    {
-                        let frame = frame_root.frame();
-                        frame.last_instr = saved_last_instr;
-                        frame.valuestackdepth = saved_valuestackdepth;
                     }
                 } else {
                     published_abort_image = true;
@@ -13939,8 +13908,10 @@ fn compile_and_run_once(
                 panic!("interpret blackhole bailed on residual {name}");
             }
             if bh_pc != usize::MAX {
+                // `aborted_tracing` (`pyjitpl.py`) returns to the
+                // interpreter with the frame the blackhole left
+                // (`bhimpl_setfield_vable_i`). Stamp only `last_instr`.
                 frame_root.frame().set_last_instr_from_next_instr(bh_pc);
-                correct_resume_vsd(frame_root.frame(), bh_pc);
             }
         } else if outcome.is_none()
             && !driver.has_compiled_loop(green_key)
@@ -13953,15 +13924,6 @@ fn compile_and_run_once(
     // the walk staged without publishing an abort image has no driver on
     // this leg; `finish_cancel_tracing` drops it with the scope.
     driver.meta_interp_mut().finish_cancel_tracing();
-    if let Some(err) = snapshot_error {
-        // Snapshot allocation failure is a MemoryError this frame can
-        // catch. `ExitFrameWithException` offers it to
-        // `handle_operation_error` and the same-frame exception table.
-        if let Some(last_instr) = snapshot_saved_last_instr {
-            frame_root.frame().last_instr = last_instr;
-        }
-        return Some(LoopResult::ExitFrameWithException(err));
-    }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished && dynasm_exec_diag_enabled() {

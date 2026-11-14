@@ -771,23 +771,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             pin_nonconst_standing_exception_class(&mut wc, walk_position)?;
             walk(jitcode_code, walk_position, &mut wc)
         };
-        if matches!(
-            &outcome,
-            Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. })
-                | Err(DispatchError::BranchGuardKeptStackUnsupported { .. })
-        ) && wc.vstack_valid
-            && wc.vstack_depth <= wc.frame_state.borrow().vstack_boxes.len()
-        {
-            // `MIFrame.registers_r` is the authoritative source upstream when
-            // an abort converts the metainterp framestack to blackholes
-            // (`blackhole.py _copy_data_from_miframe`).  Preserve pyre's equivalent mirror
-            // before `wc` drops; the epilogue checks this coordinate against
-            // the decoded abort resume pc before it mutates the live frame.
-            fbw_branch_abort_stack_latch(
-                wc.vstack_cur_pypc as usize,
-                wc.frame_state.borrow().vstack_boxes[..wc.vstack_depth].to_vec(),
-            );
-        }
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value();
@@ -991,7 +974,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         root_liveness_word,
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
-        None,
     );
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to
@@ -1373,32 +1355,21 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
 /// The bridge walk does not install `InlineConcreteFrameGuard`, so
 /// `setfield_vable` records the virtualizable write without mirroring
 /// `valuestackdepth` onto the concrete frame. The portal-call recorder
-/// then declines a header whose operand stack is non-empty. Publish the
-/// walk's operand depth when it matches `depth_based_vsd_for_wcode`.
+/// then declines a header whose operand stack is non-empty. Publish
+/// `depth_based_vsd_for_wcode` for this walk's `w_code` at `target_pc`
+/// (`LiveVars.stack_depth_at` plus locals/cells). That is the same
+/// number `_opimpl_getfield_vable` would read for this frame's
+/// `valuestackdepth`; the portal `virtualizable_boxes` slot is a
+/// different frame under an inline subwalk.
 fn publish_carrier_header_vsd<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     portal_frame_box: OpRef,
     target_pc: usize,
 ) {
-    if !ctx.vstack_valid {
-        return;
-    }
     let w_code = ctx.inline_w_code();
     let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code, target_pc) else {
         return;
     };
-    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-    if raw_code.is_null() {
-        return;
-    }
-    let stack_base = {
-        let code = unsafe { &*raw_code };
-        code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
-    };
-    let published = stack_base.saturating_add(ctx.vstack_depth);
-    if published != depth_vsd {
-        return;
-    }
     let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.concrete_of_opref(portal_frame_box)
     else {
         return;
@@ -1407,7 +1378,7 @@ fn publish_carrier_header_vsd<Sym: WalkSym>(
         return;
     }
     // Field 2 is `valuestackdepth` (`store_live_frame_static_int`).
-    crate::state::store_live_frame_static_int(gcref.0, 2, published as i64);
+    crate::state::store_live_frame_static_int(gcref.0, 2, depth_vsd as i64);
 }
 
 /// `MetaInterp.leave_portal_frame` onto the live history.

@@ -1755,15 +1755,20 @@ const _: () = assert!(std::mem::offset_of!(GcFramePrefix, frame) == GC_HEADER_SI
 /// `Box<PyFrame>` so the frame the JIT treats as the virtualizable is a
 /// real GC object with a valid header at `frame - GC_HEADER_SIZE`.
 pub struct FrameBox {
-    /// Birth address of a [`Self::new_boxed`] fallback only. A collector-owned
-    /// frame's live address is the `owner_root` slot (`shadowstack.py`
-    /// `push_roots` / `pop_roots`); this field is `null` on that path.
+    /// Address of a frame the collector does not own: the birth address of a
+    /// [`Self::new_boxed`] fallback, or the frame a [`Self::non_owning`] handle
+    /// names. A collector-owned frame's live address is the `owner_root` slot
+    /// (`shadowstack.py` `push_roots` / `pop_roots`); this field is `null` on
+    /// that path.
     ptr: *mut PyFrame,
     /// RPython's translated Rust local is a shadow-stack livevar for the
     /// complete lifetime of the owning handle.  In particular it remains a
     /// root after `FrameBox::new` returns and before `execute_frame` installs
     /// the frame on the ExecutionContext chain.
     owner_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// When true, [`Drop`] frees nothing. The pointed-to frame is owned by
+    /// another handle. Set only by [`Self::non_owning`].
+    borrowed: bool,
 }
 
 /// `FrameBox::new` takes the frame **by value** and returns
@@ -1959,6 +1964,7 @@ impl FrameBox {
                 // address is `owner_root` (`shadowstack.py` `pop_roots`).
                 ptr: std::ptr::null_mut(),
                 owner_root: Some(owner_root),
+                borrowed: false,
             });
         }
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
@@ -1993,6 +1999,7 @@ impl FrameBox {
         FrameBox {
             ptr,
             owner_root: None,
+            borrowed: false,
         }
     }
 
@@ -2004,17 +2011,15 @@ impl FrameBox {
     /// slot rather than from a register it filled before the last operation
     /// that could collect; the raw `ptr` field is that stale register, so
     /// every read of the frame goes through the slot instead.  A
-    /// [`Self::new_boxed`] frame holds no slot and is not GC-managed, so its
-    /// address is fixed and the field is the only answer.
+    /// [`Self::new_boxed`] or [`Self::non_owning`] frame holds no slot and is
+    /// not GC-managed, so its address is fixed and the field is the only
+    /// answer.
     #[inline]
     fn frame_ptr(&self) -> *mut PyFrame {
         match &self.owner_root {
             Some(owner_root) => owner_root.get().0 as *mut PyFrame,
             None => {
-                debug_assert!(
-                    !self.ptr.is_null(),
-                    "FrameBox.ptr is the new_boxed birth address"
-                );
+                debug_assert!(!self.ptr.is_null(), "FrameBox.ptr names an unmanaged frame");
                 self.ptr
             }
         }
@@ -2023,6 +2028,10 @@ impl FrameBox {
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
     pub fn into_raw(mut self) -> *mut PyFrame {
+        debug_assert!(
+            !self.borrowed,
+            "FrameBox::non_owning does not own the frame"
+        );
         // Read `frame_ptr` before releasing the slot. Afterwards the handle
         // has no `owner_root`, and `ptr` is null on the managed path.
         let ptr = self.frame_ptr();
@@ -2033,14 +2042,14 @@ impl FrameBox {
 
     /// Extra translated livevar on an already-owned GC frame.
     ///
-    /// Portal tracing pins the interpreter's live virtualizable instead of
-    /// allocating [`PyFrame::snapshot_for_tracing`]: MetaInterp reads that
-    /// same `PyFrame` (`virtualizable.py` `read_boxes`). Drop only releases
-    /// this pin; the owner's handle keeps the frame.
+    /// Portal and bridge tracing pin the interpreter's live virtualizable
+    /// (`pyjitpl.py` `initialize_virtualizable` / `virtualizable.py`
+    /// `read_boxes`). Drop only releases this pin; the owner's handle keeps
+    /// the frame.
     ///
     /// `None` when `ptr` is not collector-owned — a `new_boxed` bootstrap
-    /// frame still needs a snapshot because two `FrameBox`es would both
-    /// `Drop`-free it.
+    /// frame cannot take a second owning handle. Callers use
+    /// [`Self::non_owning`] so the walk still names that same frame.
     pub fn pin_existing(ptr: *mut PyFrame) -> Option<Self> {
         if ptr.is_null() {
             return None;
@@ -2053,7 +2062,27 @@ impl FrameBox {
             owner_root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(
                 majit_ir::GcRef(ptr as usize),
             )),
+            borrowed: false,
         })
+    }
+
+    /// Non-owning handle around a frame the collector does not own.
+    ///
+    /// [`Self::pin_existing`] is the extra livevar on a collector-owned
+    /// frame. This is the unmanaged counterpart: the frame cannot move, so
+    /// a second handle may name it without a shadow-stack root. [`Drop`]
+    /// frees nothing — a handle with `owner_root == None` would otherwise
+    /// `Box::from_raw` a frame someone else still owns.
+    ///
+    /// MetaInterp traces the live virtualizable (`pyjitpl.py`
+    /// `initialize_virtualizable` / `virtualizable.py` `read_boxes`).
+    pub fn non_owning(ptr: *mut PyFrame) -> Self {
+        debug_assert!(!ptr.is_null());
+        FrameBox {
+            ptr,
+            owner_root: None,
+            borrowed: true,
+        }
     }
 
     /// Reconstruct ownership from a pointer previously produced by
@@ -2071,6 +2100,7 @@ impl FrameBox {
             FrameBox {
                 ptr: std::ptr::null_mut(),
                 owner_root: Some(owner_root),
+                borrowed: false,
             }
         } else {
             drop(owner_root);
@@ -2081,6 +2111,7 @@ impl FrameBox {
             FrameBox {
                 ptr,
                 owner_root: None,
+                borrowed: false,
             }
         }
     }
@@ -2357,6 +2388,10 @@ impl Drop for FrameBox {
         // chain with the frame, so no manual cleanup runs here.
         // Only a `std::alloc` snapshot / bootstrap fallback box is freed
         // manually — reconstruct and drop it, which runs `PyFrame::drop`.
+        // [`Self::non_owning`] names a frame someone else still owns.
+        if self.borrowed {
+            return;
+        }
         if self.owner_root.take().is_some() {
             return;
         }
@@ -4925,11 +4960,12 @@ impl PyFrame {
         )
     }
 
-    /// RPython MetaInterp traces against its own MIFrame stack instead of
-    /// mutating the live interpreter frame in place. pyre still executes
-    /// bytecodes concretely during tracing, so use an owned snapshot when
-    /// recording a trace to keep the real frame state unchanged until the
-    /// interpreter actually executes the same path.
+    /// Copy of this frame's mutable virtualizable state for decline/replay.
+    /// Bridge tracing takes this before the walk and
+    /// [`Self::restore_resume_state_from`] puts it back when the walk does
+    /// not commit. The walk itself traces the live virtualizable
+    /// (`pyjitpl.py` `initialize_virtualizable` / `virtualizable.py`
+    /// `read_boxes`).
     pub fn snapshot_for_tracing(&self) -> Result<FrameBox, crate::PyError> {
         // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
         // the whole `trace_bytecode` walk, during which a major GC cycle can
@@ -8242,6 +8278,25 @@ x = 7
             pyre_object::gc_hook::clear_gc_owns_object_hook();
             YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().clear());
         }
+    }
+
+    /// `FrameBox::non_owning` names a frame someone else still owns.
+    /// `Drop` must not `Box::from_raw` it (`owner_root == None` would).
+    #[test]
+    fn non_owning_frame_handle_does_not_free_the_frame_on_drop() {
+        let code = crate::compile_exec("x = 1\n").expect("compile");
+        let mut owned = super::PyFrame::new(code).expect("frame allocation");
+        owned.fix_array_ptrs();
+        let ptr = (&mut *owned) as *mut super::PyFrame;
+        owned.last_instr = 42;
+        {
+            let borrowed = super::FrameBox::non_owning(ptr);
+            assert_eq!(borrowed.last_instr, 42);
+            drop(borrowed);
+        }
+        assert_eq!(owned.last_instr, 42);
+        owned.last_instr = 7;
+        assert_eq!(owned.last_instr, 7);
     }
 
     /// `FrameBox::new` boxes an already-initialized frame; an exec/eval

@@ -2626,8 +2626,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     pub vstack_cur_pypc: u32,
     /// #73: whether `vstack_boxes` is a trustworthy mirror of the live
     /// operand stack.  Set `false` at walk entry until seeded, and latched
-    /// `false` permanently on the first unmodeled stack effect so the
-    /// `stack_sync` overlay declines to use it.
+    /// `false` permanently on the first unmodeled stack effect so later
+    /// consumers skip those slots.
     pub vstack_valid: bool,
 
     /// #389(b): the py_pc the walk backed off FROM when it entered the
@@ -2805,8 +2805,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
         }
         // The executing inline frame's `f_back` is still on this trace. When
         // that caller is the loop portal, its locals are the virtualizable
-        // boxes even if the traceback names the live object and the vable
-        // cell names the snapshot copy.
+        // boxes (`initialize_virtualizable` / `read_boxes`).
         let inline = current_inline_concrete_frame();
         if inline != 0 && concrete != 0 {
             let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };
@@ -4230,6 +4229,12 @@ impl DispatchError {
                 }
                 // Forcing the watcher leaves every register bound.
                 | Self::ForceQuasiImmutable { .. }
+                // `opimpl_goto_if_not` has already selected the taken link
+                // (`self.pc = target` or fall-through) when `generate_guard`
+                // records the guard. `convert_and_run_from_pyjitpl` copies
+                // that MIFrame.pc (`_copy_data_from_miframe`).
+                | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
+                | Self::BranchGuardKeptStackUnsupported { .. }
                 // Emitted only after both segment-cut blackhole preflights
                 // succeed. The missing guard snapshot affects compilation of
                 // the discarded trace, not the complete forward image.
@@ -4264,8 +4269,6 @@ impl DispatchError {
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::FunctionCodeRacedRecord { .. }
                 | Self::ConcreteShadowAllocationFailed { .. }
-                | Self::BranchGuardKeptStackUnsupported { .. }
-                | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
                 | Self::ExcEdgeNoInFrameCatch { .. }
                 // In-walk refuse of a loop-bearing callee (`fbw_decline_inline_callee`).
                 // With a seeded inline the frames are already an MIFrame stack, so
@@ -6193,13 +6196,11 @@ node,
                     // = 0` on handler entry.
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
                     // #370: re-seed the operand-stack mirror at the handler
-                    // entry so a kept-stack guard inside the handler compiles
-                    // from the mirror instead of declining.  The unwind
-                    // boundary is otherwise unmodeled, so without this the
-                    // mirror latches invalid and every in-handler kept-stack
-                    // guard declines.  `vstack_enter_exception_handler` falls
-                    // back safely (per-slot NONE hole / `vstack_valid = false`)
-                    // for the coordinates it cannot reconstruct.
+                    // entry.  The unwind boundary is otherwise unmodeled, so
+                    // without this the mirror latches invalid.  `vstack_enter_exception_handler`
+                    // falls back safely (per-slot NONE hole /
+                    // `vstack_valid = false`) for the coordinates it cannot
+                    // reconstruct.
                     vstack_enter_exception_handler(ctx, target, exc);
                     // `finishframe_exception` sets the handler pc and raises
                     // ChangeFrame; `_interpret` checks before the handler's
@@ -8319,7 +8320,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
-    vstack: Option<&[OpRef]>,
 ) -> Vec<OpRef> {
     let mut active = Vec::new();
     collect_outer_active_boxes_into(
@@ -8332,7 +8332,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         carried_jitcode_pc,
         entry_jitcode_pc,
         entry_twin,
-        vstack,
         &mut active,
     );
     active
@@ -8352,7 +8351,6 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
-    vstack: Option<&[OpRef]>,
     active: &mut Vec<OpRef>,
 ) {
     // `#124` Approach B: resolve the base live-box set through the carried
@@ -8565,15 +8563,10 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
         }
         live_cursor = it.offset();
     }
-    // Mirror-sourced operand-stack slots: the walk-level box mirror
-    // (`ctx.vstack_boxes`, indexed by absolute operand-stack depth) is the
-    // analog of `MIFrame.registers_r` for the valuestack.  A CALL-site helper
-    // snapshot uses it for the live receiver / argument boxes so a guard
-    // inside the helper resumes those same OpRefs rather than a peel
-    // ConstPtr.  Branch guards capture at the jump's own `-live-` with no
-    // vstack overlay (`generate_guard(resumepc=orgpc)`); the register file
-    // and virtualizable shadow below are the sources there.
-    let vstack_mirror = vstack.filter(|boxes| !boxes.is_empty());
+    // `get_list_of_active_boxes` (`pyjitpl.py`) reads `self.registers_X[index]`
+    // at the resume `-live-`. The Python operand stack is `virtualizable_boxes`
+    // (`_opimpl_setarrayitem_vable` / `synchronize_virtualizable_at`) plus
+    // those live registers.
     if length_r != 0 {
         // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
         let mut it = unsafe { LivenessIterator::new(live_cursor, length_r, &all_liveness) };
@@ -8588,66 +8581,6 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                 carried_pcdep_entries,
                 color,
             );
-            if let Some(mirror) = vstack_mirror {
-                // Resume operand-stack slot for this live Ref color; the mirror
-                // box for that slot is the live value (bottom-anchored: resume
-                // slot `s` == `vstack_boxes[s]`).
-                if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
-                    nlocals,
-                    valid_stack_only,
-                    pcdep_opt.unwrap_or(&[]),
-                    color,
-                ) {
-                    if sem >= nlocals {
-                        let m = mirror.get(sem - nlocals).copied().unwrap_or(OpRef::NONE);
-                        // The walk-level mirror is a sparse, per-opcode value
-                        // source.  A present CONST_NULL is therefore an actual
-                        // PUSH_NULL/self_or_null operand, not the dense vable
-                        // shadow's "slot was never written" encoding.  Only
-                        // OpRef::NONE is a hole.  A CALL-site helper snapshot
-                        // uses the same mirror for the live receiver; overlaying
-                        // a typed ConstPtr(NULL) through a reused color would
-                        // plant NULL on a live Ref, so skip that overlay.
-                        if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
-                            active.push(m);
-                            continue;
-                        }
-                        if m == OpRef::NONE && carried_owned_slot != Some(sem) {
-                            let shadow_sources_slot = trace_ctx
-                                .virtualizable_box_at(
-                                    crate::virtualizable_gen::NUM_VABLE_SCALARS + sem,
-                                )
-                                .is_some_and(|b| {
-                                    b != OpRef::NONE
-                                        && !opref_is_null_const_ptr(b)
-                                        && b.ty() == Some(majit_ir::Type::Ref)
-                                });
-                            if !shadow_sources_slot {
-                                // The operand-stack mirror has no box, but the
-                                // register for this live color still holds one
-                                // (the value `LOAD_FAST` left there, for
-                                // instance). `_get_list_of_active_boxes` reads
-                                // `registers_r[index]` for every live color with
-                                // no further test, so encode that register.
-                                //
-                                // A bridge inputarg left in the color after the
-                                // virtualizable slot moved on is not that value.
-                                // The merge point publishes the shadow box
-                                // (`reached_loop_header` `live_arg_boxes +=
-                                // virtualizable_boxes`). Naming the stale
-                                // inputarg makes the loop cut decline a box the
-                                // entry contract does not carry. Fall through
-                                // and let the shadow arm below choose.
-                                let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
-                                if reg != OpRef::NONE && !reg.is_input_arg() {
-                                    active.push(reg);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             let fallback = || {
                 regs_r
                     .get_box(color)
@@ -9026,8 +8959,8 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
-    /// `Some` arms `WalkEndResume::Rewind` and re-executes that call. A
-    /// bridge root leaves this unset; the call position is `call_pc`.
+    /// `Some` re-executes that call. A bridge root leaves this unset; the
+    /// call position is `call_pc`.
     call_jitcode_pc: Option<usize>,
     /// Jitcode pc of the CALL this frame is paused in. The handler records
     /// that position, then sets `MIFrame.pc` to the first byte after the
@@ -10022,31 +9955,6 @@ thread_local! {
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
-    /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef
-    /// mirror)` taken at the abort, for the flush leg that resumes the
-    /// interpreter at that opcode.
-    ///
-    /// The mirror is needed because the abort lands MID-EXPRESSION: the vable
-    /// shadow's stack region reads NULL outside a merge point, so the plain
-    /// flush declines on the first operand slot and the walk falls back to the
-    /// replay this leg exists to avoid.  Holds symbolic `OpRef`s only — the
-    /// concrete refs are resolved and rooted inside the flush.
-    static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
-        const { std::cell::RefCell::new(None) };
-
-    /// Kept-stack branch-abort resume carrier: `(py_pc, complete operand-stack
-    /// OpRef mirror)` captured from the live MIFrame-equivalent walk context
-    /// before it is dropped.
-    ///
-    /// Like the quasiimmutable carrier above, this is needed only for a
-    /// mid-expression abort: the virtualizable array is authoritative at merge
-    /// points, while RPython resumes a blackhole from the MIFrame register
-    /// image at the exact abort point (`blackhole.py _copy_data_from_miframe`).  The trace
-    /// epilogue accepts this carrier only when its Python coordinate exactly
-    /// matches the decoded abort resume pc.
-    static FBW_BRANCH_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
-        const { std::cell::RefCell::new(None) };
-
     /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
     /// opcode it is currently inside, as `(py_pc, odometer)`.
     ///
@@ -10259,7 +10167,7 @@ struct FbwStoreJournalRootArea {
     published_inline_frame: *const std::cell::Cell<*mut pyre_interpreter::PyFrame>,
     published_last_instr: *const std::cell::Cell<Option<PublishedLastInstr>>,
     published_inline_shadow: *const std::cell::RefCell<Option<PublishedInlineShadow>>,
-    active_frame_escape: *const std::cell::Cell<Option<(usize, Option<usize>)>>,
+    active_frame_escape: *const std::cell::Cell<Option<usize>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
     parked_stack: *const std::cell::RefCell<Vec<fbw_state::ParkedWalkTls>>,
@@ -10872,8 +10780,7 @@ enum VstackOpClass {
     /// post-opcode operand stack.  Reconcile truncates to the new depth and
     /// reseeds the slots from the shadow (`reseed_vstack_from_shadow`); a
     /// slot the shadow cannot source (a genuine NULL exc-info slot, an
-    /// Int/Float temp) stays a NONE hole and `mirror_covers_kept` declines
-    /// for it (the conservative fallback).  Reached with a valid mirror only
+    /// Int/Float temp) stays a NONE hole.  Reached with a valid mirror only
     /// via [`vstack_enter_exception_handler`]; without that handler-entry
     /// reseed the mirror is already invalid at the unwind boundary, so this
     /// arm is inert on the non-exception path.
@@ -10903,16 +10810,15 @@ enum VstackOpClass {
     LoadSuperAttrMethod,
     /// Anything that does not fit the shapes above — FOR_ITER or any opcode
     /// this classifier does not recognise.  Latches `vstack_valid = false`
-    /// so the overlay omits those slots, which resume re-materializes (zero
-    /// regression).
+    /// so later consumers skip those slots.
     Unmodeled,
 }
 
 /// The frame whose JitCode byte offsets the branch-resume gate readers
 /// ([`branch_resume_target_stack_depth`] and the kept-slot hazard checks)
-/// resolve through.  Holds the frame's `PyJitCode` payload — its `metadata`
-/// (the tables for the jitcode-pc → Python-pc inversion) and `code_ptr` (the
-/// liveness key).
+/// and vstack-mirror coordinate readers resolve through.  Holds the
+/// frame's `PyJitCode` payload — its `metadata` (the tables for the
+/// jitcode-pc → Python-pc inversion) and `code_ptr` (the liveness key).
 ///
 /// Two constructors mark the frame model: the gate must read the frame whose
 /// jitcode the `target` offset indexes, NOT a single global.
@@ -14375,26 +14281,6 @@ fn guarded_branch_core<Sym: WalkSym>(
         };
         let kept_stack = resume_depth.is_some_and(|d| d > 0);
         let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
-        // Mirror-sourced kept-stack compile: a kept-stack guard
-        // COMPILES whenever the walk-level operand-stack mirror
-        // (`ctx.vstack_boxes`) covers EVERY kept resume slot
-        // `0..resume_depth` with a non-NONE box.  This bypasses the
-        // kept-stack declines below (whose purpose is the unreliable
-        // legacy resume the mirror replaces).  When the mirror does NOT
-        // cover a kept slot, `mirror_covers_kept` is `false` and the
-        // hazard checks below still run — they decline only for an
-        // unrestorable-Ref arm or an INVALID mirror (undermodeled walk).
-        let mirror_covers_kept = ctx.vstack_valid
-            && resume_depth.is_some_and(|d| {
-                (0..d).all(|s| {
-                    ctx.frame_state
-                        .borrow()
-                        .vstack_boxes
-                        .get(s as usize)
-                        .copied()
-                        .is_some_and(|b| b != OpRef::NONE)
-                })
-            });
         // `branch_resume_target_stack_depth` reads
         // `fbw_mode.snapshot_sym`. Probe the jitcode-store depth for
         // the unrestorable-arm decline below as well.
@@ -14467,7 +14353,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // wrong depth, so a kept-stack arm in a later function would skip
         // the decline and silently miscompile.  `kept_stack` reads the
         // correct per-function depth and closes that gap.
-        if (kept_stack || kept_stack_any_leg) && !mirror_covers_kept {
+        if kept_stack || kept_stack_any_leg {
             // Same empty-parents collapse as the vstack-mirror gate:
             // a generator-resume sub-walk compiling a kept-stack arm
             // against the caller FOR_ITER snapshot drops an item.
@@ -14547,10 +14433,10 @@ fn guarded_branch_core<Sym: WalkSym>(
             // A not-taken arm resuming at an exception-handler-protected
             // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
             // Ref) on its operand stack; the handler-entry mirror reseed
-            // reconstructs it directly (so `mirror_covers_kept` gates this
-            // whole block out), and where the mirror still does not cover,
-            // that kept Ref always also trips Hazard (1)/(2)/(3) — so the
-            // exc-region case needs no decline of its own.
+            // reconstructs it directly, and where the mirror still does
+            // not cover, that kept Ref always also trips Hazard
+            // (1)/(2)/(3) — so the exc-region case needs no decline of
+            // its own.
             if reads_null_ref || uses_edge_recovery || kept_boxed_int {
                 // Attribute the kept-stack decline to the hazard that
                 // fired and the mirror state behind it, so a corpus run
@@ -14563,7 +14449,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                 if fbw_debug_abort_enabled() {
                     eprintln!(
                         "[decline-why] PERMANENT pc={} other_target={} vstack_valid={} \
-                         subwalk={} mirror_covers_kept={} depth_gt_1={} kept_stack={} \
+                         subwalk={} depth_gt_1={} kept_stack={} \
                          kept_stack_any_leg={} reads_null_ref={} uses_edge_recovery={} \
                          kept_boxed_int={} \
                          kept_recovered_nonempty={}",
@@ -14571,7 +14457,6 @@ fn guarded_branch_core<Sym: WalkSym>(
                         other_target,
                         ctx.vstack_valid,
                         ctx.fbw_mode.inline_subwalk,
-                        mirror_covers_kept,
                         depth_gt_1,
                         kept_stack,
                         kept_stack_any_leg,
@@ -14581,19 +14466,22 @@ fn guarded_branch_core<Sym: WalkSym>(
                         kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
                     );
                 }
-                // Stamp the abort coordinate at the raise point so the
-                // driver gate cannot observe an unrelated prior abort.
-                //
-                // `MIFrame.run_one_step` has already advanced `frame.pc`, and
-                // `opimpl_goto_if_not` has already selected its link, when a
-                // tracing abort converts the frame to a blackhole
-                // (`pyjitpl.py`, `blackhole.py:1800-1810`).  Preserve  allow-line-citation
-                // that post-branch Python continuation and its popped stack,
-                // rather than making the interpreter re-run the guard opcode.
-                // The latter needs the transient truth operand which JitCode
-                // keeps only in an Int register, and replaying from the trace
-                // entry when it is absent double-applies prior residuals.
-                latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
+                // `opimpl_goto_if_not` has already selected the taken link
+                // (`self.pc = target` or fall-through) when `generate_guard`
+                // records the guard. `run_blackhole_interp_to_cancel_tracing`
+                // → `convert_and_run_from_pyjitpl` → `_copy_data_from_miframe`
+                // resumes this MIFrame at that pc. Latch the convert image
+                // there; the error pc stays the guard for `DONT_TRACE_HERE`.
+                if ctx.fbw_mode.inline_subwalk {
+                    residual_call::discard_staged_abort(ctx.session);
+                }
+                let latched =
+                    residual_call::latch_abort_blackhole(ctx, taken_pc, "branch-kept-stack");
+                if latched && ctx.fbw_mode.transparent_helper_subwalk {
+                    let splice_ok =
+                        inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                    let _ = residual_call::finish_helper_abort_latch(ctx.session, splice_ok);
+                }
                 // Stamp only at the root: a sub-walk raise must leave
                 // `abort_in_subwalk` clear so `claim_abort_coordinate` can
                 // own this pc. Overwrite a leftover true from a recovered
@@ -14631,64 +14519,6 @@ fn guarded_branch_core<Sym: WalkSym>(
     }
     write_branch_result(ctx, op.pc, result_write)?;
     Ok((DispatchOutcome::Continue, taken_pc))
-}
-
-/// Preserve the already-selected Python successor for a kept-stack branch
-/// abort, matching the forward `MIFrame.pc` copied by
-/// `convert_and_run_from_pyjitpl`.
-fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    frame: Option<&ActiveResumeFrame>,
-    guard_opcode: OpCode,
-) {
-    let Some(frame) = frame else {
-        return;
-    };
-    let py_pc = ctx.vstack_cur_pypc as usize;
-    let pjc = &frame.0;
-    if pjc.code_ptr.is_null() {
-        return;
-    }
-    let code = unsafe { &*pjc.code_ptr };
-    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, py_pc) else {
-        return;
-    };
-    let truth = match guard_opcode {
-        OpCode::GuardTrue => true,
-        OpCode::GuardFalse => false,
-        _ => return,
-    };
-    let jump = match instr {
-        pyre_interpreter::Instruction::PopJumpIfTrue { .. } => truth,
-        pyre_interpreter::Instruction::PopJumpIfFalse { .. } => !truth,
-        _ => return,
-    };
-    let successor = if jump {
-        crate::liveness::target_pc(code, &instr, py_pc, op_arg)
-    } else {
-        Some(crate::pyjitpl::semantic_fallthrough_pc(code, py_pc))
-    };
-    let Some(successor) = successor else {
-        return;
-    };
-    let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
-        .depth_at_py_pc()
-        .get(successor)
-        .copied()
-        .map(usize::from)
-    else {
-        return;
-    };
-    if !ctx.vstack_valid
-        || depth > ctx.vstack_depth
-        || depth > ctx.frame_state.borrow().vstack_boxes.len()
-    {
-        return;
-    }
-    fbw_branch_abort_stack_latch(
-        successor,
-        ctx.frame_state.borrow().vstack_boxes[..depth].to_vec(),
-    );
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(
@@ -15336,7 +15166,6 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
         sym,
         &sub_body,
         nested_entry,
-        "call_trace_commit",
         &[],
         &[],
         &ref_args,

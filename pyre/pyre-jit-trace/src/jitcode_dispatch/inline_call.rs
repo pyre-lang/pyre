@@ -3575,60 +3575,6 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
-/// Overlay the callee sub-walk's operand-stack mirror onto live Ref-bank
-/// colors that map to stack slots.
-///
-/// `collect_outer_active_boxes` overlays `vstack_boxes[sem - nlocals]` for
-/// the portal frame.  The callee sub-walk is sym-less and owns no
-/// virtualizable, so [`collect_callee_active_boxes`] used to encode only
-/// `registers_r`.  A coalesced `LOAD_FAST` / `COPY` / `MATCH_CLASS` kept
-/// slot lives in the walk mirror and may still be `OpRef::NONE` in the
-/// register bank; without this overlay a branch-guard snapshot would
-/// encode NONE for a live Ref.
-///
-/// Fill holes only: a color that already holds a box stays on the
-/// register / callee-shadow recovery path.  Only `OpRef::NONE` is a hole.
-/// A present null constant (`ConstPtr(GcRef(0))` / CONST_NULL) is a real
-/// value — a `PUSH_NULL` / `self_or_null` — and is kept, matching
-/// `get_list_of_active_boxes` (`pyjitpl.py`) and `collect_outer_active_boxes`.
-/// The mirror substitutes whenever `m != OpRef::NONE`, including a mirror
-/// CONST_NULL.  Preferring the mirror over a set register (the portal
-/// CALL-site overlay) is wrong here because the branch-guard capture keys
-/// pcdep at the resume coordinate while `vstack_boxes` is the walk's
-/// current stack — a reused color then publishes a kept operand (the dict
-/// `d` in `lookup(d, k)`) as a live local.  Local slots (`< stack_base`)
-/// stay on the register / shadow path.
-pub(crate) fn overlay_callee_vstack_on_ref_regs(
-    regs_r: &mut [OpRef],
-    stack_base: usize,
-    stack_depth: usize,
-    pcdep: &[(u8, u16, u16)],
-    vstack: &[OpRef],
-) {
-    if vstack.is_empty() {
-        return;
-    }
-    for (color, value) in regs_r.iter_mut().enumerate() {
-        if *value != OpRef::NONE {
-            continue;
-        }
-        let Some(slot) =
-            crate::state::semantic_ref_slot_for_reg_color(stack_base, stack_depth, pcdep, color)
-        else {
-            continue;
-        };
-        if slot < stack_base {
-            continue;
-        }
-        let Some(&m) = vstack.get(slot - stack_base) else {
-            continue;
-        };
-        if m != OpRef::NONE {
-            *value = m;
-        }
-    }
-}
-
 /// Whether a loop-carried operand parked below the call keeps the fold
 /// worthwhile.
 ///
@@ -3656,6 +3602,100 @@ fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
         }
         _ => false,
     }
+}
+
+/// Operand-stack depth at `jit_pc` from the containing-opcode table, then
+/// `LiveVars.stack_depth_at`. Not `WalkContext.vstack_depth`.
+fn table_operand_depth_at_jit_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<usize> {
+    let index = ctx.walk_jitcode_index()?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(index as i32)?;
+    if pjc.depth_containing_populated() {
+        return pjc
+            .depth_containing_for_jitcode_pc(jit_pc)
+            .map(|depth| depth as usize);
+    }
+    let py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc) as usize;
+    crate::liveness::liveness_for(pjc.code_ptr).stack_depth_at(py_pc)
+}
+
+fn walk_stack_base<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+    let index = ctx.walk_jitcode_index()?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(index as i32)?;
+    if pjc.code_ptr.is_null() {
+        return None;
+    }
+    let code = unsafe { &*pjc.code_ptr };
+    Some(code.varnames.len() + pyre_interpreter::ncells(code))
+}
+
+/// `virtualizable_boxes[num_static_extra_boxes + stack_base + slot]`, the
+/// index math `capture_vable_shadow_stack_image` uses for
+/// `locals_cells_stack_w`.
+fn vable_stack_box_at<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    stack_base: usize,
+    slot: usize,
+) -> Option<OpRef> {
+    let info = ctx.trace_ctx.virtualizable_info()?;
+    ctx.trace_ctx
+        .virtualizable_box_at(info.num_static_extra_boxes + stack_base + slot)
+}
+
+/// Loop-carried operand-stack slots below a CALL. On the virtualizable
+/// owner they are `virtualizable_boxes` (`capture_vable_shadow_stack_image`
+/// index math: `num_static_extra_boxes + stack_base + slot`); an inlined
+/// frame is not the owner, so its slots are the `registers_r` colors the
+/// pcdep map names at this jitcode pc (`get_list_of_active_boxes`). Depth is
+/// the containing opcode's static table at this jitcode pc
+/// (`depth_containing_for_jitcode_pc` / `LiveVars.stack_depth_at`), not
+/// `vstack_depth`.
+fn vable_loop_carried_below_call_declines<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+    nargs: usize,
+) -> bool {
+    let Some(operand_depth) = table_operand_depth_at_jit_pc(ctx, jit_pc) else {
+        return false;
+    };
+    let kept_below = operand_depth.saturating_sub(nargs);
+    if kept_below == 0 {
+        return false;
+    }
+    let Some(stack_base) = walk_stack_base(ctx) else {
+        return false;
+    };
+    let pjc = if ctx.fbw_mode.inline_subwalk {
+        let Some(index) = ctx.walk_jitcode_index() else {
+            return false;
+        };
+        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(index as i32) else {
+            return false;
+        };
+        Some(pjc)
+    } else {
+        None
+    };
+    for slot in 0..kept_below {
+        let box_ref = match &pjc {
+            Some(pjc) => pjc
+                .pcdep_for_jitcode_pc(jit_pc)
+                .and_then(|pcdep| {
+                    crate::state::semantic_slot_color_for_ref_slot(pcdep, stack_base + slot)
+                })
+                .and_then(|color| ctx.registers_r.get(color)),
+            None => vable_stack_box_at(ctx, stack_base, slot),
+        };
+        let Some(box_ref) = box_ref else {
+            continue;
+        };
+        if box_ref.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, box_ref) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
@@ -3712,58 +3752,6 @@ mod foreign_call_assembler_admission_tests {
         assert!(!foreign_callee_facts_admit_call_assembler(facts(
             false, true
         )));
-    }
-}
-
-#[cfg(test)]
-mod overlay_callee_vstack_tests {
-    use super::*;
-    use majit_ir::GcRef;
-
-    fn box_at(word: usize) -> OpRef {
-        OpRef::const_ptr(GcRef(word))
-    }
-
-    #[test]
-    fn overlay_fills_none_stack_color_from_callee_mirror() {
-        let mut regs = vec![OpRef::NONE; 5];
-        let vstack = vec![box_at(0x100), box_at(0x200)];
-        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 2, &[(1, 3, 2)], &vstack);
-        assert_eq!(regs[3], box_at(0x100));
-    }
-
-    #[test]
-    fn overlay_does_not_overwrite_set_register() {
-        let mut regs = vec![OpRef::NONE; 5];
-        regs[3] = box_at(0x999);
-        let vstack = vec![box_at(0x100)];
-        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
-        assert_eq!(regs[3], box_at(0x999));
-    }
-
-    #[test]
-    fn overlay_keeps_null_const_stack_color() {
-        let mut regs = vec![OpRef::NONE; 5];
-        regs[3] = OpRef::const_ptr(GcRef(0));
-        let vstack = vec![box_at(0x100)];
-        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
-        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
-    }
-
-    #[test]
-    fn overlay_fills_none_stack_color_from_null_const_mirror() {
-        let mut regs = vec![OpRef::NONE; 5];
-        let vstack = vec![OpRef::const_ptr(GcRef(0))];
-        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
-        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
-    }
-
-    #[test]
-    fn overlay_does_not_write_local_slots() {
-        let mut regs = vec![OpRef::NONE; 5];
-        let vstack = vec![box_at(0x100)];
-        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 1, 0)], &vstack);
-        assert_eq!(regs[1], OpRef::NONE);
     }
 }
 
@@ -3975,6 +3963,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // operand instead kept a recursion called from a `while` body on the
     // residual path permanently.
     //
+    // Those slots live in `virtualizable_boxes` (`_opimpl_setarrayitem_vable`
+    // → `synchronize_virtualizable_at`), indexed the way
+    // `capture_vable_shadow_stack_image` reads `locals_cells_stack_w`.
+    //
     // The screen is about a recursion re-entering through the loop it sits
     // in.  A foreign, non-recursive callee called from a `for` body is the
     // shape `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) folds for
@@ -3987,19 +3979,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .framestack
             .iter()
             .any(|f| f.w_code == w_code as usize);
-    if recursive_callee && ctx.vstack_valid {
-        let kept_below = ctx
-            .frame_state
-            .borrow()
-            .vstack_boxes
-            .len()
-            .saturating_sub(r_args.len());
-        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
-            .iter()
-            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
-        {
-            return Ok(None);
-        }
+    if recursive_callee && vable_loop_carried_below_call_declines(ctx, op.pc, r_args.len()) {
+        return Ok(None);
     }
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
@@ -8313,8 +8294,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -8325,7 +8304,6 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            vstack,
         )
     };
     Some(BuiltinWrapperCallSite {
@@ -8888,8 +8866,6 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -8900,7 +8876,6 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
-            vstack,
         )
     };
 
@@ -11630,7 +11605,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // pre-adjustment Python coordinate.
                     op.pc as i32,
                     OuterActiveBoxesEntryTwin::Plain,
-                    None,
                 );
                 restore_in_a_call_result(banks, saved);
                 (
@@ -19102,23 +19076,17 @@ fn walk_generator_resume<Sym: WalkSym>(
             // the no-effect residual so `jit_next` can send again.
             //
             // A kept-stack branch abort already selected the taken link
-            // (`opimpl_goto_if_not`). Convert would resume at the guard pc
-            // and re-run the branch without the truth operand. The #32
-            // portal flush cannot write this generator frame
-            // (`abort_in_subwalk`). `jit_next` is `_send_ex`, so restore
-            // the parked yield and residualize (`do_residual_call`).
+            // (`opimpl_goto_if_not`). Root walks latch at that pc and
+            // convert (`_copy_data_from_miframe`). Converting here
+            // cancels the caller's FOR_ITER and its portal loop
+            // (`generator_frame_handout_image`). `jit_next` is
+            // `_send_ex`: restore the parked yield and residualize
+            // (`do_residual_call`).
             if matches!(
                 error,
                 DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
                     | DispatchError::BranchGuardKeptStackUnsupported { .. }
             ) {
-                // Convert would resume at the guard pc and re-run the
-                // branch without the truth operand. `jit_next` is
-                // `_send_ex`: it pushes the sent value and continues
-                // after a yield, so the frame has to be back at that
-                // yield. A residual store in the post-yield body already
-                // mutated the live container; restoring `last_instr` /
-                // vsd and sending again re-runs that store.
                 if fbw_debug_abort_enabled() {
                     let gf = live_generator_frame(frame_root);
                     if !gf.is_null() {
@@ -23254,7 +23222,6 @@ fn python_portal_subwalk_site<Sym: WalkSym>(
         call_site_word,
         call_pc as i32,
         OuterActiveBoxesEntryTwin::Plain,
-        None,
     );
     PythonPortalSubwalkSite {
         outer_active_boxes: boxes,
@@ -23533,10 +23500,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 helper_return: ctx.fbw_mode.helper_return.child_helper_return(),
                 // A helper has no Python PC. Residual last_instr publication
                 // reads this field when `current_inline_concrete_frame()==0`.
+                // The parent MIFrame's CALL-site jitcode pc maps to that
+                // Python opcode (`executing_py_pc`).
                 inline_caller_py_pc: ctx
                     .fbw_mode
                     .inline_caller_py_pc
-                    .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
+                    .or_else(|| super::residual_call::walk_executing_py_pc(ctx, pc)),
                 // `FbwWalkMode.generator_resume` is only the resume
                 // sub-walk. Cloning the parent mode onto a helper would
                 // journal that helper's stores as the generator's durable frame.

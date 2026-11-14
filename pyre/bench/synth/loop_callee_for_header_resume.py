@@ -16,7 +16,7 @@
 # The invariant is a TRIPLE, not a pair:
 #     (last_instr, valuestackdepth, the stack cells [base .. base+depth))
 # py_pc 18 and py_pc 34 have the SAME static operand depth (1), so the flush's
-# height check, `correct_resume_vsd` and the frame's own consistency all pass
+# height check and the frame's own consistency both pass
 # and only the cell contents witness the tear. That is why four separate
 # audits of the publishing WRITERS found nothing: every writer was faithful to
 # the coordinate it was handed, and the coordinate was the wrong one.
@@ -32,9 +32,9 @@
 #
 # The four refuted attempts, kept because each names a writer that is NOT at
 # fault:
-#   1. `adopt_blackhole_crn` restores `last_instr` alone where its sibling
-#      `apply_blackhole_crn_handoff` restores both via `correct_resume_vsd`.
-#      Real and main-owned -- but an audit placed inside it NEVER FIRES here.
+#   1. `adopt_blackhole_crn` stamps `last_instr` alone, as its sibling
+#      `apply_blackhole_crn_handoff` does; an audit placed inside it NEVER
+#      FIRES here.
 #   2. `LiveLastInstrGuard` saves only `last_instr`. Saving/restoring the whole
 #      `FrameScalars` pair did not fix it: the guard is FAITHFUL, and the pair
 #      is already inconsistent when `enter_frame` captures it.

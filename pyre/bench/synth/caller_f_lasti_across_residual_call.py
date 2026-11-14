@@ -1,5 +1,7 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main
+# pyre-check: selfcheck-compiles=entry-bridge:refused_inline
+# `main` aborts every recording residual that forces the caller
+# (`vable_after_residual_call` → `SwitchToBlackhole(ABORT_ESCAPE)`).
 # Self-checking regression guard for a caller's `f_lasti`, read from inside a
 # callee the trace left RESIDUAL.  It reported the RESUME coordinate
 # (`post_call_pc - 1`) instead of the `CALL` the caller is suspended at.
