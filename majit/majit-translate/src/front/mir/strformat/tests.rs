@@ -245,6 +245,26 @@ fn decode_packed_format_pieces_bails_and_handles_edges() {
     assert_eq!(pieces, ["\\x".to_string(), String::new()]);
     assert_eq!(placeholders.len(), 1);
     assert!(placeholders[0].is_lower_hex_byte_02());
+    assert_eq!(placeholders[0].zero_padded_lower_hex_width(), Some(2));
+
+    // `format!("{:04x}")` / `format!("{:08x}")`: same flags as `{:02x}`,
+    // only the packed u16 width field changes.
+    let (_, placeholders) =
+        decode_packed_format_pieces(&[0xC3, 0x20, 0, 0, 0x69, 4, 0, 0]).unwrap();
+    assert_eq!(placeholders[0].zero_padded_lower_hex_width(), Some(4));
+    assert!(!placeholders[0].is_lower_hex_byte_02());
+    let (_, placeholders) =
+        decode_packed_format_pieces(&[0xC3, 0x20, 0, 0, 0x69, 8, 0, 0]).unwrap();
+    assert_eq!(placeholders[0].zero_padded_lower_hex_width(), Some(8));
+    assert!(!placeholders[0].is_lower_hex_byte_02());
+
+    // `format!("'\\u{:04x}'")` — quoted unicode-error shape.
+    let (pieces, placeholders) = decode_packed_format_pieces(&[
+        3, b'\'', b'\\', b'u', 0xC3, 0x20, 0, 0, 0x69, 4, 0, 1, b'\'', 0,
+    ])
+    .unwrap();
+    assert_eq!(pieces, ["'\\u".to_string(), "'".to_string()]);
+    assert_eq!(placeholders[0].zero_padded_lower_hex_width(), Some(4));
 
     // A literal length that overruns the buffer bails.
     assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);

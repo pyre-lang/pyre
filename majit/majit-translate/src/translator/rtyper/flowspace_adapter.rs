@@ -4678,7 +4678,10 @@ pub fn translate_op(
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
                 CallTarget::SyntheticTransparentCtor {
-                    name, owner_path, ..
+                    name,
+                    owner_path,
+                    is_struct,
+                    ..
                 } => {
                     // RPython parity: tagged-union ctor `Foo(x)` annotates as
                     // `SomePBC([ClassDesc(Foo)])` then `pair_simple_call`
@@ -4747,11 +4750,19 @@ pub fn translate_op(
                         // `MutRef<T>` is the one-field GC cell for a `&mut`
                         // GC reference: one universal placeholder per pointee
                         // shape, interned under that same suffixed qualname.
+                        let bk = call_registry.bookkeeper();
                         if matches!(
                             majit_ir::descr::strip_instantiation_suffix(name),
                             "Tuple" | "Array" | "Closure" | "MutRef"
-                        ) {
-                            call_registry.bookkeeper().intern_class_by_qualname(name)
+                        ) || (*is_struct && bk.is_known_struct_root(name))
+                        {
+                            // A struct payload intern's under
+                            // `class_identity_spelling` /
+                            // `intern_adt_type_decl_identity` (FORCE
+                            // `__pos_0`). Empty `owner_path` is that
+                            // identity: intern it so `getuniqueclassdef`
+                            // shares the row (`bookkeeper.py`).
+                            bk.intern_class_by_qualname(name)
                         } else {
                             HostObject::new_class(name.clone(), Vec::new())
                         }

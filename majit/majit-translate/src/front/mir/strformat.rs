@@ -33,9 +33,10 @@ use super::*;
 /// Returns `(pieces, placeholders)` where each placeholder records its
 /// argument index plus the static formatting fields encoded in the template.
 /// `FmtPlaceholder::is_default()` is the old `0xC0`/`0xC8` subset; retaining
-/// the fields lets a later parity rewrite recognize the one non-default shape
-/// used by `bytearray_repr_string` without treating arbitrary Rust formatting
-/// as RPython string operations.
+/// the fields lets a collapse recognize the non-default shapes it can lower
+/// (`bytearray_repr_string`'s `{:02x}` nibble lookup, and zero-padded
+/// LowerHex `{:0Nx}` as `ll_int2hex` plus left zero padding) without treating
+/// arbitrary Rust formatting as RPython string operations.
 ///
 /// `placeholders[*].arg_index` holds the argument
 /// index each placeholder renders (one per placeholder, so `pieces.len() ==
@@ -46,8 +47,9 @@ use super::*;
 /// on `0x81..=0xBF` (neither a literal length nor a placeholder), on an
 /// indirect width/precision bit, on a truncated field, on a missing `0x00`
 /// terminator, and on non-UTF-8 literal bytes.  A placeholder that carries
-/// flags/width/precision is decoded rather than refused; refusing it is the
-/// job of `FmtPlaceholder::is_default()`, which every collapse consults.
+/// flags/width/precision is decoded rather than refused; each collapse
+/// decides from those fields (`is_default`, `is_lower_hex_byte_02`,
+/// `zero_padded_lower_hex_width`).
 pub(in crate::front::mir) fn decode_packed_format_pieces(
     bytes: &[u8],
 ) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
@@ -113,10 +115,9 @@ pub(in crate::front::mir) fn decode_packed_format_pieces(
             // An indirect width/precision (`{:1$}`) names an argument for
             // the field instead of inlining it, and this decoder does not
             // know how many bytes that costs.  Guessing would desync the
-            // byte stream, and a desync that happened to land on one default
-            // placeholder would be accepted by the collapses downstream —
-            // so refuse the template outright.  No consumer accepts a
-            // non-default placeholder anyway.
+            // byte stream, and a desync that happened to land on one
+            // accepted placeholder would be taken by the collapses
+            // downstream — so refuse the template outright.
             if b & 0x30 != 0 {
                 return None;
             }
@@ -184,19 +185,33 @@ impl FmtPlaceholder {
             && !self.precision_indirect
     }
 
-    /// Rust `{:02x}` as emitted for the `u8` in
-    /// `display::bytearray_repr_string`: space fill + unknown alignment,
-    /// sign-aware zero padding, width present and equal to two.
-    pub(in crate::front::mir) fn is_lower_hex_byte_02(self) -> bool {
+    /// Direct zero-padded LowerHex width `N` (`{:0Nx}`): space fill, unknown
+    /// alignment, sign-aware zero padding, a static width, no precision and
+    /// no indirect width/precision.  `rstr.py` `parse_fmt_string` rejects
+    /// widths, so this is the Rust `format!` idiom lowered to
+    /// `ll_str.py` `ll_int2hex(i, False)` plus `formatting.py` `std_wp_number`
+    /// left zero padding, not an rtyper-level `%0Nx`.
+    pub(in crate::front::mir) fn zero_padded_lower_hex_width(self) -> Option<u16> {
         const FILL_SPACE: u32 = b' ' as u32;
         const ZERO_PAD: u32 = 1 << 24;
         const WIDTH_PRESENT: u32 = 1 << 27;
         const ALIGN_UNKNOWN: u32 = 3 << 29;
-        self.flags == Some(FILL_SPACE | ZERO_PAD | WIDTH_PRESENT | ALIGN_UNKNOWN)
-            && self.width == Some(2)
+        if self.flags == Some(FILL_SPACE | ZERO_PAD | WIDTH_PRESENT | ALIGN_UNKNOWN)
             && self.precision.is_none()
             && !self.width_indirect
             && !self.precision_indirect
+        {
+            self.width
+        } else {
+            None
+        }
+    }
+
+    /// Rust `{:02x}` as emitted for the `u8` in
+    /// `display::bytearray_repr_string`: the width-2 case of
+    /// [`Self::zero_padded_lower_hex_width`].
+    pub(in crate::front::mir) fn is_lower_hex_byte_02(self) -> bool {
+        self.zero_padded_lower_hex_width() == Some(2)
     }
 }
 
@@ -1190,7 +1205,12 @@ pub(in crate::front::mir) fn str_render_op(
 /// `__str_const("%x")` and `r_uint(n)`, skipping the cast when the
 /// value is already Unsigned.  A signed interpolant whose tuple width is
 /// under 64 bits is then `and`-masked to that width (`int_to_int_cast`
-/// `And`).  Empty literal pieces are skipped.  The
+/// `And`).  A zero-padded width `N` (`hex_pad_width`) then left-pads the
+/// hex digits with `'0'` to `N` (`formatting.py` `fmt_x` / `std_wp_number`):
+/// `__strlen` of the digits, `core::cmp::max(0, N - len)` (`builtin_max`
+/// keeps `nonneg` from the zero), `__getslice_rangeto` of an `N`-zero
+/// constant (`ll_stringslice_startstop` / `_ll_stringslice`).
+/// Empty literal pieces are skipped.  The
 /// final op reuses `result` (the displaced `alloc::fmt::format` result
 /// var) so the downstream consumer is untouched.
 pub(in crate::front::mir) fn emit_fmt_expansion_ops(
@@ -1200,6 +1220,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
     result: Variable,
     hex: bool,
     hex_signed_bits: Option<u32>,
+    hex_pad_width: Option<u16>,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
     let already_unsigned = hex && fmt_value_is_unsigned(graph, value);
@@ -1270,13 +1291,96 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 result_ty: ValueType::Str,
             },
         });
+        if let Some(width) = hex_pad_width {
+            // `formatting.py` `std_wp_number`: `padding = width - len(r)`;
+            // `if padding <= 0: padding = 0`, then emit `'0'` that many
+            // times.  `rstr.py` `parse_fmt_string` has no `%0Nx`, so the
+            // pad is those ops rather than `do_stringformat`.  `builtin_max`
+            // of `0` and the difference is `nonneg` (`builtin.py`), which
+            // `check_negative_slice` needs on the getslice stop.
+            let n_len = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            ops.push(SpaceOperation {
+                result: Some(n_len.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__strlen".to_string()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![rendered.clone()]),
+                    result_ty: ValueType::Int,
+                },
+            });
+            let width_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            ops.push(SpaceOperation {
+                result: Some(width_var.clone()),
+                kind: OpKind::ConstInt(i64::from(width)),
+            });
+            let raw_pad = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            ops.push(SpaceOperation {
+                result: Some(raw_pad.clone()),
+                kind: OpKind::BinOp {
+                    op: "sub".to_string(),
+                    lhs: width_var,
+                    rhs: n_len,
+                    result_ty: ValueType::Int,
+                },
+            });
+            let zero = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            ops.push(SpaceOperation {
+                result: Some(zero.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            let pad_len = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            ops.push(SpaceOperation {
+                result: Some(pad_len.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".into(), "cmp".into(), "max".into()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![zero, raw_pad]),
+                    result_ty: ValueType::Int,
+                },
+            });
+            let zeros = str_const(graph, &mut ops, &"0".repeat(usize::from(width)));
+            let pad = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            stamp_as_rstr_str(&pad);
+            ops.push(SpaceOperation {
+                result: Some(pad.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_rangeto".to_string()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![zeros, pad_len]),
+                    result_ty: ValueType::Str,
+                },
+            });
+            let padded = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            stamp_as_rstr_str(&padded);
+            ops.push(SpaceOperation {
+                result: Some(padded.clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: pad,
+                    rhs: rendered,
+                    result_ty: ValueType::Str,
+                },
+            });
+            parts.push(padded);
+        } else {
+            parts.push(rendered);
+        }
     } else {
         // `str(value)` — render the single Display placeholder as `UnaryOp
         // str` (`Repr.rtype_str`: `ll_str` / `ll_int2dec` / rust-heap
         // `String` copy). jtransform residualizes the rust-heap case.
         ops.push(str_render_op(value, rendered.clone()));
+        parts.push(rendered);
     }
-    parts.push(rendered);
     if pieces.len() > 1 && !pieces[1].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[1]));
     }
@@ -1553,6 +1657,9 @@ pub(in crate::front::mir) struct FmtCollapse {
     /// (`Tuple<i8>` → 8). `None` when the interpolant is already unsigned,
     /// a bool, or 64-bit (no extra mask).
     pub(in crate::front::mir) hex_signed_bits: Option<u32>,
+    /// Direct zero-padded LowerHex width `N` (`{:0Nx}`). `None` for default
+    /// `{:x}`. The `u8` `{:02x}` nibble collapse is a separate site.
+    pub(in crate::front::mir) hex_pad_width: Option<u16>,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     pub(in crate::front::mir) link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -1934,14 +2041,15 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
     fi: usize,
 ) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if !nav.placeholder.is_default() {
-        return None;
-    }
     let mut pieces = nav.pieces;
     let mut hex = false;
     let mut hex_signed_bits = None;
+    let mut hex_pad_width = None;
     match nav.kind {
         FmtArgKind::Display => {
+            if !nav.placeholder.is_default() {
+                return None;
+            }
             // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
             // A rust-heap `String` interpolant is included: collapse emits
             // `str(value)` first so the concat operands are rstr `STR`.
@@ -1950,15 +2058,28 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
             }
         }
         FmtArgKind::Debug => {
+            if !nav.placeholder.is_default() {
+                return None;
+            }
             if !fmt_value_is_rstr_string(graph, &nav.context) {
                 return None;
             }
             quote_debug_string_pieces(&mut pieces);
         }
         FmtArgKind::LowerHex => {
-            // Default-spec `{:x}` only (`is_default` already excluded
-            // `{:02x}` / `{:0width$x}`). Integer interpolant → `'%x' % r_uint`.
-            // The argument tuple's Rust integer type is also proof.
+            // Default-spec `{:x}`, or zero-padded `{:0Nx}` with a direct
+            // width. Integer interpolant → `'%x' % r_uint` (`rstr.py`
+            // `do_stringformat` `'x'` → `ll_str.py` `ll_int2hex(i, False)`),
+            // then `formatting.py` `std_wp_number` left zero padding when a
+            // width is present. The `u8` `{:02x}` nibble lookup is a
+            // separate collapse; leave that site for it.
+            if !nav.placeholder.is_default() {
+                let width = nav.placeholder.zero_padded_lower_hex_width()?;
+                if nav.placeholder.is_lower_hex_byte_02() && nav.context_is_u8 {
+                    return None;
+                }
+                hex_pad_width = Some(width);
+            }
             let proven_integer = nav.context_signed_bits.is_some()
                 || nav.context_unsigned_int
                 || fmt_value_is_integer_hex(graph, &nav.context);
@@ -1980,6 +2101,7 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
         pieces,
         hex,
         hex_signed_bits,
+        hex_pad_width,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -2068,6 +2190,7 @@ pub(in crate::front::mir) fn collapse_fmt_chains(graph: &mut FunctionGraph) -> u
             result,
             site.hex,
             site.hex_signed_bits,
+            site.hex_pad_width,
         );
         graph
             .block_mut(site.format_block)

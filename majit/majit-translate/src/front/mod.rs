@@ -101,6 +101,7 @@ pub(crate) mod slice_index;
 pub(crate) mod std_identity;
 pub(crate) mod str_find;
 pub mod typestr;
+pub(crate) mod wtf8_nth;
 
 pub use semantic::{
     AstGraphOptions, FieldRow, SemanticFunction, SemanticProgram, StructFieldRegistry,

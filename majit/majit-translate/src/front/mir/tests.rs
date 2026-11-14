@@ -31293,6 +31293,254 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
     );
 }
 
+/// `Wtf8CodePoints::nth(s, n)` is `rutf8.py` `next_codepoint_pos` /
+/// `codepoint_at_pos` via the minted `ll_wtf8_nth` helper, not a residual
+/// 2-segment FunctionPath.
+#[test]
+fn wtf8_code_points_nth_lowers_to_minted_helper() {
+    use crate::front::wtf8_nth::LL_WTF8_NTH;
+    use crate::model::{CallTarget, OpKind};
+    let s_ty = interior_adt(1);
+    let n_ty = interior_usize();
+    let cp_ty = interior_adt(1);
+    let opt_ty = option_adt_node(0, cp_ty);
+    let wtf8 = interior_struct(
+        1,
+        &["rustpython_wtf8", "CodePoint"],
+        &[("value", interior_u32())],
+        4,
+        &[0],
+        false,
+    );
+    let nth = interior_opaque(
+        1,
+        &["rustpython_wtf8", "Wtf8CodePoints", "nth"],
+        vec![s_ty.clone(), n_ty.clone()],
+        opt_ty.clone(),
+    );
+    let caller = interior_caller(
+        "nth_site",
+        2,
+        vec![s_ty.clone(), n_ty.clone()],
+        opt_ty.clone(),
+        vec![
+            interior_local(0, None, &opt_ty),
+            interior_local(1, Some("s"), &s_ty),
+            interior_local(2, Some("n"), &n_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &s_ty)),
+                        interior_copy(interior_place(2, &n_ty)),
+                    ],
+                    interior_place(0, &opt_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), wtf8], vec![caller, nth]);
+    let graph = lower_interior(&llbc, "nth_site");
+    let paths: Vec<Vec<&str>> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.iter().map(String::as_str).collect()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|segments| segments.as_slice() == ["Wtf8CodePoints", "nth"]
+                || segments.last() == Some(&"nth")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))),
+        "nth must not survive as a FunctionPath: {paths:#?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
+        "call site calls the minted helper: {paths:#?}"
+    );
+}
+
+/// Dest `Option` is a `Deduplicated` local whose payload TypeDecl is
+/// Opaque — the `unicode_translate_error_str` nth site. Intern of that
+/// payload is a named instance (`intern_opaque_payload_spelling`); the
+/// lowering must store that instance in `Some.__pos_0`, not the helper
+/// word (`ClassDef.generalize_attr` / `unionof`).
+#[test]
+fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
+    use crate::front::wtf8_nth::LL_WTF8_NTH;
+    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    let s_ty = interior_adt(1);
+    let n_ty = interior_usize();
+    let dest_ty = serde_json::json!({"Deduplicated": 10});
+    let cp_body = interior_adt(1);
+    let opt_body = option_adt_node(0, serde_json::json!({"Deduplicated": 11}));
+    let opaque_cp = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["rustpython_wtf8", "CodePoint"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(4, &[0], false)
+    });
+    let nth = interior_opaque(
+        1,
+        &["rustpython_wtf8", "Wtf8CodePoints", "nth"],
+        vec![s_ty.clone(), n_ty.clone()],
+        dest_ty.clone(),
+    );
+    let caller = interior_caller(
+        "nth_site",
+        2,
+        vec![s_ty.clone(), n_ty.clone()],
+        dest_ty.clone(),
+        vec![
+            interior_local(0, None, &dest_ty),
+            interior_local(1, Some("s"), &s_ty),
+            interior_local(2, Some("n"), &n_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &s_ty)),
+                        interior_copy(interior_place(2, &n_ty)),
+                    ],
+                    interior_place(0, &dest_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [option_enum(0), opaque_cp],
+            "fun_decls": [caller, nth],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            {"Value": [10, opt_body]},
+            {"Value": [11, cp_body]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = lower_interior(&llbc, "nth_site");
+    let ops = graph_ops(&graph);
+    let paths: Vec<Vec<&str>> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.iter().map(String::as_str).collect()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|segments| segments.as_slice() == ["Wtf8CodePoints", "nth"]
+                || segments.last() == Some(&"nth")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))),
+        "nth must not survive as a FunctionPath: {paths:#?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
+        "call site calls the minted helper: {paths:#?}"
+    );
+    let mut nth_results = Vec::new();
+    let mut ctor_results = Vec::new();
+    let mut pos0 = Vec::new();
+    for op in &ops {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == [LL_WTF8_NTH] => {
+                if let Some(result) = &op.result {
+                    nth_results.push(result.clone());
+                }
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        is_struct: true,
+                        name,
+                        owner_path,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(
+                    owner_path.is_empty(),
+                    "payload ctor intern's under class_identity_spelling, not a crate-prefixed path: {owner_path:?}"
+                );
+                let identity = super::class_identity_spelling(
+                    "rustpython_wtf8::CodePoint",
+                    &std::collections::HashSet::new(),
+                );
+                assert_eq!(
+                    name.as_str(),
+                    identity.as_str(),
+                    "payload ctor name is intern_adt_type_decl_identity"
+                );
+                if let Some(result) = &op.result {
+                    ctor_results.push(result.clone());
+                }
+            }
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ty,
+                ..
+            } if field.name == "__pos_0" => {
+                pos0.push((v.clone(), ty.clone()));
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !ctor_results.is_empty(),
+        "Opaque dest payload must be a struct instance ctor"
+    );
+    assert!(
+        pos0.iter().any(|(v, ty)| {
+            ctor_results.iter().any(|ctor| ctor == v) && matches!(ty, ValueType::Ref(_))
+        }),
+        "Some.__pos_0 must store the struct instance, not the helper word: {pos0:#?}"
+    );
+    assert!(
+        pos0.iter()
+            .all(|(v, _)| nth_results.iter().all(|nth| nth != v)),
+        "Some.__pos_0 must not store the raw nth word"
+    );
+}
+
 /// `PyError(ptr)` is the payload pointer. Construction peels to that
 /// word; `retag_error_carrier` recasts once to the handle class
 /// (`error::PyError`). No FieldWrite / synthetic ctor.

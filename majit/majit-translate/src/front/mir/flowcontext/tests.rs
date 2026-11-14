@@ -4568,9 +4568,306 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
     );
 }
 
+#[test]
+fn collapse_fmt_chains_expands_zero_padded_u32_hex() {
+    use super::{collapse_fmt_chains, fmt_path_ends_with};
+    use crate::model::{CallTarget, OpKind, ValueType};
+
+    // `format!("'\\u{:04x}'", n: u32)` — zero-padded LowerHex over unsigned.
+    let piece_bytes = [
+        3i64,
+        b'\'' as i64,
+        b'\\' as i64,
+        b'u' as i64,
+        0xC3,
+        0x20,
+        0,
+        0,
+        0x69,
+        4,
+        0,
+        1,
+        b'\'' as i64,
+        0,
+    ];
+    let mut graph =
+        single_arg_lower_hex_fmt_graph(&piece_bytes, false, "Tuple<u32>", ValueType::Unsigned);
+    collapse_fmt_chains(&mut graph);
+
+    assert!(
+        !graph_has_fmt_format(&graph),
+        "alloc::fmt::format must be consumed"
+    );
+    let bf_block = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &vec!["__str_const".to_string(), "%x".to_string()]
+                )
+            })
+        })
+        .expect("hex placeholder is __str_const(\"%x\")");
+    let kinds: Vec<&OpKind> = bf_block.operations.iter().map(|op| &op.kind).collect();
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments == &vec!["__str_const".to_string(), "'\\u".to_string()]
+        )),
+        "leading literal '\\\\u: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments == &vec!["__str_const".to_string(), "'".to_string()]
+        )),
+        "trailing quote: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, OpKind::BinOp { op, .. } if op == "mod")),
+        "hex digits are '%x' % n (`ll_int2hex`): {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("r_uint")
+        )),
+        "unsigned interpolant skips r_uint: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments == &vec!["__strlen".to_string()]
+        )),
+        "pad measures digit length with __strlen: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(kind, OpKind::ConstInt(4))),
+        "pad width is ConstInt(4): {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(kind, OpKind::ConstInt(0))),
+        "pad clamps with ConstInt(0): {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments == &vec!["core".to_string(), "cmp".to_string(), "max".to_string()]
+        )),
+        "pad_len is max(0, width-len) (`builtin_max`): {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments == &vec!["__str_const".to_string(), "0000".to_string()]
+        )),
+        "zero pad source is four zeros: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("__getslice_rangeto")
+        )),
+        "pad is zeros[:width-len] (`ll_stringslice_startstop`): {kinds:?}"
+    );
+    assert!(
+        !bf_block.operations.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if fmt_path_ends_with(segments, &["fmt", "format"])
+        )),
+        "alloc::fmt::format must be consumed"
+    );
+}
+
+#[test]
+fn collapse_fmt_chains_zero_pads_lower_hex_width_8() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+
+    // Width 8 on a 2-digit value pads 6 zeros: raw = 8 - __strlen(digits),
+    // pad_len = max(0, raw) (`std_wp_number` / `builtin_max`), then
+    // `__getslice_rangeto("00000000", pad_len)` (`_ll_stringslice`).
+    let piece_bytes = [0xC3i64, 0x20, 0, 0, 0x69, 8, 0, 0];
+    let mut graph =
+        single_arg_lower_hex_fmt_graph(&piece_bytes, false, "Tuple<u32>", ValueType::Unsigned);
+    super::collapse_fmt_chains(&mut graph);
+
+    assert!(
+        !graph_has_fmt_format(&graph),
+        "alloc::fmt::format must be consumed"
+    );
+    let bf_block = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(8)))
+        })
+        .expect("pad width ConstInt(8)");
+    let width_var = bf_block
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::ConstInt(8)))
+        .and_then(|op| op.result.clone())
+        .expect("ConstInt(8) result");
+    let strlen_var = bf_block
+        .operations
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__strlen".to_string()]
+            )
+        })
+        .and_then(|op| op.result.clone())
+        .expect("__strlen result");
+    let sub = bf_block.operations.iter().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::BinOp { op, lhs, rhs, .. }
+                if op == "sub" && lhs.id() == width_var.id() && rhs.id() == strlen_var.id()
+        )
+    });
+    let Some(OpKind::BinOp { .. }) = sub.map(|op| &op.kind) else {
+        panic!(
+            "raw pad is ConstInt(8) - __strlen: {:?}",
+            bf_block.operations
+        );
+    };
+    let raw_pad = sub.and_then(|op| op.result.clone()).expect("sub result");
+    let zero = bf_block
+        .operations
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::ConstInt(0)))
+        .and_then(|op| op.result.clone())
+        .expect("ConstInt(0) for max");
+    let max_op = bf_block.operations.iter().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments == &vec!["core".to_string(), "cmp".to_string(), "max".to_string()]
+                && args.first().map(|a| a.id()) == Some(zero.id())
+                && args.get(1).map(|a| a.id()) == Some(raw_pad.id())
+        )
+    });
+    let pad_len = max_op
+        .and_then(|op| op.result.clone())
+        .expect("pad_len is max(0, 8-len)");
+    let zeros = bf_block
+        .operations
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__str_const".to_string(), "00000000".to_string()]
+            )
+        })
+        .and_then(|op| op.result.clone())
+        .expect("eight-zero const");
+    let getslice = bf_block.operations.iter().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("__getslice_rangeto")
+                && args.first().map(|a| a.id()) == Some(zeros.id())
+                && args.get(1).map(|a| a.id()) == Some(pad_len.id())
+        )
+    });
+    assert!(
+        getslice.is_some(),
+        "pad is zeros[:8-len]; ops={:?}",
+        bf_block.operations
+    );
+}
+
+#[test]
+fn collapse_fmt_chains_leaves_u8_byte_hex_for_nibble_collapse() {
+    use crate::model::ValueType;
+
+    // `format!("\\x{c:02x}")` over `Tuple<u8>` stays residual here so
+    // `collapse_lower_hex_byte_fmt_chains` can emit the nibble lookup.
+    let piece_bytes = [
+        2i64,
+        b'\\' as i64,
+        b'x' as i64,
+        0xC3,
+        0x20,
+        0,
+        0,
+        0x69,
+        2,
+        0,
+        0,
+    ];
+    let mut graph =
+        single_arg_lower_hex_fmt_graph(&piece_bytes, false, "Tuple<u8>", ValueType::Unsigned);
+    super::collapse_fmt_chains(&mut graph);
+    assert!(
+        graph_has_fmt_format(&graph),
+        "u8 {{:02x}} must not be stolen from the nibble collapse"
+    );
+}
+
 fn single_arg_lower_hex_fmt_fixture(
     piece_bytes: &[i64],
     spill: bool,
+) -> crate::model::FunctionGraph {
+    single_arg_lower_hex_fmt_graph(
+        piece_bytes,
+        spill,
+        "Tuple<i64>",
+        crate::model::ValueType::Int,
+    )
+}
+
+fn single_arg_lower_hex_fmt_graph(
+    piece_bytes: &[i64],
+    spill: bool,
+    tuple_ctor: &str,
+    value_ty: crate::model::ValueType,
 ) -> crate::model::FunctionGraph {
     use crate::flowspace::model::Variable;
     use crate::model::{
@@ -4589,7 +4886,7 @@ fn single_arg_lower_hex_fmt_fixture(
         result: Some(ctx.clone()),
         kind: OpKind::Input {
             name: "n".into(),
-            ty: ValueType::Int,
+            ty: value_ty.clone(),
             class_root: None,
         },
     });
@@ -4597,18 +4894,18 @@ fn single_arg_lower_hex_fmt_fixture(
     graph.block_mut(b0).operations.push(SpaceOperation {
         result: Some(tuple.clone()),
         kind: OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor("Tuple<i64>"),
+            target: CallTarget::synthetic_transparent_ctor(tuple_ctor),
             args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(Some("Tuple<i64>".to_string())),
+            result_ty: ValueType::Ref(Some(tuple_ctor.to_string())),
         },
     });
     graph.block_mut(b0).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::FieldWrite {
             base: tuple.clone(),
-            field: FieldDescriptor::new("__pos_0", Some("Tuple<i64>".to_string())),
+            field: FieldDescriptor::new("__pos_0", Some(tuple_ctor.to_string())),
             value: LinkArg::Value(ctx.clone()),
-            ty: ValueType::Int,
+            ty: value_ty.clone(),
         },
     });
     let arg_ref = Variable::new();
@@ -4616,8 +4913,8 @@ fn single_arg_lower_hex_fmt_fixture(
         result: Some(arg_ref.clone()),
         kind: OpKind::FieldRead {
             base: tuple,
-            field: FieldDescriptor::new("__pos_0", Some("Tuple<i64>".to_string())),
-            ty: ValueType::Int,
+            field: FieldDescriptor::new("__pos_0", Some(tuple_ctor.to_string())),
+            ty: value_ty,
             pure: false,
         },
     });

@@ -3030,6 +3030,11 @@ fn analyze_pipeline_from_module_paths(
     // plus `ll_setitem_fast`). Minted because `<[u8]>::to_vec` of a
     // window rewrites on the front spine before prepass.
     front::join_chars::register_ll_charpsize2uintlist_helper(&mut call_control);
+    // `unicodeobject.py` `_index_to_byte` without index storage:
+    // `Wtf8CodePoints::nth` walks with `rutf8.py` `next_codepoint_pos`
+    // / `codepoint_at_pos`. Minted because the rewrite runs on the
+    // front spine before prepass.
+    front::wtf8_nth::register_ll_wtf8_nth_helper(&mut call_control);
 
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
