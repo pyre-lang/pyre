@@ -15835,8 +15835,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(field_descr),
             item_index: -1,
-            target: OpRef::input_arg_ref(0),
-            value: OpRef::input_arg_int(1),
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged(0),
             value_tagged: tagged(1),
         }];
@@ -15949,8 +15949,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(field_descr),
             item_index: -1,
-            target: OpRef::input_arg_ref(0),
-            value: OpRef::NONE,
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];
@@ -16044,8 +16044,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(pending_descr),
             item_index: -1,
-            target: OpRef::input_arg_ref(0),
-            value: OpRef::NONE,
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];
@@ -16167,8 +16167,8 @@ mod tests {
         let pending = vec![majit_ir::GuardPendingFieldEntry {
             descr: Some(pending_descr),
             item_index: -1,
-            target: OpRef::input_arg_ref(0),
-            value: OpRef::NONE,
+            target: majit_ir::operand::Operand::None,
+            value: majit_ir::operand::Operand::None,
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];

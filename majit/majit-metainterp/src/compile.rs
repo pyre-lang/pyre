@@ -831,12 +831,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             }
         };
         for index in 0..array_len {
-            // compile.py — ConstInt(index) for the array subscript.
+            // compile.py ConstInt(index) for the array subscript.
             let elem_op = Op::new(
                 item_opcode,
                 &[
                     item_base.clone(),
-                    Operand::from_opref(OpRef::const_int(index as i64)),
+                    Operand::const_from_value(Value::Int(index as i64)),
                 ],
             );
             elem_op
@@ -1088,36 +1088,23 @@ pub fn compile_tmp_callback(
         .collect();
     let num_inputs = inputargs.len() as u32;
     //
-    // `compile.py:1125-1126`
+    // compile.py:
     //     k = jitdriver_sd.portal_runner_adr
     //     funcbox = history.ConstInt(adr2int(k))
-    //
-    // `compile.py` `callargs = [funcbox] + greenboxes + inputargs`.
-    //
-    // pyre layout: the CALL op's `args` slots reference `OpRef` numbers.
-    // InputArgs occupy `0..num_inputs` and are minted via
-    // `InputArg::opref()` so they carry RPython-parity InputArg{Int,
-    // Float,Ref} variants (resoperation.py InputArgInt/727/739). Constants
-    // (funcbox + greens) carry their value inline on the OpRef
-    // variant (history.py/268/314 `Const{Int,Float,Ptr}.value`).
-    // `compile.py:1126` funcbox = ConstInt(adr2int(k)) — `ConstInt.value`
-    // inline, carried directly on the OpRef variant.
-    let funcbox_ref = OpRef::const_int(jitdriver_sd.portal_runner_adr);
-    // Green boxes follow in declaration order.
+    //     callargs = [funcbox] + greenboxes + inputargs
+    // ConstInt.__init__ — a fresh Const box per use.
     let mut callargs_box: Vec<Operand> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
-    callargs_box.push(Operand::from_opref(funcbox_ref));
+    callargs_box.push(Operand::const_from_value(Value::Int(
+        jitdriver_sd.portal_runner_adr,
+    )));
     for gb in greenboxes.iter() {
-        // history.py/268/314 Const{Int,Float,Ptr}.value inline.
-        let g_ref = match *gb {
-            Value::Int(v) => OpRef::const_int(v),
-            Value::Ref(r) => OpRef::const_ptr(r),
-            Value::Float(f) => OpRef::const_float(f),
+        match *gb {
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
-        };
-        callargs_box.push(Operand::from_opref(g_ref));
+            value => callargs_box.push(Operand::const_from_value(value)),
+        }
     }
     // Red args — bound to the inputarg objects themselves
-    // (resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref}).
+    // (resoperation.py InputArgInt / InputArgFloat / InputArgRef).
     for ia in inputargs.iter() {
         callargs_box.push(Operand::from_bound_inputarg(ia));
     }
@@ -1212,8 +1199,8 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_operand;
-    use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_operand_from_opref};
+    use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotBox, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
     /// `normalize_closing_jump_args` repairs a JUMP slot from the LABEL slot
@@ -1312,18 +1299,20 @@ mod tests {
 
         let snapshot = Snapshot {
             vable_array: vec![
-                OpRef::input_arg_ref(0).into(),
-                OpRef::const_int(8).into(),
-                OpRef::const_int(777).into(), // code object payload
-                OpRef::const_int(2).into(),
-                OpRef::const_int(999).into(), // namespace payload
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::input_arg_ref(0))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(8))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(777))), // code object payload
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(2))),
+                SnapshotBox::from_cached(rooted_operand_from_opref(OpRef::const_int(999))), // namespace payload
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
                 py_pc: 8,
-                boxes: vec![OpRef::input_arg_int(1).into()],
+                boxes: vec![SnapshotBox::from_cached(rooted_operand_from_opref(
+                    OpRef::input_arg_int(1),
+                ))],
             }],
         };
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();

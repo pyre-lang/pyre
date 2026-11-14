@@ -412,7 +412,7 @@ fn snapshot_box_from_tagged<'c>(
         return (
             crate::resume::SnapshotBox {
                 opref: cached.to_opref(),
-                cached: None,
+                cached: Some(cached.clone()),
                 const_gcref: None,
             },
             Some(cached),

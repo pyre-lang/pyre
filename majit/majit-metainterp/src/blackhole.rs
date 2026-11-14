@@ -2700,6 +2700,12 @@ pub struct BlackholeInterpBuilder {
     /// recopying the six `__init__` slots (`blackhole.py`
     /// `BlackholeInterpBuilder.acquire_interp`).
     shared_fields_gen: u32,
+    /// Portal `StateFieldLayout`, constant for the driver that owns this
+    /// builder. `blackhole_from_resumedata` copies it onto the first
+    /// acquired (outermost) interp. Inlined frames stay default.
+    /// `release_interp` still defaults the interp so a pool hit does not
+    /// leak the previous resume's layout.
+    pub(crate) state_field_layout: StateFieldLayout,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -2774,6 +2780,7 @@ impl BlackholeInterpBuilder {
             ]),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
             shared_fields_gen: 0,
+            state_field_layout: StateFieldLayout::default(),
         }
     }
 

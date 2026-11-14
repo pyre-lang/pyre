@@ -818,6 +818,12 @@ impl Drop for JitlogAbortGuard {
 pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -> SnapshotBox {
     match tagged {
         crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
+            if opref.is_none() || opref.is_constant() {
+                return SnapshotBox::from_cached(Operand::from_opref(*opref));
+            }
+            // List-path capture holds only the snapshot coordinate here.
+            // The iterator box is planted by `attach_iter_cache` /
+            // `from_cached` at the caller that holds `TraceIterator._cache`.
             let tp = opref.ty().unwrap_or(*fallback_tp);
             SnapshotBox::typed(*opref, tp)
         }
@@ -829,8 +835,7 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
                 *val
             };
             let value = heap_value_for(*tp, bits);
-            let opref = majit_ir::OpRef::const_inline_from_value(&value);
-            SnapshotBox::typed(opref, *tp)
+            SnapshotBox::from_cached(Operand::const_from_value(value))
         }
     }
 }
@@ -1003,12 +1008,13 @@ fn snapshot_maps_from_ctx(
 /// `ResumeDataLoopMemo.number` source for an optimizer that walks the
 /// recorded operations themselves (`SimpleCompileData`, the no-unroll
 /// retry): each recorded position is its own box in `_cache`.
-fn recorder_self_feed(
-    recorder: &crate::recorder::Trace,
+/// `opencoder.py TraceIterator.__init__` `_cache` seeding: each InputArg
+/// and value op is the box at its position.
+fn unique_cache_from_bound_ops(
     inputargs: &[majit_ir::InputArgRc],
     ops: &[OpRc],
-) -> crate::recorder::ByteBridgeResume {
-    let mut cache: Vec<Option<majit_ir::operand::Operand>> = Vec::new();
+) -> Vec<Option<Operand>> {
+    let mut cache: Vec<Option<Operand>> = Vec::new();
     let mut put = |pos: usize, operand| {
         if cache.len() <= pos {
             cache.resize(pos + 1, None);
@@ -1018,18 +1024,42 @@ fn recorder_self_feed(
     for inputarg in inputargs {
         put(
             inputarg.index as usize,
-            majit_ir::operand::Operand::from_bound_inputarg(inputarg),
+            Operand::from_bound_inputarg(inputarg),
         );
     }
     for op in ops {
         if op.result_type() != majit_ir::Type::Void {
-            put(
-                op.pos().get().raw() as usize,
-                majit_ir::operand::Operand::from_bound_op(op),
-            );
+            put(op.pos().get().raw() as usize, Operand::from_bound_op(op));
         }
     }
-    crate::recorder::ByteBridgeResume::from_recorder(recorder, cache)
+    cache
+}
+
+fn attach_resume_caches_from_feed_or_ops(
+    boxes: &mut SnapshotBoxes,
+    vable: &mut SnapshotBoxes,
+    vref: &mut SnapshotBoxes,
+    feed: Option<&crate::recorder::ByteBridgeResume>,
+    inputargs: &[majit_ir::InputArgRc],
+    ops: &[OpRc],
+) {
+    if let Some(feed) = feed {
+        crate::optimizeopt::attach_resume_snapshot_caches(boxes, vable, vref, feed.unique_cache());
+    } else {
+        let cache = unique_cache_from_bound_ops(inputargs, ops);
+        crate::optimizeopt::attach_resume_snapshot_caches(boxes, vable, vref, &cache);
+    }
+}
+
+fn recorder_self_feed(
+    recorder: &crate::recorder::Trace,
+    inputargs: &[majit_ir::InputArgRc],
+    ops: &[OpRc],
+) -> crate::recorder::ByteBridgeResume {
+    crate::recorder::ByteBridgeResume::from_recorder(
+        recorder,
+        unique_cache_from_bound_ops(inputargs, ops),
+    )
 }
 
 fn snapshot_map_from_byte_recorder(
@@ -1368,11 +1398,26 @@ mod byte_snapshot_map_tests {
 
         let mut opt = Optimizer::default_pipeline();
         opt.simple_compile = true;
-        opt.snapshot_boxes = maps.0;
-        opt.snapshot_frame_sizes = maps.1;
-        opt.snapshot_vable_boxes = maps.2;
-        opt.snapshot_vref_boxes = maps.3;
-        opt.snapshot_frame_pcs = maps.4;
+        let (
+            mut snapshot_boxes,
+            snapshot_frame_sizes,
+            mut snapshot_vable_boxes,
+            mut snapshot_vref_boxes,
+            snapshot_frame_pcs,
+        ) = maps;
+        attach_resume_caches_from_feed_or_ops(
+            &mut snapshot_boxes,
+            &mut snapshot_vable_boxes,
+            &mut snapshot_vref_boxes,
+            None,
+            rec.inputargs(),
+            &ops,
+        );
+        opt.snapshot_boxes = snapshot_boxes;
+        opt.snapshot_frame_sizes = snapshot_frame_sizes;
+        opt.snapshot_vable_boxes = snapshot_vable_boxes;
+        opt.snapshot_vref_boxes = snapshot_vref_boxes;
+        opt.snapshot_frame_pcs = snapshot_frame_pcs;
         opt.trace_inputargs = rec
             .inputargs()
             .iter()
@@ -1515,13 +1560,22 @@ pub(crate) fn translate_trace_iter_opref(
 /// `opencoder.py` `TraceIterator._get`: rewrite one original JUMP /
 /// `runtime_boxes` entry into the fresh-iterator namespace. Const boxes
 /// stay the same object (`ConstInt` identity); they never occupy `_cache`.
-/// Bound boxes look up `_cache` by recorder position (class-C key).
+/// Bound boxes look up `_cache` by recorder position (class-C key),
+/// except when the box already *is* a cache entry: in-place remint
+/// (`prepare_bridge_trace_from_owned`) rewrites `pos` on the live
+/// producer, so `to_opref()` is the reminted index and the original-key
+/// lookup would miss. That box is already the `_get` result.
 fn translate_trace_iter_runtime_box(box_: Operand, cache: &[Option<Operand>]) -> Operand {
     if box_.is_none() {
         return Operand::None;
     }
     if box_.is_constant() {
         return box_;
+    }
+    for slot in cache.iter().flatten() {
+        if box_.same_box(slot) {
+            return box_;
+        }
     }
     let opref = box_.to_opref();
     cache
@@ -4521,16 +4575,37 @@ impl<M: Clone> MetaInterp<M> {
     /// tally is split — the census, the per-guard warm-state counter, and the
     /// hook see every failure, since bridge-compilation thresholds and guard
     /// attribution still apply to the poll.
-    #[inline]
     ///
     /// The descr identity distinguishes the original guard from each new
     /// bridge's guards.
+    #[inline]
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
         descr: &dyn majit_ir::FailDescr,
         back_edge_poll: bool,
     ) {
+        // jitprof.py integer counters. `AbstractResumeGuardDescr.handle_fail`
+        // has no per-fail logger; `debug_print` is `have_debug_prints`.
+        let tally = if back_edge_poll {
+            &mut self.stats.back_edge_polls
+        } else {
+            &mut self.stats.guard_failures
+        };
+        *tally += 1;
+        if self.hooks.on_guard_failure.is_none()
+            && !guardlog_enabled()
+            && !crate::majit_log_enabled()
+            && !crate::guard_census_enabled()
+        {
+            return;
+        }
+        self.record_guard_failure_event_diag(green_key, descr);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_guard_failure_event_diag(&self, green_key: u64, descr: &dyn majit_ir::FailDescr) {
         let descr_id = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         if guardlog_enabled() {
             eprintln!("@@@GUARD key={green_key} descr=0x{descr_id:x}");
@@ -4541,16 +4616,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key, descr_id
             );
         }
-        let tally = if back_edge_poll {
-            &mut self.stats.back_edge_polls
-        } else {
-            &mut self.stats.guard_failures
-        };
-        *tally += 1;
         crate::guard_census_record(green_key, descr_id);
-        // logger.py has no per-fail IndexMap; jitprof.py counts
-        // Counters.OPS / ABORT_* as integers. The integer
-        // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, descr_id, 0);
         }
@@ -9763,14 +9829,14 @@ impl<M: Clone> MetaInterp<M> {
                         let resume = snapshot_recorder.as_ref().map(|recorder| {
                             recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
                         });
-                        if let Some(ref feed) = resume {
-                            crate::optimizeopt::attach_resume_snapshot_caches(
-                                &mut simple_opt.snapshot_boxes,
-                                &mut simple_opt.snapshot_vable_boxes,
-                                &mut simple_opt.snapshot_vref_boxes,
-                                feed.unique_cache(),
-                            );
-                        }
+                        attach_resume_caches_from_feed_or_ops(
+                            &mut simple_opt.snapshot_boxes,
+                            &mut simple_opt.snapshot_vable_boxes,
+                            &mut simple_opt.snapshot_vref_boxes,
+                            resume.as_ref(),
+                            &trace.inputargs,
+                            &retry_ops,
+                        );
                         simple_opt.byte_bridge_resume = resume;
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12529,14 +12595,14 @@ impl<M: Clone> MetaInterp<M> {
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
-        if let Some(ref feed) = resume {
-            crate::optimizeopt::attach_resume_snapshot_caches(
-                &mut optimizer.snapshot_boxes,
-                &mut optimizer.snapshot_vable_boxes,
-                &mut optimizer.snapshot_vref_boxes,
-                feed.unique_cache(),
-            );
-        }
+        attach_resume_caches_from_feed_or_ops(
+            &mut optimizer.snapshot_boxes,
+            &mut optimizer.snapshot_vable_boxes,
+            &mut optimizer.snapshot_vref_boxes,
+            resume.as_ref(),
+            &trace.inputargs,
+            &trace.ops,
+        );
         optimizer.byte_bridge_resume = resume;
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
@@ -13008,14 +13074,14 @@ impl<M: Clone> MetaInterp<M> {
         let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
-        if let Some(ref feed) = resume {
-            crate::optimizeopt::attach_resume_snapshot_caches(
-                &mut optimizer.snapshot_boxes,
-                &mut optimizer.snapshot_vable_boxes,
-                &mut optimizer.snapshot_vref_boxes,
-                feed.unique_cache(),
-            );
-        }
+        attach_resume_caches_from_feed_or_ops(
+            &mut optimizer.snapshot_boxes,
+            &mut optimizer.snapshot_vable_boxes,
+            &mut optimizer.snapshot_vref_boxes,
+            resume.as_ref(),
+            &trace.inputargs,
+            &trace.ops,
+        );
         optimizer.byte_bridge_resume = resume;
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
@@ -32017,9 +32083,15 @@ mod tests {
             &mut snapshot_boxes,
             0,
             vec![
-                OpRef::input_arg_int(0).into(),
-                OpRef::ref_op(2).into(),
-                OpRef::int_op(3).into(),
+                SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                    OpRef::input_arg_int(0),
+                )),
+                SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                    OpRef::ref_op(2),
+                )),
+                SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                    OpRef::int_op(3),
+                )),
             ]
             .into(),
         );
@@ -32027,7 +32099,15 @@ mod tests {
         snapshot_insert(
             &mut snapshot_vable_boxes,
             0,
-            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
+            vec![
+                SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                    OpRef::input_arg_ref(1),
+                )),
+                SnapshotBox::from_cached(crate::history::test_support::rooted_operand_from_opref(
+                    OpRef::ref_op(2),
+                )),
+            ]
+            .into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::new_resume_storage(
@@ -32128,6 +32208,64 @@ mod tests {
             "runtime_boxes remap onto the reminted JUMP args"
         );
         assert!(prepared.runtime_boxes[1].same_box(&prepared.ops[2].arg(1)));
+    }
+
+    /// `prepare_bridge_trace_from_owned` remints producer `OpRc`s in place
+    /// (`pos` is interior-mutable). `runtime_boxes` bound to those same
+    /// objects must still resolve to the prepared producer after the
+    /// reminted position diverges from the original recorder index
+    /// (`opencoder.py TraceIterator._get`).
+    #[test]
+    fn prepare_bridge_from_owned_runtime_boxes_follow_in_place_remint() {
+        let ia = InputArg::new_int_rc(0);
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_inputarg(&ia),
+                Operand::from_bound_inputarg(&ia),
+            ],
+        );
+        add.pos().set(OpRef::int_op(5));
+        let add_rc = OpRc::new(add);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                Operand::from_bound_op(&add_rc),
+                Operand::from_bound_inputarg(&ia),
+            ],
+        );
+        jump.pos().set(OpRef::NONE);
+        let jump_rc = OpRc::new(jump);
+        let runtime_boxes = vec![
+            Operand::from_bound_op(&add_rc),
+            Operand::from_bound_inputarg(&ia),
+        ];
+        let prepared = prepare_bridge_trace_from_owned(
+            vec![add_rc, jump_rc],
+            std::slice::from_ref(&ia),
+            Vec::new(),
+            SnapshotFrameSizes::new(),
+            Vec::new(),
+            Vec::new(),
+            SnapshotFramePcs::new(),
+            None,
+            runtime_boxes,
+            100,
+        );
+        assert_ne!(
+            prepared.ops[0].pos().get().raw(),
+            5,
+            "reminted producer position must differ from the original recorder index"
+        );
+        assert!(
+            prepared.runtime_boxes[0].same_box(&Operand::from_bound_op(&prepared.ops[0])),
+            "op-bound runtime box must be the in-place reminted producer"
+        );
+        assert!(
+            prepared.runtime_boxes[1]
+                .same_box(&Operand::from_bound_inputarg(&prepared.inputargs[0])),
+            "InputArg-bound runtime box must be the reminted inputarg"
+        );
     }
 
     #[test]

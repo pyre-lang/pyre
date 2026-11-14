@@ -27,13 +27,13 @@ pub use crate::resume::decode_box;
 
 /// bridgeopt.py tag_box.
 pub fn tag_box(
-    opref: OpRef,
+    box_: &Operand,
     liveboxes_from_env: &crate::resume::LiveboxMap,
     memo: &mut crate::resume::ResumeDataLoopMemo,
     env: &dyn majit_ir::BoxEnv,
     new_liveboxes: &crate::resume::LiveboxMap,
 ) -> Result<i16, crate::resume::TagOverflow> {
-    memo._gettagged(opref, env, liveboxes_from_env, new_liveboxes)
+    memo._gettagged(box_, env, liveboxes_from_env, new_liveboxes)
 }
 
 /// bridgeopt.py deserialize_optimizer_knowledge.
@@ -134,61 +134,60 @@ pub fn serialize_optimizer_knowledge(
         return Ok(());
     };
     // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
-    let is_const =
-        |opref: OpRef| opref.is_constant() || env.is_const(&env.get_box_replacement_operand(opref));
-    let field_ok = |obj: OpRef, val: OpRef| {
-        (is_const(obj) || available_boxes.contains_key(&env.get_box_replacement_operand(obj)))
-            && (is_const(val)
-                || available_boxes.contains_key(&env.get_box_replacement_operand(val)))
+    let field_ok = |obj: &Operand, val: &Operand| {
+        // bridgeopt.py serialize_optheap membership is after
+        // `AbstractValue.get_box_replacement`. Walk the box, then test
+        // Const / available_boxes (`ResumeDataVirtualAdder._gettagged`).
+        let obj = obj.get_box_replacement(false);
+        let val = val.get_box_replacement(false);
+        (obj.is_constant() || env.is_const(&obj) || available_boxes.contains_key(&obj))
+            && (val.is_constant() || env.is_const(&val) || available_boxes.contains_key(&val))
     };
-    let triples_struct: Vec<(OpRef, i32, OpRef)> = knowledge
+    let triples_struct: Vec<&(Operand, i32, Operand)> = knowledge
         .heap_fields
         .iter()
-        .copied()
-        .filter(|&(obj, _, val)| field_ok(obj, val))
+        .filter(|(obj, _, val)| field_ok(obj, val))
         .collect();
     numb_state.append_int(triples_struct.len() as i64);
-    for &(obj, descr_idx, val) in &triples_struct {
+    for (obj, descr_idx, val) in triples_struct {
         let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
-        numb_state.append_int(descr_idx as i64);
+        numb_state.append_int(*descr_idx as i64);
         let val_tag = tag_box(val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
     // bridgeopt.py:102-108: array items
-    let triples_array: Vec<(OpRef, i64, i32, OpRef)> = knowledge
+    let triples_array: Vec<&(Operand, i64, i32, Operand)> = knowledge
         .heap_arrayitems
         .iter()
-        .copied()
-        .filter(|&(obj, _, _, val)| field_ok(obj, val))
+        .filter(|(obj, _, _, val)| field_ok(obj, val))
         .collect();
     numb_state.append_int(triples_array.len() as i64);
-    for &(obj, index, descr_idx, val) in &triples_array {
+    for (obj, index, descr_idx, val) in triples_array {
         let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
         // index unchanged; resumecode.py enforces SHORT range on the
         // i64 value, panicking instead of silently wrapping a too-large
         // index into an i32.
-        numb_state.append_int(index);
-        numb_state.append_int(descr_idx as i64);
+        numb_state.append_int(*index);
+        numb_state.append_int(*descr_idx as i64);
         let val_tag = tag_box(val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
 
     // bridgeopt.py:113-122: loopinvariant results
-    let tuples_loopinvariant: Vec<(i64, OpRef)> = knowledge
+    let tuples_loopinvariant: Vec<&(i64, Operand)> = knowledge
         .loopinvariant_results
         .iter()
-        .copied()
-        .filter(|&(_, result)| {
-            is_const(result)
-                || available_boxes.contains_key(&env.get_box_replacement_operand(result))
+        .filter(|(_, result)| {
+            let result = result.get_box_replacement(false);
+            result.is_constant() || env.is_const(&result) || available_boxes.contains_key(&result)
         })
         .collect();
     numb_state.append_int(tuples_loopinvariant.len() as i64);
-    for &(const_ptr, result) in &tuples_loopinvariant {
-        let const_tag = memo.getconst_int(const_ptr)?;
+    for (const_ptr, result) in tuples_loopinvariant {
+        let const_tag = memo.getconst_int(*const_ptr)?;
         numb_state.writer.append_short(const_tag as i32);
         let result_tag = tag_box(result, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(result_tag as i32);

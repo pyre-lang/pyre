@@ -4175,7 +4175,7 @@ mod tests {
         }
     }
 
-    use super::super::seed_guard_snapshots_with;
+    use super::super::{seed_guard_snapshots_with, snapshot_contains, snapshot_insert};
 
     fn seed_virtualize_guard_snapshots(ops: &[Op]) -> (Vec<Op>, crate::optimizeopt::SnapshotBoxes) {
         // These direct optimizer tests do not build MIFrame objects.  Their
@@ -4185,9 +4185,46 @@ mod tests {
         seed_guard_snapshots_with(ops, |guard| {
             guard
                 .guard_fail_args()
-                .map(|fail_args| fail_args.iter().map(|a| a.to_opref()).collect())
+                .map(|fail_args| fail_args.to_vec())
                 .unwrap_or_default()
         })
+    }
+
+    /// Plant `SnapshotBox.cached` from rebound fail_args (`TraceIterator._cache`).
+    /// Call after `rebind_wrapped_trace_ops` so a virtual New is the box
+    /// numbering walks, not a same-position dummy.
+    fn seed_virtualize_guard_snapshots_rc(ops: &[OpRc]) -> crate::optimizeopt::SnapshotBoxes {
+        use crate::resume::SnapshotBox;
+        let mut snapshots: crate::optimizeopt::SnapshotBoxes = Vec::new();
+        let mut next_resume_pos = 0i32;
+        for op in ops.iter().filter(|op| op.opcode.is_guard()) {
+            let snapshot_boxes = op
+                .guard_fail_args()
+                .map(|fail_args| fail_args.to_vec())
+                .unwrap_or_default();
+            let resume_pos = if op.rd_resume_position() >= 0
+                && !snapshot_contains(&snapshots, op.rd_resume_position())
+            {
+                op.rd_resume_position()
+            } else {
+                while snapshot_contains(&snapshots, next_resume_pos) {
+                    next_resume_pos += 1;
+                }
+                let resume_pos = next_resume_pos;
+                next_resume_pos += 1;
+                resume_pos
+            };
+            op.set_rd_resume_position(resume_pos);
+            snapshot_insert(
+                &mut snapshots,
+                resume_pos,
+                snapshot_boxes
+                    .into_iter()
+                    .map(SnapshotBox::from_cached)
+                    .collect(),
+            );
+        }
+        snapshots
     }
 
     /// Canonicalize an op's args the way the production driver does in
@@ -4277,10 +4314,19 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
-        opt.trace_inputargs = trace_inputargs_from_ops(&ops, &types);
+        let ops_rc = Optimizer::rebind_wrapped_trace_ops(ops);
+        let snapshots = seed_virtualize_guard_snapshots_rc(&ops_rc);
+        opt.trace_inputargs = trace_inputargs_from_ops(&ops_rc, &types);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
+        opt.optimize_with_constants_and_inputs_oprc(
+            &ops_rc,
+            &mut majit_ir::ConstMap::default(),
+            1024,
+        )
+        .expect("test: unexpected InvalidLoop")
+        .into_iter()
+        .map(|rc| (*rc).clone())
+        .collect()
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
@@ -4307,11 +4353,10 @@ mod tests {
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
-        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         // Constants are Const operands in the args. A position-keyed
         // `make_constant_box` would forward a different object than the one
         // the ops carry.
-        let mut owned: Vec<Op> = ops;
+        let mut owned: Vec<Op> = ops.to_vec();
         for op in &mut owned {
             for i in 0..op.num_args() {
                 let r = op.arg_ref(i).to_opref();
@@ -4322,31 +4367,28 @@ mod tests {
         }
 
         // One object per position: a producer's result box is what later
-        // args at that position carry, and a leaf keeps the first operand.
-        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        // args / fail_args at that position carry (`TraceIterator._cache`).
+        let wrapped = Optimizer::rebind_wrapped_trace_ops(&owned);
+        let snapshots = seed_virtualize_guard_snapshots_rc(&wrapped);
         let mut leaves: Vec<Operand> = Vec::new();
-        for op in &owned {
-            let rc = OpRc::new(op.clone());
+        for rc in &wrapped {
             for i in 0..rc.num_args() {
                 let arg = rc.arg(i);
                 if arg.is_constant() || arg.is_none() {
                     continue;
                 }
                 let opref = arg.to_opref();
-                if let Some(prod) = wrapped.iter().rev().find(|p| {
+                if wrapped.iter().any(|p| {
                     let pos = p.pos().get();
                     pos == opref && p.opcode.result_type() != Type::Void
                 }) {
-                    rc.setarg(i, Operand::from_bound_op(prod));
                     continue;
                 }
-                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
-                    rc.setarg(i, leaf.clone());
+                if leaves.iter().any(|leaf| leaf.to_opref() == opref) {
                     continue;
                 }
                 leaves.push(arg);
             }
-            wrapped.push(rc);
         }
 
         let mut ctx = OptContext::new(wrapped.len());
@@ -4856,7 +4898,7 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::Label, &[vable.clone(), i1.clone(), i2.clone()]),
             Op::new(OpCode::GuardTrue, &[i1.clone()]),
-            Op::new(OpCode::Jump, &[vable, i1, i2]),
+            Op::new(OpCode::Jump, &[vable.clone(), i1.clone(), i2.clone()]),
         ];
         ops[1].setfailargs(Default::default());
         assign_positions(&mut ops);
@@ -4872,9 +4914,9 @@ mod tests {
         // its one array item.
         opt.snapshot_vable_boxes = vec![Some(
             [
-                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
-                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(1, Type::Int), Type::Int),
-                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(2, Type::Int), Type::Int),
+                crate::resume::SnapshotBox::from_cached(vable),
+                crate::resume::SnapshotBox::from_cached(i1),
+                crate::resume::SnapshotBox::from_cached(i2),
             ]
             .into_iter()
             .collect(),

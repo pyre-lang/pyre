@@ -1136,7 +1136,8 @@ impl RdVirtualInfo {
 /// after virtual materialization.
 ///
 /// Fields mirror PENDINGFIELDSTRUCT (lldescr / num / fieldnum / itemindex).
-/// `target` / `value` are pyre-only (SSA position before resume numbering).
+/// `target` / `value` are the boxes `ResumeDataVirtualAdder._add_pending_fields`
+/// reads via `get_box_replacement(op.getarg(0))` / `getarg(1)`.
 #[derive(Clone, Debug)]
 pub struct GuardPendingFieldEntry {
     /// resume.py:88 `lldescr`: the field/array descriptor itself. Carries
@@ -1146,11 +1147,12 @@ pub struct GuardPendingFieldEntry {
     /// resume.py:91 `itemindex` — for SETARRAYITEM_GC the constant array
     /// index, -1 for SETFIELD_GC.
     pub item_index: i32,
-    /// OpRef of the target struct/array (compile-time SSA position,
-    /// pyre-only — RPython resolves this via Box identity).
-    pub target: OpRef,
-    /// OpRef of the value being stored (compile-time SSA position).
-    pub value: OpRef,
+    /// Target struct/array box (`util.get_box_replacement` of the pending op's
+    /// arg 0).
+    pub target: Operand,
+    /// Value box being stored (`util.get_box_replacement` of the pending op's
+    /// arg 1, or arg 2 for SETARRAYITEM_GC).
+    pub value: Operand,
     /// resume.py `num` — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
     /// Set by store_final_boxes_in_guard when resume numbering is available.
     pub target_tagged: i16,
@@ -1168,9 +1170,9 @@ pub struct VirtualFieldsInfo {
     /// carried as `ConstInt(ptr2int(typeptr))` (model.py:199-201), never a
     /// traced ref.
     pub known_class: Option<i64>,
-    /// Field OpRefs (after get_box_replacement). Order matches the
-    /// virtual's field descriptor list.
-    pub field_oprefs: Vec<OpRef>,
+    /// Field boxes after `AbstractValue.get_box_replacement`. Order matches
+    /// the virtual's field descriptor list.
+    pub field_boxes: Vec<Operand>,
 }
 
 /// resume.py parity: box environment for _number_boxes.
@@ -1201,7 +1203,8 @@ pub trait BoxEnv {
     fn is_const(&self, box_: &Operand) -> bool;
     /// Constant value + type. Only valid when is_const returns true.
     fn get_const(&self, box_: &Operand) -> (i64, Type);
-    /// resume.py:211,214 — box.type
+    /// `resume.py ResumeDataLoopMemo._number_boxes` — box.type. Production numbering uses
+    /// `AbstractValue.type` on the box already in hand (`box.type_()`).
     fn get_type(&self, opref: OpRef) -> Type;
     /// resume.py:212-213 — getptrinfo(box) is not None and info.is_virtual()
     fn is_virtual_ref(&self, box_: &Operand) -> bool;
@@ -1209,11 +1212,12 @@ pub trait BoxEnv {
     fn is_virtual_raw(&self, box_: &Operand) -> bool;
     /// resume.py:419-426 — getptrinfo(box).visitor_walk_recursive(box, self)
     ///
-    /// Returns virtual field info for the given OpRef if it is a virtual
-    /// object. Called by `finish()` to discover virtual fields inline,
-    /// matching RPython's callback-based `visitor_walk_recursive` pattern.
-    /// Default returns None (no virtual info available).
-    fn get_virtual_fields(&self, _opref: OpRef) -> Option<VirtualFieldsInfo> {
+    /// Returns virtual field info for the given box if it is a virtual
+    /// object. Called by `ResumeDataVirtualAdder.finish` to discover virtual
+    /// fields inline, matching RPython's callback-based
+    /// `visitor_walk_recursive` pattern. Default returns None (no virtual
+    /// info available).
+    fn get_virtual_fields(&self, _box: &Operand) -> Option<VirtualFieldsInfo> {
         None
     }
     /// bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None.
@@ -1221,15 +1225,15 @@ pub trait BoxEnv {
     fn has_known_class(&self, _box: &Operand) -> bool {
         false
     }
-    /// resume.py make_virtual_info(info, fieldnums) parity.
+    /// resume.py `ResumeDataVirtualAdder.make_virtual_info` parity.
     ///
-    /// Creates an `RdVirtualInfo` for a virtual OpRef with given fieldnums.
+    /// Creates an `RdVirtualInfo` for a virtual box with given fieldnums.
     /// Dispatches on the virtual type (Virtual, VStruct, VArray, etc.)
     /// to produce the correct variant — matching RPython's
     /// `info.visitor_dispatch_virtual_type(self)` + `vinfo.set_content(fieldnums)`.
     fn make_virtual_info(
         &self,
-        _opref: OpRef,
+        _box: &Operand,
         _fieldnums: Vec<i16>,
     ) -> Option<std::rc::Rc<RdVirtualInfo>> {
         None
@@ -1237,9 +1241,9 @@ pub trait BoxEnv {
     /// resume.py:504-505 `if vinfo.fieldnums is not fieldnums: memo.nvreused += 1`.
     ///
     /// Returns true when `make_virtual_info()` would reuse an already-cached
-    /// virtual info object for the given `(opref, fieldnums)` instead of
+    /// virtual info object for the given `(box, fieldnums)` instead of
     /// allocating a fresh one.
-    fn virtual_info_would_be_reused(&self, _opref: OpRef, _fieldnums: &[i16]) -> bool {
+    fn virtual_info_would_be_reused(&self, _box: &Operand, _fieldnums: &[i16]) -> bool {
         false
     }
 }

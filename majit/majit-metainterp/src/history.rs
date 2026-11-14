@@ -964,8 +964,12 @@ impl TreeLoop {
         use majit_ir::operand::Operand;
         let bind_remapped =
             |r: OpRef, producers: &[OpRc], inputargs: &[majit_ir::InputArgRc]| -> Operand {
-                if r.is_none() || r.is_constant() {
-                    return Operand::from_opref(r);
+                if r.is_none() {
+                    return Operand::None;
+                }
+                if let Some(value) = r.inline_const_to_value() {
+                    // ConstInt.__init__ — the Const-namespace OpRef is the box.
+                    return Operand::const_from_value(value);
                 }
                 if matches!(
                     r,

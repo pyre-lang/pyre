@@ -4083,10 +4083,20 @@ pub(crate) fn lower_dispatch_body(
         .max(int_identity_end)
         .max(ref_identity_end)
         .max(config.float_identity_end());
+    // Working registers of every bank share `next_reg` at allocation
+    // time (`alloc_reg`), so the int and ref identity prefixes pin that
+    // floor: a temporary must not reuse i0/r0 or a state-field slot.
+    // The float bank is independent. `assembler.py` `Assembler.count_reg`
+    // / `assemble` set `count_regs['float']` from the highest float
+    // register index seen, 0 when the graph never mentions one. Pinning
+    // `floats` to `next_reg` reserved an unused float window the size of
+    // the int/ref floor (`num_regs_f = 3` on a portal with no float
+    // greens, state, or locals) and `copy_constants` walked it on every
+    // guard failure.
     let pinned_floor = super::regalloc::RegisterCounts {
         ints: lowerer.next_reg,
         refs: lowerer.next_reg,
-        floats: lowerer.next_reg,
+        floats: next_input_f.max(config.float_identity_end()),
     };
 
     // A.3.6.1 (`jtransform.py` `promote_greens`): bind body-local `let` stmts that

@@ -5574,6 +5574,46 @@ mod tests {
         );
     }
 
+    /// `assembler.py` `Assembler.assemble` / `count_reg` size `num_regs_f`
+    /// from the highest float register seen. A portal that never mentions a
+    /// float must not inherit the int/ref `next_reg` floor as an unused
+    /// float bank.
+    #[test]
+    fn portal_without_float_state_emits_zero_float_regs() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < program.len() {
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                state.acc
+            }
+        };
+        let compact = transform_jit_interp(config, func)
+            .to_string()
+            .replace(' ', "");
+        assert!(
+            compact.contains("ensure_f_regs(0u16)"),
+            "no-float portal must emit ensure_f_regs(0). compact expansion:\n{compact}"
+        );
+    }
+
     /// A function-scope `let mut` green is restored from
     /// `PortalResume` / `ContinueRunningNormallyArgs` and passed into
     /// `__merge_*`. A loop-head `let` of the same name is not a carried

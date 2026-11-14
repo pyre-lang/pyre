@@ -153,21 +153,6 @@ use crate::optimizeopt::OptContext;
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 
-/// 4e: `get_runtime_field` / `get_runtime_item` / `get_runtime_interiorfield`
-/// still return a const `OpRef`. Wrap that const value as an Operand at the
-/// helper boundary; do not rebuild a ResOp from the returned position.
-fn operand_from_runtime_helper_const(opref: OpRef) -> Option<Operand> {
-    if let Some(v) = opref.as_const_int() {
-        Some(Operand::const_from_value(Value::Int(v)))
-    } else if let Some(v) = opref.as_const_float() {
-        Some(Operand::const_from_value(Value::Float(v)))
-    } else {
-        opref
-            .as_const_ptr()
-            .map(|v| Operand::const_from_value(Value::Ref(v)))
-    }
-}
-
 /// Abstract info for one value at the loop boundary.
 ///
 /// Mirrors the hierarchy in RPython's `AbstractVirtualStateInfo` and its subclasses:
@@ -1148,10 +1133,10 @@ impl VirtualState {
                 // bridge types; reject the cross here so the unrolled
                 // trace falls back to `jump_to_preamble` exactly as RPython
                 // raises VirtualStatesCantMatch.
-                if let (Some(expected), Some(actual)) = (
-                    node.info.info_type(),
-                    ctx.opref_type(resolved_for_store.to_opref()),
-                ) && expected != actual
+                let t = resolved_for_store.type_();
+                if let (Some(expected), Some(actual)) =
+                    (node.info.info_type(), (t != Type::Void).then_some(t))
+                    && expected != actual
                 {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -1353,7 +1338,7 @@ impl VirtualState {
                     // box with no value at all.
                     let observed = runtime_box
                         .as_ref()
-                        .and_then(|rb| state.ctx.runtime_value_of(rb.to_opref()));
+                        .and_then(|rb| state.ctx.runtime_value_of(rb));
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={:?} runtime={runtime_box:?} runtime_value={runtime_value:?} observed={observed:?} expected={expected:?} incoming={incoming:?}",
                         box_.to_opref()
@@ -1566,7 +1551,7 @@ impl VirtualState {
                 // route through `runtime_value_of`.
                 if runtime_box
                     .as_ref()
-                    .and_then(|runtime_box| state.ctx.runtime_value_of(runtime_box.to_opref()))
+                    .and_then(|runtime_box| state.ctx.runtime_value_of(runtime_box))
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
                     state.extra_guards.push(GuardRequirement::GuardValue {
@@ -1607,8 +1592,7 @@ impl VirtualState {
                 };
                 // virtualstate.py `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
-                // 4e: `runtime_cls_of` still takes OpRef; convert at this helper boundary.
-                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb.to_opref()) else {
+                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
                     return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
@@ -1630,8 +1614,7 @@ impl VirtualState {
                 };
                 // virtualstate.py `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
-                // 4e: `runtime_cls_of` still takes OpRef; convert at this helper boundary.
-                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb.to_opref()) else {
+                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
                     return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
@@ -1683,7 +1666,7 @@ impl VirtualState {
                 // read wrapped as ConstRef(NULL) must NOT emit GUARD_NONNULL.
                 if runtime_box
                     .as_ref()
-                    .is_some_and(|rb| state.ctx.runtime_nonnull(rb.to_opref()))
+                    .is_some_and(|rb| state.ctx.runtime_nonnull(rb))
                 {
                     state.extra_guards.push(GuardRequirement::GuardNonnull {
                         arg_index: arg_idx,
@@ -1745,7 +1728,7 @@ impl VirtualState {
                     // untouched on a rejected match.
                     let within = runtime_box
                         .as_ref()
-                        .and_then(|rb| state.ctx.runtime_value_of(rb.to_opref()))
+                        .and_then(|rb| state.ctx.runtime_value_of(rb))
                         .and_then(|v| match v {
                             Value::Int(i) => Some(i),
                             _ => None,
@@ -1936,13 +1919,8 @@ impl VirtualState {
                     // are set. `get_runtime_item` reads at
                     // `array_ptr + base_size + i * itemsize` per
                     // `ArrayDescr.base_size()` / `item_size()`.
-                    // 4e: `get_runtime_item` still takes/returns OpRef; convert
-                    // at this helper boundary.
                     let recurse_runtime = match (runtime_box.as_ref(), inner.as_ref()) {
-                        (Some(rb), Some(_)) => state
-                            .ctx
-                            .get_runtime_item(rb.to_opref(), ed, i)
-                            .and_then(operand_from_runtime_helper_const),
+                        (Some(rb), Some(_)) => state.ctx.get_runtime_item(rb, ed, i),
                         _ => None,
                     };
                     let recurse_box = inner.unwrap_or(Operand::None);
@@ -2184,20 +2162,15 @@ impl VirtualState {
             // box) are present. Dispatch on `element_idx`: VArrayStruct
             // (Some(elem)) uses `get_runtime_interiorfield(rb, descr, elem)`,
             // Virtual/VStruct (None) uses `get_runtime_field(rb, descr)`.
-            // 4e: those helpers still take/return OpRef; convert at this
-            // helper boundary.
             let recurse_runtime = match (parent_runtime_box.as_ref(), inner_box.as_ref()) {
                 (Some(prb), Some(_)) => match element_idx {
-                    Some(elem) => state.ctx.get_runtime_interiorfield(
-                        prb.to_opref(),
-                        &expected_field_descrs[i],
-                        elem,
-                    ),
-                    None => state
-                        .ctx
-                        .get_runtime_field(prb.to_opref(), &expected_field_descrs[i]),
-                }
-                .and_then(operand_from_runtime_helper_const),
+                    Some(elem) => {
+                        state
+                            .ctx
+                            .get_runtime_interiorfield(prb, &expected_field_descrs[i], elem)
+                    }
+                    None => state.ctx.get_runtime_field(prb, &expected_field_descrs[i]),
+                },
                 _ => None,
             };
             let recurse_box = inner_box.unwrap_or(Operand::None);
@@ -2698,15 +2671,14 @@ fn export_single_value_inner(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> VirtualStateInfo {
-    let opref = box_.to_opref();
     // virtualstate.py `visit_not_virtual` dispatches via
     // `not_virtual(cpu, value.type, optimizer.getinfo(value))`; when
     // `info.is_constant()` is true the resulting state is LEVEL_CONSTANT
-    // (`info.py:not_virtual` builds `NotVirtualStateInfo*` with constant
-    // box stored). pyre's `get_constant(opref)` walks `_forwarded` and
-    // returns Some exactly when the chain terminates at a Const Box,
-    // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
-    // export LEVEL_CONSTANT regardless of OpRef namespace.
+    // (`info.py not_virtual` builds `NotVirtualStateInfo*` with constant
+    // box stored). `get_constant_box` walks `_forwarded` and returns Some
+    // exactly when the chain terminates at a Const Box, i.e. when PyPy's
+    // `info.is_constant()` is true. Mirror that: export LEVEL_CONSTANT
+    // regardless of OpRef namespace.
     if let Some(value) = ctx.get_constant_box(box_) {
         return VirtualStateInfo::Constant(value);
     }
@@ -2840,30 +2812,21 @@ fn export_single_value_inner(
 
     // virtualstate.py not_virtual(cpu, box.type, info): the subclass
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
-    // pyre's OptContext::opref_type reconstructs it from value_types
-    // (seeded from trace_inputargs) / producing-op result_type.
-    let tp = ctx
-        .opref_type(opref)
-        .or_else(|| {
-            // A bound ResOp whose `pos` was never stamped has no OpRef
-            // variant tag; `Op.type_` is still `opclasses[opnum].type`.
-            let t = box_.type_();
-            (t != Type::Void).then_some(t)
-        })
-        .unwrap_or_else(|| {
-            // Two different failures reach this line: the absent-operand sentinel
-            // is unexpected outside `create_state_or_none`, while a named ref
-            // means value_types lacks an entry for a real box. Keep both loud.
-            let seen = if box_.is_none() {
-                "the absent-operand sentinel reached export_state"
-            } else {
-                "no type recorded for a ref that does exist"
-            };
-            panic!(
-                "not_virtual: opref_type({opref:?}) found no type — {seen}; \
-             RPython box.type is always set (virtualstate.py:360)",
-            );
-        });
+    let tp = box_.type_();
+    if tp == Type::Void {
+        // Two different failures reach this line: the absent-operand sentinel
+        // is unexpected outside `create_state_or_none`, while a named ref
+        // means the box carries no type. Keep both loud.
+        let seen = if box_.is_none() {
+            "the absent-operand sentinel reached export_state"
+        } else {
+            "no type recorded for a ref that does exist"
+        };
+        panic!(
+            "not_virtual: box.type is Void — {seen}; \
+             virtualstate.py not_virtual / box.type is always set",
+        );
+    }
     // virtualstate.py NotVirtualStateInfoInt.__init__: an int leaf's
     // info is `getintbound(op)` (optimizer.py — always an IntBound for a
     // non-constant int), and the constructor widens it (`info.widen_update()`)
@@ -3129,6 +3092,42 @@ mod tests {
 
         assert!(a1.generalization_of(&a2, &mut ctx)); // same length, first matches, second is Unknown
         assert!(!a1.generalization_of(&a3, &mut ctx)); // different length
+    }
+
+    #[test]
+    fn generate_guards_reads_observation_from_runtime_box() {
+        // virtualstate.py NotVirtualStateInfoInt._generate_guards_unkown
+        // reads `runtime_box.getint()` off the runtime box itself. A
+        // fresh OptContext whose index-0 InputArg has no observed value
+        // must not hide the 73 carried on a different InputArgInt object.
+        let target = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
+            0, 100,
+        ))]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let mut ctx = OptContext::new(128);
+        let ctx_ia = majit_ir::InputArg::new_int_rc(0);
+        ctx.inputargs = vec![Operand::from_bound_inputarg(&ctx_ia)];
+        ctx.ensure_inputarg_bindings();
+        let boxes = vec![Operand::from_bound_inputarg(&ctx_ia)];
+        let runtime_ia = majit_ir::InputArg::new_int_rc(0);
+        runtime_ia.set_value(Value::Int(73));
+        let runtime_boxes = vec![Operand::from_bound_inputarg(&runtime_ia)];
+        let guards = target
+            .generate_guards(&incoming, &boxes, &runtime_boxes, &mut ctx, false)
+            .unwrap();
+        assert_eq!(guards.len(), 1);
+        match &guards[0] {
+            GuardRequirement::GuardBounds {
+                arg_index: 0,
+                box_,
+                bounds,
+            } => {
+                assert!(box_.same_box(&boxes[0]));
+                assert_eq!(bounds.lower, 0);
+                assert_eq!(bounds.upper, 100);
+            }
+            other => panic!("expected GuardBounds, got {other:?}"),
+        }
     }
 
     #[test]

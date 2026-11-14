@@ -2009,6 +2009,10 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
+    /// Portal `JitState::state_field_layout`, seeded once on first
+    /// `resume_in_blackhole`. Copied onto the builder so
+    /// `blackhole_from_resumedata` does not walk the chain per failure.
+    state_field_layout: crate::blackhole::StateFieldLayout,
     /// `warmstate.py make_entry_point` closure captures.
     portal_entry: PortalEntryCaptures,
     /// Reusable buffers for the compiled-entry argument walk.
@@ -2442,6 +2446,7 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: Some(Box::new(crate::resume::LlmodelBlackholeAllocator)),
             portal_jd_index: None,
             state_field_fvc: None,
+            state_field_layout: crate::blackhole::StateFieldLayout::default(),
             portal_entry: PortalEntryCaptures {
                 confirm_enter_jit_ptr: std::rc::Rc::new(std::cell::Cell::new(None)),
                 jd_index: 0,
@@ -7440,6 +7445,43 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
+    /// `debug_print` / `MAJIT_CALLEE_RCA` work for `handle_fail`.
+    ///
+    /// `have_debug_prints` is one word; the fat descr identity and
+    /// `raw_exit_slots_from_deadframe` run only when a flag is set.
+    #[cold]
+    #[inline(never)]
+    fn log_guard_fail_diag(
+        &self,
+        fd: &dyn majit_ir::FailDescr,
+        deadframe: Option<&majit_backend::DeadFrame>,
+        state: &S,
+        compiled_meta: &S::Meta,
+    ) {
+        let descr_id = fd as *const dyn majit_ir::FailDescr as *const () as usize;
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] handle_fail: descr=0x{:x} values={}",
+                descr_id,
+                fd.fail_arg_types().len()
+            );
+        }
+        if crate::callee_rca_enabled() {
+            let raw_values = deadframe.map_or_else(Vec::new, |frame| {
+                self.meta.raw_exit_slots_from_deadframe(frame, fd)
+            });
+            eprintln!(
+                "[callee-rca][guard-fail] descr=0x{:x} raw_values={:?} exit_types={:?}",
+                descr_id,
+                raw_values,
+                fd.fail_arg_types(),
+            );
+            if let Some(dump) = state.debug_state_fields(compiled_meta) {
+                eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
+            }
+        }
+    }
+
     /// `compile.py` `AbstractResumeGuardDescr.handle_fail` for the plain
     /// `ResumeGuardDescr` / `ResumeAtPositionDescr` with no virtualizable.
     fn handle_fail(
@@ -7457,30 +7499,12 @@ impl<S: JitState> JitDriver<S> {
         )
         .expect("plain handle_fail is ResumeGuardDescr");
         let fd: &dyn majit_ir::FailDescr = rgd;
-        let descr_id = fd as *const dyn majit_ir::FailDescr as *const () as usize;
         let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &deadframe);
         let descr_owning_key = majit_backend::descr_owning_green_key(fd);
         self.meta
             .record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
-        // must_compile tick for bridge threshold counting.
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] handle_fail: descr=0x{:x} values={}",
-                descr_id,
-                fd.fail_arg_types().len()
-            );
-        }
-        if crate::callee_rca_enabled() {
-            let raw_values = self.meta.raw_exit_slots_from_deadframe(&deadframe, fd);
-            eprintln!(
-                "[callee-rca][guard-fail] descr=0x{:x} raw_values={:?} exit_types={:?}",
-                descr_id,
-                raw_values,
-                fd.fail_arg_types(),
-            );
-            if let Some(dump) = state.debug_state_fields(compiled_meta) {
-                eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
-            }
+        if crate::majit_log_enabled() || crate::callee_rca_enabled() {
+            self.log_guard_fail_diag(fd, Some(&deadframe), state, compiled_meta);
         }
         // Resolved once for the whole event, where the run handed the descr
         // back, and carried here: `compile.py handle_fail` reads
@@ -7708,7 +7732,6 @@ impl<S: JitState> JitDriver<S> {
         let fd: &dyn majit_ir::FailDescr = descr_arc
             .as_fail_descr()
             .expect("a guard exit carries a FailDescr");
-        let descr_id = fd as *const dyn majit_ir::FailDescr as *const () as usize;
         let guard_value_operand = result.guard_value_operand;
         // `compile.py handle_fail` `resumedescr.rd_loop_token`.
         let descr_owning_key = result.rd_loop_token;
@@ -7743,27 +7766,8 @@ impl<S: JitState> JitDriver<S> {
         let _guard_exc_root =
             (guard_exc != 0).then(|| crate::blackhole::GuardExcRoot::park(guard_exc));
 
-        // must_compile tick for bridge threshold counting.
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] handle_fail: descr=0x{:x} values={}",
-                descr_id,
-                fd.fail_arg_types().len()
-            );
-        }
-        if crate::callee_rca_enabled() {
-            let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                self.meta.raw_exit_slots_from_deadframe(frame, fd)
-            });
-            eprintln!(
-                "[callee-rca][guard-fail] descr=0x{:x} raw_values={:?} exit_types={:?}",
-                descr_id,
-                raw_values,
-                fd.fail_arg_types(),
-            );
-            if let Some(dump) = state.debug_state_fields(compiled_meta) {
-                eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
-            }
+        if crate::majit_log_enabled() || crate::callee_rca_enabled() {
+            self.log_guard_fail_diag(fd, result.deadframe.as_ref(), state, compiled_meta);
         }
         // Resolved once for the whole event, where the run handed the descr
         // back, and carried here: `compile.py handle_fail` reads
@@ -8063,6 +8067,12 @@ impl<S: JitState> JitDriver<S> {
                 if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                     bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
                 }
+                if self.state_field_layout.total_live_values() == 0 {
+                    self.state_field_layout = state.state_field_layout();
+                }
+                if bh_builder.state_field_layout != self.state_field_layout {
+                    bh_builder.state_field_layout = self.state_field_layout.clone();
+                }
                 let all_liveness = self.meta.staticdata.liveness_info.read();
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
@@ -8087,12 +8097,9 @@ impl<S: JitState> JitDriver<S> {
                 )
             };
             {
-                // Thread the state-field register layout onto the dispatch
-                // frame (chain tail) so the `state_field` handlers map a
-                // logical scalar/array index to the flat register slot the
-                // resume reader seeded. Inlined sub-frames carry no
-                // state-field ops.
-                let sf_layout = state.state_field_layout();
+                // State-field layout is on the builder and copied onto the
+                // outermost interp in `blackhole_from_resumedata` (first
+                // acquire). Inlined sub-frames carry no state-field ops.
                 // Seed the reconstructed blackhole chain with the registered
                 // virtualizable info + identity pointer so a mid-body
                 // vable-array opcode (`getarrayitem_vable_*` /
@@ -8112,16 +8119,6 @@ impl<S: JitState> JitDriver<S> {
                 // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                 // whenever `virtualizable_info` is non-null.
                 let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                if sf_layout.total_live_values() != 0 {
-                    // `blackhole_from_resumedata` builds the chain from the
-                    // numbering alone. State-field ops live on the dispatch
-                    // frame (chain tail), not on inlined callees.
-                    let mut tail = &mut *bh;
-                    while let Some(next) = tail.nextblackholeinterp.as_deref_mut() {
-                        tail = next;
-                    }
-                    tail.state_field_layout = sf_layout.clone();
-                }
                 if !seed_vinfo_ptr.is_null() {
                     let mut current = Some(&mut *bh);
                     while let Some(frame) = current {

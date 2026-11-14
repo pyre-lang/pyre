@@ -628,16 +628,7 @@ impl OptPureState {
             opcode,
             args: args
                 .iter()
-                .map(|arg| {
-                    let replaced = arg.get_box_replacement(false);
-                    #[cfg(debug_assertions)]
-                    ctx.debug_assert_operand_matches_positional(
-                        &replaced,
-                        arg.to_opref(),
-                        "pure_from_args",
-                    );
-                    replaced
-                })
+                .map(|arg| arg.get_box_replacement(false))
                 .collect(),
             descr_identity: None,
         };
@@ -668,8 +659,6 @@ impl OptPureState {
         ctx: &mut OptContext,
     ) {
         let replaced = arg0.get_box_replacement(false);
-        #[cfg(debug_assertions)]
-        ctx.debug_assert_operand_matches_positional(&replaced, arg0.to_opref(), "pure_from_args1");
         let key = PureOpKey {
             opcode,
             args: smallvec::smallvec![replaced],
@@ -3149,12 +3138,13 @@ mod tests {
         );
     }
 
-    /// pure.py / :72-74 same_box semantics for constant args.
-    /// history.py / :251 — `same_box(a, b) == same_constant(a, b)`
-    /// for Const subclasses, so cache hits are value-equality. With
-    /// inline `ConstInt.value`, two `make_constant_int(5)` calls return
-    /// the same `OpRef::ConstInt(5)` and the cache hit is by
-    /// OpRef equality (which is now value equality).
+    /// `pure.py` / `history.py AbstractValue.same_box` semantics for
+    /// constant args. `history.py AbstractValue.same_constant` —
+    /// `same_box(a, b) == same_constant(a, b)` for Const subclasses, so
+    /// cache hits are value-equality. With inline `ConstInt.value`, two
+    /// `make_constant_int(5)` calls return the same `OpRef::ConstInt(5)`
+    /// and the cache hit is by OpRef equality (which is now value
+    /// equality).
     #[test]
     fn lookup_pure_matches_same_value_constants_across_slots() {
         let mut pass = OptPure::new();
@@ -3164,9 +3154,9 @@ mod tests {
         let c5_b = ctx.make_constant_int(5);
         assert_eq!(
             c5_a, c5_b,
-            "two ConstInt(5) boxes are same_constant-equal (history.py:251)"
+            "two ConstInt(5) boxes are same_constant-equal (history.py AbstractValue.same_constant)"
         );
-        assert_eq!(ctx.get_constant(c5_a), ctx.get_constant(c5_b));
+        assert_eq!(c5_a.inline_const_to_value(), c5_b.inline_const_to_value());
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`. `x` is the
         // canonical box materialized in ctx; the constants are Const operands.
@@ -3185,7 +3175,7 @@ mod tests {
         assert_eq!(
             pass.get_pure_result(&q, &mut ctx).map(|r| r.to_opref()),
             Some(OpRef::int_op(42)),
-            "lookup_pure must use same_box for constant args (history.py:204)"
+            "lookup_pure must use same_box for constant args (history.py AbstractValue.same_box)"
         );
 
         // A non-constant slot mismatch must still miss.

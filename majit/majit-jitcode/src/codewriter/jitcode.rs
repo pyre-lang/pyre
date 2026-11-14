@@ -1148,27 +1148,23 @@ impl JitCode {
         self.assert_startpoint(pc);
         let code = &self.body().code;
         let mut pc = pc;
-        if pc >= code.len() {
-            self.missing_liveness(pc);
-        }
+        // Translated `get_live_vars_info` indexes `self.code[pc]` after the
+        // untranslated `_startpoints` assert. Length is a debug_assert; a
+        // short pc that is not `-live-` still takes `_missing_liveness`
+        // (`pc -= OFFSET_SIZE + 1` cannot name a previous marker).
+        debug_assert!(pc < code.len());
         if unsafe { *code.get_unchecked(pc) } != op_live {
-            // `pc -= OFFSET_SIZE + 1`. A short pc cannot name a previous
-            // `-live-`; that is `_missing_liveness`, not a wrapped index.
             let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
                 self.missing_liveness(pc);
             };
             pc = back;
             self.assert_startpoint(pc);
-            if pc >= code.len() {
-                self.missing_liveness(pc);
-            }
+            debug_assert!(pc < code.len());
             if unsafe { *code.get_unchecked(pc) } != op_live {
                 self.missing_liveness(pc);
             }
         }
-        if pc + super::liveness::OFFSET_SIZE >= code.len() {
-            self.missing_liveness(pc);
-        }
+        debug_assert!(pc + super::liveness::OFFSET_SIZE < code.len());
         // SAFETY: `pc` names a `-live-` opcode and `pc+1 .. pc+OFFSET_SIZE`
         // are in `code` (`JitCode.get_live_vars_info` after the opcode test).
         unsafe { super::liveness::decode_offset_unchecked(code, pc + 1) }

@@ -742,6 +742,33 @@ mod tests {
         );
     }
 
+    /// Portal jitcode register/constant windows `BlackholeInterpreter.setposition`
+    /// copies. `assembler.py` `Assembler.assemble` sizes `num_regs_f` from the
+    /// highest float register it saw, so a portal with no float state is 0.
+    #[test]
+    fn portal_jitcode_register_windows() {
+        let mut asm = majit_metainterp::Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![0], vec![]);
+        super::__prebuild_jitcode_liveness_mainloop(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let jc = super::__dispatch_jitcode_mainloop(&mut asm, 0i64)
+            .expect("assembled shortcircuit portal");
+        println!(
+            "[portal-regs] shortcircuit i/r/f={}/{}/{} consts i/r/f={}/{}/{}",
+            jc.c_num_regs_i,
+            jc.c_num_regs_r,
+            jc.c_num_regs_f,
+            jc.constants_i.len(),
+            jc.constants_r.len(),
+            jc.constants_f.len(),
+        );
+        assert_eq!(
+            jc.c_num_regs_f, 0,
+            "a portal with no float green, state, or local must emit num_regs_f = 0 \
+             (`Assembler.assemble` `count_regs['float']`)"
+        );
+    }
+
     /// `shift` must reach the blackhole as a CALL, not as bytes to interpret.
     ///
     /// `bhimpl_inline_call_*` (`blackhole.py:1278-1319`) runs

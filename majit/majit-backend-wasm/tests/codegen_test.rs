@@ -7005,13 +7005,24 @@ fn test_non_last_label_backedge_validates() {
         jump,
     ];
 
-    // The wide entry label precedes the header, so it is a resume point; the
-    // narrow one sits inside the `loop` and gets no block pair, which is what
-    // keeps the wrapper's structured control flow well-formed here.
+    // JUMP names the wide entry; the wasm `loop` still opens at the last LABEL
+    // before that JUMP (the peeled body token) so both LABELs are resume
+    // points — `fixup_target_tokens` / `set_dispatch_target` stamp every
+    // LABEL. The JUMP re-enters the wide label through `jump_resume_ordinal`.
     assert!(codegen::is_resumable_peeled(&ops));
-    assert_eq!(codegen::resumable_label_count(&ops), 1);
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
     let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
+    let (loops, tables) = loop_and_br_table_shape(&bytes);
+    assert_eq!(
+        loops, 2,
+        "resume `loop` wraps dispatch for the non-header JUMP"
+    );
+    assert_eq!(
+        tables,
+        vec![5],
+        "entry br_table: key 0, one loader arm per label, one past-loader arm per label"
+    );
 }
 
 #[test]
@@ -7566,6 +7577,140 @@ fn host_loop_inputargs() -> Vec<InputArgRc> {
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Int, 1),
     ]
+}
+
+/// Peeled unroll whose own JUMP is `jump_to_preamble` (`start_descr`) while
+/// a later body token still sits in the ops — the shape
+/// `_jump_to_existing_trace` extra-closes onto.
+fn jump_to_preamble_two_label_ops(
+    start: &std::sync::Arc<dyn majit_ir::Descr>,
+    body: &std::sync::Arc<dyn majit_ir::Descr>,
+) -> Vec<OpRc> {
+    let start_label = OpRc::new(Op::new(
+        OpCode::Label,
+        &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+    ));
+    start_label.setdescr(start.clone());
+    let mid = OpRc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+        OpRef::int_op(2),
+    ));
+    let body_label = OpRc::new(Op::new(
+        OpCode::Label,
+        &[rb(OpRef::int_op(2)), rb(OpRef::input_arg_int(1))],
+    ));
+    body_label.setdescr(body.clone());
+    let advance = OpRc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::int_op(2), OpRef::const_int(1)],
+        OpRef::int_op(3),
+    ));
+    let guard = OpRc::new(make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(3)],
+        &[OpRef::int_op(3), OpRef::input_arg_int(1)],
+    ));
+    let jump = OpRc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&advance),
+            rb(OpRef::input_arg_int(1)),
+        ],
+    ));
+    jump.setdescr(start.clone());
+    vec![start_label, mid, body_label, advance, guard, jump]
+}
+
+/// `unroll.py` `_jump_to_existing_trace` extra-close: GUARD plus JUMP onto
+/// the body token of a `jump_to_preamble` peeled loop. Dynasm
+/// `fixup_target_tokens` stamps that token; wasm must publish it too.
+#[test]
+fn jump_to_preamble_body_token_is_a_chainable_bridge_target() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(9_910_501));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(9_910_501));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
+    let start = majit_ir::make_loop_target_descr(90, true);
+    let body = majit_ir::make_loop_target_descr(91, false);
+    let loop_ops = jump_to_preamble_two_label_ops(&start, &body);
+    let fail_descr = stamp_host_fail_descr(&loop_ops);
+    backend
+        .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
+        .expect("jump_to_preamble peeled loop compiles");
+    assert!(
+        majit_backend_wasm::failguard::label_target(&body).is_some(),
+        "body token must be published so closing_jump can read _ll_loop_code"
+    );
+    let unpublished_before = majit_backend_wasm::bridge_diag(18);
+    backend
+        .compile_bridge(
+            fail_descr.as_ref(),
+            &host_bridge_inputargs(),
+            &host_bridge_ops(&body),
+            &token,
+        )
+        .expect("extra-close onto the body token compiles");
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(18),
+        unpublished_before,
+        "body-token JUMP must not take the ml_unpublished arm"
+    );
+}
+
+/// `VirtualState::generate_guards` extra-close: INT_GE + GUARD_TRUE + JUMP
+/// of input reloads onto the body token, no advancing arithmetic in the
+/// bridge. Dynasm `closing_jump` accepts this; wasm must too.
+#[test]
+fn jump_to_preamble_extra_guard_close_onto_body_token() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(9_910_502));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(9_910_502));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
+    let start = majit_ir::make_loop_target_descr(92, true);
+    let body = majit_ir::make_loop_target_descr(93, false);
+    let loop_ops = jump_to_preamble_two_label_ops(&start, &body);
+    let fail_descr = stamp_host_fail_descr(&loop_ops);
+    backend
+        .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
+        .expect("jump_to_preamble peeled loop compiles");
+    let ge = OpRc::new(make_op(
+        OpCode::IntGe,
+        &[OpRef::input_arg_int(40), OpRef::const_int(0)],
+        OpRef::int_op(42),
+    ));
+    let extra_guard = OpRc::new(make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(42)],
+        &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
+    ));
+    let jump = OpRc::new(Op::new(
+        OpCode::Jump,
+        &[rb(OpRef::input_arg_int(40)), rb(OpRef::input_arg_int(41))],
+    ));
+    jump.setdescr(body.clone());
+    let noadvance_before = majit_backend_wasm::bridge_diag(11);
+    backend
+        .compile_bridge(
+            fail_descr.as_ref(),
+            &host_bridge_inputargs(),
+            &[ge, extra_guard, jump],
+            &token,
+        )
+        .expect("generate_guards extra-close onto the body token compiles");
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(11),
+        noadvance_before,
+        "extra-guard close must not take the decl_noadvance arm"
+    );
 }
 
 /// Header, preamble, and large-header owners all defer the inline trial

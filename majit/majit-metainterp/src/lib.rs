@@ -2087,7 +2087,8 @@ static GUARD_CENSUS_FORCED: std::sync::atomic::AtomicBool =
 
 static GUARD_CENSUS_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn guard_census_enabled() -> bool {
+#[inline]
+pub(crate) fn guard_census_enabled() -> bool {
     if GUARD_CENSUS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }

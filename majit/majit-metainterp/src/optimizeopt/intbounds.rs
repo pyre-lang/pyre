@@ -129,8 +129,6 @@ impl OptIntBoundsState {
     /// on `op._forwarded` in place. `op = get_box_replacement(op)` first.
     fn intersect_bound(&mut self, op: &Operand, bound: &IntBound, ctx: &mut OptContext) {
         let op_box = op.get_box_replacement(false);
-        #[cfg(debug_assertions)]
-        ctx.debug_assert_operand_matches_positional(&op_box, op.to_opref(), "intersect_bound");
         ctx.setintbound(&op_box, bound);
     }
 
@@ -140,8 +138,6 @@ impl OptIntBoundsState {
     /// in `OptContext::make_constant_box`.
     pub(super) fn make_constant_int(&mut self, op: &Operand, value: i64, ctx: &mut OptContext) {
         let b = op.get_box_replacement(false);
-        #[cfg(debug_assertions)]
-        ctx.debug_assert_operand_matches_positional(&b, op.to_opref(), "make_constant_int");
         ctx.make_constant_box(&b, Value::Int(value));
     }
 
@@ -604,12 +600,6 @@ impl OptIntBoundsState {
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
             let op_pos_box = res_box.get_box_replacement(false);
-            #[cfg(debug_assertions)]
-            ctx.debug_assert_operand_matches_positional(
-                &op_pos_box,
-                res_box.to_opref(),
-                "postprocess_int_signext",
-            );
             let _ = ctx.with_intbound_mut(&op_pos_box, |bm| bm.intersect_const(start, stop - 1));
         }
     }

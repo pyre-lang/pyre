@@ -15006,15 +15006,11 @@ fn reached_loop_header<Sym: WalkSym>(
         // pyjitpl.py `if not self.partial_trace` is the only compile_trace gate.
         if !has_partial && has_targets {
             // recorder → compile edge (`MetaInterp.compile_trace` jumpargs).
-            let boxes: Vec<Operand> = {
-                let meta = driver.meta_interp_mut();
-                let ctx = meta.trace_ctx().expect("compile_trace: live TraceCtx");
-                live_args
-                    .iter()
-                    .copied()
-                    .map(|r| ctx.operand_for(r))
-                    .collect()
-            };
+            let boxes: Vec<Operand> = live_args
+                .iter()
+                .copied()
+                .map(|r| ctx.trace_ctx.operand_for(r))
+                .collect();
             let outcome =
                 if from_guard {
                     driver.meta_interp_mut().compile_trace(key, &boxes, true)

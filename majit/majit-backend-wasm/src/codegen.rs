@@ -6572,17 +6572,20 @@ fn build_function(
             start += bridge.ops.len();
         }
     }
-    // A region whose closing JUMP names a resumable LABEL other than the header
-    // cannot `br` to the `loop`. Wrap the dispatch in a `loop` such a region
-    // re-enters through instead, and give the entry `br_table` a second bucket
-    // per label: key `num_labels + 1 + j` lands PAST label j's resume loader,
-    // so the region hands its values over in locals rather than through the
-    // frame slots the loader reads. A preamble-sourced region always leaves by
-    // that route: it is emitted past the `end` of the header `loop`, so no `br`
-    // reaches it.
+    // A JUMP that names a resumable LABEL other than the header cannot `br`
+    // to the `loop` — that would skip the segment between that label and the
+    // header. Wrap the dispatch in a `loop` such a JUMP re-enters through
+    // instead, and give the entry `br_table` a second bucket per label: key
+    // `num_labels + 1 + j` lands PAST label j's resume loader, so the JUMP
+    // hands its values over in locals rather than through the frame slots the
+    // loader reads. That JUMP may be an inlined region's (appended after
+    // `bridge_start`) or the owner's own back-edge (`unroll.py`
+    // `jump_to_preamble` onto `start_descr` while the body token is the
+    // header). A preamble-sourced region always leaves by that route: it is
+    // emitted past the `end` of the header `loop`, so no `br` reaches it.
     let resume_dispatch = key_dispatch
         && (outside_region_count > 0
-            || ops[bridge_start..].iter().any(|op| {
+            || ops.iter().any(|op| {
                 op.opcode == OpCode::Jump && jump_resume_ordinal(ops, op, num_labels).is_some()
             }));
 
@@ -6773,11 +6776,13 @@ fn build_function(
     // malformed trace does not emit.
     check_unbound_reads(inputargs, ops, num_vars)?;
 
-    // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
-    // preamble runs once on entry, the LABEL is the loop-back target, and
-    // JUMP branches back to it. Emit the `loop` at the LABEL selected by the
-    // terminal JUMP's descr (not merely the last LABEL) so multi-label traces
-    // re-execute the complete loop body.
+    // A peeled loop arrives as `[preamble..][LABEL start][segment..]
+    // [LABEL body][body..][JUMP]`. The wasm `loop` opens at the last LABEL
+    // before the owner's JUMP (the body token) so every LABEL is in the
+    // resumable prefix — `assembler.py` `fixup_target_tokens` / cranelift
+    // `set_dispatch_target` stamp every LABEL. A JUMP that names an earlier
+    // LABEL (`unroll.py` `jump_to_preamble` onto `start_descr`) re-enters
+    // through `jump_resume_ordinal` so the preamble still re-runs.
     let loop_label_idx = find_loop_label_index(ops);
     let has_loop = loop_label_idx.is_some();
 
@@ -10708,15 +10713,17 @@ fn build_function(
 
 /// A peeled loop — real work (the unrolled first iteration = preamble) precedes
 /// the loop-header LABEL — whether it carries one LABEL or several. `loop` is
-/// emitted at the JUMP's target label, so `build_function` wraps the trace in
-/// the resume-at-LABEL entry `br_table` (keyed on the frame dispatch-key slot,
-/// key = label ordinal + 1) and a loop-closing bridge re-enters at any of the
-/// loop's labels up to and including the header, in-module
-/// (`resumable_label_count`). `build_function` keys its wrapper on this
-/// predicate; `compile_loop` records it on `CompiledWasmLoop` as
-/// `has_preamble`. `compile_bridge` accepts a loop-closing bridge only when
-/// its JUMP's descr identifies one of the source loop's OWN labels
-/// (`label_descrs`) with matching arity and a resume-safe live set.
+/// emitted at the last LABEL before the owner's JUMP (the peeled body token),
+/// so `build_function` wraps the trace in the resume-at-LABEL entry `br_table`
+/// (keyed on the frame dispatch-key slot, key = label ordinal + 1) and a
+/// loop-closing bridge re-enters at any of the loop's labels up to and
+/// including the header, in-module (`resumable_label_count`). A JUMP that
+/// names an earlier LABEL re-enters that label through `jump_resume_ordinal`.
+/// `build_function` keys its wrapper on this predicate; `compile_loop` records
+/// it on `CompiledWasmLoop` as `has_preamble`. `compile_bridge` accepts a
+/// loop-closing bridge only when its JUMP's descr identifies one of the source
+/// loop's OWN labels (`label_descrs`) with matching arity and a resume-safe
+/// live set.
 pub fn is_resumable_peeled(ops: &[Op]) -> bool {
     let Some(loop_label) = find_loop_label_index(ops) else {
         return false;
@@ -10910,8 +10917,8 @@ fn find_jump_target_label_index(ops: &[Op], jump: &Op) -> Option<usize> {
 pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
     // The FIRST JUMP, not the last: a merged stream appends each inlined region
     // after the owner's ops, so the owner's terminal JUMP — the one that
-    // defines the loop — precedes every region's. Reading the last would let a
-    // region closing at an earlier LABEL move the `loop` onto that label.
+    // defines the loop — precedes every region's. Reading the last JUMP would
+    // let a region closing at an earlier LABEL move the `loop` onto that label.
     match ops.iter().find(|op| op.opcode == OpCode::Jump) {
         // x86/assembler.py:2463 `if target_token in
         // self.target_tokens_currently_compiling` — the TOKEN decides. A JUMP
@@ -10923,7 +10930,27 @@ pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
         // retargets the JUMP at the ORIGINAL loop's start descr. Answering
         // with the trailing label here would turn that JUMP into a back-edge
         // to a label it does not name.
-        Some(jump) if jump.has_descr() => find_jump_target_label_index(ops, jump),
+        Some(jump) if jump.has_descr() => {
+            let target = find_jump_target_label_index(ops, jump)?;
+            // The JUMP names a local LABEL. The wasm `loop` header is the last
+            // LABEL before that JUMP — the peeled body token
+            // (`unroll.py` `finalize_short_preamble`) — not necessarily the
+            // JUMP's own descr. `jump_to_preamble` names `start_descr`;
+            // cranelift `set_dispatch_target` and dynasm `fixup_target_tokens`
+            // still stamp the body token so `_jump_to_existing_trace` can
+            // JUMP to it. Labels after the owner's JUMP belong to inlined
+            // regions and must not become the header.
+            let jump_idx = ops
+                .iter()
+                .position(|op| op.opcode == OpCode::Jump)
+                .expect("Jump just found");
+            Some(
+                ops[..jump_idx]
+                    .iter()
+                    .rposition(|op| op.opcode == OpCode::Label)
+                    .unwrap_or(target),
+            )
+        }
         // No descr to decide with (legacy IR whose JUMP carries none), or no
         // JUMP at all: keep the historical last-LABEL answer.
         _ => ops.iter().rposition(|op| op.opcode == OpCode::Label),

@@ -629,16 +629,15 @@ impl Optimizer {
         }
     }
 
-    fn is_constant_placeholder_op(op: &Op, ctx: &OptContext) -> bool {
+    fn is_constant_placeholder_op(op: &Op) -> bool {
         if !matches!(
             op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             return false;
         }
-        let Some(forwarded) = ctx.read_forwarded(op.pos().get()) else {
-            return false;
-        };
+        use majit_ir::forwarding::ForwardingHost;
+        let forwarded = op.get_forwarded();
         if !forwarded.is_const() {
             return false;
         }
@@ -1813,106 +1812,75 @@ impl Optimizer {
                 seen.push(ptr);
             }
         }
-        let convert_produced = |result: OpRef,
-                                produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
-                                const_group: bool| {
-            let canonical_result = ctx.get_replacement_opref(result);
-            let replay_result = if const_group {
-                None
-            } else {
-                // pure.py `produce_potential_short_preamble_ops` walks
-                // `_newoperations`, not their replacements.  In particular,
-                // `postprocess_GUARD_TRUE` can forward an already-emitted
-                // pure comparison to CONST_1; PyPy still exports that
-                // comparison Box and `PureOp.produce_op` installs it in the
-                // next iteration's pure cache.  Keep the original result
-                // identity for that case.  Using the inline Const as the
-                // replay position would collapse distinct comparison Boxes
-                // that happen to prove the same value.
-                Some(exported_short_box_replay_result(
-                    result,
-                    canonical_result,
-                    &produced.kind,
-                )?)
+        let mut convert_produced =
+            |result: &Operand,
+             produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
+             const_group: bool| {
+                let canonical = result.get_box_replacement(false);
+                let canonical_result = canonical.to_opref(); // class-C replay pos only
+                let replay_result = if const_group {
+                    None
+                } else {
+                    // pure.py `produce_potential_short_preamble_ops` walks
+                    // `_newoperations`, not their replacements.  In particular,
+                    // `postprocess_GUARD_TRUE` can forward an already-emitted
+                    // pure comparison to CONST_1; PyPy still exports that
+                    // comparison Box and `PureOp.produce_op` installs it in the
+                    // next iteration's pure cache.  Keep the original result
+                    // identity for that case.  Using the inline Const as the
+                    // replay position would collapse distinct comparison Boxes
+                    // that happen to prove the same value.
+                    Some(exported_short_box_replay_result(
+                        result.to_opref(),
+                        canonical_result,
+                        &produced.kind,
+                    )?)
+                };
+                let preamble_op = produced.preamble_op.clone();
+                // shortpreamble.py keeps two boxes: `short_op.res` (body) and
+                // `preamble_op` (replay). `add_op_to_short` already minted the
+                // replay result. `exported_short_box_replay_result` only
+                // decides whether a forwarded-to-Const entry is kept; it must
+                // not be written onto `preamble_op.pos`.
+                if replay_result.is_none() && !const_group {
+                    return None;
+                }
+                // shortpreamble.py produce_arg already stored the dep
+                // replay handle / renamed short InputArg / Const on
+                // preamble_op.args. Keep that object: use_box reads
+                // arg.get_forwarded() on it, and ShortPreambleBuilder.__init__
+                // plants exported_infos on the same ResOperation.
+                // get_box_replacement would swap in a body box that does
+                // not carry the replay marker.
+                // An InputArg label arg whose canonical result forwards away
+                // is absent from `short_boxes.label_args`, so a re-lookup of
+                // `canonical_result` returns None and the per-slot original
+                // is lost. `produced.label_arg_idx` is the slot stamped at
+                // `add_short_input_arg` (the slot the renamed
+                // `short_inputargs[i]` pairs with — consumed by
+                // `slot_to_original`). Non-InputArg entries keep the same
+                // stamped field; `inline_short_preamble` does not read it.
+                Some(crate::optimizeopt::shortpreamble::PreambleOp {
+                    op: preamble_op,
+                    source_op: Some(produced.source_op.clone()),
+                    // short_op.res travels with the entry as the
+                    // exported `PreambleOp.res` operand; the preview
+                    // ProducedShortOp already carries the bound producer
+                    // / const operand, so it moves across unchanged.
+                    res: produced.res.clone(),
+                    kind: produced.kind,
+                    label_arg_idx: produced.label_arg_idx,
+                    invented_name: produced.invented_name,
+                    same_as_source: produced.same_as_source.clone(),
+                })
             };
-            let preamble_op = produced.preamble_op.clone();
-            // shortpreamble.py keeps two boxes: `short_op.res` (body) and
-            // `preamble_op` (replay). `add_op_to_short` already minted the
-            // replay result. `exported_short_box_replay_result` only
-            // decides whether a forwarded-to-Const entry is kept; it must
-            // not be written onto `preamble_op.pos`.
-            if replay_result.is_none() && !const_group {
-                return None;
-            }
-            // optimizer.py force_box loop parity.
-            //
-            // Resolve POSITIONALLY when a producer is registered at
-            // this slot: replay-op args carry the dep replay handle
-            // (produce_arg, shortpreamble.py) whose forwarded slot
-            // is empty, so only the body producer registered at the
-            // same position carries the Phase-1 forwarding to the
-            // canonical end box this export boundary needs.
-            //
-            // When positional resolution finds NO producer, the carried
-            // handle is unforwarded and resolves to itself
-            // (resoperation.py `get_box_replacement`): keep the handle OBJECT instead of
-            // re-minting a producer-less position-only box, so its
-            // identity (and the `Operand::Op`/`InputArg` shed) survives
-            // the export. The encoded OpRef is identical either way
-            // (`from_opref(arg.to_opref()) == arg.to_opref()`).
-            for i in 0..preamble_op.num_args() {
-                let arg = preamble_op.arg(i);
-                // The `OpRef::none()` sentinel has no producer box
-                // (`materialize_operand_at` doc) — routing it through the
-                // producer lookup is meaningless and trips the
-                // `get_box_replacement` "box must exist" debug tripwire.
-                if arg.is_none() {
-                    continue;
-                }
-                let resolved = ctx
-                    .heal_arg_to_canonical(&arg)
-                    .or_else(|| ctx.resolve_operand_operand_opt(&arg))
-                    .unwrap_or_else(|| arg.clone());
-                preamble_op.setarg(i, resolved);
-            }
-            if let Some(mut fail_args) = preamble_op.getfailargs() {
-                for arg in fail_args.iter_mut() {
-                    if arg.is_none() {
-                        continue;
-                    }
-                    *arg = arg.get_box_replacement(false);
-                }
-                preamble_op.setfailargs(fail_args);
-            }
-            // An InputArg label arg whose canonical result forwards away
-            // is absent from `short_boxes.label_args`, so a re-lookup of
-            // `canonical_result` returns None and the per-slot original
-            // is lost. `produced.label_arg_idx` is the slot stamped at
-            // `add_short_input_arg` (the slot the renamed
-            // `short_inputargs[i]` pairs with — consumed by
-            // `slot_to_original`). Non-InputArg entries keep the same
-            // stamped field; `inline_short_preamble` does not read it.
-            Some(crate::optimizeopt::shortpreamble::PreambleOp {
-                op: preamble_op,
-                source_op: Some(produced.source_op.clone()),
-                // short_op.res travels with the entry as the
-                // exported `PreambleOp.res` operand; the preview
-                // ProducedShortOp already carries the bound producer
-                // / const operand, so it moves across unchanged.
-                res: produced.res.clone(),
-                kind: produced.kind,
-                label_arg_idx: produced.label_arg_idx,
-                invented_name: produced.invented_name,
-                same_as_source: produced.same_as_source.clone(),
-            })
-        };
         let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> = produced
             .into_iter()
-            .filter_map(|(result, produced)| convert_produced(result, produced, false))
+            .filter_map(|(result, produced)| convert_produced(&result, produced, false))
             .collect();
         let exported_const_short_boxes = produced_const
             .into_iter()
-            .filter_map(|produced| convert_produced(produced.res.to_opref(), produced, true))
+            .filter_map(|produced| convert_produced(&produced.res.clone(), produced, true))
             .collect();
         ctx.exported_const_short_boxes = exported_const_short_boxes;
         if crate::majit_log_enabled() {
@@ -2666,7 +2634,7 @@ impl Optimizer {
     /// Wrap each recorded `Op` in a fresh `OpRc` and rebind later args the
     /// way `TraceIterator::_cache` does: a non-void result is the object
     /// later positions name. Positions stay as the fixture recorded them.
-    fn rebind_wrapped_trace_ops(ops: &[Op]) -> Vec<majit_ir::OpRc> {
+    pub(crate) fn rebind_wrapped_trace_ops(ops: &[Op]) -> Vec<majit_ir::OpRc> {
         let mut wrapped: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
         // First InputArg at each index. Later args at that index reuse it,
         // the same way `TraceIterator` seeds `_cache` once per input.
@@ -3459,9 +3427,8 @@ impl Optimizer {
         //
         // Never-emitted recorder ops come from the iterator's op list
         // (`opencoder.py TraceIterator._cache`), not a side map. Skip
-        // positions already in `new_operations` and recorder ops that
-        // `install_canonical_producer` / `mint_synthetic_resop` replaced
-        // as the `resop_refs` host — those replacements live in
+        // positions already in `new_operations`; replacements from
+        // `install_canonical_producer` / `mint_synthetic_resop` live in
         // `live_synthetics` below.
         for op in ops {
             let pos = op.pos().get();
@@ -3474,14 +3441,7 @@ impl Optimizer {
             ) {
                 continue;
             }
-            if ctx.new_operations_index.contains_key(&pos) {
-                continue;
-            }
-            if !ctx
-                .resop_refs
-                .get(&pos)
-                .is_some_and(|canonical| OpRc::ptr_eq(canonical, op))
-            {
+            if ctx.new_operations.iter().any(|e| e.pos().get() == pos) {
                 continue;
             }
             self.phase1_emit_ops.push(op.clone());
@@ -3766,7 +3726,7 @@ impl Optimizer {
             .new_operations
             .iter()
             .enumerate()
-            .filter(|(_, op)| !Self::is_constant_placeholder_op(op, &ctx))
+            .filter(|(_, op)| !Self::is_constant_placeholder_op(op))
             .map(|(i, _)| i)
             .collect();
         let mut idx = 0usize;
@@ -3880,7 +3840,10 @@ impl Optimizer {
             for op in &ctx.phase1_emit_ops {
                 consider_const(op);
             }
-            for op in ctx.resop_refs.values() {
+            for op in &ctx.live_synthetics {
+                consider_const(op);
+            }
+            for op in &ctx.input_ops {
                 consider_const(op);
             }
             // Align each const-folded producer's canonical `Op.pos` to its
@@ -3896,8 +3859,9 @@ impl Optimizer {
             }
 
             // Apply remap to all args and fail_args. Const operands carry
-            // their value inline (history.py:227/268/314); position-remap
-            // applies only to body-namespace OpRefs (InputArg* / *Op).
+            // their value inline (`history.py` ConstInt/ConstFloat/ConstPtr);
+            // position-remap applies only to body-namespace OpRefs
+            // (InputArg* / *Op).
             for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
                     // A bound operand (`Operand::Op` / `InputArg`) live-tracks
@@ -5340,7 +5304,7 @@ impl Optimizer {
                 self.last_guard_op_idx = None;
             }
         }
-        // optimizer.py:598-602:
+        // optimizer.py `_emit_operation`:
         //     if rop.returns_bool_result(op.opnum):
         //         self.getintbound(op).make_bool()
         // The `make_bool` IntBound write runs post-emit (below), once the
@@ -5363,6 +5327,7 @@ impl Optimizer {
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
         let _ = reuse;
+        let emitted_rc = op.clone();
         let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
         // optimizer.py `_emit_operation`: `self._really_emitted_operation = op`
         // then `_newoperations.append(op)`.
@@ -5373,9 +5338,10 @@ impl Optimizer {
         // is in the emit set.
         let emitted_box = emitted_box.get_box_replacement(false);
         debug_assert!(
-            ctx.get_box_replacement_operand(emitted)
-                .same_box(&emitted_box),
-            "emitted op at {emitted:?} is not its position's producer"
+            Operand::from_bound_op(ctx.new_operations.last().expect("just emitted"))
+                .same_box(&emitted_box)
+                || emitted_box.same_box(&Operand::from_bound_op(&emitted_rc)),
+            "emitted op is not the producer just appended"
         );
         // optimizer.py `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
@@ -5584,8 +5550,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.resolve_operand_operand(&target).to_opref(),
-                            value: ctx.resolve_operand_operand(&value).to_opref(),
+                            target: ctx.resolve_operand_operand(&target),
+                            value: ctx.resolve_operand_operand(&value),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
@@ -5863,7 +5829,7 @@ impl Optimizer {
         for pass in &self.passes {
             for (func_ptr, result) in pass.serialize_optrewrite() {
                 let replaced = result.get_box_replacement(false);
-                loopinvariant_results.push((func_ptr, replaced.to_opref()));
+                loopinvariant_results.push((func_ptr, replaced));
             }
         }
 
@@ -5872,18 +5838,18 @@ impl Optimizer {
         // ensure_descr_index should not occur — ensure_descr_index always
         // assigns. The filter_map here mirrors the RPython path where
         // heap.py:828 skips descriptors not in the CPU cache.
-        let heap_fields: Vec<(OpRef, i32, OpRef)> = heap_fields_raw
+        let heap_fields: Vec<(Operand, i32, Operand)> = heap_fields_raw
             .into_iter()
             .map(|(obj, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj.to_opref(), idx, val.to_opref())
+                (obj, idx, val)
             })
             .collect();
-        let heap_arrayitems: Vec<(OpRef, i64, i32, OpRef)> = heap_arrayitems_raw
+        let heap_arrayitems: Vec<(Operand, i64, i32, Operand)> = heap_arrayitems_raw
             .into_iter()
             .map(|(obj, index, descr, val)| {
                 let idx = self.ensure_descr_index(&descr);
-                (obj.to_opref(), index, idx, val.to_opref())
+                (obj, index, idx, val)
             })
             .collect();
 
@@ -5919,12 +5885,13 @@ impl Optimizer {
     ///     return op
     /// ```
     fn _maybe_replace_guard_value_if_changed(op: &Op, ctx: &mut OptContext) -> Option<Op> {
-        // optimizer.py:755: if op.getarg(0).type == 'i'
+        // optimizer.py `_maybe_replace_guard_value`: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        if ctx.opref_type(arg0.to_opref()) != Some(majit_ir::Type::Int) {
+        if arg0.type_() != majit_ir::Type::Int {
             return None;
         }
-        // optimizer.py: b = self.getintbound(op.getarg(0)); if b.is_bool()
+        // optimizer.py `_maybe_replace_guard_value`:
+        //   b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
             let b = ctx.resolve_operand_operand(&arg0);
             ctx.getintbound_handle(&b).borrow().clone()
@@ -5932,9 +5899,9 @@ impl Optimizer {
         if !b.is_bool() {
             return None;
         }
-        // optimizer.py:762: constvalue = op.getarg(1).getint()
+        // optimizer.py `_maybe_replace_guard_value`: constvalue = op.getarg(1).getint()
         let constvalue = op.arg(1).get_box_replacement(false).const_int()?;
-        // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
+        // optimizer.py `_maybe_replace_guard_value`: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
@@ -6126,7 +6093,7 @@ mod tests {
         mut snapshot_for_guard: F,
     ) -> crate::optimizeopt::SnapshotBoxes
     where
-        F: FnMut(&Op) -> Vec<OpRef>,
+        F: FnMut(&Op) -> Vec<Operand>,
     {
         use crate::resume::SnapshotBox;
         let mut snapshots: crate::optimizeopt::SnapshotBoxes = Vec::new();
@@ -6149,7 +6116,10 @@ mod tests {
             crate::optimizeopt::snapshot_insert(
                 &mut snapshots,
                 resume_pos,
-                snapshot_boxes.into_iter().map(SnapshotBox::from).collect(),
+                snapshot_boxes
+                    .into_iter()
+                    .map(SnapshotBox::from_cached)
+                    .collect(),
             );
         }
         snapshots
@@ -7935,8 +7905,6 @@ mod tests {
         let mut b = TraceBuilder::new();
         let x = b.input(Type::Int, 0);
         let y = b.input(Type::Int, 1);
-        let x_ref = x.to_opref();
-        let y_ref = y.to_opref();
         b.op(OpCode::IntAdd, &[x.clone(), y.clone()]);
         b.op(OpCode::GuardTrue, std::slice::from_ref(&x));
         b.op(OpCode::Finish, &[]);
@@ -7946,7 +7914,7 @@ mod tests {
         ops[1].setfailargs(vec![x.clone(), y.clone()].into());
         opt.trace_inputargs = vec![x.clone(), y.clone()];
         let num_inputs = inputs.len();
-        opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
+        opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x.clone(), y.clone()]);
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,

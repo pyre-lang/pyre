@@ -1,10 +1,10 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use majit_ir::operand::Operand;
-use majit_ir::{InputArg, OpCode, OpRc, OpRef, Type};
 #[cfg(test)]
-use majit_ir::{OPCODE_COUNT, Value};
+use majit_ir::OPCODE_COUNT;
+use majit_ir::operand::Operand;
+use majit_ir::{InputArg, OpCode, OpRc, OpRef, Type, Value};
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -739,8 +739,11 @@ where
     /// unchanged (value-inline const box); only TAGBOX-equivalent OpRefs
     /// go through `_get`, which returns the cached fresh box object.
     fn _untag(&self, opref: OpRef) -> Operand {
-        if opref.is_none() || opref.is_constant() {
-            Operand::from_opref(opref)
+        if opref.is_none() {
+            Operand::None
+        } else if let Some(value) = opref.inline_const_to_value() {
+            // ConstInt.__init__ — Const-namespace OpRef is the box.
+            Operand::const_from_value(value)
         } else {
             self._get(opref.raw() as usize)
         }
@@ -1194,10 +1197,10 @@ impl<'a> ByteTraceIter<'a> {
     /// opencoder.py `_untag` — full dispatch.
     ///
     /// TAGBOX → `_cache` lookup.  TAGINT → inline `ConstInt(v)`
-    /// (history.py `ConstInt.value` inline).  TAGCONSTPTR → inline
-    /// `ConstPtr(trace._refs[v])` (history.py `ConstPtr.value` inline).
+    /// (`ConstInt.__init__`).  TAGCONSTPTR → inline
+    /// `ConstPtr(trace._refs[v])` (`ConstPtr.__init__`).
     /// TAGCONSTOTHER → inline `ConstFloat`/`ConstInt` from
-    /// `trace._floats`/`trace._bigints` (history.py:268/227 inline). Every
+    /// `trace._floats`/`trace._bigints`. Every
     /// TAG* arm mints inline-Const directly, so the decode needs no
     /// external/legacy ConstantPool beyond these opencoder-local pools.
     ///
@@ -1215,30 +1218,23 @@ impl<'a> ByteTraceIter<'a> {
                 self._get(v as usize)
             }
             TAGINT => {
-                // opencoder.py:326-327 ConstInt(v) — signed small int.
-                // history.py ConstInt.value inline. A const OpRef
-                // sheds to `Operand::Const`, never a position-only box.
-                Operand::from_opref(OpRef::const_int(v))
+                // opencoder.py `_untag` ConstInt(v) — signed small int.
+                Operand::const_from_value(Value::Int(v))
             }
             TAGCONSTPTR => {
-                // opencoder.py:328-329 ConstPtr(self.trace._refs[v]) —
-                // history.py `ConstPtr.value` inline. The
-                // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
-                // slots across minor collection.
+                // opencoder.py `_untag` ConstPtr(self.trace._refs[v]).
                 let addr = self.trace._refs[v as usize];
-                Operand::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
+                Operand::const_from_value(Value::Ref(majit_ir::GcRef(addr as usize)))
             }
             TAGCONSTOTHER => {
-                // opencoder.py:330-334 bigint vs float split on bit 0.
+                // opencoder.py `_untag` bigint vs float split on bit 0.
                 let pool_idx = (v >> 1) as usize;
                 if v & 1 != 0 {
-                    // history.py ConstFloat.value inline.
                     let bits = self.trace._floats[pool_idx];
-                    Operand::from_opref(OpRef::const_float(f64::from_bits(bits)))
+                    Operand::const_from_value(Value::Float(f64::from_bits(bits)))
                 } else {
-                    // history.py ConstInt.value inline.
                     let val = self.trace._bigints[pool_idx];
-                    Operand::from_opref(OpRef::const_int(val))
+                    Operand::const_from_value(Value::Int(val))
                 }
             }
             other => unreachable!("ByteTraceIter: unknown tag {}", other),
