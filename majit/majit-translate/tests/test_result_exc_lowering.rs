@@ -21,7 +21,8 @@ use majit_translate::front::mir::{
     shadow_stack_erase_status,
 };
 use majit_translate::model::{
-    CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation, ValueType, cast_instance_root,
+    CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation, ValueType,
+    cast_instance_root,
 };
 use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 use std::collections::{HashMap, HashSet};

@@ -4488,9 +4488,8 @@ fn sys_exc_info_direct_fn() -> Option<ExcInfoDirectFn> {
 /// - Fallback: allocate Vec via peekvalues + generic call path
 ///
 /// `function.py funccall_valuestack` has no loop and no `@jit.unroll_safe`.
-/// The PASSTHROUGHARGS1 shadow-stack reload of `nargs` is the GC transform
-/// of the same live variables (`framework.py pop_roots`); that loop lives
-/// in `gc_roots::shadow_stack_copy_range_into_vec`.
+/// The PASSTHROUGHARGS1 rest is published inside `funcrun_obj`
+/// (`framework.py push_roots` / `pop_roots`).
 pub fn funccall_valuestack(
     func: PyObjectRef,
     nargs: usize,
@@ -4699,48 +4698,23 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
-        // `Arguments::new` can collect, so pin `[code, w_obj]` on the
-        // function-entry RootScope across `make_arguments`. Two `pin_root`
-        // calls, not `pin_roots(&[code, w_obj])`: that temporary array
-        // lowers as `newlist` and the annotator then casts the list to
-        // RootScope. Opening the dropvalues RootScope before
-        // `make_arguments` lets the annotator type `arguments_w` as GCREF
-        // (`history.py` `getkind` `'int'` for the Vec header), and
-        // `funcrun_obj` then sees `[Ref, Ref, Ref]` against `[Ref, Ref, Int]`.
+        // Two `pin_root` calls, not `pin_roots(&[code, w_obj])`: that
+        // temporary array lowers as `newlist` and the annotator then casts
+        // the list to RootScope. `make_arguments` and `dropvalues` do not
+        // allocate, and `funcrun_obj` publishes the rest before its first
+        // collecting call, so the argument Vec needs no loop here
+        // (`function.py funccall_valuestack` has none; a pin loop in this
+        // graph is `loop-without-unroll_safe` under `access_directly`).
         let pair_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = _entry_roots.pin_root(code as PyObjectRef);
         let _ = _entry_roots.pin_root(unsafe { &*caller.live() }.peekvalue(nargs - 1));
-        let mut args = unsafe { &*caller.live() }.make_arguments(nargs - 1, false, func);
+        let args = unsafe { &*caller.live() }.make_arguments(nargs - 1, false, func);
         let code = _entry_roots.get(pair_base);
         let w_obj = _entry_roots.get(pair_base + 1);
-        // Same live-variable set as the fixed-arity arm above, for the same
-        // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and `args.arguments_w` is a native Vec no root walker updates.
-        // Pin `[code, w_obj, ...args]` before `dropvalues` (`framework.py
-        // push_roots`); `function.py funccall_valuestack` then calls
-        // `code.funcrun_obj(self, w_obj, args)`.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code);
-        let _ = _roots.pin_root(w_obj);
-        // Per-word `pin_root`: `pin_roots(&args.arguments_w)` types the
-        // field as a GCREF list, then `Arguments::new` setattr of the
-        // native Vec unions `Ptr(GCREF) ∪ RustVec` and skips this graph,
-        // leaving `funcrun_obj`'s third argument typed Ref.
-        let n_args = args.arguments_w.len();
-        for i in 0..n_args {
-            let _ = _roots.pin_root(args.arguments_w[i]);
-        }
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-        let code_now = _roots.get(root_base);
-        let w_obj_now = _roots.get(root_base + 1);
-        pyre_object::gc_roots::shadow_stack_copy_range_into_vec(
-            root_base + 2,
-            &mut args.arguments_w,
-        );
         return crate::gateway::BuiltinCodePassThroughArguments1::funcrun_obj(
-            code_now,
-            w_obj_now,
+            code,
+            w_obj,
             args.arguments_w,
         );
     }

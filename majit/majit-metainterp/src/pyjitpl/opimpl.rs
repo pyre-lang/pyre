@@ -153,6 +153,12 @@ where
         table[jitcode::insns::BC_CATCH_EXCEPTION as usize] = Self::opimpl_catch_exception;
         table[jitcode::insns::BC_LAST_EXCEPTION as usize] = Self::opimpl_last_exception;
         table[jitcode::insns::BC_LAST_EXC_VALUE as usize] = Self::opimpl_last_exc_value;
+        table[jitcode::insns::BC_INT_PUSH as usize] = Self::opimpl_any_push;
+        table[jitcode::insns::BC_REF_PUSH as usize] = Self::opimpl_any_push;
+        table[jitcode::insns::BC_FLOAT_PUSH as usize] = Self::opimpl_any_push;
+        table[jitcode::insns::BC_INT_POP as usize] = Self::opimpl_any_pop;
+        table[jitcode::insns::BC_REF_POP as usize] = Self::opimpl_any_pop;
+        table[jitcode::insns::BC_FLOAT_POP as usize] = Self::opimpl_any_pop;
         table[jitcode::insns::BC_GOTO_IF_EXCEPTION_MISMATCH as usize] =
             Self::opimpl_goto_if_exception_mismatch;
         table[jitcode::insns::BC_RVMPROF_CODE as usize] = Self::opimpl_rvmprof_code;
@@ -9411,6 +9417,14 @@ where
         // BC_RAISE byte, so `code_cursor - 1` is the byte position
         // of opimpl_raise itself — what `generate_guard(...,
         // resumepc=orgpc)` records.
+        //
+        // `emit_raise!` places `catch_exception` after `raise/r` in
+        // this jitcode (`blackhole.py handle_exception_in_frame`).
+        // Unique walk leaves `pc` at the resume snapshot; pin it to
+        // `code_cursor` so `finishframe_exception` reads "just after
+        // the insn that raised" (`pyjitpl.py`). Unwind pops when this
+        // frame has no catch — the callee-terminator shape of
+        // `opimpl_raise`.
         let opcode_pc = self.frames.current_mut().code_cursor - 1;
         let src = self.frames.current_mut().next_reg() as usize;
         let (opref, concrete) = self.read_ref_reg(ctx, src);
@@ -9445,17 +9459,13 @@ where
         self.last_exception_box = Some(opref);
         self.last_exception_value = concrete;
         self.class_of_last_exc_is_const = true;
+        // `bhimpl_raise` leaves `position` past the raise operand
+        // (`blackhole.py` `_get_method`). Unique walk must do the
+        // same: `finishframe_exception` reads `frame.pc`.
         {
             let frame = self.frames.current_mut();
-            // pyopcode.py raise_varargs: RAISE_VARARGS with an
-            // explicit value records at the raising instruction.
-            super::record_application_traceback(
-                concrete,
-                ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                frame,
-            );
+            frame.pc = frame.code_cursor;
         }
-        self.pop_exception_frame(ctx);
         self.unwind_to_exception_handler(ctx)
     }
 
@@ -9473,8 +9483,65 @@ where
         }
         // RaiseWithExplicitTraceback is the bare-reraise path and
         // deliberately skips record_application_traceback.
-        self.pop_exception_frame(ctx);
+        // Same-frame catch as `opimpl_raise`: `bhimpl_reraise` leaves
+        // `position` past the insn (`blackhole.py handle_exception_in_frame`).
+        {
+            let frame = self.frames.current_mut();
+            frame.pc = frame.code_cursor;
+        }
         self.unwind_to_exception_handler(ctx)
+    }
+
+    /// pyjitpl.py `_opimpl_any_push` / `opimpl_{int,ref,float}_push`.
+    /// `flatten.py insert_renamings` parks one box in `MIFrame.pushed_box`.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_any_push(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let src = self.frames.current_mut().next_reg() as usize;
+        let opref = match bytecode {
+            jitcode::insns::BC_INT_PUSH => self.read_int_reg(ctx, src).0,
+            jitcode::insns::BC_FLOAT_PUSH => self.read_float_reg(ctx, src).0,
+            _ => self.read_ref_reg(ctx, src).0,
+        };
+        self.frames.current_mut().pushed_box = Some(opref);
+        TraceAction::Continue
+    }
+
+    /// pyjitpl.py `_opimpl_any_pop` / `opimpl_{int,ref,float}_pop`.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_any_pop(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let dst = self.frames.current_mut().next_reg() as usize;
+        let Some(opref) = self.frames.current_mut().pushed_box.take() else {
+            return TraceAction::Abort;
+        };
+        let Some(concrete) = ctx.box_bits(opref) else {
+            return TraceAction::Abort;
+        };
+        match bytecode {
+            jitcode::insns::BC_INT_POP => {
+                self.set_int_reg(ctx, dst, Some(opref), Some(concrete));
+            }
+            jitcode::insns::BC_FLOAT_POP => {
+                self.set_float_reg(ctx, dst, Some(opref), Some(concrete));
+            }
+            _ => {
+                self.set_ref_reg(ctx, dst, Some(opref), Some(concrete));
+            }
+        }
+        TraceAction::Continue
     }
 
     #[inline(never)]

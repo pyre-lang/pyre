@@ -11507,14 +11507,6 @@ impl CallControl {
         self.declared_graph_result_type(&graph)
     }
 
-    /// Raw ADT / scalar returns have a coarse `ref` frontend token but an
-    /// int-bank `FUNC.RESULT`. Recover that declared repr for untyped call
-    /// sites too, including residual tokens other than the literal `"ref"`
-    /// (`i64`, `raw:<owner>`).
-    pub(crate) fn declared_raw_result_for_target(&self, target: &CallTarget) -> bool {
-        self.declared_result_type_for_target(target) == Some(Type::Int)
-    }
-
     /// `call.py get_jitcode_calldescr` `FUNC.RESULT` kind for a direct
     /// target. `None` when the graph has no `return_type` stamp
     /// (`mir.rs` ordinary fns keep it empty so TyRef labels cannot
@@ -28579,6 +28571,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert!(
             !descriptor.extra_info.can_collect,
@@ -28597,6 +28590,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert!(
@@ -29651,6 +29645,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert!(
             inst.extra_info
@@ -29708,6 +29703,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert!(
@@ -29891,6 +29887,7 @@ mod tests {
                         OopSpecIndex::None,
                         None,
                         &mut cache,
+                        None,
                         None,
                     );
                     let ei = &descriptor.extra_info;

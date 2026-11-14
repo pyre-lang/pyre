@@ -1151,38 +1151,6 @@ pub(in crate::front::mir) fn folded_fun_id_from_immutable_static(
     immutable_static_field_fun_id(llbc, gid, field_idx)
 }
 
-/// Closed PBC family for a call through a field of a type that only
-/// exists as immutable statics: every `FnDef` those initializers store.
-pub(in crate::front::mir) fn closed_fnptr_graphs_for(
-    llbc: &Llbc,
-    body: &Unstructured,
-    operand: &Operand,
-) -> Option<Vec<crate::parse::CallPath>> {
-    let type_id = operand_fnptr_table_adt(llbc, body, operand, 0)?;
-    let mut graphs = Vec::new();
-    for g in llbc.iter_global_decls() {
-        if !immutable_static_is_prebuilt_table(llbc, g) {
-            continue;
-        }
-        if global_decl_adt_id(llbc, g) != Some(type_id) {
-            continue;
-        }
-        let Some((_, funs)) = immutable_static_init_tables(llbc, g.def_id) else {
-            continue;
-        };
-        for fun_id in funs.into_iter().flatten() {
-            let Some(fd) = llbc.fn_by_id(fun_id) else {
-                continue;
-            };
-            let path = registered_path_for_fun_decl(llbc, fd);
-            if !graphs.contains(&path) {
-                graphs.push(path);
-            }
-        }
-    }
-    (!graphs.is_empty()).then_some(graphs)
-}
-
 pub(in crate::front::mir) fn global_tyref(g: &GlobalDecl) -> Option<TyRef> {
     g.tyref.clone()
 }
@@ -1255,73 +1223,6 @@ pub(in crate::front::mir) fn place_immutable_static_field(
         }
         _ => None,
     }
-}
-
-pub(in crate::front::mir) fn operand_fnptr_table_adt(
-    llbc: &Llbc,
-    body: &Unstructured,
-    operand: &Operand,
-    depth: usize,
-) -> Option<u64> {
-    if depth > 8 {
-        return None;
-    }
-    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
-        return None;
-    };
-    place_fnptr_table_adt(llbc, body, place, depth)
-}
-
-pub(in crate::front::mir) fn place_fnptr_table_adt(
-    llbc: &Llbc,
-    body: &Unstructured,
-    place: &Place,
-    depth: usize,
-) -> Option<u64> {
-    if depth > 8 {
-        return None;
-    }
-    match &place.kind {
-        PlaceKind::Projection(inner, elem) => {
-            if projection_elem_is_deref(elem) {
-                return place_fnptr_table_adt(llbc, body, inner, depth + 1);
-            }
-            if elem.field_payload().is_some() {
-                if let Some(head) = tyref_node(&inner.ty, llbc)
-                    .and_then(|n| strip_ty_wrappers(n, llbc))
-                    .and_then(adt_node_def_id)
-                {
-                    if type_decl_is_option(llbc, head) {
-                        return place_fnptr_table_adt(llbc, body, inner, depth + 1);
-                    }
-                    if immutable_static_exists_for_adt(llbc, head) {
-                        return Some(head);
-                    }
-                }
-            }
-            None
-        }
-        PlaceKind::Global { id, .. } => {
-            let g = llbc.global_by_id(*id)?;
-            if !immutable_static_is_prebuilt_table(llbc, g) {
-                return None;
-            }
-            global_decl_adt_id(llbc, g)
-        }
-        PlaceKind::Local(index) => {
-            let assigned = local_assigned_operand(body, *index)?;
-            operand_fnptr_table_adt(llbc, body, &assigned, depth + 1)
-        }
-        _ => None,
-    }
-}
-
-pub(in crate::front::mir) fn immutable_static_exists_for_adt(llbc: &Llbc, type_id: u64) -> bool {
-    type_is_prebuilt_table(llbc, type_id)
-        && llbc.iter_global_decls().any(|g| {
-            immutable_static_is_prebuilt_table(llbc, g)
-                && global_decl_adt_id(llbc, g) == Some(type_id)
-        })
 }
 
 pub(in crate::front::mir) fn local_assigned_operand(
@@ -4322,7 +4223,7 @@ pub(in crate::front::mir) fn size_align_subst_field(
 ) -> Option<TyRef> {
     let node = tyref_node(&field.ty, llbc)?;
     let value = size_align_subst_value(node, owner, llbc, 0)?;
-    Some(TyRef::Other(value))
+    Some(TyRef::Other(value.into()))
 }
 
 pub(in crate::front::mir) fn size_align_subst_value(

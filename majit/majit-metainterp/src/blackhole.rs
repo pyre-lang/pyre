@@ -16,7 +16,7 @@
 use crate::jitexc::JitException;
 use majit_ir::GcRef;
 #[cfg(test)]
-use majit_ir::{OpCode, OpRef};
+use majit_ir::OpCode;
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -5613,6 +5613,7 @@ mod tests {
         #[test]
         fn helper_jitcode_blackhole_resumes_at_pc_from_register_banks() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
 
             let mut helper = JitCodeBuilder::default();
             helper.record_binop_i(0, OpCode::IntMul, 0, 1);
@@ -5643,6 +5644,7 @@ mod tests {
         #[test]
         fn helper_abort_after_effect_converts_into_caller_without_replaying() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
 
             let mut helper = JitCodeBuilder::default();
             helper.record_binop_i(0, OpCode::IntMul, 0, 1);

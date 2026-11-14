@@ -1996,8 +1996,8 @@ mod tests {
     }
 
     /// Crate-stripped intern vs crate-prefixed harvest plus the bare leaf
-    /// alias: `lookup_fields` unique-suffix is ambiguous, `intern_field_rows`
-    /// still finds the longer key.
+    /// alias: unique-suffix lookup already resolves the crate-prefixed harvest,
+    /// and `intern_field_rows` still finds the longer key.
     #[test]
     fn intern_field_rows_prefers_crate_prefixed_over_bare_leaf() {
         let mut reg = StructFieldRegistry::default();
@@ -2007,9 +2007,12 @@ mod tests {
             rows.clone(),
         );
         reg.fields.insert("ModuleDictStrategy".to_string(), rows);
-        assert!(
-            reg.field_rows("celldict::ModuleDictStrategy").is_none(),
-            "unique-suffix of the intern spelling vs the leaf alias is ambiguous"
+        // A bare leaf alias does not compete with a qualified owner, so the
+        // unique-suffix lookup already resolves the crate-prefixed harvest.
+        assert_eq!(
+            reg.field_rows("celldict::ModuleDictStrategy")
+                .map(|rows| rows[0].name.as_str()),
+            Some("owner")
         );
         let interned = reg
             .intern_field_rows("celldict::ModuleDictStrategy")

@@ -1224,14 +1224,17 @@ fn apply_inlined_call_stack_effect_after_success<Sym: WalkSym>(
     // sentinel did not step; using the smaller extra under-applies and
     // leaves valuestackdepth at entry. An unseeded sub-walk starts at
     // extra 0 — then only the callee liveness table is usable.
-    let mirror_extra = ctx.vstack_depth;
+    let (mirror_extra, vstack_valid) = {
+        let state = ctx.frame_state.borrow();
+        (state.vstack_depth, state.vstack_valid)
+    };
     let live_extra = crate::liveness::liveness_for(code_ptr)
         .depth_at_py_pc()
         .get(call_pc)
         .copied()
         .unwrap_or(0) as usize;
     let extra = match (
-        ctx.vstack_valid && mirror_extra >= r_args.len(),
+        vstack_valid && mirror_extra >= r_args.len(),
         live_extra >= r_args.len(),
     ) {
         (true, true) => mirror_extra.max(live_extra),
@@ -1260,10 +1263,10 @@ fn apply_inlined_call_stack_effect_after_success<Sym: WalkSym>(
         let last = ctx.frame_state.borrow().vstack_last_ref;
         (last != OpRef::NONE).then_some(last)
     };
-    if ctx.vstack_valid {
-        ctx.vstack_depth = after_extra;
-        ctx.vstack_cur_pypc = fallthrough as u32;
+    if vstack_valid {
         let mut state = ctx.frame_state.borrow_mut();
+        state.vstack_depth = after_extra;
+        state.vstack_cur_pypc = fallthrough as u32;
         state.vstack_boxes.truncate(after_extra);
         if state.vstack_boxes.len() < after_extra {
             state.vstack_boxes.resize(after_extra, OpRef::NONE);
@@ -1332,14 +1335,17 @@ fn call_site_entry_extra<Sym: WalkSym>(
     ) {
         return None;
     }
-    let mirror_extra = ctx.vstack_depth;
+    let (mirror_extra, vstack_valid) = {
+        let state = ctx.frame_state.borrow();
+        (state.vstack_depth, state.vstack_valid)
+    };
     let live_extra = crate::liveness::liveness_for(code_ptr)
         .depth_at_py_pc()
         .get(call_pc)
         .copied()
         .unwrap_or(0) as usize;
     let extra = match (
-        ctx.vstack_valid && mirror_extra >= r_args.len(),
+        vstack_valid && mirror_extra >= r_args.len(),
         live_extra >= r_args.len(),
     ) {
         (true, true) => mirror_extra.max(live_extra),

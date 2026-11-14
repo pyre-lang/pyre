@@ -30,7 +30,13 @@ use majit_translate::{
         ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, ValueType,
         VecFieldPart, getkind,
     },
-    translator::rtyper::{legacy_annotator, legacy_resolve},
+    translator::rtyper::{
+        legacy_annotator, legacy_resolve,
+        lltypesystem::{
+            lltype::{LowLevelType, PtrTarget},
+            rstr::STRPTR,
+        },
+    },
 };
 
 const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
@@ -1410,10 +1416,17 @@ fn install_semantic_layouts(callcontrol: &mut CallControl, program: &SemanticPro
     }
 }
 
-/// `code.names[idx].as_ref()` is a borrow of a by-value String item
-/// in the host `Box<[String]>` FatData region. The Index is a raw
-/// `nolength` ArrayRead of the item address; jtransform rewrites it
-/// as `getarraysubstruct` (`int_mul` 24 + `int_add`, kind `'i'`).
+/// `code.names[idx].as_str()` is a borrow of a by-value String item
+/// in the host `Box<[String]>` / `Vec<String>` FatData region. Place
+/// Index is the raw item ADDRESS: `rptr.py` InteriorPtrRepr
+/// `direct_ptradd` of the names items pointer by the unscaled index,
+/// item size `sizeof` the three-word String header. A one-word
+/// `ArrayRead` of a `Vec<String>` item would load only the UTF-8 data
+/// pointer (`get_type_flag("String")` is FLAG_POINTER). `Repr.rtype_str`
+/// then copies that header. jtransform `rewrite_op_direct_ptradd`
+/// (`jtransform.py rewrite_op_getarraysubstruct` returns
+/// `rewrite_op_direct_ptradd`) is `int_mul` by that size plus
+/// `int_add`, kind `'i'`.
 #[test]
 fn execute_store_name_names_index_is_raw_item_address() {
     let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
@@ -1425,30 +1438,23 @@ fn execute_store_name_names_index_is_raw_item_address() {
             ..Default::default()
         },
         &["pyopcode", "eval", "pyframe", "pycode"],
-        &[
-            "execute_store_name",
-            "opcode_store_name",
-            "store_name_value",
-            "store_name",
-            "get_w_locals",
-            "getdebug_data",
-            "get_or_create_w_locals",
-            "w_code_getname_w_or_new",
-            "w_code_getname_w",
-        ],
+        &["load_name_from_code"],
     )
-    .expect("lower execute_store_name");
+    .expect("lower load_name_from_code");
     let function = program
         .functions
         .iter()
-        .find(|f| f.name == "execute_store_name")
-        .expect("execute_store_name graph");
+        .find(|f| f.name == "load_name_from_code")
+        .expect("load_name_from_code graph");
 
-    let array_dump: Vec<String> = function
+    let ops: Vec<_> = function
         .graph()
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
+        .collect();
+    let dump: Vec<String> = ops
+        .iter()
         .filter_map(|op| match &op.kind {
             OpKind::ArrayRead {
                 item_ty,
@@ -1460,73 +1466,245 @@ fn execute_store_name_names_index_is_raw_item_address() {
                 "ArrayRead item_ty={item_ty:?} array_type_id={array_type_id:?} \
                  nolength={nolength} taken_by_address={taken_by_address}"
             )),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty,
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => Some(format!(
+                "direct_ptradd args={args:?} result_ty={result_ty:?} dest_ct={:?}",
+                op.result.as_ref().and_then(|v| v.concretetype())
+            )),
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "names"
+                    && matches!(
+                        field.vec_part,
+                        Some(majit_translate::model::VecFieldPart::FatData)
+                            | Some(majit_translate::model::VecFieldPart::FatLen)
+                    ) =>
+            {
+                Some(format!(
+                    "FieldRead names vec_part={:?} ty={ty:?}",
+                    field.vec_part
+                ))
+            }
+            OpKind::UnaryOp {
+                op: uop, result_ty, ..
+            } if uop == "str" => Some(format!(
+                "UnaryOp str result_ty={result_ty:?} dest_ct={:?}",
+                op.result.as_ref().and_then(|v| v.concretetype())
+            )),
             _ => None,
         })
         .collect();
-    let mut saw_names = false;
-    for op in function
-        .graph()
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-    {
-        let OpKind::ArrayRead {
-            array_type_id,
-            nolength,
-            taken_by_address,
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        let id = array_type_id.as_deref().unwrap_or("");
-        if id != "Vec<String>" {
-            continue;
-        }
-        saw_names = true;
-        assert!(
-            *nolength,
-            "names FatData is a raw items region. dump={array_dump:?}"
-        );
-        assert!(
-            *taken_by_address,
-            "`code.names[idx].as_ref()` is the item address. dump={array_dump:?}"
-        );
-    }
-    assert!(
-        saw_names,
-        "execute_store_name must ArrayRead Vec<String>. dump={array_dump:?}"
-    );
 
-    let saw_fat_len = function.graph().blocks.iter().any(|block| {
-        block.operations.iter().any(|op| match &op.kind {
-            OpKind::FieldRead { field, .. } => {
-                field.vec_part == Some(majit_translate::model::VecFieldPart::FatLen)
+    let vec_string_reads: Vec<_> = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::ArrayRead { array_type_id, .. } => {
+                array_type_id.as_deref() == Some("Vec<String>")
             }
             _ => false,
         })
+        .collect();
+    assert!(
+        vec_string_reads.is_empty(),
+        "names[idx] is not a one-word ArrayRead of a Vec<String> item. dump={dump:?}"
+    );
+
+    let names_items = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. }
+            if field.name == "names"
+                && field.vec_part == Some(majit_translate::model::VecFieldPart::FatData) =>
+        {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let names_items =
+        names_items.unwrap_or_else(|| panic!("names FatData is the items pointer. dump={dump:?}"));
+
+    fn item_ptr_aliases(
+        graph: &FunctionGraph,
+        root: &majit_translate::flowspace::model::Variable,
+    ) -> HashSet<majit_translate::flowspace::model::Variable> {
+        let mut set = HashSet::new();
+        set.insert(root.clone());
+        loop {
+            let before = set.len();
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let Some(dest) = op.result.as_ref() else {
+                        continue;
+                    };
+                    if set.contains(dest) {
+                        continue;
+                    }
+                    let follows = match &op.kind {
+                        OpKind::UnaryOp {
+                            op: uop, operand, ..
+                        } if uop == "same_as" => set.contains(operand),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            args,
+                            ..
+                        } if matches!(
+                            segments.last().map(String::as_str),
+                            Some("cast_ptr_to_int" | "cast_int_to_ptr" | "cast")
+                        ) =>
+                        {
+                            args.iter()
+                                .any(|a| a.as_variable().is_some_and(|v| set.contains(v)))
+                        }
+                        _ => false,
+                    };
+                    if follows {
+                        set.insert(dest.clone());
+                    }
+                }
+                for link in &block.exits {
+                    let Some(succ) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                        continue;
+                    };
+                    for (i, arg) in link.args.iter().enumerate() {
+                        let Some(v) = arg.as_variable() else {
+                            continue;
+                        };
+                        if !set.contains(v) {
+                            continue;
+                        }
+                        if let Some(inp) = succ.inputargs.get(i) {
+                            set.insert(inp.clone());
+                        }
+                    }
+                }
+            }
+            if set.len() == before {
+                break;
+            }
+        }
+        set
+    }
+
+    let item_bytes = 3 * majit_translate::layout::target_word_size() as usize;
+    fn is_string_header_items_ptr(ty: &LowLevelType, item_bytes: usize) -> bool {
+        let LowLevelType::Ptr(ptr) = ty else {
+            return false;
+        };
+        let PtrTarget::Array(arr) = &ptr.TO else {
+            return false;
+        };
+        match &arr.OF {
+            LowLevelType::FixedSizeArray(fsa) => {
+                fsa.length == item_bytes && matches!(fsa.OF, LowLevelType::Char)
+            }
+            _ => false,
+        }
+    }
+
+    let aliases = item_ptr_aliases(function.graph(), &names_items);
+    let ptradds: Vec<_> = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => args
+                .first()
+                .and_then(|a| a.as_variable())
+                .is_some_and(|base| aliases.contains(base)),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        ptradds.len(),
+        1,
+        "names[idx] is direct_ptradd of the names items pointer. dump={dump:?}"
+    );
+    let ptradd = ptradds[0];
+    match &ptradd.kind {
+        OpKind::Call { args, .. } => {
+            let index = args
+                .get(1)
+                .and_then(|a| a.as_variable())
+                .expect("direct_ptradd count");
+            assert_eq!(
+                FunctionGraph::concretetype_of(index),
+                ConcreteType::Signed,
+                "direct_ptradd count is the unscaled index. dump={dump:?}"
+            );
+        }
+        other => panic!("expected direct_ptradd, got {other:?}"),
+    }
+    let ptradd_ty = ptradd.result.as_ref().and_then(|v| v.concretetype());
+    assert!(
+        ptradd_ty
+            .as_ref()
+            .is_some_and(|ty| is_string_header_items_ptr(ty, item_bytes)),
+        "direct_ptradd item is sizeof(String header)={item_bytes}. dest_ct={ptradd_ty:?} dump={dump:?}"
+    );
+
+    let ptradd_result = ptradd.result.as_ref().expect("direct_ptradd result");
+    let header = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+            && args.iter().any(|a| a.as_variable() == Some(ptradd_result)) =>
+        {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let header = header.unwrap_or_else(|| {
+        panic!("interior pointer recasts into the String header. dump={dump:?}")
+    });
+    let conversions: Vec<_> = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: uop, result_ty, operand, .. }
+                    if uop == "str" && *result_ty == ValueType::Str && operand == &header
+            )
+        })
+        .collect();
+    assert_eq!(
+        conversions.len(),
+        1,
+        "as_str of the interior &String is UnaryOp str. dump={dump:?}"
+    );
+    let produced = conversions[0].result.as_ref().expect("str() result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&*STRPTR),
+        "rtype_str of the header is Ptr(STR). dump={dump:?}"
+    );
+
+    let saw_fat_len = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } => {
+            field.vec_part == Some(majit_translate::model::VecFieldPart::FatLen)
+        }
+        _ => false,
     });
     assert!(
         saw_fat_len,
         "fat-box Index bounds-checks against the sibling FatLen part"
     );
-    let saw_lt = function.graph().blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::BinOp { op, .. } if op == "lt"
-            )
-        })
+    let saw_lt = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )
     });
     assert!(saw_lt, "guard_item_index emits index < FatLen");
-    let saw_bounds_panic = function.graph().blocks.iter().any(|block| {
-        block.operations.iter().any(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => segments.iter().any(|s| s.contains("ll_slice_bounds_panic")),
-            _ => false,
-        })
+    let saw_bounds_panic = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.iter().any(|s| s.contains("ll_slice_bounds_panic")),
+        _ => false,
     });
     assert!(
         saw_bounds_panic,
@@ -1574,11 +1752,17 @@ fn execute_store_name_names_index_is_raw_item_address() {
                 field.name,
                 op.result.as_ref().map(FunctionGraph::concretetype_of)
             )),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
+                Some("leftover direct_ptradd".into())
+            }
             _ => None,
         })
         .collect();
 
-    let word = 3 * majit_translate::layout::target_word_size() as i64;
+    let word = item_bytes as i64;
     let saw_mul_24 = rewritten.graph.blocks.iter().any(|block| {
         let ops = &block.operations;
         ops.windows(2).any(|pair| {
@@ -1592,7 +1776,7 @@ fn execute_store_name_names_index_is_raw_item_address() {
     });
     assert!(
         saw_mul_24,
-        "getarraysubstruct is int_mul by sizeof(String)=24. dump={rewrite_dump:?}"
+        "rewrite_op_direct_ptradd is int_mul by sizeof(String header)={word}. dump={rewrite_dump:?}"
     );
     let saw_int_add = rewritten.graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| match &op.kind {
@@ -1607,7 +1791,7 @@ fn execute_store_name_names_index_is_raw_item_address() {
     });
     assert!(
         saw_int_add,
-        "getarraysubstruct is int_add kind 'i'. dump={rewrite_dump:?}"
+        "rewrite_op_direct_ptradd is int_add kind 'i'. dump={rewrite_dump:?}"
     );
     let leftover_gc_item = rewritten.graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| match &op.kind {
@@ -1618,6 +1802,31 @@ fn execute_store_name_names_index_is_raw_item_address() {
     assert!(
         !leftover_gc_item,
         "no getarrayitem_gc after rewrite. dump={rewrite_dump:?}"
+    );
+    let leftover_vec_string = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead { array_type_id, .. } => {
+                array_type_id.as_deref() == Some("Vec<String>")
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_vec_string,
+        "no one-word ArrayRead of a Vec<String> item after rewrite. dump={rewrite_dump:?}"
+    );
+    let leftover_ptradd = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_ptradd,
+        "direct_ptradd is rewritten, not residual. dump={rewrite_dump:?}"
     );
     let leftover_raw_r = rewritten.graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| match &op.kind {

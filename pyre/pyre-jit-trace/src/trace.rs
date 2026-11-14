@@ -1241,7 +1241,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
         let attached = unsafe { (*sym.jitcode()).index as i32 };
         if attached != carrier.root_jitcode_index {
             crate::jitcode_dispatch::census_record("P2Drain::PortalVsPerfnJitcode");
-            return (majit_metainterp::TraceAction::Abort, concrete_frame, false);
+            return (majit_metainterp::TraceAction::Abort, false);
         }
     }
     // Issue #215 item 2: drive the multiframe bridge-carrier resume via the

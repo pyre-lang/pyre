@@ -3196,14 +3196,6 @@ fn inline_struct_field_offset(
     Some(row.offset)
 }
 
-/// `cpu.fielddescrof(STRUCT, quasiimmut.get_mutate_field_name(name))`.
-/// Same STRUCT object as `field` (`descr.py get_field_descr`).
-fn mutate_field_descr(field: &FieldDescriptor) -> FieldDescriptor {
-    FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
-        .with_owner_id(field.owner_id)
-        .with_owner_declared_gc(field.owner_declared_gc)
-}
-
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
 /// one such edge is not this word on the other edge, so it stays a phi.
 ///
@@ -4720,7 +4712,9 @@ impl<'a> Transformer<'a> {
         // applied after rewrite. Resolve the same handle `hook_access_field`
         // keys flags on.
         let renamed_base = resolve_alias(renamed_base, &self.aliases);
-        let mutate_field = mutate_field_descr(field);
+        let mutate_field =
+            FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
+                .with_owner_id(field.owner_id);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!(
@@ -11691,13 +11685,16 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some(VableArrayVar {
-            vable_base,
-            array_index: arr_idx,
-            itemsize,
-            is_signed,
-            owner,
-        }) = self
+        // `getkind(Unsigned) == 'int'`. Stamping the dest Signed from that
+        // kind must not widen a `u8` / `bool` item to `Int`; the array's
+        // item bank stays the frontend `ValueType` (`rint.py` Unsigned).
+        let typed_item_ty = match typed_item_ty {
+            ValueType::Int if matches!(item_ty, ValueType::Unsigned | ValueType::Bool) => {
+                item_ty.clone()
+            }
+            other => other,
+        };
+        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
             .vable_array_vars
             .get(&resolve_alias(base, &self.aliases))
             .cloned()
@@ -16264,6 +16261,7 @@ impl<'a> Transformer<'a> {
                         nolength,
                         gckind: crate::model::ArrayGcKind::Gc,
                         pure,
+                        taken_by_address: false,
                     },
                 };
                 Some(
@@ -52019,6 +52017,7 @@ mod tests {
                     ],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(std::iter::once(count.clone())),
@@ -52071,6 +52070,7 @@ mod tests {
                     ],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(std::iter::once(count.clone())),

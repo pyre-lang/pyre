@@ -714,19 +714,22 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     assert!(super::tyref_is_fat_slice(
         &TyRef::Other(serde_json::json!({
             "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"]
-        })),
+        }).into()),
         &llbc,
     ));
     assert!(super::tyref_is_fat_slice(
-        &TyRef::Other(serde_json::json!({
-            "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"]
-        })),
+        &TyRef::Other(
+            serde_json::json!({
+                "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"]
+            })
+            .into()
+        ),
         &llbc,
     ));
     assert!(!super::tyref_is_fat_slice(
         &TyRef::Other(serde_json::json!({
             "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"]
-        })),
+        }).into()),
         &llbc,
     ));
     assert_eq!(
@@ -814,13 +817,16 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     });
     let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
     assert_eq!(
-        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
+        super::tyref_pair_slice_item_kind(
+            &TyRef::Other(slice_of(projection.clone()).into()),
+            &unique
+        ),
         Some(VecItemKind::Int),
         "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
     );
     let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
     assert_eq!(
-        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection)), &ambiguous),
+        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection).into()), &ambiguous),
         Some(VecItemKind::Ref)
     );
 }
@@ -969,7 +975,7 @@ fn stamp_rust_vec_header_replaces_kind_collapsed_signed() {
     use majit_ir::rvec::VecItemKind;
 
     let llbc = rust_vec_stamp_llbc();
-    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json());
+    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json().into());
     let var = Variable::new();
     var.set_concretetype(Some(LowLevelType::Signed));
     super::stamp_rust_vec_header(&var, &ty, &llbc);
@@ -987,7 +993,7 @@ fn stamp_rust_vec_header_keeps_existing_gc_pointer() {
     use crate::translator::rtyper::rrustvec::rust_vec_item_kind;
 
     let llbc = rust_vec_stamp_llbc();
-    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json());
+    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json().into());
     let var = Variable::new();
     var.set_concretetype(Some((*OBJECTPTR).clone()));
     super::stamp_rust_vec_header(&var, &ty, &llbc);

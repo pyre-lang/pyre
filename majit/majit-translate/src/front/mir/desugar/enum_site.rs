@@ -427,7 +427,7 @@ impl<'a> Lowering<'a> {
         // including `Option<&Vec<T>>`. The Option<&T> peel below would
         // otherwise name the Vec ADT as a GC instance class. `Vec<u8>`
         // is the list model and keeps the later payload walk.
-        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone().into()), self.llbc).is_some() {
             return None;
         }
         if let Some(root) =
@@ -598,7 +598,7 @@ impl<'a> Lowering<'a> {
             .get(0)?;
         // One-word Vec header Int niche: `None` is `option_niche_int_null`,
         // not a GC `Vec<…>` instance. `Vec<u8>` is the list model.
-        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone().into()), self.llbc).is_some() {
             return None;
         }
         let stripped = strip_ty_wrappers(payload, self.llbc)?;

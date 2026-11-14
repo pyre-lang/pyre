@@ -1458,9 +1458,7 @@ fn set_add_value_bracket_is_scalar_replaced() {
 /// harvest must not classify the body as ParamSlots.
 #[test]
 fn wrap_set_element_hash_error_is_not_param_slots() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     let hits = discover_stack_param_slots_fns(llbc);
     let wrap = hits
         .iter()
@@ -1557,10 +1555,7 @@ fn body_calls_vec_rangefrom_index(llbc: &Llbc, body: &Unstructured) -> bool {
 /// An Int-banked header must not remain a residual `Vec::index` RangeFrom.
 #[test]
 fn object_vec_rangefrom_index_is_getslice_not_residual() {
-    let llbcs: Vec<&'static Llbc> = [object_llbc(), interpreter_llbc()]
-        .into_iter()
-        .flatten()
-        .collect();
+    let llbcs: Vec<&'static Llbc> = vec![object_llbc(), interpreter_llbc()];
     assert!(
         !llbcs.is_empty(),
         "object or interpreter LLBC must be present"
@@ -1632,9 +1627,7 @@ fn object_vec_rangefrom_index_is_getslice_not_residual() {
 /// A bare `__getslice_rangefrom` has no array identity and stays residual.
 #[test]
 fn object_vec_rangefrom_jtransform_rewrites_getslice_marker() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
+    let llbc = interpreter_llbc();
     let graph = lower_named(llbc, "try_new_for_call_with_closure_and_globals_obj");
     let markers: Vec<Vec<String>> = graph
         .blocks
@@ -1688,9 +1681,7 @@ fn object_vec_rangefrom_jtransform_rewrites_getslice_marker() {
 /// is what pickle traced as a symbolic path.
 #[test]
 fn dict_operation_guard_ctor_is_not_a_residual_fnaddr() {
-    let Some(llbc) = object_llbc() else {
-        return;
-    };
+    let llbc = object_llbc();
     with_shared_lowering(llbc, |context| {
         let mut hits = Vec::new();
         for fd in llbc.iter_local_fns() {

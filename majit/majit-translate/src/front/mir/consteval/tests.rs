@@ -1726,32 +1726,28 @@ fn immutable_static_fnptr_field_folds_to_fn_const() {
 }
 
 /// A call through a field of a type that only exists as immutable
-/// statics is `indirect_call` with the initializer `FnDef`s as
-/// `c_graphs` (`rpbc.py FunctionsPBCRepr` /
-/// `jtransform.py handle_regular_indirect_call`).
+/// statics is `indirect_call` keyed by the struct field family
+/// (`FunctionReprBase.call`).
 #[test]
-fn immutable_static_fnptr_call_carries_closed_family() {
+fn immutable_static_fnptr_call_carries_field_family() {
     let llbc = vtable_fixture();
     let graph = super::lower_function(&llbc, "call_slot").expect("lower call_slot");
-    let families: Vec<Vec<String>> = op_kinds(&graph)
+    let families: Vec<&crate::model::IndirectFamilyKey> = op_kinds(&graph)
         .into_iter()
         .filter_map(|kind| match kind {
             OpKind::IndirectCall {
-                graphs: Some(graphs),
+                family_key: Some(key),
+                graphs: None,
                 ..
-            } => Some(
-                graphs
-                    .iter()
-                    .filter_map(|path| path.segments.last().cloned())
-                    .collect(),
-            ),
+            } => Some(key),
             _ => None,
         })
         .collect();
     assert_eq!(families.len(), 1, "one IndirectCall family: {graph:?}");
-    let mut leaves = families[0].clone();
-    leaves.sort();
-    assert_eq!(leaves, vec!["leaf_a".to_string(), "leaf_b".to_string()]);
+    assert_eq!(
+        families[0],
+        &crate::model::IndirectFamilyKey::fnptr_field("Vtable", "slot")
+    );
     let harvested = super::harvest_immutable_fields_from_immutable_statics(&llbc);
     let slot = harvested
         .get("Vtable")
@@ -2394,6 +2390,8 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let graph = super::lower_unstructured_with_static_addrs_and_attrs(
@@ -2404,6 +2402,7 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        Default::default(),
         &empty_set,
         &empty_set,
         &empty_set,
@@ -2418,6 +2417,8 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
         None,
         None,
         None,
+        None,
+        &empty_hints,
         Some((types.as_slice(), [].as_slice())),
     )
     .expect("lower spec body");
@@ -2739,6 +2740,8 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let queue = std::cell::RefCell::new(SpecQueue::new());
@@ -2750,6 +2753,7 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        Default::default(),
         &empty_set,
         &empty_set,
         &empty_set,
@@ -2764,6 +2768,8 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
         None,
         None,
         None,
+        None,
+        &empty_hints,
         None,
     )
     .expect("lower caller");
@@ -2949,6 +2955,8 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let lower = |queue: &std::cell::RefCell<SpecQueue>,
@@ -2961,6 +2969,7 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
             &[],
             &empty_map,
             &crate::front::semantic::StructFieldRegistry::default(),
+            Default::default(),
             &empty_set,
             &empty_set,
             &empty_set,
@@ -2975,6 +2984,8 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
             None,
             None,
             cross,
+            None,
+            &empty_hints,
             None,
         )
         .expect("lower caller")
@@ -3114,6 +3125,8 @@ fn leftover_clause_trait_ref_still_enqueues_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let queue = std::cell::RefCell::new(SpecQueue::new());
@@ -3125,6 +3138,7 @@ fn leftover_clause_trait_ref_still_enqueues_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        Default::default(),
         &empty_set,
         &empty_set,
         &empty_set,
@@ -3139,6 +3153,8 @@ fn leftover_clause_trait_ref_still_enqueues_cachedgraph() {
         None,
         None,
         None,
+        None,
+        &empty_hints,
         None,
     )
     .expect("lower caller");
@@ -3252,6 +3268,8 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let lower = |queue: &std::cell::RefCell<SpecQueue>,
@@ -3264,6 +3282,7 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
             &[],
             &empty_map,
             &crate::front::semantic::StructFieldRegistry::default(),
+            Default::default(),
             &empty_set,
             &empty_set,
             &empty_set,
@@ -3278,6 +3297,8 @@ fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
             None,
             None,
             cross,
+            None,
+            &empty_hints,
             None,
         )
         .expect("lower caller")
@@ -3419,6 +3440,8 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let queue = std::cell::RefCell::new(SpecQueue::new());
@@ -3430,6 +3453,7 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        Default::default(),
         &empty_set,
         &empty_set,
         &empty_set,
@@ -3444,6 +3468,8 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
         None,
         None,
         None,
+        None,
+        &empty_hints,
         None,
     )
     .expect("lower caller");
@@ -3621,6 +3647,8 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
     let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
     let empty_map = std::collections::HashMap::new();
+    let empty_hints: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let root_state = super::RootStackState::new(&llbc);
     let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
     let queue = std::cell::RefCell::new(SpecQueue::new());
@@ -3632,6 +3660,7 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        Default::default(),
         &empty_set,
         &empty_set,
         &empty_set,
@@ -3646,6 +3675,8 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
         None,
         None,
         None,
+        None,
+        &empty_hints,
         None,
     )
     .expect("lower caller");

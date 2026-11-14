@@ -5562,6 +5562,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),

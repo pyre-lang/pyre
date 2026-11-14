@@ -2442,13 +2442,6 @@ impl Trace {
         if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
             return;
         }
-        // Upstream `_resref` is always a GCREF. A raw / interior / stack
-        // word that the kind bank still types as Ref is not in the
-        // collector; `classify` returning None is "not an object", not
-        // "the object died".
-        if !vs.gc_referent.get() {
-            return;
-        }
         match classify(gcref.0) {
             Some(addr) if addr == gcref.0 => {}
             Some(addr) => cell.set(Some(Value::Ref(GcRef(addr)))),

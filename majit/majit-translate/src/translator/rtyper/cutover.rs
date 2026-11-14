@@ -12020,6 +12020,7 @@ mod tests {
                         segments: vec![OPTION_FN_PBC_CALLEE.into()],
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -16854,13 +16855,14 @@ mod tests {
                 ],
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(None),
         );
         let twin = value_to_var.get(&result).expect("twin");
         *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         assert_eq!(
             twin.concretetype(),
             Some(GCREF.clone()),
@@ -16878,13 +16880,14 @@ mod tests {
                 segments: vec!["erased_gcref_call".to_string()],
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(None),
         );
         let twin = value_to_var.get(&result).expect("twin");
         *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         assert_eq!(
             kind_of_in(&value_to_var, &result),
             ConcreteType::Void,

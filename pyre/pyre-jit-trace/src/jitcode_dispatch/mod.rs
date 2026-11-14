@@ -197,7 +197,6 @@ use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, WalkSym};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
-use rustpython_wtf8::Wtf8;
 
 /// Descriptor accessor carried by an active MIFrame walk.
 ///
@@ -4919,6 +4918,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     &ref_concretes,
                     &float_args,
                     &[],
+                    &[],
                     inline_w_code,
                     inline_call::SubwalkFrameKind::PythonPortal(portal_site),
                 ) {
@@ -5239,7 +5239,10 @@ fn finish_recursive_inline<Sym: WalkSym>(
             }
             let token = match token {
                 Some(token) => Some(token),
-                None => portal_assembler_token(w_code, target_pc, is_being_profiled),
+                None => {
+                    let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+                    portal_assembler_token(pin.save(), target_pc, is_being_profiled)
+                }
             };
             let emitted = inline_call::emit_walker_loop_callee_call_assembler(
                 ctx,
@@ -5253,6 +5256,7 @@ fn finish_recursive_inline<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
+                None,
                 None,
                 None,
                 None,
@@ -7121,6 +7125,7 @@ fn write_ref_reg<Sym: WalkSym>(
     {
         *c_slot = sanitized;
     }
+    ctx.frame_state.borrow_mut().vstack_last_ref = value;
     Ok(())
 }
 

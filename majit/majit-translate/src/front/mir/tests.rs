@@ -7244,7 +7244,7 @@ fn vec_typevar_clone_dest_i64_paints_int() {
                 target: CallTarget::FunctionPath { segments, .. },
                 result_ty,
                 ..
-            } if segments.last().map(String::as_str) == Some("clone") => Some(result_ty.clone()),
+            } if segments.last().map(String::as_str) == Some("list") => Some(result_ty.clone()),
             _ => None,
         });
     assert_eq!(
@@ -20273,7 +20273,7 @@ fn to_string_fn_item_llbc(self_ty: serde_json::Value, to_string_generic: bool) -
         },
         "methods": []
     });
-    llbc_with_types_traits(
+    llbc_with_types_and_traits(
         "fixture",
         vec![string_decl],
         vec![caller, to_string],
@@ -37874,9 +37874,10 @@ fn ll_vec_setitem_fast_r_item_is_gcref() {
     );
 }
 
-/// `rlist.py ll_extend`: `_ll_resize_ge` then `ll_arraycopy`. A
-/// per-item loop would be declined by `look_inside_graph` and
-/// residualize with only a symbolic path hash.
+/// `rlist.py ll_extend`: `_ll_resize_ge` then `ll_arraycopy`. The
+/// copy leaf is `ll_gcarray_arraycopy_r` (`rgc.ll_arraycopy` of the
+/// one-word object slice). A per-item loop would be declined by
+/// `look_inside_graph` and residualize with only a symbolic path hash.
 #[test]
 fn ll_vec_extend_r_is_resize_then_arraycopy() {
     let path = concat!(
@@ -37898,7 +37899,7 @@ fn ll_vec_extend_r_is_resize_then_arraycopy() {
         })
         .collect();
     assert!(
-        leaves.iter().any(|leaf| leaf == "ll_slice_arraycopy_r"),
+        leaves.iter().any(|leaf| leaf == "ll_gcarray_arraycopy_r"),
         "ll_extend copies with ll_arraycopy; leaves={leaves:?}"
     );
     assert!(
@@ -42855,7 +42856,7 @@ fn capture_of_gc_struct_field_through_mut_param_declines() {
             "generics": {"types": [{"Value": [1, s_ty.clone()]}]}
         }
     });
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![env_decl, s_decl],
         vec![caller],
@@ -52098,4 +52099,3 @@ fn positional_ctor_keeps_tyref_int_over_spelling_ref() {
         ValueType::Int
     );
 }
-

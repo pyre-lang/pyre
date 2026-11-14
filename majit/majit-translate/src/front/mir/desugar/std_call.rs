@@ -1068,6 +1068,7 @@ impl<'a> Lowering<'a> {
                     .collect(),
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![sum]),
@@ -7749,6 +7750,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__strlen".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![pat]),
@@ -7769,6 +7771,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__getslice_rangefrom".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![hay, plen]),
@@ -8138,6 +8141,7 @@ impl<'a> Lowering<'a> {
                     segments: vec!["__strlen".to_string()],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![base.clone()]),
@@ -8149,6 +8153,7 @@ impl<'a> Lowering<'a> {
                     segments: vec!["__len".to_string()],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![base.clone()]),
@@ -8834,7 +8839,14 @@ impl<'a> Lowering<'a> {
         let Some(ty) = ptr_ty else {
             return false;
         };
-        if flavor_raw_pointer_class_root(ty, self.llbc, &self.raw_alloc_flavor_structs).is_some() {
+        if flavor_raw_pointer_class_root(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
             return false;
         }
         if tyref_raw_ptr_to_classed_instance_spelling(ty, self.llbc).is_none() {

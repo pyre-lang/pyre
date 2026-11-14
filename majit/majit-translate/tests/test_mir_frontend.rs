@@ -4707,7 +4707,7 @@ fn flat_pycall_frame_comes_from_deref_mut() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("pub fn new(frame: PyFrame)"))
         })
     }
 

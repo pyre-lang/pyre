@@ -1063,9 +1063,9 @@ pub(in crate::front::mir) fn raw_scalar_address_value_type(
         .as_object()
         .is_some_and(|obj| obj.contains_key("RawPtr"))
     {
-        return raw_scalar_address_value_type(&TyRef::Other(pointee.clone()), llbc);
+        return raw_scalar_address_value_type(&TyRef::Other(pointee.clone().into()), llbc);
     }
-    let pointee_ty = TyRef::Other(pointee.clone());
+    let pointee_ty = TyRef::Other(pointee.clone().into());
     if tyref_is_fieldless_enum_free(&pointee_ty, llbc) || tyref_is_empty_enum(&pointee_ty, llbc) {
         Some(ValueType::Int)
     } else {
@@ -3017,7 +3017,7 @@ fn tyref_option_of_declared_raw_struct(
 fn tyref_option_payload_struct(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let stripped = tyref_node(ty, llbc)
         .and_then(|node| strip_ty_indirections(node, llbc))
-        .map(|node| TyRef::Other(node.clone()));
+        .map(|node| TyRef::Other(node.clone().into()));
     let src = stripped.as_ref().unwrap_or(ty);
     if let Some(payload) = crate::front::result_exc::tyref_option_payload(src, llbc) {
         return Some(payload);
@@ -3680,6 +3680,7 @@ pub(in crate::front::mir) fn raw_address_owner_root(
 pub(in crate::front::mir) fn flavor_raw_pointer_class_root(
     ty: &TyRef,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
@@ -3691,11 +3692,7 @@ pub(in crate::front::mir) fn flavor_raw_pointer_class_root(
     if !flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
         return None;
     }
-    let def_id = adt_node_def_id(pointee)?;
-    let td = llbc.type_by_id(def_id)?;
-    Some(crate::front::llbc_hints::alloc_flavor_class_intern_key(
-        &td.item_meta.name_path(),
-    ))
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// Overlay `Ptr._gckind` from the source (`lltype.py` `castable`).
@@ -4133,7 +4130,9 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // `raw_scalar_address_value_type` stays out of this function: an
     // items-base / sizehint `*mut u8` / `*mut i64` is the GcArray
     // header (`typed_array_base_call_stays_ref`).
-    if let Some(root) = flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs) {
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
         return ValueType::Ref(Some(root));
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
@@ -4491,9 +4490,20 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
                 llbc,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-            )) && flavor_raw_pointer_class_root(place_ty, llbc, raw_alloc_flavor_structs)
+            )) && flavor_raw_pointer_class_root(
+                place_ty,
+                llbc,
+                tombstoned,
+                raw_alloc_flavor_structs,
+            )
+            .is_none()
+                && flavor_raw_pointer_class_root(
+                    field_ty,
+                    llbc,
+                    tombstoned,
+                    raw_alloc_flavor_structs,
+                )
                 .is_none()
-                && flavor_raw_pointer_class_root(field_ty, llbc, raw_alloc_flavor_structs).is_none()
             {
                 return ValueType::Int;
             }
@@ -4773,7 +4783,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     // niche Option then unions `Ref(None)` with the Option dest `Int`.
     // A flavor-raw pointer stays `Ref(Some(root))`.
     if tyref_is_raw_storage_borrow(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
-        && flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs).is_none()
+        && flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs).is_none()
     {
         return ValueType::Int;
     }
@@ -6000,9 +6010,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             // `history.getkind` of the raw `Ptr` is int. Stamp `raw:<owner>`
             // so residual FUNC.RESULT is Int and `raw_ptr_token_annotation`
             // seeds `SomeInstance`.
-            if let Some(root) =
-                flavor_raw_pointer_class_root(kind_src, llbc, raw_alloc_flavor_structs)
-            {
+            if let Some(root) = flavor_raw_pointer_class_root(
+                kind_src,
+                llbc,
+                no_tombstoned_leaves(),
+                raw_alloc_flavor_structs,
+            ) {
                 return Some(format!("raw:{root}"));
             }
             // `llmemory.GCREF` / `*mut GCREFOpaque` is `SomePtr(GCREF)`.
@@ -6146,7 +6159,9 @@ fn nongc_raw_ptr_return_class_root(
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return None;
     }
-    if flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs).is_some() {
+    if flavor_raw_pointer_class_root(ty, llbc, no_tombstoned_leaves(), raw_alloc_flavor_structs)
+        .is_some()
+    {
         return None;
     }
     if tyref_is_gcref_spelling(ty, llbc) {
@@ -6669,7 +6684,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // classdef-less Instance that Pass-2 replaces with
     // `project_struct_field_type`'s `SomeInstance(pointee)`, and so
     // `valuetype_to_concrete_for_legacy` sees `Ref(Some(flavor))` → Signed.
-    if let Some(root) = flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs) {
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
         return ValueType::Ref(Some(root));
     }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
@@ -8181,8 +8198,9 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
         raw_alloc_flavor_structs,
         ambiguous_leaves,
     );
-    let class_root = flavor_raw_pointer_class_root(&pointer, llbc, raw_alloc_flavor_structs)
-        .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no class root"));
+    let class_root =
+        flavor_raw_pointer_class_root(&pointer, llbc, _tombstoned, raw_alloc_flavor_structs)
+            .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no class root"));
     let target = std::env::var("TARGET").unwrap_or_default();
     let layout = td
         .layout_for_target(llbc, &target)
@@ -8997,7 +9015,12 @@ pub(in crate::front::mir) fn tyref_atomic_inner_value_type(
         // stays `Ref(Some(root))` (`rclass.py getgcflavor`) before the
         // storage-raw int word (`ty_is_raw_address`). A GC pointee stays
         // `Ref(None)`.
-        if let Some(root) = flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs) {
+        if let Some(root) = flavor_raw_pointer_class_root(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            raw_alloc_flavor_structs,
+        ) {
             return Some(ValueType::Ref(Some(root)));
         }
         if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
@@ -9782,7 +9805,7 @@ fn tyref_instantiate_adt_field_ty(owner_ty: &TyRef, field_ty: &TyRef, llbc: &Llb
         return field_ty.clone();
     };
     match tyref_node(&substituted, llbc).and_then(|n| strip_ty_indirections(n, llbc)) {
-        Some(inner) => TyRef::Other(inner.clone()),
+        Some(inner) => TyRef::Other(inner.clone().into()),
         None => substituted,
     }
 }
@@ -11142,7 +11165,7 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     // not cover it (only Arc/Rc of flavor-raw). Residual FUNC.RESULT is
     // `raw:<owner>` (`history.getkind` of a raw `Ptr` is int); it is never
     // an rclass instance.
-    if flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs).is_some() {
+    if flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs).is_some() {
         return None;
     }
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
@@ -14117,7 +14140,7 @@ pub(in crate::front::mir) fn gc_ref_pointer(
             return false;
         };
         return gc_ref_pointer(
-            &TyRef::Other(peeled.clone()),
+            &TyRef::Other(peeled.clone().into()),
             llbc,
             tombstoned,
             gc_struct_ids,
@@ -17339,7 +17362,7 @@ pub(in crate::front::mir) fn tyref_aggregate_field_value_type_with(
     }
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
         return tyref_to_value_type_with(
-            &TyRef::Other(pointee),
+            &TyRef::Other(pointee.into()),
             llbc,
             tombstoned,
             gc_struct_ids,
@@ -17416,7 +17439,7 @@ pub(in crate::front::mir) fn tyref_array_item(ty: &TyRef, llbc: &Llbc) -> Option
             element = body;
             continue;
         }
-        return Some(TyRef::Other(stripped.clone()));
+        return Some(TyRef::Other(stripped.clone().into()));
     }
 }
 

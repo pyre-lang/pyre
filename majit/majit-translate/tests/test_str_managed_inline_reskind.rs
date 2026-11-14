@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{OBJECT_LLBC, load_llbc_if_present, lower_function};
+use common::{OBJECT_LLBC, load_llbc, lower_function};
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
@@ -18,8 +18,8 @@ use majit_translate::insns::{
 use majit_translate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind};
 use majit_translate::{CallPath, GraphTransformConfig};
 
-fn object_llbc() -> Option<&'static Llbc> {
-    load_llbc_if_present(OBJECT_LLBC)
+fn object_llbc() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
 fn is_borrowed(target: &CallTarget) -> bool {
@@ -47,10 +47,7 @@ fn graph_result_kind(graph: &FunctionGraph) -> char {
 
 #[test]
 fn w_str_from_wtf8_managed_inlines_borrowed_with_func_result() {
-    let Some(llbc) = object_llbc() else {
-        eprintln!("skipping: {OBJECT_LLBC} is missing");
-        return;
-    };
+    let llbc = object_llbc();
     let caller_name = "w_str_from_wtf8_managed";
     let callee_name = "w_str_from_wtf8_managed_borrowed";
     let caller =

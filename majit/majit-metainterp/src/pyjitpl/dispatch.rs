@@ -2503,7 +2503,7 @@ where
             return None;
         }
         for frame in &self.frames.frames {
-            for (i, slot) in frame.ref_regs.iter().enumerate() {
+            for slot in frame.ref_regs.iter() {
                 let Some(op) = *slot else {
                     continue;
                 };
@@ -3298,12 +3298,7 @@ where
     /// `finishframe_exception` (`unwind_to_exception_handler`) when an
     /// exception is standing. The class-const flag becomes true because this
     /// guard was recorded.
-    fn handle_possible_exception(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        resume_pc: usize,
-    ) -> TraceAction {
+    fn handle_possible_exception(&mut self, ctx: &mut TraceCtx, resume_pc: usize) -> TraceAction {
         if self.last_exception_value != 0 {
             let exc = self.last_exception_value;
             let class_is_const = self.class_of_last_exc_is_const;
@@ -3311,7 +3306,6 @@ where
             let exc_class_box = ctx.const_int(typeptr);
             let guard_op = self.record_state_guard_with_value(
                 ctx,
-                sym,
                 OpCode::GuardException,
                 &[exc_class_box],
                 resume_pc,
@@ -3328,7 +3322,6 @@ where
         } else {
             self.record_state_guard(
                 ctx,
-                sym,
                 OpCode::GuardNoException,
                 &[],
                 resume_pc,
@@ -3343,7 +3336,7 @@ where
     /// then `handle_possible_exception`. Unique walk of an exception-guard
     /// bridge starts on a fresh machine; this is the same call sequence
     /// `_handle_guard_failure` runs before `interpret()`.
-    fn prepare_resume_from_failure(&mut self, ctx: &mut TraceCtx, sym: &mut S) -> TraceAction {
+    fn prepare_resume_from_failure(&mut self, ctx: &mut TraceCtx) -> TraceAction {
         if !(ctx.is_bridge_trace && ctx.bridge_source_is_exception_guard())
             || ctx.bridge_exception_resume_prepared()
         {
@@ -3366,7 +3359,7 @@ where
             None => (None, None),
         };
         let resume_pc = source_pc.unwrap_or(0);
-        let action = self.handle_possible_exception(ctx, sym, resume_pc);
+        let action = self.handle_possible_exception(ctx, resume_pc);
         if matches!(action, TraceAction::Continue) {
             ctx.bridge_exception_resume_prepared = true;
             ctx.bridge_exception_source_pc = source_pc;
@@ -6180,7 +6173,7 @@ where
     // then `interpret()`. Unique walk of an exception-guard bridge has
     // no MetaInterp machine, so the same sequence runs here before
     // `run_to_end`.
-    let action = match machine.prepare_resume_from_failure(ctx, sym) {
+    let action = match machine.prepare_resume_from_failure(ctx) {
         TraceAction::Continue => machine.run_to_end(ctx, sym, runtime),
         other => other,
     };

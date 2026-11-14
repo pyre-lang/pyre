@@ -8632,8 +8632,6 @@ impl TraceCtx {
         index: OpRef,
         value: OpRef,
         descr: DescrRef,
-        index_runtime_value: i64,
-        concrete: Value,
     ) {
         let descr_index = descr.index();
         // A store has no `resvalue` and `SETARRAYITEM_GC` is never pure, so
@@ -8641,21 +8639,12 @@ impl TraceCtx {
         self.execute_and_record(
             None,
             OpCode::SetarrayitemGc,
-            Some(descr.clone()),
+            Some(descr),
             &[array_opref, index, value],
             None,
             0,
         );
         self.heapcache_setarrayitem(array_opref, index, descr_index, value);
-        let array_ptr = match self.concrete_of_opref(array_opref) {
-            Some(Value::Ref(r)) => live_gc_ptr(r).unwrap_or(0),
-            _ => 0,
-        };
-        // A virtual `NewArrayClear` has no heap pointer. Recording the op and
-        // updating the heapcache is the store; writing address 0 is not.
-        if array_ptr != 0 {
-            self.array_store(array_ptr, index_runtime_value, &descr, concrete);
-        }
     }
 }
 
@@ -11219,66 +11208,50 @@ mod tests {
 
     #[test]
     fn nonstandard_setarrayitem_vable_writes_concrete_array() {
-        // `_opimpl_setarrayitem_vable` nonstandard leg calls
-        // `execute_setarrayitem_gc` / `do_setarrayitem_gc`, which stores
-        // through the live array the way `BC_SETARRAYITEM_GC_*` does.
-        let info = make_test_vable_info_with_array();
-        let fd = info.array_pointer_field_descr(0);
-        let adesc = info.array_item_descr(0);
-
-        #[repr(C)]
-        struct Vable {
-            _pad: [u8; 24],
-            array: *mut i64,
-        }
-        let mut items = [0i64, 99i64];
-        let vable = Vable {
-            _pad: [0; 24],
-            array: items.as_mut_ptr(),
-        };
-
-        let mut recorder = Trace::new();
-        let portal = recorder.record_input_arg(Type::Ref);
-        let callee = recorder.record_input_arg(Type::Ref);
-        let box_pc = recorder.record_input_arg(Type::Int);
-        let stored = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
+        // `_opimpl_setarrayitem_vable` nonstandard leg records
+        // `SETARRAYITEM_GC` (`execute_setarrayitem_gc`) then writes the
+        // live vable array (`write_nonstandard_vable_array_item` /
+        // `bhimpl_setarrayitem_vable_*`). The length word is part of
+        // that layout; a headerless C buffer is not.
+        let heap = TwoArrayVable::new(false);
         let cpu = LiveMemTestCpu;
+        let (mut ctx, vable) = ctx_with_shadow(
+            &heap,
+            &[
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(10),
+                Value::Int(20),
+                Value::Int(30),
+            ],
+        );
         ctx.set_cpu(Some(&cpu));
-        ctx.init_virtualizable_boxes(
-            &info,
-            portal,
-            ph(Type::Ref),
-            &[box_pc, stored],
-            &[ph(Type::Int), ph(Type::Int)],
-            &[2],
-        );
-        ctx.set_opref_concrete(
-            callee,
-            Value::Ref(majit_ir::GcRef(&vable as *const Vable as usize)),
-        );
+        ctx.set_opref_concrete(vable, Value::Ref(GcRef(heap.ptr() as usize)));
+        let a_descr = heap.info.array_pointer_field_descr(0);
+        let a_item = heap.info.array_item_descr(0);
         let index = ctx.const_int(0);
+        let stored = ctx.const_int(42);
         ctx.vable_setarrayitem_checked(
             true,
             0,
-            callee,
+            vable,
             index,
             0,
-            fd.clone(),
-            adesc.clone(),
+            a_descr,
+            a_item,
             stored,
             Value::Int(42),
             false,
         );
-        assert_eq!(items[0], 42, "nonstandard setarrayitem_vable must store");
-        assert_eq!(items[1], 99, "untouched slot stays");
-
+        assert_eq!(
+            heap.slots(),
+            [1, 2, 42, 20, 30],
+            "nonstandard setarrayitem_vable must store"
+        );
+        let a_descr = heap.info.array_pointer_field_descr(0);
+        let a_item = heap.info.array_item_descr(0);
         let (_got, value) =
-            ctx.vable_getarrayitem_int_checked(true, 0, callee, index, 0, fd, adesc);
+            ctx.vable_getarrayitem_int_checked(true, 0, vable, index, 0, a_descr, a_item);
         assert_eq!(value, Some(Value::Int(42)));
     }
 
