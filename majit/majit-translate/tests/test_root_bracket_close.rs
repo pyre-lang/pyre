@@ -2507,9 +2507,9 @@ fn isinstance_bracket_is_scalar_replaced() {
 
 /// CALL_KW binder bodies: `_match_signature` loses its interpreter root
 /// brackets so the walker traces ordinary locals. `arguments_from_call_kw`
-/// publishes the packed keyword-name `Vec` (`pin_roots(&names)`); that
-/// buffer is not a GC object, so `pop_roots` / `expand_pop_roots`
-/// (`gc_restore_root`) cannot reload it. Erase keeps that bracket.
+/// `pin_roots(&names)` is a leftover local Vec, the same shape as
+/// `try_new_for_call` `pin_roots(&live)`: leftover rewrite is
+/// `getarrayitem` of that list (`leftover_published_slice`).
 #[test]
 fn call_kw_binder_bodies_erase_root_brackets() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -2527,9 +2527,9 @@ fn call_kw_binder_bodies_erase_root_brackets() {
         &interpreter,
         "::arguments_from_call_kw",
     );
-    assert!(
-        names_erase.starts_with("publish-slice-not-incoming"),
-        "arguments_from_call_kw pin_roots(&names) is a local Vec, erase={names_erase}"
+    assert_eq!(
+        names_erase, "erased",
+        "arguments_from_call_kw leftover local names Vec, erase={names_erase}"
     );
     let erase =
         majit_translate::front::mir::shadow_stack_erase_named(&interpreter, "::match_signature");

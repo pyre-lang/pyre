@@ -1991,13 +1991,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         )
     }
 
-    fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
-        if opref.is_none() {
-            return Some(Operand::None);
-        }
-        self.ctx.get_box_replacement_operand_opt(opref)
-    }
-
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
         opref
     }

@@ -2614,6 +2614,10 @@ struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
     entry_ids: std::collections::BTreeSet<u64>,
     gc_entries_ids: std::collections::BTreeSet<u64>,
+    /// `rordereddict::RDict` heads. `get_ll_dict` mints one DICTENTRY per
+    /// `(K, V)`; the hasher is a third type argument. A
+    /// `type T = RDict<K, V, S>` alias peels to this head.
+    rdict_ids: std::collections::BTreeSet<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
     tombstoned: &'a std::collections::HashSet<String>,
@@ -2731,23 +2735,40 @@ impl EntryInstantiationScan<'_> {
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
                 if let Some(id) = type_decl_ref_adt_id(adt) {
                     let args = render_adt_type_args(adt, self.llbc, depth, self.tombstoned);
-                    if (self.entry_ids.contains(&id) || self.gc_entries_ids.contains(&id))
-                        && !args.is_empty()
-                        && args
-                            .iter()
-                            .all(|arg| !arg.is_empty() && !arg.contains("??"))
-                    {
+                    let subst = type_decl_ref_generics(adt, self.llbc)
+                        .and_then(|g| g.get("types"))
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    // `Entry` / `GcEntries` carry `(K, V)`. `RDict<K, V, S>`
+                    // peels from a storage alias (`consider_type_decl_fields`
+                    // `TypeDeclKind::Alias`) and keeps the hasher; only the
+                    // first two arguments are the entry flavour (`get_ll_dict`).
+                    let kv = if self.entry_ids.contains(&id) || self.gc_entries_ids.contains(&id) {
+                        (!args.is_empty()
+                            && args
+                                .iter()
+                                .all(|arg| !arg.is_empty() && !arg.contains("??")))
+                        .then(|| (args.clone(), subst.clone()))
+                    } else if self.rdict_ids.contains(&id) {
+                        (args.len() >= 2
+                            && args
+                                .iter()
+                                .take(2)
+                                .all(|arg| !arg.is_empty() && !arg.contains("??")))
+                        .then(|| {
+                            (
+                                args.iter().take(2).cloned().collect(),
+                                subst.iter().take(2).cloned().collect(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((args, subst)) = kv {
                         let suffix = args.join(",");
                         if self.seen_suffix.insert(suffix) {
-                            let subst = type_decl_ref_generics(adt, self.llbc)
-                                .and_then(|g| g.get("types"))
-                                .and_then(serde_json::Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            self.found.push(EntryInstantiation {
-                                args: args.clone(),
-                                subst,
-                            });
+                            self.found.push(EntryInstantiation { args, subst });
                         }
                     }
                     if args.iter().all(|arg| !arg.contains("??"))
@@ -2760,11 +2781,6 @@ impl EntryInstantiationScan<'_> {
                             format!("{path}<{}>", args.join(","))
                         };
                         if self.seen_inst.insert(inst) {
-                            let subst = type_decl_ref_generics(adt, self.llbc)
-                                .and_then(|g| g.get("types"))
-                                .and_then(serde_json::Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
                             self.consider_type_decl_fields(td, &subst);
                         }
                     }
@@ -2817,8 +2833,12 @@ impl EntryInstantiationScan<'_> {
 /// `symbolic.get_field_token` then read that element's real offsets.
 /// A concrete TypeDecl field (`RDict` / `OrderedDict` → `GcEntries` →
 /// `[Entry;0]`) supplies the rows after substituting that ADT's type
-/// arguments into its TypeDecl fields (`substitute_type_vars`). Offsets
-/// come from [`repr_c_struct_field_offset`] (resolved layout, else
+/// arguments into its TypeDecl fields (`substitute_type_vars`). A
+/// signature or local that names `type T = RDict<K, V, S>` peels that
+/// alias (`TypeDeclKind::Alias` in `consider_type_decl_fields`) to the
+/// `RDict` head; that head's first two type arguments are the entry
+/// flavour (`get_ll_dict`). Offsets come from
+/// [`repr_c_struct_field_offset`] (resolved layout, else
 /// declaration order with [`instantiated_field_size_align`]). Qualified
 /// spellings only; the unsuffixed template keeps its TypeVar rows.
 /// Every TypeDecl spelling `rordereddict_entries::Entry` (a crate may
@@ -2840,10 +2860,14 @@ fn register_ordereddict_entry_rows(
     let mut entry_is_copy = true;
     let mut entry_ids = std::collections::BTreeSet::new();
     let mut gc_entries_ids = std::collections::BTreeSet::new();
+    let mut rdict_ids = std::collections::BTreeSet::new();
     for td in llbc.iter_type_decls() {
         let path = td.item_meta.name_path();
         if path.ends_with("rordereddict_entries::GcEntries") {
             gc_entries_ids.insert(td.def_id);
+        }
+        if path.ends_with("rordereddict::RDict") {
+            rdict_ids.insert(td.def_id);
         }
         if path.ends_with("rordereddict_entries::Entry")
             && matches!(td.kind, TypeDeclKind::Struct(_))
@@ -2869,6 +2893,7 @@ fn register_ordereddict_entry_rows(
         llbc,
         entry_ids,
         gc_entries_ids,
+        rdict_ids,
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
         tombstoned,
@@ -9376,6 +9401,7 @@ mod desugar;
 mod flowcontext;
 mod framestate;
 mod gcroot;
+mod host_tag;
 mod lltype;
 mod malloc;
 mod operation;

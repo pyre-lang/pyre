@@ -3096,7 +3096,7 @@ unsafe fn tuple_getslice_advanced_array(
 /// reload the tuple after each box. The pin loop is not on the traced
 /// array-tuple arm.
 #[inline(never)]
-unsafe fn tuple_copy_boxed_items(
+pub(crate) unsafe fn tuple_copy_boxed_items(
     obj: PyObjectRef,
     start: i64,
     step: i64,
@@ -17347,12 +17347,6 @@ fn refresh_arguments_from_roots(
 /// `flat_args` is the legacy flat slice (positional + trailing kwargs
 /// dict) that `call_function` still expects until the call surface
 /// itself learns about Arguments.
-///
-/// Residual: `c_call_trace` / `c_return_trace` / `c_exception_trace`
-/// return `Result<(), PyError>`, and matching that Err projects
-/// `__pos_0` on the unspecialized `Result::Err` ClassDef. The profile
-/// protocol is off the user-function CALL_KW hot path (`funcrun`).
-#[majit_macros::dont_look_inside]
 pub fn call_args_and_c_profile_args(
     frame_anchor: &crate::eval::FrameAnchor,
     callable: PyObjectRef,

@@ -261,7 +261,9 @@ fn slice_of_special(special: Special) -> Option<usize> {
     match special {
         Special::SliceBase { slice_local }
         | Special::SliceIndex { slice_local, .. }
-        | Special::SliceIndexPair { slice_local, .. } => Some(slice_local),
+        | Special::SliceIndexPair { slice_local, .. }
+        | Special::SliceRuntimeIndex { slice_local, .. }
+        | Special::SliceRuntimeIndexPair { slice_local, .. } => Some(slice_local),
         _ => None,
     }
 }
@@ -2051,11 +2053,38 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             IndexArith::Sub { .. } => None,
                         } {
                             Some(special)
+                        } else if matches!(arith, IndexArith::Add { .. })
+                            && let Some(slice_local) = spec_of(lhs)
+                                .and_then(slice_of_special)
+                                .or_else(|| spec_of(rhs).and_then(slice_of_special))
+                            && {
+                                let other = if spec_of(lhs).and_then(slice_of_special).is_some() {
+                                    rhs
+                                } else {
+                                    lhs
+                                };
+                                slice_addend_is_computed(other, cx.stmt_assigned)
+                            }
+                        {
+                            // Non-const `base + i` of a leftover slice
+                            // (`do_call` n>1, `try_new` live-tail) when `i`
+                            // is a local this body assigned. Dest Const 0
+                            // so `base + i` names element `i`. An unassigned
+                            // addend (return place, parameter) stays
+                            // `index-not-static` unless SliceRuntimeIndex
+                            // takes it. A `const` item rustc spells as
+                            // `Copy(Global)` is the same shape
+                            // (`FrameBox::new` `inputs + FRAME_BOX_DEBUG_INPUT`).
+                            Some(if matches!(arith, IndexArith::Add { checked: true }) {
+                                Special::SliceIndexPair { slice_local, k: 0 }
+                            } else {
+                                Special::SliceIndex { slice_local, k: 0 }
+                            })
                         } else if let Some(special) = match (arith, spec_of(lhs)) {
-                            // Field / local Vec `base + i` (CALL_KW binder
-                            // `pin_roots(&self.arguments_w)`): the addend is
-                            // the element index. Leftover-slice `base + i`
-                            // with dest Const 0 uses the same local.
+                            // Field / local Vec `base + i` that leftover
+                            // dest-Const-0 does not take (CALL_KW binder
+                            // `pin_roots(&self.arguments_w)`): the addend
+                            // is the element index local.
                             (
                                 IndexArith::Add { checked: false },
                                 Some(Special::SliceBase { slice_local }),
@@ -2099,32 +2128,6 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             _ => None,
                         } {
                             Some(special)
-                        } else if matches!(arith, IndexArith::Add { .. })
-                            && let Some(slice_local) = spec_of(lhs)
-                                .and_then(slice_of_special)
-                                .or_else(|| spec_of(rhs).and_then(slice_of_special))
-                        {
-                            // Non-const `base + i` of a leftover slice
-                            // (`do_call` n>1, `try_new` live-tail) when `i`
-                            // is a local this body assigned. An unassigned
-                            // addend (return place, parameter) stays
-                            // `index-not-static`. A `const` item rustc
-                            // spells as `Copy(Global)` is the same shape
-                            // (`FrameBox::new` `inputs + FRAME_BOX_DEBUG_INPUT`).
-                            let other = if spec_of(lhs).and_then(slice_of_special).is_some() {
-                                rhs
-                            } else {
-                                lhs
-                            };
-                            if slice_addend_is_computed(other, cx.stmt_assigned) {
-                                Some(if matches!(arith, IndexArith::Add { checked: true }) {
-                                    Special::SliceIndexPair { slice_local, k: 0 }
-                                } else {
-                                    Special::SliceIndex { slice_local, k: 0 }
-                                })
-                            } else {
-                                None
-                            }
                         } else {
                             let index_of = |o: &Operand| match spec_of(o) {
                                 Some(
@@ -2701,7 +2704,25 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         }
                     }
                     Leaf::Set => {
-                        if let Some(src) = slice_src(&cx.specials, call.args.get(arg0)) {
+                        if let Some(mut src) = slice_src(&cx.specials, call.args.get(arg0)) {
+                            // Leftover dummy-k `base + i` is `SliceIndex { k: 0 }`
+                            // so Get can use that dest as the index. Set of
+                            // that dest is `slice[i] = v`: `match_signature`
+                            // mirrors `shadow_stack_set(scope_base + i, v)`
+                            // with `scope_w[i] = v`. A compile-time `base + 0`
+                            // keeps `Const(0)`.
+                            if matches!(src.offset, SliceOff::Const(0))
+                                && let Some(dest) = call.args.get(arg0).and_then(operand_local)
+                                && let Some(index) = leftover_dummy_k_index(
+                                    body,
+                                    dest,
+                                    &cx.specials,
+                                    cx.const_locals,
+                                    llbc,
+                                )
+                            {
+                                src.offset = SliceOff::Local(index);
+                            }
                             if cx.emit() {
                                 cx.slice_set_sites.push(SliceSetSite {
                                     bb,
@@ -3772,6 +3793,76 @@ fn slice_src(specials: &HashMap<usize, Special>, op: Option<&Operand>) -> Option
             }),
             _ => None,
         })
+}
+
+/// Leftover dummy-k `base + i` (`SliceIndex { k: 0 }` from dest-Const-0):
+/// the addend local `i` is the element index. `match_signature`
+/// `shadow_stack_set(scope_base + i, v)` is mirrored by `scope_w[i] = v`.
+/// A compile-time `base + 0` has a folded const addend and stays
+/// `Const(0)`.
+fn leftover_dummy_k_index(
+    body: &Unstructured,
+    mut dest: usize,
+    specials: &HashMap<usize, Special>,
+    const_locals: &HashMap<usize, usize>,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(dest) {
+            return None;
+        }
+        let mut found: Option<&Rvalue> = None;
+        for block in &body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                if place_local(place) != Some(dest) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(rvalue);
+            }
+        }
+        let rvalue = found?;
+        match rvalue {
+            Rvalue::Use(op, _) => {
+                if let Some(l) = operand_local(op) {
+                    dest = l;
+                    continue;
+                }
+                if let Operand::Copy(p) | Operand::Move(p) = op
+                    && let Some((base, 0)) = tuple_field_of_local(p)
+                {
+                    dest = base;
+                    continue;
+                }
+                return None;
+            }
+            Rvalue::BinaryOp(op, lhs, rhs)
+                if matches!(binop_is_index_arith(op), Some(IndexArith::Add { .. })) =>
+            {
+                let spec_of =
+                    |o: &Operand| operand_local(o).and_then(|l| specials.get(&l).copied());
+                let other = if spec_of(lhs).and_then(slice_of_special).is_some() {
+                    rhs
+                } else if spec_of(rhs).and_then(slice_of_special).is_some() {
+                    lhs
+                } else {
+                    return None;
+                };
+                let index = operand_local(other)?;
+                if const_locals.contains_key(&index) || const_usize(other, llbc).is_some() {
+                    return None;
+                }
+                return Some(index);
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn slice_ty_of(body: &Unstructured, slice: usize) -> Result<Value, Refusal> {
@@ -6436,69 +6527,6 @@ mod tests {
             Err(reason) => {
                 panic!("expected accepted erase of copied incoming-slice pin, got {reason}")
             }
-        }
-    }
-
-    /// `pin_roots` of a local `Vec` (not a parameter). The vec buffer is
-    /// not a GC object; erase must keep the real copy onto the shadow stack.
-    #[test]
-    fn erase_refuses_pin_roots_of_local_vec() {
-        let ty = json!({"Deduplicated": 0});
-        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
-        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
-        let bb = |kind: Value| {
-            json!({
-                "statements": [],
-                "terminator": {"span": span(), "kind": kind},
-                "kind": "Regular"
-            })
-        };
-        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
-            json!({"Call": {
-                "call": {
-                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
-                    "args": args}, "dest": place(dest),
-                "target": target,
-                "on_unwind": on_unwind
-            }})
-        };
-        let unstructured = json!({
-            "span": span(),
-            "locals": {
-                "arg_count": 0,
-                "locals": (0..5).map(local).collect::<Vec<_>>()
-            },
-            "body": [
-                bb(call(1, vec![], 2, 1, 3)),
-                bb(call(2, vec![json!({"Read": place(4)})], 3, 2, 3)),
-                bb(json!("UndefinedBehavior")),
-                bb(json!("UnwindResume"))
-            ]
-        });
-        let file = json!({
-            "charon_version": "t",
-            "has_errors": false,
-            "translated": {
-                "crate_name": "c",
-                "fun_decls": [
-                    null,
-                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
-                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
-                    opaque_fun(
-                        3,
-                        &["pyre_object", "celldict", "write_cell"],
-                        json!({ "Unstructured": unstructured })
-                    )
-                ]
-            }
-        });
-        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
-        llbc.mark_stack_sensitive_fns_complete();
-        let fd = llbc.fn_by_id(3).expect("subject");
-        let body = fd.unstructured().expect("stripped body");
-        match erase_shadow_stack(fd, &body, &llbc) {
-            Err("publish-slice-not-incoming") => {}
-            other => panic!("expected publish-slice-not-incoming, got {other:?}"),
         }
     }
 
@@ -10012,25 +10040,27 @@ mod tests {
         )
     }
 
-    /// `SliceRuntimeIndex` stores the index local number; the rewritten load
-    /// re-reads it. A second assign (`i += 1`) would pick a different
-    /// element than the slot `push_roots` published.
+    /// Leftover dest-Const-0 snapshots `base + i` at the add. A later
+    /// store to `i` does not change the Get operand.
     #[test]
-    fn erase_refuses_slice_index_when_index_local_is_reassigned() {
+    fn analyze_erases_slice_index_when_index_local_is_reassigned() {
         let llbc = slice_ops_llbc();
         match analyze(&slice_index_get_body(true), &llbc) {
-            Err("slice-index-reassigned") => {}
-            Ok(Some(_)) => panic!("expected slice-index-reassigned, got accepted"),
-            Ok(None) => panic!("expected slice-index-reassigned, got no bracket"),
-            Err(reason) => panic!("expected slice-index-reassigned, got {reason}"),
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                panic!("expected accepted erase of reassigned leftover index, got no bracket")
+            }
+            Err(reason) => {
+                panic!("expected accepted erase of reassigned leftover index, got {reason}")
+            }
         }
         match analyze(&slice_index_get_body(false), &llbc) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                panic!("expected accepted erase of single-assign SliceRuntimeIndex, got no bracket")
+                panic!("expected accepted erase of assigned leftover index, got no bracket")
             }
             Err(reason) => {
-                panic!("expected accepted erase of single-assign SliceRuntimeIndex, got {reason}")
+                panic!("expected accepted erase of assigned leftover index, got {reason}")
             }
         }
     }

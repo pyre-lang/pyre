@@ -3586,6 +3586,13 @@ impl ResumeDataLoopMemo {
             numb_state.append_short(tagged);
             return Ok(());
         }
+        // ResumeDataLoopMemo._number_boxes:
+        //
+        //     box = iter.get(...)
+        //     box = box.get_box_replacement()
+        //     ...
+        //     if box.type == 'r':
+        //
         // The type used for virtual classification is the replacement
         // box's type (`AbstractValue.type`), not the original snapshot
         // slot's fallback type. A snapshot slot can carry an Int fallback
@@ -7525,16 +7532,14 @@ impl<'a> ResumeDataDirectReader<'a> {
     #[inline]
     fn finish_ref_slot(&mut self, tagged: i16) -> i64 {
         // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
-        let value = if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
+        if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
             let mut idx = (tagged >> 2) as i32;
             if idx < 0 {
                 idx += self.count;
             }
-            self.cpu_get_value(idx as usize)
-        } else {
-            self.decode_ref(tagged)
-        };
-        value
+            return self.cpu_get_value(idx as usize);
+        }
+        self.decode_ref(tagged)
     }
 
     /// resume.py next_float

@@ -984,32 +984,22 @@ pub fn fill_user_function_args(
         ));
     }
 
-    // Lay out filled_args as `[positional[0..nparams], kwonly[0..nkwonly]]`
+    // Lay out parameters as `[positional[0..nparams], kwonly[0..nkwonly]]`
     // so the layout matches `pack_varargs`'s expectation that
     // `args[total_params..]` is positional overflow destined for `*args`.
     // Without this split, positional overflow would sit in kwonly slots when
     // `has_varargs && nargs > nparams && nkwonly > 0`
     // (`def f(a, *args, b=K): f(1, 2, 3)` would put `2` in `b`'s slot).
     let total_params = nparams + nkwonly;
-    let mut filled_args: Vec<PyObjectRef> = Vec::with_capacity(total_params);
     let n_pos_copied = nargs.min(nparams);
-    // argument.py:218-219 `for i in range(take): scope_w[...] = args_w[i]` —
-    // element-by-element positional fill (`args[i]`, a `usize` element index
-    // the rtyper lowers to an ArrayRead) rather than a range-slice copy
-    // (`&args[..n]` → `core::slice::index`, which has no graph lowering).
-    for i in 0..n_pos_copied {
-        filled_args.push(args[i]);
-    }
-    for _ in n_pos_copied..total_params {
-        filled_args.push(pyre_object::PY_NULL);
-    }
-    // Both fills below allocate while the slots already laid out hold GC
-    // references: `w_tuple_getitem` re-boxes an inline payload on a
-    // specialised defaults tuple, and the kwonly fill mints a `w_str_new` key
-    // per empty slot.  A plain `Vec` is not a root area, so publish the layout
-    // and address it through the slots until the last of those allocations is
-    // behind us -- `build_list_storage`'s contract, applied to the argument
-    // vector.
+    // Both fills below allocate while copied arguments and later default
+    // values hold GC references: `w_tuple_getitem` re-boxes an inline payload
+    // on a specialised defaults tuple, and the kwonly fill's colliding-key
+    // `__eq__` can run Python.  A plain `Vec<PyObjectRef>` is not a root
+    // area, so each parameter's current word lives in a shadow-stack slot
+    // named by a `Vec<usize>` of indices — `build_list_storage`'s contract,
+    // applied to the argument vector.  A fill publishes a new slot
+    // (`pin_root`) rather than overwriting one (`RootScope::set`).
     let roots = pyre_object::gc_roots::push_roots();
     // Publish the whole live set before the first forwarding query, exactly as
     // framework.py `push_roots` writes all livevars before the allocation slow
@@ -1018,7 +1008,6 @@ pub fn fill_user_function_args(
     // from `args` only after both allocating fills.
     let header_base = roots.publish(&[callable, defaults]);
     let args_base = roots.publish(args);
-    let base = roots.publish(&filled_args);
     let extra_len = usize::from(nkwonly > 0);
     let extra = if nkwonly > 0 {
         // `__kwdefaults__` is published with the rest of the live set so
@@ -1028,7 +1017,24 @@ pub fn fill_user_function_args(
     } else {
         0
     };
-    roots.normalize(header_base, 2 + nargs + total_params + extra_len);
+    let empty_count = total_params - n_pos_copied;
+    let null_len = usize::from(empty_count > 0);
+    let null_slot = if empty_count > 0 {
+        roots.publish(&[pyre_object::PY_NULL])
+    } else {
+        0
+    };
+    let mut param_slots: Vec<usize> = Vec::with_capacity(total_params);
+    // argument.py:218-219 `for i in range(take): scope_w[...] = args_w[i]` —
+    // copied positionals keep the published `args` slot; empty parameters
+    // share one null slot until a default fill publishes a new one.
+    for i in 0..n_pos_copied {
+        param_slots.push(args_base + i);
+    }
+    for _ in n_pos_copied..total_params {
+        param_slots.push(null_slot);
+    }
+    roots.normalize(header_base, 2 + nargs + extra_len + null_len);
 
     // Fill positional defaults for slots [n_pos_copied..nparams).
     if n_pos_copied < nparams && !roots.get(header_base + 1).is_null() {
@@ -1052,7 +1058,7 @@ pub fn fill_user_function_args(
                     pyre_object::w_tuple_getitem(roots.get(header_base + 1), default_idx as i64)
                 }
             {
-                roots.set(base + i, val);
+                param_slots[i] = roots.pin_roots(&[val]);
             }
         }
     }
@@ -1063,24 +1069,30 @@ pub fn fill_user_function_args(
     // `getitem_str` on `resolve_dict_backing(w_kw_defs)`: a dict subclass
     // `__getitem__` / `__missing__` is never dispatched, while an error
     // from a colliding key's `__eq__` propagates.
+    // argument.py `_match_signature`:
+    // `w_def = self.space.finditem_str(w_kw_defs, name)`
     if nkwonly > 0 && !roots.get(extra).is_null() {
         let backing = crate::type_methods::resolve_dict_backing(roots.get(extra));
-        roots.set(extra, backing);
-        if !roots.get(extra).is_null() {
+        let backing_slot = roots.pin_roots(&[backing]);
+        if !roots.get(backing_slot).is_null() {
             for ki in 0..nkwonly {
                 let slot = nparams + ki;
-                if !roots.get(base + slot).is_null() {
+                if !roots.get(param_slots[slot]).is_null() {
                     continue;
                 }
-                if let Some(val) = unsafe {
+                match unsafe {
                     pyre_object::dictmultiobject::w_dict_getitem_str_checked(
-                        roots.get(extra),
+                        roots.get(backing_slot),
                         code_ref.varnames[slot].as_str(),
                     )
-                }
-                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
-                {
-                    roots.set(base + slot, val);
+                } {
+                    Ok(Some(val)) => {
+                        param_slots[slot] = roots.pin_roots(&[val]);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Err(crate::baseobjspace::take_pending_hash_error());
+                    }
                 }
             }
         }
@@ -1089,7 +1101,7 @@ pub fn fill_user_function_args(
     // argument.py:302-338 — missing-required after defaults fill.
     let mut missing_positional: Vec<&str> = Vec::new();
     for i in 0..nparams {
-        if roots.get(base + i).is_null() {
+        if roots.get(param_slots[i]).is_null() {
             missing_positional.push(code_ref.varnames[i].as_str());
         }
     }
@@ -1111,7 +1123,7 @@ pub fn fill_user_function_args(
     let mut missing_kwonly: Vec<&str> = Vec::new();
     for ki in 0..nkwonly {
         let slot = nparams + ki;
-        if roots.get(base + slot).is_null() {
+        if roots.get(param_slots[slot]).is_null() {
             missing_kwonly.push(code_ref.varnames[slot].as_str());
         }
     }
@@ -1137,9 +1149,10 @@ pub fn fill_user_function_args(
     // ArrayRead) the rtyper lowers, rather than the `&args[nparams..]`
     // range-slice (`core::slice::index`, no graph lowering).
     // The slots are what the fills above wrote and what a collection during
-    // them rewrote; the vector still holds the pre-publish words.
+    // them rewrote.
+    let mut filled_args: Vec<PyObjectRef> = Vec::with_capacity(total_params);
     for i in 0..total_params {
-        filled_args[i] = roots.get(base + i);
+        filled_args.push(roots.get(param_slots[i]));
     }
 
     if has_varargs && nargs > nparams {

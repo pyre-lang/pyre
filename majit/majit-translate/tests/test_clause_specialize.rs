@@ -420,27 +420,94 @@ fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
         .iter()
         .filter(|f| f.name.contains("entries_item_ptr__spec_ObjectKey____"))
         .collect();
-    assert!(
-        !unit_ptrs.is_empty(),
-        "expected ObjectKey+() entries_item_ptr spec, got {names:?}"
-    );
-    for spec in &unit_ptrs {
+    if unit_ptrs.is_empty() {
+        // `try_lower_rordereddict_item_ptr` inlines `entry_ptr` /
+        // `entries_item_ptr` (`ll_get_value` is `d.entries[i].value`
+        // getinteriorfield; rordereddict.py has no item-pointer
+        // function). The ObjectKey+() property holds on those
+        // inliners.
+        use majit_translate::model::cast_instance_root;
+        let inliners: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|f| {
+                f.name.contains("entry_at__spec_ObjectKey")
+                    || f.name.contains("entry_valid__spec_ObjectKey")
+            })
+            .collect();
         assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
-            spec.name,
-            op_kinds(spec.graph())
+            !inliners.is_empty(),
+            "expected ObjectKey+() entry_at/entry_valid inliners of entries_item_ptr, got {names:?}"
         );
-        let has_items_field =
-            spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+        for spec in &inliners {
+            assert!(
+                !graph_calls_leaf(spec.graph(), "entries_item_ptr"),
+                "{} must not bind unspecialized entries_item_ptr, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_items_field = spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
                 |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "items"),
             );
-        assert!(
-            !has_items_field,
-            "{} must not getattr items, ops {:?}",
-            spec.name,
-            op_kinds(spec.graph())
-        );
+            assert!(
+                !has_items_field,
+                "{} must not getattr items, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let gc_entries_cast =
+                spec.graph()
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| {
+                        cast_instance_root(&op.kind)
+                            .is_some_and(|root| root.rsplit("::").next() == Some("GcEntries"))
+                    });
+            assert!(
+                !gc_entries_cast,
+                "{} must not cast onto unsuffixed GcEntries, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_interior = spec
+                .graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+                    )
+                });
+            let has_direct_arrayitems = graph_calls_leaf(spec.graph(), "cast_int_to_ptr")
+                || graph_calls_leaf(spec.graph(), "cast_ptr_to_int");
+            assert!(
+                has_interior || has_direct_arrayitems,
+                "{} must emit interior-field or direct_arrayitems, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+        }
+    } else {
+        for spec in &unit_ptrs {
+            assert!(
+                graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
+                "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_items_field = spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "items"),
+            );
+            assert!(
+                !has_items_field,
+                "{} must not getattr items, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+        }
     }
 }
 

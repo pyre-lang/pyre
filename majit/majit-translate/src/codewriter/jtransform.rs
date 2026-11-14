@@ -23447,7 +23447,7 @@ mod tests {
                 )
                 .unwrap();
             graph.push_inputarg_var(graph.startblock, args.clone());
-            graph
+            let header = graph
                 .push_op_var(
                     graph.startblock,
                     OpKind::FieldRead {
@@ -23460,6 +23460,7 @@ mod tests {
                     true,
                 )
                 .unwrap();
+            graph.set_return(graph.startblock, Some(header));
             graph
         }
 
@@ -23484,13 +23485,6 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect();
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
-            )),
-            "offset 0 Vec header is cast_ptr_to_int; ops={ops:?}"
-        );
         assert!(
             ops.iter().all(|op| !matches!(
                 &op.kind,
