@@ -79,6 +79,9 @@ pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline_access(
 /// so its tid sits with the other closed ids (167) ahead of the
 /// target-gated tail.
 pub const W_ARRAY_USER_GC_TYPE_ID: u32 = 168;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ArrayUser`.
+pub static W_ARRAY_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_ARRAY_USER_GC_TYPE_ID);
 pub const W_ARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ArrayUser>();
 
 impl crate::lltype::GcType for W_ArrayUser {

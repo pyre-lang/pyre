@@ -12238,6 +12238,10 @@ static METHOD_CACHE: std::sync::LazyLock<MethodCacheCell> = std::sync::LazyLock:
 
 /// `typeobject.py MethodCache`: one old object. The host `entries` array is
 /// its storage; [`trace_method_cache_entries`] is the trace.
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `MethodCache`.
+pub static METHOD_CACHE_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+
 static METHOD_CACHE_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static METHOD_CACHE_OBJ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

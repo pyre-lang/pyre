@@ -600,6 +600,9 @@ pub fn new_version_tag() -> u64 {
 
 /// GC type id assigned to `W_TypeObject` at JitDriver init time.
 pub const W_TYPE_GC_TYPE_ID: u32 = 33;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_TypeObject`.
+pub static W_TYPE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_TYPE_GC_TYPE_ID);
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_TYPE_OBJECT_SIZE: usize = std::mem::size_of::<W_TypeObject>();
@@ -626,6 +629,10 @@ unsafe fn name_as_str(name: *const crate::unicodeobject::UnicodeValueStorage) ->
 /// keep a `malloc_raw` qualname, because an immortal holder is never greyed
 /// and so could never keep an old-gen box alive.
 pub type NameStorage = String;
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`NameStorage`].
+pub static NAME_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for [`NameStorage`]. Published by
 /// `pyre-jit::eval` after the fixed-constant type registrations; never embedded

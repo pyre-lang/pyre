@@ -103,7 +103,9 @@ pub trait GcEntriesType {
 }
 
 macro_rules! entries_gc_type_id {
-    ($atomic:ident, $setter:ident, $getter:ident, $k:ty, $v:ty) => {
+    ($atomic:ident, $cell:ident, $setter:ident, $getter:ident, $k:ty, $v:ty) => {
+        /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for this `DICTENTRYARRAY`.
+        pub static $cell: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
         static $atomic: AtomicU32 = AtomicU32::new(0);
 
         pub fn $setter(id: u32) {
@@ -125,6 +127,7 @@ macro_rules! entries_gc_type_id {
 
 entries_gc_type_id!(
     OBJECT_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID,
+    OBJECT_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
     set_object_key_pyobject_entries_gc_type_id,
     object_key_pyobject_entries_gc_type_id,
     crate::dictmultiobject::ObjectKey,
@@ -132,6 +135,7 @@ entries_gc_type_id!(
 );
 entries_gc_type_id!(
     I64_PYOBJECT_ENTRIES_GC_TYPE_ID,
+    I64_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
     set_i64_pyobject_entries_gc_type_id,
     i64_pyobject_entries_gc_type_id,
     i64,
@@ -139,6 +143,7 @@ entries_gc_type_id!(
 );
 entries_gc_type_id!(
     BYTES_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID,
+    BYTES_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
     set_bytes_key_pyobject_entries_gc_type_id,
     bytes_key_pyobject_entries_gc_type_id,
     crate::dictmultiobject::BytesKey,
@@ -146,6 +151,7 @@ entries_gc_type_id!(
 );
 entries_gc_type_id!(
     OBJECT_KEY_UNIT_ENTRIES_GC_TYPE_ID,
+    OBJECT_KEY_UNIT_ENTRIES_GC_TYPE_ID_CELL,
     set_object_key_unit_entries_gc_type_id,
     object_key_unit_entries_gc_type_id,
     crate::dictmultiobject::ObjectKey,
@@ -153,6 +159,7 @@ entries_gc_type_id!(
 );
 entries_gc_type_id!(
     IDENTITY_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID,
+    IDENTITY_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
     set_identity_key_pyobject_entries_gc_type_id,
     identity_key_pyobject_entries_gc_type_id,
     crate::identitydict::IdentityKey,
@@ -160,6 +167,7 @@ entries_gc_type_id!(
 );
 entries_gc_type_id!(
     STR_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID,
+    STR_KEY_PYOBJECT_ENTRIES_GC_TYPE_ID_CELL,
     set_str_key_pyobject_entries_gc_type_id,
     str_key_pyobject_entries_gc_type_id,
     crate::celldict::StrKey,

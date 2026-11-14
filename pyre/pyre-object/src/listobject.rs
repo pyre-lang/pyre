@@ -275,11 +275,17 @@ crate::mapdict_mixin_access! {
 /// startup. Re-exported from `pyre_jit_trace::descr` for existing
 /// call sites.
 pub const W_LIST_GC_TYPE_ID: u32 = 7;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ListObject`.
+pub static W_LIST_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_LIST_GC_TYPE_ID);
 pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
 /// User-subclass list layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (165) ahead of the
 /// target-gated tail.
 pub const W_LIST_USER_GC_TYPE_ID: u32 = 166;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ListObjectUser`.
+pub static W_LIST_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_LIST_USER_GC_TYPE_ID);
 pub const W_LIST_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObjectUser>();
 
 impl crate::lltype::GcType for W_ListObject {

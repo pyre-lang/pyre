@@ -146,6 +146,9 @@ pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype_with_access(
 /// after `W_LongObjectUser`, ahead of the target-gated tail (`build_gc`).
 /// Parents on `W_Weakref`.
 pub const W_WEAKREF_USER_GC_TYPE_ID: u32 = 201;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_WeakrefUser`.
+pub static W_WEAKREF_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_WEAKREF_USER_GC_TYPE_ID);
 pub const W_WEAKREF_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_WeakrefUser>();
 
 impl crate::lltype::GcType for W_WeakrefUser {
@@ -259,6 +262,9 @@ pub unsafe fn w_weakref_object_set_hash(obj: PyObjectRef, value: PyObjectRef) {
 /// site pins the id to this value so callers can treat it as a
 /// constant.
 pub const WEAKREF_GC_TYPE_ID: u32 = 51;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for the WEAKREF GcStruct.
+pub static WEAKREF_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(WEAKREF_GC_TYPE_ID);
 
 /// `WEAKREF = lltype.GcStruct("weakref", ("weakptr", llmemory.Address))`
 /// (gctypelayout.py). Single `weakptr` slot at offset 0 — the
@@ -366,6 +372,9 @@ pub static GC_WEAKREF_BOX_TYPE: PyType = new_pytype("__GcWeakrefBox");
 /// GC type id assigned to `GcWeakrefBox` — slot 52, immediately after
 /// `WEAKREF_GC_TYPE_ID=51`.
 pub const GC_WEAKREF_BOX_GC_TYPE_ID: u32 = 52;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `GcWeakrefBox`.
+pub static GC_WEAKREF_BOX_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(GC_WEAKREF_BOX_GC_TYPE_ID);
 
 #[repr(C)]
 pub struct GcWeakrefBox {

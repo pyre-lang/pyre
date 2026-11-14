@@ -1835,6 +1835,11 @@ impl MiniMarkGC {
         self.types.get_type_id(key, info)
     }
 
+    /// `TypeLayoutBuilder.id_of_type` lookup without allocating a new id.
+    pub fn id_of_type(&self, key: GcTypeKey) -> Option<u32> {
+        self.types.id_of_type(key)
+    }
+
     /// Check if an address is in the nursery.
     #[inline]
     pub fn is_in_nursery(&self, addr: usize) -> bool {

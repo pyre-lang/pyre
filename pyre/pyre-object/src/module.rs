@@ -43,6 +43,9 @@ pub struct Module {
 
 /// GC type id assigned to `Module` at JitDriver init time.
 pub const W_MODULE_GC_TYPE_ID: u32 = 36;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `Module`.
+pub static W_MODULE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_MODULE_GC_TYPE_ID);
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
@@ -174,6 +177,9 @@ crate::mapdict_mixin_access! {
 /// User-subclass module layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
 pub const W_MODULE_USER_GC_TYPE_ID: u32 = 204;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `ModuleUser`.
+pub static W_MODULE_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_MODULE_USER_GC_TYPE_ID);
 pub const W_MODULE_USER_OBJECT_SIZE: usize = std::mem::size_of::<ModuleUser>();
 
 impl crate::lltype::GcType for ModuleUser {
