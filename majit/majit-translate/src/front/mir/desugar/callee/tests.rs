@@ -1716,10 +1716,26 @@ fn profilefunc_family_llbc() -> Llbc {
             bb(vec![], json!("UnwindResume")),
         ],
     );
+    let trace_profile = dynamic_call_fun(
+        5,
+        &["fixture", "trace_profile"],
+        vec![],
+        copy_local(1, &profilefunc_adt),
+        vec![local_ty(0, &unit), local_ty(1, &profilefunc_adt)],
+        1,
+        vec![profilefunc_adt],
+    );
     llbc_with_types(
         "fixture",
         types,
-        vec![hook_a, hook_b, other_fn, setllprofile, setprofile],
+        vec![
+            hook_a,
+            hook_b,
+            other_fn,
+            setllprofile,
+            setprofile,
+            trace_profile,
+        ],
     )
 }
 
@@ -1758,6 +1774,81 @@ fn discover_profilefunc_graphs_keys_on_type_not_member_names() {
     assert!(
         spellings.iter().any(|s| s.contains("fn(")),
         "expanded fn(...) after alias peel must be published, got {spellings:?}"
+    );
+}
+
+/// `eval_hook_graphs_for_call` analogue: a Dynamic call whose operand is
+/// the `ProfileFunc` alias carries the published family (`call.py
+/// graphs_from` of `indirect_call`). Returning `None` here leaves
+/// `graphs is None` and BFS residual-skips `app_profile_call`.
+#[test]
+fn profilefunc_graphs_for_call_returns_published_family() {
+    let llbc = profilefunc_family_llbc();
+    llbc.set_profilefunc_graphs(vec!["hook_a".into(), "hook_b".into()]);
+    let operand: majit_charon_reader::ullbc::Operand =
+        serde_json::from_value(copy_local(0, &adt_node(1))).expect("ProfileFunc operand parses");
+    let graphs = super::profilefunc_graphs_for_call(&llbc, &operand)
+        .expect("ProfileFunc-typed operand must name the published family");
+    let names: Vec<String> = graphs.iter().map(|p| p.canonical_key()).collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "hook_a" || n.ends_with("::hook_a")),
+        "published hook_a must be attached, got {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "hook_b" || n.ends_with("::hook_b")),
+        "published hook_b must be attached, got {names:?}"
+    );
+}
+
+/// `_trace`'s `profilefunc(...)` Dynamic call is `indirect_call` with
+/// `c_graphs` (`rpbc.py FunctionReprBase.call`), so `find_all_graphs`
+/// follows the family. Residual/`__dyn_call` leaves AccessDirect copies
+/// outside `jit_graphs`.
+#[test]
+fn profilefunc_dynamic_call_attaches_published_family() {
+    let llbc = profilefunc_family_llbc();
+    llbc.set_profilefunc_graphs(vec!["hook_a".into(), "hook_b".into()]);
+    let graph = crate::front::mir::lower_function(&llbc, "trace_profile")
+        .expect("lower Dynamic ProfileFunc caller");
+    let families: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            crate::model::OpKind::IndirectCall {
+                graphs: Some(graphs),
+                ..
+            } => Some(graphs.iter().map(|p| p.canonical_key()).collect()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        families.len(),
+        1,
+        "exactly one IndirectCall with graphs, got {families:?}; ops={:?}",
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .map(|op| format!("{:?}", op.kind))
+            .collect::<Vec<_>>()
+    );
+    let names = &families[0];
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "hook_a" || n.ends_with("::hook_a")),
+        "hook_a must be on the indirect_call family, got {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "hook_b" || n.ends_with("::hook_b")),
+        "hook_b must be on the indirect_call family, got {names:?}"
     );
 }
 

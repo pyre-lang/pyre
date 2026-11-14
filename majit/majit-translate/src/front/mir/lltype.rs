@@ -5223,6 +5223,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     ) {
         return Some(root);
     }
+    // `&T` / `*mut T` of a non-GC `GcArray` ITEM (`rordereddict.py`
+    // `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`). Stamp the
+    // unsuffixed template so residual `"ref"` intern's
+    // `llannotation.py` `lltype_to_annotation` of `Ptr(STRUCT)`
+    // (`declared_return_annotation` / `project_struct_field_type`). A
+    // monomorph `Entry<K, V>` is the same ITEM; intern of the suffix
+    // would mint a ClassDef (`bookkeeper.py` `getuniqueclassdef`).
+    if let Some(root) = gcarray_item_ptr_return_class_root(ty, llbc, gc_struct_ids) {
+        return Some(root);
+    }
     // Intern residual of `*mut T` / `*const T` / `NonNull<T>` onto a
     // declared non-GC ADT. Stamp `*mut {root}` so
     // `declared_return_annotation` intern's `lltype.py` `SomePtr`
@@ -5313,6 +5323,96 @@ fn nongc_raw_ptr_return_class_root(
         return None;
     }
     Some(format!("*mut {root}"))
+}
+
+/// Unsuffixed intern key of a non-GC `GcArray` ITEM behind one pointer
+/// word (`rordereddict.py` `get_ll_dict` `DICTENTRY` / `DICTENTRYARRAY`;
+/// `lltype.py` `InteriorPtr` of `Struct` in `GcArray`).
+fn gcarray_item_ptr_return_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    let pointee = type_node_peel_aliases(pointee, llbc)?;
+    let def_id = adt_node_def_id(pointee)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let identity = type_decl_unsuffixed_identity(td);
+    if identity.is_empty() || identity.starts_with("??") || identity.starts_with('[') {
+        return None;
+    }
+    if struct_id_is_declared_gc(gc_struct_ids, struct_id_for_type_decl(td), &identity) {
+        return None;
+    }
+    type_decl_is_gcarray_item(td, llbc, gc_struct_ids).then_some(identity)
+}
+
+fn type_decl_unsuffixed_identity(td: &TypeDecl) -> String {
+    let path = strip_crate_prefix(&td.item_meta.name_path());
+    majit_ir::descr::strip_generic_args(&path).into_owned()
+}
+
+/// True when `td` is the inlined ITEM of a declared-GC `{integer, [T; 0]}`
+/// wrapper (`lltype.py` `GcArray` of `Struct`). Pointer ITEM stays a
+/// list (`FixedSizeListRepr`).
+fn type_decl_is_gcarray_item(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let item_key = type_decl_unsuffixed_identity(td);
+    for wrapper in llbc.iter_type_decls() {
+        let Some(fields) = type_decl_struct_fields(wrapper, llbc) else {
+            continue;
+        };
+        if fields.len() != 2 {
+            continue;
+        }
+        let wrapper_name = strip_crate_prefix(&wrapper.item_meta.name_path());
+        if !struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(wrapper),
+            &wrapper_name,
+        ) {
+            continue;
+        }
+        if !tyref_is_integer_scalar(&fields[0].ty, llbc) {
+            continue;
+        }
+        let Some((item, 0)) = super::views::tyref_raw_array_parts(&fields[1].ty, llbc) else {
+            continue;
+        };
+        let Some(item) = strip_ty_indirections(item, llbc) else {
+            continue;
+        };
+        let Some(item) = type_node_peel_aliases(item, llbc) else {
+            continue;
+        };
+        if one_level_pointer_pointee(item, llbc).is_some() {
+            continue;
+        }
+        let Some(item_td) = adt_node_def_id(item).and_then(|id| llbc.type_by_id(id)) else {
+            continue;
+        };
+        let item_identity = type_decl_unsuffixed_identity(item_td);
+        if struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(item_td),
+            &item_identity,
+        ) {
+            continue;
+        }
+        if item_identity == item_key {
+            return true;
+        }
+    }
+    false
 }
 
 /// A residual returning `*mut` / `Ref` of a registered GC struct is a
@@ -15989,6 +16089,11 @@ pub(in crate::front::mir) fn field_row_struct_identity(
 /// A pointer ITEM (`FixedSizeListRepr` of a W_Root / instance) stays the
 /// list path. `wrapper` supplies `??TypeVar#N` arguments for harvested
 /// generic rows; the array-of-ADT row already carries the TypeDecl path.
+/// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`),
+/// the same seed [`gcarray_item_struct_ptr_annotation`] uses for the ITEM
+/// pointer. Declared-GC of the ITEM is path identity
+/// ([`spelling_path_is_declared_gc`]): harvest's leaf `StructId` is not
+/// this TypeDecl (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`).
 pub(crate) fn struct_item_flexible_gcarray_block_annotation(
     reg: &crate::front::StructFieldRegistry,
     wrapper: &str,
@@ -15998,20 +16103,17 @@ pub(crate) fn struct_item_flexible_gcarray_block_annotation(
     use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
 
     let items_ty = substitute_typevar_markers(items_ty, &spelling_type_args(wrapper));
-    if items_ty.contains("??") {
-        return None;
-    }
     let (item, 0) = shaped_array_parts(&items_ty)? else {
         return None;
     };
     if crate::front::typestr::peel_pointer_prefix(item).is_some() {
         return None;
     }
-    if spelling_is_declared_gc(&reg.gc_struct_ids, item) {
+    if spelling_path_is_declared_gc(&reg.gc_struct_ids, item) {
         return None;
     }
     let mut visited = std::collections::HashSet::new();
-    let entry = raw_struct_array_item_lltype(reg, item, &mut visited)?;
+    let entry = raw_struct_array_item_lltype_inner(reg, item, &mut visited, true)?;
     Some(lltype_to_annotation(Ptr {
         TO: PtrTarget::Array(Array::gc(entry)),
     }))

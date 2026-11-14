@@ -2130,7 +2130,7 @@ impl<'a> Lowering<'a> {
         };
         root.filter(|r| {
             !self.struct_fields.is_some_and(|reg| {
-                crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, r)
+                crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, r)
             })
         })
     }
@@ -5013,7 +5013,7 @@ impl<'a> Lowering<'a> {
             // Ptr is SomePtr. A classdef recast here is Instance ∪ Ptr
             // at `RDict::entry_at` (`mergeinputargs`).
             if self.struct_fields.is_some_and(|reg| {
-                crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, &root)
+                crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, &root)
             }) {
                 return None;
             }
@@ -7257,7 +7257,7 @@ impl<'a> Lowering<'a> {
                                     self.registered_gc_ptr_field_root(&pre.ty)
                                             .filter(|root| {
                                                 !self.struct_fields.is_some_and(|reg| {
-                                                    crate::annotator::bookkeeper::struct_root_is_gcarray_item(
+                                                    crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(
                                                         reg, root,
                                                     )
                                                 })

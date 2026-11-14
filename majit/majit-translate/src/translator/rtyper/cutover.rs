@@ -19235,20 +19235,12 @@ mod tests {
             ("value".to_string(), "??TypeVar#1".to_string()),
             ("f_hash".to_string(), "u64".to_string()),
         ];
-        for owner in [
-            "pyre_object::rordereddict_entries::Entry",
-            entry,
-            "Entry",
-        ] {
+        for owner in ["pyre_object::rordereddict_entries::Entry", entry, "Entry"] {
             fields.fields.insert(owner.to_string(), entry_rows.clone());
         }
         let entry_id = majit_ir::descr::StructId::from_canonical(entry);
         let gc_id = majit_ir::descr::StructId::from_canonical(entries);
-        for alias in [
-            "pyre_object::rordereddict_entries::Entry",
-            entry,
-            "Entry",
-        ] {
+        for alias in ["pyre_object::rordereddict_entries::Entry", entry, "Entry"] {
             fields.class_identity.insert(
                 alias.to_string(),
                 Some(crate::front::semantic::ClassIdentity {
@@ -19281,12 +19273,12 @@ mod tests {
             .gc_struct_ids
             .insert(majit_ir::descr::StructId::from_canonical("Entry"));
         registry.set_struct_fields(Rc::new(fields));
-        registry.bookkeeper().set_raw_alloc_flavor_structs(
-            std::collections::HashSet::from([
+        registry
+            .bookkeeper()
+            .set_raw_alloc_flavor_structs(std::collections::HashSet::from([
                 entry.to_string(),
                 "Entry".to_string(),
-            ]),
-        );
+            ]));
 
         let shell = raw_ptr_token_annotation(&registry, Some("raw:rordereddict_entries::Entry"))
             .expect("DICTENTRY residual raw: token declares its annotation");
@@ -21672,6 +21664,119 @@ mod tests {
             matches!(ptr.ll_ptrtype.TO, PtrTarget::Array(_)),
             "TypedItemsBlock result must be Ptr(GcArray), got {:?}",
             ptr.ll_ptrtype.TO
+        );
+    }
+
+    /// `rordereddict.py` `_ll_dict_setitem_lookup_done` binds
+    /// `entry = d.entries[i]` as InteriorPtr of `DICTENTRY`
+    /// (`lltype.py` `Struct` in `GcArray`); `entry.key` is
+    /// `SomePtr.getattr` (`lltype.py`) / `getinteriorfield`. IdentityKey
+    /// `get_slot` FieldRead `key` of the `entry_at` dest is that getattr.
+    /// Residual `"ref"` with no class root shells classdef-less
+    /// (`valuetype_to_someshell`); official skip is
+    /// `SomeInstance.getattr("key")` on that dest.
+    #[test]
+    fn identitykey_entry_at_dest_interns_someptr_getattr_key() {
+        use std::rc::Rc;
+
+        use crate::annotator::model::{SomeString, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::model::OpKind;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let Some(object) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
+        ) else {
+            return;
+        };
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object],
+            crate::HostStaticAddrs::default(),
+            &["identitydict", "rordereddict", "rordereddict_entries"],
+            &["nth_item"],
+        )
+        .expect("lower identitydict nth_item");
+
+        let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        let entry_at = program
+            .functions
+            .iter()
+            .find(|f| f.name.contains("entry_at__spec_IdentityKey"))
+            .unwrap_or_else(|| panic!("expected IdentityKey entry_at spec, got {names:?}"));
+        let get_slot = program
+            .functions
+            .iter()
+            .find(|f| f.name.contains("get_slot__spec_IdentityKey"))
+            .unwrap_or_else(|| panic!("expected IdentityKey get_slot spec, got {names:?}"));
+        assert!(
+            get_slot
+                .graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(
+                    |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "key")
+                ),
+            "IdentityKey get_slot must FieldRead key of the entry_at dest, ops {:?}",
+            get_slot
+                .graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .map(|op| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry.set_struct_fields(Rc::new(program.struct_fields.clone()));
+
+        let graph = entry_at.graph();
+        let declared = declared_return_annotation(&registry, graph).unwrap_or_else(|| {
+            panic!(
+                "IdentityKey entry_at dest intern is SomePtr of DICTENTRY, \
+                 return_type={:?} residual_return_type={:?} return_class_root={:?} \
+                 semantic_return_class_root={:?}",
+                graph.return_type,
+                graph.residual_return_type,
+                graph.return_class_root,
+                entry_at.return_class_root
+            )
+        });
+        let s_entry = match &declared {
+            SomeValue::Ptr(ptr) => {
+                match &ptr.ll_ptrtype.TO {
+                    PtrTarget::Struct(st) => {
+                        assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
+                    }
+                    other => panic!(
+                        "IdentityKey entry_at dest SomePtr must point at STRUCT, got {other:?}"
+                    ),
+                }
+                declared.clone()
+            }
+            SomeValue::InteriorPtr(_) => declared.clone(),
+            other => panic!(
+                "IdentityKey entry_at dest intern is SomePtr/SomeInteriorPtr of DICTENTRY, \
+                 got {other:?}, return_class_root={:?}",
+                graph.return_class_root
+            ),
+        };
+
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
+        let s_key = match &s_entry {
+            SomeValue::Ptr(ptr) => ptr
+                .getattr(&SomeValue::String(s_attr))
+                .expect("SomePtr.getattr key of DICTENTRY"),
+            SomeValue::InteriorPtr(iptr) => iptr
+                .getattr(&SomeValue::String(s_attr))
+                .expect("SomeInteriorPtr.getattr key of DICTENTRY"),
+            other => panic!("entry dest intern must stay SomePtr, got {other:?}"),
+        };
+        assert!(
+            !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
+            "getattr key must not be classdef-less, got {s_key:?}"
         );
     }
 

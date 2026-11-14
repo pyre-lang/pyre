@@ -8228,6 +8228,19 @@ pub(crate) fn struct_root_is_gcarray_item(
     gcarray_item_keys_contain(reg, &item_key)
 }
 
+/// Lowering recast skip: the unsuffixed template is ITEM, so an
+/// instantiation is too (`rordereddict.py` `DICTENTRY` is `lltype.py`
+/// `Struct` in `GcArray`). Intern of a monomorph still keeps its
+/// ClassDef ([`struct_root_is_gcarray_item`] is false when the intern
+/// key carries `<…>`).
+pub(crate) fn struct_root_template_is_gcarray_item(
+    reg: &crate::front::StructFieldRegistry,
+    root: &str,
+) -> bool {
+    let template = majit_ir::descr::strip_generic_args(root);
+    struct_root_is_gcarray_item(reg, template.as_ref())
+}
+
 /// Class-identity key of a non-GC `GcArray` ITEM spelling.
 fn gcarray_item_identity_key(
     reg: &crate::front::StructFieldRegistry,
@@ -12310,6 +12323,113 @@ mod tests {
     }
 
     #[test]
+    fn unsuffixed_typevar_gc_entries_projects_to_gcarray_ptr() {
+        // Harvest of `GcEntries<K,V>` stores TypeVar items
+        // (`[Entry<??TypeVar#0,??TypeVar#1>;0]`). CAST dest of
+        // `entries_item_ptr` and `RDict.entries` intern that unsuffixed
+        // template. `rordereddict.py` `DICTENTRYARRAY` is
+        // `GcArray(DICTENTRY)` / `llannotation.py` `SomePtr`, not
+        // `FixedSizeListRepr`. A leftover `??` is one GCREF word
+        // (`gcarray_item_struct_ptr_annotation`). Harvest also stores
+        // the leaf `StructId` of every GC TypeDecl; a colliding `Entry`
+        // leaf is not this ITEM (`spelling_path_is_declared_gc`).
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::GcEntries",
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+            ],
+        );
+        harvest_class_identity(
+            &mut reg,
+            "rordereddict_entries::Entry",
+            &[
+                "pyre_object::rordereddict_entries::Entry",
+                "rordereddict_entries::Entry",
+                "Entry",
+            ],
+        );
+        note_declared_gc(
+            &mut reg,
+            &[
+                "pyre_object::rordereddict_entries::GcEntries",
+                "rordereddict_entries::GcEntries",
+                "GcEntries",
+            ],
+        );
+        reg.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        // `entry_valid` is getattr(self, "entries") then getitem
+        // (`ll_getitem_fast` / `ll_valid_from_flag`). The field intern
+        // must be the same SomePtr, not SomeList of Impossible.
+        reg.fields.insert(
+            "rordereddict::RDict".to_string(),
+            vec![
+                (
+                    "entries".to_string(),
+                    "*mut rordereddict_entries::GcEntries".to_string(),
+                ),
+                ("num_live_items".to_string(), "usize".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["rordereddict::RDict", "RDict"]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in [
+            "rordereddict_entries::GcEntries",
+            "*mut rordereddict_entries::GcEntries",
+            "GcEntries",
+            "pyre_object::rordereddict_entries::GcEntries",
+            "GcEntries<i64, *mut u8>",
+            "*mut GcEntries<i64, *mut u8>",
+            "rordereddict_entries::GcEntries<i64, *mut u8>",
+        ] {
+            assert_struct_item_gcarray_ptr(&bk.project_struct_field_type(spelling), spelling);
+        }
+
+        use crate::annotator::classdesc::ClassDef;
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("rordereddict::RDict")
+            .expect("RDict intern");
+        let interned = ClassDef::about_attribute(&classdef, "entries").expect("entries intern");
+        assert_struct_item_gcarray_ptr(&interned, "RDict.entries intern");
+    }
+
+    #[test]
     fn gcarray_item_struct_projects_to_raw_ptr_and_getattr() {
         // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined in
         // `GcArray` (`get_ll_dict`); `bookkeeper.py` `getuniqueclassdef`
@@ -12625,6 +12745,42 @@ mod tests {
                 assert_eq!(st._gckind, GcKind::Raw, "DICTENTRY is lltype.Struct");
             }
             other => panic!("DICTENTRY SomePtr must point at a Struct, got {other:?}"),
+        }
+
+        assert_struct_item_gcarray_ptr(
+            &bk.project_struct_field_type("rordereddict_entries::GcEntries"),
+            "production unsuffixed GcEntries",
+        );
+        assert_struct_item_gcarray_ptr(
+            &bk.project_struct_field_type("*mut rordereddict_entries::GcEntries"),
+            "production *mut unsuffixed GcEntries",
+        );
+        let rdict_entries: Vec<(String, String)> = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| {
+                majit_ir::descr::strip_generic_args(owner)
+                    .rsplit("::")
+                    .next()
+                    == Some("RDict")
+            })
+            .filter_map(|(owner, rows)| {
+                rows.iter()
+                    .find(|row| row.name == "entries")
+                    .map(|row| (owner.clone(), row.ty.clone()))
+            })
+            .collect();
+        assert!(
+            !rdict_entries.is_empty(),
+            "production RDict must harvest an entries field\n{}",
+            dump_owner("RDict")
+        );
+        for (owner, ty) in &rdict_entries {
+            assert_struct_item_gcarray_ptr(
+                &bk.project_struct_field_type(ty),
+                &format!("{owner}.entries ({ty})"),
+            );
         }
 
         let path_gc = crate::front::mir::spelling_path_is_declared_gc(

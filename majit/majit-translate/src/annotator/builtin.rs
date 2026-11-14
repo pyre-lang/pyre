@@ -6164,6 +6164,76 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_gcentries_is_gcarray_ptr() {
+        // `entries_item_ptr` recasts `*mut GcEntries` onto the unsuffixed
+        // template. Harvest stores TypeVar items; dest is
+        // `SomePtr(GcArray(DICTENTRY))` (`rordereddict.py` `DICTENTRYARRAY`,
+        // `llannotation.py` `lltype_to_annotation`), not SomeList of
+        // Impossible (`FixedSizeListRepr`).
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        reg.note_declared_gc_name("rordereddict_entries::GcEntries");
+        reg.note_declared_gc_name("GcEntries");
+        reg.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        bk.set_struct_fields(Rc::new(reg));
+        let s_null = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("rordereddict_entries::GcEntries"))
+            .expect("GcEntries root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_null), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("GcEntries cast must return SomePtr(GcArray)");
+        let SomeValue::Ptr(ptr) = out else {
+            panic!("GcEntries dest must project as SomePtr(GcArray), got {out:?}");
+        };
+        match &ptr.ll_ptrtype.TO {
+            PtrTarget::Array(arr) => match &arr.OF {
+                LowLevelType::Struct(st) => assert!(
+                    st.getattr_field_type("f_valid").is_some(),
+                    "GcEntries ARRAY.OF must be DICTENTRY, got {st:?}"
+                ),
+                other => panic!("GcEntries ITEM must be STRUCT, got {other:?}"),
+            },
+            other => panic!("GcEntries dest must be Ptr(GcArray), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cast_instance_intrinsic_tuple_root_narrows_to_sometuple() {
         // A residual call's `(A, B)` result arrives as a classdef-less
         // pointer; the `Tuple<A,B>` root narrows it to the RPython tuple,

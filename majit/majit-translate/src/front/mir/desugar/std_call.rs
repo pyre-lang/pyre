@@ -847,6 +847,15 @@ impl<'a> Lowering<'a> {
             });
             raw
         };
+        // `rordereddict.py` `DICTENTRY` is `lltype.Struct` inlined in
+        // `GcArray`. `direct_arrayitems` is that interior pointer
+        // (`lltype.py`); a classdef recast is Instance ∪ Ptr at
+        // `RDict::entry_at`.
+        if self.struct_fields.is_some_and(|reg| {
+            crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, root)
+        }) {
+            return raw;
+        }
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

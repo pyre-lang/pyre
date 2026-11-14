@@ -321,7 +321,9 @@ impl<'a> Lowering<'a> {
                 // GCREF erasure still recasts (`llmemory.py` `GCREF`).
                 .filter(|root| {
                     !self.struct_fields.is_some_and(|reg| {
-                        crate::annotator::bookkeeper::struct_root_is_gcarray_item(reg, root)
+                        crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(
+                            reg, root,
+                        )
                     })
                 })
                 // `Option<&mut RegisteredStruct>` is a nullable pointer
@@ -3859,31 +3861,34 @@ impl<'a> Lowering<'a> {
                         );
                         self.local_var[dest_local] = Some(LocalValue::One(raw));
                     } else if dest_is_ref
+                        && let Some((base, offset)) =
+                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
+                        && let Some(root) =
+                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                    {
+                        // `addr_of_mut!((*header).items).cast()` is
+                        // `direct_arrayitems` even when dest is the
+                        // inlined ITEM (`lltype.py` `Struct` in
+                        // `GcArray`) and `instance_narrow_for_type`
+                        // declines the classdef recast. A same-root
+                        // `.cast()` used to alias the FieldRead and
+                        // leave getattr `items` on the array pointer.
+                        let res = self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
                             &call.dest.ty,
                             &args[0],
                             src_root.as_deref(),
                         )
                     {
-                        let array_tail =
-                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
-                        let res = if let Some((base, offset)) = array_tail
-                            && let Some(root) = tyref_class_root_with(
-                                &call.dest.ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                            ) {
-                            self.emit_array_tail_item_ptr(bb_id, base, offset, &root)
-                        } else {
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind,
-                            });
-                            res
-                        };
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if self.should_emit_rffi_cast_identity_to_raw_scalar(
                         &call.dest.ty,

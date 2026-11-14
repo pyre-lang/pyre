@@ -1240,19 +1240,24 @@ fn operand_bound_fundefs(
 /// `find_all_graphs` leaves the members out of `candidate_graphs`; Phase A
 /// then mints `cachedgraph((AccessDirect, None))` copies that
 /// `warmspot.py check_access_directly_sanity` rejects.
+///
+/// A Dynamic call through the `profilefunc` field (`setllprofile` /
+/// `_trace`) is the same family (`graphs_from` residual if empty).
 pub(in crate::front::mir) fn profilefunc_graphs_for_call(
     llbc: &Llbc,
     operand: &Operand,
 ) -> Option<Vec<crate::parse::CallPath>> {
+    let paths = profilefunc_graphs_of(llbc);
+    if paths.is_empty() {
+        return None;
+    }
     let ty = match operand {
         Operand::Copy(place) | Operand::Move(place) => &place.ty,
         Operand::Const(_) => return None,
     };
-    if !tyref_is_profilefunc_family(ty, llbc) {
-        return None;
-    }
-    let paths = profilefunc_graphs_of(llbc);
-    if paths.is_empty() {
+    if !tyref_is_profilefunc_family(ty, llbc)
+        && !operand_place(operand).is_some_and(|place| place_is_profilefunc_field(place, llbc))
+    {
         return None;
     }
     Some(
