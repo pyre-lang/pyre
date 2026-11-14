@@ -1018,7 +1018,9 @@ fn collect_ref_enum_instantiations(
             tombstoned,
             &mut visited,
         );
-        let Some(u) = fd.unstructured_shared() else {
+        // A fresh parse, dropped at the end of this iteration: `unstructured_shared` would
+        // keep every admitted body alive in `FunDecl::unstructured_cache` for the whole run.
+        let Some(u) = fd.unstructured() else {
             continue;
         };
         intern_enums_from_unstructured(
@@ -3020,10 +3022,11 @@ impl<'l> CrateLowering<'l> {
             ref root_stack,
             ..
         } = *self;
-        // Harvest already parsed this body into `unstructured_shared`.
-        // Clone that projection; `unstructured()` would parse the raw JSON
-        // again. Mutation below needs an owned copy.
-        let Some(mut body) = fd.unstructured_owned() else {
+        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
+        // every call, so hold the one projection this build needs: it is
+        // both the "has a lowerable body" gate and the input the lowering
+        // below reads.
+        let Some(mut body) = fd.unstructured() else {
             return Err(DeclBuildError::NoBody);
         };
         clear_unreachable_blocks(llbc, &mut body);
@@ -7765,7 +7768,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
-    let mut u = fd.unstructured_owned().ok_or_else(|| {
+    let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
             fd.item_meta.name_path_str()
