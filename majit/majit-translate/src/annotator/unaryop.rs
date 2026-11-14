@@ -3897,6 +3897,13 @@ pub(crate) fn call_builtin_method(
             };
             method.s_self.as_ref().clone()
         }
+        // rustc `FnOnce::call_once` on a synthesized closure. The
+        // unwrap_or_else Err arm panics (`cache.py` getorbuild
+        // RuntimeError). Void: bind Impossible without blocking
+        // (`consider_op` None).
+        "fnonce_method_call_once" => {
+            return Ok(None);
+        }
         // `PyError::to_exc_object(&self) -> PyObjectRef` — the boxed
         // `W_BaseException`.  Zero positional args; the result is a
         // `PyObjectRef` instance (bound in the SomeInstance.getattr
@@ -4604,7 +4611,7 @@ fn init_someinstance_overrides(
                         ));
                     }
                 }
-                if attr == "as_ref" || attr == "as_mut" {
+                if attr == "as_ref" || attr == "as_mut" || attr == "deref" || attr == "deref_mut" {
                     let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
                         let classdesc = cd.borrow().classdesc.clone();
                         super::classdesc::ClassDesc::lookup(&classdesc, &attr).is_some()
@@ -4612,6 +4619,29 @@ fn init_someinstance_overrides(
                     if !class_defines_attr {
                         return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
                             "ptr_method_as_ref",
+                            s_self.clone(),
+                            attr,
+                        ));
+                    }
+                }
+                // rustc `FnOnce::call_once` on a synthesized closure
+                // (`unwrap_or_else` of `Result`). `cache.py`
+                // `Cache.getorbuild` raises RuntimeError on recursive
+                // construction; the Err arm diverges. A real member
+                // keeps classdef dispatch below.
+                if attr == "call_once" || attr == "call_mut" || attr == "call" {
+                    let is_rustc_closure = inst.classdef.as_ref().is_some_and(|cd| {
+                        let name = cd.borrow().name.clone();
+                        let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+                        leaf == "closure" || leaf.contains("{{closure}}")
+                    });
+                    let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
+                        let classdesc = cd.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::lookup(&classdesc, &attr).is_some()
+                    });
+                    if is_rustc_closure && !class_defines_attr {
+                        return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "fnonce_method_call_once",
                             s_self.clone(),
                             attr,
                         ));
@@ -4709,6 +4739,50 @@ fn init_someinstance_overrides(
                 //                          return self.classdef.read_attr__class__()`.
                 if attr == "__class__" {
                     return super::classdesc::ClassDef::read_attr__class__(classdef);
+                }
+                // Constant enum variant: the tag is the harvested
+                // discriminant. `__pos_0` reads `const_box` only when
+                // that box is the payload (`wrap_memo_v_as_result_ok` /
+                // `try_wrap_constant_enum_cast` store V in Result::Ok),
+                // not the variant itself. Same-classdef `const_box` falls
+                // through to `s_getattr` (unaryop.py SomeInstance.getattr
+                // returns the field TYPE).
+                if inst.is_constant() {
+                    if attr == "__discriminant"
+                        && !ann.bookkeeper.classdef_is_exception_class(classdef)
+                        && let Some(tag) = ann.bookkeeper.discriminant_of_variant_classdef(classdef)
+                    {
+                        return s_const_int(tag);
+                    }
+                    if attr == "__pos_0"
+                        && ann
+                            .bookkeeper
+                            .discriminant_of_variant_classdef(classdef)
+                            .is_some()
+                        && let Some(payload) = s_self.const_()
+                    {
+                        let s_payload =
+                            ann.bookkeeper
+                                .immutablevalue(payload)
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "AnnotatorError: SomeInstance.getattr({attr:?}) \
+                                 immutablevalue failed: {err:?}"
+                                    )
+                                });
+                        let payload_same_variant = match &s_payload {
+                            SomeValue::Instance(p) => {
+                                match (p.classdef.as_ref(), inst.classdef.as_ref()) {
+                                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !payload_same_variant {
+                            return s_payload;
+                        }
+                    }
                 }
                 // unaryop.py:840 — `getbookkeeper().record_getattr(
                 //                       self.classdef.classdesc, attr)`.

@@ -188,6 +188,10 @@ impl CodeWriter {
         let registry = std::rc::Rc::new(
             crate::translator::rtyper::call_registry::CallRegistry::new(bk),
         );
+        // Driver `specialize:memo` evaluator (`specialize.py memo`
+        // `func(*args)`). Attach before populate so
+        // `get_or_register_with_func` copies it onto memo GraphFuncs.
+        registry.set_memo_host_call(callcontrol.memo_host_call().cloned());
         // Thread the program-wide struct field shapes into the shared
         // bookkeeper so
         // `getuniqueclassdef_for_struct_root` / `project_struct_field_type`
@@ -200,6 +204,9 @@ impl CodeWriter {
         registry
             .bookkeeper()
             .set_immutable_fields_structs(callcontrol.immutable_fields_by_struct.clone());
+        registry
+            .bookkeeper()
+            .set_freeze_classes(callcontrol.freeze_classes.clone());
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.

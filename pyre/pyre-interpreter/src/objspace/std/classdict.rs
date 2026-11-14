@@ -5,31 +5,64 @@
 //! `setdictvalue` / `deldictvalue`.
 
 use crate::PyError;
-use crate::baseobjspace::{SpaceCacheClass, SpaceCacheInstance};
+use crate::baseobjspace::{ObjSpace, RetainedSpaceCache, SpaceCacheClass, SpaceCacheInstance};
 use pyre_object::dictmultiobject::{DictStrategy, DictStrategyRef, StrategyKind};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 
 /// `classdict.py ClassDictStrategy`.
-pub struct ClassDictStrategy {}
+///
+/// `InternalSpaceCache._build` constructs one per space
+/// (`callable(self.space)`). The immortal holder is this instance's
+/// `W_DictObject.dstrategy` (`typeobject.py W_TypeObject.getdict`).
+#[majit_macros::jit_immutable_fields("holder")]
+pub struct ClassDictStrategy {
+    holder: &'static DictStrategyRef,
+}
 
 impl ClassDictStrategy {
-    pub const fn new() -> Self {
-        Self {}
+    pub fn new() -> Self {
+        Self {
+            holder: pyre_object::dictmultiobject::alloc_prebuilt_dict_strategy_ref(
+                StrategyKind::Class,
+                &CLASS_DICT_SLOT,
+            ),
+        }
     }
 
-    /// The process-wide prebuilt holder `W_DictObject.dstrategy` points at.
-    /// Reached through the fromcache instance so a translated read is a
-    /// method of `space.fromcache(ClassDictStrategy)`, not a module-static.
+    /// Holder this space's class dicts store in `W_DictObject.dstrategy`.
+    #[inline(always)]
     pub fn strategy_ref(&self) -> &'static DictStrategyRef {
-        class_dict_strategy_ref()
+        self.holder
     }
 
+    /// The holder is immortal (`malloc_typed_immortal`) and has no young refs.
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut PyObjectRef)) {}
 }
 
-/// Trait-object slot used as a dict's `dstrategy`. `fromcache` still owns a
-/// per-space [`ClassDictStrategy`] so constructor identity matches upstream.
+/// `baseobjspace.py ObjSpace.fromcache` / `cache.py Cache.getorbuild`.
+#[inline(always)]
+fn class_dict_strategy_from_space(space: &ObjSpace) -> RetainedSpaceCache<ClassDictStrategy> {
+    match space.fromcache(SpaceCacheClass::ClassDictStrategy) {
+        SpaceCacheInstance::ClassDictStrategy(strategy) => strategy,
+        SpaceCacheInstance::SysState(_) => {
+            unreachable!("ClassDictStrategy fromcache")
+        }
+    }
+}
+
+/// The PREBUILT space's `fromcache(ClassDictStrategy)` holder.
+///
+/// JIT/GC bind and stamp this address (`jit_static_ref_addrs`,
+/// `stamp_prebuilt_dict_strategy_ref`). `Cache.getorbuild` specialize:memo
+/// folds `space.fromcache(X)` for the prebuilt space to this constant.
+#[inline(always)]
+pub fn class_dict_strategy_ref() -> &'static DictStrategyRef {
+    class_dict_strategy_from_space(crate::baseobjspace::object_space()).strategy_ref()
+}
+
+/// Trait-object implementation stored in the fromcache holder's `imp`.
+/// `W_DictObject.dstrategy` points at the holder.
 struct ClassDictStrategySlot;
 
 pyre_object::register_dyn_impl_vtable!(
@@ -96,13 +129,6 @@ impl DictStrategy for ClassDictStrategySlot {
 }
 
 static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
-
-pyre_object::define_prebuilt_dict_strategy_ref!(
-    CLASS_DICT_STRATEGY_REF,
-    class_dict_strategy_ref,
-    pyre_object::dictmultiobject::StrategyKind::Class,
-    &CLASS_DICT_SLOT
-);
 
 struct ClassDictMethods;
 
@@ -464,7 +490,7 @@ pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
 pub fn class_dict_for_type(w_type: PyObjectRef) -> PyObjectRef {
     let space = crate::baseobjspace::object_space();
     pyre_object::w_dict_new_with(
-        space.class_dict_strategy().strategy_ref(),
+        class_dict_strategy_from_space(space).strategy_ref(),
         w_type as pyre_object::gc_hook::GCREF,
     )
 }
@@ -481,27 +507,52 @@ mod tests {
         crate::typedef::init_typeobjects();
         let a = ObjSpace::new();
         let b = ObjSpace::new();
-        let SpaceCacheInstance::ClassDictStrategy(first) =
-            a.fromcache(SpaceCacheClass::ClassDictStrategy)
+        let SpaceCacheInstance::ClassDictStrategy(first) = a
+            .fromcache(SpaceCacheClass::ClassDictStrategy)
+            .retain_owner()
         else {
             panic!("expected ClassDictStrategy");
         };
-        let SpaceCacheInstance::ClassDictStrategy(again) =
-            a.fromcache(SpaceCacheClass::ClassDictStrategy)
+        let SpaceCacheInstance::ClassDictStrategy(again) = a
+            .fromcache(SpaceCacheClass::ClassDictStrategy)
+            .retain_owner()
         else {
             panic!("expected ClassDictStrategy");
         };
-        assert!(crate::baseobjspace::RetainedSpaceCache::ptr_eq(
-            &first, &again
+        assert!(RetainedSpaceCache::ptr_eq(&first, &again));
+        assert!(std::ptr::eq(first.strategy_ref(), again.strategy_ref()));
+        let SpaceCacheInstance::ClassDictStrategy(other) = b
+            .fromcache(SpaceCacheClass::ClassDictStrategy)
+            .retain_owner()
+        else {
+            panic!("expected ClassDictStrategy");
+        };
+        assert!(!RetainedSpaceCache::ptr_eq(&first, &other));
+        assert!(!std::ptr::eq(first.strategy_ref(), other.strategy_ref()));
+
+        let prebuilt = class_dict_strategy_from_space(crate::baseobjspace::object_space());
+        assert!(std::ptr::eq(
+            prebuilt.strategy_ref(),
+            class_dict_strategy_ref()
         ));
-        let SpaceCacheInstance::ClassDictStrategy(other) =
-            b.fromcache(SpaceCacheClass::ClassDictStrategy)
-        else {
-            panic!("expected ClassDictStrategy");
-        };
-        assert!(!crate::baseobjspace::RetainedSpaceCache::ptr_eq(
-            &first, &other
+        assert!(!std::ptr::eq(
+            first.strategy_ref(),
+            class_dict_strategy_ref()
         ));
+        assert!(!std::ptr::eq(
+            other.strategy_ref(),
+            class_dict_strategy_ref()
+        ));
+
+        let list_type = crate::typedef::gettypeobject(&pyre_object::LIST_TYPE);
+        let w_dict = class_dict_for_type(list_type);
+        unsafe {
+            let dict = &*(w_dict as *const pyre_object::W_DictObject);
+            assert!(std::ptr::eq(dict.dstrategy, class_dict_strategy_ref()));
+            assert!(std::ptr::eq(dict.dstrategy, prebuilt.strategy_ref()));
+            let hdr = majit_gc::header::header_of(dict.dstrategy as *const _ as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+        }
     }
 
     #[test]

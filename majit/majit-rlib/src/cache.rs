@@ -5,9 +5,10 @@
 //! not duplicate the object. Ordered maps preserve the host dict's insertion
 //! order without imposing a dense integer key space on class/PBC keys.
 //!
-//! The upstream `getorbuild._annspecialcase_ = "specialize:memo"` still needs
-//! source-callable registration in the translator. This module implements the
-//! host cache, not that registration or target prebuilt-object serialization.
+//! `Cache.getorbuild._annspecialcase_ = "specialize:memo"` (`cache.py`).
+//! `#[specialize_memo]` is that marker; the translator harvests it onto
+//! `GraphFunc.annspecialcase` and the driver supplies `GraphFunc.host_call`.
+//! `Cache._freeze_` admits a prebuilt cache as a PBC.
 
 use std::hash::Hash;
 
@@ -106,6 +107,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
 
     /// `Cache.getorbuild`: publish before `_ready`, but clear `_building`
     /// whether `_build` succeeds, fails, or unwinds.
+    #[majit_macros::specialize_memo]
     pub fn getorbuild<B: CacheBuilder<K, V>>(
         &self,
         key: K,

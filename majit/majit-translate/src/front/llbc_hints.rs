@@ -77,6 +77,7 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
 /// the marker consts present in `llbcs`.
 pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_function_paths: HashSet<String> = HashSet::new();
     for llbc in llbcs {
         let llbc = llbc.borrow();
         let function_paths: HashSet<String> = llbc
@@ -324,7 +325,9 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 push_hint(&mut out, path, "dont_look_inside");
             }
         }
+        all_function_paths.extend(function_paths);
     }
+    copy_specialize_memo_onto_instantiations(&mut out, &all_function_paths);
     for v in out.values_mut() {
         v.sort();
         v.dedup();
@@ -1443,6 +1446,37 @@ fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
 }
 
+/// Charon names a monomorphized copy `generic::<T, U>` while the
+/// `_annspecialcase_memo_` marker sits on the generic funcobj.
+/// `specialize.py memo` is annotator policy on that funcobj
+/// (`func._annspecialcase_`), so every instantiation must carry
+/// `specialize:memo`.
+fn copy_specialize_memo_onto_instantiations(
+    out: &mut HashMap<String, Vec<String>>,
+    function_paths: &HashSet<String>,
+) {
+    let memo_rows: Vec<(String, Vec<String>)> = out
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|hint| hint == "specialize:memo"))
+        .map(|(key, hints)| (key.clone(), hints.clone()))
+        .collect();
+    for (generic, hints) in memo_rows {
+        for path in function_paths {
+            if path == &generic {
+                continue;
+            }
+            if path
+                .strip_prefix(generic.as_str())
+                .is_some_and(|rest| rest.starts_with("::<"))
+            {
+                for hint in &hints {
+                    push_hint(out, path.clone(), hint);
+                }
+            }
+        }
+    }
+}
+
 fn marker_path_to_fn_path(
     marker_path: &str,
     prefix: &str,
@@ -1767,6 +1801,25 @@ mod tests {
             ),
             "owner::Cache::getorbuild"
         );
+    }
+
+    #[test]
+    fn specialize_memo_harvest_covers_generic_instantiations() {
+        let mut harvested = HashMap::from([(
+            "cache::Cache::getorbuild".to_string(),
+            vec!["specialize:memo".to_string()],
+        )]);
+        let function_paths = HashSet::from([
+            "cache::Cache::getorbuild".to_string(),
+            "cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>".to_string(),
+            "cache::Cache::get".to_string(),
+        ]);
+        super::copy_specialize_memo_onto_instantiations(&mut harvested, &function_paths);
+        assert_eq!(
+            harvested.get("cache::Cache::getorbuild::<SpaceCacheClass, SpaceCacheInstance>"),
+            Some(&vec!["specialize:memo".to_string()])
+        );
+        assert!(!harvested.contains_key("cache::Cache::get"));
     }
 
     #[test]

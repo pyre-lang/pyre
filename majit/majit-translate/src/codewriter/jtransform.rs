@@ -17290,8 +17290,37 @@ fn materialize_const_result(
             trait_leaf: trait_leaf.clone(),
         },
         ConstValue::None => OpKind::ConstNone,
-        ConstValue::ByteStr(s) => OpKind::ConstStr(s.clone()),
-        ConstValue::UniStr(s) => OpKind::ConstInternedStr(s.as_bytes().to_vec()),
+        ConstValue::ByteStr(s) => {
+            match c
+                .concretetype
+                .as_ref()
+                .and_then(|ll| crate::model::try_getkind(ll, true, true, true).ok())
+            {
+                Some(crate::model::ConcreteType::GcRef) | None => OpKind::ConstStr(s.clone()),
+                _ => return materialize_const_result_copy(result, c),
+            }
+        }
+        // UniChar is `'int'` (`history.py getkind`). A one-character UniStr
+        // with that type is ConstInt, not ConstInternedStr (GC unicode).
+        ConstValue::UniStr(s) => {
+            match c
+                .concretetype
+                .as_ref()
+                .and_then(|ll| crate::model::try_getkind(ll, true, true, true).ok())
+            {
+                Some(crate::model::ConcreteType::GcRef) | None => {
+                    OpKind::ConstInternedStr(s.as_bytes().to_vec())
+                }
+                Some(crate::model::ConcreteType::Signed) => {
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(ch), None) => OpKind::ConstInt(ch as i64),
+                        _ => return materialize_const_result_copy(result, c),
+                    }
+                }
+                _ => return materialize_const_result_copy(result, c),
+            }
+        }
         ConstValue::HostObject(obj) => OpKind::ConstRef(obj.clone()),
         ConstValue::LLPtr(p) if !p.nonzero() => OpKind::ConstRefNull,
         _ => return materialize_const_result_copy(result, c),

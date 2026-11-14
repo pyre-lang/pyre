@@ -604,8 +604,9 @@ mod gateway_cache_tests {
         use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
         let space = ObjSpace::new();
         let weak = std::sync::Arc::downgrade(&space);
-        let SpaceCacheInstance::ClassDictStrategy(cache) =
-            space.fromcache(SpaceCacheClass::ClassDictStrategy)
+        let SpaceCacheInstance::ClassDictStrategy(cache) = space
+            .fromcache(SpaceCacheClass::ClassDictStrategy)
+            .retain_owner()
         else {
             unreachable!()
         };

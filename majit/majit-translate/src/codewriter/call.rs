@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::annotator::model::SomeObjectTrait;
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::ConstValue;
+use crate::flowspace::model::{ConstValue, HostCall};
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
@@ -4713,6 +4713,11 @@ pub struct CallControl {
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
     /// `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    /// Classes whose inherent `_freeze_` returns True
+    /// (`bookkeeper.py` `immutablevalue`). Threaded onto the dual-gate
+    /// bookkeeper so interned classdescs receive NativeCallable
+    /// `_freeze_` returning True.
+    pub freeze_classes: HashSet<String>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// Threaded onto the dual-gate bookkeeper so interned classdescs
     /// receive `class_set("_alloc_flavor_", "raw")` (`rclass.py
@@ -4784,6 +4789,10 @@ pub struct CallControl {
     /// unit-variant prebuilt constants against the intern store that
     /// minted them.
     bookkeeper: std::cell::RefCell<Option<std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>>>,
+    /// Driver `specialize:memo` evaluator (`specialize.py memo` `func(*args)`).
+    /// Copied onto `CallRegistry` so a memo funcobj without its own
+    /// `GraphFunc.host_call` still evaluates at annotation time.
+    memo_host_call: Option<HostCall>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -5430,6 +5439,7 @@ impl CallControl {
             array_header_size: crate::layout::target_word_size(),
             struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
+            freeze_classes: HashSet::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
             immutable_array_types: HashSet::new(),
@@ -5437,6 +5447,7 @@ impl CallControl {
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
             bookkeeper: std::cell::RefCell::new(None),
+            memo_host_call: None,
         };
         cc.stamp_ll_math_llexternal_canraise();
         cc
@@ -11916,6 +11927,23 @@ impl CallControl {
         };
         self.mark_call_aroundstate_target(path, identity, save_err);
         true
+    }
+
+    /// Stamp `specialize:memo` onto the funcobj `path` names so
+    /// `source_graph_func` copies it onto `GraphFunc.annspecialcase`.
+    /// Annotator policy (`func._annspecialcase_`), not a JIT `DecoratorAttr`.
+    pub fn mark_specialize_memo(&mut self, path: &CallPath) {
+        self.stamp_graph_hint(path, "specialize:memo");
+    }
+
+    /// Driver `specialize:memo` evaluator (`GraphFunc.host_call`).
+    pub fn set_memo_host_call(&mut self, hook: Option<HostCall>) {
+        self.memo_host_call = hook;
+    }
+
+    /// Driver `specialize:memo` evaluator, if the prepass registered one.
+    pub(crate) fn memo_host_call(&self) -> Option<&HostCall> {
+        self.memo_host_call.as_ref()
     }
 
     /// Write the `func` attributes the decorators behind `hints` set onto the

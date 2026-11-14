@@ -58,7 +58,7 @@ use super::model::{
     SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeUnicodeCodePoint,
     SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none, union, unionof,
 };
-use crate::flowspace::model::ConstValue;
+use crate::flowspace::model::{ConstValue, Hlvalue};
 
 // Registry.
 
@@ -2138,6 +2138,141 @@ fn ll_arraymove_intrinsic(
     Ok(s_none())
 }
 
+/// Parent path and variant leaf of an enum-variant class root
+/// (`result::Result<i32,E>::Ok` → `("result::Result<i32,E>", "Ok")`).
+fn dest_enum_variant(root: &str) -> Option<(&str, &str)> {
+    let (parent, leaf) = root.rsplit_once("::")?;
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    if leaf.is_empty() {
+        return None;
+    }
+    Some((parent, leaf))
+}
+
+fn path_parent_leaf(path: &str) -> String {
+    let stripped = majit_ir::descr::strip_generic_args(path);
+    stripped
+        .rsplit("::")
+        .next()
+        .unwrap_or(stripped.as_ref())
+        .to_string()
+}
+
+/// rustc/Charon emit every match-arm downcast in one block, then
+/// switch. `try_wrap_constant_enum_cast` of a constant onto the wrong
+/// variant is Impossible; `consider_op` raises `BlockedInference`
+/// (`annrpython.py`). Swallowing that SimpleCall (`HarmlesslySwallowed`)
+/// skips the block's remaining live ops and exits, so the return var
+/// stays unannotated (`force_return_var_annotation` seeds Impossible).
+/// Binding Impossible and continuing lets the live arm rtype.
+/// `Result::Ok` of a success payload stays live (`try_wrap`). Dest must
+/// be a harvested enum variant or rustc `Result`/`Option` so a struct
+/// recast is not classified dead. Keyed on dest variant identity, not
+/// `getorbuild` / `fromcache` names.
+pub(crate) fn simple_call_is_dead_enum_variant_cast(
+    bk: &Bookkeeper,
+    args: &[Hlvalue],
+    operand: &SomeValue,
+) -> bool {
+    if args.len() != 3 {
+        return false;
+    }
+    let dest = match &args[2] {
+        Hlvalue::Constant(c) => match c.value.as_pystr() {
+            Some(s) => s,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let Some((parent, dest_leaf)) = dest_enum_variant(dest) else {
+        return false;
+    };
+    if !operand.is_constant() {
+        return false;
+    }
+    let variant_name = format!("{parent}::{dest_leaf}");
+    if bk.discriminant_of_variant_name(&variant_name).is_none() {
+        return false;
+    }
+    if path_parent_leaf(parent) == "Result" && dest_leaf == "Ok" {
+        return false;
+    }
+    match operand_type_leaf(operand) {
+        Some(op_leaf) => op_leaf != dest_leaf,
+        None => path_parent_leaf(parent) == "Result" && dest_leaf == "Err",
+    }
+}
+
+fn operand_class_name(operand: &SomeValue) -> Option<String> {
+    if let Some(ConstValue::HostObject(host)) = operand.const_() {
+        if let Some(cls) = host.instance_class() {
+            return Some(cls.qualname().to_string());
+        }
+        return Some(host.qualname().to_string());
+    }
+    match operand {
+        SomeValue::Instance(inst) => inst.classdef.as_ref().map(|cd| cd.borrow().name.clone()),
+        _ => None,
+    }
+}
+
+fn operand_type_leaf(operand: &SomeValue) -> Option<String> {
+    let name = operand_class_name(operand)?;
+    dest_enum_variant(&name)
+        .map(|(_, leaf)| leaf.to_string())
+        .or_else(|| {
+            let leaf = name.rsplit("::").next().unwrap_or(&name);
+            Some(leaf.split('<').next().unwrap_or(leaf).to_string())
+        })
+}
+
+fn operand_is_dest_variant(operand: &SomeValue, dest_parent: &str, dest_leaf: &str) -> bool {
+    let Some(name) = operand_class_name(operand) else {
+        return false;
+    };
+    let Some((op_parent, op_leaf)) = dest_enum_variant(&name) else {
+        return false;
+    };
+    op_leaf == dest_leaf && path_parent_leaf(op_parent) == path_parent_leaf(dest_parent)
+}
+
+/// Wrap a constant payload as a dest enum variant, or Impossible for
+/// `Result::Err` of a success payload. RPython has no Result ADT; this
+/// is the annotator of a rustc unwrap of a `specialize:memo` value.
+fn try_wrap_constant_enum_cast(
+    bk: &Rc<Bookkeeper>,
+    root: &str,
+    operand: &SomeValue,
+) -> Result<Option<SomeValue>, AnnotatorError> {
+    if !operand.is_constant() {
+        return Ok(None);
+    }
+    let Some(payload) = operand.const_().cloned() else {
+        return Ok(None);
+    };
+    let Some((parent, dest_leaf)) = dest_enum_variant(root) else {
+        return Ok(None);
+    };
+    if operand_is_dest_variant(operand, parent, dest_leaf) {
+        return Ok(None);
+    }
+    let parent_leaf = path_parent_leaf(parent);
+    if parent_leaf == "Result" {
+        if dest_leaf == "Err" {
+            return Ok(Some(s_impossible_value()));
+        }
+        if dest_leaf != "Ok" {
+            return Ok(None);
+        }
+    } else if operand_type_leaf(operand).as_deref() != Some(dest_leaf) {
+        return Ok(None);
+    }
+    let classdef = bk.getuniqueclassdef_for_enum_variant(parent, dest_leaf)?;
+    let mut inst = SomeInstance::new(Some(classdef), false, std::collections::BTreeMap::new());
+    inst.base.const_box = Some(crate::flowspace::model::Constant::new(payload));
+    Ok(Some(SomeValue::Instance(inst)))
+}
+
 /// True when `instantiated_name` is a generic instantiation of the enum
 /// variant template `root` names (`result::Result<i32,PyError>::Ok` of
 /// `Result::Ok`).  `root` itself must be a template, not an instantiation.
@@ -2546,6 +2681,24 @@ fn cast_instance_intrinsic(
         }
         None => operand,
     };
+    // FieldRead of a freeze field interned as SomePBC
+    // (`bookkeeper.py` `immutablevalue`). The MIR still recasts that
+    // field to its layout type. `rclass.py` `convert_from_to` is
+    // identity when the classdef matches; a live address of a freeze
+    // dest intern's the same way the instance arm below does.
+    if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(&root)
+        && let Some(folded) = bk.try_intern_freeze_cast(&classdef, operand)?
+    {
+        return Ok(folded);
+    }
+    // A constant non-Result payload recast to `Result::Ok` is the Ok
+    // shell (`const_box` = payload). The Err recast is Impossible, so
+    // only the success arm of a Result unwrap is entered. The same
+    // wrap applies when the dest variant leaf matches the operand's
+    // class leaf (`SpaceCacheInstance::ClassDictStrategy`).
+    if let Some(wrapped) = try_wrap_constant_enum_cast(bk, &root, operand)? {
+        return Ok(wrapped);
+    }
     let can_be_none = match operand {
         SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
         // CastBasePtrToInstanceEntry.compute_result_annotation
@@ -2615,6 +2768,9 @@ fn cast_instance_intrinsic(
     // Instance; using its ClassDef would collapse `Result<f64,E>::Ok`
     // onto the `Result::Ok` template (`strip_generic_args`).
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
+    if let Some(folded) = bk.try_intern_freeze_cast(&classdef, operand)? {
+        return Ok(folded);
+    }
     if let SomeValue::Instance(inst) = operand
         && let Some(cd) = inst.classdef.as_ref()
         && instantiates_variant_declaration(bk, &cd.borrow().name, &root)
@@ -4480,6 +4636,129 @@ mod tests {
                 "result::Result<f64,PyError>::Ok"
             ),
             "a concrete instantiation destination is not a template"
+        );
+    }
+
+    /// A constant non-Result payload recast to `Result::Ok` is the Ok
+    /// shell; recast to `Result::Err` is Impossible.
+    #[test]
+    fn constant_payload_cast_to_result_ok_wraps_as_constant_ok() {
+        let bk = bk();
+        let mut s_payload = SomeValue::Integer(SomeInteger::new(true, false));
+        s_payload.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::Int(7),
+        ));
+        let mut s_ok = crate::annotator::model::s_str0();
+        s_ok.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("core::result::Result<i32, E>::Ok"),
+        ));
+        let out =
+            cast_instance_intrinsic(&bk, &[Some(s_payload.clone()), Some(s_ok)], &HashMap::new())
+                .expect("wrap Ok");
+        assert!(
+            out.is_constant(),
+            "Result::Ok wrap of a constant payload is constant, got {out:?}"
+        );
+        let SomeValue::Instance(inst) = &out else {
+            panic!("expected Ok instance, got {out:?}");
+        };
+        assert!(
+            inst.classdef
+                .as_ref()
+                .is_some_and(|cd| cd.borrow().name.ends_with("::Ok")),
+            "wrap dest is Result::Ok, got {:?}",
+            inst.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+        );
+        let mut s_err = crate::annotator::model::s_str0();
+        s_err.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("core::result::Result<i32, E>::Err"),
+        ));
+        let err_out =
+            cast_instance_intrinsic(&bk, &[Some(s_payload), Some(s_err)], &HashMap::new())
+                .expect("wrap Err");
+        assert!(
+            matches!(err_out, SomeValue::Impossible),
+            "Result::Err wrap of a success payload is Impossible, got {err_out:?}"
+        );
+    }
+
+    #[test]
+    fn simple_call_is_dead_enum_variant_cast_of_constant_ok() {
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let fn_ = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+        let operand = Hlvalue::Variable(Variable::named("ok"));
+        let dest_err = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "core::result::Result<SpaceCacheInstance,CacheError<Never>>::Err",
+        )));
+        let args_err = vec![fn_.clone(), operand.clone(), dest_err];
+        let mut s_ok = SomeValue::Integer(SomeInteger::new(true, false));
+        s_ok.set_const_box(Constant::new(ConstValue::Int(7)));
+        assert!(
+            simple_call_is_dead_enum_variant_cast(&bk, &args_err, &s_ok),
+            "constant payload CAST to Result::Err is the dead downcast"
+        );
+
+        let dest_ok = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "core::result::Result<SpaceCacheInstance,CacheError<Never>>::Ok",
+        )));
+        let args_ok = vec![fn_.clone(), operand.clone(), dest_ok];
+        assert!(
+            !simple_call_is_dead_enum_variant_cast(&bk, &args_ok, &s_ok),
+            "CAST to Result::Ok is the live downcast"
+        );
+
+        let s_nonconst = SomeValue::Integer(SomeInteger::new(true, false));
+        assert!(
+            !simple_call_is_dead_enum_variant_cast(&bk, &args_err, &s_nonconst),
+            "non-constant operand is not the dead wrap"
+        );
+
+        let mut by_disc = HashMap::new();
+        by_disc.insert(0, "ClassDictStrategy".to_string());
+        by_disc.insert(1, "SysState".to_string());
+        let mut enum_map = HashMap::new();
+        enum_map.insert("SpaceCacheInstance".to_string(), by_disc);
+        bk.set_enum_variant_by_discriminant(Rc::new(enum_map));
+        let cdef = Some(ClassDef::new_standalone(
+            "objspace::std::classdict::ClassDictStrategy",
+            None,
+        ));
+        let mut s_strategy = SomeValue::Instance(SomeInstance::new(
+            cdef,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        s_strategy.set_const_box(Constant::new(ConstValue::Int(1)));
+        let dest_sys = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "baseobjspace::SpaceCacheInstance::SysState",
+        )));
+        let args_sys = vec![fn_.clone(), operand.clone(), dest_sys];
+        assert!(
+            simple_call_is_dead_enum_variant_cast(&bk, &args_sys, &s_strategy),
+            "constant ClassDictStrategy CAST to SysState is the dead downcast"
+        );
+        let dest_cls = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "baseobjspace::SpaceCacheInstance::ClassDictStrategy",
+        )));
+        let args_cls = vec![fn_, operand, dest_cls];
+        assert!(
+            !simple_call_is_dead_enum_variant_cast(&bk, &args_cls, &s_strategy),
+            "CAST to SpaceCacheInstance::ClassDictStrategy is the live downcast"
+        );
+        let dest_struct = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "baseobjspace::RetainedSpaceCache",
+        )));
+        let args_struct = vec![
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+            Hlvalue::Variable(Variable::named("ok")),
+            dest_struct,
+        ];
+        assert!(
+            !simple_call_is_dead_enum_variant_cast(&bk, &args_struct, &s_strategy),
+            "a struct recast is not a dead enum downcast"
         );
     }
 

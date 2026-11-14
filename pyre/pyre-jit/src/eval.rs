@@ -5148,6 +5148,8 @@ fn build_gc() -> Box<MiniMarkGC> {
             pyre_object::identitydict::identity_dict_strategy_ref(),
             pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
             pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref(),
+            // PREBUILT `space.fromcache(ClassDictStrategy)` holder
+            // (`classdict.py ClassDictStrategy`).
             pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref(),
         ] {
             pyre_object::dictmultiobject::stamp_prebuilt_dict_strategy_ref(holder, tid);

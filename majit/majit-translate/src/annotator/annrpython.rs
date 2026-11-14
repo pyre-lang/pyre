@@ -1558,14 +1558,20 @@ impl RPythonAnnotator {
         format!("graph={} block={}{}", pk.graph_id, pk.block_id, opid)
     }
 
-    /// RPython `complete(self)` (annrpython.py).
+    /// The `complete()` drain loop (annrpython.py) without the
+    /// return-var / blocked-graph tail: `complete_pending_blocks` then
+    /// `policy.no_more_blocks_to_annotate` until no pending remain.
     ///
-    /// Drains every pending-block generation until fixpoint, then
-    /// validates that every tracked graph has an annotated return
-    /// variable. Blocked blocks / failed blocks return an
-    /// `AnnotatorError`, matching upstream's `raise`.
-    pub fn complete(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
-        use super::model::SomeObjectTrait;
+    /// `MemoTable.register_finish` queues `MemoTable.finish` onto
+    /// `bookkeeper.pending_specializations`; only
+    /// `AnnotatorPolicy.no_more_blocks_to_annotate` drains it. Dual-gate's
+    /// per-subject driver previously skipped that drain, so
+    /// `compute_at_fixpoint` → `consider_call_site` →
+    /// `build_calltable_row` hit `FunctionDesc.get_graph` while `memo()`
+    /// still returned an annotation (`SpecializeResult::expect_graph`).
+    pub fn complete_pending_blocks_and_specializations(
+        &self,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
         loop {
             self.complete_pending_blocks()?;
             // upstream: `self.policy.no_more_blocks_to_annotate(self)`.
@@ -1575,6 +1581,18 @@ impl RPythonAnnotator {
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// RPython `complete(self)` (annrpython.py).
+    ///
+    /// Drains every pending-block generation until fixpoint, then
+    /// validates that every tracked graph has an annotated return
+    /// variable. Blocked blocks / failed blocks return an
+    /// `AnnotatorError`, matching upstream's `raise`.
+    pub fn complete(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
+        use super::model::SomeObjectTrait;
+        self.complete_pending_blocks_and_specializations()?;
 
         // Collect the set of graphs whose return annotation must be
         // forced after the fixpoint loop.
@@ -3051,10 +3069,57 @@ impl RPythonAnnotator {
                         e.opindex = Some(i);
                         return Ok(OpLoopOutcome::BlockedOnRaisingOp);
                     }
+                    // rustc/Charon keep dead match-arm ops in a live
+                    // block (`annrpython.py` flowin re-raises: Python
+                    // bytecode does not). An op whose argument is
+                    // Impossible cannot run (`consider_op`); bind
+                    // Impossible and continue so later live ops still
+                    // annotate. Keyed on the Impossible argument, not
+                    // on getorbuild/fromcache names.
+                    let arg_impossible = hlop
+                        .args
+                        .iter()
+                        .any(|arg| matches!(self.annotation(arg), Some(SomeValue::Impossible)));
+                    if arg_impossible {
+                        {
+                            let mut blk = block.borrow_mut();
+                            if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
+                                self.setbinding(v, super::model::s_impossible_value());
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
                     match hlop.kind {
                         super::super::flowspace::operation::OpKind::SimpleCall
                         | super::super::flowspace::operation::OpKind::CallArgs
                         | super::super::flowspace::operation::OpKind::Next => {
+                            // rustc/Charon put every match-arm downcast
+                            // in one block. Swallowing a dead variant
+                            // CAST skips the live arm and the exits;
+                            // bind Impossible and continue.
+                            let dead_variant_cast = matches!(
+                                hlop.kind,
+                                super::super::flowspace::operation::OpKind::SimpleCall
+                            ) && hlop.args.get(1).is_some_and(|opnd| {
+                                self.annotation(opnd).is_some_and(|operand| {
+                                    super::builtin::simple_call_is_dead_enum_variant_cast(
+                                        &self.bookkeeper,
+                                        &hlop.args,
+                                        &operand,
+                                    )
+                                })
+                            });
+                            if dead_variant_cast {
+                                {
+                                    let mut blk = block.borrow_mut();
+                                    if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
+                                        self.setbinding(v, super::model::s_impossible_value());
+                                    }
+                                }
+                                i += 1;
+                                continue;
+                            }
                             return Ok(OpLoopOutcome::HarmlesslySwallowed);
                         }
                         _ => {

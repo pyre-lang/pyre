@@ -75,6 +75,10 @@ struct ProviderTables {
     /// FunDecl across artefacts is its `name_path` (`bookkeeper.py`
     /// `getdesc` / `FunctionDesc.cachedgraph` on the defining funcobj).
     cross: Rc<CrossCrateSpec>,
+    /// Driver `specialize:memo` evaluator (`specialize.py memo` `func(*args)`).
+    /// Owned because [`crate::HostStaticAddrs::memo_host_call`] borrows the
+    /// caller's frame; demanded bodies rebuild that view per lowering.
+    memo_host_call: Option<crate::flowspace::model::HostCall>,
 }
 
 /// Loaded crates of one `GraphBodyProvider`, for Opaque-import
@@ -176,6 +180,7 @@ impl GraphBodyProvider {
             cross: Rc::new(CrossCrateSpec {
                 crates: RefCell::new(Vec::new()),
             }),
+            memo_host_call: static_addrs.memo_host_call.cloned(),
         };
         Self {
             crates: Vec::new(),
@@ -582,6 +587,7 @@ impl ProviderTables {
                     .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
             },
             scalar_field_stores: &scalar_field_stores,
+            memo_host_call: self.memo_host_call.as_ref(),
         })
     }
 }

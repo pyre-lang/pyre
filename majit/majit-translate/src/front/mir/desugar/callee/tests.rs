@@ -1020,6 +1020,50 @@ fn profilefunc_family_llbc() -> Llbc {
     )
 }
 
+/// `eval_hook_graphs_for_call` analogue: a `ProfileFunc` operand carries
+/// the published family as `c_graphs`; a non-family operand does not.
+#[test]
+fn profilefunc_graphs_for_call_attaches_published_family() {
+    use majit_charon_reader::ullbc::{Operand, Place, PlaceKind, TyRef};
+
+    let llbc = profilefunc_family_llbc();
+    let discovered = super::discover_profilefunc_graphs(&llbc);
+    llbc.set_profilefunc_graphs(discovered);
+    let profilefunc_ty = TyRef::Other(adt_node(1));
+    let operand = Operand::Copy(Place {
+        kind: PlaceKind::Local(0),
+        ty: profilefunc_ty,
+    });
+    let graphs = super::profilefunc_graphs_for_call(&llbc, &operand)
+        .expect("a ProfileFunc operand carries the published c_graphs family");
+    let leaves: Vec<&str> = graphs
+        .iter()
+        .filter_map(|path| path.last_segment())
+        .collect();
+    assert!(
+        leaves.contains(&"hook_a"),
+        "hook_a must be in c_graphs, got {leaves:?}"
+    );
+    assert!(
+        leaves.contains(&"hook_b"),
+        "hook_b must be in c_graphs, got {leaves:?}"
+    );
+    assert!(
+        !leaves.contains(&"other_fn"),
+        "a non-family FunDecl stays out of c_graphs, got {leaves:?}"
+    );
+
+    let other_ty = TyRef::Other(json!({"Tuple": []}));
+    let other = Operand::Copy(Place {
+        kind: PlaceKind::Local(1),
+        ty: other_ty,
+    });
+    assert!(
+        super::profilefunc_graphs_for_call(&llbc, &other).is_none(),
+        "a non-ProfileFunc operand must not take the family"
+    );
+}
+
 /// `discover_eval_hook_graphs` analogue: the family is the `ProfileFunc`
 /// type plus stores into that slot (`setllprofile` / `setprofile`), not
 /// baked member names.
