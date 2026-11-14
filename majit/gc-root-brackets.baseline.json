@@ -26,8 +26,8 @@
     "unresolved_collecting_calls_fns": 1418
   },
   "linux": {
-    "base": "b1e01cf4a6085e81f8d685dee7a769ab170100b4",
-    "brackets_reaching_no_collection": 131,
+    "base": "9e8472213eb96033d8e0abc9febb920b75b432e6",
+    "brackets_reaching_no_collection": 126,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
@@ -48,7 +48,7 @@
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
     "unread_brackets": 369,
-    "unresolved_collecting_calls": 2367,
-    "unresolved_collecting_calls_fns": 1420
+    "unresolved_collecting_calls": 2361,
+    "unresolved_collecting_calls_fns": 1417
   }
 }
