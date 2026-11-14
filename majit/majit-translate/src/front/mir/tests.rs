@@ -35854,6 +35854,66 @@ fn deref_store_of_nested_struct_field_has_no_move_plan() {
     );
 }
 
+/// `*(*env).flag = v` where `flag: &mut bool` is a one-word store
+/// (`rewrite_op_raw_store`). The Deref inner is a Field, so
+/// `atomic_ref_place` does not recover a local.
+#[test]
+fn deref_store_through_mut_ref_field_of_bool_is_raw_store() {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let mut_bool = serde_json::json!({"Ref": [null, bool_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let flag_place = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(1, &mut_env, &env_ty, &mut_bool, 0),
+                "Deref"
+            ]
+        },
+        "ty": bool_ty.clone()
+    });
+    let caller = interior_caller(
+        "store_flag",
+        2,
+        vec![mut_env.clone(), bool_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("env"), &mut_env),
+            interior_local(2, Some("v"), &bool_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                flag_place,
+                serde_json::json!({
+                    "Use": [{"Move": interior_place(2, &bool_ty)}, "No"]
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_struct(
+        0,
+        &["fixture", "Env"],
+        &[("flag", mut_bool)],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "store_flag")
+        .expect("lower *env.flag = v of a bool");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::RawStore { .. })),
+        "deref store of bool through &mut field must be RawStore; ops={ops:?}"
+    );
+}
+
 /// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through
 /// `Option<&mut Handle>` of a one-word GC handle. The Some payload and
 /// the TwoPhaseMut reborrow inherit the MutRef cell, so `*p = fresh` is

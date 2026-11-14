@@ -420,6 +420,8 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::unpack_sequence__Acce
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::with_except_start__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain
 two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain_with_resume
+two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain_with_resume::<Impl>::call_mut
+two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain_with_resume::closure::<Impl>::call_mut
 two-phase-annotate-skipped	pyre_interpreter::eval::install_current_frame
 two-phase-annotate-skipped	pyre_interpreter::eval::instantiate_raised_class
 two-phase-annotate-skipped	pyre_interpreter::eval::load_super_attr_value_w
