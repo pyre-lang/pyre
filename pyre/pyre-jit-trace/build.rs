@@ -149,11 +149,6 @@ fn emit_llbc_extraction_placeholders() {
         bincode::serialize(&Vec::<u8>::new()).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        format!("{out_dir}/callinfo_rows.bin"),
-        bincode::serialize(&Vec::<majit_ir::effectinfo::CallInfoRow>::new()).unwrap(),
-    )
-    .unwrap();
     for name in [
         "fnaddr_bindings.bin",
         "static_pytype_bindings.bin",

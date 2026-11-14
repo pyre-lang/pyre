@@ -5071,15 +5071,6 @@ impl<'a> Transformer<'a> {
         // handler has.
         let kind = if result.is_none() {
             'v'
-        } else if matches!(
-            result_ty,
-            ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State
-        ) {
-            // `call.py getcalldescr` RESULT is FUNC.RESULT. `history.py
-            // getkind` of a raw Ptr is int; `jtransform.py rewrite_call`
-            // uses that kind. A consumer-inferred GcRef on this Variable
-            // must not win.
-            'i'
         } else {
             self.resolve_call_result_kind(result, result_ty)
                 .unwrap_or_else(|| {
@@ -5102,10 +5093,7 @@ impl<'a> Transformer<'a> {
 
     /// `jtransform.py rewrite_call` uses the same result concretetype for
     /// the opcode and its register. Keep a typed raw Ptr intact instead of
-    /// restamping it from the frontend's coarser Ref hint. When
-    /// FUNC.RESULT is the int bank (`call.py getcalldescr`, `history.py
-    /// getkind` of a raw Ptr), stamp Signed; a consumer `getfield_gc`
-    /// base that inferred GcRef must not win.
+    /// restamping it from the frontend's coarser Ref hint.
     fn stamp_call_result(
         &mut self,
         graph: &FunctionGraph,
@@ -5134,9 +5122,9 @@ impl<'a> Transformer<'a> {
     /// `finalize_rewritten_graph_to_jitcode` runs on the callee — reconcile
     /// the call to the declared void so the residual_call emits a `_v`
     /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
-    /// register holding the void call's garbage.  The declared-void shell
-    /// case and a declared int-bank `RESULT` under a frontend `Ref` token
-    /// are rewritten; other calls keep `result_ty`.
+    /// register holding the void call's garbage.  Only the
+    /// declared-void-vs-resolved-Ref shell case and a declared raw ADT's
+    /// coarse Ref token are rewritten; other calls keep `result_ty`.
     ///
     /// `declared` is `FUNC.RESULT` of the called function's lltype
     /// (`call.py getcalldescr` for `direct_call` and `indirect_call`
@@ -5146,6 +5134,7 @@ impl<'a> Transformer<'a> {
     fn effective_call_result_ty(
         &self,
         declared: Option<majit_ir::value::Type>,
+        target: Option<&CallTarget>,
         op_result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ValueType {
@@ -5154,7 +5143,11 @@ impl<'a> Transformer<'a> {
         {
             ValueType::Void
         } else if matches!(result_ty, ValueType::Ref(_))
-            && declared == Some(majit_ir::value::Type::Int)
+            && target.is_some_and(|target| {
+                self.callcontrol
+                    .as_deref()
+                    .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+            })
         {
             // `call.py getcalldescr` uses FUNC.RESULT, not the frontend's
             // aggregate token. This also covers a caller whose annotation
@@ -10989,19 +10982,6 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // `framework.py pop_roots` reloads are inserted by the gctransformer
-        // after the codewriter; in a jitcode the root stays in its register.
-        if crate::front::result_exc::is_gc_erasure_root_identity(&op.kind)
-            && let CallTarget::FunctionPath { segments, .. } = target
-            && matches!(
-                segments.last().map(String::as_str),
-                Some("reload_top_root" | "reload_top_root_at")
-            )
-            && let Some(root) = args.first()
-        {
-            let src = resolve_alias(root, &self.aliases);
-            return RewriteResult::Identity(src);
-        }
         // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
         // args[0]).  The same identity applies to the Rust spelling of
         // that op: `cast_int_to_ptr(cast_ptr_to_int(p))`.
@@ -12148,8 +12128,12 @@ impl<'a> Transformer<'a> {
                         .callcontrol
                         .as_deref()
                         .and_then(|cc| cc.declared_result_type_for_target(target));
-                    let effective_result_ty =
-                        self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+                    let effective_result_ty = self.effective_call_result_ty(
+                        declared,
+                        Some(target),
+                        op.result.as_ref(),
+                        result_ty,
+                    );
                     let non_void_args = self
                         .callcontrol
                         .as_deref()
@@ -12242,8 +12226,12 @@ impl<'a> Transformer<'a> {
                         .callcontrol
                         .as_deref()
                         .and_then(|cc| cc.declared_result_type_for_target(target));
-                    let effective_result_ty =
-                        self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+                    let effective_result_ty = self.effective_call_result_ty(
+                        declared,
+                        Some(target),
+                        op.result.as_ref(),
+                        result_ty,
+                    );
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -15966,8 +15954,12 @@ impl<'a> Transformer<'a> {
                 })
                 .or_else(|| cc.declared_result_type_for_graphs(graphs))
         });
-        let effective_result_ty =
-            self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+        let effective_result_ty = self.effective_call_result_ty(
+            declared,
+            funcptr_target.as_ref(),
+            op.result.as_ref(),
+            result_ty,
+        );
         let resolved_result = self.resolve_call_result(op.result.as_ref(), &effective_result_ty);
         let result_kind = resolved_result.kind;
         self.stamp_call_result(graph, op.result.clone(), &effective_result_ty);
@@ -33548,11 +33540,14 @@ mod tests {
         }
     }
 
-    /// `pin_root` publishes a slot that bound `shadow_stack_get` residuals
-    /// read back positionally; the call stays.
+    /// Both root-stack operations keep their call.  `pin_root` publishes a
+    /// slot that bound `shadow_stack_get` residuals read back positionally,
+    /// and `reload_top_root` re-reads the slot after a collection may have
+    /// moved the object; a trace that keeps the pre-move word instead has no
+    /// other forwarding for it.
     #[test]
     fn gc_root_pin_and_reload_keep_their_calls() {
-        for leaf in ["pin_root"] {
+        for leaf in ["pin_root", "reload_top_root"] {
             let config = GraphTransformConfig::default();
             let mut transformer = Transformer::new(&config);
             let mut graph = FunctionGraph::new(format!("gc_roots_{leaf}"));
@@ -33602,64 +33597,6 @@ mod tests {
                 "{leaf} must survive as the same call, not a replacement"
             );
         }
-    }
-
-    /// `framework.py pop_roots` reloads are inserted by the gctransformer
-    /// after the codewriter; in a jitcode the root stays in its register.
-    #[test]
-    fn reload_top_root_at_elides_to_first_argument_alias() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("reload_top_root_at");
-        let entry = graph.startblock;
-        let root = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let slot = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["gc_roots", "reload_top_root_at"]);
-        let result_ty = ValueType::Ref(None);
-        let op = SpaceOperation {
-            result: Some(result_var.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![root.clone(), slot.clone()]),
-                result_ty: result_ty.clone(),
-            },
-        };
-
-        let rewritten = transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[root.clone(), slot.clone()],
-            &result_ty,
-            "reload_top_root_at",
-            &mut graph,
-        );
-        match rewritten {
-            RewriteResult::Identity(alias) => assert_eq!(alias, root),
-            _ => panic!("expected Identity alias to the root"),
-        }
-
-        graph.blocks[entry.0].operations.push(op);
-        graph.set_return(entry, Some(result_var));
-        let exceptblock = graph.exceptblock;
-        transformer.optimize_block(&mut graph, entry.0, "reload_top_root_at", exceptblock);
-        let surviving = &graph.blocks[entry.0].operations;
-        assert!(
-            surviving.iter().all(|op| !matches!(
-                &op.kind,
-                OpKind::Call { .. }
-                    | OpKind::CallResidual { .. }
-                    | OpKind::CallMayForce { .. }
-                    | OpKind::CallElidable { .. }
-                    | OpKind::InlineCall { .. }
-            )),
-            "reload_top_root_at must not survive as a residual or inline call"
-        );
-        assert_eq!(
-            graph.blocks[entry.0].exits[0].args[0].as_variable(),
-            Some(&root),
-            "result must be the root's register"
-        );
     }
 
     /// `rpython/rtyper/rbuiltin.py`: `rtype_intmask` returns its

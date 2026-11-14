@@ -3211,33 +3211,22 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     }
     // A borrow hides the projection: `&Self::Anchor` is a `Ref` whose
     // pointee is the associated type.  `trait_assoc_projection_target`
-    // only sees a top-level `TraitType`. Recurse into the binding so
-    // `tyref_is_anchor` paints the frame Ref before the transparent
-    // peel of that host word; any other transparent wrapper still
-    // types as its field, matching the by-value arm.
+    // only sees a top-level `TraitType`, and the transparent peel below
+    // only sees an ADT, so the borrow would stay a GC reference while the
+    // by-value projection is the impl's word.  Peel first, then resolve,
+    // and answer only when the binding is a transparent wrapper: that is
+    // the one borrow the transparent peel already types as its field.
     if let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
         && let Some(resolved) = trait_assoc_projection_target(node, llbc)
-    {
-        if frame_anchor::tyref_is_anchor(&resolved, llbc)
-            || frame_anchor::tyref_is_option_of_anchor(&resolved, llbc)
-        {
-            return tyref_to_value_type_with(
-                &resolved,
-                llbc,
-                tombstoned,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            );
-        }
-        if let Some(inner) = tyref_transparent_inner_value_type(
+        && let Some(inner) = tyref_transparent_inner_value_type(
             &resolved,
             llbc,
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
-        ) {
-            return inner;
-        }
+        )
+    {
+        return inner;
     }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
@@ -3300,16 +3289,6 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // one-field Rust struct wraps; checked before the transparent peel.
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
-    }
-    // A `FrameAnchor` value is the frame it was handed (`new` / `from_raw`
-    // / `frame_anchor_push`). The host type is a transparent depth word;
-    // intercept before that peel so every graph agrees on Ref, including
-    // `&FrameAnchor` and `Option<FrameAnchor>` parameters.
-    if frame_anchor::tyref_is_anchor(ty, llbc)
-        || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
-        || frame_anchor::tyref_is_option_of_anchor(ty, llbc)
-    {
-        return ValueType::Ref(frame_anchor::frame_class_root(llbc, tombstoned));
     }
     // A `repr(transparent)` GC handle keeps the wrapper's class. The
     // handle intern's as a subclass of `Deref::Target` (`error::PyError`
@@ -3528,8 +3507,8 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// any query. Paint and registration read that set. An artefact that
     /// is never seeded computes its own harvest on first read.
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
-    /// Class root of the unique `PyFrame` pointee `FrameAnchor::new` takes.
-    pub(in crate::front::mir) frame_class_root: std::sync::OnceLock<Option<String>>,
+    /// Module of the unique type whose last path segment is `FrameAnchor`.
+    pub(in crate::front::mir) frame_anchor_module: std::sync::OnceLock<Option<String>>,
     /// FunDecl paths whose artefact-local `oopspec_*` marker consts spell
     /// `jit.*`. Built from this `Llbc`'s global decls.
     pub(in crate::front::mir) oopspec_fn_paths:
@@ -6340,7 +6319,6 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
         return None;
     }
     if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc)
-        || frame_anchor::tyref_is_option_of_anchor(option_ty, llbc)
         || rbigint_gc_root::tyref_is_option_of_root(option_ty, llbc)
     {
         return None;
@@ -8216,13 +8194,6 @@ pub(in crate::front::mir) fn tyref_is_borrowed_transparent_scalar(
     if !output_type_is_ref(ty, llbc) {
         return false;
     }
-    // The host type peels to `usize`; the JIT word is the frame. A
-    // residual callee that sees `&FrameAnchor` would see the `{depth}`
-    // layout; `frame_anchor::residual_escape` declines that.
-    if frame_anchor::tyref_is_anchor(ty, llbc) || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
-    {
-        return false;
-    }
     matches!(
         tyref_transparent_inner_value_type(
             ty,
@@ -8515,13 +8486,6 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<ValueType> {
-    // The host type peels to `usize`; `tyref_is_anchor` paints the frame
-    // Ref instead. Callers that peel before that paint must not take the
-    // depth word (`dont_look_inside_return_token` / ARG kinds).
-    if frame_anchor::tyref_is_anchor(ty, llbc) || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
-    {
-        return None;
-    }
     // Peel the reference the way the atomic sibling does. A borrow of the
     // wrapper has to answer with the same bank as the wrapper itself:
     // `Rvalue::Ref` aliases the referent's Variable rather than introducing a
@@ -9141,14 +9105,6 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
         let value_node = tyref_node(&value, llbc)?;
         return adt_node_class_root_with(value_node, llbc, tombstoned);
     }
-    // Host `FrameAnchor` is a transparent depth word. Intern of that
-    // layout is a raw-word owner, and `declared_graph_result_type`
-    // remaps a `"ref"` token to Int (`raw_struct_ptr_from_layout`).
-    // The JIT word is the frame; name that class so FUNC.RESULT stays
-    // Ref (`dont_look_inside_return_class_root`).
-    if frame_anchor::type_node_is_anchor(node, llbc) {
-        return frame_anchor::frame_class_root(llbc, tombstoned);
-    }
     let def_id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(def_id)?;
     // Pointer-shaped payloads stay on the wrapper (`PyError`).
@@ -9216,7 +9172,6 @@ pub(in crate::front::mir) fn adt_type_arg_is_pointer_like_depth(
         || type_node_shared_ref_pointee(node, llbc).is_some()
         || type_node_raw_ptr_pointee(node, llbc).is_some()
         || owner_root_guard::type_node_is_guard(node, llbc)
-        || frame_anchor::type_node_is_anchor(node, llbc)
     {
         return true;
     }
@@ -10204,8 +10159,6 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
     let payload = crate::front::result_exc::tyref_option_payload(option_ty, llbc)?;
     if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc)
         || owner_root_guard::tyref_is_guard(&payload, llbc)
-        || frame_anchor::tyref_is_option_of_anchor(option_ty, llbc)
-        || frame_anchor::tyref_is_anchor(&payload, llbc)
         || rbigint_gc_root::tyref_is_option_of_root(option_ty, llbc)
         || rbigint_gc_root::tyref_is_root(&payload, llbc)
     {
@@ -10215,7 +10168,6 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
     let pointee = one_level_pointer_pointee(payload_node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
     if owner_root_guard::type_node_is_guard(pointee, llbc)
-        || frame_anchor::type_node_is_anchor(pointee, llbc)
         || rbigint_gc_root::type_node_is_root(pointee, llbc)
     {
         return None;
@@ -10304,13 +10256,10 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     // is the int-bank SomePtr; `Input.class_root` still names the pointee
     // so `derive_subject_inputcells` seeds that `SomePtr`.
     // `Option<OwnerRootGuard>` stays the nullable GCREF word
-    // (`owner_root_guard.rs`). `Option<FrameAnchor>` is the same
-    // nullable frame word (`frame_anchor.rs`). A borrow of a raw enum
-    // is Int (`ty_is_raw_address`) and never reaches this paint.
+    // (`owner_root_guard.rs`). A borrow of a raw enum is Int
+    // (`ty_is_raw_address`) and never reaches this paint.
     if owner_root_guard::tyref_is_option_of_guard(ty, llbc)
         || owner_root_guard::tyref_is_guard(&payload, llbc)
-        || frame_anchor::tyref_is_option_of_anchor(ty, llbc)
-        || frame_anchor::tyref_is_anchor(&payload, llbc)
         || rbigint_gc_root::tyref_is_option_of_root(ty, llbc)
         || rbigint_gc_root::tyref_is_root(&payload, llbc)
     {
@@ -10560,10 +10509,8 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     };
     // `OwnerRootGuard` lowers as the one reference it roots, so
     // `Option<OwnerRootGuard>` is the same nullable word as
-    // `Option<*mut T>`. `FrameAnchor` is the frame, same shape.
-    if owner_root_guard::type_node_is_guard(payload, llbc)
-        || frame_anchor::type_node_is_anchor(payload, llbc)
-    {
+    // `Option<*mut T>`.
+    if owner_root_guard::type_node_is_guard(payload, llbc) {
         return true;
     }
     // `RBigIntGcRoot` is the by-value `RBigInt`, not a pointer word, so
