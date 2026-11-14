@@ -301,14 +301,15 @@ fn fnptr_field_family_follows_stored_functions_not_field_names() {
         vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
     );
     let rows = discover_fnptr_field_families(&llbc);
+    // Members are registered_path_for_fun_decl: the FunDecl identity keeps the crate Ident.
     assert_eq!(
         family_members(&rows, "mod::Table", "left"),
-        ["mod::TABLE::foo"],
+        ["c::mod::TABLE::foo"],
         "left stores nested foo, not a FunDecl named left: {rows:?}"
     );
     assert_eq!(
         family_members(&rows, "mod::Table", "right"),
-        ["mod::bar"],
+        ["c::mod::bar"],
         "right stores top-level bar: {rows:?}"
     );
     assert!(
@@ -325,12 +326,12 @@ fn fnptr_field_family_follows_swapped_initializer() {
     let rows = discover_fnptr_field_families(&llbc);
     assert_eq!(
         family_members(&rows, "mod::Table", "left"),
-        ["mod::bar"],
+        ["c::mod::bar"],
         "swapped left stores bar: {rows:?}"
     );
     assert_eq!(
         family_members(&rows, "mod::Table", "right"),
-        ["mod::foo"],
+        ["c::mod::foo"],
         "swapped right stores foo: {rows:?}"
     );
 }
@@ -420,12 +421,12 @@ fn fnptr_field_family_keys_use_full_defining_type_path() {
     let rows = discover_fnptr_field_families(&llbc);
     assert_eq!(
         family_members(&rows, "a::Table", "slot"),
-        ["a::foo"],
+        ["c::a::foo"],
         "a::Table.slot family: {rows:?}"
     );
     assert_eq!(
         family_members(&rows, "b::Table", "slot"),
-        ["b::bar"],
+        ["c::b::bar"],
         "b::Table.slot family: {rows:?}"
     );
     assert!(
@@ -470,7 +471,7 @@ fn fnptr_field_family_unions_static_and_runtime_stores() {
     let rows = discover_fnptr_field_families(&llbc);
     assert_eq!(
         family_members(&rows, "mod::Table", "slot"),
-        ["mod::f", "mod::g"],
+        ["c::mod::f", "c::mod::g"],
         "static f and runtime g: {rows:?}"
     );
 }
@@ -613,7 +614,7 @@ fn fnptr_field_family_unions_diamond_local_assigns() {
     let rows = discover_fnptr_field_families(&llbc);
     assert_eq!(
         family_members(&rows, "mod::Table", "slot"),
-        ["mod::f", "mod::g"],
+        ["c::mod::f", "c::mod::g"],
         "diamond union of f and g: {rows:?}"
     );
 }
