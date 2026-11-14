@@ -6215,9 +6215,8 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
     ];
 
-    let frame = codegen::FrameGeometry::fixed();
     assert!(
-        codegen::has_label_param_entry(&inputargs, &ops, frame, None),
+        codegen::has_label_param_entry(&inputargs, &ops, None),
         "this shape is the one the wide entry exists for; if the gate stops \
          accepting it the rest of these assertions prove nothing"
     );
@@ -6247,30 +6246,93 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
         "trace_wide takes frame_ptr plus one word per fixed label parameter"
     );
 
-    // The shim reads from `FRAME_SLOT_BASE`, so its loads land in slots
-    // 1..=FROZEN_LABEL_PARAM_ARITY and a frame holding exactly that many slots
-    // is one short — its last load would run off the end.
-    let exact = codegen::FrameGeometry {
-        value_slots: majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
-        ..frame
-    };
+    // The wide type is process-wide. A compact frame smaller than
+    // `FROZEN_LABEL_PARAM_ARITY` still publishes it: the shim zero-pads
+    // parameters whose spill slots would reach the dispatch key.
+    let compact =
+        codegen::FrameGeometry::compact(codegen::frame_value_slots(&inputargs, &ops), 0, 0);
     assert!(
-        !codegen::has_label_param_entry(&inputargs, &ops, exact, None),
-        "a frame with FROZEN_LABEL_PARAM_ARITY slots must be rejected"
+        compact.value_slots < majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
+        "this peeled loop is the size that used to miss the wide type"
     );
-    let one_more = codegen::FrameGeometry {
-        value_slots: majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY + 1,
-        ..frame
-    };
     assert!(
-        codegen::has_label_param_entry(&inputargs, &ops, one_more, None),
-        "one slot past the arity is the smallest frame the shim can read"
+        codegen::has_label_param_entry(&inputargs, &ops, None),
+        "a compact frame smaller than FROZEN_LABEL_PARAM_ARITY still publishes \
+         the wide type"
+    );
+}
+
+/// `compile_loop` publishes the slots this recursive loop uses, matching
+/// `assembler.py` `assemble_loop` `update_frame_depth(frame_depth)`. Guest
+/// nursery size is `GcHeader` plus `JitFrame::alloc_size` of that depth
+/// (`jitframe.py` `jitframeinfo_update_depth` / `rewrite.py`
+/// `handle_call_assembler`).
+#[test]
+fn compile_loop_publishes_trace_sized_jitframe_for_a_small_recursive_loop() {
+    use majit_backend::Backend;
+    use majit_backend_wasm::failguard::CompiledWasmLoop;
+
+    let _serialized = HOST_COMPILE_LOCK.lock();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = majit_backend::JitCellToken::new(9_900_081);
+    let inputargs = host_loop_inputargs();
+    let label = majit_ir::make_loop_target_descr(81, false);
+    let ops = host_loop_ops(&label);
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .expect("small recursive loop compiles");
+    let compiled = token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        .expect("compiled wasm loop");
+    let mut ops_plain: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+    codegen::materialize_unbound_label_args(&inputargs, &mut ops_plain);
+    let value_slots = codegen::frame_value_slots(&inputargs, &ops_plain);
+    let homes = codegen::count_ref_homes(&inputargs, &ops_plain);
+    let labels = codegen::label_ref_capture_slots(&inputargs, &ops_plain);
+    let expected = codegen::FrameGeometry::compact(value_slots, homes + labels, labels);
+    assert!(
+        expected.value_slots < majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
+        "this shape must not pay the label-parameter TYPE width as JITFRAME bytes"
+    );
+    assert_eq!(compiled.frame, expected);
+    assert_eq!(
+        compiled.frame,
+        codegen::FrameGeometry::compact(
+            compiled.frame.value_slots,
+            compiled.frame.home_slots,
+            compiled.frame.label_ref_slots,
+        )
+    );
+    assert_eq!(compiled.frame.frame_bytes, compiled.frame.ca_frame_bytes);
+    assert_eq!(
+        compiled.frame.frame_bytes as u64,
+        compiled
+            .frame
+            .force_slot_ofs((expected.value_slots as u64).saturating_sub(1))
+            + 8
+    );
+    let depth = token
+        .compiled_loop_token()
+        .expect("clt")
+        .frame_info
+        .lock()
+        .depth() as usize;
+    assert_eq!(depth, expected.ca_frame_depth());
+    let nursery =
+        majit_gc::header::GcHeader::SIZE + majit_backend::jitframe::JitFrame::alloc_size(depth);
+    assert_eq!(
+        nursery,
+        majit_gc::header::GcHeader::SIZE
+            + majit_backend::jitframe::JITFRAME_FIXED_SIZE
+            + std::mem::size_of::<isize>() * (1 + depth)
     );
 }
 
 /// A loop-closing bridge whose target published a wide entry hands the jump
 /// arguments over as parameters. The narrow entry is a shim that loads
-/// `FROZEN_LABEL_PARAM_ARITY` frame slots and tail-calls the wide one, so
+/// in-bounds label parameters and tail-calls the wide one, so
 /// writing the args into those slots first is a round trip through memory that
 /// the target undoes instruction for instruction.
 ///
