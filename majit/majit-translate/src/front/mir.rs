@@ -1011,7 +1011,7 @@ fn collect_ref_enum_instantiations(
             tombstoned,
             &mut visited,
         );
-        let Some(u) = fd.unstructured() else {
+        let Some(u) = fd.unstructured_shared() else {
             continue;
         };
         intern_enums_from_unstructured(
@@ -1506,7 +1506,7 @@ fn register_ref_enum_instantiation_rows(
         let TypeDeclKind::Enum(variants) = &td.kind else {
             continue;
         };
-        let name = td.item_meta.name_path();
+        let name = td.item_meta.name_path_str();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         let canon_base = strip_crate_prefix(&name);
         if exception_class_hint_for_paths(exception_class_hints, &name, &canon_base).is_some() {
@@ -1517,7 +1517,7 @@ fn register_ref_enum_instantiation_rows(
         // collision; gate the ambiguous bare spellings on that, same as the
         // discriminant-map mirror.
         let leaf_survived = enum_variant_by_discriminant.contains_key(&leaf);
-        let mut bases: Vec<&str> = vec![name.as_str()];
+        let mut bases: Vec<&str> = vec![name];
         // FieldRead / getuniqueclassdef owner_root is crate-stripped
         // (`class_identity_spelling` / `strip_crate_prefix`):
         // `option::Option<CodePoint>::Some`, not `core::option::Option<…>`.
@@ -1799,8 +1799,8 @@ fn intern_opaque_payload_spelling(
         if !matches!(td.kind, TypeDeclKind::Opaque) {
             continue;
         }
-        let name = td.item_meta.name_path();
-        let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+        let name = td.item_meta.name_path_str();
+        let leaf = name.rsplit("::").next().unwrap_or(name);
         let canon = strip_crate_prefix(&name);
         if spelling != name && spelling != leaf && spelling != canon {
             continue;
@@ -1813,7 +1813,7 @@ fn intern_opaque_payload_spelling(
         if decl_is_str0_or_oparg(&name) {
             return;
         }
-        for key in [name.as_str(), canon.as_str(), leaf] {
+        for key in [name, canon.as_str(), leaf] {
             if key.is_empty() {
                 continue;
             }
@@ -1944,7 +1944,9 @@ fn collect_opaque_raw_ptr_from_node(
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object)
                 && type_decl_ref_adt_id(adt)
                     .and_then(|id| llbc.type_by_id(id))
-                    .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
+                    .is_some_and(|td| {
+                        td.item_meta.name_path_str() == "core::ptr::non_null::NonNull"
+                    })
                 && let Some(pointee) = type_decl_ref_generics(adt, llbc)
                     .and_then(|g| g.get("types"))
                     .and_then(serde_json::Value::as_array)
@@ -2782,7 +2784,7 @@ impl<'l> CrateLowering<'l> {
     /// [`WORD_LOAD_LLEXTERNALS`]: crate::translator::rtyper::lltypesystem::module::ll_extaccessor::WORD_LOAD_LLEXTERNALS
     pub(crate) fn declare_llexternal(&self, fd: &FunDecl) -> bool {
         use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::WORD_LOAD_LLEXTERNALS;
-        let name_path = fd.item_meta.name_path();
+        let name_path = fd.item_meta.name_path_str();
         let declared = WORD_LOAD_LLEXTERNALS
             .iter()
             .any(|row| row.segments.iter().copied().eq(name_path.split("::")));
@@ -2976,11 +2978,10 @@ impl<'l> CrateLowering<'l> {
             ref root_stack,
             ..
         } = *self;
-        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
-        // every call, so hold the one projection this build needs: it is
-        // both the "has a lowerable body" gate and the input the lowering
-        // below reads.
-        let Some(mut body) = fd.unstructured() else {
+        // Harvest already parsed this body into `unstructured_shared`.
+        // Clone that projection; `unstructured()` would parse the raw JSON
+        // again. Mutation below needs an owned copy.
+        let Some(mut body) = fd.unstructured_owned() else {
             return Err(DeclBuildError::NoBody);
         };
         clear_unreachable_blocks(llbc, &mut body);
@@ -3119,7 +3120,7 @@ impl<'l> CrateLowering<'l> {
             &req.types,
             &req.const_generics,
         );
-        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
             None => (String::new(), stripped),
@@ -3498,7 +3499,7 @@ pub(crate) enum DeclBuildError {
 /// `{bare, crate::*, pyre_*::*}` correctly and the portal lookup in
 /// `register_configured_jitdrivers` (`["eval_loop_jit"]`) resolves.
 fn fun_decl_name_path_is_host_env(fd: &FunDecl) -> bool {
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     let segments: Vec<String> = path
         .split("::")
         .filter(|segment| !segment.is_empty())
@@ -3517,7 +3518,7 @@ fn fun_decl_name_path_is_host_env(fd: &FunDecl) -> bool {
 }
 
 fn decl_module_path_and_name(fd: &FunDecl) -> (String, String) {
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
     match stripped.rsplit_once("::") {
         Some((module, leaf)) => (module.to_string(), leaf.to_string()),
         None => (String::new(), stripped),
@@ -3530,7 +3531,7 @@ fn decl_module_path_and_name(fd: &FunDecl) -> (String, String) {
 fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
     let segs: Vec<String> = fd
         .item_meta
-        .name_path()
+        .name_path_str()
         .split("::")
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -3547,7 +3548,7 @@ fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
 fn fun_decl_is_jit_ll_arraycopy(fd: &FunDecl) -> bool {
     let segs: Vec<String> = fd
         .item_meta
-        .name_path()
+        .name_path_str()
         .split("::")
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -3577,7 +3578,7 @@ fn note_body_crate_root_into(
         return;
     };
     fields.note_foreign_body_crate_root(root);
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
     fields.note_foreign_body_callable(root, &stripped);
 }
 
@@ -4778,17 +4779,13 @@ fn note_declared_gc_owner(
     td: &TypeDecl,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
-    let name = td.item_meta.name_path();
+    let name = td.item_meta.name_path_str();
     let stripped = strip_crate_prefix(&name);
     let sid = struct_id_for_type_decl(td);
     if !struct_id_is_declared_gc(gc_struct_ids, sid, &stripped) {
         return;
     }
-    let leaf = name
-        .rsplit("::")
-        .next()
-        .unwrap_or(name.as_str())
-        .to_string();
+    let leaf = name.rsplit("::").next().unwrap_or(name).to_string();
     struct_fields.gc_struct_ids.insert(sid);
     struct_fields
         .gc_struct_ids
@@ -5486,7 +5483,7 @@ fn derive_program_metadata(
             continue;
         }
         // The handle is the `RBigInt` it roots; it is not a ClassDef.
-        if rbigint_gc_root::is_root_path(&td.item_meta.name_path()) {
+        if rbigint_gc_root::is_root_path(td.item_meta.name_path_str()) {
             continue;
         }
         if matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
@@ -6303,7 +6300,7 @@ fn derive_program_metadata(
     let compiler_constants_path = "rustpython_compiler_core::bytecode::Constants";
     if llbc
         .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == compiler_constants_path)
+        .any(|td| td.item_meta.name_path_str() == compiler_constants_path)
     {
         let rows = vec![crate::front::semantic::FieldRow::positional(
             "__pos_0",
@@ -6350,7 +6347,7 @@ fn derive_program_metadata(
     let num_complex_canon = strip_crate_prefix(num_complex_path);
     if llbc
         .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == num_complex_path)
+        .any(|td| td.item_meta.name_path_str() == num_complex_path)
     {
         let rows = vec![
             ("re".to_string(), "f64".to_string()),
@@ -6390,7 +6387,7 @@ fn derive_program_metadata(
     let alloc_vec_path = "alloc::vec::Vec";
     if llbc
         .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == alloc_vec_path)
+        .any(|td| td.item_meta.name_path_str() == alloc_vec_path)
     {
         let rows = vec![
             crate::front::semantic::FieldRow::named("buf", "*mut u8"),
@@ -6431,7 +6428,7 @@ fn derive_program_metadata(
     let layout_path = "core::alloc::layout::Layout";
     if llbc
         .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == layout_path)
+        .any(|td| td.item_meta.name_path_str() == layout_path)
     {
         let rows = vec![
             crate::front::semantic::FieldRow::positional("__pos_0", "usize"),
@@ -6605,7 +6602,7 @@ pub(crate) fn spelling_is_declared_gc(
 }
 
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
-    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
+    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(td.item_meta.name_path_str()))
 }
 
 /// `true` when `path` is majit-gc's `GcType` declaration.
@@ -6676,7 +6673,7 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         let Some(decl) = llbc.trait_by_id(trait_id) else {
             continue;
         };
-        if !trait_path_is_majit_gc_gctype(&decl.item_meta.name_path()) {
+        if !trait_path_is_majit_gc_gctype(decl.item_meta.name_path_str()) {
             continue;
         }
         let Some(self_ty) = impl_trait
@@ -6732,7 +6729,7 @@ pub(crate) fn declared_gckind_by_name(
             if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
                 continue;
             }
-            let canon = strip_crate_prefix(&td.item_meta.name_path());
+            let canon = strip_crate_prefix(td.item_meta.name_path_str());
             let kind = if struct_id_is_declared_gc(&gc, struct_id_for_type_decl(td), &canon) {
                 GcKind::Gc
             } else {
@@ -6815,7 +6812,7 @@ impl DuplicateLeafFacts {
             if type_decl_is_builtin_adt(td) || td.published_struct_copy {
                 continue;
             }
-            let name = td.item_meta.name_path();
+            let name = td.item_meta.name_path_str();
             let (stripped, def_crate) = if let Some(rest) = name.strip_prefix(&prefix) {
                 (rest.to_string(), crate_name.clone())
             } else if matches!(td.kind, TypeDeclKind::Opaque) {
@@ -6824,7 +6821,7 @@ impl DuplicateLeafFacts {
                     .next()
                     .unwrap_or(crate_name.as_str())
                     .to_string();
-                (strip_crate_prefix(&name), def_crate)
+                (strip_crate_prefix(name), def_crate)
             } else {
                 continue;
             };
@@ -7633,10 +7630,10 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
-    let mut u = fd.unstructured().ok_or_else(|| {
+    let mut u = fd.unstructured_owned().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
-            fd.item_meta.name_path()
+            fd.item_meta.name_path_str()
         ))
     })?;
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
@@ -7999,7 +7996,7 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
             return None;
         }
     }
-    let name = fd.item_meta.name_path();
+    let name = fd.item_meta.name_path_str();
     let leaf = name.rsplit("::").next().unwrap_or(&name);
     Some(crate::front::clause_spec::spec_leaf(
         leaf, fd.def_id, args, llbc,

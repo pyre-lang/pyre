@@ -20,7 +20,7 @@ fn lower_pyframe_method(leaf: &str) -> FunctionGraph {
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
+        .find(|fd| fd.item_meta.name_path_str().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
     common::with_shared_lowering(llbc, |context| {
         lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
@@ -35,7 +35,7 @@ fn lower_all_named(leaf: &str) -> Vec<FunctionGraph> {
     let suffix = format!("::{leaf}");
     common::with_shared_lowering(llbc, |context| {
         llbc.iter_local_fns()
-            .filter(|fd| fd.item_meta.name_path().ends_with(&suffix))
+            .filter(|fd| fd.item_meta.name_path_str().ends_with(&suffix))
             .filter_map(|fd| lower_fun_decl(context, fd).ok())
             .collect()
     })
@@ -326,7 +326,7 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
     let graphs: Vec<FunctionGraph> = common::with_shared_lowering(llbc, |context| {
         let mut graphs: Vec<FunctionGraph> = Vec::new();
         for fd in llbc.iter_local_fns() {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             if path.contains("frame_locals_proxy_snapshot") {
                 let g =
                     lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {path}: {e:?}"));

@@ -497,7 +497,7 @@ impl<'a> Lowering<'a> {
         }
         let def_id = self.tyref_adt_def_id(dest_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        Some(format!("{}{}", td.item_meta.name_path(), suffix))
+        Some(format!("{}{}", td.item_meta.name_path_str(), suffix))
     }
 
     /// Class root of a one-word niche `Option<&T>` / `Option<&mut T>` /
@@ -715,7 +715,7 @@ impl<'a> Lowering<'a> {
         // `Some(..)` mints; `some_owner` then derives `Option<X>::Some`.
         let option_owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
@@ -1446,7 +1446,7 @@ impl<'a> Lowering<'a> {
         let td = self.llbc.type_by_id(def_id)?;
         let result_owner = format!(
             "{}{}",
-            td.item_meta.name_path(),
+            td.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(ty, self.llbc, self.tombstoned_leaves)
         );
         let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
@@ -1845,12 +1845,12 @@ impl<'a> Lowering<'a> {
         let dest_decl = self.llbc.type_by_id(self.tyref_adt_def_id(dest_ty)?)?;
         let receiver_owner = format!(
             "{}{}",
-            recv_decl.item_meta.name_path(),
+            recv_decl.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let result_owner = format!(
             "{}{}",
-            dest_decl.item_meta.name_path(),
+            dest_decl.item_meta.name_path_str(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
@@ -2444,7 +2444,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .type_by_id(def_id)
-            .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
+            .is_some_and(|td| td.item_meta.name_path_str() == "core::ptr::non_null::NonNull")
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` whose

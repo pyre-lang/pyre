@@ -2835,7 +2835,7 @@ fn collect_checked_binop_calls(file: &crate::schema::LlbcFile) -> Arc<[(u64, &'s
     ];
     let mut table = Vec::new();
     for fd in file.translated.fun_decls.iter().flatten() {
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if let Some((_, op)) = INTRINSICS.iter().copied().find(|(name, _)| path == *name) {
             table.push((fd.def_id, op));
         }
@@ -4395,7 +4395,7 @@ mod tests {
             {"Ident": ["null", 0]},
             {"Instantiated": {"params": {}, "skip_binder": args.clone(), "kind": "Other"}}
         ]));
-        assert_eq!(mono.name_path(), "core::ptr::null");
+        assert_eq!(mono.name_path_str(), "core::ptr::null");
         assert_eq!(mono.instantiation(), Some(&args));
         assert!(matches!(
             mono.template_name().last(),
@@ -4407,7 +4407,7 @@ mod tests {
             {"Ident": ["ptr", 0]},
             {"Ident": ["null", 0]}
         ]));
-        assert_eq!(generic.name_path(), "core::ptr::null");
+        assert_eq!(generic.name_path_str(), "core::ptr::null");
         assert_eq!(generic.instantiation(), None);
     }
 
@@ -4439,7 +4439,7 @@ mod tests {
             {"Builtin": ["AnonConst", 0]}
         ]));
         assert_eq!(
-            meta.name_path(),
+            meta.name_path_str(),
             "pyre_interpreter::baseobjspace::getattr_str_impl::anon_const"
         );
         assert!(is_const_initializer_leaf("promoted"));
@@ -5076,7 +5076,7 @@ mod tests {
             {"Impl": {"Trait": 1}},
             {"Ident": ["f", 0]}
         ]));
-        assert_eq!(meta.name_path(), "core::<Impl>::f");
+        assert_eq!(meta.name_path_str(), "core::<Impl>::f");
         assert_eq!(meta.trait_impl_id(), Some(1));
     }
 

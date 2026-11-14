@@ -18,7 +18,7 @@ fn loads_fixture_corpus() {
     assert!(!llbc.file.has_errors);
     let local_count = llbc
         .iter_local_fns()
-        .filter(|f| f.item_meta.name_path().starts_with("charon_corpus::"))
+        .filter(|f| f.item_meta.name_path_str().starts_with("charon_corpus::"))
         .count();
     // 6 base fns (straight_line_add, branch_loop_sum, strategy_len,
     // parse_one, desugar_mix, tuple_roundtrip) + `bool_then_closure` and
@@ -130,7 +130,7 @@ fn every_corpus_function_decodes() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
 
     for fd in llbc.iter_local_fns() {
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         let Some(u) = fd.unstructured() else { continue };
 
         for (bb_idx, bb) in u.body.iter().enumerate() {
@@ -252,7 +252,7 @@ fn dedup_body_resolves_inline_shape() {
                 let body = llbc.dedup_body(*id).unwrap_or_else(|| {
                     panic!(
                         "dedup_body({id}) returned None for an input TyRef in {}",
-                        fd.item_meta.name_path()
+                        fd.item_meta.name_path_str()
                     )
                 });
                 assert!(
@@ -320,7 +320,7 @@ fn assert_no_promoted_anon_const_read(llbc: &Llbc, u: &majit_charon_reader::ullb
             assert!(
                 !is_promoted_anon_const(gd),
                 "body still reads AnonConst promoted global {id} ({})",
-                gd.item_meta.name_path()
+                gd.item_meta.name_path_str()
             );
         }
     }
@@ -383,7 +383,7 @@ fn code_flags_bits_or_inlines_promoted_flat_borrow() {
 
     let flat_id = llbc
         .iter_global_decls()
-        .find(|gd| gd.item_meta.name_path().ends_with("::FLAT"))
+        .find(|gd| gd.item_meta.name_path_str().ends_with("::FLAT"))
         .map(|gd| gd.def_id)
         .expect("CodeFlags::FLAT global");
     let found = consecutive_assigns(&u).iter().any(|(p0, rv0, _, rv1)| {

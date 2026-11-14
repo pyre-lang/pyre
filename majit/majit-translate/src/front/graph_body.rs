@@ -339,7 +339,7 @@ impl GraphBodyProvider {
         let mut found = None;
         for (i, krate) in self.crates.iter().enumerate() {
             for fd in krate.llbc.iter_local_fns() {
-                if fd.item_meta.name_path() != name_path {
+                if fd.item_meta.name_path_str() != name_path {
                     continue;
                 }
                 if found.is_some() {
@@ -381,14 +381,14 @@ impl GraphBodyProvider {
         let Some(declared) = declared else {
             return Err(LowerError::Unsupported(format!(
                 "{}: no Unstructured body",
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
             )));
         };
         let Some(graph) = krate.build_decl_graph(&self.tables, src.def_id, &stamp, &declared)
         else {
             return Err(LowerError::Unsupported(format!(
                 "{}: body did not lower",
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
             )));
         };
         self.tables.declare_all_queued();
@@ -696,7 +696,7 @@ mod tests {
             else {
                 continue;
             };
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             let src = provider
                 .source_for_name_path(&name_path)
                 .unwrap_or_else(|| panic!("no unique GraphBodySource for {name_path}"));

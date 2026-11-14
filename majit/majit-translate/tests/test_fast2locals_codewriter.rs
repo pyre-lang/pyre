@@ -25,7 +25,7 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
+        .find(|fd| fd.item_meta.name_path_str().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
     // The graph under test returns `Result<(), PyError>`, so the lowering has
     // to be told which `Result` is the fallible return before `result_exc` can
@@ -280,7 +280,7 @@ fn fast2locals_assembles() {
                 assert!(
                     fd.has_unstructured_body(),
                     "CodeFlags::bits FunDecl {} is Opaque",
-                    fd.item_meta.name_path()
+                    fd.item_meta.name_path_str()
                 );
             }
             CallTarget::Method { name, .. } if name == "bits" => {

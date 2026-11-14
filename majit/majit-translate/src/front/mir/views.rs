@@ -2821,7 +2821,7 @@ impl<'a> Lowering<'a> {
                 }
                 _ => {
                     let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
-                    if self.dont_look_inside.contains(&fd.item_meta.name_path()) {
+                    if self.dont_look_inside.contains(fd.item_meta.name_path_str()) {
                         return Err(LowerError::Unsupported(format!(
                             "bb{mir_bb}: residual {name} returns a pair slice"
                         )));
@@ -4175,7 +4175,7 @@ pub(in crate::front::mir) fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -
     };
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::vec::Vec")
 }
 
 /// `Ptr(Struct(raw) "RustVec")` for `kind` (`rrustvec.rs rust_vec_lltype`).
@@ -4235,7 +4235,7 @@ pub(in crate::front::mir) fn tyref_one_word_vec_ast(ty: &TyRef, llbc: &Llbc) -> 
         node = strip_ty_wrappers(pointee, llbc)?;
     }
     let id = adt_node_def_id(node)?;
-    if llbc.type_by_id(id)?.item_meta.name_path() != "alloc::vec::Vec" {
+    if llbc.type_by_id(id)?.item_meta.name_path_str() != "alloc::vec::Vec" {
         return None;
     }
     let ast = charon_type_value_to_ast_string(node, llbc, 0);
@@ -4285,7 +4285,7 @@ pub(in crate::front::mir) fn tyref_is_object_pointer_rust_vec(ty: &TyRef, llbc: 
     };
     if llbc
         .type_by_id(id)
-        .is_none_or(|td| td.item_meta.name_path() != "alloc::vec::Vec")
+        .is_none_or(|td| td.item_meta.name_path_str() != "alloc::vec::Vec")
     {
         return false;
     }
@@ -4594,7 +4594,7 @@ pub(in crate::front::mir) fn tyref_pair_slice_iter_item_kind(
     let path = llbc
         .type_by_id(adt_node_def_id(node)?)?
         .item_meta
-        .name_path();
+        .name_path_str();
     if path != "core::slice::iter::Iter" && path != "core::slice::iter::IterMut" {
         return None;
     }
@@ -4656,7 +4656,7 @@ pub(in crate::front::mir) fn iter_mut_item_is_object_pointer(ty: &TyRef, llbc: &
     };
     let Some(path) = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .map(|td| td.item_meta.name_path())
+        .map(|td| td.item_meta.name_path_str())
     else {
         return false;
     };
@@ -5154,7 +5154,7 @@ pub(in crate::front::mir) fn callee_leaf_name(reg: &RegularCall, llbc: &Llbc) ->
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     if let Some(leaf) = path.rsplit("::").next().filter(|s| !s.is_empty()) {
         return Some(leaf.to_string());
     }
@@ -5660,7 +5660,7 @@ fn global_ty_is_dyn_impl_vtable_desc(
 ) -> bool {
     llbc.global_ty_adt_def_id(gd)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(&td.item_meta.name_path()))
+        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(td.item_meta.name_path_str()))
 }
 
 fn dyn_impl_vtable_desc_adt_path(path: &str) -> bool {
@@ -5744,11 +5744,8 @@ pub(in crate::front::mir) fn dyn_unsize_src_trait_names(
     let trait_name = tyref_dyn_trait_decl_id(dest_ty, llbc)
         .and_then(|id| llbc.trait_by_id(id))
         .map(|td| {
-            let path = td.item_meta.name_path();
-            path.rsplit("::")
-                .next()
-                .unwrap_or(path.as_str())
-                .to_string()
+            let path = td.item_meta.name_path_str();
+            path.rsplit("::").next().unwrap_or(path).to_string()
         })
         .unwrap_or_else(|| "Trait".to_string());
     (src_name, trait_name)
@@ -6817,7 +6814,7 @@ pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(
         };
         let segments: Vec<String> = fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .split("::")
             .map(str::to_string)
             .collect();

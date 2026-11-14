@@ -391,7 +391,7 @@ fn marked_enum_payload(
     if variants.is_empty() || variants.iter().all(|variant| variant.fields.is_empty()) {
         return None;
     }
-    let path = decl.item_meta.name_path();
+    let path = decl.item_meta.name_path_str();
     let canon = crate::front::mir::strip_crate_prefix(&path);
     let hint = hints.iter().find(|hint| {
         crate::front::llbc_hints::exception_class_enum_path_matches(&hint.enum_path, &path)

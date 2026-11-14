@@ -57,7 +57,7 @@ pub(super) fn is_guard_path(path: &str) -> bool {
 
 fn type_id_is_guard(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id)
-        .is_some_and(|td| is_guard_path(&td.item_meta.name_path()))
+        .is_some_and(|td| is_guard_path(td.item_meta.name_path_str()))
 }
 
 /// `node` is the guard ADT, after dedup and hash-cons wrappers.
@@ -265,7 +265,7 @@ pub(super) fn classify(call: &CallPayload, llbc: &Llbc) -> Option<Op> {
     {
         return Some(Op::Drop);
     }
-    if leaf == "take" && is_option_take_path(&fd.item_meta.name_path()) {
+    if leaf == "take" && is_option_take_path(fd.item_meta.name_path_str()) {
         let pointee_is_guard_option = arg_tys.iter().flatten().any(|ty| {
             tyref_is_option_of_guard(ty, llbc)
                 || ref_pointee_ty(ty, llbc)
@@ -307,7 +307,7 @@ fn callee_stays_residual(
     if !fd.has_unstructured_body() {
         return true;
     }
-    let path = super::strip_crate_prefix(&fd.item_meta.name_path());
+    let path = super::strip_crate_prefix(fd.item_meta.name_path_str());
     dont_look_inside.contains(&path)
 }
 
@@ -331,7 +331,7 @@ fn niche_option_predicate(call: &CallPayload, llbc: &Llbc) -> bool {
     if !matches!(leaf, "is_some" | "is_none") {
         return false;
     }
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     if !path.contains("option::<Impl>") && !path.contains("::option::") {
         return false;
     }

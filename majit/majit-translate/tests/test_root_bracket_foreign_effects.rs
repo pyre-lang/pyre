@@ -85,7 +85,7 @@ const NEWLY_ERASING_WITNESSES: &[&str] = &[
 fn named_body_erases(llbc: &Llbc, suffix: &str) -> Option<bool> {
     let root_stack_state = RootStackState::new(llbc);
     for fd in llbc.iter_local_fns() {
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if !path.contains(suffix) {
             continue;
         }
@@ -160,7 +160,7 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
         .iter_fun_decls()
         .find(|fd| {
             !fd.item_meta.is_local
-                && fd.item_meta.name_path().ends_with("::new")
+                && fd.item_meta.name_path_str().ends_with("::new")
                 && scope_owner_identity(&interpreter, fd).contains("RootedItems")
         })
         .expect("interpreter names RootedItems::new")
@@ -212,14 +212,14 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
     );
     let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
     let opaque = module.iter_type_decls().any(|td| {
-        td.item_meta.name_path().ends_with("::PyErrorObject")
+        td.item_meta.name_path_str().ends_with("::PyErrorObject")
             && matches!(td.kind, majit_charon_reader::ullbc::TypeDeclKind::Opaque)
     });
     assert!(opaque, "pyre-module sees PyErrorObject as an opaque struct");
     apply_published_structs(&mut module, &fields);
     assert!(
         module.iter_type_decls().any(|td| {
-            td.item_meta.name_path().ends_with("::PyErrorObject") && td.published_struct_copy
+            td.item_meta.name_path_str().ends_with("::PyErrorObject") && td.published_struct_copy
         }),
         "PyErrorObject's copied fields stay an import, not a second class"
     );
@@ -253,12 +253,13 @@ fn imported_class_header_construction_keeps_the_defining_fields() {
     let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
     apply_published_structs(&mut module, &fields);
     assert!(module.iter_type_decls().any(|td| {
-        td.item_meta.name_path() == "pyre_object::pyobject::PyObject" && td.published_struct_copy
+        td.item_meta.name_path_str() == "pyre_object::pyobject::PyObject"
+            && td.published_struct_copy
     }));
     let fd = module
         .iter_fun_decls()
         .find(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.contains("::_ssl::memory_bio_methods::") && path.ends_with("::__new__")
         })
         .expect("MemoryBIO.__new__ declaration");

@@ -14,7 +14,7 @@ fn dict_compaction_keeps_upstream_opaque_boundary() {
     let functions: Vec<_> = llbc
         .iter_local_fns()
         .filter(|function| {
-            let path = function.item_meta.name_path();
+            let path = function.item_meta.name_path_str();
             path.contains("::rordereddict::") && path.ends_with("::remove_deleted_items")
         })
         .collect();

@@ -108,11 +108,8 @@ pub(crate) fn unique_local_unstructured<'a>(
 ) -> Option<(usize, &'a FunDecl)> {
     let mut found = None;
     for (i, krate) in crates.iter().enumerate() {
-        for fd in krate.llbc.iter_fun_decls() {
+        for fd in krate.llbc.fun_decls_named(path) {
             if !fd.item_meta.is_local {
-                continue;
-            }
-            if fd.item_meta.name_path_str() != path {
                 continue;
             }
             if !decl_has_unstructured_body(fd) {
@@ -283,10 +280,16 @@ fn remap_adt(
 }
 
 fn remap_trait_impl_id(from: &Llbc, to: &Llbc, id: u64) -> Result<u64, &'static str> {
+    let Some(trait_path) = from.trait_impls_raw().get(id as usize).and_then(|row| {
+        let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
+        Some(from.trait_by_id(trait_id)?.item_meta.name_path_str())
+    }) else {
+        return Err("remap-impl-src");
+    };
     let Some(identity) = render_trait_impl(from, id) else {
         return Err("remap-impl-src");
     };
-    unique_trait_impl(to, &identity).ok_or("remap-impl-no-dest")
+    unique_trait_impl(to, trait_path, &identity).ok_or("remap-impl-no-dest")
 }
 
 fn remap_trait_decl_ref_id(v: &mut Value, from: &Llbc, to: &Llbc) -> Result<(), &'static str> {
@@ -312,18 +315,15 @@ fn remap_trait_decl_id(from: &Llbc, to: &Llbc, id: u64) -> Result<u64, &'static 
     let Some(td) = from.trait_by_id(id) else {
         return Err("remap-trait-src");
     };
-    let path = td.item_meta.name_path();
-    unique_trait_decl(to, &path)
+    let path = td.item_meta.name_path_str();
+    unique_trait_decl(to, path)
         .map(|td| td.def_id)
         .ok_or("remap-trait-no-dest")
 }
 
 fn unique_type_decl<'a>(llbc: &'a Llbc, path: &str) -> Option<&'a TypeDecl> {
     let mut found = None;
-    for td in llbc.iter_type_decls() {
-        if td.item_meta.name_path_str() != path {
-            continue;
-        }
+    for td in llbc.type_decls_named(path) {
         if found.is_some() {
             return None;
         }
@@ -337,10 +337,7 @@ fn unique_trait_decl<'a>(
     path: &str,
 ) -> Option<&'a majit_charon_reader::ullbc::TraitDecl> {
     let mut found = None;
-    for td in llbc.iter_trait_decls() {
-        if td.item_meta.name_path_str() != path {
-            continue;
-        }
+    for td in llbc.trait_decls_named(path) {
         if found.is_some() {
             return None;
         }
@@ -349,20 +346,22 @@ fn unique_trait_decl<'a>(
     found
 }
 
-fn unique_trait_impl(llbc: &Llbc, identity: &str) -> Option<u64> {
+fn unique_trait_impl(llbc: &Llbc, trait_path: &str, identity: &str) -> Option<u64> {
     let mut found = None;
-    for (index, _) in llbc.trait_impls_raw().iter().enumerate() {
-        let id = index as u64;
-        let Some(rendered) = render_trait_impl(llbc, id) else {
-            continue;
-        };
-        if rendered != identity {
-            continue;
+    for td in llbc.trait_decls_named(trait_path) {
+        for (index, _) in llbc.trait_impl_rows_of(td.def_id) {
+            let id = index as u64;
+            let Some(rendered) = render_trait_impl(llbc, id) else {
+                continue;
+            };
+            if rendered != identity {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
         }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(id);
     }
     found
 }
@@ -1488,7 +1487,7 @@ pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     let row = llbc.trait_impls_raw().get(impl_id as usize)?;
     let impl_trait = row.get("impl_trait")?;
     let trait_id = impl_trait.get("id")?.as_u64()?;
-    let name = llbc.trait_by_id(trait_id)?.item_meta.name_path();
+    let name = llbc.trait_by_id(trait_id)?.item_meta.name_path_str();
     let types = impl_trait
         .pointer("/generics/types")
         .and_then(Value::as_array)

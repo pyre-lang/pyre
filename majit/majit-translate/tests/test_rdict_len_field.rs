@@ -187,7 +187,7 @@ fn identity_length_reads_num_live_items() {
             let Some(fd) = llbc.fn_by_id(id) else {
                 continue;
             };
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             if !(path.contains("rordereddict") || path.contains("identitydict")) {
                 continue;
             }
@@ -233,7 +233,7 @@ fn module_dict_len_reads_num_live_items() {
             let Some(fd) = llbc.fn_by_id(id) else {
                 continue;
             };
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             if !(path.contains("rordereddict") || path.contains("celldict")) {
                 continue;
             }

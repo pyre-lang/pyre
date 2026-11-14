@@ -290,7 +290,7 @@ fn field_is_fat_dyn(
         else {
             continue;
         };
-        let path = decl.item_meta.name_path();
+        let path = decl.item_meta.name_path_str();
         let id_hit = owner_id.is_some_and(|id| id_matches(id, &path));
         let rank = owner_path_rank(&path, owner_root);
         if !id_hit && rank.is_none() {

@@ -88,7 +88,7 @@ impl<'a> Lowering<'a> {
             if gd.global_kind_str() != Some("NamedConst") {
                 return None;
             }
-            named_const_fold_for_path(&gd.item_meta.name_path())
+            named_const_fold_for_path(gd.item_meta.name_path_str())
         })
     }
 
@@ -398,7 +398,7 @@ impl<'a> Lowering<'a> {
             .and_then(|node| strip_ty_wrappers(node, self.llbc))
             .and_then(adt_node_def_id)
             .and_then(|id| self.llbc.type_by_id(id))
-            .map(|decl| decl.item_meta.name_path())
+            .map(|decl| decl.item_meta.name_path_str())
         else {
             return false;
         };
@@ -481,11 +481,11 @@ impl<'a> Lowering<'a> {
     /// handling below to answer.
     pub(in crate::front::mir) fn pytype_addr_by_impl_identity(&self, def_id: u64) -> Option<i64> {
         let global = self.llbc.global_by_id(def_id)?;
-        let item_path = global.item_meta.name_path();
+        let item_path = global.item_meta.name_path_str();
         let impl_id = global.item_meta.trait_impl_id()?;
         let row = self.llbc.trait_impl_by_id(impl_id)?;
         let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
-        let trait_path = self.llbc.trait_by_id(trait_id)?.item_meta.name_path();
+        let trait_path = self.llbc.trait_by_id(trait_id)?.item_meta.name_path_str();
         // The impl identity names the OWNER, not which associated item was
         // read.  `PyreClassPyTypeOf` also defines `DESCRIPTOR`, `PYNAME`, and
         // the CPython flag constants; mapping any of those to the owner's
@@ -512,7 +512,7 @@ impl<'a> Lowering<'a> {
             .llbc
             .type_by_id(adt_node_def_id(node)?)?
             .item_meta
-            .name_path();
+            .name_path_str();
         // Compared with [`path_eq_ignoring_raw`], not `==`: this key is
         // spelled by `module_path!()` on the host side and so keeps a
         // raw-identifier `r#`, while the `name_path()` just read is
@@ -651,7 +651,7 @@ impl<'a> Lowering<'a> {
                     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
                         return None;
                     };
-                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path_str() {
                         "core::mem::size_of" => false,
                         "core::mem::align_of" => true,
                         // `_0` defined by some other function: not a bare
@@ -736,7 +736,12 @@ impl<'a> Lowering<'a> {
             // only an `AtLeast` guarantee, no chosen align. Its fields are
             // pointers, boxes and `u32`s, so the alignment is the target
             // word (`CARGO_CFG_TARGET_POINTER_WIDTH`).
-            if want_align && decl.item_meta.name_path().ends_with("bytecode::CodeObject") {
+            if want_align
+                && decl
+                    .item_meta
+                    .name_path_str()
+                    .ends_with("bytecode::CodeObject")
+            {
                 return Some(crate::layout::target_word_size() as i64);
             }
             // Charon leaves a generic struct's `chosen` layout null. The
@@ -933,9 +938,8 @@ pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     for g in llbc.iter_global_decls() {
-        let path = g.item_meta.name_path();
-        let Ok(index) = entries.binary_search_by(|(known, _)| known.as_str().cmp(path.as_str()))
-        else {
+        let path = g.item_meta.name_path_str();
+        let Ok(index) = entries.binary_search_by(|(known, _)| known.as_str().cmp(path)) else {
             continue;
         };
         let Some(encoded) = encode_foldable_op(&entries[index].1) else {
@@ -1619,7 +1623,7 @@ pub(in crate::front::mir) fn promoted_int_range_inclusive_bounds(
     if g.global_kind_str() != Some("AnonConst") {
         return None;
     }
-    let leaf = g.item_meta.name_path().rsplit("::").next()?.to_string();
+    let leaf = g.item_meta.name_path_str().rsplit("::").next()?.to_string();
     if !majit_charon_reader::ullbc::is_const_initializer_leaf(&leaf) {
         return None;
     }
@@ -1894,7 +1898,7 @@ pub(in crate::front::mir) fn const_eval_opaque_bitflag_call(
     if fd.has_unstructured_body() {
         return None;
     }
-    let leaf = fd.item_meta.name_path();
+    let leaf = fd.item_meta.name_path_str();
     let leaf = leaf.rsplit("::").next()?;
     match (leaf, args) {
         ("from_element", [ConstLit::EnumDisc(disc)]) => {
@@ -2059,7 +2063,7 @@ pub(in crate::front::mir) fn eval_arr_call(
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let path = llbc.fn_by_id(*id)?.item_meta.name_path();
+    let path = llbc.fn_by_id(*id)?.item_meta.name_path_str();
     if path.ends_with("::len") && call.args.len() == 1 {
         let ArrVal::SliceOf(arr_local) = eval_arr_operand(llbc, locals, &call.args[0])? else {
             return None;
@@ -2921,7 +2925,7 @@ pub(in crate::front::mir) fn const_eval_size_align_call(
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path_str() {
         "core::mem::size_of" => false,
         "core::mem::align_of" => true,
         _ => return None,
@@ -3107,7 +3111,7 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
     if global.global_kind_str() != Some("NamedConst") {
         return None;
     }
-    let path = global.item_meta.name_path();
+    let path = global.item_meta.name_path_str();
     let leaf = path.rsplit("::").next()?;
     if !path.starts_with("core::num::<Impl>::") || !matches!(leaf, "MIN" | "MAX") {
         return None;

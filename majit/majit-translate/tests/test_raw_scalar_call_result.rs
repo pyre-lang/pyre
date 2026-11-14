@@ -170,7 +170,7 @@ fn find_method<'a>(llbc: &'a Llbc, leaf: &str, owner: &str) -> &'a FunDecl {
     let owner_suffix = format!("::{owner}");
     llbc.iter_local_fns()
         .find(|fd| {
-            fd.item_meta.name_path().ends_with(&suffix)
+            fd.item_meta.name_path_str().ends_with(&suffix)
                 && receiver_path(llbc, fd)
                     .is_some_and(|path| path == owner || path.ends_with(&owner_suffix))
         })
@@ -179,7 +179,7 @@ fn find_method<'a>(llbc: &'a Llbc, leaf: &str, owner: &str) -> &'a FunDecl {
 
 fn find_exact<'a>(llbc: &'a Llbc, path: &str) -> &'a FunDecl {
     llbc.iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == path)
+        .find(|fd| fd.item_meta.name_path_str() == path)
         .unwrap_or_else(|| panic!("missing {path}"))
 }
 
@@ -220,7 +220,7 @@ fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
     let suffix = format!("::{leaf}");
     llbc.iter_local_fns()
         .filter(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.ends_with(&suffix) && path.contains("mapdict")
         })
         .collect()
@@ -238,7 +238,7 @@ fn mapdict_get_reads_slots_map_pointer_as_int() {
         let mut saw_pos0 = false;
         for fd in gets {
             let graph = lower_fun_decl(context, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
             let pos0: Vec<_> = ops(&graph)
                 .filter_map(|op| match &op.kind {
                     OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => Some(ty),
@@ -430,7 +430,7 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
             assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
             for fd in fns {
                 let graph = lower_fun_decl(context, fd)
-                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
                 for op in ops(&graph) {
                     if let OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
@@ -593,7 +593,7 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
         assert!(!fns.is_empty(), "instance_getclass is in pyre-object LLBC");
         for fd in fns {
             let graph = lower_fun_decl(context, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
             assert_mapnode_casts_are_word_operands(&graph);
         }
     });
@@ -604,7 +604,7 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
         let mut checked_interp_graph = false;
         for fd in terms {
             let graph = lower_fun_decl(interp_ctx, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
             let has_word_mapnode = ops(&graph).any(|op| {
                 majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
                     && operand_is_word(

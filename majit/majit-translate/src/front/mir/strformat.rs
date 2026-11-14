@@ -2985,7 +2985,7 @@ pub(in crate::front::mir) fn debug_enum_variants_by_discr(
     // compare on the crate-stripped spelling.
     let td = llbc
         .iter_type_decls()
-        .find(|td| strip_crate_prefix(&td.item_meta.name_path()) == owner_root)?;
+        .find(|td| strip_crate_prefix(td.item_meta.name_path_str()) == owner_root)?;
     let TypeDeclKind::Enum(variants) = &td.kind else {
         return None;
     };

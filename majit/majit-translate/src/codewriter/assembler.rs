@@ -13626,7 +13626,7 @@ mod tests {
             .expect("raw pointer fixture parses");
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path().ends_with("::bump"))
+            .find(|fd| fd.item_meta.name_path_str().ends_with("::bump"))
             .expect("bump");
         let context = crate::front::mir::LowerContext::new(&llbc);
         let mut graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower bump");
@@ -13901,7 +13901,7 @@ mod tests {
             .expect("raw enum fixture parses");
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path().ends_with("::bump"))
+            .find(|fd| fd.item_meta.name_path_str().ends_with("::bump"))
             .expect("bump");
         let context = crate::front::mir::LowerContext::new(&llbc);
         let mut graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower bump");
@@ -14245,7 +14245,7 @@ mod tests {
             .expect("niche pointer fixture parses");
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path().ends_with("::classify"))
+            .find(|fd| fd.item_meta.name_path_str().ends_with("::classify"))
             .expect("classify");
         let context = crate::front::mir::LowerContext::new(&llbc);
         let graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower classify");

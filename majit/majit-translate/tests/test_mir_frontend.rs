@@ -627,8 +627,9 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             let Some(body): Option<Unstructured> = fd.unstructured() else {
                 continue;
             };
-            let graph = lower_fun_decl(context, fd)
-                .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
+            let graph = lower_fun_decl(context, fd).unwrap_or_else(|e| {
+                panic!("{} failed to lower: {e}", fd.item_meta.name_path_str())
+            });
 
             // Invariant A.  The iterator `next`-diamond rewrite
             // (`front::iter_next`) is the one sanctioned synthesized
@@ -1023,7 +1024,7 @@ fn bool_then_keeps_regular_call_to_core_body() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             let is_then = path.ends_with("::bool::<Impl>::then");
             let is_then_some = path.ends_with("::bool::<Impl>::then_some");
             if !is_then && !is_then_some {
@@ -2025,8 +2026,8 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
         if !fd.has_unstructured_body() {
             return false;
         }
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        let path = fd.item_meta.name_path_str();
+        let leaf = path.rsplit("::").next().unwrap_or(path);
         if !unwrap_or_leaf(leaf) || !path.contains("option") {
             return false;
         }
@@ -3215,7 +3216,7 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
         .iter_local_fns()
         .find(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("index_through_a_closure::<Impl>::call")
         })
         .expect("closure body");
@@ -3326,7 +3327,7 @@ fn code_flags_methods_call_translated_bodies() {
                     assert!(
                         fd.has_unstructured_body(),
                         "{name}: CodeFlags::{leaf} FunDecl {} is Opaque",
-                        fd.item_meta.name_path()
+                        fd.item_meta.name_path_str()
                     );
                     if leaf == "contains" {
                         contains_fun_decl_id = Some(id);
@@ -3374,10 +3375,10 @@ fn code_flags_methods_call_translated_bodies() {
         .find(|fd| {
             fd.def_id == contains_id
                 && fd.has_unstructured_body()
-                && fd.item_meta.name_path().ends_with("::<Impl>::contains")
+                && fd.item_meta.name_path_str().ends_with("::<Impl>::contains")
                 && fd
                     .item_meta
-                    .name_path()
+                    .name_path_str()
                     .contains("rustpython_compiler_core::bytecode")
         })
         .unwrap_or_else(|| {
@@ -3441,10 +3442,10 @@ fn code_flags_methods_call_translated_bodies() {
                 .find(|fd| {
                     fd.has_unstructured_body()
                         && fd.def_id != contains_id
-                        && fd.item_meta.name_path().ends_with("::<Impl>::contains")
+                        && fd.item_meta.name_path_str().ends_with("::<Impl>::contains")
                         && fd
                             .item_meta
-                            .name_path()
+                            .name_path_str()
                             .contains("rustpython_compiler_core::bytecode::_::")
                 })
                 .expect("InternalBitFlags impl contains");
@@ -3709,7 +3710,7 @@ fn frame_box_owner_root_word_roundtrips() {
             let fd = llbc
                 .iter_local_fns()
                 .find(|fd| {
-                    fd.item_meta.name_path().contains("pyframe")
+                    fd.item_meta.name_path_str().contains("pyframe")
                         && fd
                             .item_meta
                             .source_text
@@ -4155,7 +4156,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
             let fd = llbc
                 .iter_local_fns()
                 .find(|fd| {
-                    fd.item_meta.name_path().contains("pyframe")
+                    fd.item_meta.name_path_str().contains("pyframe")
                         && fd
                             .item_meta
                             .source_text
@@ -4164,7 +4165,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
                 })
                 .unwrap_or_else(|| panic!("missing {source}"));
             let graph = lower_fun_decl(context, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
             let calls: Vec<String> = graph
                 .blocks
                 .iter()
@@ -4279,7 +4280,7 @@ fn rbigint_gc_root_new_is_the_value() {
     let llbc = load_llbc(RLIB_LLBC);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::gc::live_rbigint")
         .expect("live_rbigint in majit-rlib LLBC");
     common::with_shared_lowering(llbc, |context| {
         let graph = lower_fun_decl(context, fd).expect("lower live_rbigint");
@@ -4300,7 +4301,7 @@ fn rbigint_gc_root_deref_is_the_value() {
     let llbc = load_llbc(RLIB_LLBC);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_help_mult")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::_help_mult")
         .expect("_help_mult in majit-rlib LLBC");
     common::with_shared_lowering(llbc, |context| {
         let graph = lower_fun_decl(context, fd).expect("lower _help_mult");
@@ -4323,7 +4324,7 @@ fn rbigint_gc_root_drop_is_nothing() {
     let llbc = load_llbc(RLIB_LLBC);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_help_mult")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::_help_mult")
         .expect("_help_mult in majit-rlib LLBC");
     common::with_shared_lowering(llbc, |context| {
         let graph = lower_fun_decl(context, fd).expect("lower _help_mult");

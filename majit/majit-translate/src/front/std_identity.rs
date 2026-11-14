@@ -686,7 +686,7 @@ fn is_named_adt(node: &serde_json::Value, llbc: &majit_charon_reader::Llbc, path
         return false;
     };
     llbc.type_by_id(id)
-        .is_some_and(|td| td.item_meta.name_path() == path)
+        .is_some_and(|td| td.item_meta.name_path_str() == path)
 }
 
 fn vec_elem<'a>(

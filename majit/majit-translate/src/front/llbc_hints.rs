@@ -81,10 +81,10 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
         let llbc = llbc.borrow();
         let function_paths: HashSet<String> = llbc
             .iter_local_fns()
-            .map(|fd| strip_crate_prefix(&fd.item_meta.name_path()))
+            .map(|fd| strip_crate_prefix(fd.item_meta.name_path_str()))
             .collect();
         for gd in llbc.iter_global_decls() {
-            let path = gd.item_meta.name_path();
+            let path = gd.item_meta.name_path_str();
             // Charon emits a crate-less duplicate Ident for some
             // body-local markers (`_elidable_function_invert` next to
             // `rbigint::RBigInt::invert::_elidable_function_invert`).
@@ -101,7 +101,7 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
             if !path.contains("::") {
                 continue;
             }
-            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let leaf = path.rsplit("::").next().unwrap_or(path);
             if let Some(fn_leaf) = leaf.strip_prefix("_jit_look_inside_") {
                 if should_skip_generated_elidable_helper(fn_leaf) {
                     continue;
@@ -315,7 +315,7 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
         // set equals the published set and a stamped accessor always resolves
         // to a real address.
         for fd in llbc.iter_local_fns() {
-            let path = strip_crate_prefix(&fd.item_meta.name_path());
+            let path = strip_crate_prefix(fd.item_meta.name_path_str());
             let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
             if leaf == "type_object"
                 && fd.signature.inputs.is_empty()
@@ -357,8 +357,8 @@ pub fn harvest_immutable_fields_from_llbcs(
     let mut out: HashMap<String, Vec<(String, crate::model::ImmutableRank)>> = HashMap::new();
     for llbc in llbcs {
         for gd in llbc.iter_global_decls() {
-            let path = gd.item_meta.name_path();
-            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let path = gd.item_meta.name_path_str();
+            let leaf = path.rsplit("::").next().unwrap_or(path);
             let Some(struct_name) = leaf.strip_prefix(IMMUTABLE_FIELDS_PREFIX) else {
                 continue;
             };
@@ -412,8 +412,8 @@ pub fn harvest_alloc_flavor_raw_from_llbcs(llbcs: &[Llbc]) -> HashSet<String> {
     let mut out = HashSet::new();
     for llbc in llbcs {
         for gd in llbc.iter_global_decls() {
-            let path = gd.item_meta.name_path();
-            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let path = gd.item_meta.name_path_str();
+            let leaf = path.rsplit("::").next().unwrap_or(path);
             let Some(struct_name) = leaf.strip_prefix(ALLOC_FLAVOR_PREFIX) else {
                 continue;
             };
@@ -1149,8 +1149,8 @@ fn resolved_exception_class_markers(llbcs: &[Llbc]) -> Vec<ResolvedExceptionClas
     let mut out: Vec<ResolvedExceptionClass> = Vec::new();
     for llbc in llbcs {
         for gd in llbc.iter_global_decls() {
-            let path = gd.item_meta.name_path();
-            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let path = gd.item_meta.name_path_str();
+            let leaf = path.rsplit("::").next().unwrap_or(path);
             let Some(enum_name) = leaf.strip_prefix(EXCEPTION_CLASS_PREFIX) else {
                 continue;
             };
@@ -1663,7 +1663,7 @@ fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i6
     }
     let save_err = save_err?;
     let fd = llbc.fn_by_id(fn_id?)?;
-    let path = strip_crate_prefix(&fd.item_meta.name_path());
+    let path = strip_crate_prefix(fd.item_meta.name_path_str());
     let link = fd
         .item_meta
         .attr_info

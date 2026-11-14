@@ -946,7 +946,7 @@ impl<'a> Lowering<'a> {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: residual `{}` argument {index} borrows a \
                      repr(transparent) scalar; the word is not an address",
-                    fd.item_meta.name_path()
+                    fd.item_meta.name_path_str()
                 )));
             }
         }
@@ -1000,7 +1000,7 @@ pub(in crate::front::mir) fn root_scope_drop_glue_template(
 ) -> Option<serde_json::Value> {
     let fd = llbc
         .iter_fun_decls()
-        .find(|fd| gc_root_scope_drop_glue_path(&fd.item_meta.name_path()))?;
+        .find(|fd| gc_root_scope_drop_glue_path(fd.item_meta.name_path_str()))?;
     Some(serde_json::json!({
         "Drop": {
             "place": {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
@@ -1104,7 +1104,7 @@ pub(in crate::front::mir) fn drop_place_is_object_lock_guard(place: &Place, llbc
     adt_id_flexible(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             let segments: Vec<&str> = path.split("::").collect();
             segments.last() == Some(&"ObjectLockGuard") && segments.contains(&"objlock")
         })
@@ -1404,7 +1404,7 @@ pub(in crate::front::mir) fn explicit_drop_temp_of_owned_guard(
 pub(in crate::front::mir) fn place_ty_is_root_scope(place: &Place, llbc: &Llbc) -> bool {
     output_adt_def_id_free(&place.ty, llbc)
         .and_then(|def_id| llbc.type_by_id(def_id))
-        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+        .is_some_and(|decl| gc_root_scope_type_path(decl.item_meta.name_path_str()))
 }
 
 pub(in crate::front::mir) fn glue_call_drop_blocks(
@@ -1672,15 +1672,15 @@ pub(in crate::front::mir) type ScopeConstructorTracker =
 impl RootStackState {
     pub fn new(llbc: &Llbc) -> Self {
         let root_api_is_local = llbc.iter_type_decls().any(|decl| {
-            decl.item_meta.is_local && gc_root_scope_type_path(&decl.item_meta.name_path())
+            decl.item_meta.is_local && gc_root_scope_type_path(decl.item_meta.name_path_str())
         });
         let root_api_is_visible = root_api_is_local
             || llbc
                 .iter_type_decls()
-                .any(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+                .any(|decl| gc_root_scope_type_path(decl.item_meta.name_path_str()))
             || llbc.iter_fun_decls().any(|fd| {
                 fd.item_meta
-                    .name_path()
+                    .name_path_str()
                     .split("::")
                     .any(|s| s == ROOT_SCOPE_MODULE)
             });
@@ -1797,7 +1797,7 @@ impl<'a> RootStackAnalyzer<'a> {
         let Some(fd) = self.llbc.fn_by_id(id) else {
             return true;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if path.split("::").any(|s| s == ROOT_SCOPE_MODULE) {
             return !root_stack_api_is_neutral(&path);
         }
@@ -1905,7 +1905,7 @@ impl<'a> RootStackAnalyzer<'a> {
         }
         let leaf = fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .rsplit("::")
             .next()
             .unwrap_or("fn")
@@ -1934,7 +1934,7 @@ impl<'a> RootStackAnalyzer<'a> {
         if !self.llbc.has_root_stack_effects() {
             return self.state.root_api_is_visible;
         }
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let krate = path.split("::").next().unwrap_or_default();
         match self.llbc.root_stack_effect(krate, &path) {
             Some(touches) => touches,
@@ -4543,7 +4543,7 @@ fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
     if let Some(adt_def_id) = resolve_impl_owner_adt_def_id_free(llbc, seg)
         && let Some(td) = llbc.type_by_id(adt_def_id)
     {
-        let owner = td.item_meta.name_path();
+        let owner = td.item_meta.name_path_str();
         if !owner.is_empty() {
             return format!("<impl {owner}>");
         }
@@ -6588,7 +6588,7 @@ pub(in crate::front::mir) fn type_id_is_owner_root(id: u64, llbc: &Llbc) -> bool
     llbc.type_by_id(id).is_some_and(|td| {
         // The leaf compare keeps the full path off every other ADT local.
         matches!(td.item_meta.template_name().last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
-            && owner_root_type_path(&td.item_meta.name_path())
+            && owner_root_type_path(td.item_meta.name_path_str())
     })
 }
 
@@ -6666,7 +6666,7 @@ pub(in crate::front::mir) fn owner_root_callee_of_decl(
     llbc: &Llbc,
 ) -> OwnerRootCallee {
     let sig = &fd.signature;
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or("");
     let first_input_is_root_borrow = sig.inputs.first().is_some_and(|ty| {
         tyref_node(ty, llbc)
@@ -7008,7 +7008,7 @@ pub(in crate::front::mir) fn tyref_is_owned_vec(ty: &TyRef, llbc: &Llbc) -> bool
         return false;
     };
     llbc.type_by_id(id)
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::vec::Vec")
 }
 
 pub(in crate::front::mir) fn operand_moves_local(op: &Operand, local: usize) -> bool {
@@ -7755,7 +7755,9 @@ pub(in crate::front::mir) fn root_scope_drop_sites(
         let Some(decl) = llbc.type_by_id(def_id) else {
             continue;
         };
-        if gc_root_scope_type_path(&decl.item_meta.name_path()) && !moved.contains(local as usize) {
+        if gc_root_scope_type_path(decl.item_meta.name_path_str())
+            && !moved.contains(local as usize)
+        {
             sites.push((bb_idx, local as usize));
         }
     }

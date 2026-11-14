@@ -20,7 +20,7 @@ fn unicode_translate_error_borrow_chain_is_value_lowered() {
     let declaration = llbc
         .iter_local_fns()
         .find(|f| {
-            f.item_meta.name_path() == "pyre_interpreter::display::unicode_translate_error_str"
+            f.item_meta.name_path_str() == "pyre_interpreter::display::unicode_translate_error_str"
         })
         .expect("unicode_translate_error_str exists in interpreter LLBC");
     common::with_shared_lowering(llbc, |context| {

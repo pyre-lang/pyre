@@ -200,7 +200,7 @@ pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> &std::collections:
 fn collect_oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for gd in llbc.iter_global_decls() {
-        let path = strip_crate_prefix(&gd.item_meta.name_path());
+        let path = strip_crate_prefix(gd.item_meta.name_path_str());
         let Some((module, leaf)) = path.rsplit_once("::") else {
             continue;
         };
@@ -242,7 +242,7 @@ impl<'a> OopspecFns<'a> {
 }
 
 fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &OopspecFns<'_>) -> bool {
-    oopspec_fns.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+    oopspec_fns.contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
 }
 
 fn call_substituted_inputs(
@@ -330,7 +330,7 @@ fn residual_scalar_ref_callee(
 ) -> bool {
     fun_decl_is_residual(fd, dont_look_inside)
         && !fun_decl_has_oopspec(fd, oopspec_fns)
-        && !is_inlined_mem_exchange_path(&fd.item_meta.name_path())
+        && !is_inlined_mem_exchange_path(fd.item_meta.name_path_str())
 }
 
 pub(in crate::front::mir) fn collect_cell_scalar_locals(
@@ -1284,7 +1284,7 @@ impl<'a> Lowering<'a> {
         let Some(decl_path) = self
             .llbc
             .fn_by_id(fun_id)
-            .map(|fd| fd.item_meta.name_path())
+            .map(|fd| fd.item_meta.name_path_str())
         else {
             return false;
         };

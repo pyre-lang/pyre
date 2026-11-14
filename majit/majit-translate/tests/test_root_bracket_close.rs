@@ -52,7 +52,7 @@ use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
     llbc.iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
+        .find(|fd| fd.item_meta.name_path_str().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"))
 }
 
@@ -182,7 +182,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
             assert!(
                 reachable_closes(&graph) > 0,
                 "{} drops a surviving guard in a block that does not bind it and              lowers no close",
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
             );
         }
         assert!(
@@ -313,7 +313,11 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
     };
     llbc.dedup_to_adt_def_id(*id)
         .and_then(|def_id| llbc.type_by_id(def_id))
-        .is_some_and(|decl| decl.item_meta.name_path().ends_with("gc_roots::RootScope"))
+        .is_some_and(|decl| {
+            decl.item_meta
+                .name_path_str()
+                .ends_with("gc_roots::RootScope")
+        })
 }
 
 /// Most of the brackets that survive the erasure must actually close.
@@ -461,7 +465,7 @@ fn folded_switch_bools(llbc: &Llbc, body: &Unstructured) -> Vec<Option<bool>> {
         let Some(decl) = llbc.fn_by_id(*id) else {
             continue;
         };
-        let path = decl.item_meta.name_path();
+        let path = decl.item_meta.name_path_str();
         let value = if name_path_ends_with(&path, "jit::we_are_jitted") {
             true
         } else if name_path_ends_with(&path, "majit_gc::gc_alloc_failed_pending") {
@@ -824,7 +828,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .filter(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.ends_with("::get") && path.contains("gc_roots::<Impl>")
         })
         .map(|fd| scope_owner_identity(object, fd))
@@ -879,7 +883,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .filter(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.ends_with("::release") && path.contains("baseobjspace::<Impl>")
         })
         .map(|fd| scope_owner_identity(interpreter, fd))
@@ -920,7 +924,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
     let saturating: Vec<String> = object
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
-        .filter(|fd| fd.item_meta.name_path().ends_with("::saturating_add"))
+        .filter(|fd| fd.item_meta.name_path_str().ends_with("::saturating_add"))
         .map(|fd| scope_owner_identity(object, fd))
         .collect();
     let mut unique_sat = saturating.clone();
@@ -951,7 +955,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .filter(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.ends_with("::drop_in_place") || path.contains("drop_in_place")
         })
         .map(|fd| scope_owner_identity(object, fd))
@@ -981,7 +985,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
         .filter(|fd| fd.body.is_some())
         .filter(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .contains("typedef::method_owner::OWNER")
         })
         .map(|fd| scope_owner_identity(interpreter, fd))
@@ -1009,7 +1013,7 @@ fn stack_effect_identity_splits_impl_homonyms() {
     let extern_root_scope: Vec<String> = interpreter
         .iter_fun_decls()
         .filter(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path.contains("gc_roots::<Impl>") && path.ends_with("::get")
         })
         .map(|fd| scope_owner_identity(interpreter, fd))

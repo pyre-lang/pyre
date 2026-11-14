@@ -461,7 +461,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
         let Some((assign_bb, read_bb, local_n)) = found else {
             continue;
         };
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
 
         // POSITIVE arm: a read placed after its binding block in RPO must
         // bucket as forward-ref.
@@ -586,7 +586,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
             continue;
         }
         finder_matched += 1;
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         let Some((read_bb, local_n)) = parse_read_bb_and_local(&msg) else {
             eprintln!("PARSE-FAIL {name} | {msg}");
             other += 1;
@@ -846,7 +846,7 @@ fn mir_on_unwind_target_taxonomy() {
             // there. Keying on the drop-glue symbol is a proxy; it is the one
             // the corpus actually distinguishes, and a `Switch` appearing under
             // any other name is reported rather than absorbed.
-            let in_drop_glue = fd.item_meta.name_path().contains("drop_in_place");
+            let in_drop_glue = fd.item_meta.name_path_str().contains("drop_in_place");
             let destructor_cleanup = term_kind_label == "Drop"
                 && !matches!(eventual, "Call" | "Return")
                 && (eventual != "Switch" || in_drop_glue);
@@ -859,7 +859,7 @@ fn mir_on_unwind_target_taxonomy() {
                     tally.examples.push(format!(
                         "{}::bb{bb_idx} [{term_kind_label}] on_unwind=bb{on_unwind} \
                          -> {eventual} (chain_len={chain_len}, drop_in_chain={drop_in_chain})",
-                        fd.item_meta.name_path()
+                        fd.item_meta.name_path_str()
                     ));
                 }
             }

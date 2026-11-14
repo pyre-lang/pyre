@@ -4825,7 +4825,7 @@ impl<'a> Lowering<'a> {
             .unwrap_or(node);
         let id = adt_node_def_id(pointee)?;
         let decl = self.llbc.type_by_id(id)?;
-        let name_path = decl.item_meta.name_path();
+        let name_path = decl.item_meta.name_path_str();
         // A crate-relative spelling withdrawn as ambiguous (`function::Method`
         // declared in two crates) keeps the crate in the class identity
         // (`tombstoned_owner_spelling`), and the layout is registered under
@@ -4892,7 +4892,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let name = crate::model::crate_relative_struct_owner(
-            &decl.item_meta.name_path(),
+            decl.item_meta.name_path_str(),
             self.graph.name.split("::").next(),
         );
         let mut ll_fields = Vec::with_capacity(fields.len());
@@ -6211,7 +6211,7 @@ impl<'a> Lowering<'a> {
         if fields.is_empty() || field_decl.is_repr_transparent() {
             return false;
         }
-        let field_path = field_decl.item_meta.name_path();
+        let field_path = field_decl.item_meta.name_path_str();
         !["core::", "alloc::", "std::"]
             .iter()
             .any(|prefix| field_path.starts_with(prefix))
@@ -8815,7 +8815,7 @@ impl<'a> Lowering<'a> {
         // tuple-struct constructor `<Struct>`.
         let variant_idx = match &td.kind {
             TypeDeclKind::Enum(variants) => {
-                let leaf = fd.item_meta.name_path();
+                let leaf = fd.item_meta.name_path_str();
                 let leaf = leaf.rsplit("::").next()?;
                 Some(variants.iter().position(|v| v.name == leaf)?)
             }
@@ -8856,7 +8856,7 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
-        let name_path = td.item_meta.name_path();
+        let name_path = td.item_meta.name_path_str();
         let head_adt = head.as_object();
         let type_leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
         // Struct intern keys a dotted `owner_path.join(".")` path
@@ -9063,7 +9063,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<(bool, bool)> {
         let is_match = type_decl_ref_adt_id(head)
             .and_then(|id| self.llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path() == type_path);
+            .is_some_and(|td| td.item_meta.name_path_str() == type_path);
         if !is_match {
             return None;
         }
@@ -9193,7 +9193,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn type_decl_is_declared_gc(&self, td: &TypeDecl) -> bool {
-        let name = strip_crate_prefix(&td.item_meta.name_path());
+        let name = strip_crate_prefix(td.item_meta.name_path_str());
         struct_id_is_declared_gc(
             self.gc_struct_ids,
             super::struct_id_for_type_decl(td),
@@ -9274,7 +9274,7 @@ impl<'a> Lowering<'a> {
         // path (`module::Type` / `module::Enum::Variant`) — the same key
         // the layout layer is registered under. `owner_id` carries the
         // collision-free identity for the layout layer.
-        let name_path = td.item_meta.name_path();
+        let name_path = td.item_meta.name_path_str();
         // `owner_root` is the annotation-side class identity (crate-stripped
         // `module::Type`): a reference-payload workspace enum instantiation
         // reads its field off the per-instantiation variant class
@@ -9471,7 +9471,7 @@ impl<'a> Lowering<'a> {
         if !variants.iter().any(|candidate| candidate.name == variant) {
             return None;
         }
-        self.exception_class_attr_owner(&td.item_meta.name_path(), variants, variant, field)
+        self.exception_class_attr_owner(td.item_meta.name_path_str(), variants, variant, field)
     }
 
     /// Scalar field of an opaque dependency struct.
@@ -9581,10 +9581,10 @@ impl<'a> Lowering<'a> {
         // trait_root the family lookup keys on is the bare trait leaf
         // (matching `register_trait_method`, which registers under
         // `SemanticFunction.trait_root` = the trait's leaf name).
-        let vtable_path = self.llbc.type_by_id(vtable_id)?.item_meta.name_path();
+        let vtable_path = self.llbc.type_by_id(vtable_id)?.item_meta.name_path_str();
         let trait_path = vtable_path
             .strip_suffix("::{vtable}")
-            .unwrap_or(vtable_path.as_str());
+            .unwrap_or(vtable_path);
         let trait_root = trait_path.rsplit("::").next()?.to_string();
         Some((trait_root, method_name))
     }
@@ -9648,7 +9648,7 @@ impl<'a> Lowering<'a> {
         if td.published_struct_copy {
             return None;
         }
-        let path = td.item_meta.name_path();
+        let path = td.item_meta.name_path_str();
         if path_ends_with_segments(&path, "sync::once_lock::OnceLock") {
             return None;
         }
@@ -9698,7 +9698,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<majit_ir::descr::StructId> {
         let value = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(value)?;
-        let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
+        let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path_str();
         let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
             &name_path,
             self.tombstoned_leaves,
@@ -10907,7 +10907,7 @@ pub(in crate::front::mir) fn overlay_field_lltype(
         if struct_id_is_declared_gc(
             gc_struct_ids,
             struct_id_for_type_decl(td),
-            &strip_crate_prefix(&td.item_meta.name_path()),
+            &strip_crate_prefix(td.item_meta.name_path_str()),
         ) {
             return (*GCREF).clone();
         }

@@ -152,11 +152,11 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     let name_path = "pyre_object::rordereddict_entries::entries_item_ptr";
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == name_path)
+        .find(|fd| fd.item_meta.name_path_str() == name_path)
         .unwrap_or_else(|| panic!("{name_path} in pyre-object LLBC"));
     let gcref_id = llbc
         .iter_type_decls()
-        .find(|td| td.item_meta.name_path() == "pyre_object::pyobject::PyObject")
+        .find(|td| td.item_meta.name_path_str() == "pyre_object::pyobject::PyObject")
         .unwrap_or_else(|| panic!("PyObject in pyre-object LLBC"))
         .def_id;
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
@@ -2029,7 +2029,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &llbc,
             fd,
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .rsplit("::")
                 .next()
                 .unwrap()
@@ -2046,7 +2046,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &empty_names,
             &format!(
                 "fixture::{}",
-                fd.item_meta.name_path().rsplit("::").next().unwrap()
+                fd.item_meta.name_path_str().rsplit("::").next().unwrap()
             ),
         )
     };
@@ -2106,7 +2106,7 @@ fn random_genrand32_fixed_array_keeps_concrete_identity() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("::genrand32"))
+        .find(|fd| fd.item_meta.name_path_str().ends_with("::genrand32"))
         .expect("_random::Random::genrand32 in interpreter LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower Random::genrand32");
@@ -2161,7 +2161,7 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
     ] {
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path() == name)
+            .find(|fd| fd.item_meta.name_path_str() == name)
             .unwrap_or_else(|| panic!("{name} in majit-rlib LLBC"));
         crate::test_support::with_lowering(llbc, |context| {
             let graph =
@@ -2930,7 +2930,7 @@ fn live_rbigint_clone_result_is_rbigint_instance() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::gc::live_rbigint")
         .expect("live_rbigint in majit-rlib LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower live_rbigint");
@@ -2964,7 +2964,11 @@ fn pow_from_fn_table_is_array_of_closure_calls() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("rbigint::<Impl>::pow"))
+        .find(|fd| {
+            fd.item_meta
+                .name_path_str()
+                .ends_with("rbigint::<Impl>::pow")
+        })
         .expect("RBigInt::pow in majit-rlib LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd)
@@ -3032,7 +3036,7 @@ fn a_kept_handle_is_the_producer_value() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_int_bitwise_and")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::_int_bitwise_and")
         .expect("_int_bitwise_and in majit-rlib LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower _int_bitwise_and");
@@ -3093,7 +3097,7 @@ fn a_kept_handle_is_the_producer_value() {
         let closure = llbc
             .iter_local_fns()
             .find(|fd| {
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
                     == "majit_rlib::rbigint::_int_bitwise_and::<Impl>::call_once"
             })
             .expect("_int_bitwise_and closure in majit-rlib LLBC");
@@ -3113,7 +3117,7 @@ fn live_rbigint_returns_the_rooted_value() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
+        .find(|fd| fd.item_meta.name_path_str() == "majit_rlib::rbigint::gc::live_rbigint")
         .expect("live_rbigint in majit-rlib LLBC");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower live_rbigint");
@@ -3197,7 +3201,8 @@ fn gcref_address_cast_store_keeps_gcref_pointer() {
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
-            fd.item_meta.name_path() == "majit_rlib::rbigint::<Impl>::with_size_reloading_digits"
+            fd.item_meta.name_path_str()
+                == "majit_rlib::rbigint::<Impl>::with_size_reloading_digits"
         })
         .expect("with_size_reloading_digits");
     crate::test_support::with_lowering(llbc, |context| {
@@ -3287,7 +3292,7 @@ fn assert_extracted_core_body_lowers(llbc: &Llbc, suffix: &str) {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             if !name_path.ends_with(suffix) {
                 continue;
             }
@@ -3372,7 +3377,7 @@ fn random_rnd_keeps_regular_call_to_core_body() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path() == "pyre_module::module::_random::<Impl>::rnd")
+        .find(|fd| fd.item_meta.name_path_str() == "pyre_module::module::_random::<Impl>::rnd")
         .expect("W_Random::rnd");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower rnd");
@@ -3406,7 +3411,11 @@ fn random_wrapper_narrows_nullable_self_to_w_random() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+        .find(|fd| {
+            fd.item_meta
+                .name_path_str()
+                .ends_with("::__majit_wrap_random")
+        })
         .expect("_random::__majit_wrap_random");
     crate::test_support::with_lowering(llbc, |context| {
         let graph = super::lower_fun_decl(context, fd).expect("lower wrapper");
@@ -6560,7 +6569,7 @@ fn range_contains_real_body_carries_le_lt() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let p = fd.item_meta.name_path();
+            let p = fd.item_meta.name_path_str();
             if !p.ends_with("::contains") || !p.contains("ops::range") {
                 continue;
             }
@@ -6602,7 +6611,7 @@ fn range_contains_real_body_carries_le_lt() {
         }
         eprintln!(
             "RangeBounds::contains path={} leaves={leaves:?} binops={binops:?} int_between={int_between}",
-            bounds_fd.item_meta.name_path()
+            bounds_fd.item_meta.name_path_str()
         );
         assert_eq!(int_between, 0, "body must not emit int_between");
         let has = |name: &str| leaves.iter().any(|l| l == name) || binops.iter().any(|b| b == name);
@@ -6638,7 +6647,7 @@ fn range_contains_real_body_carries_le_lt() {
             }
             eprintln!(
                 "Range::contains path={} leaves={range_leaves:?} int_between={range_between}",
-                range_fd.item_meta.name_path()
+                range_fd.item_meta.name_path_str()
             );
             assert_eq!(range_between, 0);
         }
@@ -7470,7 +7479,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
         .iter_local_fns()
         .find(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("::w_module_dict_setitem_str_internal")
         })
         .expect("w_module_dict_setitem_str_internal in pyre-object LLBC");
@@ -7556,7 +7565,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
                 super::trait_impl_id_for_fundecl(callee),
                 None,
                 "module arm must name the inherent setitem_str, bound={bound:?} path={}",
-                callee.item_meta.name_path()
+                callee.item_meta.name_path_str()
             );
             assert_eq!(
                 bound,
@@ -9243,7 +9252,7 @@ fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
         ] {
             let fd = llbc
                 .iter_local_fns()
-                .find(|fd| fd.item_meta.name_path() == name)
+                .find(|fd| fd.item_meta.name_path_str() == name)
                 .unwrap_or_else(|| panic!("{name} in majit-rlib LLBC"));
             let policy = super::strip_crate_prefix(name);
             assert!(
@@ -10267,7 +10276,7 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             if !name_path.ends_with("::result::<Impl>::as_ref") {
                 continue;
             }
@@ -10316,7 +10325,7 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             if !name_path.ends_with("::option::<Impl>::expect") {
                 continue;
             }
@@ -10493,7 +10502,7 @@ fn result_map_err_keeps_regular_call_to_core_body() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             if !name_path.ends_with("::result::<Impl>::map_err") {
                 continue;
             }
@@ -11479,7 +11488,7 @@ fn saturating_sub_wrapper_diamond_real() {
     crate::test_support::with_lowering(llbc, |context| {
         let mut saw = 0usize;
         for fd in llbc.iter_fun_decls() {
-            if fd.item_meta.name_path() != "core::num::<Impl>::saturating_sub" {
+            if fd.item_meta.name_path_str() != "core::num::<Impl>::saturating_sub" {
                 continue;
             }
             if !fd.has_unstructured_body() {
@@ -11687,7 +11696,7 @@ fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
     let mut to_bool_override = false;
     let mut to_bool_default = false;
     for fd in llbc.iter_local_fns() {
-        let name_path = fd.item_meta.name_path();
+        let name_path = fd.item_meta.name_path_str();
         let trait_path = super::trait_impl_trait_path_for_fundecl(llbc, fd);
         let trait_leaf = trait_path.as_deref().and_then(|p| p.rsplit("::").next());
         if trait_leaf == Some("OpcodeStepExecutor")
@@ -12331,7 +12340,7 @@ fn option_of_one_word_item_vec_keeps_the_enum_tag() {
         let fd = llbc
             .iter_local_fns()
             .find(|fd| {
-                fd.item_meta.name_path() == "pyre_interpreter::argument::<Impl>::new"
+                fd.item_meta.name_path_str() == "pyre_interpreter::argument::<Impl>::new"
                     && fd.signature.inputs.len() == 7
             })
             .expect("Arguments::new");

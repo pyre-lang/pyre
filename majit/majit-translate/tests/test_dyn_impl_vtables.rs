@@ -21,7 +21,7 @@ fn strategy_impls(llbc: &Llbc) -> Vec<(String, String)> {
         let Some(decl) = llbc.trait_by_id(trait_id) else {
             continue;
         };
-        let trait_path = decl.item_meta.name_path();
+        let trait_path = decl.item_meta.name_path_str();
         let trait_leaf = trait_path.rsplit("::").next().unwrap_or(&trait_path);
         let concrete_trait = matches!(trait_leaf, "DictStrategy" | "SetStrategy");
         let unwrapped_set = trait_leaf == "AbstractUnwrappedSetStrategy";
@@ -137,7 +137,7 @@ fn dyn_impl_vtable_desc_adt_path(path: &str) -> bool {
 fn global_ty_is_dyn_impl_vtable_desc(llbc: &Llbc, gd: &GlobalDecl) -> bool {
     llbc.global_ty_adt_def_id(gd)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(&td.item_meta.name_path()))
+        .is_some_and(|td| dyn_impl_vtable_desc_adt_path(td.item_meta.name_path_str()))
 }
 
 fn registered_dyn_impls(llbc: &Llbc) -> Vec<(String, String)> {

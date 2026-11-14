@@ -1108,7 +1108,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             {
                 let name = llbc
                     .fn_by_id(*id)
-                    .map(|f| f.item_meta.name_path())
+                    .map(|f| f.item_meta.name_path_str())
                     .unwrap_or_default();
                 from_call.insert(l, name.rsplit("::").take(2).collect::<Vec<_>>().join("::"));
             }
@@ -1736,7 +1736,7 @@ mod tests {
                 got,
                 want,
                 "call-graph edges of {} (id {}) must equal strip_cleanup_blocks",
-                fd.item_meta.name_path(),
+                fd.item_meta.name_path_str(),
                 fd.def_id
             );
         }

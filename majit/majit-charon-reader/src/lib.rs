@@ -172,6 +172,15 @@ pub struct Llbc {
     /// `impl_trait.id`, sorted. `trait_impls` is immutable after parse, so the index is built
     /// once. See [`Llbc::trait_impls_of`].
     trait_impl_rows_by_trait: std::sync::OnceLock<Vec<(u64, usize)>>,
+    /// Indexes into `fun_decls` of every present entry, sorted by `name_path`. The table is
+    /// immutable after parse, so the index is built once. See [`Llbc::fun_decls_named`].
+    fun_decl_ids_by_name: std::sync::OnceLock<Vec<usize>>,
+    /// Indexes into `type_decls` of every present entry, sorted by `name_path`. The table is
+    /// immutable after parse, so the index is built once. See [`Llbc::type_decls_named`].
+    type_decl_ids_by_name: std::sync::OnceLock<Vec<usize>>,
+    /// Indexes into `trait_decls` of every present entry, sorted by `name_path`. The table is
+    /// immutable after parse, so the index is built once. See [`Llbc::trait_decls_named`].
+    trait_decl_ids_by_name: std::sync::OnceLock<Vec<usize>>,
     /// One value the translator derives from this artefact and reuses across queries.
     /// [`Llbc::type_decls_mut`] drops it, since editing a type declaration can change it.
     derived: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
@@ -411,6 +420,37 @@ pub fn with_llbc_link_read<'a, R>(
     }
 }
 
+/// Present (`Some`) table indexes, sorted by `(name_path, index)`.
+fn name_sorted_present_ids<T>(table: &[Option<T>], name: impl Fn(&T) -> &str) -> Vec<usize> {
+    let mut ids: Vec<usize> = table
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+        .collect();
+    ids.sort_unstable_by(|&a, &b| {
+        name(table[a].as_ref().unwrap())
+            .cmp(name(table[b].as_ref().unwrap()))
+            .then(a.cmp(&b))
+    });
+    ids
+}
+
+/// Entries of `table` whose name is `path`, in table-index order. `index` is the
+/// `name_sorted_present_ids` index of `table`, built on first use.
+fn present_named<'a, T>(
+    table: &'a [Option<T>],
+    index: &'a std::sync::OnceLock<Vec<usize>>,
+    name: impl Fn(&T) -> &str,
+    path: &str,
+) -> impl Iterator<Item = &'a T> + 'a {
+    let index = index.get_or_init(|| name_sorted_present_ids(table, &name));
+    let start = index.partition_point(|&i| name(table[i].as_ref().unwrap()) < path);
+    let end = index.partition_point(|&i| name(table[i].as_ref().unwrap()) <= path);
+    index[start..end]
+        .iter()
+        .map(|&i| table[i].as_ref().unwrap())
+}
+
 impl Llbc {
     /// Load and parse a `.llbc` / `.ullbc` JSON file.
     ///
@@ -503,6 +543,9 @@ impl Llbc {
             trait_assoc_index: std::sync::OnceLock::new(),
             drop_impl_owners: std::sync::OnceLock::new(),
             trait_impl_rows_by_trait: std::sync::OnceLock::new(),
+            fun_decl_ids_by_name: std::sync::OnceLock::new(),
+            type_decl_ids_by_name: std::sync::OnceLock::new(),
+            trait_decl_ids_by_name: std::sync::OnceLock::new(),
             derived: std::sync::OnceLock::new(),
             type_flag_memo: std::sync::Mutex::new(Vec::new()),
         })
@@ -628,7 +671,7 @@ impl Llbc {
                 .flatten()
                 .find(|fd| {
                     fd.item_meta
-                        .name_path()
+                        .name_path_str()
                         .ends_with("::call::register_eval_override")
                 })
                 .and_then(|fd| fd.signature.inputs.first())
@@ -1007,7 +1050,7 @@ impl Llbc {
     pub fn local_fn(&self, name: &str) -> Option<&FunDecl> {
         let suffix = format!("::{name}");
         for f in self.iter_local_fns() {
-            let path = f.item_meta.name_path();
+            let path = f.item_meta.name_path_str();
             if path == name || path.ends_with(&suffix) {
                 return Some(f);
             }
@@ -1208,6 +1251,36 @@ impl Llbc {
         self.trait_impl_rows_of(trait_decl_id).map(|(_, row)| row)
     }
 
+    /// FunDecls whose `name_path` is `path`, in table-index order.
+    pub fn fun_decls_named<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a FunDecl> + 'a {
+        present_named(
+            &self.file.translated.fun_decls,
+            &self.fun_decl_ids_by_name,
+            |d| d.item_meta.name_path_str(),
+            path,
+        )
+    }
+
+    /// TypeDecls whose `name_path` is `path`, in table-index order.
+    pub fn type_decls_named<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a TypeDecl> + 'a {
+        present_named(
+            &self.file.translated.type_decls,
+            &self.type_decl_ids_by_name,
+            |d| d.item_meta.name_path_str(),
+            path,
+        )
+    }
+
+    /// TraitDecls whose `name_path` is `path`, in table-index order.
+    pub fn trait_decls_named<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a TraitDecl> + 'a {
+        present_named(
+            &self.file.translated.trait_decls,
+            &self.trait_decl_ids_by_name,
+            |d| d.item_meta.name_path_str(),
+            path,
+        )
+    }
+
     /// The translator's derived value for this artefact, computed by `init` on first use.
     /// One artefact holds one derived type; asking for another type panics.
     pub fn derived<T: std::any::Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> &T {
@@ -1217,10 +1290,11 @@ impl Llbc {
             .expect("Llbc::derived holds one type")
     }
 
-    /// Mutable access to the type declarations. Drops the [`Llbc::derived`] value
-    /// and the per-type-id flag memo.
+    /// Mutable access to the type declarations. Drops the [`Llbc::derived`] value,
+    /// the per-type-id flag memo, and the name-sorted type-decl index.
     pub fn type_decls_mut(&mut self) -> impl Iterator<Item = &mut TypeDecl> + '_ {
         self.derived = std::sync::OnceLock::new();
+        self.type_decl_ids_by_name = std::sync::OnceLock::new();
         self.type_flag_memo.get_mut().unwrap().clear();
         self.file.translated.type_decls.iter_mut().flatten()
     }
@@ -1312,7 +1386,7 @@ impl Llbc {
                             .and_then(serde_json::Value::as_u64)
                             .and_then(|trait_id| self.trait_by_id(trait_id))
                             .is_none_or(|decl| {
-                                decl.item_meta.name_path() == "core::ops::drop::Drop"
+                                decl.item_meta.name_path_str() == "core::ops::drop::Drop"
                             })
                             .then_some(owner)
                     })

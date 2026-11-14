@@ -3868,7 +3868,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             assert!(
                 fd.has_unstructured_body(),
                 "Constants::index FunDecl {} is Opaque",
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
             );
         }
     }
@@ -3904,7 +3904,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             assert!(
                 fd.has_unstructured_body(),
                 "Constants::deref FunDecl {} is Opaque",
-                fd.item_meta.name_path()
+                fd.item_meta.name_path_str()
             );
             deref_ids.push(id);
         }
@@ -3972,10 +3972,11 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     let mut boxed_handlers = 0usize;
     crate::test_support::with_lowering(llbc, |context| {
         for fd in llbc.iter_local_fns().filter(|fd| {
-            fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
+            fd.item_meta.name_path_str().ends_with("::bigint_constant")
+                && fd.unstructured().is_some()
         }) {
             let graph = super::lower_fun_decl(context, fd)
-                .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path()));
+                .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path_str()));
             let calls: Vec<&[String]> = graph
                 .blocks
                 .iter()
@@ -12142,7 +12143,7 @@ fn option_map_or_keeps_regular_call_to_core_body() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             if !name_path.ends_with("::option::<Impl>::map_or") {
                 continue;
             }
@@ -12218,7 +12219,7 @@ fn option_map_family_keeps_regular_call_to_core_body() {
                 if !fd.has_unstructured_body() {
                     continue;
                 }
-                let name_path = fd.item_meta.name_path();
+                let name_path = fd.item_meta.name_path_str();
                 if !name_path.ends_with(&suffix) {
                     continue;
                 }
@@ -12383,7 +12384,7 @@ fn option_map_or_else_and_flatten_keep_regular_call_to_core_body() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let name_path = fd.item_meta.name_path();
+            let name_path = fd.item_meta.name_path_str();
             let is_map_or_else = name_path.ends_with("::option::<Impl>::map_or_else");
             let is_flatten = name_path.ends_with("::option::<Impl>::flatten");
             if !is_map_or_else && !is_flatten {
@@ -12422,7 +12423,7 @@ fn option_map_or_else_and_flatten_keep_regular_call_to_core_body() {
             }
             if !fd
                 .item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("::type_fully_qualified_name")
             {
                 continue;
@@ -16576,7 +16577,7 @@ fn fundecl_module_is_the_crate_qualified_defining_module() {
     let module_of = |name: &str| {
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path() == name)
+            .find(|fd| fd.item_meta.name_path_str() == name)
             .unwrap_or_else(|| panic!("no fun decl {name}"));
         super::fundecl_module(fd)
     };
@@ -16588,13 +16589,13 @@ fn fundecl_module_is_the_crate_qualified_defining_module() {
         .iter_local_fns()
         .find(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .starts_with("pyre_module::module::")
                 && fd.item_meta.name.iter().any(|seg| seg.is_impl())
         })
         .expect("a method under pyre_module::module");
     let module = super::fundecl_module(method).expect("method module");
-    let name_path = method.item_meta.name_path();
+    let name_path = method.item_meta.name_path_str();
     assert!(
         name_path.starts_with(&format!("{module}::<")),
         "{name_path}: module {module} must end at the impl segment"

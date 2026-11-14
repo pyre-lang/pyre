@@ -277,7 +277,7 @@ impl<'a> Lowering<'a> {
         };
         let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
             )
         });
@@ -322,7 +322,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let is_get = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            crate::front::slice_get::is_slice_get_name_path(&fd.item_meta.name_path())
+            crate::front::slice_get::is_slice_get_name_path(fd.item_meta.name_path_str())
         });
         is_get
             && callsite_or_generic_index_is_scalar(
@@ -342,7 +342,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            crate::front::slice_get::is_slice_get_mut_name_path(&fd.item_meta.name_path())
+            crate::front::slice_get::is_slice_get_mut_name_path(fd.item_meta.name_path_str())
         })
     }
 
@@ -355,7 +355,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::<Impl>::first" | "core::slice::<Impl>::last"
             )
         })
@@ -432,9 +432,9 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::index::<Impl>::index_mut")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str() == "core::slice::index::<Impl>::index_mut"
+        })
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
@@ -448,7 +448,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::slice::<Impl>::swap")
     }
 
     /// Element type of a `core::slice::<Impl>::swap` call, read off the
@@ -488,7 +488,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref"
+            fd.item_meta.name_path_str() == "pyre_object::object_array::<Impl>::set_ref"
         })
     }
 
@@ -499,7 +499,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::object_array::items_block_set_ref"
+            fd.item_meta.name_path_str() == "pyre_object::object_array::items_block_set_ref"
         })
     }
 
@@ -510,7 +510,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::typeobject::type_write_barrier"
+            fd.item_meta.name_path_str() == "pyre_object::typeobject::type_write_barrier"
         })
     }
 
@@ -671,7 +671,7 @@ impl<'a> Lowering<'a> {
         let mut elem_align: Option<u64> = None;
         let mut saw = false;
         for td in self.llbc.iter_type_decls() {
-            let name = td.item_meta.name_path();
+            let name = td.item_meta.name_path_str();
             let td_leaf = name.rsplit("::").next().unwrap_or("");
             if td_leaf.split('<').next().unwrap_or(td_leaf) != leaf {
                 continue;
@@ -915,7 +915,7 @@ impl<'a> Lowering<'a> {
         };
         let leaf = fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .rsplit("::")
             .next()
             .unwrap_or("")
@@ -1197,7 +1197,7 @@ impl<'a> Lowering<'a> {
             let Some(trait_path) = self
                 .llbc
                 .trait_by_id(trait_id)
-                .map(|decl| decl.item_meta.name_path())
+                .map(|decl| decl.item_meta.name_path_str())
             else {
                 continue;
             };
@@ -1229,7 +1229,7 @@ impl<'a> Lowering<'a> {
                 let Some(fd) = self.llbc.fn_by_id(fid) else {
                     continue;
                 };
-                if fd.item_meta.name_path().rsplit("::").next() != Some("default") {
+                if fd.item_meta.name_path_str().rsplit("::").next() != Some("default") {
                     continue;
                 }
                 return Some(self.assoc_fn_call_target(fd));
@@ -1248,7 +1248,7 @@ impl<'a> Lowering<'a> {
             spec_segments(self.llbc, fd, &leaf)
         } else {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .split("::")
                 .map(str::to_string)
                 .collect()
@@ -1650,7 +1650,7 @@ impl<'a> Lowering<'a> {
                 if td.is_repr_transparent() && fields.len() == 1 {
                     return self.move_plan(&fields[0].ty);
                 }
-                let name_path = td.item_meta.name_path();
+                let name_path = td.item_meta.name_path_str();
                 let owner = class_identity_spelling(&name_path, self.tombstoned_leaves);
                 let owner_id =
                     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
@@ -1692,7 +1692,7 @@ impl<'a> Lowering<'a> {
                 })
             }
             TypeDeclKind::Enum(variants) => {
-                let name_path = td.item_meta.name_path();
+                let name_path = td.item_meta.name_path_str();
                 let leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
                 let canon = strip_crate_prefix(&name_path);
                 let base_id = majit_ir::descr::StructId::from_canonical(&canon);
@@ -1913,7 +1913,7 @@ impl<'a> Lowering<'a> {
             .llbc
             .type_by_id(plan.ctor_id)
             .expect("move plan type is in the LLBC");
-        let name_path = td.item_meta.name_path();
+        let name_path = td.item_meta.name_path_str();
         let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
         let leaf = segments.pop().unwrap_or_default();
         let result = self
@@ -2440,7 +2440,7 @@ impl<'a> Lowering<'a> {
             None => type_decl_ref_adt_id(head.as_object()?)?,
         };
         let td = self.llbc.type_by_id(type_id)?;
-        if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
+        if td.item_meta.name_path_str() != "core::sync::atomic::Ordering" {
             return None;
         }
         let TypeDeclKind::Enum(variants) = &td.kind else {
@@ -2459,7 +2459,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path().rsplit("::").next() != Some("get") {
+        if fd.item_meta.name_path_str().rsplit("::").next() != Some("get") {
             return false;
         }
         fd.signature
@@ -2483,7 +2483,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path().rsplit("::").next() != Some("get") {
+        if fd.item_meta.name_path_str().rsplit("::").next() != Some("get") {
             return false;
         }
         recv_ty.is_some_and(|t| tyref_is_oncelock_fn(t, self.llbc))
@@ -2515,7 +2515,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let is_get_or_init = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let name = fd.item_meta.name_path();
+            let name = fd.item_meta.name_path_str();
             name.contains("::once_lock::") && name.rsplit("::").next() == Some("get_or_init")
         });
         is_get_or_init
@@ -2540,7 +2540,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "core::sync::atomic::<Impl>::new"
+            fd.item_meta.name_path_str() == "core::sync::atomic::<Impl>::new"
                 && tyref_atomic_inner_value_type(
                     &fd.signature.output,
                     self.llbc,
@@ -2593,7 +2593,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
             )
         })
@@ -2620,7 +2620,8 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+        if self.llbc.fn_by_id(*id)?.item_meta.name_path_str() != "core::slice::raw::from_raw_parts"
+        {
             return None;
         }
         self.graph
@@ -2660,7 +2661,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "majit_gc::gc_current_object_address")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "majit_gc::gc_current_object_address")
     }
 
     pub(in crate::front::mir) fn is_gc_current_object_address_adapter_graph(&self) -> bool {
@@ -2806,7 +2807,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::ptr::const_ptr::<Impl>::cast_mut" | "core::ptr::mut_ptr::<Impl>::cast_const"
             )
         })
@@ -2997,7 +2998,7 @@ impl<'a> Lowering<'a> {
         if fd.has_unstructured_body() {
             return false;
         }
-        if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
+        if fd.item_meta.name_path_str().rsplit("::").next() != Some("borrow") {
             return false;
         }
         let Some(ti) = self.llbc.trait_impls_raw().get(impl_id as usize) else {
@@ -3012,7 +3013,7 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.trait_by_id(trait_id) else {
             return false;
         };
-        if td.item_meta.name_path() != "core::borrow::Borrow" {
+        if td.item_meta.name_path_str() != "core::borrow::Borrow" {
             return false;
         }
         let Some(types) = ti
@@ -3057,7 +3058,7 @@ impl<'a> Lowering<'a> {
         let leaf_owned: Option<String> = match &reg.kind {
             CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).and_then(|fd| {
                 fd.item_meta
-                    .name_path()
+                    .name_path_str()
                     .rsplit("::")
                     .next()
                     .map(str::to_string)
@@ -3091,7 +3092,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_wtf8")
+        fd.item_meta.name_path_str().rsplit("::").next() == Some("utf8_payload_wtf8")
     }
 
     /// `prebuilt_str_storage(&str) -> *mut UnicodeValueStorage` — the
@@ -3108,7 +3109,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         matches!(
-            fd.item_meta.name_path().as_str(),
+            fd.item_meta.name_path_str(),
             "pyre_object::unicodeobject::prebuilt_str_storage"
                 | "pyre_object::unicodeobject::prebuilt_wtf8_storage"
         )
@@ -3123,34 +3124,34 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_bytes")
+        fd.item_meta.name_path_str().rsplit("::").next() == Some("utf8_payload_bytes")
     }
 
     pub(in crate::front::mir) fn is_w_str_storage(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_str_storage"))
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str().rsplit("::").next() == Some("w_str_storage")
+        })
     }
 
     pub(in crate::front::mir) fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_data"))
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str().rsplit("::").next() == Some("w_bytes_data")
+        })
     }
 
     pub(in crate::front::mir) fn is_w_bytes_block(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_block"))
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str().rsplit("::").next() == Some("w_bytes_block")
+        })
     }
 
     pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
@@ -3158,7 +3159,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
+            fd.item_meta.name_path_str().rsplit("::").next() == Some("bytes_block_chars")
         })
     }
 
@@ -4342,7 +4343,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next();
         // `str::bytes` is the same byte view as `as_bytes`: the iterator
         // yields `u8` and the string is already its bytes. `str::chars`
@@ -4378,7 +4379,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path_str();
         let leaf = path.rsplit("::").next()?;
         match (leaf, argc) {
             ("to_ascii_lowercase", 1) if path.contains("str") => Some("lower"),
@@ -4400,7 +4401,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next();
         // `str::from_utf8_unchecked(&[u8]) -> &str` is the same byte-for-byte
         // view as `Wtf8::from_bytes_unchecked`: the destination is the string.
@@ -4448,7 +4449,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().ends_with("::from_utf8_lossy")
+        fd.item_meta.name_path_str().ends_with("::from_utf8_lossy")
             && tyref_is_cow_str(dest_ty, self.llbc)
     }
 
@@ -4926,7 +4927,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if !fd.item_meta.name_path().ends_with("::to_string") {
+        if !fd.item_meta.name_path_str().ends_with("::to_string") {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
@@ -4938,7 +4939,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().ends_with("::to_string"))
+            .is_some_and(|fd| fd.item_meta.name_path_str().ends_with("::to_string"))
     }
 
     /// `Wtf8::to_wtf8_buf(&self) -> Wtf8Buf`, `<str as ToOwned>::to_owned
@@ -4964,7 +4965,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let np = fd.item_meta.name_path();
+        let np = fd.item_meta.name_path_str();
         let Some(leaf) = np.rsplit("::").next() else {
             return false;
         };
@@ -4995,9 +4996,10 @@ impl<'a> Lowering<'a> {
 
     pub(in crate::front::mir) fn is_copy_or_trait_clone_call(&self, reg: &RegularCall) -> bool {
         match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
-                is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str())
-            }),
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .is_some_and(|fd| is_core_clone_impls_clone_path(fd.item_meta.name_path_str())),
             CallKind::Trait(v) => is_trait_clone_clone(v, self.llbc),
             _ => false,
         }
@@ -5215,7 +5217,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        is_core_default_path(fd.item_meta.name_path().as_str())
+        is_core_default_path(fd.item_meta.name_path_str())
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
     }
 
@@ -5234,7 +5236,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        is_core_tuple_default_path(fd.item_meta.name_path().as_str())
+        is_core_tuple_default_path(fd.item_meta.name_path_str())
             && tyref_is_tuple(dest_ty, self.llbc)
             && self.can_emit_default_of_ty(dest_ty)
     }
@@ -5910,7 +5912,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let segs: Vec<&str> = path.split("::").collect();
         matches!(
             segs.as_slice(),
@@ -5941,7 +5943,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let root = path.split("::").next().unwrap_or("");
         path.rsplit("::").next() == Some("default") && matches!(root, "core" | "std" | "alloc")
     }
@@ -5958,8 +5960,8 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        let path = fd.item_meta.name_path();
-        if !is_core_ptr_add_path(path.as_str()) && !is_core_ptr_sub_path(path.as_str()) {
+        let path = fd.item_meta.name_path_str();
+        if !is_core_ptr_add_path(path) && !is_core_ptr_sub_path(path) {
             return None;
         }
         let pointee = first_arg_ty.and_then(|ty| {
@@ -5975,7 +5977,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
+            .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path_str()))
     }
 
     /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
@@ -6057,7 +6059,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        if !is_core_ptr_write_path(fd.item_meta.name_path().as_str()) {
+        if !is_core_ptr_write_path(fd.item_meta.name_path_str()) {
             return None;
         }
         let ty = value_ty?;
@@ -6162,7 +6164,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path() == "pyre_object::gc_storage::gc_alloc_storage_box"
+        fd.item_meta.name_path_str() == "pyre_object::gc_storage::gc_alloc_storage_box"
             && first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
             && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
     }
@@ -6209,7 +6211,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let np = fd.item_meta.name_path();
+        let np = fd.item_meta.name_path_str();
         let Some(leaf) = np.rsplit("::").next() else {
             return false;
         };
@@ -6240,7 +6242,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let np = fd.item_meta.name_path();
+            let np = fd.item_meta.name_path_str();
             let segs: Vec<String> = np.split("::").map(str::to_string).collect();
             fmt_path_ends_with(&segs, &["fmt", "format"])
         })
@@ -6317,7 +6319,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
+            fd.item_meta.name_path_str() == "core::iter::traits::collect::<Impl>::into_iter"
         })
     }
 
@@ -6336,7 +6338,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::iter::<Impl>::into_iter"
                     | "alloc::vec::<Impl>::into_iter"
                     // `core::array::<Impl>` is the `&[T; N]` by-reference
@@ -6373,7 +6375,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next();
         if leaf != Some("chars") || !path.contains("str") {
             return false;
@@ -6397,7 +6399,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next();
         if leaf != Some("as_ptr") || !path.split("::").any(|seg| seg == "str") {
             return false;
@@ -6424,7 +6426,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path.rsplit("::").next();
         if leaf != Some("len") || !path.split("::").any(|seg| seg == "str") {
             return false;
@@ -6448,7 +6450,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         let leaf = path
             .rsplit("::")
             .next()
@@ -6525,7 +6527,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "alloc::vec::<Impl>::len"
                     | "pyre_object::int_array::<Impl>::len"
                     | "pyre_object::float_array::<Impl>::len"
@@ -6539,7 +6541,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let np = fd.item_meta.name_path();
+            let np = fd.item_meta.name_path_str();
             np.rsplit("::").next() == Some("set_len")
                 && np.split("::").any(|seg| seg == "vec" || seg == "Vec")
         })
@@ -6552,7 +6554,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::object_array::items_block_capacity"
+            fd.item_meta.name_path_str() == "pyre_object::object_array::items_block_capacity"
         })
     }
 
@@ -6578,7 +6580,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::object_array::items_block_items_base"
+            fd.item_meta.name_path_str() == "pyre_object::object_array::items_block_items_base"
         })
     }
 
@@ -6674,9 +6676,9 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::len")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str() == "pyre_object::object_array::<Impl>::len"
+        })
     }
 
     /// Owner leaf of `IntArray::len` / `FloatArray::len` — the nested
@@ -6689,7 +6691,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path_str() {
             "pyre_object::int_array::<Impl>::len" => Some("IntArray"),
             "pyre_object::float_array::<Impl>::len" => Some("FloatArray"),
             _ => None,
@@ -6783,7 +6785,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::len")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::slice::<Impl>::len")
     }
 
     pub(in crate::front::mir) fn is_slice_is_empty(&self, reg: &RegularCall) -> bool {
@@ -6792,7 +6794,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::is_empty")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::slice::<Impl>::is_empty")
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
@@ -6826,9 +6828,9 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             matches!(
-                path.as_str(),
+                path,
                 "core::slice::<Impl>::as_slice"
                     | "core::slice::<Impl>::as_mut_slice"
                     | "pyre_object::object_array::<Impl>::as_slice"
@@ -6847,7 +6849,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path_str() {
             "pyre_object::bytes_array::<Impl>::as_slice"
             | "pyre_object::bytes_array::<Impl>::as_mut_slice" => Some("BytesArray"),
             "pyre_object::unicode_array::<Impl>::as_slice"
@@ -6865,7 +6867,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path_str() {
             "pyre_object::int_array::<Impl>::as_slice"
             | "pyre_object::int_array::<Impl>::as_mut_slice" => Some((
                 "IntArray",
@@ -6902,7 +6904,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::ptr::copy")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::ptr::copy")
     }
 
     /// `core::ptr::copy_nonoverlapping` / `std::ptr::copy_nonoverlapping`.
@@ -6939,7 +6941,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
             )
         })
@@ -7132,7 +7134,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
             )
         })
@@ -7242,7 +7244,7 @@ impl<'a> Lowering<'a> {
         // `name_path` drops `UnsafeCell`).
         let leaf_is_word = |leaf: &str| matches!(leaf, "new" | "into_inner" | "get" | "get_mut");
         let owner_is_cell = |owner: &str| owner == "UnsafeCell" || owner.ends_with("::UnsafeCell");
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         if let Some((owner, leaf)) = path.rsplit_once("::")
             && leaf_is_word(leaf)
             && owner_is_cell(owner)
@@ -7453,7 +7455,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
-                fd.item_meta.name_path().as_str(),
+                fd.item_meta.name_path_str(),
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
             )
         })
@@ -7501,7 +7503,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::mem::forget")
     }
 
     /// `majit_ir::icf::icf_identity_token::<ID>()` /
@@ -7515,7 +7517,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             path == "majit_ir::icf::icf_identity_token"
                 || path == "majit_ir::icf::icf_identity_token_of"
         })
@@ -7528,7 +7530,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::drop")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::mem::drop")
     }
 
     pub(in crate::front::mir) fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
@@ -7537,7 +7539,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::hint::must_use")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::hint::must_use")
     }
 
     /// `RBigInt::translated_alias(self)` is the Rust ownership spelling of an
@@ -7557,7 +7559,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             // Charon spells an inherent impl method owned by another crate
             // either `rbigint::RBigInt::translated_alias` or
             // `rbigint::<Impl>::translated_alias`, depending on which LLBC
@@ -7602,7 +7604,7 @@ impl<'a> Lowering<'a> {
                 }
                 // Inherent `From::from` fixtures have no TraitImpl id; the
                 // declared `from(T) -> T` signature is the same identity.
-                if fd.item_meta.name_path() != "core::convert::<Impl>::from" {
+                if fd.item_meta.name_path_str() != "core::convert::<Impl>::from" {
                     return false;
                 }
                 let Some(src) = fd.signature.inputs.first() else {
@@ -7654,7 +7656,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path() != "core::convert::num::<Impl>::from" {
+        if fd.item_meta.name_path_str() != "core::convert::num::<Impl>::from" {
             return false;
         }
         let Some(src) = fd.signature.inputs.first() else {
@@ -7733,7 +7735,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::is_nan")
     }
 
     /// `f64::abs(self)` — `core` has no graph body (Opaque).  `rfloat`
@@ -7744,7 +7746,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::abs")
     }
 
     /// `core::num::<Impl>::abs` on a word-sized signed integer (`i64` /
@@ -7758,7 +7760,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path() == "core::num::<Impl>::abs"
+        fd.item_meta.name_path_str() == "core::num::<Impl>::abs"
             && fd.signature.inputs.first().is_some_and(|src| {
                 matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"))
             })
@@ -7773,7 +7775,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path_str();
         let leaf = path
             .strip_prefix("core::f64::<Impl>::")
             .or_else(|| path.strip_prefix("std::f64::<Impl>::"))?;
@@ -7792,7 +7794,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_finite")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::is_finite")
     }
 
     /// Rust's opaque infinity predicate maps to ll_math.py ll_math_isinf.
@@ -7802,7 +7804,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_infinite")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::is_infinite")
     }
 
     /// `f64::from_bits(bits)` — `core` has no graph body (Opaque), so map the
@@ -7833,7 +7835,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             // Charon spells an inherent `f64` method either as
             // `core::f64::<Impl>::to_bits` or as `core::f64::to_bits`.
             path.strip_prefix("core::f64::<Impl>::")
@@ -7863,8 +7865,8 @@ impl<'a> Lowering<'a> {
         if self.tyref_literal_int_atom(dest_ty) != Some("I64") {
             return false;
         }
-        let path = fd.item_meta.name_path();
-        match path.as_str() {
+        let path = fd.item_meta.name_path_str();
+        match path {
             "core::f64::<Impl>::to_int_unchecked" | "std::f64::<Impl>::to_int_unchecked" => true,
             "core::convert::num::<Impl>::to_int_unchecked"
             | "core::convert::num::FloatToInt::to_int_unchecked" => {
@@ -8218,7 +8220,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_negative")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::is_sign_negative")
     }
 
     /// `f64::is_sign_positive(self)` — the positive half of the same sign-bit
@@ -8231,7 +8233,7 @@ impl<'a> Lowering<'a> {
         };
         self.llbc
             .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_positive")
+            .is_some_and(|fd| fd.item_meta.name_path_str() == "core::f64::<Impl>::is_sign_positive")
     }
 
     /// `majit_metainterp::jit::promote(x)` / the lower-layer
@@ -8258,7 +8260,7 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path_str() {
             "majit_metainterp::jit::promote" | "majit_ir::jit::promote" => Some("hint_promote"),
             "majit_metainterp::jit::promote_string" => Some("hint_promote_string"),
             "majit_metainterp::jit::promote_unicode" => Some("hint_promote_unicode"),
@@ -8377,7 +8379,7 @@ impl<'a> Lowering<'a> {
                     m.fn_id
                 })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
-            let path = fd.item_meta.name_path();
+            let path = fd.item_meta.name_path_str();
             let leaf = path.rsplit("::").next().unwrap_or("from");
             return Some(IntoDevirt::Target(spec_segments(self.llbc, fd, leaf)));
         }
@@ -8446,7 +8448,7 @@ impl<'a> Lowering<'a> {
         let is_into = self
             .llbc
             .trait_by_id(trait_id)
-            .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into");
+            .is_some_and(|td| td.item_meta.name_path_str() == "core::convert::Into");
         is_into && tyref_is_string_or_os_path_family(dest_ty, self.llbc)
     }
 
@@ -8763,7 +8765,7 @@ pub(in crate::front::mir) fn is_atomic_method(
     let Some(fd) = llbc.fn_by_id(*id) else {
         return false;
     };
-    let name = fd.item_meta.name_path();
+    let name = fd.item_meta.name_path_str();
     if name.rsplit("::").next() != Some(method) {
         return false;
     }
@@ -8799,7 +8801,7 @@ pub(in crate::front::mir) fn is_atomic_from_ptr_identity(
         return false;
     };
     llbc.fn_by_id(*id).is_some_and(|fd| {
-        fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
+        fd.item_meta.name_path_str() == "core::sync::atomic::<Impl>::from_ptr"
             && tyref_atomic_inner_value_type(
                 &fd.signature.output,
                 llbc,

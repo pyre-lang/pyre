@@ -114,7 +114,7 @@ fn classify_call(
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
     let fd = callee_fun_decl(call, llbc)?;
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     let segments: Vec<&str> = path.split("::").collect();
     let leaf = *segments.last()?;
     if let Some(class) = classify_frame_anchor(leaf, &segments, call, llbc) {
@@ -2564,7 +2564,7 @@ fn is_rooted_items_local(body: &Unstructured, llbc: &Llbc, local: usize) -> bool
     super::output_adt_def_id_free(&decl.ty, llbc)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|t| {
-            let path = t.item_meta.name_path();
+            let path = t.item_meta.name_path_str();
             path.rsplit("::").next() == Some("RootedItems")
                 && path.split("::").any(|s| s == super::ROOT_SCOPE_MODULE)
         })
@@ -2576,7 +2576,7 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
     };
     super::output_adt_def_id_free(&decl.ty, llbc)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|t| super::gc_root_scope_type_path(&t.item_meta.name_path()))
+        .is_some_and(|t| super::gc_root_scope_type_path(t.item_meta.name_path_str()))
 }
 
 /// Drop of the guard / `root_scope_close` rewinds to the open depth, so
@@ -2885,7 +2885,7 @@ pub(super) fn erase_shadow_stack(
     }
     // The root-stack runtime itself implements the leaves this pass removes;
     // its bodies stay as written for the callers that keep their brackets.
-    if fd.item_meta.name_path().contains("::gc_roots::") || is_frame_anchor_helper(fd, llbc) {
+    if fd.item_meta.name_path_str().contains("::gc_roots::") || is_frame_anchor_helper(fd, llbc) {
         return Ok(None);
     }
     // `body` keeps every extracted block at its original index (promoted
@@ -3051,7 +3051,7 @@ pub(super) fn erase_or_keep(fd: &FunDecl, body: Unstructured, llbc: &Llbc) -> Un
             crate::decline::record(
                 crate::decline::gate::SHADOW_STACK_ERASE,
                 reason,
-                format_args!("{}", fd.item_meta.name_path()),
+                format_args!("{}", fd.item_meta.name_path_str()),
             );
             body
         }
@@ -3078,7 +3078,7 @@ fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
         let assembled = assembled_effect_from_tables(llbc, &identity);
         if !assembled.is_none() && registered.is_none() {
             overlay_hides += 1;
-            let name = fd.item_meta.name_path();
+            let name = fd.item_meta.name_path_str();
             let msg = format!(
                 "stack-effect overlay: {name} identity={identity} tables {} callee_effect_of None",
                 assembled.describe()
@@ -3091,7 +3091,7 @@ fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
         }
         if registered != walked {
             mismatches += 1;
-            let name = fd.item_meta.name_path();
+            let name = fd.item_meta.name_path_str();
             let why = stack_walk(&body, llbc, &effect)
                 .why
                 .as_deref()
@@ -3373,7 +3373,7 @@ fn resolved_callee_is_origportal_alias(llbc: &Llbc, path: &str) -> bool {
 /// Origportal is a property of the FunDecl, matched by the configured
 /// jitdriver path (`rewritten_origportal_fns`).
 fn is_origportal_alias_fd(llbc: &Llbc, fd: &FunDecl) -> bool {
-    resolved_callee_is_origportal_alias(llbc, &fd.item_meta.name_path())
+    resolved_callee_is_origportal_alias(llbc, fd.item_meta.name_path_str())
 }
 
 /// Registered effect of `identity`: `None` if not sensitive or proven
@@ -5057,7 +5057,7 @@ mod tests {
     fn stack_fn_identity(llbc: &Llbc, suffix: &str) -> String {
         llbc.iter_fun_decls()
             .find(|fd| {
-                let path = fd.item_meta.name_path();
+                let path = fd.item_meta.name_path_str();
                 path == suffix || path.ends_with(&format!("::{suffix}"))
             })
             .map(|fd| super::super::scope_owner_identity(llbc, fd))
@@ -7137,7 +7137,7 @@ mod tests {
             .iter_local_fns()
             .find(|fd| {
                 fd.item_meta
-                    .name_path()
+                    .name_path_str()
                     .ends_with("::w_module_dict_setitem_str_internal")
             })
             .expect("w_module_dict_setitem_str_internal present");

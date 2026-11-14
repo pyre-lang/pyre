@@ -81,7 +81,7 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
             // Without this qualification the canonical registration loop at
             // `lib.rs` cannot find the graph keyed by
             // `[qualified_owner, method]`.
-            let owner = strip_crate_prefix(&td.item_meta.name_path());
+            let owner = strip_crate_prefix(td.item_meta.name_path_str());
             match impl_atomic_alias_leaf(llbc, impl_seg) {
                 Some(alias) => match owner.rsplit_once("::") {
                     Some((module, _)) => format!("{module}::{alias}"),
@@ -122,7 +122,7 @@ pub(in crate::front::mir) fn trait_default_call_segments(
     }
     let self_ty = generics.get("types")?.as_array()?.first()?;
     let td = llbc.type_by_id(resolve_tyexpr_to_adt_def_id_free(llbc, self_ty)?)?;
-    let owner = strip_crate_prefix(&td.item_meta.name_path());
+    let owner = strip_crate_prefix(td.item_meta.name_path_str());
     if owner.is_empty() {
         return None;
     }
@@ -518,7 +518,7 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
-    let path = fd.item_meta.name_path();
+    let path = fd.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or("fn");
     Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
 }
@@ -742,7 +742,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
         llbc,
         gc_struct_ids,
         error_carrier,
-        |fd| marked.contains(&strip_crate_prefix(&fd.item_meta.name_path())),
+        |fd| marked.contains(&strip_crate_prefix(fd.item_meta.name_path_str())),
         true,
         raw_alloc_flavor_structs,
     )
@@ -759,7 +759,7 @@ pub(in crate::front::mir) fn declined_atomic_load_fun_decl(
     use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
     let segments: Vec<String> = fd
         .item_meta
-        .name_path()
+        .name_path_str()
         .split("::")
         .map(String::from)
         .collect();
@@ -1005,7 +1005,7 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
     struct_id_is_declared_gc(
         gc_struct_ids,
         sid,
-        &strip_crate_prefix(&td.item_meta.name_path()),
+        &strip_crate_prefix(td.item_meta.name_path_str()),
     )
 }
 
@@ -1076,8 +1076,8 @@ pub(in crate::front::mir) fn tyref_decl_names_gcref(ty: &TyRef, llbc: &Llbc) -> 
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    let path = td.item_meta.name_path();
-    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    let path = td.item_meta.name_path_str();
+    let leaf = path.rsplit("::").next().unwrap_or(path);
     crate::annotator::bookkeeper::is_gcref_type_spelling(leaf)
         || crate::annotator::bookkeeper::is_gcref_type_spelling(&path)
         || leaf.eq_ignore_ascii_case("GcRef")
@@ -1222,7 +1222,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // so the FunctionPath the declined-Method arm emits resolves.
         let name_path: Vec<String> = fd
             .item_meta
-            .name_path()
+            .name_path_str()
             .split("::")
             .map(String::from)
             .collect();
@@ -1454,7 +1454,7 @@ pub(in crate::front::mir) fn local_crate_opaque_import_external(
     let result_ty = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)?;
     let segments: Vec<String> = fd
         .item_meta
-        .name_path()
+        .name_path_str()
         .split("::")
         .map(str::to_string)
         .collect();
@@ -1585,7 +1585,10 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
                 .cloned()
                 .or_else(|| {
                     tyref_is_rust_heap_string(output, llbc).then(|| {
-                        class_identity_spelling(&td.item_meta.name_path(), no_tombstoned_leaves())
+                        class_identity_spelling(
+                            td.item_meta.name_path_str(),
+                            no_tombstoned_leaves(),
+                        )
                     })
                 });
             match &td.kind {
@@ -1856,7 +1859,7 @@ fn from_impl_conversions(
 ) -> Result<crate::front::result_exc::FromResidualConversion, String> {
     let from_id = llbc
         .iter_trait_decls()
-        .find(|decl| decl.item_meta.name_path() == "core::convert::From")
+        .find(|decl| decl.item_meta.name_path_str() == "core::convert::From")
         .map(|decl| decl.def_id);
     let Some(from_id) = from_id else {
         return Err(format!(
@@ -1894,7 +1897,7 @@ fn from_impl_conversions(
             let Some(fd) = llbc.fn_by_id(fn_id) else {
                 continue;
             };
-            let leaf = fd.item_meta.name_path();
+            let leaf = fd.item_meta.name_path_str();
             if leaf.rsplit("::").next() != Some("from") {
                 continue;
             }
@@ -2057,13 +2060,13 @@ pub(in crate::front::mir) fn type_decl_immutable_fields<'a>(
     td: &TypeDecl,
     table: &'a ImmutableFieldsTable,
 ) -> Option<&'a Vec<(String, crate::model::ImmutableRank)>> {
-    let path = td.item_meta.name_path();
+    let path = td.item_meta.name_path_str();
     let stripped = strip_crate_prefix(&path);
-    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    let leaf = path.rsplit("::").next().unwrap_or(path);
     table
         .get(&stripped)
         .or_else(|| table.get(leaf))
-        .or_else(|| table.get(&path))
+        .or_else(|| table.get(path))
 }
 
 /// `STRUCT._immutable_field(name)` (`jtransform.py` `rewrite_op_getfield`):
@@ -2146,7 +2149,7 @@ pub(in crate::front::mir) fn one_level_pointer_pointee<'a>(
     }
     let def_id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(def_id)?;
-    if td.item_meta.name_path() == "core::ptr::non_null::NonNull" {
+    if td.item_meta.name_path_str() == "core::ptr::non_null::NonNull" {
         let adt = obj.get("Adt")?.as_object()?;
         return type_decl_ref_generics(adt, llbc)?
             .get("types")?
@@ -2203,7 +2206,7 @@ pub(in crate::front::mir) fn flavor_raw_adt_node(
     };
     crate::front::llbc_hints::alloc_flavor_raw_contains(
         raw_alloc_flavor_structs,
-        &td.item_meta.name_path(),
+        td.item_meta.name_path_str(),
     )
 }
 
@@ -2299,7 +2302,7 @@ pub(in crate::front::mir) fn container_declared_gc(
         .is_some_and(|td| {
             crate::front::llbc_hints::alloc_flavor_raw_contains(
                 raw_alloc_flavor_structs,
-                &td.item_meta.name_path(),
+                td.item_meta.name_path_str(),
             )
         })
     {
@@ -2352,7 +2355,7 @@ pub(in crate::front::mir) fn exception_carrier_node(node: &serde_json::Value, ll
         return false;
     };
     llbc.type_by_id(def_id)
-        .is_some_and(|td| td.item_meta.name_path() == carrier)
+        .is_some_and(|td| td.item_meta.name_path_str() == carrier)
 }
 
 /// A non-builtin struct/enum node whose declared kind is Raw.
@@ -2380,7 +2383,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     }
     let name = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .map(|td| strip_crate_prefix(td.item_meta.name_path_str()))
         .unwrap_or_default();
     if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
@@ -2468,7 +2471,7 @@ fn adt_def_is_raw_storage_at(
     // A marked exception-class enum is the minted class, not a raw word
     // bag. `&E` must stay `Ref` so the parameter carries the class root.
     if matches!(&td.kind, TypeDeclKind::Enum(_)) {
-        let path = td.item_meta.name_path();
+        let path = td.item_meta.name_path_str();
         let canon = strip_crate_prefix(&path);
         if exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon).is_some()
         {
@@ -2478,12 +2481,12 @@ fn adt_def_is_raw_storage_at(
     if struct_id_is_declared_gc(
         gc_struct_ids,
         struct_id_for_type_decl(td),
-        &strip_crate_prefix(&td.item_meta.name_path()),
+        &strip_crate_prefix(td.item_meta.name_path_str()),
     ) {
         return false;
     }
     let carrier = llbc.exception_carrier();
-    if !carrier.is_empty() && td.item_meta.name_path() == carrier {
+    if !carrier.is_empty() && td.item_meta.name_path_str() == carrier {
         return false;
     }
     // Flavor-raw stays `InstanceRepr` with malloc flavor raw
@@ -2849,7 +2852,7 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
         if struct_id_is_declared_gc(
             gc_struct_ids,
             struct_id_for_type_decl(td),
-            &strip_crate_prefix(&td.item_meta.name_path()),
+            &strip_crate_prefix(td.item_meta.name_path_str()),
         ) {
             return false;
         }
@@ -2893,11 +2896,14 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
 /// `Vec` / `String` / `Rc` and the object header. A pointer cycle through
 /// `PyObject` is not raw storage: the header holds a class pointer.
 pub(in crate::front::mir) fn adt_path_is_gc_container(llbc: &Llbc, def_id: u64) -> bool {
-    let Some(path) = llbc.type_by_id(def_id).map(|td| td.item_meta.name_path()) else {
+    let Some(path) = llbc
+        .type_by_id(def_id)
+        .map(|td| td.item_meta.name_path_str())
+    else {
         return true;
     };
     matches!(
-        path.as_str(),
+        path,
         "alloc::vec::Vec"
             | "alloc::string::String"
             | "std::vec::Vec"
@@ -3830,7 +3836,7 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
 /// env type's name path without its crate, the same key
 /// `impl_method_owner_for_fundecl` stamps on the impl's `self_ty_root`.
 pub(in crate::front::mir) fn closure_env_call_once_owner(td: &TypeDecl) -> String {
-    strip_crate_prefix(&td.item_meta.name_path())
+    strip_crate_prefix(td.item_meta.name_path_str())
 }
 
 /// Byte compared in a predicate body of the form `item == c`.
@@ -4208,14 +4214,14 @@ pub(in crate::front::mir) fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> boo
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             let leaf = path
                 .split('<')
                 .next()
-                .unwrap_or(path.as_str())
+                .unwrap_or(path)
                 .rsplit("::")
                 .next()
-                .unwrap_or(path.as_str());
+                .unwrap_or(path);
             leaf == "PhantomData" || leaf == "BuildHasherDefault"
         })
     {
@@ -4585,11 +4591,11 @@ pub(in crate::front::mir) fn option_nonzero_word_kind_inner(
     };
     let Some(path) = adt_node_def_id(payload)
         .and_then(|def_id| llbc.type_by_id(def_id))
-        .map(|td| td.item_meta.name_path())
+        .map(|td| td.item_meta.name_path_str())
     else {
         return None;
     };
-    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    let leaf = path.rsplit("::").next().unwrap_or(path);
     if !is_std_nonzero_path(&path) {
         return None;
     }
@@ -4882,7 +4888,7 @@ pub(in crate::front::mir) fn tyref_fieldless_enum_class_root(
     llbc: &Llbc,
 ) -> Option<String> {
     let td = tyref_fieldless_enum_def(ty, llbc)?;
-    Some(strip_crate_prefix(&td.item_meta.name_path()))
+    Some(strip_crate_prefix(td.item_meta.name_path_str()))
 }
 
 /// Interned class-root spelling of a payload-carrying enum `ty`.
@@ -5247,7 +5253,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
         return None;
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
-    Some(format!("{}{suffix}", td.item_meta.name_path()))
+    Some(format!("{}{suffix}", td.item_meta.name_path_str()))
 }
 
 /// Intern class root of a `*mut T` / `*const T` / `NonNull<T>` whose
@@ -5279,7 +5285,7 @@ fn nongc_raw_ptr_return_class_root(
     let is_raw_ptr = node.as_object().is_some_and(|o| o.contains_key("RawPtr"));
     let is_nonnull = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull");
+        .is_some_and(|td| td.item_meta.name_path_str() == "core::ptr::non_null::NonNull");
     if !is_raw_ptr && !is_nonnull {
         return None;
     }
@@ -5435,7 +5441,7 @@ pub(in crate::front::mir) fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             path == "rbigint::RBigInt" || path.ends_with("::rbigint::RBigInt")
         })
 }
@@ -5464,7 +5470,7 @@ pub(in crate::front::mir) fn tyref_is_word_signed_range_adt(
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
             (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
-                && td.item_meta.name_path() == adt_path
+                && td.item_meta.name_path_str() == adt_path
         });
     if !is_range {
         return false;
@@ -5806,7 +5812,7 @@ pub(in crate::front::mir) fn tyref_is_wtf8buf(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path().ends_with("Wtf8Buf"))
+        .is_some_and(|td| td.item_meta.name_path_str().ends_with("Wtf8Buf"))
 }
 
 pub(in crate::front::mir) fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -5814,7 +5820,7 @@ pub(in crate::front::mir) fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> boo
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::string::String")
 }
 
 /// A by-value or exactly-one-raw-pointer `alloc::string::String`.
@@ -5835,7 +5841,7 @@ pub(in crate::front::mir) fn tyref_is_rust_heap_string(ty: &TyRef, llbc: &Llbc) 
     };
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::string::String")
 }
 
 /// Class root of the Rust-heap `alloc::string::String` (crate-stripped
@@ -6276,7 +6282,7 @@ fn type_node_is_declared_classed_adt(node: &serde_json::Value, llbc: &Llbc) -> b
     if !declared {
         return false;
     }
-    let path = td.item_meta.name_path();
+    let path = td.item_meta.name_path_str();
     let stripped = strip_crate_prefix(&path);
     let root = adt_node_class_root_with(node, llbc, no_tombstoned_leaves()).unwrap_or(stripped);
     !raw_ptr_pointee_is_non_adt_spelling("", &path)
@@ -6648,7 +6654,7 @@ pub(in crate::front::mir) fn tyref_is_string_builder(ty: &TyRef, llbc: &Llbc) ->
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(adt_node_def_id)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == STRING_BUILDER_PATH)
+        .is_some_and(|td| td.item_meta.name_path_str() == STRING_BUILDER_PATH)
 }
 
 /// The `name_path` of `rstring.py`'s `StringBuilder` in pyre-object.
@@ -6818,7 +6824,7 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if type_decl_is_builtin_adt(td) || type_decl_is_closure_env(td) {
         return None;
     }
-    if td.item_meta.name_path() == "alloc::boxed::Box" {
+    if td.item_meta.name_path_str() == "alloc::boxed::Box" {
         return None;
     }
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
@@ -6898,7 +6904,7 @@ fn exception_class_by_value_adt<'a>(ty: &TyRef, llbc: &'a Llbc) -> Option<&'a Ty
     }
     let id = adt_node_def_id(node)?;
     let td = llbc.type_by_id(id)?;
-    if td.item_meta.name_path() == "alloc::boxed::Box" {
+    if td.item_meta.name_path_str() == "alloc::boxed::Box" {
         return None;
     }
     Some(td)
@@ -6909,7 +6915,7 @@ fn exception_class_by_value_adt<'a>(ty: &TyRef, llbc: &'a Llbc) -> Option<&'a Ty
 /// in place.
 pub(in crate::front::mir) fn tyref_is_by_value_alloc_string(ty: &TyRef, llbc: &Llbc) -> bool {
     exception_class_by_value_adt(ty, llbc)
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::string::String")
 }
 
 /// Row spelling of an RPython list of str.
@@ -6931,7 +6937,7 @@ pub(in crate::front::mir) fn tyref_is_by_value_vec_string(ty: &TyRef, llbc: &Llb
     let Some(td) = exception_class_by_value_adt(ty, llbc) else {
         return false;
     };
-    if td.item_meta.name_path() != "alloc::vec::Vec" {
+    if td.item_meta.name_path_str() != "alloc::vec::Vec" {
         return false;
     }
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
@@ -6976,7 +6982,7 @@ pub(in crate::front::mir) fn tyref_is_by_value_raw_flavor_struct(
     }
     crate::front::llbc_hints::alloc_flavor_raw_contains(
         raw_alloc_flavor_structs,
-        &td.item_meta.name_path(),
+        td.item_meta.name_path_str(),
     )
 }
 
@@ -7059,7 +7065,7 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
         return true;
     }
     if exception_class_by_value_adt(ty, llbc).is_some_and(|td| {
-        let path = td.item_meta.name_path();
+        let path = td.item_meta.name_path_str();
         path == "alloc::vec::Vec" || path == "alloc::collections::vec_deque::VecDeque"
     }) {
         return false;
@@ -7073,7 +7079,7 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     ) else {
         return true;
     };
-    let path = td.item_meta.name_path();
+    let path = td.item_meta.name_path_str();
     if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, &path) {
         return true;
     }
@@ -7143,7 +7149,7 @@ pub(in crate::front::mir) fn struct_copy_owner_keys(
     td: &TypeDecl,
     tombstoned: &std::collections::HashSet<String>,
 ) -> (String, majit_ir::descr::StructId) {
-    let name_path = td.item_meta.name_path();
+    let name_path = td.item_meta.name_path_str();
     let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
     // Same closure exception as [`Lowering::resolve_adt_field`]: a crate-root
     // or cross-crate-stripped closure would get the full path from
@@ -7660,7 +7666,7 @@ pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
-    let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    let name = llbc.type_by_id(def_id)?.item_meta.name_path_str();
     let as_ty = TyRef::Other(node.clone());
     // A modeled pointer-niche enum is the null word, not an enum class.
     // A tagged enum whose payload is a named transparent handle still
@@ -8045,8 +8051,7 @@ fn type_node_is_rustc_pointer_niche(node: &serde_json::Value, llbc: &Llbc) -> bo
     };
     match llbc
         .type_by_id(def_id)
-        .map(|td| td.item_meta.name_path())
-        .as_deref()
+        .map(|td| td.item_meta.name_path_str())
     {
         Some("core::ptr::non_null::NonNull") => true,
         Some("alloc::vec::Vec") => {
@@ -8225,7 +8230,7 @@ pub(in crate::front::mir) fn tyexpr_to_adt_def_id(
 pub(in crate::front::mir) fn deref_trait_decl_id(llbc: &Llbc) -> Option<u64> {
     let mut found = None;
     for decl in llbc.iter_trait_decls() {
-        if decl.item_meta.name_path() != "core::ops::deref::Deref" {
+        if decl.item_meta.name_path_str() != "core::ops::deref::Deref" {
             continue;
         }
         if found.is_some() {
@@ -8343,7 +8348,7 @@ pub(in crate::front::mir) fn opaque_pointer_handle(decl: &TypeDecl, llbc: &Llbc)
         return false;
     }
     if llbc
-        .transparent_scalar_kind(&decl.item_meta.name_path())
+        .transparent_scalar_kind(decl.item_meta.name_path_str())
         .is_some()
     {
         return false;
@@ -8642,7 +8647,7 @@ fn integer_newtype_inner_field_structural<'a>(
     fields: &'a [FieldDecl],
     llbc: &Llbc,
 ) -> Option<&'a TyRef> {
-    let path = decl.item_meta.name_path();
+    let path = decl.item_meta.name_path_str();
     if path == STRING_BUILDER_PATH || path == "alloc::string::String" {
         return None;
     }
@@ -8880,7 +8885,7 @@ pub(in crate::front::mir) fn tyref_is_oparg(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    let path = td.item_meta.name_path();
+    let path = td.item_meta.name_path_str();
     let Some(leaf) = path.strip_prefix("rustpython_compiler_core::bytecode::oparg::") else {
         return false;
     };
@@ -8977,7 +8982,7 @@ pub(crate) fn same_nominal_adt(llbc: &Llbc, a: u64, b: u64) -> bool {
     };
     x.item_meta.instantiation().is_some()
         && y.item_meta.instantiation().is_some()
-        && x.item_meta.name_path() == y.item_meta.name_path()
+        && x.item_meta.name_path_str() == y.item_meta.name_path_str()
 }
 
 /// A type argument, after peeling `&` / `*mut` / aliases, names an ADT.
@@ -9181,7 +9186,7 @@ pub(in crate::front::mir) fn adt_type_arg_is_pointer_like_depth(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    if td.item_meta.name_path() == "core::ptr::non_null::NonNull" {
+    if td.item_meta.name_path_str() == "core::ptr::non_null::NonNull" {
         return true;
     }
     if let Some((index, _)) = transparent_nonzst_field(td, llbc)
@@ -9209,7 +9214,7 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
         .is_some_and(|t| !t.is_empty());
-    let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    let name = llbc.type_by_id(def_id)?.item_meta.name_path_str();
     if has_type_args {
         // A parameterised workspace ADT (e.g. `CodeObject<C>` used at
         // its one `ConstantData` instantiation) registers in
@@ -9531,7 +9536,7 @@ pub(in crate::front::mir) fn tyref_is_gcref_spelling(ty: &TyRef, llbc: &Llbc) ->
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             path == "GCREFOpaque" || path.ends_with("::GCREFOpaque")
         })
 }
@@ -9627,7 +9632,7 @@ fn type_node_is_c_void(node: &serde_json::Value, llbc: &Llbc) -> bool {
     adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             path == "c_void" || path.ends_with("::c_void")
         })
 }
@@ -10673,7 +10678,9 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     let Some(def_id) = adt_node_def_id(payload) else {
         return false;
     };
-    let payload_path = llbc.type_by_id(def_id).map(|td| td.item_meta.name_path());
+    let payload_path = llbc
+        .type_by_id(def_id)
+        .map(|td| td.item_meta.name_path_str());
     // PyPy TextIOWrapper.pending_bytes is `None` or an ordinary RPython
     // list (`interp_textio.py:_writeflush`). Rust's `Vec<T>` is a
     // three-word source spelling, but the front translates it to the same
@@ -10682,7 +10689,7 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     // A `Vec` of one-word items is instead the address of its raw
     // `{ptr, len, cap}` header, which is never null, so its `Option`
     // keeps the tagged aggregate.
-    match payload_path.as_deref() {
+    match payload_path {
         Some("core::ptr::non_null::NonNull") => true,
         Some("alloc::vec::Vec") => {
             tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), llbc).is_none()
@@ -10727,7 +10734,7 @@ pub(in crate::front::mir) fn tyref_is_box_u8_slice(ty: &TyRef, llbc: &Llbc) -> b
     let is_box = adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Box")
         || type_decl_ref_adt_id(adt)
             .and_then(|id| llbc.type_by_id(id))
-            .is_some_and(|decl| decl.item_meta.name_path() == "alloc::boxed::Box");
+            .is_some_and(|decl| decl.item_meta.name_path_str() == "alloc::boxed::Box");
     if !is_box {
         return false;
     }
@@ -11303,7 +11310,7 @@ pub(in crate::front::mir) fn type_node_box_pointee<'l>(
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|def_id| llbc.type_by_id(def_id))
                 .is_some_and(|td| {
-                    td.item_meta.name_path() == "alloc::boxed::Box"
+                    td.item_meta.name_path_str() == "alloc::boxed::Box"
                         || matches!(
                             &td.src,
                             TypeDeclSrc::Builtin(Some(s)) if s == "Box"
@@ -11335,7 +11342,7 @@ fn type_node_thin_arc_or_rc_pointee<'l>(
     };
     match leaf {
         "Arc" | "Rc" => {
-            let path = td.item_meta.name_path();
+            let path = td.item_meta.name_path_str();
             if !(path.contains("::sync::") || path.contains("::rc::")) {
                 return None;
             }
@@ -11840,7 +11847,7 @@ pub(in crate::front::mir) fn json_ty_is_niche_option_word(
     };
     if llbc
         .type_by_id(id)
-        .is_none_or(|td| td.item_meta.name_path() != "core::option::Option")
+        .is_none_or(|td| td.item_meta.name_path_str() != "core::option::Option")
     {
         return false;
     }
@@ -11945,7 +11952,7 @@ pub(in crate::front::mir) fn json_ty_is_by_value_copy_aggregate(
     if type_decl_struct_owner(td, llbc).is_none() {
         return false;
     }
-    if adt_path_is_interior_mutable(&td.item_meta.name_path()) {
+    if adt_path_is_interior_mutable(td.item_meta.name_path_str()) {
         return false;
     }
     json_ty_is_copy_pod_value(node, llbc, 0)
@@ -12006,7 +12013,7 @@ fn json_ty_is_copy_pod_value(node: &serde_json::Value, llbc: &Llbc, depth: usize
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    if adt_path_is_interior_mutable(&td.item_meta.name_path())
+    if adt_path_is_interior_mutable(td.item_meta.name_path_str())
         || tyref_atomic_arg(&ty, llbc).is_some()
     {
         return false;
@@ -12327,7 +12334,7 @@ pub(in crate::front::mir) fn fun_decl_is_dont_look_inside(
     fd: &FunDecl,
     dont_look_inside: &std::collections::HashSet<String>,
 ) -> bool {
-    dont_look_inside.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+    dont_look_inside.contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
 }
 
 /// A callee reached through its real Rust ABI. It has no unstructured
@@ -12830,7 +12837,7 @@ pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
         let is_into = clause
             .trait_id
             .and_then(|id| llbc.trait_by_id(id))
-            .map(|td| td.item_meta.name_path())
+            .map(|td| td.item_meta.name_path_str())
             .is_some_and(|n| n.rsplit("::").next() == Some("Into"));
         if !is_into {
             continue;
@@ -13328,7 +13335,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
 }
 
 fn transparent_scalar_kind_layout_spelling(decl: &TypeDecl, llbc: &Llbc) -> Option<String> {
-    let kind = llbc.transparent_scalar_kind(&decl.item_meta.name_path())?;
+    let kind = llbc.transparent_scalar_kind(decl.item_meta.name_path_str())?;
     let target = std::env::var("TARGET").unwrap_or_default();
     let size = decl
         .layout_for_target(llbc, &target)
@@ -14249,13 +14256,13 @@ pub(in crate::front::mir) fn ty_dedup_key(v: &serde_json::Value) -> Option<u64> 
 /// `from_impl_conversion` resolve by `TraitDecl.item_meta.name_path`.
 pub(in crate::front::mir) fn trait_decl_is_convert_from(llbc: &Llbc, trait_id: u64) -> bool {
     llbc.trait_by_id(trait_id)
-        .is_some_and(|td| td.item_meta.name_path() == "core::convert::From")
+        .is_some_and(|td| td.item_meta.name_path_str() == "core::convert::From")
 }
 
 /// `core::convert::Into` — the trait `callee_is_blanket_into` selects.
 pub(in crate::front::mir) fn trait_decl_is_convert_into(llbc: &Llbc, trait_id: u64) -> bool {
     llbc.trait_by_id(trait_id)
-        .is_some_and(|td| td.item_meta.name_path() == "core::convert::Into")
+        .is_some_and(|td| td.item_meta.name_path_str() == "core::convert::Into")
 }
 
 fn trait_impl_decl_id(llbc: &Llbc, impl_id: u64) -> Option<u64> {
@@ -14341,7 +14348,7 @@ pub(in crate::front::mir) fn charon_dyn_trait_to_ast_string(
     // the trait's leaf name.
     match json_dyn_trait_decl_id(dynt).and_then(|id| llbc.trait_by_id(id)) {
         Some(td) => {
-            let name = td.item_meta.name_path();
+            let name = td.item_meta.name_path_str();
             let leaf = name.rsplit("::").next().unwrap_or(&name);
             format!("dyn {leaf}")
         }
@@ -14419,7 +14426,7 @@ fn adt_def_is_integer_word(def_id: u64, llbc: &Llbc, stack: &mut Vec<u64>) -> bo
         return true;
     }
     if llbc
-        .transparent_scalar_kind(&td.item_meta.name_path())
+        .transparent_scalar_kind(td.item_meta.name_path_str())
         .is_some()
     {
         return true;
@@ -14499,8 +14506,8 @@ fn type_arg_referent_is_raw_storage(
     if type_decl_is_closure_env(td) || type_decl_is_builtin_adt(td) {
         return false;
     }
-    let path = td.item_meta.name_path();
-    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    let path = td.item_meta.name_path_str();
+    let leaf = path.rsplit("::").next().unwrap_or(path);
     if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
         return false;
     }
@@ -14676,7 +14683,7 @@ fn intern_adt_node_with_numeric_id(
 fn unique_type_id_for_name_path(llbc: &Llbc, path: &str) -> Option<u64> {
     let mut found = None;
     for td in llbc.iter_type_decls() {
-        if td.item_meta.name_path() != path {
+        if td.item_meta.name_path_str() != path {
             continue;
         }
         if found.is_some() {
@@ -15625,7 +15632,7 @@ fn intern_suffix_keeps_cast_leaf(llbc: &Llbc, leaf: &str) -> bool {
         .filter(|td| {
             matches!(td.kind, TypeDeclKind::Struct(_))
                 && !td.published_struct_copy
-                && td.item_meta.name_path().rsplit("::").next() == Some(leaf)
+                && td.item_meta.name_path_str().rsplit("::").next() == Some(leaf)
         })
         .count()
         >= 2
@@ -16265,7 +16272,7 @@ pub(in crate::front::mir) fn abstract_trait_call_target(
     }
     let default_method_path = format!("{trait_path}::{method_leaf}");
     let has_body = llbc.iter_local_fns().any(|fd| {
-        let path = fd.item_meta.name_path();
+        let path = fd.item_meta.name_path_str();
         (path == default_method_path || path.ends_with(&format!("::{default_method_path}")))
             && fd.has_unstructured_body()
     });

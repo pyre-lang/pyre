@@ -2782,7 +2782,7 @@ pub(in crate::front::mir) fn lower_object_fn(name_path: &str) -> crate::model::F
     crate::test_support::with_shared_lowering(llbc, |context| {
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path() == name_path)
+            .find(|fd| fd.item_meta.name_path_str() == name_path)
             .unwrap_or_else(|| panic!("{name_path} in pyre-object LLBC"));
         super::lower_fun_decl(context, fd)
             .unwrap_or_else(|err| panic!("lower {name_path}: {err:?}"))
@@ -10777,7 +10777,7 @@ fn array_from_fn_first_call(llbc: &Llbc) -> majit_charon_reader::ullbc::CallPayl
         .iter_local_fns()
         .find(|fd| {
             fd.item_meta
-                .name_path()
+                .name_path_str()
                 .rsplit("::")
                 .next()
                 .is_some_and(|leaf| leaf.starts_with("from_fn_n"))
@@ -16894,7 +16894,7 @@ fn lower_map_or_core_body(llbc: &Llbc) -> FunctionGraph {
         for fd in llbc.iter_fun_decls() {
             if fd
                 .item_meta
-                .name_path()
+                .name_path_str()
                 .ends_with("::option::<Impl>::map_or")
             {
                 return super::lower_fun_decl(ctx, fd)
@@ -21483,7 +21483,7 @@ fn empty_dict_get_empty_storage_production_recasts_gcref() {
     let mut null_mut_recast = 0usize;
     let mut misses = Vec::new();
     for fd in llbc.iter_local_fns() {
-        let n = fd.item_meta.name_path();
+        let n = fd.item_meta.name_path_str();
         if !n.contains("get_empty_storage") {
             continue;
         }
@@ -21756,7 +21756,7 @@ fn niche_option_nominal_pointers_none_is_null_some_is_identity() {
         crate::test_support::load_ullbc(crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC);
     let box_def_id = corpus
         .iter_type_decls()
-        .find(|td| td.item_meta.name_path() == "alloc::boxed::Box")
+        .find(|td| td.item_meta.name_path_str() == "alloc::boxed::Box")
         .map(|td| td.def_id)
         .expect("Box type declaration in corpus");
     let raw_nominal = serde_json::json!({
@@ -26515,7 +26515,7 @@ fn sized_gate_rejects_unsized_wtf8_accepts_sized_wstruct() {
     // does after `adt_node_def_id`): find its def-id, read layout.size.
     let size_of = |suffix: &str| -> Option<Option<u64>> {
         llbc.iter_type_decls()
-            .find(|td| td.item_meta.name_path().ends_with(suffix))
+            .find(|td| td.item_meta.name_path_str().ends_with(suffix))
             .map(|td| td.layout_for_target(llbc, &target).and_then(|l| l.size))
     };
 

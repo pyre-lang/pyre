@@ -293,7 +293,7 @@ fn ty_id(t: &TyRef) -> Option<u64> {
 pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         // `pin_root` / `shadow_stack_get` live in `pyre-object`. An
         // optional-module artefact extracted `--opaque pyre_object`
         // does not carry those names, but it does carry its own
@@ -383,7 +383,7 @@ pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64
             let is_option = llbc
                 .dedup_to_adt_def_id(t)
                 .and_then(|def| llbc.type_by_id(def))
-                .is_some_and(|td| td.item_meta.name_path() == "core::option::Option");
+                .is_some_and(|td| td.item_meta.name_path_str() == "core::option::Option");
             if !is_option {
                 continue;
             }
@@ -402,7 +402,7 @@ pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64
 
 fn pyerror_def_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     llbc.iter_type_decls()
-        .filter(|td| td.item_meta.name_path().ends_with("::error::PyError"))
+        .filter(|td| td.item_meta.name_path_str().ends_with("::error::PyError"))
         .map(|td| td.def_id)
         .collect()
 }
@@ -444,7 +444,7 @@ fn pyerror_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
         }
     }
     for fd in llbc.iter_fun_decls() {
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         if name.contains("::error::") && name.ends_with("::pin") {
             for inp in &fd.signature.inputs {
                 consider(llbc, &defs, &mut out, inp);
@@ -469,7 +469,7 @@ fn result_pyerror_type_ids(
     let py_defs = pyerror_def_ids(llbc);
     let result_defs: HashSet<u64> = llbc
         .iter_type_decls()
-        .filter(|td| td.item_meta.name_path() == "core::result::Result")
+        .filter(|td| td.item_meta.name_path_str() == "core::result::Result")
         .map(|td| td.def_id)
         .collect();
     let mut seen = HashSet::new();
@@ -550,7 +550,7 @@ pub fn frame_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     ];
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {
-        let name = fd.item_meta.name_path();
+        let name = fd.item_meta.name_path_str();
         if FIRST_INPUT
             .iter()
             .any(|p| name == *p || name.ends_with(&format!("::{p}")))
@@ -3428,7 +3428,7 @@ fn explicit_drop_owners(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
             .get("id")
             .and_then(serde_json::Value::as_u64)
             .and_then(|trait_id| llbc.trait_by_id(trait_id))
-            .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop");
+            .is_none_or(|decl| decl.item_meta.name_path_str() == "core::ops::drop::Drop");
         if drop_or_unknown {
             owners.insert(def_id);
         }
@@ -5223,13 +5223,13 @@ mod tests {
                         pin_facts(&a),
                         pin_facts(&b),
                         "pin facts of {} (id {}) must equal strip_cleanup_blocks",
-                        fd.item_meta.name_path(),
+                        fd.item_meta.name_path_str(),
                         fd.def_id
                     );
                 }
                 (a, b) => panic!(
                     "pin-fact presence of {} (id {}) diverged from strip_cleanup_blocks: retained={} stripped={}",
-                    fd.item_meta.name_path(),
+                    fd.item_meta.name_path_str(),
                     fd.def_id,
                     a.is_some(),
                     b.is_some()
