@@ -255,6 +255,15 @@ pub fn load_llbc(path: &'static str) -> &'static Llbc {
     })
 }
 
+/// `None` when the artefact has not been extracted, so the caller can skip.
+pub fn load_llbc_if_present(path: &'static str) -> Option<&'static Llbc> {
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return None;
+    }
+    Some(load_llbc(path))
+}
+
 /// Lower one named declaration, reusing the artefact's shared context.
 pub fn lower_named(llbc: &'static Llbc, function_name: &str) -> Result<FunctionGraph, LowerError> {
     lower_named_with_static_addrs(llbc, function_name, HostStaticAddrs::default())
