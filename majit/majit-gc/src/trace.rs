@@ -10,6 +10,7 @@
 //! payload start. The collector reads/writes GcRef values at these offsets
 //! directly.
 use majit_ir::GcRef;
+use std::collections::HashMap;
 
 /// One `gctypelayout.GCData.TYPE_INFO` entry of the materialized
 /// type-info group (`GcLLDescr_framework.get_translated_info_for_typeinfo`,
@@ -327,6 +328,22 @@ enum WitnessElement {
     Max,
 }
 
+/// lltype `TYPE` identity `TypeLayoutBuilder.id_of_type` is keyed by.
+///
+/// The referenced object must be a `static` (not a `const`, whose address
+/// is not unique).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct GcTypeKey(usize);
+
+impl GcTypeKey {
+    /// Address of a `'static` object used as the `id_of_type` key.
+    /// The referenced object must be a `static` (not a `const`, whose
+    /// address is not unique).
+    pub fn of<T>(identity: &'static T) -> Self {
+        Self(identity as *const T as usize)
+    }
+}
+
 /// Registry mapping type IDs to their type descriptors and object sizes.
 ///
 /// Mirrors RPython's `gctypelayout.TypeLayoutBuilder` and the surrounding
@@ -337,10 +354,11 @@ enum WitnessElement {
 /// and `freeze_types` (matches the implicit translator-end freeze
 /// captured by `can_add_new_types`).
 pub struct TypeRegistry {
-    /// `gctypelayout.id_of_type` parity — owns one `TypeInfo` per
-    /// registered class. Indexed by typeid as a small integer (the
-    /// majit-internal counterpart to `_unique_cdef_id`).
+    /// One `TypeInfo` per registered class. Indexed by typeid as a small
+    /// integer (the majit-internal counterpart to `_unique_cdef_id`).
     entries: Vec<TypeInfo>,
+    /// `gctypelayout.py` `TypeLayoutBuilder.id_of_type` — `{LLTYPE: type_id}`.
+    id_of_type: HashMap<GcTypeKey, u32>,
     /// `gctypelayout.type_info_group` parity — the contiguous
     /// `(TYPE_INFO, CLASSTYPE)` member array the backend reads at
     /// codegen time via `get_translated_info_for_typeinfo`.
@@ -1142,6 +1160,7 @@ impl TypeRegistry {
     pub fn new() -> Self {
         TypeRegistry {
             entries: Vec::new(),
+            id_of_type: HashMap::new(),
             layout_table: Vec::new(),
             frozen_layout_table: None,
             offset_tables: Vec::new(),
@@ -1149,6 +1168,24 @@ impl TypeRegistry {
             can_add_new_types: true,
             inheritance_ids_assigned: false,
         }
+    }
+
+    /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id`.
+    ///
+    /// Return the stored id on a hit. On a miss, `register` the `TypeInfo`
+    /// (which asserts `can_add_new_types`), store the id, and return it.
+    pub fn get_type_id(&mut self, key: GcTypeKey, info: impl FnOnce() -> TypeInfo) -> u32 {
+        if let Some(&type_id) = self.id_of_type.get(&key) {
+            return type_id;
+        }
+        let type_id = self.register(info());
+        self.id_of_type.insert(key, type_id);
+        type_id
+    }
+
+    /// Lookup in `TypeLayoutBuilder.id_of_type` without allocating a new id.
+    pub fn id_of_type(&self, key: GcTypeKey) -> Option<u32> {
+        self.id_of_type.get(&key).copied()
     }
 
     /// Register a new type and return its type ID.
@@ -1615,6 +1652,40 @@ mod tests {
         assert_eq!(reg.get(id0).size, 16);
         assert_eq!(reg.get(id1).size, 32);
         assert!(!reg.get(id0).has_gc_ptrs);
+    }
+
+    #[test]
+    fn get_type_id_same_key_twice_returns_same_id() {
+        static KEY: u8 = 0;
+        let mut reg = TypeRegistry::new();
+        let key = GcTypeKey::of(&KEY);
+        let id0 = reg.get_type_id(key, || TypeInfo::simple(16));
+        let id1 = reg.get_type_id(key, || TypeInfo::simple(32));
+        assert_eq!(id0, id1);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.id_of_type(key), Some(id0));
+        assert_eq!(reg.get(id0).size, 16);
+    }
+
+    #[test]
+    fn get_type_id_distinct_static_keys_get_ids_in_call_order() {
+        static KEY_A: u8 = 0;
+        static KEY_B: u8 = 1;
+        let mut reg = TypeRegistry::new();
+        let id_a = reg.get_type_id(GcTypeKey::of(&KEY_A), || TypeInfo::simple(8));
+        let id_b = reg.get_type_id(GcTypeKey::of(&KEY_B), || TypeInfo::simple(16));
+        assert_eq!(id_a, 0);
+        assert_eq!(id_b, 1);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeRegistry::register called after freeze_types")]
+    fn get_type_id_miss_after_freeze_panics() {
+        static KEY: u8 = 0;
+        let mut reg = TypeRegistry::new();
+        reg.freeze_types();
+        let _ = reg.get_type_id(GcTypeKey::of(&KEY), || TypeInfo::simple(8));
     }
 
     #[test]
