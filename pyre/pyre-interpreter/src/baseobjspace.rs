@@ -5807,7 +5807,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         if !pyre_object::w_list_setitem(obj, idx, item) {
             return if pyre_object::gc_hook::gc_alloc_failed_pending() {
-                Err(crate::PyError::memory_error(""))
+                Err(crate::runtime_ops::fetch_memory_error())
             } else {
                 Err(PyError::index_error("list assignment index out of range"))
             };
@@ -16532,7 +16532,7 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
             )
         };
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         return Ok(ok);
     }
@@ -16960,7 +16960,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     if !w_dict.is_null() {
         let removed = unsafe { pyre_object::w_dict_delitem_str(w_dict, name) };
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         if removed {
             return Ok(w_none());

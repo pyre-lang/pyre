@@ -3240,6 +3240,9 @@ impl NamespaceOpcodeHandler for PyFrame {
         let base = roots.pin_roots(&[value, w_locals, w_code]);
         let hash = crate::baseobjspace::named_key_hash(name, roots.get(base + 2), nameindex);
         if store_name_into_dict(roots.get(base + 1), name, hash, roots.get(base)) {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
             return Ok(());
         }
         let w_code = roots.get(base + 2);
@@ -3268,12 +3271,18 @@ impl NamespaceOpcodeHandler for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[value, w_globals, w_code]);
         let hash = crate::baseobjspace::named_key_hash(name, roots.get(base + 2), nameindex);
-        if !roots.get(base + 1).is_null()
-            && !store_name_into_dict(roots.get(base + 1), name, hash, roots.get(base))
-        {
-            let w_code = roots.get(base + 2);
-            let key = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
-            crate::baseobjspace::setitem(roots.get(base + 1), key, roots.get(base))?;
+        let w_globals = roots.get(base + 1);
+        if !w_globals.is_null() {
+            if store_name_into_dict(w_globals, name, hash, roots.get(base)) {
+                if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                    return Err(crate::runtime_ops::fetch_memory_error());
+                }
+            } else {
+                let w_code = roots.get(base + 2);
+                let key =
+                    unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
+                crate::baseobjspace::setitem(roots.get(base + 1), key, roots.get(base))?;
+            }
         }
         Ok(())
     }
@@ -3489,6 +3498,7 @@ pub unsafe fn load_global_via_cache_extern(
 /// (`crate::baseobjspace::named_key_hash`), so a stored name is hashed once per
 /// string rather than once per opcode.  Zero leaves the strategy to hash the
 /// borrowed bytes.
+/// `ModuleDictStrategy.setitem_str` is void and can raise MemoryError; callers check `gc_alloc_failed_pending` after it, the `exceptiontransform.py gen_exc_check` shape, which the annotator folds out of the jitcode.
 fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjectRef) -> bool {
     if !unsafe { pyre_object::is_dict(w_ns) } {
         return false;
@@ -3537,6 +3547,9 @@ pub unsafe fn store_name_value_w(
     if let Some(name) = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
         && store_name_into_dict(w_locals, name, 0, value)
     {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(crate::runtime_ops::fetch_memory_error());
+        }
         return Ok(());
     }
     crate::baseobjspace::setitem(w_locals, w_name, value)?;
@@ -3604,7 +3617,11 @@ pub unsafe fn store_global_value_w(
                 None => false,
             }
         });
-        if !stored {
+        if stored {
+            if pyre_object::gc_hook::gc_alloc_failed_pending() {
+                return Err(crate::runtime_ops::fetch_memory_error());
+            }
+        } else {
             crate::baseobjspace::setitem(w_globals, w_name, value)?;
         }
     }

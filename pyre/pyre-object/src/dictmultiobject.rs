@@ -4155,6 +4155,11 @@ pub unsafe fn w_module_dict_store_inner_checked(
         && let Some(ks) = key_as_utf8(key)
     {
         w_module_dict_setitem_str(obj, ks, value);
+        // `celldict.py setitem_str` raises MemoryError from the key's STR
+        // allocation; the caller fetches it (`take_pending_dict_key_error`).
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return Err(DictKeyError);
+        }
         return Ok(());
     }
     if !w_module_dict_is_object_strategy(obj) {

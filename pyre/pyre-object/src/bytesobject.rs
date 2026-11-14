@@ -53,13 +53,14 @@ pub type BytesBlock = crate::unicodeobject::Utf8Str;
 
 /// Allocate a [`BytesBlock`] holding `bytes`.
 ///
-/// `rstr.mallocstr` / `incminimark.malloc_varsize`: nursery allocation with
-/// old-gen spill (`gc_hook::try_gc_alloc`), then
-/// `external_malloc(..., alloc_young=True)` without the collection
-/// (`try_gc_alloc_young_nonmoving_no_collect`) when that does not allocate.
-/// A Failed request returns null so the caller raises (`rstr.py`
-/// `mallocstr` / `gc_alloc_failed_pending`). Host OOM with no pending
-/// exception still aborts. [`try_alloc_bytes_block`] is the `Option` twin.
+/// `incminimark.malloc_varsize` goes through the nursery hook
+/// `try_gc_alloc_nursery_raw`, which collects, or takes `external_malloc`
+/// for a large request. Only NoRoute (no GC allocator installed) falls
+/// back to `try_gc_alloc_young_nonmoving_no_collect`, then the raw block.
+/// A failed request returns null with MemoryError pending (`transform.py`
+/// `_ll_malloc_varsize_no_length`). Host OOM with no pending exception
+/// still aborts (`handle_alloc_error`). [`try_alloc_bytes_block`] is the
+/// `Option` twin.
 ///
 /// Falls back to a plain allocation before the GC is up or in a unit test,
 /// where the block is immortal, as the storage box's `malloc_raw` fallback is.
@@ -97,8 +98,8 @@ fn route_bytes_block(size: usize) -> BlockRoute {
     if tid == 0 {
         return BlockRoute::Raw;
     }
-    // `rstr.mallocstr`: Failed stops; only NoRoute tries the non-moving
-    // young allocator (`alloc_lowlevel_string`).
+    // `_ll_malloc_varsize_no_length` raises on a NULL result; only NoRoute
+    // tries the non-moving young allocator (`alloc_lowlevel_string`).
     let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, size);
     if crate::gc_hook::gc_alloc_failed_pending() && young.is_null() {
         return BlockRoute::Refused;
@@ -714,36 +715,6 @@ mod tests {
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(bytes_block_chars(block), b"leaf");
         }
-    }
-
-    /// `rstr.py mallocstr`: a Failed GC request returns null after storing
-    /// MemoryError (`gc_alloc_failed_pending`). Host OOM still aborts.
-    #[test]
-    fn alloc_bytes_block_failed_returns_null_after_storing_memory_error() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let _hook_lock = crate::gc_hook::hook_test_guard();
-        static PENDING: AtomicBool = AtomicBool::new(false);
-        fn raise() {
-            PENDING.store(true, Ordering::SeqCst);
-        }
-        fn occurred() -> bool {
-            PENDING.load(Ordering::SeqCst)
-        }
-        fn null_hook(_type_id: u32, _payload_size: usize) -> crate::gc_hook::GCREF {
-            std::ptr::null_mut()
-        }
-        PENDING.store(false, Ordering::SeqCst);
-        majit_gc::set_active_raise_memory_error(Some(raise));
-        majit_gc::set_active_exception_occurred(Some(occurred));
-        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
-        crate::gc_hook::register_gc_alloc_hook(null_hook);
-        let p = alloc_bytes_block(b"leaf");
-        assert!(p.is_null());
-        assert!(crate::gc_hook::gc_alloc_failed_pending());
-        PENDING.store(false, Ordering::SeqCst);
-        crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
-        majit_gc::set_active_raise_memory_error(None);
-        majit_gc::set_active_exception_occurred(None);
     }
 
     /// `typedef.py _getusercls(W_BytesObject)`: exact bytes keep the bare

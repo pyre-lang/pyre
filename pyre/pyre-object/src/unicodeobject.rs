@@ -54,8 +54,8 @@ pub type UnicodeValueStorage = Utf8Str;
 /// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
 /// The copy below fills every byte the caller asked for.
 ///
-/// A failed allocation is `MemoryError` upstream (`rstr.py` `mallocstr` /
-/// `rtype_malloc`). The raw helper answers 0; a Failed request returns null
+/// A failed allocation is `MemoryError` upstream (`transform.py`
+/// `_ll_malloc_varsize_no_length`). The raw helper answers 0; a Failed request returns null
 /// so the caller raises (`gc_alloc_failed_pending`). Host OOM with no
 /// pending exception still aborts (`handle_alloc_error`). `Layout::new` is
 /// the abort path's reported request (`items_block_alloc_failed` uses the
@@ -2629,10 +2629,9 @@ mod tests {
         );
     }
 
-    /// `rstr.py mallocstr`: a Failed GC request returns null after storing
-    /// MemoryError (`gc_alloc_failed_pending`). Host OOM still aborts.
+    /// `transform.py` `_ll_malloc_varsize_no_length`: a failed STR / bytes-block request returns null with MemoryError pending (`gc_alloc_failed_pending`).
     #[test]
-    fn alloc_utf8_payload_failed_returns_null_after_storing_memory_error() {
+    fn failed_str_alloc_returns_null_with_memory_error_pending() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let _hook_lock = crate::gc_hook::hook_test_guard();
         static PENDING: AtomicBool = AtomicBool::new(false);
@@ -2652,6 +2651,10 @@ mod tests {
         crate::gc_hook::register_gc_alloc_hook(null_hook);
         let p = alloc_utf8_payload(b"leaf", true);
         assert!(p.is_null());
+        assert!(crate::gc_hook::gc_alloc_failed_pending());
+        PENDING.store(false, Ordering::SeqCst);
+        let b = crate::bytesobject::alloc_bytes_block(b"leaf");
+        assert!(b.is_null());
         assert!(crate::gc_hook::gc_alloc_failed_pending());
         PENDING.store(false, Ordering::SeqCst);
         crate::lowlevel_string::clear_lowlevel_str_gc_type_id();

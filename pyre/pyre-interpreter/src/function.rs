@@ -1584,7 +1584,7 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
         let name = unsafe { crate::function_get_name(obj()) }.to_string();
         let w_name = pyre_object::w_str_new_managed(&name);
         if w_name.is_null() {
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         let _ = pyre_object::gc_roots::pin_root(w_name);
         let args = pyre_object::w_tuple_new(vec![
@@ -1602,7 +1602,7 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
     }
     let w_qualname = pyre_object::w_str_from_wtf8_managed(unsafe { function_get_qualname(obj()) });
     if w_qualname.is_null() {
-        return Err(crate::PyError::memory_error(""));
+        return Err(crate::runtime_ops::fetch_memory_error());
     }
     Ok(w_qualname)
 }
@@ -1625,7 +1625,7 @@ pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
     let name = unsafe { function_get_name(obj) }.to_string();
     let name = pyre_object::w_str_new_managed(&name);
     if name.is_null() {
-        return Err(crate::PyError::memory_error(""));
+        return Err(crate::runtime_ops::fetch_memory_error());
     }
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
@@ -3049,7 +3049,7 @@ pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) -> Result<(), 
         }
         function_set_func_name(obj, name);
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            return Err(crate::PyError::memory_error(""));
+            return Err(crate::runtime_ops::fetch_memory_error());
         }
         Ok(())
     }
@@ -4101,7 +4101,7 @@ pub unsafe fn method_class_bound_qualname(
     };
     let w_name = pyre_object::w_str_new_managed(&format!("{owner_qualname}.{inherited_name}"));
     if w_name.is_null() {
-        return Err(crate::PyError::memory_error(""));
+        return Err(crate::runtime_ops::fetch_memory_error());
     }
     Ok(Some(w_name))
 }
@@ -4168,7 +4168,7 @@ pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, cr
                 Some(mangled) => {
                     let w_mangled = pyre_object::w_str_new_managed(&mangled);
                     if w_mangled.is_null() {
-                        return Err(crate::PyError::memory_error(""));
+                        return Err(crate::runtime_ops::fetch_memory_error());
                     }
                     let _ = pyre_object::gc_roots::pin_root(w_mangled);
                     pyre_object::gc_roots::shadow_stack_len() - 1
