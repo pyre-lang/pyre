@@ -1134,6 +1134,17 @@ mod helper_fnaddr_registry {
         }
     }
 
+    impl majit_ir::helper_fnaddr::ResidualRefResult for PyError {
+        fn into_residual_ref(self) -> i64 {
+            self.0
+        }
+    }
+
+    #[dont_look_inside]
+    fn make_error(code: i64) -> PyError {
+        PyError(code)
+    }
+
     #[dont_look_inside]
     fn maybe_div(a: i64, b: i64) -> Result<i64, PyError> {
         if b == 0 { Err(PyError(7)) } else { Ok(a / b) }
@@ -1218,6 +1229,24 @@ mod helper_fnaddr_registry {
         });
         assert!(found_ff, "(f64, f64) -> f64 trampoline was not registered");
         assert!(found_ii, "(i64, i64) -> f64 trampoline was not registered");
+    }
+
+    #[test]
+    fn by_value_error_return_publishes_ref_word() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::make_error") {
+                assert_eq!(desc.arity, 1);
+                assert_eq!(desc.abi, "w>w");
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(9), 9);
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "by-value error-carrier trampoline was not registered"
+        );
     }
 
     #[test]
