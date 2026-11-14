@@ -274,6 +274,18 @@ pub(crate) fn jit_clear_published_exception() {
     }
 }
 
+/// `pyopcode.py handle_asynchronous_error`: the except handler has the
+/// OperationError, so the breaker bit that stood for the RPython
+/// MemoryError is spent. Opaque: it reads the process-global word and a
+/// thread-local owed flag, same as [`jit_clear_published_exception`].
+#[inline]
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_breaker_on_memory_error(kind: crate::PyErrorKind) {
+    if matches!(kind, crate::PyErrorKind::MemoryError) {
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+    }
+}
+
 /// `ExceptionTransformer.rpyexc_fetch_exception`: save `exc_value`,
 /// `rpyexc_clear`, return that value.  The value half is
 /// `BH_LAST_EXC_VALUE` (`object_residual_raise`); the backend type/value
@@ -347,7 +359,10 @@ pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
 /// this branch is the interpreter-visible conversion: the same
 /// `PyFrame.handle_bytecode` `except MemoryError:
 /// handle_asynchronous_error(ec, space.w_MemoryError)` turn into an
-/// OperationError.
+/// OperationError. The carrier is the prebuilt singleton
+/// ([`fetch_memory_error`]), not a fresh `PyError::memory_error("")`
+/// malloc: that nursery/oldgen allocation is a second collection on a
+/// heap already at `max_heap_size`.
 ///
 /// Clearing the ll exception cells is not in this graph.
 /// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear` run
@@ -358,7 +373,7 @@ pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
 #[inline]
 pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null() {
-        return Err(crate::PyError::memory_error(""));
+        return Err(fetch_memory_error());
     }
     Ok(obj)
 }
@@ -372,7 +387,7 @@ macro_rules! fresh_alloc_or_memory_error {
     ($obj:expr) => {{
         let obj: pyre_object::PyObjectRef = $obj;
         if obj.is_null() {
-            Err(crate::PyError::memory_error(""))
+            Err(crate::runtime_ops::fetch_memory_error())
         } else {
             Ok(obj)
         }

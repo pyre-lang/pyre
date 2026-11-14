@@ -2399,6 +2399,10 @@ pub fn handle_exception_with_context(
         // `_store_exception` cells so a later compiled `GUARD_NO_EXCEPTION`
         // does not re-deliver the value this except already consumed.
         crate::runtime_ops::jit_clear_published_exception();
+        // `pyopcode.py handle_asynchronous_error` has turned the RPython
+        // MemoryError into this OperationError; taking the breaker here is
+        // that landing, so a later ticker wrap does not raise it again.
+        crate::runtime_ops::take_breaker_on_memory_error(err.kind);
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
         *next_instr = (target_bytes / 2) as usize;
