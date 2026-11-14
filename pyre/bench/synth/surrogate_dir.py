@@ -4,6 +4,15 @@
 # `loops_compiled=0` on every backend -- and pypy's side sat on the
 # execution floor, so the gate compared startup. At 1600 the loop compiles
 # and pypy's own execution is a measurement.
+#
+# wasm keeps its own `surrogate_dir.wasm.jitstats`. The guest's posix
+# module has a different surface (it builds `stat_result` first, and
+# `dir(posix)` has 72 names, not 256), so `sorted()` in
+# `structseqtype.__new__` during startup feeds the list_extend jitdriver
+# (`_do_extend_from_iterable`) a different sequence. Its trace starts on
+# the last item and reaches the portal return, which compiles a FINISH
+# trace (`compile_done_with_this_frame`): one more loop, and 200 more
+# guard failures before that green is retraced.
 
 import sys
 
