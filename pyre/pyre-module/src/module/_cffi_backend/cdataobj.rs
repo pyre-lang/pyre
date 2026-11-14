@@ -1012,8 +1012,14 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
         return Err(PyError::type_error("__call__ needs a cdata receiver"));
     }
     // `W_CData.call`: `with self as ptr: return self.ctype.call(ptr, args_w)`.
-    // The gateway reads `len` first so the walker can name the array
-    // descriptor; the pins then keep every argument across `cdata_arg`.
+    // `UnwrapSpec_EmitRun.visit_args_w` (`gateway.py`) passes
+    // `space.fixedview` of the vararg as `args_w`; that list is `args[1:]`.
+    // The pins keep every argument alive across `cdata_arg` on the
+    // interpreter; the jitcode eraser drops them (`RootBracketPlan`), so
+    // the recording walk sees `args` as the incoming GcArray and
+    // `shadow_stack_copy_range(args_base + 1)` as a copy from that array
+    // (`slice_copies` → `copy_object_slice_range_into_vec`, the erased
+    // form of an incoming-slice pin).
     let nargs = args.len();
     let roots = pyre_object::gc_roots::push_roots();
     let args_base = roots.pin_roots(args);

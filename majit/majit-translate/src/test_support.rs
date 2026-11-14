@@ -360,6 +360,7 @@ pub(crate) fn layout_table_for(
                 size: 16,
                 align: 8,
                 gckind,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: RefCell::new(None),

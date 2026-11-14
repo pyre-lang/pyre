@@ -39,8 +39,13 @@ fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
     live.replace_active_box(oldbox, newbox);
 }
 
-/// Bind this walk's live banks onto the MIFrame that is about to pause
-/// for a child: the top inlined Python frame, or the portal.
+/// Bind this walk's live banks onto the current MIFrame.
+///
+/// `pyjitpl.py` `walk_active_trace_refs` walks every `framestack`
+/// `MIFrame.registers_r`, including the frame that is executing. Helper
+/// subwalks park that list on `helper_live`; a Python / portal body parks
+/// it here. Called at frame entry and again when the frame pauses for a
+/// child (`bind_paused_caller_regs` at the CALL).
 pub(super) fn bind_paused_caller_regs(
     session: &std::cell::RefCell<WalkSession>,
     registers_r: &RegisterBank,
@@ -66,13 +71,56 @@ pub(super) fn push_helper_live(
     registers_i: &RegisterBank,
     registers_f: &RegisterBank,
     frame_state: &WalkFrameState,
+    jitcode_index: Option<usize>,
 ) {
-    session.borrow_mut().helper_live.push(LiveFrameRegs::new(
-        registers_r,
-        registers_i,
-        registers_f,
-        frame_state,
-    ));
+    let mut live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
+    live.jitcode_index = jitcode_index;
+    session.borrow_mut().helper_live.push(live);
+}
+
+/// Pops the helper live slot this walk pushed (`pyjitpl.py popframe`).
+pub(super) struct HelperLiveGuard<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl<'a> HelperLiveGuard<'a> {
+    pub(super) fn after_push(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        Self { session }
+    }
+}
+
+impl Drop for HelperLiveGuard<'_> {
+    fn drop(&mut self) {
+        pop_helper_live(self.session);
+    }
+}
+
+/// Stamp the CALL that paused this frame. `MIFrame.run_one_step` has already
+/// advanced past that op, so `build_parent_miframe_from_live_banks` resumes
+/// at `next_pc` (`_setup_return_value_*` / `get_list_of_active_boxes(in_a_call=True)`).
+pub(super) fn mark_paused_caller_call(
+    session: &std::cell::RefCell<WalkSession>,
+    jitcode_index: u32,
+    call_jitcode_pc: usize,
+) {
+    let mut session = session.borrow_mut();
+    if let Some(live) = session.helper_live.last_mut() {
+        live.call_jitcode_pc = Some(call_jitcode_pc);
+        if live.jitcode_index.is_none() {
+            live.jitcode_index = Some(jitcode_index as usize);
+        }
+        return;
+    }
+    if let Some(live) = session
+        .framestack
+        .last_mut()
+        .and_then(|frame| frame.live.as_mut())
+    {
+        live.call_jitcode_pc = Some(call_jitcode_pc);
+        if live.jitcode_index.is_none() {
+            live.jitcode_index = Some(jitcode_index as usize);
+        }
+    }
 }
 
 pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
@@ -222,6 +270,7 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &RegisterBank::default(),
             &suspended_state,
+            None,
         );
         session.borrow_mut().framestack.push(InlineFrame {
             is_portal: false,
@@ -496,6 +545,7 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &RegisterBank::default(),
             &state,
+            None,
         );
         assert_eq!(session.borrow().helper_live.len(), 1);
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
@@ -1538,7 +1588,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     // pyjitpl.py `indexbox.getint()` — the array slot is chosen from
     // the concrete index. Fail loud if the walker can't resolve it.
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
@@ -1810,7 +1860,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
         _ => {

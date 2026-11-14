@@ -231,6 +231,47 @@ fn list_inner_bodies_use_one_descr_per_item_kind() {
     }
 }
 
+/// Helper-innermost resume of `list.pop()` (`pickle_bridge_call_assembler_resumes_caller`
+/// `load_stop` → `self.stack.pop()`) blackhole-interprets this body. Every
+/// strategy-switch arm must not land on `abort`: fused
+/// `float_items.len()` / `.pop()` (and the IntOrFloat twins) residualized
+/// as `abort/>r` and the blackhole then panics (`canonical blackhole aborted`).
+#[test]
+fn w_list_pop_end_inner_strategy_arms_do_not_abort() {
+    link_module_pytypes();
+    let jc = all_jitcodes()
+        .iter()
+        .find(|jc| jc.name == "w_list_pop_end_inner")
+        .expect("w_list_pop_end_inner in all_jitcodes");
+    let table = descr_table();
+    let ops: Vec<_> = decoded_ops(&jc.code).collect();
+    let mut saw_switch = false;
+    for op in decoded_ops(&jc.code) {
+        if !op.opname.starts_with("switch") {
+            continue;
+        }
+        for idx in descr_operands(&jc.code, &op) {
+            let Some(BhDescr::Switch { dict, .. }) = table.get(idx) else {
+                continue;
+            };
+            saw_switch = true;
+            for (key, target) in dict {
+                let first_non_live = ops
+                    .iter()
+                    .find(|op| op.pc >= *target && op.opname != "live")
+                    .unwrap_or_else(|| panic!("no op at/after pc {target} for switch key {key}"));
+                assert!(
+                    !first_non_live.opname.starts_with("abort"),
+                    "w_list_pop_end_inner switch key {key} target {target} lands \
+                     on {} (pickle BH abort path)",
+                    first_non_live.key
+                );
+            }
+        }
+    }
+    assert!(saw_switch, "w_list_pop_end_inner has a strategy switch");
+}
+
 /// `__majit_wrap_random` reads its `&[PyObjectRef]` argument with
 /// `arraylen_gc` / `getarrayitem_gc_r`. Those ops name
 /// `OBJECT_REF_GCARRAY_TYPE_ID` in the frozen pool; rehydrating that
@@ -298,4 +339,71 @@ fn builtin_wrapper_args_reads_bridge_to_the_runtime_object_descr() {
         "__majit_wrap_random has no getarrayitem_gc_r/rid>r whose pool \
          identity is {OBJECT_REF_GCARRAY_TYPE_ID}",
     );
+}
+
+/// `W_BytesIO.read_slice` `p + count` used to be `jit_ll_strconcat`
+/// because Int FieldRead dests stayed Unknown→`'r'`. The shipped
+/// jitcode must keep int add / listslice `rii`, not strconcat.
+#[test]
+fn read_slice_jitcode_has_no_strconcat() {
+    use majit_jitcode::codewriter::jitcode::ConstIRelocKind;
+    link_module_pytypes();
+    let jc = all_jitcodes()
+        .iter()
+        .find(|jc| {
+            matches!(
+                &jc.fnaddr_reloc,
+                Some(ConstIRelocKind::FnAddr { path, .. })
+                    if path.contains("interp_bytesio") && path.contains("read_slice")
+            )
+        })
+        .expect("interp_bytesio read_slice jitcode");
+    let ops: Vec<_> = decoded_ops(&jc.code)
+        .map(|op| format!("{}@{}", op.key, op.pc))
+        .collect();
+    eprintln!(
+        "read_slice name={} code_len={} nops={}\n{ops:#?}",
+        jc.name,
+        jc.code.len(),
+        ops.len()
+    );
+    assert!(
+        !ops.iter().any(|s| s.contains("strconcat")),
+        "read_slice must not residual ll_strconcat; ops={ops:?}"
+    );
+}
+
+/// Every GC ArrayDescr the producer minted carries a non-zero ARRAY identity
+/// (`effectinfo.py compute_bitstrings` has no sentinel). Virtualizable
+/// frame arrays keep `type_id` 0 by design (`vable_arraydescrof`) so a
+/// `GUARD_GC_TYPE` is not false for the other allocator arm. A raw
+/// `rffi.CArray` descr (`raw_carray_descrof`) is not GC-managed and
+/// keeps `type_id` 0: there is no collector type identity for a
+/// headerless native array.
+#[test]
+fn array_descrs_carry_nonzero_identity() {
+    let table = descr_table();
+    for i in 0..table.len() {
+        let Some(BhDescr::Array {
+            type_id,
+            array_type_id,
+            ei_index,
+            is_gc_managed,
+            ..
+        }) = table.get(i)
+        else {
+            continue;
+        };
+        if !*is_gc_managed {
+            continue;
+        }
+        if *ei_index == u32::MAX && array_type_id.is_none() {
+            continue;
+        }
+        assert_ne!(
+            *type_id, 0,
+            "pool ArrayDescr {i} has ARRAY identity 0 \
+             array_type_id={array_type_id:?} ei_index={ei_index}"
+        );
+    }
 }

@@ -466,7 +466,12 @@ impl RootScope {
     }
 
     /// First slot owned by this root bracket.
+    ///
+    /// Residual like [`Self::pin_root`]: `push_roots` already returns the
+    /// `save_point` word, and a look-inside field read would take a Ref
+    /// receiver that word never occupied.
     #[inline]
+    #[majit_macros::dont_look_inside_cannot_raise]
     pub fn base(&self) -> usize {
         self.save_point
     }
@@ -1244,8 +1249,7 @@ pub fn shadow_stack_copy_range_into_vec(base: usize, dst: &mut Vec<PyObjectRef>)
 /// The erased form of [`shadow_stack_copy_range`] when the slots were an
 /// incoming `&[PyObjectRef]` the root-bracket pass took out of the jitcode
 /// (`RootBracketPlan`; `gctransform` / `shadowstack.py push_roots` never
-/// emits a bracket into a jitcode). `W_CData.call` (`cdataobj.py descr_call`)
-/// passes `args_w` through; the wrapper's `args[1:]` copy is that list slice.
+/// emits a bracket into a jitcode).
 ///
 /// `copy_from_slice` is a residual memmove and needs a concrete `src`
 /// pointer. The recording walk of `__majit_wrap_cdata_call` holds the

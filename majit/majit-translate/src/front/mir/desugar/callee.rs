@@ -2830,6 +2830,20 @@ pub(in crate::front::mir) fn str_chars_view_extra_live(
     sites
 }
 
+/// A Call whose result is the length-prefixed byte-string view
+/// (`BytesBlock` / rstr `STR`, `ValueType::Str`). The dest is that view,
+/// so `[p..p+count]` is `__getslice_range`. A host `&[u8]` pair stamps
+/// `Unsigned` and is not this view (`w_bytearray_data`).
+pub(in crate::front::mir) fn opkind_is_byte_payload_view(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            result_ty: ValueType::Str,
+            ..
+        }
+    )
+}
+
 /// `from_raw_parts(ptr, len)` where `ptr` is
 /// `(base as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` and `len` is
 /// `bh_lowlevel_string_len(base)` on that same `base`.
@@ -2914,13 +2928,16 @@ pub(in crate::front::mir) fn operand_is_lowlevel_string_chars_offset(
 
 /// `LOWLEVEL_STRING_CHARS_OFFSET` (`lowlevel_string.rs`) — `size_of` the
 /// rstr `STR` header (`rstr.py` `STR`).
-pub(in crate::front::mir) const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
+const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
     "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET";
 
-pub(in crate::front::mir) fn place_is_chars_offset_global(
-    llbc: &Llbc,
-    place: Option<&Place>,
-) -> bool {
+/// Byte offset of `chars` in rstr `STR` / `BytesBlock` (`Utf8Str`):
+/// hash word, then length word (`llmemory.offsetof(STR, 'chars')`).
+pub(in crate::front::mir) fn lowlevel_string_chars_byte_offset() -> usize {
+    2 * crate::layout::target_word_size()
+}
+
+fn place_is_chars_offset_global(llbc: &Llbc, place: Option<&Place>) -> bool {
     let Some(PlaceKind::Global { id, .. }) = place.map(|place| &place.kind) else {
         return false;
     };

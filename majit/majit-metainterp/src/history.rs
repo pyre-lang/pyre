@@ -898,6 +898,21 @@ impl TreeLoop {
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
     ) -> TreeLoop {
+        match self.try_cut_trace_from(start, original_boxes) {
+            Ok(cut) => cut,
+            Err(msg) => panic!("{msg}"),
+        }
+    }
+
+    /// Fallible [`Self::cut_trace_from`]. A suffix that names a pre-cut
+    /// producer not among `original_boxes` is `Err` rather than a panic, so a
+    /// sibling interp-origin cut (`ResumeFromInterpDescr` from a visited
+    /// header) can skip that header and still compile the guard walk.
+    pub fn try_cut_trace_from(
+        &self,
+        start: TreeLoopCutPosition,
+        original_boxes: &[crate::trace_ctx::GreenBox],
+    ) -> Result<TreeLoop, String> {
         let cut_ops = &self.ops[start.op_index..];
 
         // `TraceIterator.__init__` `force_inputargs`: `_cache[arg.get_position()]
@@ -945,20 +960,20 @@ impl TreeLoop {
 
         let producer_opcode =
             |r: OpRef| -> Option<OpCode> { self.op_defining(r).map(|op| op.opcode) };
-        let resolve = |r: OpRef, where_: &str| -> OpRef {
+        let resolve = |r: OpRef, where_: &str| -> Result<OpRef, String> {
             if !Self::is_runtime_opref(r) {
-                return r;
+                return Ok(r);
             }
             if let Some(&new_ref) = remap.get(&r) {
-                return new_ref;
+                return Ok(new_ref);
             }
-            panic!(
+            Err(format!(
                 "cut-trace leak: {where_} names pre-cut producer {r:?} \
                  (root {:?}) which is not among the merge-point live boxes \
                  (`opencoder.py` `TraceIterator._get` asserts the cache hit; \
                  `pyjitpl.py` `reached_loop_header` `live_arg_boxes`)",
                 producer_opcode(r),
-            );
+            ))
         };
 
         use majit_ir::operand::Operand;
@@ -993,7 +1008,7 @@ impl TreeLoop {
             let opcode = new_op.opcode;
             for j in 0..new_op.num_args() {
                 let old = new_op.arg(j).to_opref();
-                let new_ref = resolve(old, &format!("suffix {opcode:?} arg {j}"));
+                let new_ref = resolve(old, &format!("suffix {opcode:?} arg {j}"))?;
                 new_op.setarg(j, bind_remapped(new_ref, &new_ops, &new_inputargs));
             }
             let cut_opcode = new_op.opcode;
@@ -1022,60 +1037,75 @@ impl TreeLoop {
             }
         }
 
-        let remapped_snapshots: Vec<crate::recorder::Snapshot> = self
-            .snapshots
-            .iter()
-            .map(|snap| {
-                if !suffix_snapshot_offsets.contains(&snap.resume_position) {
-                    return crate::recorder::Snapshot {
-                        resume_position: snap.resume_position,
-                        frames: Vec::new(),
-                        vable_boxes: Vec::new(),
-                        vref_boxes: Vec::new(),
-                    };
-                }
-                let remap_tagged =
-                    |t: &crate::recorder::SnapshotTagged| -> crate::recorder::SnapshotTagged {
-                        match t {
-                            crate::recorder::SnapshotTagged::Box(old_ref, tp) => {
-                                if !Self::is_runtime_opref(*old_ref) {
-                                    return *t;
-                                }
-                                if let Some(&new_ref) = remap.get(old_ref) {
-                                    crate::recorder::SnapshotTagged::Box(new_ref, *tp)
-                                } else {
-                                    panic!(
-                                        "cut-trace leak: suffix snapshot {} names \
-                                         pre-cut producer {old_ref:?} (root {:?}) \
-                                         which is not among the merge-point live boxes \
-                                         (`opencoder.py` `TraceIterator._get` asserts \
-                                         the cache hit; `pyjitpl.py` \
-                                         `reached_loop_header` `live_arg_boxes`)",
-                                        snap.resume_position,
-                                        producer_opcode(*old_ref),
-                                    );
-                                }
-                            }
-                            other => *other,
-                        }
-                    };
-                crate::recorder::Snapshot {
+        let mut remapped_snapshots: Vec<crate::recorder::Snapshot> =
+            Vec::with_capacity(self.snapshots.len());
+        for snap in &self.snapshots {
+            if !suffix_snapshot_offsets.contains(&snap.resume_position) {
+                remapped_snapshots.push(crate::recorder::Snapshot {
                     resume_position: snap.resume_position,
-                    frames: snap
-                        .frames
-                        .iter()
-                        .map(|f| crate::recorder::SnapshotFrame {
-                            jitcode_index: f.jitcode_index,
-                            pc: f.pc,
-                            boxes: f.boxes.iter().map(&remap_tagged).collect(),
-                        })
-                        .collect(),
-                    vable_boxes: snap.vable_boxes.iter().map(&remap_tagged).collect(),
-                    vref_boxes: snap.vref_boxes.iter().map(&remap_tagged).collect(),
+                    frames: Vec::new(),
+                    vable_boxes: Vec::new(),
+                    vref_boxes: Vec::new(),
+                });
+                continue;
+            }
+            let remap_tagged =
+                |t: &crate::recorder::SnapshotTagged| -> Result<crate::recorder::SnapshotTagged, String> {
+                    match t {
+                        crate::recorder::SnapshotTagged::Box(old_ref, tp) => {
+                            if !Self::is_runtime_opref(*old_ref) {
+                                return Ok(*t);
+                            }
+                            if let Some(&new_ref) = remap.get(old_ref) {
+                                Ok(crate::recorder::SnapshotTagged::Box(new_ref, *tp))
+                            } else {
+                                Err(format!(
+                                    "cut-trace leak: suffix snapshot {} names \
+                                     pre-cut producer {old_ref:?} (root {:?}) \
+                                     which is not among the merge-point live boxes \
+                                     (`opencoder.py` `TraceIterator._get` asserts \
+                                     the cache hit; `pyjitpl.py` \
+                                     `reached_loop_header` `live_arg_boxes`)",
+                                    snap.resume_position,
+                                    producer_opcode(*old_ref),
+                                ))
+                            }
+                        }
+                        other => Ok(*other),
+                    }
+                };
+            let mut frames = Vec::with_capacity(snap.frames.len());
+            for f in &snap.frames {
+                let mut boxes = Vec::with_capacity(f.boxes.len());
+                for t in &f.boxes {
+                    boxes.push(remap_tagged(t)?);
                 }
-            })
-            .collect();
-        TreeLoop::from_oprc(new_inputargs, new_ops, remapped_snapshots)
+                frames.push(crate::recorder::SnapshotFrame {
+                    jitcode_index: f.jitcode_index,
+                    pc: f.pc,
+                    boxes,
+                });
+            }
+            let mut vable_boxes = Vec::with_capacity(snap.vable_boxes.len());
+            for t in &snap.vable_boxes {
+                vable_boxes.push(remap_tagged(t)?);
+            }
+            let mut vref_boxes = Vec::with_capacity(snap.vref_boxes.len());
+            for t in &snap.vref_boxes {
+                vref_boxes.push(remap_tagged(t)?);
+            }
+            remapped_snapshots.push(crate::recorder::Snapshot {
+                resume_position: snap.resume_position,
+                frames,
+                vable_boxes,
+                vref_boxes,
+            });
+        }
+        Ok(TreeLoop::from_oprc(
+            new_inputargs,
+            new_ops,
+            remapped_snapshots,
+        ))
     }
 }
 
@@ -2236,6 +2266,24 @@ mod tests {
     }
 
     #[test]
+    fn test_try_cut_trace_from_returns_err_on_leak() {
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        op0.pos().set(iop(2));
+        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
+        op1.pos().set(iop(3));
+        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
+        op2.pos().set(vop(4));
+        let trace = TreeLoop::new(inputargs, vec![op0, op1, op2]);
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let err = trace
+            .try_cut_trace_from(start, &original_boxes)
+            .expect_err("pre-cut producer must be a leak");
+        assert!(err.contains("cut-trace leak"), "{err}");
+    }
+
+    #[test]
     fn test_cut_trace_from_empties_snapshots_no_suffix_guard_names() {
         // `CutTrace` never iterates a snapshot no suffix guard names.
         // A pre-cut snapshot box that is not in `original_boxes` must not
@@ -2527,6 +2575,7 @@ impl TraceCtx {
             // `cut_at` does not rewind `_snapshot_data`. Live guards after
             // the cut no longer name the discarded captures.
             self.snapshots.clear();
+            self.encoded_snapshot_live_refs.clear();
         } else {
             self.snapshots.truncate(pos.snapshot_data_len);
         }
@@ -2688,7 +2737,11 @@ impl TraceCtx {
             // so the snapshot stays in `self.snapshots` for that walk.
             // `snapshot_tagged_to_box` resolves each index immediately
             // before `_encode`. Dropped after: the byte stream is the
-            // record.
+            // record. Keep the TAGBOX Ref FrontendOps as live-box roots
+            // (`pyjitpl.py` `walk_active_trace_refs`): `_resref` must
+            // stay reachable after the register is overwritten, and
+            // `self.snapshots` cannot hold them (decode skip).
+            self.encoded_snapshot_live_refs = snapshot.live_ref_boxes();
             self.snapshots.push(snapshot);
             let id = self
                 .recorder

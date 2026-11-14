@@ -157,6 +157,35 @@ fn is_ptr_int_cast_target(target: &CallTarget) -> bool {
     )
 }
 
+fn is_cast_int_to_ptr_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+}
+
+fn is_signedness_retype_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    matches!(
+        segments.last().map(String::as_str),
+        Some("r_uint" | "intmask")
+    )
+}
+
+fn is_cast_instance_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+}
+
+fn call_is_header_identity(target: &CallTarget, args: &[crate::model::LinkArg]) -> bool {
+    (args.len() == 1 && is_ptr_int_cast_target(target))
+        || (!args.is_empty() && is_cast_instance_target(target))
+}
+
 fn producer_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
     let (block_id, idx) = resolve_to_producer_op(graph, var)?;
     graph
@@ -179,9 +208,7 @@ fn peel_ptr_int_casts(graph: &FunctionGraph, var: &Variable) -> Variable {
             return current;
         };
         match &op.kind {
-            OpKind::Call { target, args, .. }
-                if args.len() == 1 && is_ptr_int_cast_target(target) =>
-            {
+            OpKind::Call { target, args, .. } if call_is_header_identity(target, args) => {
                 current = args[0].clone().into_variable();
             }
             OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
@@ -196,9 +223,7 @@ fn canonical_source(graph: &FunctionGraph, var: &Variable) -> Variable {
     let peeled = peel_ptr_int_casts(graph, var);
     match producer_op(graph, &peeled) {
         Some(op) => match &op.kind {
-            OpKind::Call { target, args, .. }
-                if args.len() == 1 && is_ptr_int_cast_target(target) =>
-            {
+            OpKind::Call { target, args, .. } if call_is_header_identity(target, args) => {
                 canonical_source(graph, &args[0].clone().into_variable())
             }
             OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
@@ -233,20 +258,69 @@ fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
     }
 }
 
-fn ptr_add_chars_offset_header(graph: &FunctionGraph, ptr: &Variable) -> Option<Variable> {
+/// Peel `r_uint` / 2-arg `cast_int_to_ptr(CCHARP, int)` / 1-arg ptr-int
+/// casts wrapping a chars-offset add. The add itself is
+/// `lltype.py` `direct_arrayitems` of `rstr.py` `STR.chars`.
+fn peel_chars_ptr_wrapper(graph: &FunctionGraph, ptr: &Variable) -> Option<Variable> {
     match &producer_op(graph, ptr)?.kind {
-        OpKind::Call { target, args, .. } if args.len() == 2 && is_ptr_add_target(target) => {
-            let offset = args[1].clone().into_variable();
-            is_chars_offset(const_int_of(graph, &offset)?).then(|| args[0].clone().into_variable())
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => Some(operand.clone()),
+        OpKind::Call { target, args, .. }
+            if args.len() == 1
+                && (is_ptr_int_cast_target(target) || is_signedness_retype_target(target)) =>
+        {
+            args[0].as_variable().cloned()
         }
-        OpKind::BinOp { op, lhs, rhs, .. } if op == "add" || op == "int_add" => {
-            is_chars_offset(const_int_of(graph, rhs)?).then(|| lhs.clone())
+        OpKind::Call { target, args, .. }
+            if args.len() == 2 && is_cast_int_to_ptr_target(target) =>
+        {
+            args[1].as_variable().cloned()
         }
         _ => None,
     }
 }
 
-fn len_names_same_header(graph: &FunctionGraph, len: &Variable, header: &Variable) -> bool {
+fn is_direct_ptradd_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("direct_ptradd")
+        && segments.iter().any(|s| s == "lltype")
+}
+
+pub(crate) fn ptr_add_chars_offset_header(
+    graph: &FunctionGraph,
+    ptr: &Variable,
+) -> Option<Variable> {
+    let mut current = ptr.clone();
+    let mut seen: Vec<u64> = Vec::new();
+    loop {
+        if seen.contains(&current.id()) {
+            return None;
+        }
+        seen.push(current.id());
+        match &producer_op(graph, &current)?.kind {
+            OpKind::Call { target, args, .. }
+                if args.len() == 2
+                    && (is_ptr_add_target(target) || is_direct_ptradd_target(target)) =>
+            {
+                let offset = args[1].as_variable()?;
+                return is_chars_offset(const_int_of(graph, offset)?)
+                    .then(|| args[0].as_variable().cloned())
+                    .flatten();
+            }
+            OpKind::BinOp { op, lhs, rhs, .. } if op == "add" || op == "int_add" => {
+                return is_chars_offset(const_int_of(graph, rhs)?).then(|| lhs.clone());
+            }
+            _ => current = peel_chars_ptr_wrapper(graph, &current)?,
+        }
+    }
+}
+
+pub(crate) fn len_names_same_header(
+    graph: &FunctionGraph,
+    len: &Variable,
+    header: &Variable,
+) -> bool {
     let Some(op) = producer_op(graph, len) else {
         return false;
     };

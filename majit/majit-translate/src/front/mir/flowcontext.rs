@@ -154,10 +154,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// hint for a callee in this set so it routes as a `FunctionPath` the
     /// registry resolves to the same residual fnaddr.
     pub(in crate::front::mir) dont_look_inside: &'a std::collections::HashSet<String>,
-    /// Membership of FunDecl paths that carry an `oopspec:jit.*` marker:
+    /// Membership of FunDecl paths that carry an `oopspec:` marker:
     /// this artefact's marker consts, and the program-wide harvested set.
-    /// Residual `&Scalar` spills skip those callees: jtransform rewrites
-    /// them to a box query instead of the rustc pointer ABI.
+    /// Residual `&Scalar` spills skip those callees: `jtransform.py`
+    /// `handle_builtin_call` rewrites them instead of the rustc `&T`
+    /// pointer ABI.
     pub(in crate::front::mir) oopspec_fns: OopspecFns<'a>,
     /// Leaves whose `struct_origins` entry `harden_duplicate_leaf_metadata`
     /// cleared. A duplicated leaf is not a class; [`adt_node_class_root_with`]
@@ -741,14 +742,16 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    block_u8: &[bool],
+    error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[], &[]);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[], &[], block_u8, error_carrier);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
-    let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
+    let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, &[], n_slots);
     // Arguments become startblock inputargs in source order
     // (RPython parity: `flowcontext.py` `init_locals_stack` fills
     // `locals_w`; arguments are `model.py` `Block` inputargs).
@@ -784,6 +787,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // (mirrors the `parse.rs` arg-binding path).
         graph.name_value_var(&var, name.clone());
         *slot = Some(var.clone());
+        // `*const Utf8Str` / `*mut Utf8Str` / `*const BytesBlock` are
+        // `Ptr(STR)` from the pointee declaration (`rstr.py` `STR`).
+        stamp_rstr_str_ptr_from_pointee(&var, &local.ty, llbc);
         let ty = tyref_to_value_type_with(
             &local.ty,
             llbc,
@@ -1487,8 +1493,8 @@ impl<'a> Lowering<'a> {
             raw_alloc_flavor_structs,
         );
         let n_locals = body.locals.locals.len();
-        let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
-            pair_len_shadows(body, llbc, &name, accum);
+        let (len_shadow, str_view_locals, list_view_locals, list_view_fixed, block_u8) =
+            pair_len_shadows(body, llbc, &name, accum, static_addrs.error_carrier);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -1513,8 +1519,12 @@ impl<'a> Lowering<'a> {
         let n_slots = owner_end + atomic_shadow_slot_count(&atomic_shadow);
         // A body returning a pair slice or a window takes the address of
         // the caller's length slot as a trailing parameter. A STR-view
-        // local 0 has no length shadow and still needs the slot.
-        let ret_len_slot_local = ret_len_slot_index(&body.locals, llbc, &len_shadow, n_slots);
+        // local 0 of a transparent STR-pointer wrapper is one `Ptr(STR)`
+        // word (`space.bytes_w`); a slot would convert it to a window at
+        // return (`emit_str_to_window`). A `Utf8Str` header still takes
+        // the slot (STR → window at the function boundary).
+        let ret_len_slot_local =
+            ret_len_slot_index(&body.locals, llbc, &len_shadow, &str_view_locals, n_slots);
         let mut n_slots = n_slots + usize::from(ret_len_slot_local.is_some());
         let mut local_var: Vec<Option<LocalValue>> = vec![None; n_slots];
 
@@ -1566,6 +1576,10 @@ impl<'a> Lowering<'a> {
             if str_view_locals.get(i).copied().unwrap_or(false) {
                 stamp_as_rstr_str(&var);
             }
+            // `*const Utf8Str` / `*mut Utf8Str` / `*const BytesBlock` are
+            // `Ptr(STR)` from the pointee declaration (`rstr.py` `STR`).
+            // Same helper as [`pygraph_initial_block`].
+            stamp_rstr_str_ptr_from_pointee(&var, &local.ty, llbc);
             let ty = tyref_to_value_type_with(
                 &local.ty,
                 llbc,
@@ -2076,6 +2090,7 @@ impl<'a> Lowering<'a> {
                 if let Some(local) = body.locals.locals.get(local_idx) {
                     stamp_rust_vec_header(&var, &local.ty, llbc);
                     stamp_raw_u8_ccharp(&var, &local.ty, llbc);
+                    stamp_rstr_str_ptr_from_pointee(&var, &local.ty, llbc);
                 } else if let Some(slot_ty) =
                     atomic_shadow_slot_ty(&atomic_class, &atomic_shadow, local_idx)
                 {
@@ -2140,6 +2155,16 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
+                // BytesBlock / STR `as_bytes` dests (`block_u8`) are the
+                // same one-word view (`rstr.py` `STR`); `[p..p+count]` is
+                // `__getslice_range` (`LLHelpers.ll_stringslice_startstop`).
+                for (i, marked) in block_u8.iter().enumerate() {
+                    if *marked {
+                        for row in &mut rows {
+                            row.insert(i);
+                        }
+                    }
+                }
                 rows
             },
             block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
@@ -2184,6 +2209,12 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, marked)| marked.then_some(i))
+                .chain(
+                    block_u8
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, marked)| marked.then_some(i)),
+                )
                 .collect(),
             list_view_locals: list_view_locals
                 .iter()
@@ -2489,6 +2520,21 @@ impl<'a> Lowering<'a> {
             .map(|i| fs.entries.get(i).cloned().flatten())
             .collect();
         self.local_var = self.hydrate_words(words);
+    }
+
+    /// `Ptr(STR)` on every bound one-word local whose declared type is a
+    /// raw pointer to rstr `STR`. Same helper as [`pygraph_initial_block`].
+    fn stamp_bound_rstr_str_ptrs(&self) {
+        for (i, slot) in self.local_var.iter().enumerate() {
+            let Some(local) = self.body.locals.locals.get(i) else {
+                continue;
+            };
+            let var = match slot {
+                Some(LocalValue::One(var) | LocalValue::ItemAddr(var)) => var,
+                _ => continue,
+            };
+            stamp_rstr_str_ptr_from_pointee(var, &local.ty, self.llbc);
+        }
     }
 
     /// Record `FrameState.copy`'s fresh input → predecessor Variable.
@@ -3186,6 +3232,12 @@ impl<'a> Lowering<'a> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
         let row = self.block_id.row(mir_bb);
         self.local_var = self.hydrate_words(self.block_entry_local_var[row].unpack());
+        // `FrameState.copy` mints a fresh Variable per slot
+        // (`framestate.py` `_copy` / `Variable(v)`) and leaves
+        // `concretetype` unset. Stamp `Ptr(STR)` from the local's
+        // declared type (`rstr.py` `STR`) so a residual `stroruni.concat`
+        // arg that crossed a block edge still has `SoU.TO == rstr.STR`.
+        self.stamp_bound_rstr_str_ptrs();
         // Framestate scrubs a write-only `index_mut` place (`ll_setitem_fast`
         // has no loaded item), so the entry row hydrates it as `None`.
         // Bind a fresh Variable with no element value so `mem_slot` still
@@ -3519,6 +3571,15 @@ impl<'a> Lowering<'a> {
                 let dest_local = i as usize;
                 let inherit_byte_view = match &rvalue {
                     Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                        self.operand_is_string_byte_view(op)
+                            || operand_tyref(op).is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
+                    }
+                    // Charon spells `*const BytesBlock as *mut Utf8Str` as
+                    // `Rvalue::UnaryOp` Cast, not `Rvalue::Cast`. Same
+                    // operand predicate as the Cast arm so
+                    // `stamp_as_rstr_str` runs when dest is a one-word
+                    // STR view (`rstr.py` `STR`).
+                    Rvalue::UnaryOp(kind, op) if unary_op_is_cast(kind) => {
                         self.operand_is_string_byte_view(op)
                             || operand_tyref(op).is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
                     }
@@ -4013,8 +4074,10 @@ impl<'a> Lowering<'a> {
         discr: Operand,
         targets: SwitchTargets,
     ) -> Result<(), LowerError> {
-        let bb_id = self.emit_bb(mir_bb);
         let discr_var = self.resolve_operand(mir_bb, discr)?;
+        // A pair-slice Index scrutinee (`match bytes[0]`) is `pair_getitem`,
+        // which `fork_in_bounds` closes the head of. Close the emit tail.
+        let bb_id = self.emit_bb(mir_bb);
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 // Constant-bool discriminant: take the known arm
@@ -4681,6 +4744,7 @@ impl<'a> Lowering<'a> {
                     let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
                         *slot == Some(local_idx)
                             && (self.local_holds_str_view(owner)
+                                || self.local_ty_is_str_view(owner)
                                 || self
                                     .local_var
                                     .get(owner)

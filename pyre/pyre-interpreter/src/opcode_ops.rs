@@ -1519,6 +1519,33 @@ pub extern "C" fn jit_baseobjspace_delitem(obj: PyObjectRef, key: PyObjectRef) -
     }
 }
 
+/// One-word residual ABI for [`crate::baseobjspace::delitem_slot`].
+///
+/// The slot body is the builtin `__delitem__` the operator residualizes when
+/// look-inside does not finish. `Result<(), PyError>` is sret, so the raw
+/// function cannot be the residual target; this bridge is the same shape as
+/// [`jit_baseobjspace_delitem`].
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_delitem_slot(obj: PyObjectRef, key: PyObjectRef) -> i64 {
+    match crate::baseobjspace::delitem_slot(obj, key) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+/// One-word residual ABI for [`crate::baseobjspace::filterfalse_next_w`].
+///
+/// `PyResult` is sret. The iterator-next residual keeps its graph (and
+/// EffectInfo) and binds this address the way [`compare_slot_jit_abi`]
+/// binds `compare_slot`.
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_filterfalse_next_w(obj: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::filterfalse_next_w(obj) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
+}
+
 // BUILD_MAP's void `inline_call_r_v` calls this address. The recorded graph
 // is `dict_display_setitem`; its Rust `Result` is a different ABI, so the
 // two must not share an address.

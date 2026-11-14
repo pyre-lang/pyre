@@ -257,6 +257,22 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// `core::slice::index::<Impl>::index(_mut)` — the trait shim for both
+    /// scalar `s[i]` and range `s[a..b]`. Scalar sites take
+    /// [`Self::is_slice_scalar_index_call`]; range sites take the
+    /// `__getslice_*` marker when the receiver is a string byte view.
+    pub(in crate::front::mir) fn is_slice_index_path(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
+            )
+        })
+    }
+
     /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
     /// indexing.  RPython represents the same operation directly as
     /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
@@ -272,15 +288,7 @@ impl<'a> Lowering<'a> {
         reg: &RegularCall,
         index_ty: Option<&TyRef>,
     ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            matches!(
-                fd.item_meta.name_path().as_str(),
-                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
-            )
-        });
+        let is_index = self.is_slice_index_path(reg);
         let callsite_index_is_scalar = index_ty.is_some_and(|ty| {
             vec_index_type_is_scalar(
                 ty,
@@ -1924,10 +1932,14 @@ impl<'a> Lowering<'a> {
         } else {
             format!("{}::{leaf}", segments.join("::"))
         };
+        let mut ctor_target = CallTarget::synthetic_transparent_struct_ctor(segments, leaf);
+        if td.is_repr_transparent() {
+            ctor_target = ctor_target.with_repr_transparent();
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_struct_ctor(segments, leaf),
+                target: ctor_target,
                 args: Vec::new(),
                 result_ty: ValueType::Ref(Some(owner)),
             },
@@ -1994,10 +2006,7 @@ impl<'a> Lowering<'a> {
         if let Some(descr) = self.span_raw_scalar_ptr_or_atomic(ty) {
             return Some(descr);
         }
-        let id = self.tyref_adt_def_id(ty)?;
-        let td = self.llbc.type_by_id(id)?;
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let size = td.layout_for_target(self.llbc, &target)?.size?;
+        let size = self.tyref_layout_byte_size(ty)?;
         if size == 0 || size > 8 {
             return None;
         }
@@ -2060,6 +2069,16 @@ impl<'a> Lowering<'a> {
             },
         });
         Ok(loaded)
+    }
+
+    pub(in crate::front::mir) fn tyref_layout_byte_size(&self, ty: &TyRef) -> Option<u64> {
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        // `layout_for_target` refuses a layout whose field offsets are
+        // still `Deduplicated`. `size_align_for_target` still answers
+        // `size_of` (`DynLike` over `HeldUnion` is 16 bytes).
+        td.size_align_for_target(self.llbc, &target)?.0
     }
 
     pub(in crate::front::mir) fn raw_word_descr(
@@ -2599,30 +2618,249 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Return the owning `BytesBlock` for the exact
-    /// `bytes_block_chars(block)` raw-slice constructor.
+    /// Return the owning `BytesBlock` for a raw-slice constructor over
+    /// address-taken `chars` whose length is that same header's `length`.
     ///
     /// RPython's `STR` is a length-prefixed GC struct with a variable-sized
     /// `chars` array (`lltypesystem/rstr.py`). pyre's `BytesBlock` is that
     /// `STR` (`type BytesBlock = Utf8Str`): the lifted value is the header,
     /// not the interior `chars` address. Matching the defining FieldRead
-    /// also proves this is that layout adapter rather than an unrelated
-    /// raw slice in the helper.
+    /// plus [`crate::front::from_raw_parts::len_names_same_header`] proves
+    /// this is that layout adapter rather than an unrelated raw slice.
+    /// The enclosing function name is not consulted; this subsumes the
+    /// previous `leaf == "bytes_block_chars"` / `_mut` gate.
     pub(in crate::front::mir) fn bytes_block_header_from_raw_parts(
         &self,
         bb_id: BlockId,
         reg: &RegularCall,
         chars: &Variable,
+        len: &Variable,
     ) -> Option<Variable> {
-        if !self.graph_is_bytes_block_chars_or_string_view() {
-            return None;
-        }
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        if path != "core::slice::raw::from_raw_parts"
+            && path != "core::slice::raw::from_raw_parts_mut"
+        {
             return None;
         }
+        // The supplied pointer must SSA-prove as this header's `chars`
+        // (`rstr.py` `STR` / `ll_stritem_nonneg`; `rffi.py` `charpsize2str`
+        // copies from `cp`). Uniqueness of another address-taken field
+        // is not provenance. A live-in with no producer yet leaves the
+        // residual; `rewire_from_raw_parts_sites` recovers once edges
+        // exist (`resolve_to_producer_op` / `chars_field_header`).
+        let header = self.bytes_block_header_of_chars_ptr(bb_id, chars)?;
+        crate::front::from_raw_parts::len_names_same_header(&self.graph, len, &header)
+            .then_some(header)
+    }
+
+    /// Items address of an address-taken array field used as a pair
+    /// `from_raw_parts` pointer (`lltype.py direct_arrayitems`).
+    ///
+    /// `addr_of!((*header).chars) as *const T` leaves a `FieldRead` of
+    /// the `[T; 0]` tail; using that result as the pair pointer loads
+    /// item zero. Recover the header and `array_items_base` from the
+    /// supplied pointer's SSA producer (`lltype.py` `direct_arrayitems`
+    /// uses `arrayptr`). A live-in is chased through the unique
+    /// incoming `Link` (`resolve_to_producer_op`); a merge or a
+    /// producer that is not that FieldRead keeps the supplied pointer.
+    pub(in crate::front::mir) fn array_tail_of_pair_from_raw_parts_ptr(
+        &self,
+        mir_bb: usize,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Ok(Some(found)) = self.taken_array_field_address(bb_id, ptr, dest_ty) {
+            return Some(found);
+        }
+        self.taken_array_field_address_chased(ptr, dest_ty)
+    }
+
+    fn taken_array_field_address_chased(
+        &self,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let mut current = ptr.clone();
+        for _ in 0..12 {
+            if let Some(found) = self.taken_array_field_read_of(&current, dest_ty) {
+                return Some(found);
+            }
+            let producer = self.producer_op(&current)?;
+            match &producer.kind {
+                OpKind::FieldRead { base, field, .. } if field.taken_by_address => {
+                    let owner = field.owner_root.as_deref()?;
+                    let offset = self.array_field_offset_for(
+                        owner,
+                        &field.name,
+                        dest_ty,
+                        Some(&current),
+                        Some(base),
+                    )?;
+                    return Some((base.clone(), offset));
+                }
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn taken_array_field_read_of(
+        &self,
+        var: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if op.result.as_ref() != Some(var) || !field.taken_by_address {
+                    continue;
+                }
+                let owner = field.owner_root.as_deref()?;
+                let offset = self.array_field_offset_for(
+                    owner,
+                    &field.name,
+                    dest_ty,
+                    Some(var),
+                    Some(base),
+                )?;
+                return Some((base.clone(), offset));
+            }
+        }
+        None
+    }
+
+    fn array_field_offset_for(
+        &self,
+        owner: &str,
+        field_name: &str,
+        dest_ty: Option<&TyRef>,
+        var: Option<&Variable>,
+        header: Option<&Variable>,
+    ) -> Option<u64> {
+        let instantiated_align = Self::array_tail_instantiated_elem_align(
+            var.and_then(|v| self.instantiated_elem_align_of_var(v, field_name)),
+            header.and_then(|h| self.instantiated_elem_align_of_var(h, field_name)),
+            dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, field_name)),
+        )
+        .or_else(|| dest_ty.and_then(|ty| tyref_slice_elem_is_u8(ty, self.llbc).then_some(1)));
+        self.array_field_tail_offset(owner, field_name, instantiated_align)
+    }
+
+    pub(in crate::front::mir) fn bytes_block_header_of_chars_ptr(
+        &self,
+        bb_id: BlockId,
+        chars: &Variable,
+    ) -> Option<Variable> {
+        let mut current = chars.clone();
+        // A STR-typed input / header word is the header only when the
+        // supplied pointer SSA-proves as `header + chars offset`
+        // (`from_raw_parts.rs` `ptr_add_chars_offset_header`).
+        // `from_raw_parts(header, n)` itself copies from the prefix
+        // (`rffi.py` `charpsize2str`), not `s.chars`.
+        let mut peeled_chars_offset = false;
+        for _ in 0..12 {
+            if let Some(base) = self.bytes_block_chars_field_base(bb_id, &current) {
+                return Some(base);
+            }
+            if let Some(header) =
+                crate::front::from_raw_parts::ptr_add_chars_offset_header(&self.graph, &current)
+            {
+                current = header;
+                peeled_chars_offset = true;
+                continue;
+            }
+            match self.producer_op(&current) {
+                Some(producer) => match &producer.kind {
+                    OpKind::FieldRead { base, field, .. }
+                        if field.name == "chars"
+                            && field.owner_root.as_deref() == Some("bytesobject::BytesBlock")
+                            && field.taken_by_address =>
+                    {
+                        return Some(base.clone());
+                    }
+                    OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                        current = operand.clone();
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if args.len() == 1
+                        && segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "cast"
+                                    | "cast_ptr_to_int"
+                                    | "cast_int_to_ptr"
+                                    | "from_exposed_addr"
+                                    | "from_exposed_addr_mut"
+                                    | "r_uint"
+                                    | "intmask"
+                            )
+                        }) =>
+                    {
+                        current = args[0]
+                            .as_variable()
+                            .cloned()
+                            .unwrap_or_else(|| args[0].clone().into_variable());
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if args.len() == 2
+                        && segments.last().map(String::as_str) == Some("cast_int_to_ptr") =>
+                    {
+                        let Some(addr) = args[1].as_variable() else {
+                            return None;
+                        };
+                        current = addr.clone();
+                    }
+                    OpKind::Input {
+                        ty: ValueType::Str, ..
+                    } if peeled_chars_offset => return Some(current),
+                    _ if peeled_chars_offset => {
+                        return self.var_is_string_header_word(&current).then_some(current);
+                    }
+                    _ => return None,
+                },
+                None if peeled_chars_offset => {
+                    return self.var_is_string_header_word(&current).then_some(current);
+                }
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn bytes_block_chars_field_base(&self, bb_id: BlockId, chars: &Variable) -> Option<Variable> {
         self.graph
             .block(bb_id)
             .operations
@@ -3042,10 +3280,12 @@ impl<'a> Lowering<'a> {
     /// cannot route on the classdef-less string receiver (the `Cannot
     /// find attribute "as_ref" on UnicodeString` wall).  Bind the
     /// destination to the receiver instead, the same alias shape as the
-    /// container deref above.  Gated on the receiver being a string value
-    /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
-    /// precise than the impl owner-leaf, plus the `str`-typed result so
-    /// `AsRef<[u8]>` is the `as_bytes` byte view
+    /// container deref above, except a rust-heap `{cap, ptr, len}`
+    /// interpolant is `Repr.rtype_str` ([`Self::bind_str_view_of_receiver`]).
+    /// Gated on the receiver being a string-family value
+    /// (`tyref_is_string_family`: already-STR `str`/`Wtf8`/`Wtf8Buf` or a
+    /// rust-heap `String`), more precise than the impl owner-leaf, plus
+    /// the `str`-typed result so `AsRef<[u8]>` is the `as_bytes` byte view
     /// ([`Self::is_string_as_bytes_identity`]) and `AsRef<OsStr>` /
     /// `AsRef<Path>` keep their ordinary lowering.
     pub(in crate::front::mir) fn is_string_to_str_identity(
@@ -3135,6 +3375,15 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_str_storage"))
     }
 
+    pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
+        })
+    }
+
     pub(in crate::front::mir) fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -3151,24 +3400,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_block"))
-    }
-
-    pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
-        })
-    }
-
-    pub(in crate::front::mir) fn graph_is_bytes_block_chars_or_string_view(&self) -> bool {
-        self.graph
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&self.graph.name)
-            == "bytes_block_chars"
     }
 
     /// `W_BytesObject.data` as `rstr.py` `STR` (`W_BytesObject._value`).
@@ -3346,10 +3577,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Window data word is `CCHARP` (int-kind address) on every link.
-    /// A GC fat box is split; a GC header is `rffi.cast(CCHARP, p)`;
-    /// a Signed address is `cast_int_to_ptr(CCHARP, int)` (`lltype.py`
-    /// `ann_cast_int_to_ptr`) so merge does not union `Ptr(Array)` with
-    /// `Integer`.
+    /// A GC fat box is split; a STR / BytesBlock header is chars
+    /// (`rstr.py` `STR`, `llmemory.offsetof(STR, 'chars')`); any other
+    /// GC header is `rffi.cast(CCHARP, p)`; a Signed address is
+    /// `cast_int_to_ptr(CCHARP, int)` (`lltype.py` `ann_cast_int_to_ptr`)
+    /// so merge does not union `Ptr(Array)` with `Integer`.
     pub(in crate::front::mir) fn ensure_window_ccharp(
         &mut self,
         mir_bb: usize,
@@ -3362,6 +3594,11 @@ impl<'a> Lowering<'a> {
         }
         if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
             return ptr;
+        }
+        if self.var_is_string_header_word(&ptr) {
+            let chars = self.chars_ptr_of_header(mir_bb, ptr, lowlevel_string_chars_byte_offset());
+            let bb_id = self.emit_bb(mir_bb);
+            return emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars);
         }
         if self.var_is_gc_ref_value(&ptr) {
             let bb_id = self.emit_bb(mir_bb);
@@ -3884,6 +4121,9 @@ impl<'a> Lowering<'a> {
         range_is_full: bool,
         checked: bool,
     ) -> Result<(Variable, Variable), LowerError> {
+        // A STR / BytesBlock GCREF is the header (`rstr.py` `STR`). The
+        // window data word is chars (`llmemory.offsetof(STR, 'chars')`).
+        let ptr = self.chars_ptr_if_str_header(mir_bb, ptr);
         if range_is_full {
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
@@ -3963,6 +4203,18 @@ impl<'a> Lowering<'a> {
             "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
         ) && args.len() == 2
         {
+            // `header.add(CHARS_OFFSET)` is `direct_arrayitems` of
+            // `STR.chars` (`lltype.py`). The dest is CCHARP plus the
+            // supplied length, including a live prefix below capacity.
+            if let Some(ptr) = self.chars_array_view_of_from_raw_parts_ptr(mir_bb, &args[0]) {
+                return Ok((ptr, args[1].clone()));
+            }
+            if self.var_is_string_header_word(&args[0]) {
+                return Ok((
+                    self.ensure_window_ccharp(mir_bb, args[0].clone()),
+                    args[1].clone(),
+                ));
+            }
             let ptr_ty = arg_tys
                 .first()
                 .and_then(Option::as_ref)
@@ -3970,6 +4222,9 @@ impl<'a> Lowering<'a> {
             let ptr = match ptr_ty {
                 Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
                     self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                }
+                Some(ValueType::Ref(_)) if self.from_raw_parts_ptr_already_chars_view(&args[0]) => {
+                    args[0].clone()
                 }
                 Some(ValueType::Ref(_)) => {
                     let bb_id = self.emit_bb(mir_bb);
@@ -4311,6 +4566,8 @@ impl<'a> Lowering<'a> {
                 pure: false,
             },
         });
+        // `W_BytesObject.data` is `*const BytesBlock` / rstr `STR`.
+        stamp_as_rstr_str(&field);
         field
     }
 
@@ -6012,7 +6269,81 @@ impl<'a> Lowering<'a> {
             .flatten()
             .and_then(|local| peel_copy_and_cast(self.llbc, self.body, local))
             .and_then(|base| self.body.locals.locals.get(base))
-            .is_some_and(|decl| tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc))
+            .is_some_and(|decl| {
+                tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc)
+                    || tyref_is_bytes_block_ptr(&decl.ty, self.llbc)
+            })
+    }
+
+    /// `dest_local` is the pointer of a later `from_raw_parts{,_mut}` whose
+    /// dest is a host `&[u8]` window or `&mut [u8]` pair (`rstr.py` `STR`
+    /// chars stay a displaced address; live prefix length is not
+    /// `ll_strlen`). A matching-length W1 `&[u8]` (no length shadow) still
+    /// needs the add peelable so RegularCall can recover the header.
+    pub(in crate::front::mir) fn add_dest_feeds_window_from_raw_parts(
+        &self,
+        dest_local: usize,
+    ) -> bool {
+        let forward_blocks = forward_reachable_mask(self.llbc, self.body);
+        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            if !regular_call_is_slice_from_raw_parts(reg, self.llbc) || call.args.len() != 2 {
+                continue;
+            }
+            let PlaceKind::Local(frp_dest) = call.dest.kind else {
+                continue;
+            };
+            let frp_dest = frp_dest as usize;
+            if !self.body.locals.locals.get(frp_dest).is_some_and(|loc| {
+                tyref_is_u8_window(&loc.ty, self.llbc)
+                    || tyref_host_u8_pair_item_kind(&loc.ty, self.llbc).is_some()
+            }) {
+                continue;
+            }
+            let Some(ptr_local) = operand_local(call.args.first()) else {
+                continue;
+            };
+            let peeled = peel_copy_and_cast(self.llbc, self.body, ptr_local).unwrap_or(ptr_local);
+            if peeled == dest_local || ptr_local == dest_local {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `direct_arrayitems` of `rstr.py` `STR.chars` (`lltype.py`): CCHARP
+    /// to the chars array. Header identity is the SSA chase
+    /// [`Self::bytes_block_header_of_chars_ptr`] /
+    /// `ptr_add_chars_offset_header` (`peeled_chars_offset`).
+    pub(in crate::front::mir) fn chars_array_view_of_from_raw_parts_ptr(
+        &mut self,
+        mir_bb: usize,
+        ptr: &Variable,
+    ) -> Option<Variable> {
+        let bb_id = self.emit_bb(mir_bb);
+        let header = self.bytes_block_header_of_chars_ptr(bb_id, ptr)?;
+        Some(self.ensure_window_ccharp(mir_bb, header))
+    }
+
+    /// Bound chars pointer is already `CCHARP` / an integer address of
+    /// `STR.chars`. `cast_ptr_to_int` of `r_uint` is
+    /// `rtype_cast_ptr_to_int` `got Some(Unsigned)`.
+    pub(in crate::front::mir) fn from_raw_parts_ptr_already_chars_view(
+        &self,
+        ptr: &Variable,
+    ) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        ptr.concretetype().as_ref().is_some_and(|ty| {
+            lltype_is_ccharp(ty) || matches!(ty, LowLevelType::Signed | LowLevelType::Unsigned)
+        })
     }
 
     /// Later intercepts in this same `RegularCall` match already lower
@@ -6732,6 +7063,45 @@ impl<'a> Lowering<'a> {
             .flatten()
             .is_some_and(|local| self.string_byte_view_locals.contains(&local));
         self.alias_dest_to_arg0(dest_local, arg, inherit);
+    }
+
+    /// `&str` / `str` view of `arg`. An already-STR word is identity
+    /// (`rstr.py` one string type). A rust-heap `{cap, ptr, len}` header is
+    /// not `Ptr(STR)`: `Repr.rtype_str` copies it (`UnaryOp str` →
+    /// `jit_ll_str_from_rust_string`) so a later residual `&str` trampoline
+    /// (`codepoints_in_utf8`) rebuilds via `rstr_payload` from the same
+    /// lltype. Gate on the SSA interpolant, not the TyRef: a marked
+    /// exception-class `String` field is already `Ptr(STR)` even though its
+    /// LLBC type is `alloc::string::String`.
+    pub(in crate::front::mir) fn bind_str_view_of_receiver(
+        &mut self,
+        dest_local: usize,
+        arg: Variable,
+        arg_locals: &[Option<usize>],
+        dest_ty: &TyRef,
+        bb_id: crate::model::BlockId,
+    ) {
+        let dest_is_str =
+            tyref_strips_to_str(dest_ty, self.llbc) || tyref_is_string_value(dest_ty, self.llbc);
+        if dest_is_str && crate::front::mir::interpolant_is_rust_heap_string(&self.graph, &arg) {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+            stamp_as_rstr_str(&res);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "str".to_string(),
+                    operand: arg,
+                    result_ty: ValueType::Str,
+                },
+            });
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+        } else {
+            self.alias_dest_to_arg0_inherit(dest_local, arg, arg_locals);
+        }
     }
 
     pub(in crate::front::mir) fn operand_is_string_byte_view(&self, op: &Operand) -> bool {

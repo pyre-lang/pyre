@@ -1277,14 +1277,11 @@ pub(crate) fn build_wb_slowpath(
 ) -> Option<(codebuf::ArenaExecutableBuffer, usize)> {
     let descr = crate::runner::dynasm_write_barrier_descr()?;
     let func = if !withcards {
-        // `descr.get_write_barrier_fn(cpu)`. The frame takes the guarded
-        // entry, an ordinary store the one `gc.py get_write_barrier_fn`
-        // names.
-        if for_frame {
-            crate::runner::dynasm_write_barrier as *const () as i64
-        } else {
-            crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
-        }
+        // x86/assembler.py `_build_wb_slowpath`:
+        // `func = descr.get_write_barrier_fn(self.cpu)` for both
+        // `for_frame` and ordinary stores. `gc.py get_write_barrier_fn`
+        // is `get_write_barrier_failing_case` = `remember_young_pointer`.
+        crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
     } else {
         if descr.jit_wb_cards_set == 0 {
             return None;
@@ -1631,7 +1628,9 @@ fn build_malloc_slowpath_body(
         // (pyre JIT body 0-mod-16 + outer-CALL push).  `push rax`
         // brings rsp to 0-mod-16 — already aligned for the inner CALL
         // on SysV, while Win64 still needs its 32-byte shadow space.
-        let wb_fn = crate::runner::dynasm_write_barrier as *const () as i64;
+        // `_reload_frame_if_necessary` / `_write_barrier_fastpath`
+        // `is_frame=True` → `wb_slowpath[4]` → `get_write_barrier_fn`.
+        let wb_fn = crate::runner::dynasm_jit_remember_young_pointer as *const () as i64;
         #[cfg(target_os = "windows")]
         {
             dynasm!(asm ; .arch x64

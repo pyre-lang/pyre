@@ -5011,12 +5011,18 @@ impl<S: JitState> JitDriver<S> {
                                 return;
                             }
                         } else {
-                            // No targets: consume bridge_info, fall through to
-                            // compile_loop (pyjitpl.py). The resumekey
-                            // survives because upstream never clears it in this
-                            // region (pyjitpl.py); only the attempt latch
-                            // is set.
+                            // No targets: pyjitpl.py `reached_loop_header`
+                            // skips `compile_trace` and falls into the
+                            // merge-point scan. No prior same-greenkey entry
+                            // appends and the walk continues; a prior entry
+                            // falls through to compile_loop. Compiling a loop
+                            // on this first visit left the origin guard
+                            // unbridged (`recursive_call_frame_relocation`
+                            // tid=2).
                             crate::mc_diag_bump(51); // bridge_no_targets_close
+                            if self.keep_tracing_after_declined_jump(target_key, &live_arg_boxes) {
+                                continue;
+                            }
                             self.bridge_attempt_declined = true;
                         }
                     }
@@ -5250,11 +5256,15 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                         } else {
-                            // No targets: consume bridge_info, fall through. The
-                            // resumekey survives because upstream never clears it
-                            // in this region (pyjitpl.py:2979-3060); only the
-                            // attempt latch is set.
+                            // No targets: pyjitpl.py `reached_loop_header`
+                            // skips `compile_trace` and falls into the
+                            // merge-point scan. No prior same-greenkey entry
+                            // appends and the walk continues; a prior entry
+                            // falls through to compile_loop.
                             crate::mc_diag_bump(51); // bridge_no_targets_close
+                            if self.keep_tracing_after_declined_jump(target_key, &jump_args) {
+                                continue;
+                            }
                             self.bridge_attempt_declined = true;
                         }
                     }
@@ -5778,6 +5788,11 @@ impl<S: JitState> JitDriver<S> {
             };
             // pyjitpl.py same_greenkey: the green key is the identity.
             // `header_pc` recorded below is this close's guest pc.
+            // Pass the typed close as-is: filtering on `get_uhash() ==
+            // target_key` dropped a live typed key whose hash disagreed
+            // with `green_key_from_code_ptr` (profiled folded to false)
+            // and fell through to hash-only, which then matched the
+            // origin seed.
             (
                 ctx.close_header_pc(),
                 ctx.close_green_key(),
@@ -5818,7 +5833,7 @@ impl<S: JitState> JitDriver<S> {
                 .cloned()
                 .or_else(|| start.as_ref().filter(|key| matches_target(key)).cloned())
                 .or_else(|| warm.installed_greenkey(target_key, &types))
-                .or(close)
+                .or(close.clone())
                 .or(start)
                 .expect(
                     "keep_tracing_after_declined_jump: a merge point keeps its greens: \
@@ -5829,7 +5844,8 @@ impl<S: JitState> JitDriver<S> {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
-            ctx.find_merge_point_same_greenkey(&key_typed).is_some()
+            ctx.find_merge_point_same_greenkey(close.as_ref().unwrap_or(&key_typed))
+                .is_some()
         };
         if already {
             return false;

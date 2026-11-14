@@ -2058,7 +2058,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &llbc,
             spec,
             &empty_gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
         )
         .as_deref(),
         Some("raw:Owner"),
@@ -2083,7 +2083,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &llbc,
             spec,
             &empty_gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
         )
         .as_deref(),
         Some("i64")
@@ -8360,6 +8360,304 @@ fn closure_capturing_borrowed_transparent_scalar_annotates() {
         .expect("a closure capturing a borrowed transparent scalar annotates");
 }
 
+/// `match *self` on a GC-ref data-carrying niche enum loads the host
+/// tag word and decodes it to the variant index `SwitchInt` lists.
+/// A plain `__discriminant` FieldRead would leave the niche word
+/// (`0x8000…` for a tagged variant) against keys `0..n`.
+#[test]
+fn gc_ref_niche_discriminant_decodes_to_switch_targets() {
+    use crate::front::host_layout::host_variant_index;
+    use crate::model::OpKind;
+    use majit_charon_reader::ullbc::TagLayout;
+
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let enum_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let ref_ty = serde_json::json!({"Ref": ["Erased", enum_ty, "Shared"]});
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let local = |index: u64, ty: &serde_json::Value| place(serde_json::json!({"Local": index}), ty);
+    let arg = local(1, &ref_ty);
+    let deref = place(serde_json::json!({"Projection": [arg, "Deref"]}), &enum_ty);
+    let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
+    let ret = || {
+        serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span(), "kind": "Return"}
+        })
+    };
+    let scalar = |text: &str| serde_json::json!({"Scalar": {"Unsigned": ["U8", text]}});
+    let item_meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "gcniche",
+            "type_decls": [null, {
+                "def_id": 1,
+                "item_meta": item_meta(&["gcniche", "E"]),
+                "kind": {"Enum": [
+                    {"name": "A", "fields": []},
+                    {"name": "Pay", "fields": [
+                        {"name": null, "is_positional": true, "ty": u8_ty}
+                    ]},
+                    {"name": "B", "fields": []}
+                ]},
+                "src": "Normal",
+                "layout": [{
+                    "key": "host",
+                    "value": {
+                        "size": 1,
+                        "align": 1,
+                        "discriminator": {"Branch": {
+                            "offset": {"chosen": 0},
+                            "int_ty": {"Unsigned": "U8"},
+                            "children": [
+                                [{"start": {"Unsigned": ["U8", "10"]}, "end": {"Unsigned": ["U8", "10"]}}, {"Known": 0}],
+                                [{"start": {"Unsigned": ["U8", "12"]}, "end": {"Unsigned": ["U8", "12"]}}, {"Known": 2}]
+                            ],
+                            "fallback": {"Known": 1}
+                        }},
+                        "variant_layouts": [
+                            {"field_offsets": []},
+                            {"field_offsets": [0]},
+                            {"field_offsets": []}
+                        ],
+                        "repr": {"transparent": false}
+                    }
+                }]
+            }],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": item_meta(&["gcniche", "classify"]),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [ref_ty],
+                    "output": i64_ty
+                },
+                "src": "Normal",
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [
+                                {"index": 0, "name": null, "span": span(), "ty": i64_ty},
+                                {"index": 1, "name": "p", "span": span(), "ty": ref_ty},
+                                {"index": 2, "name": "tag", "span": span(), "ty": i64_ty}
+                            ]
+                        },
+                        "body": [
+                            {
+                                "statements": [
+                                    assign(
+                                        local(0, &i64_ty),
+                                        serde_json::json!({"Use": [
+                                            {"Const": [
+                                                {"Integer": {"Signed": ["I64", "0"]}},
+                                                i64_ty
+                                            ]},
+                                            "No"
+                                        ]})
+                                    ),
+                                    assign(
+                                        local(2, &i64_ty),
+                                        serde_json::json!({"Discriminant": deref})
+                                    )
+                                ],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {"Switch": {
+                                        "discr": {"Read": local(2, &i64_ty)},
+                                        "targets": {"SwitchInt": [
+                                            null,
+                                            [[scalar("0"), 1], [scalar("1"), 2], [scalar("2"), 3]],
+                                            4
+                                        ]}
+                                    }}
+                                }
+                            },
+                            ret(),
+                            ret(),
+                            ret(),
+                            ret()
+                        ]
+                    }
+                }
+            }],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": item_meta(&["majit_gc", "header", "GcType"])
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {"types": [{"Value": [1, enum_ty]}]}
+                }
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("gc-ref niche fixture parses");
+    let td = llbc.type_by_id(1).expect("E");
+    let facts = super::harvest_declared_gc_facts(&llbc);
+    assert!(
+        facts
+            .gc_struct_ids()
+            .contains(&super::struct_id_for_type_decl(td)),
+        "GcType impl must seed E as a GC-ref enum"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "classify").expect("lower classify");
+
+    let tag: TagLayout = td
+        .layout_for_target(&llbc, &std::env::var("TARGET").unwrap_or_default())
+        .expect("host layout")
+        .tag()
+        .expect("host tag");
+    let (discr, mut cases) = gc_disc_switch_int_cases(&graph);
+    cases.sort_unstable();
+    assert_eq!(
+        cases,
+        vec![0, 1, 2],
+        "SwitchInt targets are the variant indices"
+    );
+    let producers = gc_disc_op_by_result(&graph);
+    assert!(
+        producers.values().any(|kind| {
+            matches!(
+                kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            )
+        }),
+        "a GC-ref niche tag loads __discriminant"
+    );
+    assert!(
+        producers
+            .values()
+            .all(|kind| !matches!(kind, OpKind::RawLoad { .. })),
+        "a GC-ref tag is getfield, not raw_load"
+    );
+    for raw in [0u128, 10, 11, 12, 13, 255] {
+        let decoded = gc_disc_eval_int(&producers, &discr, raw as i64);
+        let expect = host_variant_index(&tag, raw) as i64;
+        assert_eq!(decoded, expect, "raw tag {raw} decodes to variant {expect}");
+        assert!(
+            cases.contains(&decoded),
+            "decoded variant {decoded} is not a SwitchInt target {cases:?}"
+        );
+    }
+}
+
+fn gc_disc_switch_int_cases(
+    graph: &crate::model::FunctionGraph,
+) -> (crate::flowspace::model::Variable, Vec<i64>) {
+    let mut found = None;
+    for block in &graph.blocks {
+        let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch else {
+            continue;
+        };
+        let mut cases = Vec::new();
+        for link in &block.exits {
+            if let Some(crate::model::ExitCase::Const(cv)) = &link.exitcase {
+                match cv {
+                    crate::flowspace::model::ConstValue::Int(n) => cases.push(*n),
+                    crate::flowspace::model::ConstValue::UInt(n) => cases.push(*n as i64),
+                    _ => {}
+                }
+            }
+        }
+        if !cases.is_empty() {
+            found = Some((var.clone(), cases));
+        }
+    }
+    found.expect("SwitchInt on the decoded discriminant")
+}
+
+fn gc_disc_op_by_result(
+    graph: &crate::model::FunctionGraph,
+) -> std::collections::HashMap<u64, crate::model::OpKind> {
+    let mut ops = std::collections::HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = &op.result {
+                ops.insert(result.id(), op.kind.clone());
+            }
+        }
+    }
+    ops
+}
+
+fn gc_disc_eval_int(
+    ops: &std::collections::HashMap<u64, crate::model::OpKind>,
+    var: &crate::flowspace::model::Variable,
+    raw_tag: i64,
+) -> i64 {
+    fn rec(
+        ops: &std::collections::HashMap<u64, crate::model::OpKind>,
+        id: u64,
+        raw_tag: i64,
+        seen: &mut Vec<u64>,
+    ) -> i64 {
+        if seen.contains(&id) {
+            panic!("cycle in discriminant decode at {id}");
+        }
+        seen.push(id);
+        let kind = ops.get(&id).unwrap_or_else(|| {
+            panic!("discriminant decode reads undefined var {id}");
+        });
+        let value = match kind {
+            crate::model::OpKind::ConstInt(n) => *n,
+            crate::model::OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                raw_tag
+            }
+            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => {
+                let a = rec(ops, lhs.id(), raw_tag, seen);
+                let b = rec(ops, rhs.id(), raw_tag, seen);
+                match op.as_str() {
+                    "sub" => a.wrapping_sub(b),
+                    "add" => a.wrapping_add(b),
+                    "mul" => a.wrapping_mul(b),
+                    "and" => a & b,
+                    "eq" => i64::from((a as u64) == (b as u64)),
+                    "uint_le" => i64::from((a as u64) <= (b as u64)),
+                    other => panic!("unexpected decode op {other}"),
+                }
+            }
+            other => panic!("unexpected decode producer {other:?}"),
+        };
+        seen.pop();
+        value
+    }
+    rec(ops, var.id(), raw_tag, &mut Vec::new())
+}
+
 /// Each receiver that reaches a `Vec` — an inline field, a `&mut Vec`
 /// local, and a pointer loaded out of `Box<Vec<_>>` — becomes a getfield
 /// of the buffer word. A declared virtualizable array is not a receiver
@@ -11954,6 +12252,8 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
         panic!("slot op is an input");
@@ -11982,6 +12282,8 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
         panic!("slot op is an input");
@@ -13448,4 +13750,59 @@ fn merge_phi_concretetype_requires_predecessor_agreement() {
         "agreeing CCHARP stamps the merge phi; ct={:?}",
         phi.concretetype()
     );
+}
+
+/// Production `bytes_concat` residual `jit_ll_strconcat` args are `Ptr(STR)`.
+/// `w_bytes_block` dest is `*const BytesBlock`; Charon spells the
+/// `as *mut Utf8Str` as `UnaryOp` Cast. rtyper `StringRepr` sets
+/// `op.result.concretetype = Ptr(STR)` (`rstr.py` `STR`).
+#[test]
+fn bytes_concat_ll_strconcat_args_are_strptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "pyre_interpreter::objspace::descroperation::bytes_concat",
+    )
+    .expect("lower bytes_concat");
+    let mut concat_args = Vec::new();
+    for op in graph_ops(&graph) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("jit_ll_strconcat") {
+            continue;
+        }
+        assert_eq!(
+            args.len(),
+            2,
+            "ll_strconcat takes two STR pointers; graph={graph:#?}"
+        );
+        concat_args.push(args.clone());
+    }
+    assert!(
+        !concat_args.is_empty(),
+        "bytes_concat must residualize jit_ll_strconcat; graph={graph:#?}"
+    );
+    for args in &concat_args {
+        for (i, arg) in args.iter().enumerate() {
+            let var = arg
+                .as_variable()
+                .unwrap_or_else(|| panic!("ll_strconcat arg[{i}] is a Variable; graph={graph:#?}"));
+            assert_eq!(
+                var.concretetype(),
+                Some(STRPTR.clone()),
+                "ll_strconcat arg[{i}] is Ptr(STR); graph={graph:#?}"
+            );
+        }
+    }
 }

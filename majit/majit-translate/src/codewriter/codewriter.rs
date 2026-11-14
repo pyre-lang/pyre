@@ -200,6 +200,10 @@ impl CodeWriter {
         registry
             .bookkeeper()
             .set_immutable_fields_structs(callcontrol.immutable_fields_by_struct.clone());
+        registry
+            .bookkeeper()
+            .set_field0_parents(callcontrol.field0_parents.clone());
+
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.
@@ -564,12 +568,12 @@ impl CodeWriter {
                     &callcontrol.raw_alloc_flavor_structs,
                 );
                 // Skip commits `GcRef` as `rclass.OBJECTPTR`
-                // (`concrete_to_canonical_lltype`). A Call dest whose
-                // `result_ty` names a registered GC struct is
+                // (`concrete_to_canonical_lltype`). A Call / Input dest
+                // whose name is a registered GC struct is
                 // `getinstancerepr(classdef)` (`rtyper.py`
-                // `setconcretetype`, `rclass.py` `getinstancerepr`),
-                // the same producer `backfill_untyped_call_results`
-                // uses when the dest is untyped.
+                // `setconcretetype`, `rclass.py` `getinstancerepr`); an
+                // items-block name is `getrepr` of that layout `Ptr`.
+                // Later-block inputargs inherit that lltype along links.
                 if let Ok((_, rtyper)) = self.dual_gate_registry(callcontrol).ensure_session() {
                     crate::translator::rtyper::cutover::stamp_named_ref_call_dests(graph, &rtyper);
                 }

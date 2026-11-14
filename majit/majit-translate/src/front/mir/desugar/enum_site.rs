@@ -807,6 +807,44 @@ impl<'a> Lowering<'a> {
             .is_some_and(|local| self.string_byte_view_locals.contains(&local))
     }
 
+    /// `__getslice_*` marker args for a range Index of a string byte view.
+    /// Bounds come from the Range/RangeFrom/RangeTo aggregate already
+    /// recorded for `front::slice_index`.
+    pub(in crate::front::mir) fn string_byte_view_getslice_args(
+        &self,
+        slice: &Variable,
+        range: &Variable,
+    ) -> Option<(&'static str, Vec<Variable>)> {
+        if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some((
+                "__getslice_range",
+                vec![slice.clone(), site.start.clone(), site.end.clone()],
+            ));
+        }
+        if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some((
+                "__getslice_rangefrom",
+                vec![slice.clone(), site.start.clone()],
+            ));
+        }
+        if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some(("__getslice_rangeto", vec![slice.clone(), site.end.clone()]));
+        }
+        None
+    }
+
     /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
     /// `as_bytes()` aliases the receiver to the `StringRepr`, so the
     /// successful arm must emit `__string_byte_getitem`; any other

@@ -2257,11 +2257,11 @@ pub(crate) struct CrateLoweringState {
     /// GC-schema path uses (leaf and crate-stripped path).
     immutable_fields: ImmutableFieldsTable,
     dont_look_inside: std::collections::HashSet<String>,
-    /// Harvested `oopspec:jit.*` paths from `func_hints` (the
-    /// whole-program union when the provider filled that map). Residual
-    /// `&Scalar` spills skip those callees: jtransform rewrites them to
-    /// a box query (`jit.isconstant`) instead of the rustc pointer ABI.
-    /// `ordereddict.lookup` still residual-executes the rustc trampoline.
+    /// Harvested `oopspec:` paths from `func_hints` (the whole-program
+    /// union when the provider filled that map). Residual `&Scalar`
+    /// spills skip those callees: `jtransform.py` `handle_builtin_call`
+    /// rewrites them (`_handle_jit_call`, `_handle_dict_lookup_call` /
+    /// `OS_DICT_LOOKUP`, …) instead of the rustc `&T` pointer ABI.
     oopspec_fns: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
@@ -2523,7 +2523,7 @@ impl CrateLoweringState {
             .filter(|(_, hints)| {
                 hints.iter().any(|hint| {
                     hint.strip_prefix("oopspec:")
-                        .is_some_and(|spec| spec.starts_with("jit."))
+                        .is_some_and(|spec| !spec.is_empty())
                 })
             })
             .map(|(path, _)| path.clone())
@@ -2898,6 +2898,10 @@ impl<'l> CrateLowering<'l> {
             residual,
             &self.state.raw_alloc_flavor_structs,
         );
+        let block_u8 = unstructured_if_naked_pair_slice(fd, self.llbc)
+            .as_ref()
+            .map(|body| bytes_block_chars_view_locals(body, self.llbc))
+            .unwrap_or_default();
         pygraph_initial_block(
             &mut graph,
             &locals,
@@ -2916,6 +2920,8 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
         if declared_result_is_unit(
             &fd.signature.output,
@@ -3019,7 +3025,12 @@ impl<'l> CrateLowering<'l> {
     /// A `dont_look_inside` copy whose body does not lower still keeps
     /// the header `declare_spec` stamped from `substituted_signature`
     /// (`policy.py` `look_inside_graph` residualizes; the body is not
-    /// a jitcode subject).
+    /// a jitcode subject). That header is not `funcobj.graph`:
+    /// `GraphAnalyzer.analyze` walks a present graph, and a header-only
+    /// body walks to false. A missing graph is AttributeError →
+    /// `top_result()` (`graphanalyze.py`). The copy is not an
+    /// `rffi.llexternal`, so it is a failed build (`LazyGraph::deferred`
+    /// producing none), not `LazyGraph::external`.
     fn lower_spec(
         &self,
         req: crate::front::clause_spec::SpecRequest,
@@ -3030,15 +3041,18 @@ impl<'l> CrateLowering<'l> {
         } else {
             self.build_spec_body(&spec.body)
         };
-        let graph = match built {
+        match built {
             Some(graph) => {
                 spec.header.residualize_unresolved_trait_const(&graph);
-                spec.header.graph_stamp().apply(graph)
+                let graph = spec.header.graph_stamp().apply(graph);
+                Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
             }
-            None if spec.dont_look_inside => self.spec_header_graph(&spec),
-            None => return None,
-        };
-        Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
+            None if spec.dont_look_inside => {
+                let header = self.spec_header_graph(&spec);
+                Some(spec.into_semantic(crate::model::LazyGraph::deferred(header, || None)))
+            }
+            None => None,
+        }
     }
 
     /// Declare one clause specialization: the graph
@@ -3160,6 +3174,7 @@ impl<'l> CrateLowering<'l> {
             residual,
             &self.state.raw_alloc_flavor_structs,
         );
+        let block_u8 = bytes_block_chars_view_locals(&spec.body.body, self.llbc);
         pygraph_initial_block(
             &mut graph,
             &spec.body.body.locals,
@@ -3178,6 +3193,8 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -3647,7 +3664,11 @@ impl SemanticFunctionHeader {
         // `dont_look_inside` / `elidable` callees and every trait-method
         // member of an indirect-call row stamp FUNC.RESULT.
         // A `repr(transparent)` scalar wrapper is that word.
-        // Aggregate `"ref"` results stay unstamped.
+        // Aggregate `"ref"` results stay unstamped. A unit `()` is the
+        // empty-tuple ADT and is stamped void so
+        // `finalize_rewritten_graph_to_jitcode`'s `declared=='v' && cfg=='r'`
+        // gate can run `widen_unit_return_to_void` (`call.py FUNC.RESULT`,
+        // `jtransform.py rewrite_call`).
         // A declaration of the `BuiltinCodeFn` pointer type is a member of
         // that indirect-call family, so it stamps the pointer type's RESULT
         // for the same reason a trait-method member does.
@@ -3695,21 +3716,27 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        let return_type = if stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token)
-            && !output_is_raw_address_word(
-                &signature.output,
-                llbc,
-                error_carrier,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        {
-            signature_token
-        } else {
-            None
-        };
+        // A clause-spec copy may substitute a signature whose output
+        // no longer looks like the empty-tuple ADT; the FunDecl's own
+        // output is still unit. Either one is `FUNC.RESULT = void`.
+        let return_type =
+            if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
+                Some("()".to_string())
+            } else if stamp_return_token {
+                signature_token
+            } else if signature_token.as_deref().is_some_and(scalar_result_token)
+                && !output_is_raw_address_word(
+                    &signature.output,
+                    llbc,
+                    error_carrier,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            {
+                signature_token
+            } else {
+                None
+            };
         let return_class_root = dont_look_inside_return_class_root(
             &signature.output,
             llbc,
@@ -3913,8 +3940,14 @@ impl GraphStamp {
         if !self.hints.is_empty() {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
         }
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already stamped void by
+        // `declared_result_is_unit`. Keep that over a later
+        // non-void header token (a spec copy whose substituted output is
+        // coloured Ref).
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         graph.residual_return_type = self.residual_return_type.clone();
         graph.return_class_root = self.return_class_root.clone();
@@ -6391,32 +6424,56 @@ fn derive_program_metadata(
         );
     }
 
-    // `core::alloc::layout::Layout` is Opaque. It is the two-word
-    // `{size, align}` aggregate (`from_size_align.rs`); Charon has no
-    // field rows. `__pos_0` is size at 0, `__pos_1` is align at one word.
-    let layout_path = "core::alloc::layout::Layout";
-    if llbc
-        .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == layout_path)
-    {
+    // `core::alloc::layout::Layout` is an Opaque core TypeDecl: Charon does
+    // not publish `{size, align}`, but `from_size_align::build_layout_aggregate`
+    // writes `__pos_0` / `__pos_1`. The niladic struct ctor lowers to
+    // `OpKind::New` (`jtransform` `struct_ctor_alloc_owner`), which needs a
+    // fieldful SizeDescr so the collector issues a type id. Same metadata
+    // shape as `Constants` / `Complex` above: rows on the real value, gated
+    // on the TypeDecl existing so an unrelated local `Layout` is untouched.
+    // `__pos_0` is size at 0, `__pos_1` is align at one word.
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        if !crate::front::from_size_align::is_layout_adt_owner(&name) {
+            continue;
+        }
+        if struct_fields
+            .fields
+            .get(&name)
+            .is_some_and(|rows| rows.iter().any(|row| row.name == "__pos_0"))
+        {
+            continue;
+        }
         let rows = vec![
             crate::front::semantic::FieldRow::positional("__pos_0", "usize"),
             crate::front::semantic::FieldRow::positional("__pos_1", "usize"),
         ];
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
-            struct_fields.fields.insert(key.to_string(), rows.clone());
-            known_struct_names.insert(key.to_string());
+        let canonical_name = strip_crate_prefix(&name);
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        for key in [name.clone(), canonical_name.clone(), leaf.clone()] {
+            struct_fields.fields.insert(key.clone(), rows.clone());
+            known_struct_names.insert(key);
         }
         let sid = majit_ir::descr::StructId::from_canonical("alloc::layout::Layout");
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
+        for key in [name.clone(), canonical_name.clone(), leaf.clone()] {
             record_struct_id(
                 &mut struct_ids,
                 &mut struct_fields.class_identity,
-                key.to_string(),
+                key,
                 sid,
                 "alloc::layout::Layout",
             );
         }
+        struct_origins
+            .entry(leaf)
+            .or_insert_with(|| "alloc::layout".to_string());
+        struct_field_attrs.insert(
+            canonical_name,
+            vec![
+                ("__pos_0".to_string(), ValueType::Unsigned),
+                ("__pos_1".to_string(), ValueType::Unsigned),
+            ],
+        );
         let word = crate::layout::target_word_size() as u64;
         let mut field_offsets = std::collections::HashMap::new();
         field_offsets.insert("__pos_0".to_string(), 0);
@@ -6481,17 +6538,40 @@ fn derive_program_metadata(
 /// rstr `STR` (`is_rstr_str_family_spelling`) is GC at the pointee
 /// (`pointee_is_raw_word`) without a `GcType` seed: putting it in
 /// `gc_struct_ids` would make `registered_gc_ptr_class_root_with` of
-/// `&Utf8Str` a nullable instance.
+/// `&Utf8Str` a nullable instance. [`Self::field0_parent_ids`] is the
+/// inverse of the field-0 edges, kept next to them: a named struct in
+/// that set is an rclass instance root (`getinstancerepr` → OBJECT).
 #[derive(Default)]
 pub(crate) struct DeclaredGcFacts {
     seeds: Vec<majit_ir::descr::StructId>,
     field0: Vec<(majit_ir::descr::StructId, majit_ir::descr::StructId)>,
+    /// StructIds that some owner inlines as by-value field 0.
+    /// Inverse of `field0` (owner → parent). Filled in [`Self::record_field0`].
+    field0_parents: std::collections::HashSet<majit_ir::descr::StructId>,
 }
 
 impl DeclaredGcFacts {
     pub(crate) fn absorb(&mut self, other: Self) {
         self.seeds.extend(other.seeds);
         self.field0.extend(other.field0);
+        self.field0_parents.extend(other.field0_parents);
+    }
+
+    /// Record a by-value field-0 parent (`struct_field0_type_id`).
+    pub(crate) fn record_field0(
+        &mut self,
+        owner: majit_ir::descr::StructId,
+        parent: majit_ir::descr::StructId,
+    ) {
+        self.field0.push((owner, parent));
+        self.field0_parents.insert(parent);
+    }
+
+    /// StructIds that appear as by-value field 0 of some struct.
+    pub(crate) fn field0_parent_ids(
+        &self,
+    ) -> &std::collections::HashSet<majit_ir::descr::StructId> {
+        &self.field0_parents
     }
 
     /// `StructId`s whose declared kind is `Gc`.
@@ -6568,6 +6648,61 @@ pub(crate) fn spelling_is_declared_gc(
     [template.as_ref(), stripped.as_str(), leaf]
         .into_iter()
         .any(|cand| gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(cand)))
+}
+
+/// Whether `sid` is a `#[repr(transparent)]` struct: the exact identity,
+/// or the generic template `name` instantiates.
+///
+/// Folded into [`crate::call::StructLayout::repr_transparent`] at layout
+/// registration. `raw_struct_ptr_from_layout` reads that field.
+pub(crate) fn struct_id_is_repr_transparent(
+    ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+) -> bool {
+    ids.contains(&sid)
+        || majit_ir::descr::struct_template_id_for_name(name)
+            .is_some_and(|template| ids.contains(&template))
+}
+
+/// Whether `sid` is a by-value field-0 parent of some registered struct.
+///
+/// Same identity-or-template fallback as [`struct_id_is_declared_gc`].
+/// `gc_struct_ptr_lltype_from_layout` returns `None` for these so
+/// `getinstancerepr` maps the instance root to `OBJECT`.
+pub(crate) fn struct_id_is_field0_parent(
+    ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+) -> bool {
+    ids.contains(&sid)
+        || majit_ir::descr::struct_template_id_for_name(name)
+            .is_some_and(|template| ids.contains(&template))
+}
+
+/// StructIds whose LLBC declaration records `#[repr(transparent)]`.
+///
+/// `TypeDecl::is_repr_transparent` is the Charon layout fact. Folded
+/// into `StructLayout::repr_transparent`; not a lookup table.
+pub(crate) fn harvest_repr_transparent_struct_ids(
+    llbc: &Llbc,
+) -> std::collections::HashSet<majit_ir::descr::StructId> {
+    let mut out = std::collections::HashSet::new();
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_builtin_adt(td) {
+            continue;
+        }
+        if td.published_struct_copy {
+            continue;
+        }
+        if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
+            continue;
+        }
+        if td.is_repr_transparent() {
+            out.insert(struct_id_for_type_decl(td));
+        }
+    }
+    out
 }
 
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
@@ -6668,7 +6803,7 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         let Some(field0) = struct_field0_type_id(llbc, td, &facts.seeds) else {
             continue;
         };
-        facts.field0.push((struct_id_for_type_decl(td), field0));
+        facts.record_field0(struct_id_for_type_decl(td), field0);
     }
     facts
 }

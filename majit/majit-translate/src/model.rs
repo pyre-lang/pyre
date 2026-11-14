@@ -320,6 +320,10 @@ pub enum CallTarget {
         /// the owner spelling.
         #[serde(default)]
         payload_void: bool,
+        /// LLBC `TypeDecl::is_repr_transparent`. A one-field wrapper is
+        /// the field value; a unit-like zero-arg ctor still allocates.
+        #[serde(default)]
+        repr_transparent: bool,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -497,6 +501,7 @@ impl CallTarget {
             is_struct: false,
             variant_tag: None,
             payload_void: false,
+            repr_transparent: false,
         }
     }
 
@@ -514,6 +519,7 @@ impl CallTarget {
             is_struct: false,
             variant_tag: None,
             payload_void: false,
+            repr_transparent: false,
         }
     }
 
@@ -534,6 +540,7 @@ impl CallTarget {
             is_struct: false,
             variant_tag: Some(variant_tag),
             payload_void: false,
+            repr_transparent: false,
         }
     }
 
@@ -555,6 +562,7 @@ impl CallTarget {
             is_struct: true,
             variant_tag: None,
             payload_void: false,
+            repr_transparent: false,
         }
     }
 
@@ -565,6 +573,41 @@ impl CallTarget {
             *payload_void = true;
         }
         self
+    }
+
+    /// Record that this struct ctor's LLBC declaration is
+    /// `#[repr(transparent)]`.
+    pub fn with_repr_transparent(self) -> Self {
+        match self {
+            Self::SyntheticTransparentCtor {
+                name,
+                owner_path,
+                is_struct,
+                variant_tag,
+                payload_void,
+                ..
+            } => Self::SyntheticTransparentCtor {
+                name,
+                owner_path,
+                is_struct,
+                variant_tag,
+                payload_void,
+                repr_transparent: true,
+            },
+            other => other,
+        }
+    }
+
+    /// A `TypeDeclKind::Struct` whose layout is `#[repr(transparent)]`.
+    pub fn is_repr_transparent_struct(&self) -> bool {
+        matches!(
+            self,
+            Self::SyntheticTransparentCtor {
+                is_struct: true,
+                repr_transparent: true,
+                ..
+            }
+        )
     }
 
     pub fn receiver_root(&self) -> Option<&str> {

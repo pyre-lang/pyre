@@ -3856,7 +3856,10 @@ impl TraceCtx {
     /// pyjitpl.py `same_greenkey(original_boxes, live_arg_boxes, num_green_args)`.
     ///
     /// Live greens compare with `GreenKey::same_constant` (`pyjitpl.py`
-    /// `same_greenkey` / `Const.same_constant`).
+    /// `same_greenkey` / `Const.same_constant`). A leftover
+    /// position-0 seed is not a `reached_loop_header` append; skip it
+    /// before the shape assert so a bridge's fail-arg boxes cannot
+    /// panic against portal live args.
     pub fn has_merge_point_same_greenkey(&self, live: &GreenKey, live_args_len: usize) -> bool {
         // pyjitpl.py reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
@@ -3865,6 +3868,9 @@ impl TraceCtx {
         //       if same_greenkey(...):
         //           ...
         for mp in self.current_merge_points.iter().rev() {
+            if self.merge_point_is_bridge_origin_seed(mp) {
+                continue;
+            }
             // pyjitpl.py `assert len(original_boxes) == len(live_arg_boxes)`.
             // Seed and every later header visit push the same red+vable
             // length as the header's live args.
@@ -3878,6 +3884,15 @@ impl TraceCtx {
             }
         }
         false
+    }
+
+    /// `pyjitpl.py` `_handle_guard_failure` starts
+    /// `current_merge_points = []`. The position-0 seed is
+    /// `_compile_and_run_once`, not a `reached_loop_header` append.
+    /// Bridges do not add that seed; skip it if one is left over.
+    /// Primary traces close through it (`has_prefix_ops` is false).
+    fn merge_point_is_bridge_origin_seed(&self, mp: &MergePoint) -> bool {
+        self.is_bridge_trace && !mp.position.has_prefix_ops(self.num_inputargs())
     }
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
@@ -3983,11 +3998,12 @@ impl TraceCtx {
     /// the trace-start `header_pc` missed a point recorded under the merge
     /// point's own pc (and the other way round). `header_pc` on
     /// [`MergePoint`] stays the guest pc of that visit, for the cut.
+    /// A bridge never matches its origin through the position-0 seed
+    /// (`pyjitpl.py` `_handle_guard_failure` starts empty).
     pub fn find_merge_point_same_greenkey(&self, live: &GreenKey) -> Option<&MergePoint> {
-        self.current_merge_points
-            .iter()
-            .rev()
-            .find(|mp| mp.green_key_typed.same_constant(live))
+        self.current_merge_points.iter().rev().find(|mp| {
+            !self.merge_point_is_bridge_origin_seed(mp) && mp.green_key_typed.same_constant(live)
+        })
     }
 
     /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577

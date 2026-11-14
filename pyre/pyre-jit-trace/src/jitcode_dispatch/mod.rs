@@ -692,7 +692,7 @@ pub(crate) enum HelperCallEntry {
     Unavailable,
     /// The root portal's CALL boundary.
     CallerBoundary,
-    /// The inlined Python caller at the CALL's entry.
+    /// The inlined Python caller at the CALL's orgpc (`generate_guard(resumepc=orgpc)`).
     Frame(InlineParentFrame),
 }
 
@@ -734,6 +734,16 @@ impl HelperReturn {
         match self {
             Self::CalleePrologue => Self::CalleePrologue,
             Self::CallResult | Self::Converted => Self::CallResult,
+        }
+    }
+
+    /// `ret` of a helper entered from this walk. Nested helpers under a
+    /// callee-prologue keep that tag (`gettrace` under `call_trace`);
+    /// every other entry takes `ret` (`Converted` stays `Converted`).
+    pub(crate) fn nested_entry_return(self, ret: Self) -> Self {
+        match self {
+            Self::CalleePrologue => Self::CalleePrologue,
+            Self::CallResult | Self::Converted => ret,
         }
     }
 }
@@ -800,6 +810,14 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Absolute `MetaInterpStaticData.jitcodes` index of this paused frame.
+    /// `None` until the owner stamps it (`run_sub_jitcode_walk`).
+    pub(crate) jitcode_index: Option<usize>,
+    /// CALL / `inline_call` / residual pc in this frame that entered the
+    /// child. `MIFrame.run_one_step` (`pyjitpl.py`) has already advanced
+    /// past that op, so the blackhole resumes at `next_pc` with the result
+    /// register pending (`_setup_return_value_*`).
+    pub(crate) call_jitcode_pc: Option<usize>,
 }
 
 impl LiveFrameRegs {
@@ -814,6 +832,8 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            jitcode_index: None,
+            call_jitcode_pc: None,
         }
     }
 
@@ -858,7 +878,9 @@ pub struct WalkSession {
     /// currently owns. `MetaInterp.replace_box` writes these in place.
     /// Each helper also has a `w_code == 0` `InlineFrame` on `framestack`
     /// while it is walking or paused under a nested helper
-    /// (`capture_resumedata` numbers that `MIFrame`).
+    /// (`capture_resumedata` numbers that `MIFrame`). Abort conversion
+    /// builds the blackhole `MIFrame` from these banks
+    /// (`convert_and_run_from_pyjitpl`).
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
@@ -1531,6 +1553,9 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
     let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
     for &(w_code, py_pc) in levels.iter().rev() {
+        if w_code == 0 {
+            continue;
+        }
         let old = exc_ptr;
         journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -2359,6 +2384,11 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     pub(crate) transparent_helper_heap_writing_at_entry: Option<usize>,
     /// Recorder position at that same CALL (`SubWalkRewind.pre_fold_pos`).
     pub(crate) transparent_helper_trace_at_entry: Option<majit_metainterp::recorder::TracePosition>,
+    /// [`fbw_executed_residual_counts`] sampled at that same CALL. Nested
+    /// helpers sample again so a post-`do_residual_call` wrap is per-CALL.
+    /// A helper `GUARD_NOT_FORCED` snapshot abort after `do_residual_call`
+    /// already ran wraps as `AfterResidualCall` so the latch is past dest.
+    pub(crate) transparent_helper_residuals_at_entry: Option<(u32, u32, u32)>,
     /// Set only while walking the generated `write_cell` helper.  Inner
     /// ops are `helper=None` Void writes the StoreName loop-var exemption
     /// cannot see; the caller journals them (`FBW_CELL_STORE_JOURNAL`).
@@ -2386,6 +2416,15 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `None` for every other walk, which is what keeps the durable-frame
     /// journal off every path but this one.
     pub generator_resume: Option<GeneratorResumeSubwalk>,
+    /// Set only while `residualize_inline_call_via_fnaddr` runs
+    /// `try_execute_residual_call_via_executor_inner`. That path is
+    /// `pyjitpl.py do_residual_call` of a callable `jitcode.fnaddr`
+    /// (`blackhole.py handler_inline_call_*` / `bhimpl_inline_call_*`).
+    /// The current `transparent_helper_jitcode_index` is the parent
+    /// helper, which may be a Regular graph with no callable fnaddr;
+    /// the refuse that stops `CallMayForce*` inside that unconvertible
+    /// body must not refuse this `bh_call_*` of the callee.
+    pub bh_call_fnaddr_residual: bool,
 }
 
 /// The suspended generator a resume sub-walk is running on.
@@ -2426,12 +2465,14 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             transparent_helper_journal_at_entry: self.transparent_helper_journal_at_entry,
             transparent_helper_heap_writing_at_entry: self.transparent_helper_heap_writing_at_entry,
             transparent_helper_trace_at_entry: self.transparent_helper_trace_at_entry,
+            transparent_helper_residuals_at_entry: self.transparent_helper_residuals_at_entry,
             cell_store_helper_subwalk: self.cell_store_helper_subwalk,
             carrier_resume: self.carrier_resume,
             current_exception_seed_from_walk_store: self.current_exception_seed_from_walk_store,
             class_of_last_exc_is_const: self.class_of_last_exc_is_const,
             generator_resume: self.generator_resume,
             subwalk_floor: self.subwalk_floor,
+            bh_call_fnaddr_residual: self.bh_call_fnaddr_residual,
         }
     }
 }
@@ -2462,11 +2503,13 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             transparent_helper_journal_at_entry: None,
             transparent_helper_heap_writing_at_entry: None,
             transparent_helper_trace_at_entry: None,
+            transparent_helper_residuals_at_entry: None,
             cell_store_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             generator_resume: None,
+            bh_call_fnaddr_residual: false,
         }
     }
 }
@@ -4036,6 +4079,23 @@ pub enum DispatchError {
     /// back to a raw SETFIELD_GC, which writes the root frame's shadow on
     /// every caught-exception bridge.
     TracebackNodeVableFieldUnavailable { pc: usize, field: &'static str },
+    /// `execute_varargs` already ran and dest is written
+    /// (`MIFrame.make_result_of_lastop`: pc is already past the dest).
+    /// `pc` is the `-live-` after the call. `lastop` is the non-void dest
+    /// (`InnermostMiframeBuild::LiveMarker`). `cause` is why the walk still
+    /// aborted. `run_blackhole_interp_to_cancel_tracing` resumes there and
+    /// must not re-invoke the residual.
+    AfterResidualCall {
+        pc: usize,
+        lastop: Option<(char, usize, i64)>,
+        cause: Box<DispatchError>,
+    },
+    /// The walker declined this residual (`execute_varargs` did not run).
+    /// Dest is not live. Resume at `pc` so `convert_and_run_from_pyjitpl`
+    /// (`blackhole.py`) / `MetaInterp.aborted_tracing` (`pyjitpl.py`) runs
+    /// the call natively. Distinct from [`Self::AfterResidualCall`], whose
+    /// pc is already past dest.
+    DeclinedResidualCall { pc: usize },
 }
 
 impl DispatchError {
@@ -4123,6 +4183,8 @@ impl DispatchError {
             Self::TraceTooLong { .. } => "TraceTooLong",
             Self::SegmentTraceSnapshotUnavailable { .. } => "SegmentTraceSnapshotUnavailable",
             Self::TracebackNodeVableFieldUnavailable { .. } => "TracebackNodeVableFieldUnavailable",
+            Self::AfterResidualCall { .. } => "AfterResidualCall",
+            Self::DeclinedResidualCall { .. } => "DeclinedResidualCall",
         }
     }
 
@@ -4190,7 +4252,9 @@ impl DispatchError {
             | Self::ExcEdgeNoInFrameCatch { pc, .. }
             | Self::TraceTooLong { pc, .. }
             | Self::SegmentTraceSnapshotUnavailable { pc, .. }
-            | Self::TracebackNodeVableFieldUnavailable { pc, .. } => *pc,
+            | Self::TracebackNodeVableFieldUnavailable { pc, .. }
+            | Self::AfterResidualCall { pc, .. }
+            | Self::DeclinedResidualCall { pc, .. } => *pc,
         }
     }
 
@@ -4214,6 +4278,24 @@ impl DispatchError {
     /// An allow-list, not a deny-list: a class left out only forgoes the
     /// handoff, while a class wrongly let in resumes on missing data.
     pub(crate) fn leaves_complete_image(&self) -> bool {
+        // `execute_varargs` already ran and dest is written. The cause is
+        // why the discarded trace still aborts (`GUARD_NOT_FORCED` snapshot,
+        // `capture_resumedata`); blackhole continues from `pc` past dest
+        // (`MIFrame.make_result_of_lastop` / `after_residual_call=True`).
+        if let Self::AfterResidualCall { .. } = self {
+            return true;
+        }
+        // An unbound `symbolic_fnaddr` residual is not a complete image:
+        // the walk stopped on a helper the blackhole cannot run either, so
+        // converting would continue from a pc that still needs that call.
+        // `symbolic == 0` is a look-inside wall whose remaining Python the
+        // blackhole can execute; those stay on the allow-list.
+        if matches!(
+            self,
+            Self::OrthodoxSubWalkTraceUnsupported { symbolic, .. } if *symbolic != 0
+        ) {
+            return false;
+        }
         matches!(
             self,
             Self::UndecodableOpcode { .. }
@@ -4234,6 +4316,10 @@ impl DispatchError {
                 // succeed. The missing guard snapshot affects compilation of
                 // the discarded trace, not the complete forward image.
                 | Self::SegmentTraceSnapshotUnavailable { .. }
+                // Declined residual: registers are bound; dest is not live.
+                // `residual_executed_resume` is None, so the latch is
+                // `TraceTooLong` at the call op (`instruction_starts_at`).
+                | Self::DeclinedResidualCall { .. }
         )
     }
 
@@ -4253,6 +4339,9 @@ impl DispatchError {
     /// handler after the callee residuals have already run. The latch
     /// coordinate is that CALL, so converting would re-enter the body.
     pub(crate) fn can_convert_seeded_inline(&self) -> bool {
+        if let Self::AfterResidualCall { cause, .. } = self {
+            return cause.can_convert_seeded_inline();
+        }
         if self.leaves_complete_image() {
             return true;
         }
@@ -4287,6 +4376,38 @@ impl DispatchError {
     /// no frame coordinate is taken.
     pub(crate) fn is_clean_decline(&self) -> bool {
         matches!(self, Self::BinopRewindCommitRefused { .. })
+    }
+
+    /// Mark that `execute_varargs` already ran and dest is written.
+    ///
+    /// `MIFrame.make_result_of_lastop` runs with pc already past the dest.
+    /// A later `SwitchToBlackhole` resumes there. Errors that already latch
+    /// PAST the call (`VableEscapedDuringResidualCall`, `TraceTooLong`,
+    /// `ForceQuasiImmutable`) stay as themselves.
+    pub(crate) fn after_residual_call(
+        self,
+        next_pc: usize,
+        lastop: Option<(char, usize, i64)>,
+    ) -> Self {
+        match self {
+            Self::AfterResidualCall { .. }
+            | Self::VableEscapedDuringResidualCall { .. }
+            | Self::TraceTooLong { .. }
+            | Self::ForceQuasiImmutable { .. } => self,
+            cause => Self::AfterResidualCall {
+                pc: next_pc,
+                lastop,
+                cause: Box::new(cause),
+            },
+        }
+    }
+
+    /// Resume PAST a residual whose dest is already written: `(next_pc, lastop)`.
+    pub(crate) fn residual_executed_resume(&self) -> Option<(usize, Option<(char, usize, i64)>)> {
+        match self {
+            Self::AfterResidualCall { pc, lastop, .. } => Some((*pc, *lastop)),
+            _ => None,
+        }
     }
 
     /// Construct the callee-inline decline.  The
@@ -5024,7 +5145,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         ResidualExecOutcome::Executed(Ok(_)) => 0i64,
         ResidualExecOutcome::Executed(Err(exc)) => exc,
         ResidualExecOutcome::Declined(cause) => {
-            fbw_state::fbw_mark_unjournaled_effect(cause);
+            residual_call::stop_unexecuted_residual(ctx, op.pc, cause, None)?;
             let recorded =
                 ctx.trace_ctx
                     .record_op_with_descr(call_opcode, &allboxes, descr_for_decline);
@@ -5319,7 +5440,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     let raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
-            fbw_state::fbw_mark_unjournaled_effect(cause);
+            residual_call::stop_unexecuted_residual(ctx, op.pc, cause, None)?;
             false
         }
     };
@@ -5558,6 +5679,9 @@ pub(crate) fn helper_blackhole_after_run_one_step<Sym: WalkSym>(
     if blackhole_latched {
         let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
         blackhole_latched = finish_helper_abort_latch(ctx.session, splice_ok);
+        if blackhole_latched {
+            ctx.session.borrow_mut().abort_in_subwalk = true;
+        }
     }
     match helper_too_long_decision(true, blackhole_latched, fbw_executed_effect_count()) {
         HelperTooLongDecision::DeliverOutcome => Ok(()),
@@ -5752,8 +5876,53 @@ pub fn walk<Sym: WalkSym>(
                 // resume coordinate, and the enclosing Python walk must still
                 // be able to claim and latch the propagated abort. A clean
                 // decline is not an abort at all (`is_clean_decline`).
+                // A translated helper is an `MIFrame` (`blackhole.py
+                // setposition` + `run`). Latch it here, while its banks are
+                // live, together with the paused caller at the CALL's
+                // `next_pc`. A helper whose `jitcode.fnaddr` is not callable
+                // is not a `bh_call_*` target: leave the claim unset so the
+                // enclosing walk's declined-subwalk recovery can run.
+                // Innermost `helper_live` is that frame (`framestack[-1]`);
+                // the walk stamp can still name a parent Regular graph.
+                let helper_convertible = residual_call::helper_frame_is_convertible(
+                    ctx.fbw_mode.transparent_helper_subwalk,
+                    residual_call::residual_call_helper_index(ctx),
+                ) && !error.is_clean_decline();
+                // `do_residual_call` already ran inside this helper.
+                // `GUARD_NOT_FORCED` snapshot miss: wrap so the latch is the
+                // `-live-` after dest (`after_residual_call=True`).
+                // A capture refuse already at that `-live-` (`Orthodox` with
+                // `symbolic == 0`) latches there too: `DeclinedResidualCall`
+                // would resume a live marker as an unexecuted residual.
+                // The abort pc must be this frame's `opcode_position`: a
+                // nested uncallable helper's own `-live-` (pickle `tell_pos`
+                // pc=8) is not this frame's residual dest, and wrapping it
+                // skipped the enclosing `history.cut` + `do_residual_call`.
+                // A later unexecuted residual stays itself so blackhole
+                // runs it; wrapping that as `AfterResidualCall` would skip it.
+                let residual_ran_in_helper = helper_convertible
+                    && ctx
+                        .fbw_mode
+                        .transparent_helper_residuals_at_entry
+                        .is_some_and(|before| fbw_state::fbw_executed_residual_counts() != before);
+                let error = match error {
+                    DispatchError::GuardResumeCoordinateUnavailable { .. }
+                        if residual_ran_in_helper =>
+                    {
+                        inline_call::after_helper_residual_abort(code, error)
+                    }
+                    DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 }
+                        if residual_ran_in_helper
+                            && pc == opcode_position
+                            && crate::jitcode_runtime::decode_op_at(code, pc)
+                                .is_some_and(|op| op.opname == "live") =>
+                    {
+                        error.after_residual_call(pc, None)
+                    }
+                    other => other,
+                };
                 let coordinate_belongs_to_this_frame =
-                    walk_err_coordinate_belongs_to_this_frame(&error, ctx);
+                    helper_convertible || walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
@@ -5806,10 +5975,22 @@ pub fn walk<Sym: WalkSym>(
                     }
                     _ => false,
                 };
-                let helper_abort_image_latchable = ctx.fbw_mode.transparent_helper_subwalk
+                // `ResidualCallArgUnbound` is not `leaves_complete_image`
+                // (an `OpRef::NONE` with no prior residual is still a hole).
+                // After `do_residual_call` already ran, convert in place at
+                // this opcode (`convert_and_run_from_pyjitpl`); do not wrap
+                // `AfterResidualCall` — R2 has not executed.
+                let residual_unbound_after_effect =
+                    matches!(error, DispatchError::ResidualCallArgUnbound { .. })
+                        && ctx.fbw_mode.transparent_helper_subwalk
+                        && !error.is_clean_decline()
+                        && (residual_ran_in_helper || helper_call_unrewindable)
+                        && !abort_blackhole_latched();
+                let helper_abort_image_latchable = (ctx.fbw_mode.transparent_helper_subwalk
                     && abort_image_latchable
                     && !error.is_clean_decline()
-                    && helper_call_unrewindable;
+                    && helper_call_unrewindable)
+                    || residual_unbound_after_effect;
                 if helper_abort_image_latchable {
                     let decoded_next = decode_op_at(code, opcode_position).map(|op| op.next_pc);
                     let resume_pc = helper_abort_resume_pc(
@@ -5858,33 +6039,88 @@ pub fn walk<Sym: WalkSym>(
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
                 //
+                // A translated helper is its own MIFrame (`blackhole.py
+                // setposition`). Latch `[portal/opcode frame, ..., helper]`
+                // from the live banks; the parent sits at the CALL's `next_pc`
+                // (`MIFrame.run_one_step` / `get_list_of_active_boxes(
+                // in_a_call=True)`). A failed helper latch leaves the claim
+                // unset so the enclosing Python walk can still remap.
+                // Trace-length is not deferred: `_interpret` checks it on the
+                // helper MIFrame itself, and the post-step arm below does too.
+                //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame && abort_image_latchable {
-                    let resume_pc = if effects_moved {
-                        // After this step applied an effect, only a published
-                        // post-effect coordinate of THIS frame is latched; a
-                        // CALL-start image would replay an executed CALL
-                        // (`_get_opimpl_method` advances `MIFrame.pc` before
-                        // the opimpl; `convert_and_run_from_pyjitpl` copies
-                        // that pc).
-                        // A canonical helper is transparent: a helper pc
-                        // indexes the helper JitCode, not this Python frame's
-                        // JitCode (RPython keeps those as distinct MIFrames),
-                        // so this frame never latches at the helper's pc.
-                        helper_capability_gap_resume_pc(
+                //
+                // `DeclinedResidualCall` is an unexecuted residual
+                // (`stop_unexecuted_residual`). On a helper with no
+                // unrewindable effect it is `pyjitpl.py` `history.cut` then
+                // `do_residual_call` of that helper, not
+                // `convert_and_run_from_pyjitpl`.
+                // `JitMergePointGreenKeyUnresolved` is the same cut: the
+                // helper entered another jitdriver's merge point
+                // (`generatorentry_driver`), which is not this MIFrame's
+                // remainder.
+                let residual_declined_cuttable = ctx.fbw_mode.transparent_helper_subwalk
+                    && !helper_call_unrewindable
+                    && (matches!(
+                        error,
+                        DispatchError::DeclinedResidualCall { .. }
+                            | DispatchError::JitMergePointGreenKeyUnresolved { .. }
+                    ) || inline_call::declined_unbound_regular_recovers_enclosing(&error));
+                if coordinate_belongs_to_this_frame
+                    && abort_image_latchable
+                    && !residual_declined_cuttable
+                {
+                    // The image belongs to THIS WalkContext's MIFrame.
+                    // `_get_opimpl_method` has already advanced `self.pc`
+                    // past an executed residual; latching at `opcode_position`
+                    // would resume this frame before an effect it applied.
+                    // A nested level that moved effects must latch at its own
+                    // post-effect pc; this frame only latches at CALL start
+                    // when this step applied nothing.
+                    // `_interpret`: `run_one_step` advances pc, then
+                    // `SwitchToBlackhole` converts the live frame. A residual
+                    // whose `execute_varargs` already ran resumes at
+                    // `next_pc` (`make_result_of_lastop`: pc is past dest)
+                    // with dest spliced (`vable_after_residual_call`).
+                    // An unexecuted op stays at `opcode_position`.
+                    let latched = match error.residual_executed_resume() {
+                        Some((next_pc, lastop)) => latch_abort_blackhole_innermost(
+                            ctx,
+                            next_pc,
+                            "mod2730",
+                            InnermostMiframeBuild::LiveMarker(lastop),
+                        ),
+                        None if effects_moved => helper_capability_gap_resume_pc(
                             code,
                             opcode_position,
                             ctx.live_after_jit_pc,
                             effects_at_step,
                         )
-                    } else {
-                        Some(residual_call::abort_latch_resume_pc(ctx, opcode_position))
+                        .map(|resume_pc| {
+                            latch_abort_blackhole_innermost(
+                                ctx,
+                                resume_pc,
+                                "mod2730",
+                                InnermostMiframeBuild::TraceTooLong,
+                            )
+                        })
+                        .unwrap_or(false),
+                        None => latch_abort_blackhole_innermost(
+                            ctx,
+                            opcode_position,
+                            "mod2730",
+                            InnermostMiframeBuild::TraceTooLong,
+                        ),
                     };
-                    if let Some(resume_pc) = resume_pc {
-                        let _ = latch_abort_blackhole(ctx, resume_pc, "mod2730");
+                    if latched && helper_convertible {
+                        let splice_ok =
+                            inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                        if finish_helper_abort_latch(ctx.session, splice_ok) {
+                            ctx.session.borrow_mut().abort_in_subwalk = true;
+                        }
                     }
                 }
                 if effects_moved
@@ -5991,6 +6227,16 @@ pub fn walk<Sym: WalkSym>(
             // returns `TraceTooLong` so the enclosing Python CALL can
             // latch; an effectful walk without a complete image keeps
             // executing every call (`helper_too_long_decision`).
+            // A recovered helper subwalk may have left a multi-frame image.
+            // This too-long is a new unwind after a completed step
+            // (`blackhole_if_trace_too_long` after `run_one_step`). Force-qmut
+            // already discards on a new unwind; without it `try_adopt` prefers
+            // the stale helper image over the single-frame latch this arm
+            // writes. An inline too-long keeps its innermost image: `step()`
+            // returned Continue, so that image is this abort, not a leftover.
+            if snapshot_safe && !ctx.fbw_mode.inline_subwalk {
+                discard_staged_abort(ctx.session);
+            }
             let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
             // equivalent).  Ask the height check here, while a refusal can still
@@ -6410,6 +6656,32 @@ fn read_int_reg<Sym: WalkSym>(
     operand_offset: usize,
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<OpRef, DispatchError> {
+    let reg = code[op.pc + 1 + operand_offset] as usize;
+    let value = read_int_reg_raw(code, op, operand_offset, ctx)?;
+    // Same unbound-slot check as [`read_ref_reg`]. `OpRef::None.raw()` is
+    // `u32::MAX`; encoding that as TAGBOX overflows `append_int` and the
+    // portal aborts as `ABORT_TOO_LONG`. Decline so a helper that reads a
+    // color `setup_call` never wrote residualizes at the callable parent
+    // (`pyjitpl.py` never executes a box of `None`).
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "i",
+        });
+    }
+    Ok(value)
+}
+
+/// [`read_int_reg`] without the unbound-slot check. `*_vable_*` array
+/// index reads use this so an `OpRef::NONE` index still surfaces
+/// [`DispatchError::VableArrayIndexNotConcrete`].
+fn read_int_reg_raw<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
     ctx.registers_i
@@ -6433,14 +6705,23 @@ fn read_float_reg<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
-    ctx.registers_f
+    let value = ctx
+        .registers_f
         .get(reg)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg,
             len: ctx.registers_f.len(),
             bank: "f",
-        })
+        })?;
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "f",
+        });
+    }
+    Ok(value)
 }
 
 /// Read a three-byte little-endian label operand at `pc + 1 +
@@ -7483,80 +7764,41 @@ fn dispatch_switch_id<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// Bridge an `MIFrame`'s register banks +
-/// trace recorder + last-exc state into a `WalkContext` and run
-/// `walk()` against the supplied jitcode body.
+/// Fresh `MetaInterp` (`pyjitpl.py`) plus `prepare_resume_from_failure`.
+/// Call once per compile attempt (`full_body_walk_trace` Reset,
+/// `drive_bridge_carrier_walk`), not from [`dispatch_via_miframe`]: that
+/// function is one jitcode body (`interpret()`), and a no-raise body must
+/// leave `class_of_last_exc_is_const` alone.
 ///
-/// RPython parity context: in RPython the metainterp loop iterates
-/// over `metainterp.framestack[-1].pc` calling `bytecode_step` which
-/// dispatches to the right `opimpl_*`. There's no separate "walker
-/// entry" because the metainterp loop *is* the walker. This entry
-/// point is pyre's equivalent: it drives the walker against the
-/// supplied `MIFrame` state and is the sole production tracing path.
-///
-/// Field plumbing:
-/// * `registers_r/i/f` — allocated fresh per call sized to
-///   `top_num_regs_* + top_constants_*.len()`, then populated by
-///   the inline `setup_call` from `argboxes_*` and constant slots.
-///   PyPy parity: `pyjitpl.py MIFrame.__init__` allocates
-///   the bank vectors at frame construction; `:188 setup_call`
-///   populates slots `[0..argboxes.len())` from the caller's
-///   argboxes. Walker handlers writing dst slots (`int_copy`,
-///   `binop_int_record`, etc.) mutate them in place; the banks are
-///   dropped when this function returns (matching PyPy's per-frame
-///   lifetime).
-/// * `trace_ctx` — borrowed mutably from `miframe.ctx`'s
-///   `TraceCtx`. Recording (`record_op`, `finish`, etc.) goes
-///   through this.
-/// * `last_exc_value` — reads `sym.last_exc_box` as the initial
-///   value (`OpRef::NONE` collapses to `None`). On exit the
-///   walker's final `last_exc_value` is mirrored back if non-None,
-///   so a `raise/r` -> `catch_exception/L` -> handler trace
-///   leaves `sym.last_exc_box` pointing at the in-flight exc OpRef
-///   (parity with RPython metainterp.last_exc_value).
-/// * `descr_refs`, `sub_jitcode_lookup` — caller-provided, same
-///   contract as direct `walk()` callers. Production callers wire
-///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
-///   closure over the lazy runtime jitcode cache.
-///
-/// `is_top_level` selects the outer-frame semantic:
-///
-/// * `true` — outermost trace entry. `*_return/*` arms record
-///   `Finish(value, done_with_this_frame_descr_<kind>)` and a `raise/r`
-///   that is never caught records
-///   `Finish(exc, exit_frame_with_exception_descr_ref)`.
-/// * `false` — sub-frame entry: `*_return/*` arms surface
-///   `SubReturn { result }` and uncaught `raise/r` arms surface
-///   `SubRaise { exc }` to the caller. The shadow validator (Phase
-///   D-3) drives this for per-Python-opcode arms — a Python-opcode arm
-///   compiled by the codewriter ends with `*_return/*` (since each arm
-///   is a self-contained sub-jitcode invoked from the outer dispatcher
-///   via `inline_call_r_r/dR>r`), so shadow mode must NOT emit a FINISH
-///   per Python opcode.
-///
-/// Sub-walks driven by `inline_call_r_r/dR>r` recursion always set
-/// `is_top_level=false` regardless of this caller-side flag (the
-/// recursion constructs its own `WalkContext`).
-///
-/// **Production wiring**: the full-body-walk walker
-/// (`full_body_walk_trace`) is the caller, dispatching each JitCode
-/// opcode through this entry as it walks the body.
-///
-/// `prepare_resume_from_failure` (`pyjitpl.py`): a fresh `MetaInterp` has
-/// `last_exc_value` null until an op of the trace raises. Only an exception
-/// guard (`ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr`) installs one
-/// before the first op, from `cpu.grab_exc_value(deadframe)`.
-///
-/// Called once at the start of a bridge trace. Later walks of the same
-/// trace leave the value on the walker `last_exc_value` until `finishframe`
-/// (`finishframe_clear_last_exc`) or a handler consumes it. Residuals write
-/// `BH_LAST_EXC_VALUE`; the grab itself stays in `GUARD_EXC_VALUE` for the
-/// park (`GuardExcRoot`).
+/// Every trace runs on a fresh `MetaInterp`, whose `last_exc_value` is
+/// null until an op of the trace raises. Only `prepare_resume_from_failure`
+/// installs one before the first op, and only for a `ResumeGuardExcDescr`
+/// / `ResumeGuardCopiedExcDescr` source guard, from that failure's
+/// `cpu.grab_exc_value(deadframe)`. A root trace and a non-exception-guard
+/// bridge are therefore not seeded: neither a residual helper's leftover in
+/// `BH_LAST_EXC_VALUE` nor the exception an enclosing `except` block is
+/// handling (`ExecutionContext.sys_exc_value`) is this trace's exception.
+/// Residuals write `BH_LAST_EXC_VALUE`; the grab itself stays in
+/// `GUARD_EXC_VALUE` for the park (`GuardExcRoot`). Later walks of the
+/// same trace leave the value on walker `last_exc_value` until
+/// `finishframe` (`finishframe_clear_last_exc`) or a handler consumes it.
 pub(crate) fn seed_standing_exception_for_walk<Sym: WalkSym>(
     sym: &mut Sym,
     trace_ctx: &mut TraceCtx,
 ) {
     if !(trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard()) {
+        // Fresh `MetaInterp` (`pyjitpl.py`): `last_exc_value` is null until
+        // an op of THIS trace raises. The sym persists across walks, so a
+        // previous loop's handler leftover would otherwise survive into a
+        // non-exception-guard bridge and abort at the next
+        // `catch_exception/L` (`CatchExceptionWithActiveException`).
+        // `prepare_resume_from_failure` is the only seeder, and only for
+        // `ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr`.
+        sym.set_current_exc_value(pyre_object::PY_NULL);
+        sym.set_current_exc_box(OpRef::NONE);
+        sym.set_last_exc_value(pyre_object::PY_NULL);
+        sym.set_last_exc_box(OpRef::NONE);
+        sym.set_class_of_last_exc_is_const(false);
         return;
     }
 
@@ -9420,18 +9662,32 @@ pub(crate) fn operator_continuation_parent_frame(
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
 
+/// Extra-area payload for [`WalkSessionRoots`]: the session cell plus the
+/// tracing `FrontendResrefOwner` copied at publication so the walker does
+/// not read `ACTIVE_TRACE`.
+struct WalkSessionArea {
+    session: *const std::cell::RefCell<WalkSession>,
+    owner: majit_metainterp::FrontendResrefOwner,
+}
+
 /// The translated stack root of this attempt's MetaInterp/framestack
 /// (warmstate.py WarmEnterState.make_entry_point.bound_reached). Borrow the
 /// stable RefCell for the whole attempt, including empty-stack intervals and
 /// post-walk snapshots. Frame guards may be stored in a Vec and retired in
 /// insertion order; none of them owns this publication's lifetime.
 pub(crate) struct WalkSessionRoots<'a> {
+    // Retire the area before releasing its payload (field drop order).
     _area: majit_gc::shadow_stack::MutatorExtraAreaGuard,
+    _payload: Box<WalkSessionArea>,
     _session: &'a std::cell::RefCell<WalkSession>,
 }
 
 impl<'a> WalkSessionRoots<'a> {
     pub(crate) fn new(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        let payload = Box::new(WalkSessionArea {
+            session: std::ptr::from_ref(session),
+            owner: crate::trace::active_trace_resref_owner(),
+        });
         let area = unsafe {
             // The returned guard's borrow prevents moving/dropping the cell
             // before retirement. Collectors visit it only under mutator STW
@@ -9439,12 +9695,13 @@ impl<'a> WalkSessionRoots<'a> {
             // collecting call. The checked callback enforces that last rule.
             majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
                 walk_session_roots,
-                (session as *const std::cell::RefCell<WalkSession>).cast(),
+                std::ptr::from_ref(payload.as_ref()).cast(),
                 "walk_session",
             )
         };
         Self {
             _area: area,
+            _payload: payload,
             _session: session,
         }
     }
@@ -9472,7 +9729,9 @@ fn walk_paused_register_bank(
 }
 
 unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let cell = unsafe { &*(data as *const std::cell::RefCell<WalkSession>) };
+    let area = unsafe { &*(data as *const WalkSessionArea) };
+    let owner = area.owner;
+    let cell = unsafe { &*area.session };
     let mut session = cell
         .try_borrow_mut()
         .expect("WalkSession borrow held across collection");
@@ -9482,25 +9741,31 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         visitor(&mut root);
         *ptr = root.0 as pyre_object::PyObjectRef;
     };
-    // MetaInterp.last_exc_value and blackhole.py tmpreg_r are owner fields,
-    // not merely roots when an inline frame happens to be on the stack.
+    // pyjitpl.py `walk_active_trace_refs`: `MetaInterp.last_exc_box` is a
+    // Box, so `RefFrontendOp._resref` / `ConstPtr.value` stay reachable
+    // while the exception is pending. `tmpreg_r`, `finish_payload`, and
+    // `portal_call_frame` are the same kind of owner field.
     if let Some(value) = session.last_exc_value.as_mut() {
-        value.walk_const_ptr_refs_mut(visitor);
+        walk_frontend_box(value, owner, visitor);
     }
     if let ConcreteValue::Ref(value) = &mut session.last_exc_value_concrete {
         walk_ptr(value, visitor);
         unsafe { pyre_interpreter::eval::walk_raw_exception_roots(*value, visitor) };
     }
     if let Some(seed) = session.carrier_raise_seed.as_mut() {
-        seed.exc.walk_const_ptr_refs_mut(visitor);
+        walk_frontend_box(&mut seed.exc, owner, visitor);
         if let ConcreteValue::Ref(value) = &mut seed.exc_concrete {
             walk_ptr(value, visitor);
             unsafe { pyre_interpreter::eval::walk_raw_exception_roots(*value, visitor) };
         }
     }
-    session.tmpreg_r.walk_const_ptr_refs_mut(visitor);
+    walk_frontend_box(&mut session.tmpreg_r, owner, visitor);
     if let Some((value, _)) = session.finish_payload.as_mut() {
-        value.walk_const_ptr_refs_mut(visitor);
+        walk_frontend_box(value, owner, visitor);
+    }
+    if let Some((frame, vref)) = session.portal_call_frame.as_mut() {
+        walk_frontend_box(frame, owner, visitor);
+        walk_frontend_box(vref, owner, visitor);
     }
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
         walk_ptr(value, visitor);
@@ -9531,11 +9796,24 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
             value.walk_const_ptr_refs_mut(visitor);
         }
     }
+    // pyjitpl.py `walk_active_trace_refs`: every `MIFrame.registers_r` is a
+    // GC root. Helper subwalks live on `helper_live` rather than
+    // `MetaInterp.framestack`; walking them here is that same list.
+    for live in &session.helper_live {
+        live.registers_r.walk_roots(owner, visitor);
+        live.frame_state().walk_roots(owner, visitor);
+    }
+    for frame in session.framestack.iter() {
+        if let Some(live) = frame.live.as_ref() {
+            live.registers_r.walk_roots(owner, visitor);
+            live.frame_state().walk_roots(owner, visitor);
+        }
+    }
     let mut walk_parent = |parent: &mut InlineParentFrame| {
-        // history.py ConstPtr.value remains reachable through each
-        // paused frame's active boxes, including constructor tails.
+        // history.py ConstPtr.value / RefFrontendOp._resref remain reachable
+        // through each paused frame's active boxes, including constructor tails.
         for value in &mut parent.boxes {
-            value.walk_const_ptr_refs_mut(visitor);
+            walk_frontend_box(value, owner, visitor);
         }
         for (_, value) in &mut parent.call_stack_overrides {
             walk_ptr(value, visitor);
@@ -9549,6 +9827,14 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
             for (_, value) in &mut blackhole.ref_values {
                 walk_ptr(value, visitor);
             }
+        }
+        // `attach_live_caller` parks the MIFrame banks; a helper pause has
+        // `blackhole: None`, so these lists are the live `registers_r`.
+        if let Some(bank) = parent.registers_r.as_ref() {
+            bank.walk_roots(owner, visitor);
+        }
+        if let Some(state) = parent.frame_state.as_ref() {
+            state.walk_roots(owner, visitor);
         }
     };
     for frame in session.framestack.iter_mut() {
@@ -11446,8 +11732,7 @@ fn direct_libffi_call<Sym: WalkSym>(
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
-            fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
-            fbw_mark_unjournaled_effect(cause);
+            residual_call::stop_unexecuted_residual(ctx, pc, cause, None)?;
             false
         }
     };
@@ -11720,8 +12005,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
-            fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
-            fbw_mark_unjournaled_effect(cause);
+            residual_call::stop_unexecuted_residual(ctx, pc, cause, None)?;
             false
         }
     };
@@ -14072,7 +14356,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
 /// pool (`JitCodeBody` has no `descrs` field), so it resolves its `d`/`j`
 /// descr operands through the global pool (`all_descr_refs()` /
 /// `RawDescrPool::Global`), and its inline-call descrs through this lookup.
-static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
+pub(crate) static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
     sub_jitcode_body_by_index;
 
 fn mark_trace_reads_module_global(
@@ -14299,7 +14583,9 @@ fn guarded_branch_core<Sym: WalkSym>(
     // `bhimpl_goto_if_not` re-evaluates the restored condition.
     // `other_target` is still the not-taken arm (kept-stack trampoline
     // decode, depth gate, unrestorable-arm decline). Capture keys the
-    // jump itself rather than this destination.
+    // jump itself rather than this destination. Helper graphs have no
+    // Python trampoline (`flatten.py` `-live-` then `goto_if_not`); they
+    // take the same orgpc live-before path.
     let other_target = resolve_branch_target_through_trampoline(code, other_pc);
     {
         // #124/#281: a branch guard whose resume target still holds a
@@ -14361,12 +14647,9 @@ fn guarded_branch_core<Sym: WalkSym>(
         // which is an unmapped address rather than a wrong answer.
         //
         // Depth 0 is the right answer, not merely the safe one: a helper frame
-        // owns no Python operand stack, and its guards resume at the paused
-        // parents' CALL coordinates
-        // (`walker_capture_transparent_helper_snapshot`), re-executing the call
-        // -- exactly the reasoning `single_frame_collapse` above already
-        // applies to the helper walk whose framestack is empty.  This closes
-        // the same case when it is not.
+        // owns no Python operand stack. Its guards resume inside the helper
+        // (`walker_capture_transparent_helper_snapshot` encodes the helper
+        // section at the guard's pc).
         //
         // `transparent_helper_subwalk` and not `inline_subwalk`: the latter is
         // also set for a Python-callee sub-walk, where the bank and the target
@@ -14628,7 +14911,9 @@ fn guarded_branch_core<Sym: WalkSym>(
         // Capture at the jump's `-live-` BEFORE (`ctx.live_before_jit_pc`)
         // so the snapshot boxes are the live set before `goto_if_not`
         // (condition included) and blackhole `bhimpl_goto_if_not`
-        // re-evaluates the branch.
+        // re-evaluates the branch. A helper has no trampoline, so this is
+        // the same live-before (or `op.pc` when that anchor is unset) —
+        // `get_list_of_active_boxes` at `orgpc - SIZE_LIVE_OP`.
         let capture_pc = if ctx.live_before_jit_pc != usize::MAX {
             ctx.live_before_jit_pc
         } else {
@@ -17323,6 +17608,11 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .profiler()
                 .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+            // `record_op` / the nursery alloc below can minor-collect.
+            // Pin the live MIFrame refs the extra-area walks
+            // (`walk_active_trace_refs` / `registers_r`) so `_resref` is
+            // already forwarded when the next operand is read.
+            let live_pins = residual_call::pin_live_frame_ref_registers(ctx);
             let resbox = ctx
                 .trace_ctx
                 .record_op_with_descr(opcode, &[length], descr.clone());
@@ -17357,7 +17647,14 @@ fn handle<Sym: WalkSym>(
             // An unknown length keeps the Null posture. Signed/Float
             // arrays stamp a typed items block so `OS_ARRAYCOPY` can run;
             // `NEW_ARRAY_CLEAR` zeroes it (`bh_new_array_clear`) so
-            // `getarrayitem_gc_i` reads `FREE` (0).
+            // `getarrayitem_gc_i` reads `FREE` (0). A `[u8]` /
+            // `GcArray(Char)` dest is BytesBlock (item_size 1, chars at
+            // 8): the word-sized arm cannot represent it, and leaving
+            // it unbound aborts the void `OS_ARRAYCOPY` that
+            // `ll_listslice_startstop` records (`ResidualCallArgUnbound`
+            // on dest). Stamp a zeroed BytesBlock so that copy runs
+            // during the walk, the same way `bh_new_array` (`llmodel.py`)
+            // allocates from the live arraydescr.
             let mut concrete = ConcreteValue::Null;
             if let Some((tid, item_size, items_base)) = cleared_struct_array {
                 // `cd>r` encodes the length in the opcode byte. Reading
@@ -17395,8 +17692,9 @@ fn handle<Sym: WalkSym>(
                                 .map(|p| p as *mut u8)
                         }
                     } else if let Some(ad) = descr.as_array_descr() {
-                        if ad.is_array_of_structs() || ad.item_size() != std::mem::size_of::<u64>()
-                        {
+                        if ad.is_array_of_structs() {
+                            None
+                        } else if ad.item_size() != std::mem::size_of::<u64>() {
                             None
                         } else {
                             // Analyzer `get_array_descr` leaves
@@ -17454,6 +17752,7 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             }
+            residual_call::refresh_live_frame_ref_registers(ctx, &live_pins);
             write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
@@ -18705,7 +19004,44 @@ fn handle<Sym: WalkSym>(
                     },
                 },
             )? {
-                Some(outcome) => Ok((outcome, op.next_pc)),
+                Some(outcome) => {
+                    if matches!(&outcome, DispatchOutcome::CloseLoop { .. }) {
+                        // pyjitpl.py `get_procedure_token(greenboxes)`: publish
+                        // this merge point's own pc and greens, as the
+                        // `already_compiled_here` arm already does, so
+                        // `close_header_pc` does not fall back to the session
+                        // header (mc_diag slot 56).
+                        let live_typed = crate::driver::make_green_key_typed(
+                            code_ptr,
+                            next_instr,
+                            is_being_profiled,
+                        );
+                        let close_ints: Vec<i64> = gi
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_refs: Vec<i64> = gr
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_floats: Vec<i64> = gf
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_greens = (close_ints.len() == gi.len()
+                            && close_refs.len() == gr.len()
+                            && close_floats.len() == gf.len())
+                        .then_some((
+                            close_ints,
+                            close_refs,
+                            close_floats,
+                            live_typed.types.to_vec(),
+                        ));
+                        ctx.trace_ctx
+                            .publish_close_from_merge_point(close_greens, next_instr as i64);
+                    }
+                    Ok((outcome, op.next_pc))
+                }
                 None => {
                     put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
                     Ok((DispatchOutcome::Continue, op.next_pc))

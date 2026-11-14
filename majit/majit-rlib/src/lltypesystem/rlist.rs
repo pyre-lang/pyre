@@ -583,7 +583,8 @@ const _: () = assert!(GC_LIST_LENGTH_OFFSET == 0);
 const _: () = assert!(GC_LIST_ITEMS_OFFSET == std::mem::size_of::<i64>());
 const _: () = assert!(std::mem::size_of::<GcList>() == 2 * std::mem::size_of::<i64>());
 
-fn rlist_overallocate_signed(newsize: i64) -> i64 {
+/// `rlist.py _ll_list_resize_hint_really` over-allocation with Signed `newsize`: `some = 3 if newsize < 9 else 6; some += newsize >> 3; return newsize + some`.
+pub fn rlist_overallocate_signed(newsize: i64) -> i64 {
     let some = if newsize < 9 { 3i64 } else { 6i64 };
     let some = some.wrapping_add(newsize >> 3);
     newsize.wrapping_add(some)

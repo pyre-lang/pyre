@@ -4331,6 +4331,20 @@ impl OptContext {
                 // info lives on the replay op, so `make_guards(preamble_op)`
                 // names that result rather than the export-time box.
                 self.set_preamble_forwarded_info(&produced_op.preamble_op, info);
+                // shortpreamble.py `ShortInputArg(box, renamed)`: `preamble_op`
+                // IS the renamed InputArg, so the plant above lands on it.
+                // pyre's InputArg `preamble_op` is a SAME_AS stood in at the
+                // original label box (`add_short_input_arg`); `produce_arg`
+                // returns `short_inputargs[label_arg_idx]`, which is what
+                // `HeapOp.add_op_to_short` puts in the replay GETFIELD and
+                // what `use_box` `make_guards` reads. Plant the same info
+                // on that renamed box.
+                if produced_op.kind == PreambleOpKind::InputArg
+                    && let Some(idx) = produced_op.label_arg_idx
+                    && let Some(renamed) = short_inputargs.get(idx)
+                {
+                    self.set_preamble_forwarded_info_at(renamed, info);
+                }
             }
         }
 
@@ -4868,7 +4882,6 @@ impl OptContext {
         preamble_op: &majit_ir::OpRc,
         info: &crate::optimizeopt::info::OpInfo,
     ) {
-        use crate::optimizeopt::info::OpInfo;
         let source = preamble_op.pos().get();
         if source.is_constant() || source.is_none() {
             return;
@@ -4879,8 +4892,32 @@ impl OptContext {
         ) {
             self.bind_input_resops(std::slice::from_ref(preamble_op));
         }
-        let b = Operand::from_bound_op(preamble_op);
-        if self.has_forwarding(&b) {
+        // Replay ops (Heap / Pure) carry info on the Op itself
+        // (`Operand::from_bound_op`). A SAME_AS stand-in whose `pos` is an
+        // InputArg would `materialize_operand_at` to that InputArg and miss
+        // the stand-in slot `add_short_input_arg` planted.
+        self.plant_preamble_forwarded_info(&Operand::from_bound_op(preamble_op), info);
+    }
+
+    /// shortpreamble.py `preamble_op.set_forwarded(info)` on a renamed
+    /// `ShortInputArg` box (`short_inputargs[i]`). The renamed Operand is
+    /// the box `produce_arg` returns; plant on it rather than rematerializing
+    /// from an OpRef (which would miss the stand-in `add_short_input_arg`
+    /// planted).
+    fn set_preamble_forwarded_info_at(
+        &mut self,
+        renamed: &Operand,
+        info: &crate::optimizeopt::info::OpInfo,
+    ) {
+        if renamed.to_opref().is_constant() || renamed.to_opref().is_none() {
+            return;
+        }
+        self.plant_preamble_forwarded_info(renamed, info);
+    }
+
+    fn plant_preamble_forwarded_info(&self, b: &Operand, info: &crate::optimizeopt::info::OpInfo) {
+        use crate::optimizeopt::info::OpInfo;
+        if self.has_forwarding(b) {
             return;
         }
         match info {
@@ -11800,6 +11837,9 @@ mod ensure_ptr_info_arg0_tests {
         fn type_id(&self) -> u32 {
             self.index
         }
+        fn vtable(&self) -> usize {
+            self.index as usize
+        }
         fn is_immutable(&self) -> bool {
             false
         }
@@ -12032,6 +12072,39 @@ mod ensure_ptr_info_arg0_tests {
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
         assert!(matches!(&*pi, PtrInfo::Instance(_)));
+    }
+
+    /// shortpreamble.py `use_box` + info.py `InstancePtrInfo.make_guards`:
+    /// GETFIELD of an object field upgrades the InputArg receiver to
+    /// Instance (no `known_class`); `use_box` then emits `GUARD_SUBCLASS`
+    /// of that InputArg before the GETFIELD
+    /// (`test_guards_before_getfields_in_short_preamble`). A jump that
+    /// binds the InputArg to a ConstPtr of another class then hits
+    /// rewrite.py `optimize_GUARD_SUBCLASS` rather than compiling the
+    /// GETFIELD of that const.
+    #[test]
+    fn collect_use_box_guards_emits_guard_subclass_of_instance_getfield_receiver() {
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let parent = instance_parent_descr();
+        // `use_box` snapshots `read_forwarded` via `inputarg_refs`. The GETFIELD
+        // receiver must be that host (`ensure_replay_heap_receiver` rebinds
+        // export-time operands the same way).
+        let receiver = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let descr: DescrRef = Arc::new(TestFieldDescr {
+            index: 0,
+            parent: parent.clone(),
+        });
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[receiver], descr);
+        op.pos().set(OpRef::int_op(1));
+        let _ = ctx.ensure_ptr_info_arg0(&op);
+        let (arg_guards, _result_guards) = ctx
+            .collect_use_box_guards(&op)
+            .expect("use_box guards of an Instance GETFIELD receiver");
+        assert!(
+            arg_guards.iter().any(|g| g.opcode == OpCode::GuardSubclass
+                && g.arg(0).to_opref() == OpRef::input_arg_ref(0)),
+            "expected GUARD_SUBCLASS of the GETFIELD receiver, got {arg_guards:?}"
+        );
     }
 
     /// optimizer.py:485-487 ARRAYLEN_GC branch → `info.ArrayPtrInfo(descr)`.

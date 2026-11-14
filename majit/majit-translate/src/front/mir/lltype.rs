@@ -2938,6 +2938,15 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
+    // A Rust pointer's lowlevel type comes from the pointee declaration
+    // (`lltype.Ptr` of that struct). `Utf8Str` / `BytesBlock` are rstr
+    // `STR` (`rstr.py` `GcStruct('rpy_string', …)`); `*const Utf8Str`,
+    // `*mut Utf8Str`, and `*const BytesBlock` are `Ptr(STR)`, not a raw
+    // address. The current crate's `GcType` harvest may omit a
+    // cross-crate pointee (`bytes_concat` in the interpreter LLBC).
+    if tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
+        return false;
+    }
     let Some(node) = tyref_node(ty, llbc).and_then(|node| type_node_peel_aliases(node, llbc))
     else {
         return false;
@@ -5079,11 +5088,15 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if raw_scalar_address_value_type(kind_src, llbc).is_some() {
         return Some("i64".to_string());
     }
-    // A pair slice returns its item pointer word; the length goes through
-    // the caller's slot.
-    if tyref_pair_slice_item_kind(kind_src, llbc)
-        .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
-    {
+    // A pair slice of a one-word item returns its item pointer word; the
+    // length goes through the caller's slot (`ret_len_slot_local`,
+    // `SLICE_LEN_SLOT_STORE`). After `result_exc` projects
+    // `Result<T, PyError>` to `T`, a pair slice `T` is that same pair
+    // (`kind_src`). Host `&mut [u8]` is a W2 list (`tyref_is_u8_list`):
+    // `pair_len_shadow` leaves it without a length slot, so FUNC.RESULT
+    // follows the CFG GcRef. A `BytesBlock.chars` view is one STR Ref;
+    // `arraylen_gc` reads length.
+    if tyref_pair_slice_item_kind(kind_src, llbc).is_some() {
         return Some("u64".to_string());
     }
     // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
@@ -6609,11 +6622,12 @@ pub(in crate::front::mir) fn wtf8_string_identity_segments(segments: &[String]) 
 /// `Cow<str-family>` (`unicodehelper.py str_decode_utf8` returns a
 /// plain str; the Cow ADT is that rstr).
 ///
-/// `as_str` / `as_ref` / `as_bytes` / `to_string` / `deref` are identity
-/// on either spelling (`rstr.py` has one string type). A rust-heap
-/// `String` still paints `ValueType::Ref` so `ll_strconcat` does not
-/// consume a `{cap, ptr, len}` header. `Cow<str>` paints `ValueType::Str`
-/// ([`tyref_is_cow_str`]).
+/// `as_bytes` / `to_string` are identity on either spelling (`rstr.py`
+/// has one string type). `as_str` / `as_ref` / `deref` of an already-STR
+/// word are identity; of a rust-heap header they are `Repr.rtype_str`.
+/// A rust-heap `String` still paints `ValueType::Ref` so `ll_strconcat`
+/// does not consume a `{cap, ptr, len}` header. `Cow<str>` paints
+/// `ValueType::Str` ([`tyref_is_cow_str`]).
 pub(in crate::front::mir) fn tyref_is_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_string_value(ty, llbc)
         || tyref_is_rust_heap_string(ty, llbc)
@@ -7117,10 +7131,7 @@ pub(in crate::front::mir) fn struct_decls_by_owner(llbc: &Llbc) -> &StructDeclsB
     })
 }
 
-pub(in crate::front::mir) fn type_decl_by_owner_root<'l>(
-    llbc: &'l Llbc,
-    owner: &str,
-) -> Option<&'l TypeDecl> {
+fn type_decl_by_owner_root<'l>(llbc: &'l Llbc, owner: &str) -> Option<&'l TypeDecl> {
     let index = struct_decls_by_owner(llbc);
     let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
     if let Some((key, pos)) = index.exact.get(start)
@@ -10001,6 +10012,17 @@ pub(in crate::front::mir) fn tyref_adt_generics_type_arg(
     serde_json::from_value(node.clone()).ok()
 }
 
+/// A `u8` scalar (the host `&[u8]` pair item), including behind the
+/// usual type wrappers. Distinct from `i8` (`rstr.py` `STR` chars are
+/// unsigned).
+pub(in crate::front::mir) fn tyref_is_u8_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| json_ty_scalar_element_spelling(n, llbc))
+        .as_deref()
+        == Some("u8")
+}
+
 /// Shared immutable `&[u8]` / `*const [u8]` (Charon `Ref`/`RawPtr` of
 /// `Slice<u8>`). This TyRef is a fat window, not `rstr.py` `STR`.
 /// `&mut [u8]` / `*mut [u8]` stay a list of unsigned.
@@ -10757,6 +10779,46 @@ pub(in crate::front::mir) fn tyref_is_fixed_u8_list(ty: &TyRef, llbc: &Llbc) -> 
     tyref_raw_array_parts(&array_ty, llbc).is_some_and(|(item, _)| {
         json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
     })
+}
+
+/// A host `&[u8]` item is an integer byte. Deduplicated `u8` place
+/// types can fall back to `Ref`; keep the load in the int bank so a
+/// `match bytes[0]` SwitchInt stays `'i'`.
+pub(in crate::front::mir) fn u8_pair_item_ty(item_ty: &ValueType) -> ValueType {
+    match item_ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => item_ty.clone(),
+        _ => ValueType::Unsigned,
+    }
+}
+
+/// Host `&[u8]` / `&mut [u8]` / `*const [u8]` / `*mut [u8]`, including
+/// `Option` of those. Independent of pair-slice classification: a
+/// BytesBlock-backed `[u8]` view is still this element type.
+pub(in crate::front::mir) fn tyref_slice_elem_is_u8(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let inner = node
+        .get("Adt")
+        .and_then(|adt| adt.get("generics")?.get("types")?.as_array()?.first())
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .unwrap_or(node);
+    let pointee = match (inner.get("Ref"), inner.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array().and_then(|a| a.get(1)),
+        (None, Some(raw)) => raw.as_array().and_then(|a| a.first()),
+        _ => None,
+    };
+    let Some(pointee) = pointee.and_then(|p| strip_ty_indirections(p, llbc)) else {
+        return false;
+    };
+    let Some(item) = pointee
+        .get("Slice")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+    else {
+        return false;
+    };
+    json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
 }
 
 pub(in crate::front::mir) fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {

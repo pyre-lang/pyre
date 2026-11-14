@@ -316,8 +316,8 @@ fn get_or_create_array_descr_with_full_id(
         }
     }
     let descr_id = alloc_array_descr_id();
-    // `array_type_id` Some → `LLType::Array(path_hash(atid))` cache
-    // slot (analyzer ↔ runtime convergence path).
+    // `array_type_id` Some → `LLType::Array(array_identity_hash(atid))`
+    // cache slot (analyzer ↔ runtime convergence path).
     // `array_type_id` None but `type_id != 0` → no codewriter
     // lltype-identity carrier but a stable GC-tid is available
     // (`make_array_descr_with_type` path).  Widening that tid to
@@ -327,8 +327,7 @@ fn get_or_create_array_descr_with_full_id(
     // `cache_key()` migration — without this fallback, every
     // `PY_OBJECT_ARRAY_GC_TYPE_ID`-class runtime descr collapsed
     // onto slot 0 at the `BhDescr` boundary.
-    // `array_type_id` None and `type_id == 0` → no identity carrier
-    // at all (legacy `make_array_descr` no-identity path); stay 0.
+    // `array_type_id` None and `type_id == 0` → shape identity.
     // Packed `BhDescr::Array.type_id` is the producer `cache_key`
     // (`cpu.arraydescrof` / `descr.py get_array_descr`). Dump spelling
     // is not a second `_cache_array` key.
@@ -336,9 +335,13 @@ fn get_or_create_array_descr_with_full_id(
         packed_cache_key
     } else {
         match key.array_type_id.as_deref() {
-            Some(atid) => majit_ir::descr::path_hash(atid),
+            Some(atid) => majit_ir::descr::array_identity_hash(atid),
             None if type_id != 0 => type_id as u64,
-            None => 0,
+            // No identity carrier at all: mint a shape identity so
+            // `prepass.rs add_descr` still publishes the descr.
+            None => majit_ir::descr::array_identity_hash(&format!(
+                "__anon_array[base={base_size};item={item_size};len={len_offset:?};ty={item_type:?}]"
+            )),
         }
     };
     // `descr.py` ArrayDescr — a single flag-bearing descriptor.
@@ -383,7 +386,7 @@ fn get_or_create_array_descr_with_full_id(
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
-    // `gc_cache._cache_array` keyed on `LLType::Array(path_hash(atid))`
+    // `gc_cache._cache_array` keyed on `LLType::Array(cache_key)`
     // so later analyzer-side `gc_cache.get_array_descr` cache-hit
     // returns this exact Arc.  Without an `array_type_id` (legacy
     // `make_array_descr` callers), only the local
@@ -1763,7 +1766,7 @@ static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "data",
                 pyre_object::bytearrayobject::BYTEARRAY_DATA_OFFSET,
-                std::mem::size_of::<*mut Vec<u8>>(),
+                std::mem::size_of::<*mut pyre_object::bytesobject::BytesBlock>(),
                 Type::Ref,
                 false,
                 false,
@@ -10433,6 +10436,76 @@ mod tests {
         );
     }
 
+    /// `W_CType` has no `DECLARED_GROUPS` row. A truncated borrowed
+    /// layout that only lists `w_class` still injects the pytype vtable,
+    /// but packed kind-0 must still mint the rest of
+    /// `heaptracker.all_fielddescrs` — including `lifeline` — so an
+    /// EffectInfo member for that field stays one `(STRUCT, fieldname)`.
+    #[cfg(feature = "pyre-module")]
+    #[test]
+    fn kind0_packed_fields_survive_a_truncated_vtable_shell() {
+        publish_pyre_class_vtables();
+        let mut found = None;
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr
+                .struct_path
+                .ends_with("::_cffi_backend::ctypeobj::W_CType")
+                || descr.struct_path.ends_with("::ctypeobj::W_CType")
+            {
+                found = Some(descr);
+            }
+        });
+        let descr = found.expect("W_CType pyre_class descriptor");
+        let stripped = match descr.struct_path.split_once("::") {
+            Some((_, rest)) => rest,
+            None => descr.struct_path,
+        };
+        let key = majit_ir::descr::path_hash(stripped);
+        let _ = majit_ir::descr::publish_borrowed_struct_layout(
+            u32::MAX,
+            descr.object_size,
+            0,
+            key,
+            0,
+            true,
+            false,
+            &[],
+            vec![majit_ir::descr::BorrowedField {
+                index: 0,
+                name: Cow::Borrowed("ob.w_class"),
+                field_key: "w_class",
+                offset: pyre_object::pyobject::W_CLASS_OFFSET,
+                field_size: WORD,
+                field_type: Type::Ref,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(true),
+                load_is_acquire: false,
+                store_is_release: false,
+            }],
+        );
+        crate::jitcode_runtime::materialize_gccache_owned_descrs();
+        let member = majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: key,
+            field_name: "lifeline".into(),
+        };
+        match descr_from_set_member(&member) {
+            SetMemberLookup::Resolved(descr) => {
+                let field = descr.as_field_descr().expect("lifeline FieldDescr");
+                assert_eq!(field.field_key(), "lifeline");
+            }
+            SetMemberLookup::AbsentContainer => {
+                panic!("W_CType.lifeline has no runtime container after kind-0 publish")
+            }
+            SetMemberLookup::Ambiguous => {
+                panic!("W_CType.lifeline is ambiguous after a truncated vtable shell")
+            }
+        }
+        crate::jitcode_runtime::rehydrate_build_descr_raw_sets();
+    }
+
     /// `W_CType` is a pyre-module `#[pyre_class]` with no `DECLARED_GROUPS`
     /// row. Publishing the class census must make a `vtable=0` mint of
     /// its parent SizeDescr `is_object()`, so a speculative `kind` read
@@ -13413,6 +13486,49 @@ mod tests {
                 panic!("stamp lookup of packed cache_key: AbsentContainer")
             }
             SetMemberLookup::Ambiguous => panic!("stamp lookup of packed cache_key: Ambiguous"),
+        }
+    }
+
+    /// Opcode EffectInfo keys Array members on `BhDescr.type_id`. A wrapping
+    /// `array_type_id` of that key must still publish `_cache_array` under
+    /// `type_id`, or stamp resolution panics `AbsentContainer`.
+    #[test]
+    fn make_descr_from_bh_publishes_array_under_type_id_when_spelling_wraps_the_key() {
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let cache_key = 0x7187_6406_62f2_2417u64;
+        let bridged = make_descr_from_bh(&BhDescr::Array {
+            base_size: 8,
+            itemsize: 8,
+            len_offset: Some(0),
+            type_id: cache_key,
+            gc_type_id: u32::MAX,
+            item_type: Type::Ref,
+            is_array_of_pointers: true,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: true,
+            ei_index: 25,
+            array_type_id: Some(format!("__anon_array[{cache_key:#x}]")),
+            interior_fields: Vec::new(),
+            load_is_acquire: false,
+        });
+        match descr_from_set_member(&DescrSetMember::Array {
+            array_id: cache_key,
+        }) {
+            SetMemberLookup::Resolved(found) => {
+                assert!(
+                    std::sync::Arc::ptr_eq(&bridged, &found),
+                    "EffectInfo Array{{array_id: type_id}} must be the opcode descr"
+                );
+            }
+            SetMemberLookup::AbsentContainer => {
+                panic!("expected Resolved under type_id, got AbsentContainer")
+            }
+            SetMemberLookup::Ambiguous => {
+                panic!("expected Resolved under type_id, got Ambiguous")
+            }
         }
     }
 
@@ -16789,10 +16905,23 @@ pub(crate) fn force_all_declared_groups() {
 /// size descr that `register_keyed_size` then discards (the runtime group
 /// owns the vtable). A vtable-less shell still falls through: that path is
 /// the one `register_keyed_size` may upgrade.
+///
+/// Only a [`DECLARED_GROUPS`] or module-user row is that owner. A
+/// `#[pyre_class]` with no row (`W_CType`) can still carry a vtable from
+/// `publish_pyre_class_vtables` plus a truncated borrowed field list; that
+/// is not a declared group, and packed kind-0 must still run
+/// `get_field_descr` for every `heaptracker.all_fielddescrs` leaf.
 fn published_declared_group(
     spec: &majit_jitcode::jitcode::BhSizeSpec,
 ) -> Option<majit_ir::descr::SimpleDescrGroup> {
     if spec.type_id == 0 {
+        return None;
+    }
+    if !DECLARED_GROUP_BY_KEY.contains_key(&spec.type_id)
+        && !MODULE_USER_LAYOUT_DESCR_GROUPS
+            .iter()
+            .any(|entry| entry.group.size_descr.cache_key() == spec.type_id)
+    {
         return None;
     }
     let key = majit_ir::descr::LLType::Struct(spec.type_id);
@@ -18589,6 +18718,17 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     *type_id,
                 )
             };
+            // EffectInfo Array members key on `BhDescr.type_id` (the ARRAY
+            // cache_key `arraydescrof_concrete` stamped). Publishing only
+            // under `array_identity_hash(array_type_id)` diverges when that
+            // spelling is a wrapping of the key rather than the string
+            // that was hashed (`__anon_array[0x{cache_key}]`).
+            if *type_id != 0 {
+                majit_ir::descr_registry::register_keyed_array(
+                    majit_ir::descr::LLType::Array(*type_id),
+                    descr.clone(),
+                );
+            }
             // `effectinfo.py compute_bitstrings` republish: the
             // codewriter-side `array_index` carried across the BhDescr
             // boundary lands on the runtime descr so heap.rs
