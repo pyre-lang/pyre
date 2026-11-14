@@ -409,12 +409,14 @@ pub fn descr_dict_locks_after_fork_child() {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
+        // `StaticMethod.getdict` keeps `self` live across `space.newdict`.
+        // `w_dict_new_instance` collects: pin before the first field load so a
+        // forwarded nursery word is rewritten, then the barrier precedes the
+        // field store (`transform_generic_set`).
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj]);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         if (*(obj as *mut StaticMethod)).w_dict.is_null() {
-            // `w_dict_new_instance` collects: the receiver joins the livevar
-            // set across it, then the barrier precedes the field store
-            // (`transform_generic_set`).
-            let _roots = crate::gc_roots::push_roots();
-            let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
             let dict_slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(w_dict);
@@ -637,12 +639,14 @@ pub unsafe fn w_classmethod_current_w_function_qmut(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
+        // `ClassMethod.getdict` keeps `self` live across `space.newdict`.
+        // `w_dict_new_instance` collects: pin before the first field load so a
+        // forwarded nursery word is rewritten, then the barrier precedes the
+        // field store (`transform_generic_set`).
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj]);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         if (*(obj as *mut ClassMethod)).w_dict.is_null() {
-            // `w_dict_new_instance` collects: the receiver joins the livevar
-            // set across it, then the barrier precedes the field store
-            // (`transform_generic_set`).
-            let _roots = crate::gc_roots::push_roots();
-            let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
             let dict_slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(w_dict);
@@ -752,7 +756,12 @@ mod tests {
         crate::gil_ready::publish_gil_ready_for_test();
         for i in 0..500 {
             let sm = w_staticmethod_new(PY_NULL);
-            let sm_addr = sm as usize;
+            // `w_dict_new_instance` collects. Keep the receiver on this
+            // thread's root stack so the two workers' raw copies name a live
+            // object; `getdict` then follows a nursery forwarding stub.
+            let _roots = crate::gc_roots::push_roots();
+            let sm_slot = crate::gc_roots::pin_roots(&[sm]);
+            let sm_addr = crate::gc_roots::shadow_stack_get(sm_slot) as usize;
             let barrier = std::sync::Barrier::new(2);
             let first = std::sync::atomic::AtomicUsize::new(0);
             let second = std::sync::atomic::AtomicUsize::new(0);
@@ -770,7 +779,10 @@ mod tests {
             });
             let a = first.load(std::sync::atomic::Ordering::Relaxed);
             let b = second.load(std::sync::atomic::Ordering::Relaxed);
-            let field = unsafe { (*(sm as *const StaticMethod)).w_dict as usize };
+            let field = unsafe {
+                (*(crate::gc_roots::shadow_stack_get(sm_slot) as *const StaticMethod)).w_dict
+                    as usize
+            };
             assert_eq!(a, b, "iteration {i} returned two dict identities");
             assert_eq!(a, field, "iteration {i} dict is not the field");
         }
