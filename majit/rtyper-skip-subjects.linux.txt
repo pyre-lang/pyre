@@ -219,6 +219,7 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::native_slot_get
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::native_slot_set
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::next
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::next_yield_from
+two-phase-annotate-skipped	pyre_interpreter::baseobjspace::next_yield_from__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_delattr
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_getattribute_surrogate
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_setattr
@@ -283,7 +284,7 @@ two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_next
 two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_pow
 two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_str
 two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_str::<Impl>::call_once
-two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_super_from_frame_layout
+two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_super_from_frame_layout__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::builtins::call_and_check
 two-phase-annotate-skipped	pyre_interpreter::builtins::complex_coerce
 two-phase-annotate-skipped	pyre_interpreter::builtins::complex_index_to_real
@@ -411,6 +412,7 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_merge__AccessDir
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_simple__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_with_spec__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_aiter__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_anext::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_anext__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_awaitable__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_len__AccessDirect_None
@@ -461,7 +463,7 @@ two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain_with_resume:
 two-phase-annotate-skipped	pyre_interpreter::eval::eval_frame_plain_with_resume::closure::<Impl>::call_mut
 two-phase-annotate-skipped	pyre_interpreter::eval::install_current_frame
 two-phase-annotate-skipped	pyre_interpreter::eval::instantiate_raised_class
-two-phase-annotate-skipped	pyre_interpreter::eval::load_super_attr_value_w
+two-phase-annotate-skipped	pyre_interpreter::eval::load_super_attr_value_w__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::normalize_raise_cause
 two-phase-annotate-skipped	pyre_interpreter::eval::normalize_raise_cause::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::eval::prepare_frame_resume
@@ -487,10 +489,10 @@ two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::setllprof
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::store_profilefunc
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::take_pending_loop_exit
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::app_profile_call
-two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall
-two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall_defaults
+two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall_defaults__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::function::fget___module__
-two-phase-annotate-skipped	pyre_interpreter::function::funccall_valuestack
+two-phase-annotate-skipped	pyre_interpreter::function::funccall_valuestack__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::function::function_set_kwdefaults_from_definition
 two-phase-annotate-skipped	pyre_interpreter::function::sys_exc_info_direct_fn
 two-phase-annotate-skipped	pyre_interpreter::gateway::builtin_code_get
@@ -1049,7 +1051,7 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::into_generator
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::into_generator_named
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::locals2fast
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::locals2fast__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::make_arguments
+two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::make_arguments__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::run
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::setdictscope__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::snapshot_for_generator

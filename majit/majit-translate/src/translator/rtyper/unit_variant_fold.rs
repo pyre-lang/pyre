@@ -775,9 +775,9 @@ mod tests {
                 result: None,
                 kind: OpKind::Call {
                     target: CallTarget::function_path([
-                        "pyre_interpreter",
-                        "eval",
-                        "frame_anchor_release",
+                        "pyre_object",
+                        "objlock",
+                        "object_lock_release",
                     ]),
                     args: call_args(vec![depth.clone()]),
                     result_ty: ValueType::Void,

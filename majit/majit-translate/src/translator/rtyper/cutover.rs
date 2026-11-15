@@ -3196,6 +3196,17 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the foreign-stdlib
     // and unsafe-fn stubs above.
     register_foreign_opaque_method_externals(registry, foreign_opaque_method_externals);
+    // `getdesc` is the bookkeeper's for the whole annotation
+    // (`bookkeeper.py Bookkeeper.getdesc`); installing it before Pass 2 lets
+    // the `ProfileFunc` family (`executioncontext.py setllprofile`) be interned
+    // before the funcptr pre-pass seeds `Option<ProfileFunc>` cells from it.
+    let store = function_graphs.clone();
+    let globals = Rc::downgrade(registry);
+    registry.set_getdesc(Rc::new(move |key| {
+        let registry = globals.upgrade()?;
+        describe_declared_funcobj(&store, &registry, key)
+    }));
+    registry.intern_profilefunc_family();
     // Pass 2 — give each *unique* registry entry the lowered body its
     // default graph is built from. Aliases share one `Rc<FunctionEntry>`,
     // so `Rc::as_ptr` identifies the unique entries.
@@ -3241,12 +3252,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // Each method is installed only on its declaration's class;
     // `seed_struct_root_method_members` is the one place that does that.
     registry.seed_struct_root_method_members();
-    let store = function_graphs.clone();
-    let globals = Rc::downgrade(registry);
-    registry.set_getdesc(Rc::new(move |key| {
-        let registry = globals.upgrade()?;
-        describe_declared_funcobj(&store, &registry, key)
-    }));
     Ok(())
 }
 

@@ -18823,6 +18823,7 @@ mod tests {
     #[test]
     fn profilefunc_family_fn_const_folds_to_hostobject_not_llptr() {
         use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
         use crate::model::CallTarget;
 
         struct RestoreFamily;
@@ -18833,16 +18834,41 @@ mod tests {
         }
         let _restore = RestoreFamily;
 
-        let registry = empty_call_registry();
+        let registry = Rc::new(empty_call_registry());
         let family_key =
             crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(["hook_a"]);
         let empty_sig = Signature::new(Vec::<String>::new(), None, None);
-        let family_entry = registry.get_or_register(family_key, empty_sig);
+        let family_entry = registry.get_or_register(family_key, empty_sig.clone());
         crate::profilefunc_family::register_profilefunc_family(
-            vec!["hook_a".into()],
+            vec!["hook_a".into(), "hook_b".into()],
             vec!["ProfileFunc".into()],
         );
+        let globals = Rc::downgrade(&registry);
+        registry.set_getdesc(Rc::new(move |key| {
+            let registry = globals.upgrade()?;
+            let [name] = key.segments() else {
+                return None;
+            };
+            if name != "hook_b" {
+                return None;
+            }
+            let graph_func = GraphFunc::new(
+                key.name().to_string(),
+                Constant::new(ConstValue::Dict(std::sync::Arc::new(
+                    indexmap::IndexMap::new(),
+                ))),
+            );
+            Some(registry.get_or_register_with_func(key.clone(), empty_sig.clone(), graph_func))
+        }));
         registry.intern_profilefunc_family();
+        let SomeValue::PBC(pbc) = registry.bookkeeper().profilefunc_pbc_or_none() else {
+            panic!("interned family must be a PBC of FunctionDescs");
+        };
+        assert_eq!(
+            pbc.descriptions.len(),
+            2,
+            "declared family member is interned on first lookup"
+        );
 
         let family_define = OpKind::Call {
             target: CallTarget::FunctionPath {
@@ -18860,7 +18886,7 @@ mod tests {
             result: Some(Variable::new()),
             kind: family_define,
         };
-        match legacy_const_define_hlvalue(&family_op, Some(&registry))
+        match legacy_const_define_hlvalue(&family_op, Some(registry.as_ref()))
             .expect("family fn const folds")
         {
             Some(Hlvalue::Constant(c)) => {
