@@ -3198,8 +3198,12 @@ unsafe fn malloc_fast_slow(
     let free_addr = PUBLISHED_BUMP
         .free_addr
         .load(std::sync::atomic::Ordering::Relaxed);
+    // `MAJIT_GC_STRESS_TRACE_ALLOC` routes every allocation here so it
+    // reaches `stress_trace_alloc_minor` below; the per-thread chunk bump
+    // must not answer it first.
     if free_addr == PUBLISHED_BUMP_GIL_DISABLED
         && !gc_sync::stw_requested()
+        && !gc_stress_trace_alloc_enabled()
         && let Some(obj) = unsafe { malloc_fast_bump_threadlocal(type_id, payload_size) }
     {
         return obj;
