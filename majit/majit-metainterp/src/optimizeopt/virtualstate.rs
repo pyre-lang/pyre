@@ -517,6 +517,23 @@ fn visit_state_info(
     }
 }
 
+/// Walk inline `ConstPtr.value` copies stored in a VirtualState node slice.
+///
+/// `history.py` `ConstPtr` (`_attrs_ = ('value',)`) and `virtualstate.py`
+/// `NotVirtualStateInfo.constbox`: the holder stores the box and the GC
+/// traces `box.value` in place for as long as the holder is alive. The
+/// in-flight export is a holder the GC traces in place exactly like
+/// `walk_target_token_const_ptrs` does after publication.
+pub(crate) fn walk_nodes_const_ptr_refs_mut(
+    nodes: &[Rc<VirtualStateInfoNode>],
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
+    for node in nodes {
+        visit_info_node(Rc::as_ptr(node), visitor, &mut seen);
+    }
+}
+
 /// A complete snapshot of abstract state at a loop boundary.
 ///
 /// The `state` vector has one entry per loop-carried variable (matching the
@@ -560,10 +577,7 @@ impl VirtualState {
     /// a stop-the-world GC walk we mutate the node payloads in place so all
     /// shared references observe the forwarded address.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
-        for node in &self.state {
-            visit_info_node(Rc::as_ptr(node), visitor, &mut seen);
-        }
+        walk_nodes_const_ptr_refs_mut(&self.state, visitor);
     }
 
     pub fn new(state: Vec<VirtualStateInfo>) -> Self {
@@ -623,7 +637,7 @@ impl VirtualState {
     ///         s.enum(self)
     /// ```
     /// Resets per-instance position cells before walking so that repeated
-    /// calls (e.g., after `refresh_from_gc`) start from a clean
+    /// calls (e.g., after `force_boxes`) start from a clean
     /// RPython-equivalent state.
     pub fn enum_top_level(&mut self) {
         self.info_counter = -1;
@@ -2305,9 +2319,11 @@ impl Clone for VirtualState {
     /// is one object; assignment (`TargetToken.virtual_state = vs`,
     /// `ExportedState.virtual_state = vs`) never copies the instance tree.
     /// `VirtualState.__init__` / `from_shared_rcs` is the only constructor
-    /// that walks `enum`; `refresh_from_gc` and `force_boxes` rewrite this
-    /// instance in place. A deep copy of the node tree was a compile-time
-    /// `IndexMap` + per-node `Rc` on every `token.virtual_state.clone()`.
+    /// that walks `enum`; `force_boxes` rewrites this instance in place.
+    /// `refresh_from_gc` mutates ConstPtr words inside the shared nodes
+    /// and does not replace top-level Rcs. A deep copy of the node tree
+    /// was a compile-time `IndexMap` + per-node `Rc` on every
+    /// `token.virtual_state.clone()`.
     fn clone(&self) -> Self {
         VirtualState {
             state: self.state.clone(),

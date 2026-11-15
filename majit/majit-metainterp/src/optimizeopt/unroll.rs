@@ -1,5 +1,5 @@
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 /// Loop unrolling pass (peel one iteration).
 ///
 /// Detects loops ending with a `Jump` back-edge and peels one iteration:
@@ -2447,21 +2447,29 @@ pub struct ExportedState {
     /// normal Const object attributes; pyre records the walk order and copies
     /// the forwarded values back in `refresh_from_gc`.
     rooted_const_ptr_slots: Vec<usize>,
-    /// Live `ConstPtr` indexes, traced by the minor's `drag_out_root`.
+    /// Live `ConstPtr` indexes and in-flight VirtualState node Rcs, traced
+    /// by the minor's `drag_out_root`.
     ///
     /// The shadow-stack copies above are updated before `Wave::enter` and
     /// are not the table. `Operand::from_opref` re-interns `resolve` before
     /// `refresh_from_gc`, so a minor must `trace_index` these slots in the
-    /// extra-root walk or the table keeps the nursery address.
+    /// extra-root walk or the table keeps the nursery address. The VS
+    /// inline `Constant(Value::Ref)` copies are a different holder: the
+    /// area walks them in place the way `walk_target_token_const_ptrs`
+    /// does after the token is published.
     const_ptr_root: Option<ExportedConstPtrRoot>,
     /// Shadow stack depth at creation. release_roots pops to here.
     shadow_stack_base: usize,
 }
 
-/// Heap list of `ConstPtr` indexes. The extra-area pointer is
-/// `Box::into_raw` provenance, so moving `ExportedState` does not stale it.
+/// Heap list of `ConstPtr` indexes plus clones of the export's top-level
+/// VirtualState nodes. The extra-area pointer is `Box::into_raw`
+/// provenance, so moving `ExportedState` does not stale it. The Rc clones
+/// keep the payloads at a stable heap address; the area data is the
+/// root's own payload (no side table).
 struct ExportedConstPtrIndexes {
     indexes: Vec<u32>,
+    vs_nodes: Vec<std::rc::Rc<crate::optimizeopt::virtualstate::VirtualStateInfoNode>>,
 }
 
 /// Drops the extra area before freeing [`ExportedConstPtrIndexes`].
@@ -2476,13 +2484,19 @@ struct ExportedConstPtrRoot {
 
 impl std::fmt::Debug for ExportedConstPtrRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let indexes: &[u32] = if self.indexes.is_null() {
-            &[]
+        let (indexes, vs_nodes): (&[u32], usize) = if self.indexes.is_null() {
+            (&[], 0)
         } else {
-            unsafe { (*self.indexes).indexes.as_slice() }
+            unsafe {
+                (
+                    (*self.indexes).indexes.as_slice(),
+                    (*self.indexes).vs_nodes.len(),
+                )
+            }
         };
         f.debug_struct("ExportedConstPtrRoot")
             .field("indexes", &indexes)
+            .field("vs_nodes", &vs_nodes)
             .finish()
     }
 }
@@ -2500,6 +2514,7 @@ impl Drop for ExportedConstPtrRoot {
 
 unsafe fn walk_exported_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
     let roots = unsafe { &*(data as *const ExportedConstPtrIndexes) };
+    crate::optimizeopt::virtualstate::walk_nodes_const_ptr_refs_mut(&roots.vs_nodes, visitor);
     for &index in &roots.indexes {
         majit_ir::const_ptr_table::trace_index(index, visitor);
     }
@@ -2518,8 +2533,6 @@ unsafe fn walk_exported_const_ptr_indexes(data: *const (), visitor: &mut dyn FnM
 enum ExportedGcRefField {
     /// exported_infos[OpRef].ptr_info = PtrInfo::Constant(GcRef)
     InfoPtrInfoConstant,
-    /// virtual_state.state[index] = Constant(Value::Ref)
-    VirtualStateConstantRef(usize),
     /// `partial_trace_inputargs[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))`.
     /// PyPy `InputArg._forwarded` host (resoperation.py:700).
     PartialTraceInputArgInfoPtrInfoConstant(usize),
@@ -2836,7 +2849,6 @@ impl ExportedState {
     /// copy first (lower shadow stack depth), then the shorter-lived copy.
     pub fn root_all_gcrefs(&mut self) {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
-        use crate::optimizeopt::virtualstate::VirtualStateInfo;
         // Idempotency: a retrace can feed the same ExportedState back
         // through `imported_state` and call `root_all_gcrefs` again.
         // Without releasing the previous batch first, the earlier roots
@@ -2875,27 +2887,10 @@ impl ExportedState {
                 }
             }
         }
-        // ── virtual_state GcRef fields ──
-        // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
-        // The rooted_refs `key` slot here just tags the field origin;
-        // these entries dispatch on the field kind and never key back into
-        // `exported_infos`, so use the `Operand::None` sentinel.
-        let dummy_key = Operand::None;
-        for (i, entry) in self.virtual_state.state.iter().enumerate() {
-            match &entry.info {
-                // KnownClass.class_ptr and Virtual.known_class are immortal
-                // vtable integers (ConstInt), never traced refs — not rooted.
-                VirtualStateInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
-                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                    self.rooted_refs.push((
-                        dummy_key.clone(),
-                        ExportedGcRefField::VirtualStateConstantRef(i),
-                        ss_idx,
-                    ));
-                }
-                _ => {}
-            }
-        }
+        // VirtualState ConstPtr words are walked in place by the extra
+        // area (`vs_nodes`) and by `walk_const_ptr_refs_mut` below. They
+        // are not snapshotted onto `rooted_refs`: replacing those Rcs in
+        // `refresh_from_gc` would leave the area walking a different node.
         // ── partial_trace `_forwarded` GcRef fields ──
         // `partial_trace.inputargs` / `partial_trace.operations`
         // (compile.py:362) keep every preamble-pass `AbstractValue`
@@ -2903,6 +2898,10 @@ impl ExportedState {
         // payloads (`PtrInfo::Constant` or `Const::Ref`; `Instance.known_class`
         // is an immortal vtable integer, never a traced ref). Root each so
         // `compile_retrace` chain walks observe live handles.
+        // The rooted_refs `key` slot here just tags the field origin;
+        // these entries dispatch on the field kind and never key back into
+        // `exported_infos`, so use the `Operand::None` sentinel.
+        let dummy_key = Operand::None;
         for (i, ia) in self.partial_trace_inputargs.iter().enumerate() {
             let forwarded = ia.forwarded.borrow().clone();
             root_forwarded_gcref(
@@ -2937,19 +2936,26 @@ impl ExportedState {
         self.publish_const_ptr_root(&const_ptr_addrs);
     }
 
-    /// Register `addrs` for the life of this `ExportedState` so a minor's
-    /// extra-root `drag_out_root` writes `ConstPtr.value` through
-    /// `trace_index`.
+    /// Register interned `ConstPtr` indexes and this export's VirtualState
+    /// node Rcs so a minor's extra-root `drag_out_root` writes both the
+    /// table (`trace_index`) and the in-flight VS copies in place.
+    ///
+    /// `history.py` `ConstPtr` / `virtualstate.py` `NotVirtualStateInfo.constbox`:
+    /// the holder stores the box and the GC traces `box.value` in place
+    /// for as long as the holder is alive. After publication,
+    /// `walk_target_token_const_ptrs` does that walk; this area is the
+    /// same walk for the in-flight export.
     ///
     /// Scoped: `ExportedState.final` is false and the object dies with the
-    /// optimization. Token-held `VirtualState` constants are walked from
-    /// `walk_rd_consts_refs`, not from this area.
+    /// optimization. Each `root_all_gcrefs` replaces `self.const_ptr_root`,
+    /// so a clone that re-roots (`final_exported_state`, peel backup)
+    /// registers its own `virtual_state.state` Rcs.
     ///
     /// The shadow-stack copy is a different slot. `refresh_from_gc` copies
     /// it back later; cranelift snapshot re-interns the table before that.
     fn publish_const_ptr_root(&mut self, addrs: &[GcRef]) {
         self.const_ptr_root = None;
-        if addrs.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
+        if !majit_gc::shadow_stack::mutator_is_registered() {
             return;
         }
         let mut indexes = Vec::with_capacity(addrs.len());
@@ -2958,12 +2964,13 @@ impl ExportedState {
                 indexes.push(index);
             }
         }
-        if indexes.is_empty() {
-            return;
-        }
         indexes.sort_unstable();
         indexes.dedup();
-        let indexes = Box::into_raw(Box::new(ExportedConstPtrIndexes { indexes }));
+        let vs_nodes = self.virtual_state.state.clone();
+        if indexes.is_empty() && vs_nodes.is_empty() {
+            return;
+        }
+        let indexes = Box::into_raw(Box::new(ExportedConstPtrIndexes { indexes, vs_nodes }));
         // SAFETY: `indexes` stays allocated until `ExportedConstPtrRoot`'s
         // drop, which unregisters `area` first. Moving the owner copies the
         // pointer and does not move the allocation. The walk only reads it.
@@ -2988,49 +2995,21 @@ impl ExportedState {
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
     ///
-    /// VirtualStateInfo top-level entries are stored as
-    /// `Rc<VirtualStateInfoNode>` (so two aliased jump args can share a single
-    /// `Rc`); GcRef updates have to replace the entire `Rc` with a fresh
-    /// one because the inner enum is immutable.
-    ///
-    /// **Aliasing preservation**: RPython virtualstate.py
-    /// `VirtualStateConstructor.create_state` caches by Python object
-    /// identity, so a GC pause never breaks the "two aliased jump args
-    /// share one VirtualStateInfo" invariant. Rust's `Rc<...>` is immutable
-    /// after construction, so each per-slot GcRef refresh would otherwise
-    /// allocate an independent new `Rc` for every shared slot, breaking
-    /// the `Rc::as_ptr` dedup the walker relies on. Snapshot the original
-    /// `Rc::as_ptr` per slot, group slots that
-    /// originally shared an `Rc`, and after the GcRef updates re-clone a
-    /// single canonical `Rc` into every slot of each group so the
-    /// post-refresh tree preserves the pre-GC aliasing.
+    /// VirtualState ConstPtr words live in the shared
+    /// `Rc<VirtualStateInfoNode>` payloads. The extra-area walk and this
+    /// refresh both mutate those words in place so every clone of the
+    /// graph observes the forwarded address (`history.py` `ConstPtr` /
+    /// `virtualstate.py` `NotVirtualStateInfo.constbox`). Top-level Rcs
+    /// are not replaced: a replaced Rc would no longer be the node the
+    /// `"exported_state"` area walks.
     pub fn refresh_from_gc(&mut self) {
         use crate::optimizeopt::info::PtrInfo;
-        use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
-        use std::rc::Rc;
-        // virtualstate.py create_state cache parity: snapshot original Rc identities
-        // so we can re-share post-update slots that aliased pre-GC.
-        let original_ptrs: Vec<usize> = self
-            .virtual_state
-            .state
-            .iter()
-            .map(|rc| Rc::as_ptr(rc) as usize)
-            .collect();
-        let mut virtual_state_dirty = false;
         for &(ref key, ref field, ss_idx) in &self.rooted_refs {
             let updated = majit_gc::shadow_stack::get(ss_idx);
             match field {
                 ExportedGcRefField::InfoPtrInfoConstant => {
                     if let Some(info) = self.exported_infos.get_mut(key) {
                         *info = crate::optimizeopt::info::OpInfo::ptr(PtrInfo::Constant(updated));
-                    }
-                }
-                ExportedGcRefField::VirtualStateConstantRef(i) => {
-                    if let Some(entry) = self.virtual_state.state.get_mut(*i) {
-                        *entry = VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
-                            Value::Ref(updated),
-                        ));
-                        virtual_state_dirty = true;
                     }
                 }
                 ExportedGcRefField::PartialTraceInputArgInfoPtrInfoConstant(i) => {
@@ -3054,24 +3033,6 @@ impl ExportedState {
                     }
                 }
             }
-        }
-        if virtual_state_dirty {
-            // Re-share slots that originally aliased: walk the snapshot
-            // map and copy each group's first canonical Rc into every
-            // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: crate::FxIndexMap<usize, Rc<VirtualStateInfoNode>> =
-                crate::FxIndexMap::default();
-            for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
-                let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
-                    Rc::clone(&self.virtual_state.state[slot_idx])
-                });
-                if !Rc::ptr_eq(entry, &self.virtual_state.state[slot_idx]) {
-                    self.virtual_state.state[slot_idx] = Rc::clone(entry);
-                }
-            }
-            // Rc identities have shifted, so position cells must be
-            // re-derived against the canonical state graph.
-            self.virtual_state.enum_top_level();
         }
         let rooted_const_ptr_slots = self.rooted_const_ptr_slots.clone();
         let mut root_idx = 0usize;
