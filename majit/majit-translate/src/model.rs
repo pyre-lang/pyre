@@ -225,13 +225,24 @@ pub use majit_jitcode::rclass::ImmutableRank;
 ///
 /// `ok` / `err` are the Result variant fields. `continue_ty` / `break_ty`
 /// are the ControlFlow variant fields. `None` is a void payload and is
-/// not read or written.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// not read or written. The `*_vsid` fields are the instance STRUCTs
+/// `ensure_enum_variant_instance_layout` registered for those variants
+/// (`rclass.py` `getinstancerepr`); the match writes every field op
+/// against that id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct ResultBranchPayloads {
     pub ok: Option<ValueType>,
     pub err: Option<ValueType>,
     pub continue_ty: Option<ValueType>,
     pub break_ty: Option<ValueType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_vsid: Option<majit_ir::descr::StructId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub break_vsid: Option<majit_ir::descr::StructId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_vsid: Option<majit_ir::descr::StructId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1579,9 +1590,10 @@ pub enum OpKind {
     /// `guard_true`.  The blackhole reads the word (`bhimpl_guard_class`,
     /// `cpu.bh_classof`).
     ///
-    /// pyre's class word is `PyObject.ob_type`, embedded first in every
-    /// object as `ob_header`; `heaptracker::is_header_word` knows it by
-    /// that name.  The result register keeps the kind the read had —
+    /// pyre's class word is `PyObject.ob_type`, the typeptr at the end of
+    /// the offset-0 first-field chain (`heaptracker::is_typeptr_field` /
+    /// `has_gcstruct_a_vtable`).  The result register keeps the kind the
+    /// read had —
     /// `int` when the pointer was typed raw, `ref` when it was typed
     /// GC — so the consumers of the original read are untouched; the
     /// class-pointer hint ops (`record_exact_class/ri`) already carry the
@@ -5206,13 +5218,19 @@ pub fn fuse_boxing_alloc(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> usize {
-    fuse_boxing_alloc_with(graph, struct_field_attrs, &|_, _| None)
+    fuse_boxing_alloc_with(
+        graph,
+        struct_field_attrs,
+        &|_, _| None,
+        &std::collections::HashMap::new(),
+    )
 }
 
 pub(crate) fn fuse_boxing_alloc_with(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     expand_inline_struct: &dyn Fn(&str, &str) -> Option<InlineStructExpansion>,
+    func_hints: &std::collections::HashMap<String, Vec<String>>,
 ) -> usize {
     use crate::flowspace::model::Variable;
     // Gate names come from `crate::decline::gate` rather than being
@@ -5300,6 +5318,109 @@ pub(crate) fn fuse_boxing_alloc_with(
     // clusters this fork is not about.
     fn allocates_movable(flavor: &str) -> bool {
         matches!(flavor, "malloc" | "malloc_typed_managed")
+    }
+
+    // Native `try_gc_alloc_young_nonmoving_raw` is the interpreter's
+    // nonmovable young allocator. The declared llop is `malloc`
+    // (`lloperation.py malloc`, flavor `'gc'`): `jtransform.py
+    // rewrite_op_malloc` turns that into `NewWithVtable` of the following
+    // `__cast_instance` STRUCT. `rewrite_op_malloc` refuses a leftover
+    // `nonmovable` flag, so the fused op is a nursery `NewWithVtable`.
+    // The native body stays the nonmovable young allocator
+    // (`framework.py gct_fv_gc_malloc` /
+    // `external_malloc(..., alloc_young=True)`); the JIT does not see that
+    // adaptation. Look-inside constructors virtualize
+    // (`PyFrame.__init__._always_inline_`,
+    // `hint(fresh_virtualizable=True)`). STRUCT comes from the cast dest,
+    // not a type-id table.
+    //
+    // Recognition is the callee's declared llop (`#[jit_llop("malloc")]`,
+    // harvested as `llop:malloc`), the identity `ExtRegistryEntry._about_`
+    // / `specialize_call` uses.
+    fn is_declared_malloc(
+        target: &CallTarget,
+        func_hints: &std::collections::HashMap<String, Vec<String>>,
+    ) -> bool {
+        crate::front::llbc_hints::harvested_callee_llop(target, func_hints) == Some("malloc")
+    }
+    fn layout_owner_for_tid_size_alloc(
+        name: &str,
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<String> {
+        if registered_struct_layout(name, struct_field_attrs).is_some() {
+            return Some(name.to_string());
+        }
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        if leaf != name && registered_struct_layout(leaf, struct_field_attrs).is_some() {
+            Some(leaf.to_string())
+        } else {
+            None
+        }
+    }
+    fn tid_size_alloc_owner(
+        graph: &FunctionGraph,
+        result: &Variable,
+        result_ty: &ValueType,
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<String> {
+        // A GCREF result is `Ref(None)` (or an unnamed Ref). A named result
+        // is the malloc STRUCT only when that name has a registered layout;
+        // `pin_root(raw as PyObjectRef)` is a different cast of the same
+        // bump and must not win over the initializing `__cast_instance`.
+        if let ValueType::Ref(Some(name)) = result_ty
+            && let Some(owner) = layout_owner_for_tid_size_alloc(name, struct_field_attrs)
+        {
+            return Some(owner);
+        }
+        let mut found: Option<String> = None;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let Some(root) = cast_instance_root(&op.kind) else {
+                continue;
+            };
+            let Some(cast_result) = op.result.as_ref() else {
+                continue;
+            };
+            let OpKind::Call { args, .. } = &op.kind else {
+                continue;
+            };
+            let Some(src) = args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            // FrameBox::new threads the bump through pin_root / field
+            // reloads. `store_roots` walks identity/phi producers with no
+            // hop bound, so the same alias test as the boxing-cluster
+            // arm reaches those reloads.
+            if !refers_to_alloc(graph, src, result) {
+                continue;
+            }
+            // STRUCT is the dest that `rewrite_op_malloc` would have taken:
+            // the object the following setfields initialize. A pin_root
+            // recast of the same bump has no such stores.
+            let initializes =
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|store| {
+                        matches!(
+                            &store.kind,
+                            OpKind::FieldWrite { base, .. }
+                                if refers_to_alloc(graph, base, cast_result)
+                        )
+                    });
+            if !initializes {
+                continue;
+            }
+            let Some(owner) = layout_owner_for_tid_size_alloc(root, struct_field_attrs) else {
+                continue;
+            };
+            match &found {
+                None => found = Some(owner),
+                Some(seen) if seen == &owner => {}
+                Some(_) => return None,
+            }
+        }
+        found
     }
 
     // Resolve the type-pointer the dropped `ob_header.ob_type` store carries:
@@ -5846,6 +5967,64 @@ pub(crate) fn fuse_boxing_alloc_with(
                         continue;
                     }
                     return true;
+                }
+            }
+        }
+        false
+    }
+    /// The bump is the live GCREF word of a different object, or an
+    /// argument of a non-identity call. Payload `FieldWrite`s whose base
+    /// is the allocated STRUCT, identity recasts, and returning that
+    /// STRUCT are the uses `rewrite_op_malloc` consumes.
+    fn declared_malloc_has_foreign_use(graph: &FunctionGraph, result: &Variable) -> bool {
+        let info = lifetime(graph, result);
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            if op.result.as_ref() == Some(result) {
+                continue;
+            }
+            if identity_operand(&op.kind).is_some() {
+                continue;
+            }
+            match &op.kind {
+                OpKind::FieldWrite { base, value, .. } => {
+                    if value
+                        .as_variable()
+                        .is_some_and(|var| info.vars.contains(var))
+                        && !info.vars.contains(base)
+                    {
+                        return true;
+                    }
+                }
+                OpKind::Call { args, .. } => {
+                    if args
+                        .iter()
+                        .any(|arg| arg.as_variable().is_some_and(|var| info.vars.contains(var)))
+                    {
+                        return true;
+                    }
+                }
+                _ => {
+                    for mentioned in crate::inline::op_variable_refs(&op.kind) {
+                        if !info.vars.contains(&mentioned) {
+                            continue;
+                        }
+                        let field_ok = match &op.kind {
+                            OpKind::FieldWrite { base, value, .. } => {
+                                base == &mentioned && value.as_variable() != Some(&mentioned)
+                            }
+                            OpKind::FieldRead { base, .. } => base == &mentioned,
+                            OpKind::UnaryOp { op, operand, .. }
+                                if (op == "ptr_iszero" || op == "ptr_nonzero")
+                                    && operand == &mentioned =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !field_ok {
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -6635,6 +6814,49 @@ pub(crate) fn fuse_boxing_alloc_with(
         }
     }
 
+    let tid_size_fused = {
+        let mut rewrites = Vec::new();
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                let OpKind::Call {
+                    target, result_ty, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if !is_declared_malloc(target, func_hints) {
+                    continue;
+                }
+                let Some(result) = op.result.clone() else {
+                    continue;
+                };
+                let Some(owner) =
+                    tid_size_alloc_owner(graph, &result, result_ty, struct_field_attrs)
+                else {
+                    continue;
+                };
+                // `_try_inline_malloc` keeps a malloc whose result is stored
+                // as another object's field (`FrameBox.owner_root`) or passed
+                // to a non-identity call (`try_gc_write_barrier_managed`).
+                // Those uses are the live GCREF word, not payload setfields
+                // of the allocated STRUCT, so the Call stays for
+                // `rewrite_op_malloc` at jtransform.
+                if declared_malloc_has_foreign_use(graph, &result) {
+                    continue;
+                }
+                let has_vtable = registered_struct_layout(&owner, struct_field_attrs)
+                    .and_then(|rows| rows.first())
+                    .is_some_and(|(name, _)| is_header_field(name));
+                rewrites.push((bi, oi, owner, has_vtable));
+            }
+        }
+        let fused = rewrites.len();
+        for (bi, oi, owner, has_vtable) in rewrites {
+            graph.blocks[bi].operations[oi].kind = malloc_opkind(owner, has_vtable);
+        }
+        fused
+    };
+
     let mut sites: Vec<Site> = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
@@ -7294,7 +7516,7 @@ pub(crate) fn fuse_boxing_alloc_with(
         }
     }
     sink_fused_boxing_aggregates_at_raw_writes(graph, &fused_aggregates);
-    fused
+    tid_size_fused + fused
 }
 
 /// Rematerialize a fused boxing aggregate only at a raw `ptr::write` use.
@@ -7473,12 +7695,19 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// An operand is threaded only when it is available on every predecessor path
 /// into the use block.  This is the same condition `SSA_to_SSI` enforces while
 /// adding one inputarg to every block and one argument to every incoming link
-/// (`rpython/translator/backendopt/ssa.py`).  Diamond joins are valid
-/// when the definition dominates the split; a value defined in only one arm,
-/// or one with no upstream definition, is left untouched so the adapter can
-/// Skip the malformed graph.  Back edges provisionally satisfy the recursive
-/// check, but a separate ancestor-definition check prevents a source-less SCC
-/// from manufacturing a definition.  Graphs with no cross-block-undefined
+/// (`rpython/translator/backendopt/ssa.py`).  `SSA_to_SSI.record_used_var`
+/// walks every `op.args` (every op kind), `block.exitswitch`, and `link.args`;
+/// this pass matches that census via `op_variable_refs` so a loop-carried
+/// iterator named only on the back-edge
+/// (`range_iter` plants `iter()` in the preheader, the latch forwards it)
+/// is an inputarg of the latch, the way `ll_listnext` (`rlist.py`) keeps
+/// the iterator live across a body that does not mention it.
+/// Diamond joins are valid when the definition dominates the split; a
+/// value defined in only one arm, or one with no upstream definition, is
+/// left untouched so the adapter can Skip the malformed graph.  Back
+/// edges provisionally satisfy the recursive check, but a separate
+/// ancestor-definition check prevents a source-less SCC from
+/// manufacturing a definition.  Graphs with no cross-block-undefined
 /// operand collect no work and stay byte-identical.
 pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
@@ -11055,8 +11284,25 @@ impl FunctionGraph {
                 if matches {
                     saw_match = true;
                 } else if self.block_can_reach_var(pred, var, preds, reach_memo) {
-                    mixed = true;
-                    break;
+                    // `SSA_to_SSI` unions a minted `w` with `v`
+                    // (`variable_families.union(v, w)`) before walking
+                    // predecessors. That copy is the same family, not a
+                    // genuine phi of unrelated values
+                    // (`DataFlowFamilyBuilder.complete` unifies only
+                    // count == 2). An unresolved copy (incoming still
+                    // unpadded, or a back-edge whose producer is the
+                    // in-progress `w`) has no other origin and must
+                    // not force a second mint at the header.
+                    let other_family = match incoming {
+                        Some(LinkArg::Value(incoming_var)) => self
+                            .ssi_origin_definition(incoming_var)
+                            .is_some_and(|origin| origin != *var),
+                        _ => true,
+                    };
+                    if other_family {
+                        mixed = true;
+                        break;
+                    }
                 }
             }
             if mixed || !saw_match {
@@ -11129,18 +11375,25 @@ impl FunctionGraph {
                 local.clone(),
             );
         }
-        // `ssa.py` `SSA_to_SSI`: append a value for `w` on every incoming
-        // link, then give the predecessor its own copy. Recursing first
-        // yields that predecessor local; a later `set_goto` /
-        // `recloseblock` can replace an exit and drop the extra slot, so
-        // re-walk incoming edges and pad any link still short of
+        // `ssa.py` `SSA_to_SSI`:
+        //   for link in links:
+        //       link.args.append(v)
+        //       pending.append((link.prevblock, v))
+        // Append original `v` first so a family lookup at a predecessor
+        // sees this back-edge as `v` (`DataFlowFamilyBuilder` unified
+        // the header phi with `v` when both incomings were `v`).
+        // `renamevariables` at the predecessor then rewrites the slot
+        // to that block's local. A later `set_goto` / `recloseblock`
+        // can drop the extra slot, so pad any link still short of
         // `inputargs` (`flowspace/model.py` `Link.__init__`
         // `len(args) == len(target.inputargs)`).
-        for (pred_block, exit_idx) in pred_edges {
-            let carried = self.carried_from_pred(pred_block, var, memo, block);
+        for &(pred_block, exit_idx) in &pred_edges {
             self.block_mut(pred_block).exits[exit_idx]
                 .args
-                .push(LinkArg::Value(carried));
+                .push(LinkArg::Value(var.clone()));
+        }
+        for (pred_block, _) in pred_edges {
+            self.carried_from_pred(pred_block, var, memo, block);
         }
         self.pad_incoming_slot_for_var(block, var, &local, memo);
         Some(local)
@@ -11217,6 +11470,24 @@ impl FunctionGraph {
             }
         }
         var.clone()
+    }
+
+    /// Operation result or startblock inputarg `var` was minted from.
+    /// `None` when the copy's incoming is still unpadded — the
+    /// in-progress `variable_families.union(v, w)` case, not a second
+    /// family (`DataFlowFamilyBuilder.complete`).
+    fn ssi_origin_definition(
+        &self,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Variable> {
+        let producer = self.chase_ssi_producer(var, &mut HashSet::new());
+        let is_origin = self.blocks.iter().any(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&producer))
+                || (b.id == self.startblock && b.inputargs.contains(&producer))
+        });
+        is_origin.then_some(producer)
     }
 
     /// Incoming links that lost extra SSI slots (one predecessor
@@ -18025,7 +18296,12 @@ mod tests {
             (owner == "Derived" && field == "base").then(|| test_inline_expansion(true, Vec::new()))
         };
         assert_eq!(
-            fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
+            fuse_boxing_alloc_with(
+                &mut graph,
+                &attrs,
+                &base_is_inlined,
+                &std::collections::HashMap::new(),
+            ),
             1
         );
         prune_dead_boxing_remnants(&mut graph);
@@ -18166,7 +18442,12 @@ mod tests {
         };
 
         let mut nonzero = graph.clone();
-        fuse_boxing_alloc_with(&mut nonzero, &attrs, &expand(false));
+        fuse_boxing_alloc_with(
+            &mut nonzero,
+            &attrs,
+            &expand(false),
+            &std::collections::HashMap::new(),
+        );
         assert!(
             !nonzero
                 .blocks
@@ -18177,7 +18458,15 @@ mod tests {
              the chain of length one leaves Derived without a header"
         );
 
-        assert_eq!(fuse_boxing_alloc_with(&mut graph, &attrs, &expand(true)), 1);
+        assert_eq!(
+            fuse_boxing_alloc_with(
+                &mut graph,
+                &attrs,
+                &expand(true),
+                &std::collections::HashMap::new(),
+            ),
+            1
+        );
         prune_dead_boxing_remnants(&mut graph);
         let ops = &graph.block(entry).operations;
         assert!(
@@ -18304,7 +18593,12 @@ mod tests {
             (owner == "Derived" && field == "base").then(|| test_inline_expansion(true, Vec::new()))
         };
         assert_eq!(
-            fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
+            fuse_boxing_alloc_with(
+                &mut graph,
+                &attrs,
+                &base_is_inlined,
+                &std::collections::HashMap::new(),
+            ),
             1
         );
         prune_dead_boxing_remnants(&mut graph);
@@ -18648,7 +18942,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -18854,7 +19153,12 @@ mod tests {
                 )
             })
             .expect("the by-value copy of nested");
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -19073,7 +19377,12 @@ mod tests {
                 ],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse across a block");
 
         let ops_a = &graph.block(entry).operations;
@@ -19318,7 +19627,12 @@ mod tests {
                     )
                 })
                 .expect("the by-value copy of nested");
-            let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+            let fused = fuse_boxing_alloc_with(
+                &mut graph,
+                &attrs,
+                &expand,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(fused, 1, "a two-level nested struct must fuse");
 
             let ops = &graph.block(entry).operations;
@@ -19554,7 +19868,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -19797,7 +20116,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 0,
             "disagreeing nested leaves across copy paths must leave malloc residual"
@@ -20017,7 +20341,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 1,
             "agreeing nested leaves across copy paths must fuse"
@@ -20242,7 +20571,12 @@ mod tests {
                 )
             })
             .expect("the by-value copy of nested");
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 1,
             "a call of nested after the copy must not block read-back fusion"
@@ -20473,7 +20807,12 @@ mod tests {
                 )
             })
             .expect("the by-value copy of nested");
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 1,
             "a call of nested before the copy must not block read-back fusion"
@@ -20725,7 +21064,12 @@ mod tests {
                 )
             })
             .expect("the by-value copy of nested");
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -20945,7 +21289,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
@@ -21154,6 +21503,203 @@ mod tests {
                     if segments.last().map(String::as_str) == Some("malloc_typed_managed")
             )),
             "young malloc_typed_managed must not survive the fusion"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_young_nonmoving_raw_plus_cast() {
+        // Native young-nonmoving bump + `__cast_instance` is
+        // `rewrite_op_malloc` of that STRUCT: the recorded jitcode is
+        // `new_with_vtable` so a look-inside constructor virtualizes.
+        // Recognition is the harvested `llop:malloc` token, not
+        // the allocator path.
+        let mut graph = FunctionGraph::new("FrameBox::new");
+        let entry = graph.startblock;
+        let tid = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let size = graph
+            .push_op_var(entry, OpKind::ConstInt(64), true)
+            .unwrap();
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "young_nonmoving".into(),
+                            "alloc_raw".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![tid, size]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let dest = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("pyframe::PyFrame", raw),
+                true,
+            )
+            .unwrap();
+        let pycode = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: dest.clone(),
+                field: FieldDescriptor::new("pycode", Some("pyframe::PyFrame".into())),
+                value: LinkArg::Value(pycode),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, Some(dest));
+        let attrs = std::collections::HashMap::from([(
+            "pyframe::PyFrame".to_string(),
+            vec![
+                (
+                    "ob_header".to_string(),
+                    ValueType::Ref(Some("PyObject".into())),
+                ),
+                ("pycode".to_string(), ValueType::Ref(None)),
+            ],
+        )]);
+        let hints = std::collections::HashMap::from([(
+            "young_nonmoving::alloc_raw".to_string(),
+            vec!["llop:malloc".to_string()],
+        )]);
+        let mut unnamed = graph.clone();
+        assert_eq!(
+            fuse_boxing_alloc(&mut unnamed, &attrs),
+            0,
+            "the same path without a declared llop must not fuse"
+        );
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &|_, _| None, &hints);
+        assert_eq!(fused, 1, "young-nonmoving + cast must fuse");
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::NewWithVtable { owner, vtable: 0 }
+                        if owner == "pyframe::PyFrame"
+                )
+            }),
+            "NewWithVtable must replace young_nonmoving_raw"
+        );
+        assert!(
+            !graph.block(entry).operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("alloc_raw")
+            )),
+            "declared-llop allocator must not survive the fusion"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_keeps_declared_malloc_stored_as_foreign_field() {
+        // `FrameBox.owner_root` is the bump as a different object's field.
+        // `_try_inline_malloc` refuses that use; the Call stays.
+        let mut graph = FunctionGraph::new("FrameBox::new");
+        let entry = graph.startblock;
+        let tid = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let size = graph
+            .push_op_var(entry, OpKind::ConstInt(64), true)
+            .unwrap();
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "young_nonmoving".into(),
+                            "alloc_raw".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![tid, size]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let dest = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("pyframe::PyFrame", raw.clone()),
+                true,
+            )
+            .unwrap();
+        let pycode = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: dest.clone(),
+                field: FieldDescriptor::new("pycode", Some("pyframe::PyFrame".into())),
+                value: LinkArg::Value(pycode),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let handle = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "pyframe::FrameBox".into(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: handle.clone(),
+                field: FieldDescriptor::new("owner_root", Some("pyframe::FrameBox".into())),
+                value: LinkArg::Value(raw),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, Some(handle));
+        let attrs = std::collections::HashMap::from([(
+            "pyframe::PyFrame".to_string(),
+            vec![
+                (
+                    "ob_header".to_string(),
+                    ValueType::Ref(Some("PyObject".into())),
+                ),
+                ("pycode".to_string(), ValueType::Ref(None)),
+            ],
+        )]);
+        let hints = std::collections::HashMap::from([(
+            "young_nonmoving::alloc_raw".to_string(),
+            vec!["llop:malloc".to_string()],
+        )]);
+        assert_eq!(
+            fuse_boxing_alloc_with(&mut graph, &attrs, &|_, _| None, &hints),
+            0,
+            "owner_root store of the bump must keep the declared malloc"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("alloc_raw")
+            )),
+            "declared-llop allocator must remain when stored as a foreign field"
         );
     }
 
@@ -22392,7 +22938,12 @@ mod tests {
                 )],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 0,
             "a residual call of the nested source must leave malloc residual"
@@ -22799,7 +23350,12 @@ mod tests {
                 ],
             ))
         };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        let fused = fuse_boxing_alloc_with(
+            &mut graph,
+            &attrs,
+            &expand,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             fused, 0,
             "a call of a nested source with explicit leaf stores must leave malloc residual"
@@ -24688,6 +25244,99 @@ mod tests {
             other => panic!("expected UnaryOp, got {other:?}"),
         }
         assert_eq!(graph.block(dead).exits[0].args.len(), 0);
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// A for-loop latch that names the preheader `iter()` result on the
+    /// back-edge without defining it (`range_iter` plants `iter()` in the
+    /// preheader; `rlist.py` `ll_listnext` keeps that iterator live through
+    /// a body that does not mention it). `SSA_to_SSI` `record_used_var` on
+    /// `link.args` threads a `Variable.copy()` inputarg so the adapter's
+    /// `link_arg_to_hlvalue` sees a defined operand (`flowspace/model.py`
+    /// `checkgraph` `definevar`).
+    #[test]
+    fn thread_undefined_link_arg_on_loop_back_edge() {
+        let mut graph = FunctionGraph::new("thread_link_arg_latch");
+        let entry = graph.startblock;
+        let (header, header_args) = graph.create_block_with_arg_vars(1);
+        let latch = graph.create_block();
+        let iter = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let iter_phi = header_args[0].clone();
+        let next_item = graph.alloc_value_var();
+        graph.block_mut(header).operations.push(SpaceOperation {
+            result: Some(next_item),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__iter_next".to_string()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![iter_phi.clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        graph.set_goto(entry, header, vec![iter.clone()]);
+        graph.set_goto(header, latch, vec![]);
+        graph.set_goto(latch, header, vec![iter.clone()]);
+
+        assert!(
+            !graph.variable_defined_in_block(latch, &iter),
+            "pre-thread latch must not define the preheader iterator",
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(
+            graph.block(header).inputargs.as_slice(),
+            std::slice::from_ref(&iter_phi),
+            "header phi is reused as the family member (DataFlowFamilyBuilder.complete)"
+        );
+        let latch_iter = graph
+            .ssi_variable_at_block(latch, &iter)
+            .expect("latch back-edge iterator is threaded");
+        assert_ne!(
+            latch_iter.id(),
+            iter.id(),
+            "latch inputarg is Variable.copy()"
+        );
+        assert!(
+            graph.variable_defined_in_block(latch, &latch_iter),
+            "latch copy is a definition of this block"
+        );
+        assert!(
+            graph.block(latch).inputargs.contains(&latch_iter),
+            "latch copy is a latch inputarg"
+        );
+        assert_eq!(graph.block(latch).exits[0].target, header);
+        assert!(
+            matches!(
+                &graph.block(latch).exits[0].args[0],
+                LinkArg::Value(v) if v.id() == latch_iter.id()
+            ),
+            "latch exit and header incoming slot from the latch carry the local copy"
+        );
+        assert!(
+            graph.variable_defined_in_block(entry, &iter),
+            "producer identity stays defined in the preheader"
+        );
+        assert!(
+            !graph.variable_defined_in_block(latch, &iter),
+            "producer identity is not defined in latch"
+        );
         assert_unique_variable_definitions(&graph);
     }
 

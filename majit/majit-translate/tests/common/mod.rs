@@ -6,7 +6,9 @@
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
 use majit_translate::flowspace::bytecode::ConstantData;
-use majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs;
+use majit_translate::front::llbc_hints::{
+    harvest_alloc_flavor_raw_from_llbcs, harvest_hints_from_llbcs,
+};
 use majit_translate::front::mir::{LowerContext, LowerError, lower_fun_decl_with_static_addrs};
 use majit_translate::front::semantic::SemanticProgram;
 use majit_translate::model::FunctionGraph;
@@ -131,6 +133,9 @@ fn make_lower_context(llbc: &'static Llbc) -> LowerContext<'static> {
                         OBJECT_LLBC,
                     ))),
                 )
+                .with_merged_func_hints(harvest_hints_from_llbcs(
+                    std::slice::from_ref(load_llbc(OBJECT_LLBC)),
+                ))
             } else {
                 LowerContext::new(llbc)
             };

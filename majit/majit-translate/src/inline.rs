@@ -1969,6 +1969,33 @@ mod tests {
         }
     }
 
+    /// `simplify.py CanRemove` keys the llop after lowering
+    /// (`lloperation.py` `canfold` / `canremove`), not a host path suffix.
+    #[test]
+    fn can_remove_op_does_not_infer_purity_from_llop_name_suffix() {
+        let call = |path: &[&str]| OpKind::Call {
+            target: CallTarget::function_path(path.iter().map(|s| (*s).to_string())),
+            args: crate::model::call_args(vec![crate::flowspace::model::Variable::new()]),
+            result_ty: crate::model::ValueType::Int,
+        };
+        assert!(!can_remove_op(&call(&["app", "lltype", "cast_ptr_to_int"])));
+        assert!(!can_remove_op(&call(&["app", "rarithmetic", "intmask"])));
+        assert!(!can_remove_op(&call(&["app", "rarithmetic", "r_uint"])));
+        // After rtyping the same names are llops / identity, which
+        // `enum_ops_without_sideeffects` puts in `CanRemove`.
+        let operand = crate::flowspace::model::Variable::new();
+        assert!(can_remove_op(&OpKind::UnaryOp {
+            op: "cast_ptr_to_int".into(),
+            operand: operand.clone(),
+            result_ty: crate::model::ValueType::Int,
+        }));
+        assert!(can_remove_op(&OpKind::UnaryOp {
+            op: "same_as".into(),
+            operand,
+            result_ty: crate::model::ValueType::Int,
+        }));
+    }
+
     #[test]
     fn lowered_blackhole_op_purity_is_opname_aware() {
         let pure = |name: &str| {

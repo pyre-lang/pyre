@@ -608,6 +608,106 @@ pub fn register_struct_fields_with_layout(
     }
 }
 
+/// Nested typed-strategy storage `flatten_list_storage_field` names on
+/// `W_ListObject` (`int_items` / `float_items` / `bytes_items` /
+/// `ascii_items`) and the inner leaves it fuses (`block` / `len`).
+const LIST_STORAGE_NESTED: &[(&str, &str)] = &[
+    ("int_items", "IntArray"),
+    ("float_items", "FloatArray"),
+    ("bytes_items", "BytesArray"),
+    ("ascii_items", "UnicodeArray"),
+];
+const LIST_STORAGE_LEAVES: &[&str] = &["block", "len"];
+
+/// `flatten_list_storage_field` emits `getattr(list, "ascii_items.block")`
+/// on `W_ListObject`. `heaptracker.py all_fielddescrs` numbers that
+/// dotted leaf on the GC owner; the classdef only has the nested
+/// `ascii_items` row, so `SomeInstance.getattr` of the fused name was
+/// Impossible and blocked `_orig_extend_from_tuple`. Seed the same
+/// leaves the front-end names, with the inner field's FORCE shell.
+pub fn register_flattened_list_storage_leaves(
+    struct_field_attrs: &HashMap<String, Vec<(String, crate::model::ValueType)>>,
+) {
+    let mut tables = FORCE_ATTRIBUTES_INTO_CLASSES.write();
+    let list_keys: Vec<String> = tables
+        .struct_keys
+        .iter()
+        .filter(|k| k.rsplit("::").next() == Some("W_ListObject"))
+        .cloned()
+        .collect();
+    if list_keys.is_empty() {
+        return;
+    }
+
+    let mut nested_by_key: HashMap<String, IndexMap<String, ForceAnnotation>> = HashMap::new();
+    let mut nested_keys_by_leaf: HashMap<String, Vec<String>> = HashMap::new();
+    for key in &tables.struct_keys {
+        let Some(leaf) = key.rsplit("::").next() else {
+            continue;
+        };
+        if !matches!(
+            leaf,
+            "IntArray" | "FloatArray" | "BytesArray" | "UnicodeArray"
+        ) {
+            continue;
+        }
+        let Some(attrs) = tables.attributes.get(key) else {
+            continue;
+        };
+        nested_by_key.insert(key.clone(), attrs.clone());
+        nested_keys_by_leaf
+            .entry(leaf.to_string())
+            .or_default()
+            .push(key.clone());
+    }
+    for keys in nested_keys_by_leaf.values_mut() {
+        keys.sort();
+    }
+
+    for list_key in list_keys {
+        let list_fields = struct_field_attrs.get(&list_key);
+        for &(nested_field, nested_leaf) in LIST_STORAGE_NESTED {
+            let nested_key = list_fields
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == nested_field)
+                        .and_then(|(_, vt)| match vt {
+                            crate::model::ValueType::Ref(Some(root)) => {
+                                let canon = majit_ir::descr::canonical_struct_name(root);
+                                if nested_by_key.contains_key(root) {
+                                    Some(root.clone())
+                                } else if nested_by_key.contains_key(&canon) {
+                                    Some(canon)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    nested_keys_by_leaf
+                        .get(nested_leaf)
+                        .and_then(|keys| keys.first())
+                        .cloned()
+                });
+            let Some(nested_key) = nested_key else {
+                continue;
+            };
+            let Some(nested_attrs) = nested_by_key.get(&nested_key) else {
+                continue;
+            };
+            let entry = tables.attributes.entry(list_key.clone()).or_default();
+            for leaf in LIST_STORAGE_LEAVES {
+                if let Some(ann) = nested_attrs.get(*leaf) {
+                    entry.insert(format!("{nested_field}.{leaf}"), ann.clone());
+                }
+            }
+        }
+    }
+}
+
 /// The forced attributes of a positional aggregate class (`Tuple<A,B>` /
 /// `Array<T;N>`), one per `__pos_N` item, shelled as
 /// [`register_struct_fields`] shells a struct's rows. `TupleRepr` reads
@@ -3682,6 +3782,57 @@ mod tests {
                 "layout char must seed SomeUnicodeCodePoint::new(false), got no_nul"
             ),
             other => panic!("expected SomeUnicodeCodePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flattened_list_storage_leaves_seed_dotted_ascii_items_block() {
+        register_struct_fields_with_layout(
+            "force_test_list_storage::UnicodeArray",
+            &[
+                ("block".into(), crate::model::ValueType::Ref(None)),
+                ("len".into(), crate::model::ValueType::Unsigned),
+            ],
+            Some(&[
+                ("block".into(), "*mut ItemsBlock".into()),
+                ("len".into(), "usize".into()),
+            ]),
+        );
+        register_struct_fields_with_layout(
+            "force_test_list_storage::W_ListObject",
+            &[(
+                "ascii_items".into(),
+                crate::model::ValueType::Ref(Some("force_test_list_storage::UnicodeArray".into())),
+            )],
+            Some(&[(
+                "ascii_items".into(),
+                "force_test_list_storage::UnicodeArray".into(),
+            )]),
+        );
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "force_test_list_storage::W_ListObject".into(),
+            vec![(
+                "ascii_items".into(),
+                crate::model::ValueType::Ref(Some("force_test_list_storage::UnicodeArray".into())),
+            )],
+        );
+        register_flattened_list_storage_leaves(&attrs);
+        let entry = forced_attributes_for("force_test_list_storage::W_ListObject")
+            .expect("FORCE row for force_test_list_storage::W_ListObject");
+        match entry.get("ascii_items.block") {
+            Some(SomeValue::Instance(inst)) => assert!(
+                inst.classdef.is_none(),
+                "ascii_items.block must seed the inner block shell"
+            ),
+            other => panic!("expected classdef-less instance for block, got {other:?}"),
+        }
+        match entry.get("ascii_items.len") {
+            Some(SomeValue::Integer(i)) => assert!(
+                i.unsigned,
+                "ascii_items.len must seed the inner Unsigned length"
+            ),
+            other => panic!("expected Unsigned len, got {other:?}"),
         }
     }
 

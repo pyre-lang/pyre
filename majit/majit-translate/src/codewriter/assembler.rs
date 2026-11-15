@@ -5413,7 +5413,7 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
     let Some(owner) = field.owner_root.as_deref() else {
         return BhFieldLookup::Missing;
     };
-    if let Some(parent_spec) = bh_size_spec_from_callcontrol(cc, owner) {
+    if let Some(parent_spec) = bh_size_spec_for(cc, owner, field.owner_id) {
         let full_name = bh_field_name(owner, &field.name);
         // `descr.py get_field_descr` is `getattr(STRUCT, fieldname)`:
         // only the STRUCT's own field, never a nested `inner.fieldname`.
@@ -5425,7 +5425,7 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
             return BhFieldLookup::Parent(spec.clone());
         }
     }
-    cc.struct_layout_for(owner)
+    bh_struct_layout_for_field(cc, owner, field.owner_id)
         .and_then(|layout| {
             layout
                 .fields
@@ -5435,6 +5435,26 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
         })
         .map(BhFieldLookup::Layout)
         .unwrap_or(BhFieldLookup::Missing)
+}
+
+/// Layout of the STRUCT `owner_id` names, or of the template spelling
+/// when that STRUCT has no registered layout of its own.
+///
+/// `get_field_descr(STRUCT, fieldname)` keys on the STRUCT object. A
+/// registered instance layout is that object; an unregistered
+/// monomorphization still has to resolve FAM / heuristic fields the
+/// template already publishes (`GcEntries.items` past the length word).
+fn bh_struct_layout_for_field(
+    cc: &CallControl,
+    owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
+) -> Option<std::rc::Rc<crate::codewriter::call::StructLayout>> {
+    if let Some(sid) = owner_id
+        && let Some(layout) = cc.struct_layout_for_id(sid)
+    {
+        return Some(layout);
+    }
+    cc.struct_layout_for(owner)
 }
 
 /// One step of the `fielddescrof` mint. `Layout` still has the
@@ -5552,14 +5572,14 @@ fn describe_v_inst_from_base(
     }
 }
 
-/// Offset and size of a by-value substructure that has no flattened field
-/// descriptor of its own.
+/// Offset and size of a by-value substructure (`getsubstruct`).
 ///
-/// This deliberately shares `fielddescrof`'s lookup: an exact parent
-/// `all_fielddescrs` match wins, and only a layout-row fallback carrying the
-/// struct flag denotes the `getsubstruct` shape. Size is the layout row's
-/// byte size, so `rewrite_op_getfield` can tell a transparent one-word
-/// newtype (an ordinary load) from the first nested parent struct (identity).
+/// `descr.py` `get_type_flag` → `FLAG_STRUCT` is that shape: a nested
+/// STRUCT, or the three-word inline `Vec`. The field may also sit on the
+/// parent SizeDescr (`get_field_descr`); listing it there does not make
+/// the access a one-word load. Size is the row's byte size, so
+/// `rewrite_op_getfield` can tell a transparent one-word newtype (an
+/// ordinary load) from the first nested parent struct (identity).
 pub(crate) fn inline_substruct_field_layout(
     cc: &crate::codewriter::call::CallControl,
     field: &crate::model::FieldDescriptor,
@@ -5567,6 +5587,9 @@ pub(crate) fn inline_substruct_field_layout(
     match bh_field_lookup(cc, field) {
         BhFieldLookup::Layout(row) if row.flag == majit_ir::descr::ArrayFlag::Struct => {
             Some((row.offset, row.size))
+        }
+        BhFieldLookup::Parent(spec) if spec.field_flag == majit_ir::descr::ArrayFlag::Struct => {
+            Some((spec.offset, spec.field_size))
         }
         BhFieldLookup::Parent(_) | BhFieldLookup::Layout(_) | BhFieldLookup::Missing => None,
     }
@@ -5656,12 +5679,25 @@ fn is_explicit_shell_variant_owner(owner: &str) -> bool {
         "core::option::Option::Some",
         "std::option::Option::Some",
     ];
-    let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
-        return false;
-    };
-    SHELLED
-        .into_iter()
-        .any(|anchor| majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id))
+    // Charon `strip_crate_prefix` harvests `result::Result::Ok` for the
+    // std enum (`front/mir.rs`). That spelling is often absent from
+    // `STRUCT_ID_BY_NAME`, so the identity match below cannot see it;
+    // `explicit_sum_shell` still laid the `[tag@0 | payload@8]` out.
+    const STRIPPED: [&str; 3] = [
+        "result::Result::Ok",
+        "result::Result::Err",
+        "option::Option::Some",
+    ];
+    let stripped = majit_ir::descr::strip_generic_args(owner);
+    let name = stripped.as_ref();
+    if let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(name) {
+        return SHELLED
+            .into_iter()
+            .any(|anchor| majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id));
+    }
+    STRIPPED.contains(&name)
+        || SHELLED.contains(&name)
+        || matches!(name, "Result::Ok" | "Result::Err" | "Option::Some")
 }
 
 /// `BhSizeSpec.type_id` for one owner spelling.
@@ -5759,12 +5795,17 @@ fn minted_exception_chain_for_key(cc: &CallControl, key: &str) -> Vec<String> {
 /// Size, alignment, and owner of the host object header.
 ///
 /// `InstanceRepr._setup_repr` roots every instance at `OBJECT`. The
-/// header is the field-registry owner whose first field is the typeptr
-/// (`heaptracker::is_typeptr_field`). Its size and alignment are that
-/// owner's `StructLayout`, the same record `CallControl::struct_layout_for`
-/// already stores for a host class. Every spelling that resolves must
-/// agree. A missing layout is skipped; none resolved, a zero size, or
-/// two shapes is a closed failure.
+/// header is the field-registry owner whose own first field is the
+/// typeptr and which is not a one-word typeptr
+/// (`heaptracker::is_host_object_header_owner` / `rclass.py OBJECT`
+/// plus the host class word). `virtualref.ObjectHeader` is the
+/// one-word `typeptr` OBJECT used as `JitVirtualRef.super`. A subclass
+/// inlines the parent as field 0, so its first field is that struct
+/// (or a dotted path through it), not the typeptr. Its size and
+/// alignment are that owner's `StructLayout`, the same record
+/// `CallControl::struct_layout_for` already stores for a host class.
+/// Every spelling that resolves must agree. A missing layout is skipped;
+/// none resolved, a zero size, or two shapes is a closed failure.
 ///
 /// The owner is the first resolved spelling in name order. The field
 /// map does not iterate stably, and the spec rows come from that
@@ -5776,12 +5817,9 @@ fn host_object_header_layout(cc: &CallControl) -> (usize, usize, String) {
     let mut owners: Vec<String> = cc
         .struct_fields()
         .fields
-        .iter()
-        .filter_map(|(owner, rows)| {
-            let first = rows.first()?;
-            let field = crate::model::FieldDescriptor::new(first.name.clone(), Some(owner.clone()));
-            crate::codewriter::heaptracker::is_typeptr_field(&field).then(|| owner.clone())
-        })
+        .keys()
+        .filter(|owner| crate::codewriter::heaptracker::is_host_object_header_owner(cc, owner))
+        .cloned()
         .collect();
     owners.sort();
     let mut found: Option<(usize, usize, String)> = None;
@@ -5806,7 +5844,7 @@ fn host_object_header_layout(cc: &CallControl) -> (usize, usize, String) {
     }
     found.unwrap_or_else(|| {
         panic!(
-            "minted exception instance: no StructLayout for the object header whose first field is the typeptr (heaptracker::is_typeptr_field)"
+            "minted exception instance: no StructLayout for the host object header whose own first field is the typeptr (heaptracker::is_host_object_header_owner)"
         )
     })
 }
@@ -5918,7 +5956,7 @@ fn minted_exception_instance_layout(
         let mut own: Vec<MintedLayoutField<'_>> = Vec::new();
         for row in &rows {
             if row.name == "__discriminant"
-                || crate::codewriter::heaptracker::is_header_word(class_key, &row.name)
+                || crate::codewriter::heaptracker::is_header_word(cc, class_key, &row.name)
             {
                 continue;
             }
@@ -6095,6 +6133,37 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
 ) -> Option<crate::jitcode::BhSizeSpec> {
+    bh_size_spec_for(cc, owner, None)
+}
+
+/// True when `owner_id` is a STRUCT whose layout must not be taken from
+/// the generic template spelling.
+///
+/// `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the lltype
+/// STRUCT object. A FieldRead's `owner_id` is that object. The spelling
+/// is only a way to reach it: a bare leaf two modules share is withdrawn
+/// (`struct_id_for_name` → `None`), and that must not drop the instance
+/// back onto the template / C-order heuristic.
+fn bh_uses_instance_layout(owner: &str, owner_id: Option<majit_ir::descr::StructId>) -> bool {
+    let Some(owner_id) = owner_id else {
+        return false;
+    };
+    if is_explicit_shell_variant_owner(owner)
+        || is_explicit_shell_variant_owner(&majit_ir::descr::strip_generic_args(owner))
+    {
+        return false;
+    }
+    match majit_ir::descr::struct_template_id_for_name(owner) {
+        Some(template) => template != owner_id,
+        None => true,
+    }
+}
+
+fn bh_size_spec_for(
+    cc: &CallControl,
+    owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
+) -> Option<crate::jitcode::BhSizeSpec> {
     if owner.is_empty() {
         return None;
     }
@@ -6112,19 +6181,20 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // generic TypeDecl is only a template: `Option<usize>::Some` and
     // `Option<BinOpKind>::Some` can have different payload banks and therefore
     // cannot share a field-descr cache entry. Prefer Charon's concrete
-    // instantiation layout and fall back to the nominal template only for the
-    // layout lookup; descriptor identity remains the full concrete owner.
+    // instantiation layout when that STRUCT has one; fall back to the
+    // nominal template only when this field names the template itself
+    // (`descr.py` `get_field_descr(STRUCT, fieldname)`).
     let template_owner = majit_ir::descr::strip_generic_args(owner);
     let template_owner = template_owner.as_ref();
-    let layout_owner = if cc.struct_layout_for(owner).is_some() {
+    let instance_layout = owner_id.and_then(|sid| cc.struct_layout_for_id(sid));
+    let use_instance_layout = bh_uses_instance_layout(owner, owner_id) && instance_layout.is_some();
+    let layout_owner = if use_instance_layout {
+        owner
+    } else if cc.struct_layout_for(owner).is_some() {
         owner
     } else {
         template_owner
     };
-    let mut size = cc
-        .struct_layout_for(layout_owner)
-        .map(|layout| layout.size)
-        .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
     // `rclass.py` lays a subclass's inherited fields out before its own
     // fields.  Annotation metadata deliberately keeps enum-variant attrs
     // variant-local, so reconstruct that inherited physical slot here for
@@ -6139,11 +6209,27 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // payload row, so it needs no reconstruction.
     let result_variant = is_explicit_shell_variant_owner(template_owner)
         && cc.struct_layout_for(owner).is_none_or(|layout| {
-            layout
-                .fields
-                .iter()
-                .any(|field| field.name == "__discriminant")
+            // An empty TypeVar-template layout still needs the shell
+            // reconstructed (`enum_variant_field_occupies_storage` left
+            // no occupying rows). A payload-only instantiation keeps
+            // its own rows and is not this case.
+            layout.fields.is_empty()
+                || layout
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "__discriminant")
         });
+    // Fields of an explicit Result/Option shell come from `instance_layout`
+    // when that STRUCT is registered. Size must come from the same row: a
+    // `Vec<u8>` payload is three words, and the template shell is still
+    // tag + one word.
+    let mut size = if use_instance_layout || (result_variant && instance_layout.is_some()) {
+        instance_layout.as_ref().map(|layout| layout.size)
+    } else {
+        cc.struct_layout_for(layout_owner)
+            .map(|layout| layout.size)
+            .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))
+    }?;
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -6151,20 +6237,25 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // together by `heaptracker.all_fielddescrs`.  Prefer the instantiated rows
     // for Result variants, falling back to the template only when no such rows
     // exist, so the payload participates in that same flattened slot list.
+    // `descr.py` `get_size_descr` / `heaptracker.all_fielddescrs` walk
+    // one STRUCT. Collect fields from the layout of the id this spec
+    // stamps; never mix an instance type_id with the template's name
+    // list.
     let mut all_fielddescrs = if result_variant {
-        let instantiated = bh_result_variant_field_specs(cc, owner);
-        if instantiated.is_empty() {
-            bh_result_variant_field_specs(cc, template_owner)
+        if instance_layout.is_some() {
+            bh_all_field_specs_for_struct_id(cc, owner, owner_id)
         } else {
-            instantiated
+            let instantiated = bh_result_variant_field_specs(cc, owner);
+            if instantiated.is_empty() {
+                bh_result_variant_field_specs(cc, template_owner)
+            } else {
+                instantiated
+            }
         }
+    } else if use_instance_layout {
+        bh_all_field_specs_for_struct_id(cc, owner, owner_id)
     } else {
-        let instantiated = bh_all_field_specs_for_struct(cc, owner);
-        if instantiated.is_empty() {
-            bh_all_field_specs_for_struct(cc, template_owner)
-        } else {
-            instantiated
-        }
+        bh_all_field_specs_for_struct(cc, layout_owner)
     };
     if result_variant {
         size = size.max(16);
@@ -6195,6 +6286,33 @@ pub(crate) fn bh_size_spec_from_callcontrol(
                 false,
             ),
         );
+    }
+    // The generic TypeDecl skips a TypeVar payload row
+    // (`enum_variant_field_occupies_storage`). The explicit shell still
+    // has that word (`front/mir.rs` `explicit_sum_shell`; `result_exc.rs`
+    // documents `__discriminant` at 0 and `__pos_0` at 8). Reconstruct it
+    // here so every mint of this STRUCT identity carries the same
+    // SizeDescr (`descr.py` `get_size_descr`).
+    if result_variant
+        && !all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__pos_0")
+    {
+        let index = all_fielddescrs.len();
+        all_fielddescrs.push(bh_field_spec_from_parts(
+            index as u32,
+            template_owner,
+            "__pos_0",
+            8,
+            8,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            false,
+            false,
+            index,
+            false,
+            false,
+        ));
     }
     if result_variant {
         // `heaptracker.get_fielddescr_index_in` counts through the embedded
@@ -6287,15 +6405,25 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        // `layout_owner` is the template spelling used to look up the one
-        // physical field layout.  The low-level STRUCT identity is still the
-        // concrete monomorphization (`Option<i64>::Some`, not
-        // `Option::Some`), exactly as RPython's `GcStruct` object remains
-        // distinct even when two reprs share a shape.  Field descriptors
-        // already preserve this identity in `fielddescrof`; allocations must
-        // use the same key or a freshly virtualized object and its first
-        // setfield acquire different parents.
-        type_id: bh_size_type_id(owner, layout_owner, is_gc_managed),
+        // The low-level STRUCT identity is the concrete monomorphization
+        // (`RDict<IdentityKey, PyObjectRef>`, not the `RDict` template),
+        // exactly as RPython's `GcStruct` object remains distinct even
+        // when two reprs share a shape. Field offsets come from that
+        // STRUCT's layout when one is registered.
+        type_id: if is_gc_managed {
+            let stamped = if result_variant || use_instance_layout {
+                owner_id.or_else(|| majit_ir::descr::struct_id_for_name(owner))
+            } else {
+                majit_ir::descr::struct_id_for_name(layout_owner)
+                    .or_else(|| majit_ir::descr::struct_id_for_name(owner))
+                    .or(owner_id)
+            };
+            stamped
+                .map(majit_ir::descr::StructId::as_u64)
+                .unwrap_or_else(|| bh_size_type_id(owner, layout_owner, is_gc_managed))
+        } else {
+            bh_size_type_id(owner, layout_owner, is_gc_managed)
+        },
         vtable: 0,
         owner: String::new(),
         all_fielddescrs,
@@ -6355,9 +6483,27 @@ fn bh_all_field_specs_for_struct(
     cc: &CallControl,
     owner: &str,
 ) -> Vec<crate::jitcode::BhFieldSpec> {
+    bh_all_field_specs_for_struct_id(cc, owner, None)
+}
+
+fn bh_all_field_specs_for_struct_id(
+    cc: &CallControl,
+    owner: &str,
+    owner_sid: Option<majit_ir::descr::StructId>,
+) -> Vec<crate::jitcode::BhFieldSpec> {
     let mut specs = Vec::new();
-    bh_all_field_specs_for_struct_into(cc, owner, owner, "", 0, &mut specs);
+    bh_all_field_specs_for_struct_into(cc, owner, owner, "", 0, &mut specs, owner_sid);
     specs
+}
+
+/// `heaptracker.py` recurses `isinstance(FIELD, lltype.Struct)`.
+/// `ArrayFlag::Struct` is also the three-word inline `Vec`
+/// (`get_type_flag` / `field_layout_is_inline_vec`), which is not a
+/// nested STRUCT (`is_known_by_value_struct` is false). Flattening that
+/// spelling looks up `Vec<u8>` as an owner, finds no fields, and drops
+/// the payload from SizeDescr.
+fn bh_nested_struct_to_flatten(cc: &CallControl, type_str: &str) -> bool {
+    !crate::vec_layout::field_layout_is_inline_vec(type_str) && cc.is_known_struct(type_str)
 }
 
 /// Build the variant-owned portion of the explicit `Result<T, PyError>` /
@@ -6435,8 +6581,17 @@ fn bh_all_field_specs_for_struct_into(
     field_prefix: &str,
     base_offset: usize,
     specs: &mut Vec<crate::jitcode::BhFieldSpec>,
+    owner_sid: Option<majit_ir::descr::StructId>,
 ) {
-    if let Some(layout) = cc.struct_layout_for(owner) {
+    let layout = if let Some(sid) = owner_sid {
+        cc.struct_layout_for_id(sid)
+    } else {
+        cc.struct_layout_for(owner)
+    };
+    if owner_sid.is_some() && layout.is_none() {
+        return;
+    }
+    if let Some(layout) = layout {
         // The textual entries registry carries the inner-struct type name
         // for nested fields; match by field name to recover the owner
         // string when recursing.  Cloned out of `cc` so the immutable
@@ -6446,15 +6601,15 @@ fn bh_all_field_specs_for_struct_into(
             .map(|fs| fs.to_vec())
             .unwrap_or_default();
         for fl in &layout.fields {
-            // Header words are skipped against the owner that declares them,
-            // which is the nested owner once the walk has descended. They are
-            // not part of the positional census (`heaptracker.py all_fielddescrs`), so a
-            // list that keeps them numbers every following field two slots
-            // past where `get_fielddescr_index_in` puts it — and the index a
-            // descr is minted with is then a position in a different list
-            // than the one attached to it as the parent.
+            // Skip the original owner's first-field-chain typeptr
+            // (`heaptracker.py all_fielddescrs` `if name == 'typeptr':
+            // continue`, sound because lltype inlines a GcStruct only as
+            // the first field). A typeptr at a non-zero offset
+            // (`GcFramePrefix.frame.ob_header.ob_type`) is an ordinary
+            // leaf of this flattened list (`descr.py get_field_descr`).
+            let field_key = format!("{field_prefix}{}", fl.name);
             if fl.field_type == majit_ir::value::Type::Void
-                || crate::codewriter::heaptracker::is_header_word(owner, &fl.name)
+                || crate::codewriter::heaptracker::is_header_word(cc, root_owner, &field_key)
                 || fl.name.starts_with("c__pad")
             {
                 continue;
@@ -6462,10 +6617,14 @@ fn bh_all_field_specs_for_struct_into(
             if fl.flag == majit_ir::descr::ArrayFlag::Struct {
                 // `heaptracker.py:68-69 isinstance(FIELD, lltype.Struct):
                 //  all_fielddescrs(gccache, FIELD, only_gc, res, get_field_descr)`.
+                // Inline Vec is FLAG_STRUCT for the three-word aggregate
+                // and stays one leaf, the same row `from_type_strings`
+                // keeps for a plain struct field of type `Vec<u8>`.
                 if let Some(inner_owner) = entries
                     .iter()
                     .find(|row| row.name == fl.name)
                     .map(|row| row.ty.as_str())
+                    && bh_nested_struct_to_flatten(cc, inner_owner)
                 {
                     let nested_prefix = format!("{field_prefix}{}.", fl.name);
                     bh_all_field_specs_for_struct_into(
@@ -6475,12 +6634,12 @@ fn bh_all_field_specs_for_struct_into(
                         &nested_prefix,
                         base_offset + fl.offset,
                         specs,
+                        None,
                     );
+                    continue;
                 }
-                continue;
             }
             let index_in_parent = specs.len();
-            let field_key = format!("{field_prefix}{}", fl.name);
             let (field_type, field_flag, is_immutable) = vtable_method_slot_layout(
                 owner,
                 &fl.name,
@@ -6532,13 +6691,17 @@ fn bh_all_field_specs_for_struct_into(
         }
         let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
-        let is_skipped_field = crate::codewriter::heaptracker::is_header_word(owner, field_name)
-            || field_name.starts_with("c__pad");
+        let field_key = format!("{field_prefix}{field_name}");
+        let is_skipped_field =
+            crate::codewriter::heaptracker::is_header_word(cc, root_owner, &field_key)
+                || field_name.starts_with("c__pad");
         if !is_skipped_field {
-            if field_flag == majit_ir::descr::ArrayFlag::Struct {
-                // `heaptracker.py:68-69` recursive flatten for nested
-                // structs.  `field_type_str` is the inner owner name in
-                // this textual path.
+            if field_flag == majit_ir::descr::ArrayFlag::Struct
+                && bh_nested_struct_to_flatten(cc, field_type_str)
+            {
+                // `heaptracker.py` recursive flatten for nested structs.
+                // `field_type_str` is the inner owner name in this textual
+                // path.
                 let nested_prefix = format!("{field_prefix}{field_name}.");
                 bh_all_field_specs_for_struct_into(
                     cc,
@@ -6547,11 +6710,11 @@ fn bh_all_field_specs_for_struct_into(
                     &nested_prefix,
                     base_offset + offset,
                     specs,
+                    None,
                 );
             } else {
                 let index_in_parent = specs.len();
                 let rank = cc.field_immutability(Some(owner), field_name);
-                let field_key = format!("{field_prefix}{field_name}");
                 let (field_type, field_flag, is_immutable) = vtable_method_slot_layout(
                     owner,
                     field_name,
@@ -6725,7 +6888,7 @@ fn raw_host_field_offset(
     )
 }
 
-fn fielddescrof(
+pub(crate) fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
     callcontrol: Option<&CallControl>,
@@ -6757,7 +6920,7 @@ fn fielddescrof(
 
     let canonical_owner = canonical_field_owner(field);
     if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
-        parent = bh_size_spec_from_callcontrol(cc, owner);
+        parent = bh_size_spec_for(cc, owner, field.owner_id);
         // RPython `descr.py` keys both the SizeDescr and
         // FieldDescr caches on the low-level STRUCT object, never on the
         // spelling used to reach that object.  The Rust front end can carry
@@ -6772,14 +6935,22 @@ fn fielddescrof(
                 .owner_id
                 .or_else(|| majit_ir::descr::struct_id_for_name(owner))
         {
-            parent_spec.type_id = if parent_spec.is_gc_managed {
-                owner_id.as_u64()
+            if parent_spec.is_gc_managed {
+                // Keep the STRUCT `bh_size_spec_for` walked
+                // (`descr.py` `get_size_descr` cache[STRUCT]). Overwrite
+                // only the hash fallback (`type_id == 0`) or when the
+                // parent already names this owner; replacing a registered
+                // template id with an instance whose layout was not walked
+                // is two field lists under one SizeDescr.
+                if parent_spec.type_id == 0 || parent_spec.type_id == owner_id.as_u64() {
+                    parent_spec.type_id = owner_id.as_u64();
+                }
             } else {
                 // StructId identifies the nominal declaration only. Raw and
                 // GC variants of that declaration are distinct lltypes, so
                 // retain the storage discriminator installed above.
-                majit_ir::descr::path_hash_for_gc_kind(owner, false)
-            };
+                parent_spec.type_id = majit_ir::descr::path_hash_for_gc_kind(owner, false);
+            }
         }
         // `resolve_field_layout` mints in this order: `bh_field_lookup`
         // (Parent / Layout), then `scalar_word`. `require_mutate_field_resolved`
@@ -6851,10 +7022,29 @@ fn fielddescrof(
                 );
             }
             FieldLayoutResolution::Unresolved => {
+                let parent_fields = parent
+                    .as_ref()
+                    .map(|spec| {
+                        spec.all_fielddescrs
+                            .iter()
+                            .map(|f| f.field_key().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let layout_fields = bh_struct_layout_for_field(cc, owner, field.owner_id)
+                    .map(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .map(|row| row.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 panic!(
                     "fielddescrof: getattr({owner}, {}) failed: field is not a member of that STRUCT \
-                     (descr.py get_field_descr / symbolic.get_field_token)",
-                    field.name
+                     (descr.py get_field_descr / symbolic.get_field_token); \
+                     owner_id={:?} parent_fields={parent_fields:?} layout_fields={layout_fields:?}",
+                    field.name, field.owner_id,
                 );
             }
         }
@@ -7819,6 +8009,68 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    /// `heaptracker.py all_fielddescrs` skips `typeptr` only on the
+    /// offset-0 first-field chain. A contained object's class word is a
+    /// flattened leaf (`descr.py get_field_descr`).
+    #[test]
+    fn flattened_census_publishes_nonzero_offset_typeptr() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let mut cc = crate::call::CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![
+                ("ob_type".to_string(), "*const PyType".to_string()),
+                ("w_class".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "W_FloatObject".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("value".to_string(), "f64".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "PyFrame".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("pycode".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "GcFramePrefix".to_string(),
+            vec![
+                ("gc_header".to_string(), "u64".to_string()),
+                ("frame".to_string(), "PyFrame".to_string()),
+            ],
+        );
+        cc.set_known_struct_names(
+            ["PyObject", "W_FloatObject", "PyFrame", "GcFramePrefix"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        cc.set_struct_fields(fields);
+
+        let prefix = bh_all_field_specs_for_struct(&cc, "GcFramePrefix");
+        let prefix_keys: Vec<_> = prefix.iter().map(|s| s.field_key().to_string()).collect();
+        assert!(
+            prefix_keys.iter().any(|k| k == "frame.ob_header.ob_type"),
+            "GcFramePrefix flatten must publish contained typeptr: {prefix_keys:?}"
+        );
+        let float = bh_all_field_specs_for_struct(&cc, "W_FloatObject");
+        let float_keys: Vec<_> = float.iter().map(|s| s.field_key().to_string()).collect();
+        assert!(
+            !float_keys
+                .iter()
+                .any(|k| k == "ob_header.ob_type" || k == "ob_type"),
+            "first-field-chain typeptr stays out of flatten: {float_keys:?}"
+        );
+    }
 
     /// `descr.py get_type_flag` of the canonical RustVec header-pointer
     /// spellings is FLAG_UNSIGNED / Int / word, matching `get_type_flag`.
@@ -8888,6 +9140,71 @@ mod tests {
         );
     }
 
+    /// Template `Result::Ok` keeps only the inherited tag (TypeVar payload
+    /// skipped). `bh_size_spec_for` still reconstructs the explicit-shell
+    /// payload word so `getattr(STRUCT, __pos_0)` hits one SizeDescr.
+    #[test]
+    fn fielddescrof_explicit_shell_template_pos0_is_payload_word() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        use crate::call::StructLayout;
+
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
+        let owner = "Result::Ok";
+        let owner_id = majit_ir::descr::StructId::from_canonical("core::result::Result::Ok");
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        // Production registers the TypeVar template as an empty layout
+        // (`enum_variant_field_occupies_storage`). That must not drop
+        // the explicit-shell payload word.
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: Vec::new(),
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("explicit Result variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+
+        let crate::jitcode::BhDescr::Field {
+            offset,
+            field_type,
+            index_in_parent,
+            parent: Some(parent),
+            ..
+        } = fielddescrof(
+            &FieldDescriptor::new("__pos_0", Some(owner.to_string())),
+            &crate::model::ValueType::Ref(None),
+            Some(&cc),
+            true,
+        )
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 8);
+        assert_eq!(field_type, majit_ir::value::Type::Ref);
+        assert_eq!(index_in_parent, Some(1));
+        assert_eq!(parent.all_fielddescrs.len(), 2);
+        assert_eq!(parent.all_fielddescrs[1].field_key(), "__pos_0");
+    }
+
     /// Bare `Tuple` is unit `()`. `__pos_0` is not a member
     /// (`getattr(STRUCT, fieldname)` / `get_field_descr`).
     #[test]
@@ -9207,6 +9524,191 @@ mod tests {
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
         assert_eq!(spec.type_id, concrete_id.as_u64());
         assert_eq!(spec.all_fielddescrs.len(), 2);
+    }
+
+    /// `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the
+    /// concrete lltype STRUCT. Two monomorphizations of one generic
+    /// TypeDecl are two STRUCTs; their field offsets must not collapse
+    /// onto the template spelling (`owner_root` stays the unsuffixed
+    /// leaf for a struct).
+    #[test]
+    fn fielddescrof_keeps_generic_instance_field_offsets() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let template_name = "RDict";
+        let template_id = majit_ir::descr::StructId::from_canonical("rordereddict::RDict");
+        let int_id = template_id.instantiate("<i64,PyObjectRef>");
+        let ident_id = template_id.instantiate("<IdentityKey,PyObjectRef>");
+        let _registry = register_struct_ids_serialized(HashMap::from([(
+            template_name.to_string(),
+            Some(template_id),
+        )]));
+
+        let layout_at = |num_live_items: usize, size: usize| StructLayout {
+            size,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+            fields: vec![
+                StructFieldLayout {
+                    name: "indexes".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                },
+                StructFieldLayout {
+                    name: "entries".to_string(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                },
+                StructFieldLayout {
+                    name: "num_live_items".to_string(),
+                    offset: num_live_items,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+            ],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            template_name.to_string(),
+            vec![
+                ("indexes".to_string(), "*mut i8".to_string()),
+                ("entries".to_string(), "*mut i8".to_string()),
+                ("num_live_items".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(template_id, layout_at(16, 24));
+        cc.set_struct_layout(int_id, layout_at(16, 24));
+        cc.set_struct_layout(ident_id, layout_at(32, 48));
+
+        let descr = |owner_id: majit_ir::descr::StructId| {
+            let field = FieldDescriptor::new("num_live_items", Some(template_name.to_string()))
+                .with_owner_id(Some(owner_id));
+            let crate::jitcode::BhDescr::Field {
+                offset,
+                parent: Some(parent),
+                ..
+            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc), true)
+            else {
+                panic!("num_live_items must carry a parent descriptor");
+            };
+            (offset, parent.type_id)
+        };
+
+        let (int_off, int_ty) = descr(int_id);
+        let (ident_off, ident_ty) = descr(ident_id);
+        assert_eq!(int_off, 16);
+        assert_eq!(ident_off, 32);
+        assert_eq!(int_ty, int_id.as_u64());
+        assert_eq!(ident_ty, ident_id.as_u64());
+        assert_ne!(int_ty, ident_ty);
+    }
+
+    /// A 4-crate merge withdraws the bare leaf (`struct_ids["RDict"] =
+    /// None`). The FieldRead still carries the instance STRUCT on
+    /// `owner_id`; `get_field_descr` must use that STRUCT's offset.
+    #[test]
+    fn fielddescrof_keeps_instance_offsets_when_the_leaf_is_ambiguous() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let template_name = "RDict";
+        let template_id = majit_ir::descr::StructId::from_canonical("rordereddict::RDict");
+        let int_id = template_id.instantiate("<i64,PyObjectRef>");
+        let ident_id = template_id.instantiate("<IdentityKey,PyObjectRef>");
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (template_name.to_string(), None),
+            ("rordereddict::RDict".to_string(), Some(template_id)),
+        ]));
+
+        let layout_at = |num_live_items: usize, size: usize| StructLayout {
+            size,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+            fields: vec![
+                StructFieldLayout {
+                    name: "indexes".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                },
+                StructFieldLayout {
+                    name: "entries".to_string(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                },
+                StructFieldLayout {
+                    name: "num_live_items".to_string(),
+                    offset: num_live_items,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+            ],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            template_name.to_string(),
+            vec![
+                ("indexes".to_string(), "*mut i8".to_string()),
+                ("entries".to_string(), "*mut i8".to_string()),
+                ("num_live_items".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(template_id, layout_at(16, 24));
+        cc.set_struct_layout(int_id, layout_at(16, 24));
+        cc.set_struct_layout(ident_id, layout_at(32, 48));
+
+        let descr = |owner_id: majit_ir::descr::StructId| {
+            let field = FieldDescriptor::new("num_live_items", Some(template_name.to_string()))
+                .with_owner_id(Some(owner_id));
+            let crate::jitcode::BhDescr::Field {
+                offset,
+                parent: Some(parent),
+                ..
+            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc), true)
+            else {
+                panic!("num_live_items must carry a parent descriptor");
+            };
+            (offset, parent.type_id)
+        };
+
+        let (int_off, int_ty) = descr(int_id);
+        let (ident_off, ident_ty) = descr(ident_id);
+        assert_eq!(int_off, 16, "int instance offset with ambiguous leaf");
+        assert_eq!(
+            ident_off, 32,
+            "identity instance offset with ambiguous leaf"
+        );
+        assert_eq!(int_ty, int_id.as_u64());
+        assert_eq!(ident_ty, ident_id.as_u64());
+        assert_ne!(int_ty, ident_ty);
     }
 
     #[test]
@@ -12649,6 +13151,79 @@ mod tests {
         (cc, guard)
     }
 
+    fn sized_layout(size: usize, align: usize) -> crate::call::StructLayout {
+        crate::call::StructLayout {
+            size,
+            align,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+            fields: Vec::new(),
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Subclass structs that inline the header, or publish a dotted
+    /// first-field chain to the typeptr, are not `rclass.OBJECT`. Their
+    /// layouts must not enter [`host_object_header_layout`].
+    #[test]
+    fn host_object_header_layout_selects_own_typeptr_not_inlined_subclass() {
+        use std::collections::HashMap;
+
+        let mut cc = crate::call::CallControl::new();
+        let mut ids = HashMap::new();
+        let header_id = majit_ir::descr::StructId::from_canonical(host_header_owner());
+        ids.insert(host_header_owner().to_string(), Some(header_id));
+        cc.set_struct_layout(header_id, host_header_layout());
+        for (name, size) in [
+            ("AFlatHeader", 8usize),
+            ("ObjectHeader", 8usize),
+            ("W_FloatObject", 24usize),
+        ] {
+            let sid = majit_ir::descr::StructId::from_canonical(name);
+            ids.insert(name.to_string(), Some(sid));
+            cc.set_struct_layout(sid, sized_layout(size, 8));
+        }
+        let _guard = crate::test_support::register_struct_ids_serialized(ids);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(host_header_owner().to_string(), host_header_rows());
+        fields.fields.insert(
+            "ObjectHeader".to_string(),
+            vec![crate::front::semantic::FieldRow::named("typeptr", "usize")],
+        );
+        fields.fields.insert(
+            "W_FloatObject".to_string(),
+            vec![
+                crate::front::semantic::FieldRow::named("ob_header", "PyObject"),
+                crate::front::semantic::FieldRow::named("value", "f64"),
+            ],
+        );
+        fields.fields.insert(
+            "AFlatHeader".to_string(),
+            vec![
+                crate::front::semantic::FieldRow::named("ob_header.ob_type", "*const PyType"),
+                crate::front::semantic::FieldRow::named("payload", "i64"),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(
+            ["PyObject", "W_FloatObject", "AFlatHeader", "ObjectHeader"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+
+        let header = host_header_layout();
+        let (size, align, owner) = host_object_header_layout(&cc);
+        assert_eq!(owner, host_header_owner());
+        assert_eq!((size, align), (header.size, header.align));
+        let specs = host_object_header_gc_field_specs(&cc, &owner);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].field_key(), "w_class");
+    }
+
     fn assemble_new_with_vtable(
         cc: &crate::call::CallControl,
         owner: &str,
@@ -15269,12 +15844,24 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(loaded.clone()));
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: loaded.clone(),
+                    rhs: len.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(sum.clone()));
         FunctionGraph::set_concretetype_of_inline(
             &frame,
             crate::codewriter::type_state::ConcreteType::GcRef,
         );
-        for var in [&index, &stored, &loaded, &len] {
+        for var in [&index, &stored, &loaded, &len, &sum] {
             FunctionGraph::set_concretetype_of_inline(
                 var,
                 crate::codewriter::type_state::ConcreteType::Signed,
@@ -15487,7 +16074,19 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(graph.startblock, Some(array_result_var.clone()));
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: field_result_var.clone(),
+                    rhs: array_result_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(sum.clone()));
 
         // Publish kinds to graph cells before jtransform.  Variable
         // Rc-shares the concretetype cell across clones, so the
@@ -15506,6 +16105,10 @@ mod tests {
         );
         FunctionGraph::set_concretetype_of_inline(
             &array_result_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &sum,
             crate::codewriter::type_state::ConcreteType::Signed,
         );
 

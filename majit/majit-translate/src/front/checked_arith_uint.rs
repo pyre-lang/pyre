@@ -71,6 +71,10 @@ pub(crate) struct CheckedArithUintSite {
     pub payload_ty: ValueType,
     /// Operand atom width; `< JIT_BANK_BITS` selects the narrow overflow test.
     pub bits: u32,
+    /// Instance STRUCT of the built `Some`.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `None`.
+    pub none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// Rewrite every recorded unsigned `checked_{add,sub,mul}` site into the native
@@ -517,6 +521,7 @@ fn rewire_one_checked_arith_uint_site(
         &site.option_owner,
         disc,
         Some((&site.some_owner, value, site.payload_ty.clone())),
+        [site.none_vsid, site.some_vsid],
     );
     Ok(())
 }
@@ -952,6 +957,8 @@ mod tests {
             some_owner: "core::option::Option<usize>::Some".to_string(),
             payload_ty: ValueType::Unsigned,
             bits: 64,
+            some_vsid: None,
+            none_vsid: None,
         }
     }
 

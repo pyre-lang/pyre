@@ -23,13 +23,12 @@ mod common;
 use common::{INTERPRETER_LLBC, load_llbc};
 use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
 
-/// The leaf name of every function reviewed as `unroll_safe`, with the
+/// Harvested name of every function reviewed as `unroll_safe`, with the
 /// upstream decorator it mirrors.
 ///
-/// Matched on the leaf rather than the full path because the harvester
-/// spells a method with its impl block (`pyframe::<Impl>::fast2locals`) and
-/// a free function without one (`builtins::leading_non_null_count`); the
-/// leaves are unambiguous across the interpreter.
+/// A unique leaf (`leading_non_null_count`) matches any harvested path
+/// ending in that leaf. When two impl methods share a leaf, harvest keys
+/// them `{owner}::{leaf}` and the inventory lists those full paths.
 const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `abstractinst.py` carries `@jit.unroll_safe` on all three.
     (
@@ -57,6 +56,9 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "get_and_call_function",
         "descroperation.py get_and_call_function",
     ),
+    // `function.py Function.funccall(self, *args_w)`:
+    // `*args_w` has a length fixed per call site, so the copies unroll.
+    ("funccall_result", "function.py Function.funccall"),
     // `baseobjspace.py call_function(self, w_func, *args_w)`: the same
     // per-call-site `*args_w`, copied by `list(args_w)`.
     ("call_function_impl_result", "baseobjspace.py call_function"),
@@ -376,10 +378,14 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // Both pyre methods that share this leaf (the throw-surface table and
     // the `PyError` materialiser) are loop-free, so `look_inside_graph`
     // already admits them; the hint is the upstream decorator, not a
-    // descent-scope change.
+    // descent-scope change. Harvest keys each `{owner}::{leaf}`.
     (
-        "normalize_exception",
-        "error.py OperationError.normalize_exception",
+        "error::ExceptionNormalization::normalize_exception",
+        "error.py OperationError.normalize_exception throw-surface table",
+    ),
+    (
+        "error::PyError::normalize_exception",
+        "error.py OperationError.normalize_exception PyError materialiser",
     ),
     // `pyframe.py dropvaluesuntil` is `@jit.unroll_safe` and promotes
     // `finaldepth`. The exception-table handler calls it after
@@ -571,25 +577,40 @@ fn harvested_unroll_safe() -> Vec<String> {
         );
     }
 
-    // `REVIEWED_UNROLL_SAFE` and the subset check below both match on the
-    // leaf, on the stated assumption that leaves are unambiguous across the
-    // interpreter.  Nothing else verifies that.  If an unreviewed function
-    // elsewhere later takes an already-reviewed leaf name and is hinted, the
-    // subset check would pass on the strength of the other function's review
-    // — the one outcome this file exists to prevent.
+    // A unique-leaf inventory row would accept either of two harvested
+    // `{owner}::{leaf}` keys. Full-path rows are the only way to review
+    // both; a shared leaf that is not keyed that way is the outcome this
+    // file exists to prevent.
+    let reviewed_full: std::collections::HashSet<&str> = REVIEWED_UNROLL_SAFE
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| name.contains("::"))
+        .collect();
     let mut leaves: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for path in &paths {
         if let Some(previous) = leaves.insert(leaf(path), path.as_str()) {
-            panic!(
-                "leaf `{}` is ambiguous between {previous} and {path}. \
-                 REVIEWED_UNROLL_SAFE matches by leaf, so it cannot tell them \
-                 apart and one would ride on the other's review; key the \
-                 inventory by full path before adding either.",
-                leaf(path),
-            );
+            let both_keyed =
+                reviewed_full.contains(previous) && reviewed_full.contains(path.as_str());
+            if !both_keyed {
+                panic!(
+                    "leaf `{}` is ambiguous between {previous} and {path}. \
+                     REVIEWED_UNROLL_SAFE matches by leaf, so it cannot tell \
+                     them apart and one would ride on the other's review; \
+                     key the inventory by full path before adding either.",
+                    leaf(path),
+                );
+            }
         }
     }
     paths
+}
+
+fn reviewed_name_matches(name: &str, path: &str) -> bool {
+    if name.contains("::") {
+        name == path
+    } else {
+        name == leaf(path)
+    }
 }
 
 fn leaf(path: &str) -> &str {
@@ -603,7 +624,7 @@ fn every_unroll_safe_in_the_shipped_llbc_is_a_reviewed_one() {
         assert!(
             REVIEWED_UNROLL_SAFE
                 .iter()
-                .any(|(name, _)| *name == leaf(path)),
+                .any(|(name, _)| reviewed_name_matches(name, path)),
             "{path} carries `unroll_safe` but is not in REVIEWED_UNROLL_SAFE. \
              The attribute admits this graph and its callee closure into the \
              candidate set, so it needs its own evidence — measure \

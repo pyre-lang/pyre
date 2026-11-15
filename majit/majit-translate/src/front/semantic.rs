@@ -1535,6 +1535,10 @@ pub struct SemanticProgram {
     /// `c_graphs` for an indirect call through that slot. Empty until the
     /// first-pass harvest fills it.
     pub fnptr_field_families: Vec<(String, String, String)>,
+    /// Live assembler layout table for this translation (`descr.py`
+    /// `get_size_descr` cache[STRUCT]). One `Rc` per translation, shared
+    /// with every crate's lowering and with `CallControl`.
+    pub struct_layouts: crate::codewriter::call::StructLayoutTable,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and
