@@ -6302,7 +6302,7 @@ fn bh_uses_instance_layout(owner: &str, owner_id: Option<majit_ir::descr::Struct
     }
 }
 
-fn bh_size_spec_for(
+pub(crate) fn bh_size_spec_for(
     cc: &CallControl,
     owner: &str,
     owner_id: Option<majit_ir::descr::StructId>,
@@ -6407,28 +6407,13 @@ fn bh_size_spec_for(
         && !all_fielddescrs
             .iter()
             .any(|field| field.field_key() == "__discriminant")
+        && let Some(tag) = inherited_enum_tag_spec(cc, template_owner)
     {
         for (index, field) in all_fielddescrs.iter_mut().enumerate() {
             field.index = (index + 1) as u32;
             field.index_in_parent = index + 1;
         }
-        all_fielddescrs.insert(
-            0,
-            bh_field_spec_from_parts(
-                0,
-                template_owner,
-                "__discriminant",
-                0,
-                8,
-                majit_ir::value::Type::Int,
-                majit_ir::descr::ArrayFlag::Signed,
-                false,
-                false,
-                0,
-                false,
-                false,
-            ),
-        );
+        all_fielddescrs.insert(0, tag);
     }
     // The generic TypeDecl skips a TypeVar payload row
     // (`enum_variant_field_occupies_storage`). The explicit shell still
@@ -6573,53 +6558,118 @@ fn bh_size_spec_for(
     })
 }
 
+/// The discriminant-only enum base `variant_owner` inherits.
+///
+/// `rclass.InstanceRepr._setup_repr` embeds that base as `super`. Evidence is
+/// the `__discriminant`-only base registration `front/mir.rs` writes, or the
+/// explicit Result/Option shell (`is_explicit_shell_variant_owner`) whose tag
+/// is the same inherited row.
+fn tag_carrying_enum_base_of_variant<'a>(
+    cc: &CallControl,
+    variant_owner: &'a str,
+) -> Option<&'a str> {
+    let (base_owner, _variant) = variant_owner.rsplit_once("::")?;
+    let base_is_tag_enum = cc.struct_fields().is_enum_base(base_owner)
+        || cc
+            .struct_field_entries(base_owner)
+            .is_some_and(|entries| entries.len() == 1 && entries[0].name == "__discriminant");
+    if base_is_tag_enum || is_explicit_shell_variant_owner(variant_owner) {
+        Some(base_owner)
+    } else {
+        None
+    }
+}
+
+/// Display owner of an inherited `__discriminant` row: the enum leaf plus its
+/// origin (`canonical_struct_name`), with any `<…>` instantiation reattached.
+fn canonical_enum_base_display(base_owner: &str) -> String {
+    let leaf = base_owner.rsplit("::").next().unwrap_or(base_owner);
+    majit_ir::descr::canonical_struct_name(leaf)
+}
+
+fn with_enum_base_tag_owner(
+    tag: crate::jitcode::BhFieldSpec,
+    base_owner: &str,
+) -> crate::jitcode::BhFieldSpec {
+    let base_name = canonical_enum_base_display(base_owner);
+    if tag.name == bh_field_name(&base_name, "__discriminant") {
+        tag
+    } else {
+        bh_field_spec_from_parts(
+            0,
+            &base_name,
+            "__discriminant",
+            tag.offset,
+            tag.field_size,
+            tag.field_type,
+            tag.field_flag,
+            tag.is_immutable,
+            tag.is_quasi_immutable,
+            0,
+            tag.load_is_acquire,
+            tag.store_is_release,
+        )
+    }
+}
+
 /// The enum base's `__discriminant` row that `variant_owner` inherits, or
 /// `None` when `variant_owner` does not name a variant of a tag-carrying enum.
 ///
-/// The evidence is the `__discriminant`-only base registration `front/mir.rs`
-/// writes for every payload enum whose tag width Charon spelled -- a plain
-/// struct whose path merely contains `::` registers its own rows under that
-/// key and fails the shape test, and an enum whose tag width was recorded but
-/// is unspellable registers no base at all, which is the state that wants a
-/// declining read rather than a reconstructed slot.
-///
-/// The row is named under the *variant*, the way the explicit shell's own tag
-/// row is: it is the variant's slot 0, and what identifies it as the base's
-/// field is the inheritance edge the read side resolves. Charon can spell the
-/// variant with a crate prefix or only the enum leaf while the discriminant
-/// read uses the crate-stripped canonical base. Rebuild the variant owner from
-/// that leaf's registered origin so both spell the same inheritance edge.
+/// `heaptracker.all_fielddescrs` recurses into `'super'` and keeps the base
+/// STRUCT's FieldDescr object. Return that BASE spec without renaming it onto
+/// the variant. Charon can spell the variant with a crate prefix or only the
+/// enum leaf; the discriminant read uses the crate-stripped canonical base, so
+/// the returned row's display owner is that canonical base.
 fn inherited_enum_tag_spec(
     cc: &CallControl,
     variant_owner: &str,
 ) -> Option<crate::jitcode::BhFieldSpec> {
-    let (base_owner, variant) = variant_owner.rsplit_once("::")?;
-    let entries = cc.struct_field_entries(base_owner)?;
-    if entries.len() != 1 || entries[0].name != "__discriminant" {
-        return None;
-    }
-    let tag = bh_all_field_specs_for_struct(cc, base_owner)
+    let base_owner = tag_carrying_enum_base_of_variant(cc, variant_owner)?;
+    if let Some(tag) = bh_all_field_specs_for_struct(cc, base_owner)
         .into_iter()
-        .find(|spec| spec.field_key() == "__discriminant")?;
-    let base_leaf = base_owner.rsplit("::").next().unwrap_or(base_owner);
-    let canonical_variant_owner = format!(
-        "{}::{variant}",
-        majit_ir::descr::canonical_struct_name(base_leaf)
-    );
+        .find(|spec| spec.field_key() == "__discriminant")
+    {
+        return Some(with_enum_base_tag_owner(tag, base_owner));
+    }
+    let base_name = canonical_enum_base_display(base_owner);
     Some(bh_field_spec_from_parts(
         0,
-        &canonical_variant_owner,
+        &base_name,
         "__discriminant",
-        tag.offset,
-        tag.field_size,
-        tag.field_type,
-        tag.field_flag,
-        tag.is_immutable,
-        tag.is_quasi_immutable,
         0,
-        tag.load_is_acquire,
-        tag.store_is_release,
+        8,
+        majit_ir::value::Type::Int,
+        majit_ir::descr::ArrayFlag::Signed,
+        false,
+        false,
+        0,
+        false,
+        false,
     ))
+}
+
+/// `rclass.InstanceRepr._get_field` walks `rbase` after `cast_pointer`, so
+/// `cpu.fielddescrof` is keyed on the BASE STRUCT. Rewrite a `__discriminant`
+/// access whose owner is `Enum::Variant` (or whose `owner_id` is a variant
+/// STRUCT while the spelling already names the base) onto that base.
+pub(crate) fn fielddescrof_enum_base_owner(
+    cc: &CallControl,
+    field_name: &str,
+    owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
+) -> (String, Option<majit_ir::descr::StructId>) {
+    if field_name != "__discriminant" {
+        return (owner.to_string(), owner_id);
+    }
+    if let Some(base_owner) = tag_carrying_enum_base_of_variant(cc, owner) {
+        let base_sid = majit_ir::descr::struct_id_for_name(base_owner);
+        return (base_owner.to_string(), base_sid);
+    }
+    if cc.struct_fields().is_enum_base(owner) {
+        let base_sid = majit_ir::descr::struct_id_for_name(owner);
+        return (owner.to_string(), base_sid.or(owner_id));
+    }
+    (owner.to_string(), owner_id)
 }
 
 fn bh_all_field_specs_for_struct(
@@ -6757,6 +6807,17 @@ fn bh_all_field_specs_for_struct_into(
             {
                 continue;
             }
+            // `heaptracker.all_fielddescrs` recurses `'super'` and reuses the
+            // base FieldDescr; the variant registry still lists the prepended
+            // `__discriminant` row for slot order (`front/mir.rs`). Skip it so
+            // `inherited_enum_tag_spec` prepends the BASE spec
+            // (`bh_result_variant_field_specs` already skips the same row).
+            if field_prefix.is_empty()
+                && fl.name == "__discriminant"
+                && tag_carrying_enum_base_of_variant(cc, root_owner).is_some()
+            {
+                continue;
+            }
             if fl.flag == majit_ir::descr::ArrayFlag::Struct {
                 // `heaptracker.py:68-69 isinstance(FIELD, lltype.Struct):
                 //  all_fielddescrs(gccache, FIELD, only_gc, res, get_field_descr)`.
@@ -6838,6 +6899,13 @@ fn bh_all_field_specs_for_struct_into(
         let is_skipped_field =
             crate::codewriter::heaptracker::is_header_word(cc, root_owner, &field_key)
                 || field_name.starts_with("c__pad");
+        if field_prefix.is_empty()
+            && field_name == "__discriminant"
+            && tag_carrying_enum_base_of_variant(cc, root_owner).is_some()
+        {
+            offset += field_size;
+            continue;
+        }
         if !is_skipped_field {
             if field_flag == majit_ir::descr::ArrayFlag::Struct
                 && bh_nested_struct_to_flatten(cc, field_type_str)
@@ -7062,8 +7130,17 @@ pub(crate) fn fielddescrof(
     };
 
     let canonical_owner = canonical_field_owner(field);
+    let mut descr_owner = canonical_owner.clone().unwrap_or_default();
     if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
-        parent = bh_size_spec_for(cc, owner, field.owner_id);
+        // `rclass.InstanceRepr._get_field` walks `rbase` after `cast_pointer`,
+        // so `cpu.fielddescrof` is keyed on the BASE STRUCT.
+        let (owner, owner_id) =
+            fielddescrof_enum_base_owner(cc, field_key.as_str(), owner, field.owner_id);
+        descr_owner = owner.clone();
+        let mut field = field.clone();
+        field.owner_root = Some(owner.clone());
+        field.owner_id = owner_id;
+        parent = bh_size_spec_for(cc, &owner, owner_id);
         // RPython `descr.py` keys both the SizeDescr and
         // FieldDescr caches on the low-level STRUCT object, never on the
         // spelling used to reach that object.  The Rust front end can carry
@@ -7074,9 +7151,7 @@ pub(crate) fn fielddescrof(
         // both operations resolve through one parent SizeDescr and therefore
         // one `__discriminant` FieldDescr.
         if let Some(parent_spec) = parent.as_mut()
-            && let Some(owner_id) = field
-                .owner_id
-                .or_else(|| majit_ir::descr::struct_id_for_name(owner))
+            && let Some(owner_id) = owner_id.or_else(|| majit_ir::descr::struct_id_for_name(&owner))
         {
             if parent_spec.is_gc_managed {
                 // Keep the STRUCT `bh_size_spec_for` walked
@@ -7092,7 +7167,7 @@ pub(crate) fn fielddescrof(
                 // StructId identifies the nominal declaration only. Raw and
                 // GC variants of that declaration are distinct lltypes, so
                 // retain the storage discriminator installed above.
-                parent_spec.type_id = majit_ir::descr::path_hash_for_gc_kind(owner, false);
+                parent_spec.type_id = majit_ir::descr::path_hash_for_gc_kind(&owner, false);
             }
         }
         // `resolve_field_layout` mints in this order: `bh_field_lookup`
@@ -7100,7 +7175,7 @@ pub(crate) fn fielddescrof(
         // accepts only Parent / Layout (`descr.py get_field_descr`). The
         // Layout arm still runs `transparent_scalar_field` here so a
         // one-word newtype stays a leaf load.
-        let resolution = resolve_field_layout(cc, field);
+        let resolution = resolve_field_layout(cc, &field);
         let mut found_parent_field = matches!(resolution, FieldLayoutResolution::Parent(_));
         match resolution {
             FieldLayoutResolution::Parent(spec) => {
@@ -7174,7 +7249,7 @@ pub(crate) fn fielddescrof(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let layout_fields = bh_struct_layout_for_field(cc, owner, field.owner_id)
+                let layout_fields = bh_struct_layout_for_field(cc, &owner, field.owner_id)
                     .map(|layout| {
                         layout
                             .fields
@@ -7191,12 +7266,12 @@ pub(crate) fn fielddescrof(
                 );
             }
         }
-        if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
+        if let Some(rank) = cc.field_immutability(Some(&owner), &field_key) {
             // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
             is_immutable = true;
             is_quasi_immutable = rank.is_quasi_immutable();
         }
-        if is_quasi_immutable && cc.field_row_is_atomic(owner, &field_key) {
+        if is_quasi_immutable && cc.field_row_is_atomic(&owner, &field_key) {
             load_is_acquire = true;
             store_is_release = true;
         }
@@ -7395,7 +7470,7 @@ pub(crate) fn fielddescrof(
         index_in_parent,
         parent: parent.map(std::sync::Arc::new),
         name: field_key,
-        owner: canonical_owner.unwrap_or_default(),
+        owner: descr_owner,
         load_is_acquire,
         store_is_release,
     }
@@ -8968,6 +9043,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fielddescrof_variant_discriminant_uses_the_enum_base_descr() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let mut ids = standard_shell_struct_ids();
+        let result_base = majit_ir::descr::StructId::from_canonical("core::result::Result");
+        for name in [
+            "Result",
+            "result::Result",
+            "std::result::Result",
+            "core::result::Result",
+        ] {
+            ids.insert(name.to_string(), Some(result_base));
+        }
+        let _registry = register_struct_ids_serialized(ids);
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        for owner in ["result::Result", "core::result::Result"] {
+            struct_fields.fields.insert(
+                owner.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        struct_fields.fields.insert(
+            "result::Result::Err".to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("__pos_0".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let descr = |owner: &str| {
+            let field = FieldDescriptor::new("__discriminant", Some(owner.to_string()));
+            let crate::jitcode::BhDescr::Field {
+                parent: Some(parent),
+                name,
+                ..
+            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc), true)
+            else {
+                panic!("Result discriminant must carry a parent descriptor");
+            };
+            (parent.type_id, name)
+        };
+
+        let (err_tid, err_key) = descr("result::Result::Err");
+        let (base_tid, base_key) = descr("result::Result");
+        assert_eq!(err_tid, base_tid, "variant tag uses the enum-base parent");
+        assert_eq!(err_tid, result_base.as_u64());
+        assert_eq!(err_key, base_key);
+        assert_eq!(err_key, "__discriminant");
+    }
+
     use crate::test_support::register_struct_ids_serialized;
 
     fn standard_shell_struct_ids() -> HashMap<String, Option<majit_ir::descr::StructId>> {
@@ -9900,13 +10029,13 @@ mod tests {
                 .expect("BinOperand variant size");
         assert_eq!(
             bin_operand.all_fielddescrs[0].name,
-            "grain::bytecode::op::BinOperand::Local.__discriminant"
+            "grain::bytecode::op::BinOperand.__discriminant"
         );
 
         let union = bh_size_spec_from_callcontrol(&cc, "Union::Int").expect("Union variant size");
         assert_eq!(
             union.all_fielddescrs[0].name,
-            "types::dynamic::Union::Int.__discriminant"
+            "types::dynamic::Union.__discriminant"
         );
     }
 

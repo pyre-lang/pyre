@@ -8214,6 +8214,36 @@ fn share_struct_collector_tid(cached: &SimpleSizeDescr, built: &SimpleSizeDescr)
     }
 }
 
+/// Intern key of an inherited `__discriminant` row whose display owner is a
+/// different STRUCT than the group being published.
+///
+/// `heaptracker.all_fielddescrs` recurses into `'super'` with
+/// `get_field_descr(gccache, INNER, name)`, so the tag is the BASE STRUCT's
+/// own FieldDescr. `None` when this spec is this STRUCT's own tag.
+fn inherited_enum_tag_intern_key(
+    spec: &SimpleFieldDescrSpec,
+    group_key: &LLType,
+) -> Option<LLType> {
+    if spec.field_key != "__discriminant" {
+        return None;
+    }
+    let owner = spec.name.rsplit_once('.')?.0;
+    if owner.is_empty() {
+        return None;
+    }
+    let key = match struct_id_for_name(owner) {
+        Some(sid) if sid.as_u64() != 0 => LLType::Struct(sid.as_u64()),
+        _ => {
+            let hashed = StructId::from_canonical_spelling(owner).as_u64();
+            if hashed == 0 {
+                return None;
+            }
+            LLType::Struct(hashed)
+        }
+    };
+    (key != *group_key).then_some(key)
+}
+
 /// [`make_simple_descr_group_keyed_with_headerless`] for a STRUCT whose first
 /// field is an inlined parent STRUCT.
 ///
@@ -8288,11 +8318,16 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     );
     // descr.py — cache-or-mint each FieldDescr by
     // `(STRUCT, fieldname)` before freezing this producer's positional list.
-    let own_field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
-        .iter()
-        .map(|spec| {
-            gc.get_field_descr_declaring(
-                struct_key.clone(),
+    // `heaptracker.all_fielddescrs` recurses into an inlined parent STRUCT
+    // with `get_field_descr(gccache, INNER, name)`, so an inherited
+    // `__discriminant` is the BASE STRUCT's own FieldDescr object and is
+    // passed as `inlined_parent` rather than interned under this STRUCT.
+    let mut inherited_parent: Vec<Arc<SimpleFieldDescr>> = Vec::new();
+    let mut own_field_descrs: Vec<Arc<SimpleFieldDescr>> = Vec::new();
+    for spec in field_specs {
+        if let Some(tag_key) = inherited_enum_tag_intern_key(spec, &struct_key) {
+            inherited_parent.push(gc.get_field_descr_declaring(
+                tag_key,
                 &spec.field_key,
                 Some(spec.name.as_str()),
                 spec.offset,
@@ -8303,23 +8338,42 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
                 spec.flag,
                 spec.index,
                 spec.virtualizable,
-                // `Some` because `SimpleFieldDescrSpec.index_in_parent` is a
-                // plain `usize` and CANNOT express the absence, not because
-                // every spec resolved a slot: the spec factories in
-                // `pyre-jit-trace/src/descr.rs` write literal `index_in_parent:
-                // 0` at a dozen sites. So on this path `unresolved_claimed` is
-                // an upper bound and `unresolved_placeholder` a lower one. The
-                // bound is exact only for callers that hand the `Option` in
-                // themselves — the deserialized-`BhDescr::Field` path.
-                Some(spec.index_in_parent + leading_len),
+                Some(spec.index_in_parent),
                 spec.is_class_word,
                 spec.load_is_acquire,
                 spec.store_is_release,
-            )
-        })
-        .collect();
-    let field_descrs: Vec<Arc<SimpleFieldDescr>> = inlined_parent
+            ));
+            continue;
+        }
+        own_field_descrs.push(gc.get_field_descr_declaring(
+            struct_key.clone(),
+            &spec.field_key,
+            Some(spec.name.as_str()),
+            spec.offset,
+            spec.field_size,
+            spec.field_type,
+            spec.is_immutable,
+            spec.is_quasi_immutable,
+            spec.flag,
+            spec.index,
+            spec.virtualizable,
+            // `Some` because `SimpleFieldDescrSpec.index_in_parent` is a
+            // plain `usize` and CANNOT express the absence, not because
+            // every spec resolved a slot: the spec factories in
+            // `pyre-jit-trace/src/descr.rs` write literal `index_in_parent:
+            // 0` at a dozen sites. So on this path `unresolved_claimed` is
+            // an upper bound and `unresolved_placeholder` a lower one. The
+            // bound is exact only for callers that hand the `Option` in
+            // themselves — the deserialized-`BhDescr::Field` path.
+            Some(spec.index_in_parent + leading_len),
+            spec.is_class_word,
+            spec.load_is_acquire,
+            spec.store_is_release,
+        ));
+    }
+    let field_descrs: Vec<Arc<SimpleFieldDescr>> = inherited_parent
         .iter()
+        .chain(inlined_parent.iter())
         .chain(own_field_descrs.iter())
         .cloned()
         .collect();
