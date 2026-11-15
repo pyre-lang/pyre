@@ -125,7 +125,7 @@ pub fn tuple_hash_green_hash(w_type: PyObjectRef) -> u64 {
 /// `JitCell.get_jitcell(*greenargs)` compares the live greens in place, so
 /// this builds no [`GreenKey`]. Function-entry uses the same
 /// `resolve_cell_key_with_greenargs` door (`eval.rs`
-/// `tick_function_entry_from_portal`).
+/// `tuple_hash_function_entry_jit`).
 #[inline]
 pub fn tuple_hash_resolved_cell_key(
     warm: &majit_metainterp::warmstate::WarmEnterState,

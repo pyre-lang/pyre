@@ -595,6 +595,9 @@ pub fn register_tuple_hash_merge_hook(f: TupleHashMergeFn) {
 /// `None` means the warm state stayed in the interpreter (`maybe_compile_and_run`
 /// returned without raising). `Some` is the portal result: the trace or the
 /// compiled loop ran the remaining iterations and returns the accumulator.
+///
+/// `warmspot.py` `rewrite_can_enter_jits` inserts `can_enter_jit` at the
+/// portal start; this hook is that enter and ticks `increment_threshold`.
 #[inline]
 pub fn tuple_hash_merge_point(
     w_type: PyObjectRef,
@@ -606,6 +609,39 @@ pub fn tuple_hash_merge_point(
     TUPLE_HASH_MERGE_HOOK
         .get()
         .and_then(|f| f(w_type, w_tuple, len, acc, i))
+}
+
+/// `warmspot.py rewrite_jit_merge_point`: the original `_descr_hash_jitdriver`
+/// graph ends in `return portal_runner(*args)`. The merge hook above is the
+/// in-portal `increment_threshold` door and cannot carry this runner: the two
+/// doors tick different counters (`increment_function_threshold` here).
+type TupleHashPortalRunnerFn = fn(
+    w_type: PyObjectRef,
+    w_tuple: PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Result<u64, crate::PyError>;
+majit_gc::oncelock_fn_static!(static TUPLE_HASH_PORTAL_RUNNER_HOOK: OnceLock<TupleHashPortalRunnerFn>);
+
+pub fn register_tuple_hash_portal_runner_hook(f: TupleHashPortalRunnerFn) {
+    let _ = TUPLE_HASH_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `hash_driver`. Falls back to
+/// [`crate::tuple_hash_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn tuple_hash_portal_runner(
+    w_type: PyObjectRef,
+    w_tuple: PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Result<u64, crate::PyError> {
+    match TUPLE_HASH_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(w_type, w_tuple, len, acc, i),
+        None => unsafe { crate::tuple_hash_portal(w_type, w_tuple, len, acc, i) },
+    }
 }
 
 /// Clear the note and disarm it: a jd2 walk has finished, or its

@@ -9933,9 +9933,9 @@ fn get_printable_location_tuple_hash(w_type: pyre_object::PyObjectRef) -> String
 /// `hash_driver.jit_merge_point` runtime hook.
 ///
 /// `warmspot.py` `rewrite_can_enter_jits` inserts `can_enter_jit` at a
-/// portal that has none in source. The interpreter reaches
-/// `_descr_hash_jitdriver` / `tuple_hash_portal` at the marker; this hook
-/// is that enter.
+/// portal that has none in source. The in-portal loop header ticks
+/// `increment_threshold`. Function entry is
+/// [`tuple_hash_function_entry_jit`] (`ll_portal_runner`).
 ///
 /// The interpreted path is `warmstate.py maybe_compile_and_run`: cell
 /// lookup + counter tick. `execute_args` (the live reds) are built only
@@ -10017,6 +10017,85 @@ fn tuple_hash_merge_point_jit(
         }
         majit_metainterp::warmstate::HotResult::NotHot
         | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
+    }
+}
+
+/// `warmspot.py ll_portal_runner`: `maybe_compile_and_run` with
+/// `increment_function_threshold`. A compiled token is
+/// `EnterJitAssembler`; a counter fire is `bound_reached`. `NotHot`
+/// returns `None` so the runner continues at `portal_ptr`.
+fn tuple_hash_function_entry_jit(
+    w_type: pyre_object::PyObjectRef,
+    w_tuple: pyre_object::PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
+) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    if w_type.is_null() || w_tuple.is_null() {
+        return None;
+    }
+    // Green is `w_type` (`tupleobject.py` `greens=['w_type']`).
+    // `warmstate.py maybe_compile_and_run` with
+    // `increment_function_threshold` (`ll_portal_runner`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[w_type, w_tuple]);
+    // `GreenRefPin` walks `majit_gc::shadow_stack`, which is not `gc_roots`
+    // (pyre extra-area). Pin the live wrapper from the gc_roots slot.
+    let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
+    let (driver, _) = driver_pair();
+    let jd_no = pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX;
+    let hash = pyre_jit_trace::tuplehash_state::tuple_hash_green_hash(
+        pin.get() as pyre_object::PyObjectRef
+    );
+    let greenargs = [pin.get() as i64];
+    let (cell_key, _) = driver
+        .meta_interp()
+        .resolved_entry_procedure_token_on_driver(
+            jd_no,
+            hash,
+            Some((
+                &greenargs,
+                pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
+            )),
+        );
+    // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
+    // `_find_shadow`). Re-read every w_type/w_tuple from the pins.
+    let greenargs = [pin.get() as i64];
+    let hash = pyre_jit_trace::tuplehash_state::tuple_hash_green_hash(
+        pin.get() as pyre_object::PyObjectRef
+    );
+    // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
+    let step = driver.meta_interp_mut().function_entry_step_on_driver(
+        jd_no,
+        cell_key,
+        hash,
+        pin.save(),
+        0,
+        Some((
+            greenargs.as_slice(),
+            pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
+        )),
+        &[],
+    );
+    let w_type = pin.get() as pyre_object::PyObjectRef;
+    let w_tuple = roots.get(base + 1);
+    match step {
+        FunctionEntryStep::RunCompiled(token) => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
+            }
+            let raw = pyre_jit_trace::tuplehash_state::tuple_hash_raw_reds(
+                len as i64, acc as i64, i as i64, w_tuple,
+            );
+            enter_compiled_tuple_hash(cell_key, token, &raw, w_tuple, len, acc, i)
+        }
+        FunctionEntryStep::Proceed => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
+            }
+            drive_tuple_hash_trace(cell_key, w_type, w_tuple, len, acc, i)
+        }
+        FunctionEntryStep::NotHot => None,
     }
 }
 
@@ -11423,6 +11502,7 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
     pyre_interpreter::call::register_tuple_hash_merge_hook(tuple_hash_merge_point_jit);
+    pyre_interpreter::call::register_tuple_hash_portal_runner_hook(tuple_hash_ll_portal_runner);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -12066,6 +12146,7 @@ fn eval_with_jit_inner(
         pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
         pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
         pyre_interpreter::call::register_tuple_hash_merge_hook(tuple_hash_merge_point_jit);
+        pyre_interpreter::call::register_tuple_hash_portal_runner_hook(tuple_hash_ll_portal_runner);
         // The backend-agnostic registrations here — notably the JIT exception
         // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
         // residual-call raises through — are required on every backend; the
@@ -12725,12 +12806,16 @@ fn generatorentry_portal_runner(
 ///
 /// Argument order is the portal calldescr: greens then reds in
 /// `JitDriverStaticData.vars` (`w_type`, `len`, `acc`, `i`, `obj`).
+///
+/// `maybe_compile_and_run(state.increment_function_threshold, *args)`
+/// then `portal_ptr(*args)`. The in-portal merge point ticks
+/// `increment_threshold`.
 fn tuple_hash_ll_portal_runner(
     mut w_type: pyre_object::PyObjectRef,
-    len: i64,
-    acc: i64,
-    i: i64,
     mut w_tuple: pyre_object::PyObjectRef,
+    len: usize,
+    acc: u64,
+    i: usize,
 ) -> Result<u64, pyre_interpreter::error::PyError> {
     // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
     let roots = pyre_object::gc_roots::push_roots();
@@ -12738,11 +12823,8 @@ fn tuple_hash_ll_portal_runner(
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
     w_type = roots.get(base);
     w_tuple = roots.get(base + 1);
-    let len = len as usize;
-    let acc = acc as u64;
-    let i = i as usize;
 
-    if let Some(result) = tuple_hash_merge_point_jit(w_type, w_tuple, len, acc, i) {
+    if let Some(result) = tuple_hash_function_entry_jit(w_type, w_tuple, len, acc, i) {
         return result;
     }
     w_type = roots.get(base);
@@ -12762,7 +12844,7 @@ pub extern "C" fn ll_tuple_hash_portal_runner_shim(
     i: i64,
     w_tuple: pyre_object::PyObjectRef,
 ) -> i64 {
-    match tuple_hash_ll_portal_runner(w_type, len, acc, i, w_tuple) {
+    match tuple_hash_ll_portal_runner(w_type, w_tuple, len as usize, acc as u64, i as usize) {
         Ok(result) => {
             // `compile_tmp_callback` is `CALL` + `GUARD_NO_EXCEPTION` +
             // `FINISH`. The caller's loop records the same
