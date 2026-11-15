@@ -8021,6 +8021,59 @@ fn with_hint_walk_context<R>(
     result
 }
 
+fn with_authoritative_hint_walk<R>(
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    run: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>) -> R,
+) -> R {
+    let regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: concrete_r.to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = run(&mut wc);
+    regs_r.copy_from_slice(&wc.registers_r.to_vec());
+    concrete_r.copy_from_slice(&wc.frame_state.borrow().concrete_registers_r);
+    result
+}
+
 /// A portal helper's success-path guards resume at the CALL (`entry_py_pc`).
 /// `pyjitpl.py capture_resumedata` numbers only the `MIFrame`s already on
 /// `metainterp.framestack`; a residual call does not push one. Numbering a
@@ -10785,6 +10838,348 @@ fn walker_pin_terminator_allow_unboxing_records_quasiimmut_from_mutate_descr() {
             .expect("Terminator resolves an instance")
         },
         "Terminator.allow_unboxing?",
+    );
+}
+
+/// Simulated nursery move of a mapdict node during
+/// [`super::walker_guard_mapdict_instance_shape`].
+#[derive(Clone, Copy)]
+struct MapdictShapeForwardPlan {
+    old_map: usize,
+    new_map: usize,
+    old_term: usize,
+    new_term: usize,
+    /// Extra GC pointer interned before the guard (attribute node, store-add
+    /// `new_map`). Zero means unused.
+    extra_old: usize,
+    extra_new: usize,
+    instance: usize,
+}
+
+thread_local! {
+    static MAPDICT_SHAPE_FORWARD: std::cell::Cell<Option<MapdictShapeForwardPlan>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn run_mapdict_shape_forward() {
+    MAPDICT_SHAPE_FORWARD.with(|slot| {
+        let Some(plan) = slot.get() else {
+            return;
+        };
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_ir::const_ptr_table::walk(&mut |gcref| {
+            if gcref.0 == plan.old_map {
+                gcref.0 = plan.new_map;
+            } else if gcref.0 == plan.old_term {
+                gcref.0 = plan.new_term;
+            } else if plan.extra_old != 0 && gcref.0 == plan.extra_old {
+                gcref.0 = plan.extra_new;
+            }
+        });
+        if plan.instance != 0 {
+            unsafe {
+                (*(plan.instance as *mut pyre_object::W_ObjectObject)).map =
+                    plan.new_map as pyre_interpreter::objspace::std::mapdict::MapRef;
+            }
+        }
+    });
+}
+
+struct ClearMapdictShapeForward;
+
+impl Drop for ClearMapdictShapeForward {
+    fn drop(&mut self) {
+        MAPDICT_SHAPE_FORWARD.with(|slot| slot.set(None));
+    }
+}
+
+unsafe fn copy_terminator(
+    old: pyre_interpreter::objspace::std::mapdict::MapRef,
+) -> pyre_interpreter::objspace::std::mapdict::MapRef {
+    let copy = std::ptr::read(old as *const pyre_object::mapdict::Terminator);
+    let raw = pyre_object::lltype::malloc_typed_managed(copy);
+    assert!(!raw.is_null(), "forwarded terminator must allocate");
+    unsafe {
+        (*raw).base.terminator = raw as pyre_interpreter::objspace::std::mapdict::MapRef;
+    }
+    raw as pyre_interpreter::objspace::std::mapdict::MapRef
+}
+
+unsafe fn copy_unboxed_attr(
+    old: pyre_interpreter::objspace::std::mapdict::MapRef,
+    new_term: pyre_interpreter::objspace::std::mapdict::MapRef,
+) -> pyre_interpreter::objspace::std::mapdict::MapRef {
+    let mut copy = std::ptr::read(old as *const pyre_object::mapdict::UnboxedPlainAttribute);
+    copy.base.base.terminator = new_term;
+    let raw = pyre_object::lltype::malloc_typed_managed(copy);
+    assert!(!raw.is_null(), "forwarded map node must allocate");
+    raw as pyre_interpreter::objspace::std::mapdict::MapRef
+}
+
+unsafe fn copy_plain_attr(
+    old: pyre_interpreter::objspace::std::mapdict::MapRef,
+    new_term: pyre_interpreter::objspace::std::mapdict::MapRef,
+) -> pyre_interpreter::objspace::std::mapdict::MapRef {
+    let mut copy = std::ptr::read(old as *const pyre_object::mapdict::PlainAttribute);
+    copy.base.terminator = new_term;
+    let raw = pyre_object::lltype::malloc_typed_managed(copy);
+    assert!(!raw.is_null(), "forwarded map node must allocate");
+    raw as pyre_interpreter::objspace::std::mapdict::MapRef
+}
+
+#[test]
+fn load_attr_unboxed_pins_forwarded_terminator_after_shape_guard_collects() {
+    // `try_walker_specialize_load_attr` used the pre-guard `map` for
+    // `map_terminator` after `walker_guard_mapdict_instance_shape`. That
+    // helper's version-tag pin / map promote append to `Trace._ops` and can
+    // minor-collect (`mapdict.py` `_get_mapdict_map`; `history.py` `ConstPtr`).
+    // This harness cannot force that collect (`TraceCtx::for_test_types`
+    // records into a host buffer), so the helper's test hook rewrites the
+    // minted ConstPtr slots the way a minor would, and the fold must pin the
+    // forwarded terminator.
+    use crate::state::ConcreteValue;
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    pyre_interpreter::typedef::init_typeobjects();
+    let w_type = pyre_object::typeobject::w_type_new(
+        "MapdictShapeFwd",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+    }
+    let term = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        w_type,
+        pyre_object::mapdict::TerminatorKind::Dict,
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_terminator(w_type, term);
+    }
+    let inst = pyre_object::w_instance_new(w_type);
+    let value = pyre_object::w_int_new(1);
+    assert!(
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_node_setdictvalue(
+                inst,
+                rustpython_wtf8::Wtf8::new("obj"),
+                value,
+            )
+        },
+        "store an unboxable int onto the instance map"
+    );
+    let resolved = unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(inst, "obj")
+    };
+    let Some((_, _, old_map, _, _, _, _)) = resolved else {
+        panic!("unboxed LOAD_ATTR fast path must accept this instance");
+    };
+    let old_term = unsafe { pyre_object::mapdict::map_terminator(old_map) };
+    let new_term = unsafe { copy_terminator(old_term as _) };
+    let new_map = unsafe { copy_unboxed_attr(old_map, new_term) };
+    let _restore = [
+        RestoreConstPtr::intern(old_map as usize),
+        RestoreConstPtr::intern(old_term as usize),
+        RestoreConstPtr::intern(new_map as usize),
+        RestoreConstPtr::intern(new_term as usize),
+        RestoreConstPtr::intern(inst as usize),
+        RestoreConstPtr::intern(w_type as usize),
+    ];
+    MAPDICT_SHAPE_FORWARD.with(|slot| {
+        slot.set(Some(MapdictShapeForwardPlan {
+            old_map: old_map as usize,
+            new_map: new_map as usize,
+            old_term: old_term as usize,
+            new_term: new_term as usize,
+            extra_old: 0,
+            extra_new: 0,
+            instance: inst as usize,
+        }));
+    });
+    super::mapdict_shape_collect_hook::set(Some(run_mapdict_shape_forward));
+    let _clear_hook = super::mapdict_shape_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearMapdictShapeForward;
+
+    let mut tc = fresh_trace_ctx();
+    // A ConstPtr receiver takes `UnboxedPlainAttribute._pure_direct_read`,
+    // which pins `ever_mutated?` on the attribute node. That node is the
+    // unboxed map; intern it before the guard so the hook can rewrite it.
+    let obj = tc.const_ref(inst as i64);
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        super::specialize::try_walker_specialize_load_attr(wc, 0, obj, "obj", 0, 'r').expect("fold")
+    });
+    assert_eq!(
+        folded,
+        Some(()),
+        "unboxed LOAD_ATTR fold must accept this instance"
+    );
+
+    let recorder = tc.into_recorder();
+    let expected_term = crate::descr::terminator_allow_unboxing_descr();
+    let term_ptrs: Vec<u64> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .filter_map(|op| {
+            let descr = op.getdescr()?;
+            let qd = descr.as_quasi_immut_descr()?;
+            std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_term).then_some(qd.struct_ptr())
+        })
+        .collect();
+    assert_eq!(
+        term_ptrs,
+        [new_term as u64],
+        "pinned terminator must be the forwarded node, not the pre-guard address {old_term:?}"
+    );
+    let expected_attr = crate::descr::plain_attribute_ever_mutated_descr();
+    let attr_ptrs: Vec<u64> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .filter_map(|op| {
+            let descr = op.getdescr()?;
+            let qd = descr.as_quasi_immut_descr()?;
+            std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_attr).then_some(qd.struct_ptr())
+        })
+        .collect();
+    assert_eq!(
+        attr_ptrs,
+        [new_map as u64],
+        "pinned attribute node must be the forwarded map, not the pre-guard address {old_map:?}"
+    );
+}
+
+#[test]
+fn store_attr_add_bakes_forwarded_new_map_after_shape_guard_collects() {
+    // `try_walker_specialize_store_attr` interned `add.new_map()` after
+    // `walker_guard_mapdict_instance_shape`. That guard can minor-collect;
+    // the add fold must bake the forwarded transition target
+    // (`history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::{compile_exec, w_code_new};
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    pyre_interpreter::typedef::init_typeobjects();
+    let w_type = pyre_object::typeobject::w_type_new(
+        "MapdictShapeFwdAdd",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+    }
+    let term = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        w_type,
+        pyre_object::mapdict::TerminatorKind::Dict,
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_terminator(w_type, term);
+    }
+    let inst = pyre_object::w_instance_new(w_type);
+    let value = pyre_object::w_str_new("v");
+    let add = unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_add_fast_path(inst, "obj", value)
+    };
+    let Some(add) = add else {
+        panic!("store_attr_add fast path must accept a fresh instance");
+    };
+    let old_map = add.map();
+    let old_new_map = add.new_map();
+    drop(add);
+    let old_term = unsafe { pyre_object::mapdict::map_terminator(old_map) };
+    let new_term = unsafe { copy_terminator(old_term as _) };
+    let new_map = unsafe { copy_terminator(old_map) };
+    let forwarded_new_map = unsafe { copy_plain_attr(old_new_map, new_term) };
+    let py_code = compile_exec("x.obj = y").expect("test code should compile");
+    let name_idx = py_code
+        .names
+        .iter()
+        .position(|n| n.as_str() == "obj")
+        .expect("STORE_ATTR name is in co_names");
+    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ());
+    let _restore = [
+        RestoreConstPtr::intern(old_map as usize),
+        RestoreConstPtr::intern(old_term as usize),
+        RestoreConstPtr::intern(new_map as usize),
+        RestoreConstPtr::intern(new_term as usize),
+        RestoreConstPtr::intern(old_new_map as usize),
+        RestoreConstPtr::intern(forwarded_new_map as usize),
+        RestoreConstPtr::intern(inst as usize),
+        RestoreConstPtr::intern(w_type as usize),
+        RestoreConstPtr::intern(value as usize),
+    ];
+    MAPDICT_SHAPE_FORWARD.with(|slot| {
+        slot.set(Some(MapdictShapeForwardPlan {
+            old_map: old_map as usize,
+            new_map: new_map as usize,
+            old_term: old_term as usize,
+            new_term: new_term as usize,
+            extra_old: old_new_map as usize,
+            extra_new: forwarded_new_map as usize,
+            // Leave the instance map on the pre-guard terminator. The hook
+            // cannot rewrite `StoreAttrAdd`'s shadow-stack slots, and
+            // `store_attr_add_commit` `debug_assert`s they still match.
+            instance: 0,
+        }));
+    });
+    super::mapdict_shape_collect_hook::set(Some(run_mapdict_shape_forward));
+    let _clear_hook = super::mapdict_shape_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearMapdictShapeForward;
+
+    // `store_attr_add` commit reads the installed storage through
+    // `field_sanity_load`, which needs a wired cpu. `AllocTestCpu` uses
+    // the default `bh_getfield_gc_r` (a real pointer-width load).
+    let dummy_block: Box<[usize; 8]> = Box::new([0; 8]);
+    let cpu = AllocTestCpu {
+        block: dummy_block.as_ref().as_ptr() as i64,
+    };
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let obj = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(obj);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef(inst as usize)));
+    let value_op = tc.const_ref(value as i64);
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        super::specialize::try_walker_specialize_store_attr(
+            wc,
+            0,
+            obj,
+            value_op,
+            w_code as usize,
+            name_idx,
+        )
+        .expect("fold")
+    });
+    assert_eq!(
+        folded,
+        Some(()),
+        "store_attr_add fold must accept this instance"
+    );
+
+    let recorder = tc.into_recorder();
+    let baked: Vec<usize> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+        .filter_map(|op| {
+            let stored = op.getarglist().get(1)?.to_opref();
+            match stored {
+                OpRef::ConstPtr(idx) => Some(majit_ir::const_ptr_table::resolve(idx).0),
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(
+        baked.contains(&(forwarded_new_map as usize)),
+        "baked new_map must be the forwarded node {forwarded_new_map:?}, got {baked:?}"
+    );
+    assert!(
+        !baked.contains(&(old_new_map as usize)),
+        "baked new_map must not be the pre-guard address {old_new_map:?}"
     );
 }
 

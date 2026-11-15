@@ -15256,6 +15256,25 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
     let get_const = ctx.trace_ctx.const_ref(w_get as i64);
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    // The descriptor itself is mutable through `__class__` assignment.  Its
+    // live map/class guard is therefore load-bearing even though the receiver
+    // type lookup produced a constant pointer to it.
+    let shape = walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        w_descr,
+        descr_type,
+        descr_map,
+    )?;
+    let w_descr = shape.concrete_obj;
+    let _descr_type = shape.w_type;
+    let _descr_map = shape.map;
+    let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
+    let w_type = walker_concrete_ref_object(ctx, type_const).unwrap_or(w_type);
+    let w_get = walker_concrete_ref_object(ctx, get_const).unwrap_or(w_get);
     let arg_concretes = vec![
         ConcreteValue::Ref(w_get),
         ConcreteValue::Null,
@@ -15263,12 +15282,6 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_obj),
         ConcreteValue::Ref(w_type),
     ];
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-
-    // The descriptor itself is mutable through `__class__` assignment.  Its
-    // live map/class guard is therefore load-bearing even though the receiver
-    // type lookup produced a constant pointer to it.
-    walker_guard_mapdict_instance_shape(ctx, op.pc, descr_const, w_descr, descr_type, descr_map)?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -15413,18 +15426,17 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
     let descr_const = ctx.trace_ctx.const_ref(pins.w_descr as i64);
     let owner_const = ctx.trace_ctx.const_ref(pins.w_owner as i64);
     let none = pyre_object::w_none();
-    let (instance_op, instance_concrete) = if pins.class_access {
+    let (instance_op, mut instance_concrete) = if pins.class_access {
         (ctx.trace_ctx.const_ref(none as i64), none)
     } else {
         (obj, concrete_obj)
     };
-    let arg_concretes = vec![
-        ConcreteValue::Ref(pins.w_get),
-        ConcreteValue::Null,
-        ConcreteValue::Ref(pins.w_descr),
-        ConcreteValue::Ref(instance_concrete),
-        ConcreteValue::Ref(pins.w_owner),
-    ];
+    let mut w_descr = pins.w_descr;
+    let descr_type_const = ctx.trace_ctx.const_ref(pins.descr_type as i64);
+    let descr_map_const = ctx.trace_ctx.const_ref(pins.descr_map as i64);
+    let attr_cell_const =
+        (!pins.attr_cell.is_null()).then(|| ctx.trace_ctx.const_ref(pins.attr_cell as i64));
+    let mut w_owner = pins.w_owner;
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     if pins.class_access {
         // The receiver is the class object. `GuardClass` on a type only
@@ -15432,46 +15444,70 @@ pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[obj, owner_const])?;
         ctx.trace_ctx.heap_cache_mut().replace_box(obj, owner_const);
         walker_pin_type_version_tag(ctx, op.pc, owner_const)?;
+        w_owner = walker_concrete_ref_object(ctx, owner_const).unwrap_or(w_owner);
     } else {
-        walker_guard_mapdict_instance_shape(
+        let shape = walker_guard_mapdict_instance_shape(
             ctx,
             op.pc,
             obj,
             concrete_obj,
-            pins.w_owner,
+            w_owner,
             pins.receiver_map,
         )?;
+        instance_concrete = shape.concrete_obj;
+        w_owner = shape.w_type;
     }
+    w_descr = walker_concrete_ref_object(ctx, descr_const).unwrap_or(w_descr);
     // A class-body assignment is an `ObjectMutableCell`. The version pin above
     // does not move on `write_cell`; getfield the payload before baking it.
-    if !pins.attr_cell.is_null() {
-        super::walker_promote_object_mutable_cell(ctx, op.pc, pins.attr_cell, pins.w_descr)?;
+    if let Some(attr_cell_const) = attr_cell_const {
+        let attr_cell = walker_concrete_ref_object(ctx, attr_cell_const).unwrap_or(pins.attr_cell);
+        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_descr)?;
     }
     // `__class__` assignment on the descriptor retargets its map. The class
     // lookup handed back a constant pointer, which does not pin that.
-    walker_guard_mapdict_instance_shape(
+    // The pins above append to `Trace._ops` and can minor-collect; re-read
+    // every descriptor word off the ConstPtr minted before them
+    // (`history.py` `ConstPtr`).
+    w_descr = walker_concrete_ref_object(ctx, descr_const).unwrap_or(w_descr);
+    let descr_type = walker_concrete_ref_object(ctx, descr_type_const).unwrap_or(pins.descr_type);
+    let descr_map = walker_concrete_ref_object(ctx, descr_map_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(pins.descr_map);
+    let shape = walker_guard_mapdict_instance_shape(
         ctx,
         op.pc,
         descr_const,
-        pins.w_descr,
-        pins.descr_type,
-        pins.descr_map,
+        w_descr,
+        descr_type,
+        descr_map,
     )?;
+    w_descr = shape.concrete_obj;
+    let _descr_type = shape.w_type;
+    let _descr_map = shape.map;
+    let w_get = walker_concrete_ref_object(ctx, get_const).unwrap_or(pins.w_get);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_get),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(w_descr),
+        ConcreteValue::Ref(instance_concrete),
+        ConcreteValue::Ref(w_owner),
+    ];
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
         'r',
         dst,
-        pins.w_get,
+        w_get,
         get_const,
-        pins.w_get,
+        w_get,
         arg_concretes,
         vec![descr_const, instance_op, owner_const],
         vec![
-            ConcreteValue::Ref(pins.w_descr),
+            ConcreteValue::Ref(w_descr),
             ConcreteValue::Ref(instance_concrete),
-            ConcreteValue::Ref(pins.w_owner),
+            ConcreteValue::Ref(w_owner),
         ],
         None,
         w_code,
@@ -15712,7 +15748,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
         return Ok(None);
     }
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+    let Some(mut concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
@@ -15739,7 +15775,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     } else {
         None
     };
-    let (w_type, _, receiver_map, w_getattribute, attr_cell) =
+    let (mut w_type, _, receiver_map, w_getattribute, attr_cell) =
         if let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = instance_hook {
             (w_type, version_tag, Some(map), w_getattribute, attr_cell)
         } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = type_hook {
@@ -15770,17 +15806,30 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         }
 
         let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+        // Mint before the first collecting pin (`history.py` `ConstPtr`).
+        let func_const = ctx.trace_ctx.const_ref(w_func as i64);
+        let getattribute_const = ctx.trace_ctx.const_ref(w_getattribute as i64);
+        let attr_cell_const =
+            (!attr_cell.is_null()).then(|| ctx.trace_ctx.const_ref(attr_cell as i64));
+        let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
         if let Some(map) = receiver_map {
-            walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
+            let shape =
+                walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
+            concrete_obj = shape.concrete_obj;
+            w_type = shape.w_type;
         } else {
             // The receiver is the class. `GuardClass` only names the shared
             // type layout, so pin the metaclass through `w_class`.
             walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type)?;
+            w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
         }
+        let w_getattribute =
+            walker_concrete_ref_object(ctx, getattribute_const).unwrap_or(w_getattribute);
         // The version-tag pin above does not cover an in-place cell write.  Same
         // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
         // on `ExceptionInlineReceiverGuard::attr_cell`.
-        if !attr_cell.is_null() {
+        if let Some(attr_cell_const) = attr_cell_const {
+            let attr_cell = walker_concrete_ref_object(ctx, attr_cell_const).unwrap_or(attr_cell);
             super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattribute)?;
         }
         if let Some(field) = wrapper_field {
@@ -15793,9 +15842,11 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
         // GuardClass / version-tag pin / `box_str_constant` can minor-collect.
         let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
+        let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
+        let w_func = walker_concrete_ref_object(ctx, func_const).unwrap_or(w_func);
         let leading_arg = match leading {
             HookLeading::Receiver => Some((obj, concrete_obj)),
-            HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+            HookLeading::Class => Some((w_type_const, w_type)),
             HookLeading::None => None,
         };
         let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
@@ -15809,7 +15860,6 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         arg_concretes.push(ConcreteValue::Ref(name_obj));
         callee_args.push(name_const);
         callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
-        let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
         let inlined = try_walker_inline_resolved_user_call_inner(
             ctx,
             op,
@@ -15817,7 +15867,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             'r',
             dst,
             w_func,
-            hook_const,
+            func_const,
             w_func,
             arg_concretes,
             callee_args,
@@ -15873,7 +15923,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     let getattr_pin = residual_call::owner_root_if_gc(w_getattribute as usize);
     let attr_cell_pin = residual_call::owner_root_if_gc(attr_cell as usize);
     if let Some(map) = receiver_map {
-        walker_guard_mapdict_instance_shape(
+        let shape = walker_guard_mapdict_instance_shape(
             ctx,
             op.pc,
             obj,
@@ -15881,6 +15931,8 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             pinned_obj(&type_pin, w_type),
             map,
         )?;
+        concrete_obj = shape.concrete_obj;
+        let _w_type = shape.w_type;
     } else {
         walker_guard_exception_attr_slot(
             ctx,
@@ -15889,6 +15941,8 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             pinned_obj(&obj_pin, concrete_obj),
             pinned_obj(&type_pin, w_type),
         )?;
+        concrete_obj = pinned_obj(&obj_pin, concrete_obj);
+        let _w_type = pinned_obj(&type_pin, w_type);
     }
     let attr_cell = pinned_obj(&attr_cell_pin, attr_cell);
     let w_getattribute = pinned_obj(&getattr_pin, w_getattribute);
@@ -15935,13 +15989,13 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
         return Ok(None);
     }
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+    let Some(mut concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, _, map, w_getattr, attr_cell)) = (unsafe {
+    let Some((mut w_type, _, map, w_getattr, attr_cell)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -16002,12 +16056,21 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     // own past this point, so keep a rewind point the way the property twins
     // do.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Mint before the first collecting pin (`history.py` `ConstPtr`).
+    let func_const = ctx.trace_ctx.const_ref(w_func as i64);
+    let getattr_descr_const = ctx.trace_ctx.const_ref(w_getattr as i64);
+    let attr_cell_const = (!attr_cell.is_null()).then(|| ctx.trace_ctx.const_ref(attr_cell as i64));
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     // Both pins the oracle asked for, plus the layout guard its map read needs.
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
+    let shape = walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
+    concrete_obj = shape.concrete_obj;
+    w_type = shape.w_type;
+    let w_getattr = walker_concrete_ref_object(ctx, getattr_descr_const).unwrap_or(w_getattr);
     // The version-tag pin above does not cover an in-place cell write.  Same
     // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
     // on `ExceptionInlineReceiverGuard::attr_cell`.
-    if !attr_cell.is_null() {
+    if let Some(attr_cell_const) = attr_cell_const {
+        let attr_cell = walker_concrete_ref_object(ctx, attr_cell_const).unwrap_or(attr_cell);
         super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
     }
     // The pins above make the DESCRIPTOR a constant; they say nothing about the
@@ -16026,12 +16089,15 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
             as pyre_object::PyObjectRef;
     let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
+    let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
+    let w_func = walker_concrete_ref_object(ctx, func_const).unwrap_or(w_func);
     let leading_arg = match leading {
         // The live receiver box: baking it would collapse instances that share
         // this shape but not this identity.
         HookLeading::Receiver => Some((obj, concrete_obj)),
         // The class the `w_class` guard above already pinned.
-        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+        HookLeading::Class => Some((w_type_const, w_type)),
         HookLeading::None => None,
     };
     // `[__getattr__, <self-placeholder>, <bound arg>?, name]`: the method-form
@@ -16047,7 +16113,6 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     arg_concretes.push(ConcreteValue::Ref(name_obj));
     callee_args.push(name_const);
     callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
-    let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
     let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
@@ -16055,7 +16120,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         'r',
         dst,
         w_func,
-        getattr_const,
+        func_const,
         w_func,
         arg_concretes,
         callee_args,
@@ -16146,9 +16211,40 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
     let get_const = ctx.trace_ctx.const_ref(w_get as i64);
     let descr_const = ctx.trace_ctx.const_ref(w_getattr as i64);
     let owner_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let descr_type_const = ctx.trace_ctx.const_ref(descr_type as i64);
+    let descr_map_const = ctx.trace_ctx.const_ref(descr_map as i64);
+    let attr_cell_const = (!attr_cell.is_null()).then(|| ctx.trace_ctx.const_ref(attr_cell as i64));
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let shape = walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
+    let concrete_obj = shape.concrete_obj;
+    let w_type = shape.w_type;
+    let w_getattr = walker_concrete_ref_object(ctx, descr_const).unwrap_or(w_getattr);
+    if let Some(attr_cell_const) = attr_cell_const {
+        let attr_cell = walker_concrete_ref_object(ctx, attr_cell_const).unwrap_or(attr_cell);
+        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
+    }
+    let w_getattr = walker_concrete_ref_object(ctx, descr_const).unwrap_or(w_getattr);
+    let descr_type = walker_concrete_ref_object(ctx, descr_type_const).unwrap_or(descr_type);
+    let descr_map = walker_concrete_ref_object(ctx, descr_map_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(descr_map);
+    let shape = walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        w_getattr,
+        descr_type,
+        descr_map,
+    )?;
+    let w_getattr = shape.concrete_obj;
+    let _descr_type = shape.w_type;
+    let _descr_map = shape.map;
+    let w_get = walker_concrete_ref_object(ctx, get_const).unwrap_or(w_get);
+    let w_type = walker_concrete_ref_object(ctx, owner_const).unwrap_or(w_type);
     let name_obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name))
         as pyre_object::PyObjectRef;
     let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
     let attr_ctx = AttributeErrorInlineContext {
         obj,
         obj_concrete: concrete_obj,
@@ -16162,12 +16258,6 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_obj),
         ConcreteValue::Ref(w_type),
     ];
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, map)?;
-    if !attr_cell.is_null() {
-        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
-    }
-    walker_guard_mapdict_instance_shape(ctx, op.pc, descr_const, w_getattr, descr_type, descr_map)?;
 
     let mut handed: Option<(OpRef, ConcreteValue)> = None;
     let got = try_walker_inline_resolved_user_call_inner(

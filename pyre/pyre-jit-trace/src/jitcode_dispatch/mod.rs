@@ -12988,6 +12988,55 @@ fn walker_guard_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// Post-guard mapdict instance identity.
+///
+/// `mapdict.py MapdictStorageMixin._get_mapdict_map` `jit.promote(self.map)`
+/// yields a `history.py` `ConstPtr`; the collector updates that box. Callers
+/// use these forwarded words rather than the raw copies taken before the
+/// guard. A heap `W_TypeObject` is nursery-born (`typeobject.py`), so `w_type`
+/// moves too.
+#[derive(Clone, Copy)]
+struct MapdictInstanceShape {
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    map: pyre_interpreter::objspace::std::mapdict::MapRef,
+}
+
+/// Test-only writeback at the helper's collecting calls.
+///
+/// Production collection is `record_guard` / `record_op` → `record_bytes` →
+/// `opencoder.py` `Trace._double_ops` → `alloc_fast_nursery_collecting_typed_rooted`.
+/// `TraceCtx::for_test_types` records into a host buffer, so tests install a
+/// hook that rewrites the minted `ConstPtr` slots the way that minor would.
+#[cfg(test)]
+pub(crate) mod mapdict_shape_collect_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    pub fn set(hook: Option<fn()>) {
+        HOOK.with(|slot| slot.set(hook));
+    }
+
+    pub fn run() {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub struct ClearOnDrop;
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set(None);
+        }
+    }
+}
+
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
 /// live version tag, and the exact map shape used by the mapdict attribute
 /// folds.  The layout guard proves that a later receiver still has the wide
@@ -13003,7 +13052,7 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
-) -> Result<(), DispatchError> {
+) -> Result<MapdictInstanceShape, DispatchError> {
     // `load/store_attr_*_fast_path` accepted this receiver only after
     // `has_mapdict_storage` proved its prefix. Preserve the concrete layout
     // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
@@ -13018,10 +13067,12 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
     // Mint ConstPtr boxes for live GC refs so later uses read the forwarded
-    // word (`history.py` `ConstPtr.value`). Guard/snapshot emission writes a
-    // Rust `TraceRecordBuffer` and does not collect; the contended
-    // `instance_lock` (`before_external_block`) on the store-add commit path
-    // is the safepoint that can minor-collect nursery maps.
+    // word (`history.py` `ConstPtr.value`). GuardClass, the version-tag pin
+    // (`walker_pin_type_version_tag` → `record_quasiimmut_field` → `record_op`),
+    // and the map promote each append to `opencoder.py Trace._ops`;
+    // `Trace._double_ops` grows that buffer with
+    // `alloc_fast_nursery_collecting_typed_rooted` and can minor-collect
+    // nursery maps (`mapdict.py` `_get_mapdict_map`).
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     let map_const = ctx.trace_ctx.const_ref(map as i64);
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -13072,7 +13123,21 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
         .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
         .unwrap_or(map);
     specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map)?;
-    Ok(())
+    // Promote records getfield + GuardValue and can collect again. Reload
+    // every live GC ref off its ConstPtr / receiver box after that
+    // (`history.py` `ConstPtr.value`; `mapdict.py` `_get_mapdict_map`).
+    #[cfg(test)]
+    mapdict_shape_collect_hook::run();
+    let concrete_obj = specialize::live_box_ref(ctx, obj, concrete_obj);
+    let map = walker_concrete_ref_object(ctx, map_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(map);
+    let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
+    Ok(MapdictInstanceShape {
+        concrete_obj,
+        w_type,
+        map,
+    })
 }
 
 /// True when the payload `ob_type` already determines the Python-visible
