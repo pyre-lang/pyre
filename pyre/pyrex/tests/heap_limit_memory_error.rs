@@ -164,21 +164,122 @@ fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -
     cmd.output().expect("spawn pyre-dynasm")
 }
 
-/// A failure message carrying the child's status, its stdout, and the tail of
-/// its stderr — an assertion here fails in a subprocess, so the parent has to
-/// quote it or the reason is lost.
+/// A failure message carrying the child's status, its stdout, the tail of
+/// its stderr, and host facts that distinguish GitHub ubuntu runners —
+/// an assertion here fails in a subprocess, so the parent has to quote it
+/// or the reason is lost.
 fn report(what: &str, out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr_lines: Vec<&str> = stderr.lines().collect();
+    let tail_start = stderr_lines.len().saturating_sub(20);
     format!(
-        "{what} exited {:?}\n--- stdout ---\n{}\n--- stderr tail ---\n{}",
+        "{what} exited {:?}\n--- stdout ---\n{}\n--- stderr tail ---\n{}\n--- host ---\n{}",
         out.status,
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        stderr_lines[tail_start..].join("\n"),
+        host_facts(),
     )
+}
+
+/// Best-effort Linux host facts for the `--- host ---` section. Other OSes
+/// contribute nothing; a missing file becomes `<path>: unavailable`.
+fn host_facts() -> String {
+    #[cfg(not(target_os = "linux"))]
+    {
+        String::new()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fn read_trimmed(path: &str) -> Result<String, ()> {
+            std::fs::read_to_string(path)
+                .map(|s| s.trim_end().to_string())
+                .map_err(|_| ())
+        }
+        fn file_or_unavailable(path: &str) -> String {
+            match read_trimmed(path) {
+                Ok(s) => format!("{path}: {s}"),
+                Err(()) => format!("{path}: unavailable"),
+            }
+        }
+        fn first_line_with_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(prefix))
+        }
+
+        let mut lines = Vec::new();
+
+        match read_trimmed("/proc/cpuinfo") {
+            Ok(text) => {
+                if let Some(line) = first_line_with_prefix(&text, "model name") {
+                    lines.push(line.to_string());
+                }
+                if let Some(line) = first_line_with_prefix(&text, "cache size") {
+                    lines.push(line.to_string());
+                }
+            }
+            Err(()) => lines.push("/proc/cpuinfo: unavailable".to_string()),
+        }
+
+        const CPU0_CACHE: &str = "/sys/devices/system/cpu/cpu0/cache";
+        match std::fs::read_dir(CPU0_CACHE) {
+            Ok(entries) => {
+                let mut indexes: Vec<std::path::PathBuf> = entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("index"))
+                            && path.is_dir()
+                    })
+                    .collect();
+                indexes.sort();
+                for index in indexes {
+                    let field = |name: &str| match std::fs::read_to_string(index.join(name)) {
+                        Ok(s) => s.trim().to_string(),
+                        Err(_) => format!("{}: unavailable", index.join(name).display()),
+                    };
+                    lines.push(format!(
+                        "{}: level={} type={} size={}",
+                        index.display(),
+                        field("level"),
+                        field("type"),
+                        field("size"),
+                    ));
+                }
+            }
+            Err(_) => lines.push(format!("{CPU0_CACHE}: unavailable")),
+        }
+
+        match read_trimmed("/proc/meminfo") {
+            Ok(text) => {
+                if let Some(line) = first_line_with_prefix(&text, "MemTotal:") {
+                    lines.push(line.to_string());
+                }
+                if let Some(line) = first_line_with_prefix(&text, "MemAvailable:") {
+                    lines.push(line.to_string());
+                }
+            }
+            Err(()) => lines.push("/proc/meminfo: unavailable".to_string()),
+        }
+
+        lines.push(file_or_unavailable("/proc/sys/kernel/osrelease"));
+        lines.push(file_or_unavailable(
+            "/sys/kernel/mm/transparent_hugepage/enabled",
+        ));
+        lines.push(file_or_unavailable("/proc/sys/vm/overcommit_memory"));
+
+        let mut env_lines: Vec<String> = std::env::vars()
+            .filter(|(key, _)| {
+                key.starts_with("PYPY_GC_") || key.starts_with("PYRE_") || key.starts_with("MAJIT_")
+            })
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        env_lines.sort();
+        lines.extend(env_lines);
+
+        lines.join("\n")
+    }
 }
 
 /// Assert a `--heapsize` arm reached the middle rung: the loop did not finish,
