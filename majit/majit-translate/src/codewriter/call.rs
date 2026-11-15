@@ -2476,8 +2476,13 @@ pub struct GraphTransform {
 
 impl GraphTransform {
     fn apply(&self, graph: &mut FunctionGraph) {
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already `FUNC.RESULT = void`. A later
+        // registration token (a spec copy whose substituted output is
+        // coloured Ref) must not recolour it.
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         if let Some(root) = &self.return_class_root {
             graph.return_class_root = Some(root.clone());
@@ -2530,6 +2535,8 @@ pub(crate) enum DecoratorAttr {
     /// `rffi.py llexternal` `canraise=False` on the C function
     /// (`canraise.py analyze_external_call`).
     FuncptrCannotRaise,
+    /// `func._jit_look_inside_ = False` (`rlib/jit.py` `dont_look_inside`).
+    DontLookInside,
 }
 
 impl DecoratorAttr {
@@ -2569,6 +2576,7 @@ impl DecoratorAttr {
             "not_in_trace" => Self::Oopspec("jit.not_in_trace".to_string()),
             "gc_effects" => Self::GcEffects,
             "funcptr_canraise_false" => Self::FuncptrCannotRaise,
+            "dont_look_inside" => Self::DontLookInside,
             _ => return None,
         })
     }
@@ -2647,6 +2655,12 @@ impl FuncObjAttrs {
                 DecoratorAttr::FuncptrCannotRaise => {
                     func.canraise = false;
                     None
+                }
+                DecoratorAttr::DontLookInside => {
+                    if func.jit_look_inside.is_none() {
+                        func.jit_look_inside = Some(false);
+                    }
+                    Some("dont_look_inside")
                 }
             };
             if let Some(token) = token {
@@ -4758,6 +4772,9 @@ pub struct CallControl {
     /// `_exception_class_<Enum>` rows. `CodeWriter::dual_gate_registry`
     /// mints each hierarchy on the bookkeeper after the error carrier.
     pub exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
+    /// By-value field-0 parents (`DeclaredGcFacts::field0_parent_ids`).
+    /// A named struct in this set is an rclass instance root.
+    pub field0_parents: HashSet<majit_ir::descr::StructId>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
     /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
@@ -4863,6 +4880,10 @@ pub struct StructLayout {
     /// on the field-0 chain. `Raw` otherwise. Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
+    /// `#[repr(transparent)]` (`TypeDecl::is_repr_transparent`). The
+    /// wrapper's repr is the one non-ZST field's; it is never a
+    /// headerless raw ADT (`raw_struct_ptr_from_layout`).
+    pub repr_transparent: bool,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
@@ -5121,6 +5142,7 @@ impl StructLayout {
             size,
             align,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: layout_fields,
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -5471,6 +5493,7 @@ impl CallControl {
             immutable_fields_by_struct: HashMap::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
+            field0_parents: HashSet::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
@@ -6256,7 +6279,7 @@ impl CallControl {
                 // `canonical_array_type_id` joins those dump aliases.
                 let canonical = crate::front::typestr::canonical_array_type_id(atid);
                 let atid = canonical.as_ref();
-                let path_hash_u64 = majit_ir::descr::path_hash(atid);
+                let path_hash_u64 = majit_ir::descr::array_identity_hash(atid);
                 let nolength = len_offset.is_none();
                 let length_offset = len_offset.unwrap_or(0);
                 // `descr.py get_array_descr` cache-or-mint:
@@ -11979,6 +12002,18 @@ impl CallControl {
         self.stamp_graph_hint(&path, "elidable");
     }
 
+    /// `func._jit_look_inside_ = False` (`rlib/jit.py` `dont_look_inside`).
+    /// Harvested `_jit_look_inside_` markers used to skip `DecoratorAttr`,
+    /// so a policy-opaque helper with no `function_graphs` row never got
+    /// the attribute CollectAnalyzer reads off `funcobj`.
+    pub fn mark_dont_look_inside(&mut self, path: CallPath) {
+        let func = self.func_effects_mut(&path);
+        if func.jit_look_inside.is_none() {
+            func.jit_look_inside = Some(false);
+        }
+        self.stamp_graph_hint(&path, "dont_look_inside");
+    }
+
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py).
     /// Mark a target as loop-invariant.
     pub fn mark_loopinvariant(&mut self, path: CallPath) {
@@ -12300,6 +12335,7 @@ impl CallControl {
                 DecoratorAttr::CannotCollect => self.mark_cannot_collect(path),
                 DecoratorAttr::GcEffects => self.mark_external_gc_effects(path),
                 DecoratorAttr::FuncptrCannotRaise => self.mark_external_cannot_raise(path),
+                DecoratorAttr::DontLookInside => self.mark_dont_look_inside(path),
             }
         }
     }
@@ -18284,7 +18320,8 @@ mod tests {
         assert_eq!(cc.field_immutability(Some("b::Foo"), "x"), None);
     }
     use crate::model::{
-        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+        BlockId, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType,
+        exception_exitcase,
     };
 
     /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
@@ -18952,6 +18989,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: Vec::new(),
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -25214,6 +25252,7 @@ mod tests {
                 size: crate::layout::target_word_size(),
                 align: crate::layout::target_word_size(),
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -25298,6 +25337,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -25390,6 +25430,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -25424,6 +25465,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -26541,6 +26583,53 @@ mod tests {
         assert!(
             !cc.analyze_can_collect(&path, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "a graph with no allocation and no call must analyse as not collecting"
+        );
+    }
+
+    /// CollectAnalyzer of a fully analyzed empty body is false.
+    /// `_jit_look_inside_` is not a collecting effect (`collectanalyze.py`
+    /// `analyze_direct_call`; `test_call.py` `test_can_or_cannot_collect`).
+    #[test]
+    fn complete_non_collecting_dont_look_inside_graph_does_not_collect() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("leaf");
+        graph.push_hint("dont_look_inside");
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["leaf"]);
+        cc.register_function_graph(path, graph);
+        let target = CallTarget::function_path(["leaf"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            !descriptor.extra_info.can_collect,
+            "CollectAnalyzer of a fully analyzed empty body is false; \
+             _jit_look_inside_ is not a collecting effect"
+        );
+
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments(["pure"]), simple_graph("pure"));
+        let target = CallTarget::function_path([crate::model::FN_CONST_HEAD, "pure"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            !descriptor.extra_info.can_collect,
+            "fn-const residual of a proven non-collecting graph stays false"
         );
     }
 
@@ -32031,6 +32120,7 @@ mod tests {
                 size: 4,
                 align: 1,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: Some(host.clone()),
                 ll_struct: std::cell::RefCell::new(None),
@@ -32069,6 +32159,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 16,

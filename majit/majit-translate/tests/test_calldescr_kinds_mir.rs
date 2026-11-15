@@ -284,6 +284,18 @@ fn scalar_pointer_params_match_int_callers() {
     );
 }
 
+#[test]
+fn eval_loop_jit_lowers() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-jit.ullbc"
+    ))
+    .expect("pyre-jit.ullbc is already extracted");
+    lower_function(&llbc, "eval_loop_jit").unwrap_or_else(|err| {
+        panic!("eval_loop_jit must lower: {err}");
+    });
+}
+
 fn call_segments(target: &CallTarget) -> Option<&[String]> {
     match target {
         CallTarget::FunctionPath { segments, .. } => Some(segments.as_slice()),
