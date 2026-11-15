@@ -2766,7 +2766,8 @@ pub fn alloc_with_del(
     vtable_offset: Option<usize>,
     w_class_offset: Option<usize>,
 ) -> i64 {
-    let obj = majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(tid, size));
+    use majit_gc::GcAllocator;
+    let obj = majit_gc::GcHandle.alloc_nursery_typed(tid, size);
     if obj.is_null() {
         majit_gc::raise_memory_error();
         return 0;
@@ -3800,9 +3801,7 @@ pub trait Backend: Send {
         let tid = majit_gc::lowlevel_str_type_id();
         assert_ne!(tid, 0, "bh_newstr: low-level STR type is unpublished");
         use majit_gc::GcAllocator;
-        let result = majit_gc::gc_sync::gc_op(|gc| {
-            gc.alloc_varsize_typed(tid, 2 * word + 1, 1, length as usize)
-        });
+        let result = majit_gc::GcHandle.alloc_varsize_typed(tid, 2 * word + 1, 1, length as usize);
         assert!(!result.is_null(), "bh_newstr: allocation failed");
         unsafe {
             ((result.0 + word) as *mut usize).write_unaligned(length as usize);
@@ -3940,9 +3939,7 @@ pub trait Backend: Send {
             "bh_newunicode: low-level UNICODE type is unpublished"
         );
         use majit_gc::GcAllocator;
-        let result = majit_gc::gc_sync::gc_op(|gc| {
-            gc.alloc_varsize_typed(tid, 2 * word, 4, length as usize)
-        });
+        let result = majit_gc::GcHandle.alloc_varsize_typed(tid, 2 * word, 4, length as usize);
         assert!(!result.is_null(), "bh_newunicode: allocation failed");
         unsafe {
             ((result.0 + word) as *mut usize).write_unaligned(length as usize);

@@ -1279,6 +1279,18 @@ impl LiveRootFrame {
             root_count,
         }
     }
+
+    /// Write the current (possibly forwarded) shadow-stack copies back
+    /// into the original slots without popping. After a GIL-off
+    /// `safepoint_poll` the copies have been forwarded and the slots
+    /// have not; a later [`crate::gc_sync::gc_op_stw_slots`] must pin
+    /// the live addresses, not from-space stubs.
+    #[inline]
+    pub fn reload_slots(&self) {
+        for i in 0..self.root_count {
+            unsafe { *self.roots.add(i) = self.slot.get(self.depth + i) };
+        }
+    }
 }
 
 impl Drop for LiveRootFrame {

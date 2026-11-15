@@ -1324,6 +1324,19 @@ fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> 
     None
 }
 
+/// Same box-then-singleton order as [`with_cranelift_gc`]. The singleton
+/// arm is [`majit_gc::GcHandle`] so each method picks its own `gc_op` /
+/// `gc_op_alloc` / `gc_op_collecting` / `gc_op_stw_root` path.
+fn with_cranelift_gc_collecting<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+    if gc_box::present() {
+        return gc_box::with_mut(f);
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(f(&mut majit_gc::GcHandle));
+    }
+    None
+}
+
 fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     with_cranelift_gc(f).expect("missing active GC runtime")
 }
@@ -1477,7 +1490,13 @@ unsafe fn alloc_nursery_typed_with_placement_via_active_runtime(
 /// it, from a residual call whose jitframe gcmap roots the trace's live set, so
 /// the embedded minor cycle reclaims dead bigints instead of spilling to old-gen.
 fn alloc_nursery_collecting_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
-    with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
+    if gc_box::present() {
+        return with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0));
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::GcHandle.alloc_nursery_typed(type_id, size);
+    }
+    GcRef(0)
 }
 
 /// Rooted companion used for a GC child held only in one native Rust slot.
@@ -1492,10 +1511,23 @@ unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    with_cranelift_gc(|gc| unsafe {
+    if let Some(r) = gc_box::with_mut(|gc| unsafe {
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
-    })
-    .unwrap_or(GcRef(0))
+    }) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        unsafe { *needs_write_barrier = true };
+        return GcRef(0);
+    }
+    unsafe {
+        majit_gc::standalone_alloc_nursery_collecting_typed_rooted(
+            type_id,
+            size,
+            root,
+            needs_write_barrier,
+        )
+    }
 }
 
 /// Rooted companion used when more than one native Rust slot holds a GC child.
@@ -1512,7 +1544,7 @@ unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
     root_count: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    with_cranelift_gc(|gc| unsafe {
+    if let Some(r) = gc_box::with_mut(|gc| unsafe {
         gc.alloc_fast_nursery_collecting_typed_roots(
             type_id,
             size,
@@ -1520,8 +1552,22 @@ unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
             root_count,
             needs_write_barrier,
         )
-    })
-    .unwrap_or(GcRef(0))
+    }) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        unsafe { *needs_write_barrier = true };
+        return GcRef(0);
+    }
+    unsafe {
+        majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    }
 }
 
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
@@ -1540,7 +1586,14 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 /// May itself run that minor (`threshold_reached` then
 /// `minor_collection_with_major_progress`).
 fn alloc_young_nonmoving_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
-    with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
+    if gc_box::present() {
+        return with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, size))
+            .unwrap_or(GcRef(0));
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::GcHandle.alloc_young_nonmoving_typed(type_id, size);
+    }
+    GcRef(0)
 }
 
 /// [`alloc_young_nonmoving_typed_via_active_runtime`] without the collection
@@ -1556,11 +1609,11 @@ fn alloc_young_nonmoving_typed_no_collect_via_active_runtime(type_id: u32, size:
 /// live PyObjectRef is rooted — Rust-stack PyObjectRef in nursery would
 /// dangle after the embedded minor cycle).
 fn collect_generation_via_active_runtime(generation: i64) -> i64 {
-    with_cranelift_gc(|gc| gc.collect_generation(generation)).unwrap_or(0)
+    with_cranelift_gc_collecting(|gc| gc.collect_generation(generation)).unwrap_or(0)
 }
 
 fn freeze_via_active_runtime() {
-    with_cranelift_gc(|gc| gc.freeze());
+    with_cranelift_gc_collecting(|gc| gc.freeze());
 }
 
 fn unfreeze_via_active_runtime() {
@@ -1572,7 +1625,7 @@ fn freeze_count_via_active_runtime() -> i64 {
 }
 
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
-    with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
+    with_cranelift_gc_collecting(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
         // `rgc.py collect_step`: SCANNING on both sides would never report completion.
         old_state: majit_gc::GcStepTransition::STATE_MARKING,
         new_state: majit_gc::GcStepTransition::STATE_SCANNING,
@@ -1581,7 +1634,7 @@ fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
 
 fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
+    with_cranelift_gc_collecting(|gc| gc.get_objects(generation, &mut visit));
 }
 
 /// Split the same way [`gc_write_barrier_via_active_runtime`] is: the TLS path
@@ -1594,7 +1647,7 @@ fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVis
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.get_referents(obj, &mut visit));
     } else if majit_gc::gc_sync::is_initialized() {
-        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, &mut visit));
+        majit_gc::GcHandle.get_referents(obj, &mut visit);
     }
 }
 
@@ -1642,7 +1695,7 @@ fn get_rpy_type_index_via_active_runtime(obj: GcRef) -> Option<usize> {
 
 fn get_rpy_roots_via_active_runtime(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
     let mut visit = visitor;
-    with_cranelift_gc(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
+    with_cranelift_gc_collecting(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
 }
 
 fn get_rpy_referents_via_active_runtime(
@@ -1653,7 +1706,7 @@ fn get_rpy_referents_via_active_runtime(
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
     } else if majit_gc::gc_sync::is_initialized() {
-        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_referents(obj, &mut visit))
+        majit_gc::GcHandle.get_rpy_referents(obj, &mut visit)
     } else {
         false
     }
@@ -1670,13 +1723,7 @@ fn is_app_level_object_via_active_runtime(obj: GcRef) -> bool {
 }
 
 fn dump_rpy_heap_via_active_runtime(fd: i32) -> Result<bool, i32> {
-    if gc_box::present() {
-        return with_cranelift_gc(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false));
-    }
-    if majit_gc::gc_sync::is_initialized() {
-        return majit_gc::gc_sync::gc_op(|gc| gc.dump_rpy_heap(fd));
-    }
-    Ok(false)
+    with_cranelift_gc_collecting(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false))
 }
 
 fn get_typeids_text_via_active_runtime() -> Option<Vec<u8>> {
@@ -1691,22 +1738,17 @@ fn add_memory_pressure_via_active_runtime(size: isize, object: GcRef) {
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.add_memory_pressure(size, object));
     } else if majit_gc::gc_sync::is_initialized() {
-        if object.is_null() {
-            majit_gc::gc_sync::gc_op(|gc| gc.add_memory_pressure(size, object));
-        } else {
-            majit_gc::gc_sync::gc_op_with_root(object, |gc, object| {
-                gc.add_memory_pressure(size, object)
-            });
-        }
+        majit_gc::GcHandle.add_memory_pressure(size, object);
     }
 }
 
 fn maybe_collect_for_external_malloc_via_active_runtime(totalsize: usize) -> bool {
-    with_cranelift_gc(|gc| gc.maybe_collect_for_external_malloc(totalsize)).unwrap_or(false)
+    with_cranelift_gc_collecting(|gc| gc.maybe_collect_for_external_malloc(totalsize))
+        .unwrap_or(false)
 }
 
 fn total_memory_pressure_via_active_runtime() -> isize {
-    with_cranelift_gc(|gc| gc.total_memory_pressure()).unwrap_or(0)
+    with_cranelift_gc_collecting(|gc| gc.total_memory_pressure()).unwrap_or(0)
 }
 
 /// Non-moving old-gen-only major trampoline. Nursery addresses stay put.
@@ -1715,14 +1757,14 @@ fn total_memory_pressure_via_active_runtime() -> isize {
 /// The depth ≤ 2 gate exists because opcode-handler Rust locals are not
 /// rooted; assembler frames are rooted by gcmap.
 fn collect_oldgen_nonmoving_via_active_runtime() {
-    with_cranelift_gc(|gc| gc.collect_oldgen_nonmoving());
+    with_cranelift_gc_collecting(|gc| gc.collect_oldgen_nonmoving());
 }
 
 /// Moving minor plus one bounded major step.
 /// `incminimark.py` `minor_collection_with_major_progress` with
 /// `force_enabled=False`.
 fn collect_nursery_via_active_runtime() {
-    with_cranelift_gc(|gc| gc.collect_nursery());
+    with_cranelift_gc_collecting(|gc| gc.collect_nursery());
 }
 
 fn register_finalizer_via_active_runtime(fq_index: usize, obj: GcRef) {
@@ -4227,7 +4269,7 @@ fn active_runtime_alloc_varsize_typed_and_set_len(
     length_ofs: usize,
     length: usize,
 ) -> u64 {
-    let result = with_cranelift_gc(|gc| {
+    let result = with_cranelift_gc_collecting(|gc| {
         let obj = gc.alloc_varsize_typed(type_id, base_size, item_size, length);
         if obj.is_null() {
             0
@@ -4361,7 +4403,8 @@ fn active_runtime_alloc_oldgen_typed(type_id: u32, payload_size: usize) -> u64 {
 /// same OOM contract, but the collecting `malloc_fixedsize` entry point rather
 /// than the direct old-generation one.
 fn active_runtime_alloc_fixedsize_typed(type_id: u32, payload_size: usize) -> u64 {
-    match with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, payload_size).0 as u64) {
+    match with_cranelift_gc_collecting(|gc| gc.alloc_nursery_typed(type_id, payload_size).0 as u64)
+    {
         None => raw_fixedsize_alloc_typed(type_id, payload_size),
         Some(v) => v,
     }
@@ -33992,7 +34035,7 @@ mod tests {
         );
         // Drop the deadframe so the object is unrooted for the minor.
         drop(backend.execute_token(&token, &[]));
-        with_cranelift_gc(|gc| gc.collect_nursery());
+        with_cranelift_gc_collecting(|gc| gc.collect_nursery());
         assert_eq!(
             NEW_BUMP_DESTRUCTOR_RUNS.load(Ordering::SeqCst),
             1,
