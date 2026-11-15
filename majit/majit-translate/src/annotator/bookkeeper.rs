@@ -559,6 +559,12 @@ pub struct Bookkeeper {
     /// already projected (dedups the pending drain and the bare-name
     /// arm's first-sight detection).
     pub(crate) projected_struct_rows: RefCell<std::collections::HashSet<String>>,
+    /// TODO: no upstream equivalent.  Roots whose struct-field graph
+    /// [`Self::getuniqueclassdef_for_struct_root`] walked and projected
+    /// under the current registry.  A later call for such a root finds
+    /// every reachable class interned and every row in
+    /// `projected_struct_rows`, so it skips both passes.
+    pub(crate) struct_roots_projected: RefCell<std::collections::BTreeSet<String>>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// `rclass.py getgcflavor` reads `_alloc_flavor_` off the classdesc;
     /// intern stamps that param onto matching hosts.
@@ -1965,6 +1971,7 @@ impl Bookkeeper {
             trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
+            struct_roots_projected: RefCell::new(std::collections::BTreeSet::new()),
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
             immutable_fields_structs: RefCell::new(HashMap::new()),
             exception_class_hierarchies: RefCell::new(Vec::new()),
@@ -1993,6 +2000,9 @@ impl Bookkeeper {
     /// the previous registry.
     pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.struct_fields.borrow_mut() = Some(registry.clone());
+        // A root walked under the previous registry (or under none) has
+        // to be walked again under this one.
+        self.struct_roots_projected.borrow_mut().clear();
         let old_keys: Vec<(String, HostObject)> = self
             .struct_root_classes()
             .iter()
@@ -4140,13 +4150,14 @@ impl Bookkeeper {
     /// field typed as another struct resolves to a fully populated inner
     /// `SomeInstance(classdef)`, not an attrs-empty inner stub.
     ///
-    /// Order-independent w.r.t. [`Self::set_struct_fields`]: the call
-    /// re-traverses and re-projects every time, so a root registered
-    /// before the field registry arrived has its (and its transitive
-    /// structs') attrs back-filled on a later call — RPython grows class
-    /// attrs as annotation proceeds.  Identity is stable across calls
-    /// (the host class is interned once), so the back-fill mutates the
-    /// already-published `ClassDef` rather than minting a fresh one.
+    /// Order-independent w.r.t. [`Self::set_struct_fields`]: a root walked
+    /// before the field registry arrived is walked again after it
+    /// (`set_struct_fields` clears `struct_roots_projected`), so its (and
+    /// its transitive structs') attrs are back-filled on that later call
+    /// — RPython grows class attrs as annotation proceeds.  Identity is
+    /// stable across calls (the host class is interned once), so the
+    /// back-fill mutates the already-published `ClassDef` rather than
+    /// minting a fresh one.
     pub fn getuniqueclassdef_for_struct_root(
         self: &Rc<Self>,
         root: &str,
@@ -4200,7 +4211,15 @@ impl Bookkeeper {
         // would overflow a recursive walk), so a linear scan over `graph`
         // needs no parallel hash index and lets every node move into
         // `graph` without a clone.
-        let mut worklist: Vec<String> = vec![root.to_string()];
+        // A root that already completed both passes under this registry
+        // starts with an empty worklist: every class it reaches is
+        // interned and its rows are in `projected_struct_rows`.
+        let already_projected = self.struct_roots_projected.borrow().contains(root);
+        let mut worklist: Vec<String> = if already_projected {
+            Vec::new()
+        } else {
+            vec![root.to_string()]
+        };
         let mut graph: Vec<String> = Vec::new();
         while let Some(n) = worklist.pop() {
             if graph.contains(&n) {
@@ -4297,6 +4316,11 @@ impl Bookkeeper {
             let next = self.pending_struct_row_projection.borrow_mut().pop();
             let Some(n) = next else { break };
             self.project_struct_rows(&n)?;
+        }
+        if !already_projected {
+            self.struct_roots_projected
+                .borrow_mut()
+                .insert(root.to_string());
         }
         let host = self.intern_class_by_qualname(root);
         self.getuniqueclassdef(&host)

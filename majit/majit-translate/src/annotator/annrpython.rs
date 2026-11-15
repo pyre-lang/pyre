@@ -417,8 +417,7 @@ struct BlockAnnotationSnapshot {
 
 /// Scope returned by [`RPythonAnnotator::enter_drain_blocks_scope`].
 /// Dropping it is `complete_helpers`' `finally: self.added_blocks = saved`
-/// (annrpython.py). An enclosing tracker also receives the blocks flowed
-/// inside the scope, as it would have without the scope.
+/// (annrpython.py).
 pub(crate) struct DrainBlocksScope<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<IndexMap<BlockKey, BlockRef>>,
@@ -426,11 +425,7 @@ pub(crate) struct DrainBlocksScope<'a> {
 
 impl Drop for DrainBlocksScope<'_> {
     fn drop(&mut self) {
-        let mut slot = self.ann.added_blocks.borrow_mut();
-        let drained = std::mem::replace(&mut *slot, self.saved.take());
-        if let (Some(outer), Some(drained)) = (slot.as_mut(), drained) {
-            outer.extend(drained);
-        }
+        *self.ann.added_blocks.borrow_mut() = self.saved.take();
     }
 }
 
@@ -1787,7 +1782,8 @@ impl RPythonAnnotator {
     /// prologue (annrpython.py), without the subject rollback that
     /// [`Self::enter_added_blocks_scope`] carries. While the returned scope
     /// lives, `processblock` records the blocks it flows, so
-    /// `call_sites_with_positions` walks those blocks only.
+    /// `raise_if_subject_blocked` and `call_sites_with_positions` see those
+    /// blocks only.
     pub(crate) fn enter_drain_blocks_scope(&self) -> DrainBlocksScope<'_> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
         DrainBlocksScope { ann: self, saved }

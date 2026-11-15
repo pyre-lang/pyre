@@ -6395,24 +6395,22 @@ fn drive_regular_subject(
 /// (`annrpython.py RPythonAnnotator.complete_pending_blocks`).
 fn drain_session_pending(call_registry: &CallRegistry) -> Result<(), TyperError> {
     let (annotator, _) = call_registry.ensure_session()?;
-    {
-        // `complete_helpers` (annrpython.py): track the blocks this
-        // completion flows, so `compute_at_fixpoint` considers their call
-        // sites only. Each driven subject already ran its own
-        // `compute_at_fixpoint` over the blocks it added, and
-        // `run_annotator_simplify_isolated` runs the whole-program one.
-        let _drain_blocks = annotator.enter_drain_blocks_scope();
-        annotator
-            .complete_pending_blocks()
-            .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
-        call_registry
-            .bookkeeper()
-            .compute_at_fixpoint()
-            .map_err(|err| TyperError::message(format!("compute_at_fixpoint failed: {err}")))?;
-    }
+    // `complete_helpers` (annrpython.py): track the blocks this completion
+    // flows, so the blocked check and `compute_at_fixpoint` consider those
+    // blocks only. Each driven subject already ran its own
+    // `compute_at_fixpoint` over the blocks it added, and
+    // `run_annotator_simplify_isolated` runs the whole-program one.
+    let _drain_blocks = annotator.enter_drain_blocks_scope();
+    annotator
+        .complete_pending_blocks()
+        .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
     annotator
         .raise_if_subject_blocked()
         .map_err(|err| TyperError::message(format!("complete_pending_blocks failed: {err}")))?;
+    call_registry
+        .bookkeeper()
+        .compute_at_fixpoint()
+        .map_err(|err| TyperError::message(format!("compute_at_fixpoint failed: {err}")))?;
     Ok(())
 }
 
