@@ -18541,8 +18541,15 @@ fn generic_payload_enum_instantiations_get_distinct_variant_structs() {
     assert_ne!(ref_sid, template);
 
     let cc = call_control_from_program(&program);
-    let unit_parent = size_parent(&cc, "__discriminant", "payload::E::V", unit_sid);
-    let ref_disc = size_parent(&cc, "__discriminant", "payload::E::V", ref_sid);
+    // `rclass.InstanceRepr._get_field` keys `__discriminant` on the BASE
+    // STRUCT, so `size_parent` of the tag is the enum layout. The variant
+    // instance list is `bh_size_spec_for` (`heaptracker.all_fielddescrs`).
+    let unit_parent =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "payload::E::V", Some(unit_sid))
+            .expect("unit variant size");
+    let ref_disc =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "payload::E::V", Some(ref_sid))
+            .expect("ref variant size");
     let ref_pos = size_parent(&cc, "__pos_0", "payload::E::V", ref_sid);
     assert_eq!(field_keys(&unit_parent), vec!["__discriminant".to_string()]);
     assert_eq!(
@@ -18672,8 +18679,18 @@ fn unshelled_generic_payload_enum_instance_layout_is_tag_plus_payload() {
     assert_ne!(unit_sid, i64_sid);
 
     let cc = call_control_from_program(&program);
-    let unit_parent = size_parent(&cc, "__discriminant", "ops::range::E::Included", unit_sid);
-    let i64_disc = size_parent(&cc, "__discriminant", "ops::range::E::Included", i64_sid);
+    let unit_parent = crate::codewriter::assembler::bh_size_spec_for(
+        &cc,
+        "ops::range::E::Included",
+        Some(unit_sid),
+    )
+    .expect("unit variant size");
+    let i64_disc = crate::codewriter::assembler::bh_size_spec_for(
+        &cc,
+        "ops::range::E::Included",
+        Some(i64_sid),
+    )
+    .expect("i64 variant size");
     let i64_pos = size_parent(&cc, "__pos_0", "ops::range::E::Included", i64_sid);
     assert_eq!(field_keys(&unit_parent), vec!["__discriminant".to_string()]);
     assert_eq!(
@@ -18937,7 +18954,8 @@ fn nongeneric_fat_pointer_payload_enum_instance_layout_is_tag_plus_payload() {
     let sid = super::concrete_adt_struct_id(template, Some(&adt), &llbc, &tomb);
     assert_eq!(sid, template, "empty args leave the template identity");
     let cc = call_control_from_program(&program);
-    let parent = size_parent(&cc, "__discriminant", "fmt::Arg::Bytes", sid);
+    let parent = crate::codewriter::assembler::bh_size_spec_for(&cc, "fmt::Arg::Bytes", Some(sid))
+        .expect("Bytes variant size");
     let keys = field_keys(&parent);
     assert!(
         keys.iter().any(|k| k == "__discriminant"),
@@ -19069,7 +19087,9 @@ fn residual_sibling_arg_occupying_payload_is_tag_plus_payload() {
     let sid = super::concrete_adt_struct_id(template, Some(&adt), &llbc, &tomb);
     assert_ne!(sid, template);
     let cc = call_control_from_program(&program);
-    let parent = size_parent(&cc, "__discriminant", "ops::Flow::Continue", sid);
+    let parent =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "ops::Flow::Continue", Some(sid))
+            .expect("Continue variant size");
     assert_eq!(
         field_keys(&parent),
         vec!["__discriminant".to_string(), "__pos_0".to_string()]
