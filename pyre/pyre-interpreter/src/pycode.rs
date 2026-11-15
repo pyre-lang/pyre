@@ -1353,6 +1353,69 @@ fn code_new_memory_error() -> crate::PyError {
     crate::runtime_ops::fetch_memory_error()
 }
 
+type CodeGlobalsCaches = parking_lot::Mutex<
+    Vec<Option<std::sync::Weak<parking_lot::Mutex<pyre_object::celldict::GlobalCache>>>>,
+>;
+type CodeMapdictCaches = Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>;
+
+/// Host boxes `w_code_new_owned` surrenders before the wrapper exists.
+///
+/// `pycode.py` `PyCode.__init__` / `_initialize` allocates only GC objects,
+/// so a raise leaks nothing. The caches are `Box::into_raw` tables, and an
+/// owning constructor has already `Box::into_raw`'d the `CodeObject` graph;
+/// `attach_code_unit_wrapper` runs only after the wrapper malloc. This Drop
+/// frees what no destructor will: the caches while the wrapper does not
+/// exist, and the owned graph until the unit is attached.
+struct CodeNewCleanup {
+    code_ptr: *const (),
+    owner: usize,
+    globals_caches: *mut CodeGlobalsCaches,
+    mapdict_caches: *mut CodeMapdictCaches,
+    attached: bool,
+    armed: bool,
+}
+
+impl CodeNewCleanup {
+    fn wrapper_published(&mut self) {
+        // `pycode_destructor` frees the caches stored on the wrapper.
+        self.globals_caches = std::ptr::null_mut();
+        self.mapdict_caches = std::ptr::null_mut();
+    }
+
+    fn unit_attached(&mut self) {
+        self.attached = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CodeNewCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if !self.globals_caches.is_null() {
+            drop(unsafe { Box::from_raw(self.globals_caches) });
+            self.globals_caches = std::ptr::null_mut();
+        }
+        if !self.mapdict_caches.is_null() {
+            drop(unsafe { Box::from_raw(self.mapdict_caches) });
+            self.mapdict_caches = std::ptr::null_mut();
+        }
+        if !self.attached {
+            reclaim_owned_code_box(self.owner, self.code_ptr);
+        }
+    }
+}
+
+fn reclaim_owned_code_box(owner: usize, code_ptr: *const ()) {
+    if owner != 0 && owner == code_ptr as usize && !code_ptr.is_null() {
+        drop(unsafe { Box::from_raw(code_ptr as *mut crate::CodeObject) });
+    }
+}
+
 /// Residual ABI for a refused `w_code_new_owned`: republish the fetched
 /// MemoryError and return null (`jit_publish_residual_error`).
 fn code_new_residual_null(error: crate::PyError) -> PyObjectRef {
@@ -1428,6 +1491,14 @@ fn w_code_new_owned(
             Vec::with_capacity(names_len);
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(v))
+    };
+    let mut cleanup = CodeNewCleanup {
+        code_ptr,
+        owner,
+        globals_caches,
+        mapdict_caches,
+        attached: false,
+        armed: true,
     };
     // `pycode.py self.co_consts_w = consts`. The table is a young
     // `FixedObjectArray`; allocate it only after the wrapper is rooted,
@@ -1530,6 +1601,7 @@ fn w_code_new_owned(
     if obj.is_null() {
         return Err(code_new_memory_error());
     }
+    cleanup.wrapper_published();
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
@@ -1564,6 +1636,7 @@ fn w_code_new_owned(
     // own wrapper against the same owner, and a wrapper that dies during the
     // loop must not find the count at zero.
     attach_code_unit_wrapper(owner, code_ptr);
+    cleanup.unit_attached();
     // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name)
     // for name in cellvars]`, laid out by localsplus slot. Minted after the
     // wrapper is pinned so the array is a young child of an old-gen PyCode
@@ -1678,6 +1751,7 @@ fn w_code_new_owned(
         (*owner).co_names_w =
             pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
     }
+    cleanup.disarm();
     Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
@@ -6041,6 +6115,64 @@ mod tests {
             0
         );
         assert_eq!(pycode.co_flags, bits);
+    }
+
+    #[test]
+    fn w_code_new_owned_releases_caches_when_wrapper_malloc_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        fn refuse_pycode(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+            if type_id == W_CODE_GC_TYPE_ID {
+                return std::ptr::null_mut();
+            }
+            // Filename intern and other managed births can run before the
+            // wrapper malloc. Fail only the PyCode request; every other
+            // type gets a headered host block so
+            // `try_gc_write_barrier_managed` can read `obj - GcHeader::SIZE`.
+            let header = majit_gc::header::GcHeader::SIZE;
+            let total = header.saturating_add(payload_size.max(1));
+            let layout =
+                std::alloc::Layout::from_size_align(total, majit_gc::header::GcHeader::ALIGN)
+                    .expect("PyCode refuse-hook host layout");
+            unsafe {
+                let raw = std::alloc::alloc_zeroed(layout);
+                if raw.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                *(raw as *mut majit_gc::header::GcHeader) =
+                    majit_gc::header::GcHeader::new(type_id);
+                raw.add(header) as pyre_object::gc_hook::GCREF
+            }
+        }
+        struct ClearRaise;
+        impl Drop for ClearRaise {
+            fn drop(&mut self) {
+                majit_gc::set_active_raise_memory_error(None);
+                majit_gc::set_active_exception_occurred(None);
+            }
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        let _clear_raise = ClearRaise;
+        let code = compile_exec("answer = 42\n").expect("compile failed");
+        pyre_object::gc_hook::register_gc_alloc_hook(refuse_pycode);
+        let err = box_code_object(code).expect_err("PyCode malloc must fail");
+        assert_eq!(err.kind, crate::PyErrorKind::MemoryError);
+        pyre_object::gc_hook::clear_gc_alloc_hook();
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
+        let w_code =
+            box_code_object(compile_exec("answer = 42\n").expect("compile failed")).unwrap();
+        assert!(!w_code.is_null());
     }
 
     #[test]

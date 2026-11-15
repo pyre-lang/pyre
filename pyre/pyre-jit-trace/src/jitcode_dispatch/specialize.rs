@@ -1884,6 +1884,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // CellFamily is a moving nursery object. Mint ConstPtr boxes before
+    // the self-cell read / GuardValue / GuardClass / family pin so later
+    // uses read the forwarded word (`history.py` `ConstPtr.value`).
+    // `record_guard` / `record_op` append to `opencoder.py` `Trace._ops`;
+    // `_double_ops` can minor-collect.
+    let family_const = ctx.trace_ctx.const_ref(family as i64);
+    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
+    let self_const = ctx.trace_ctx.const_ref(concrete_self as i64);
+    let callable_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
+    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
+    let receiver_type_const =
+        apparent.map(|answer| ctx.trace_ctx.const_ref(answer.receiver_type as i64));
+    let receiver_map_const =
+        apparent.map(|answer| ctx.trace_ctx.const_ref(answer.receiver_map as i64));
+
     // `_get_self_location`'s cellvar arm is the ordinary red-cell LOAD_DEREF
     // shape.  All of that helper's decline conditions were proved above (and
     // the inline-resume condition at entry), so once it emits no later
@@ -1900,15 +1915,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     };
 
     // Which callable `super` names is baked into the emitted body.
+    let concrete_callable =
+        walker_concrete_ref_object(ctx, callable_const).unwrap_or(concrete_callable);
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
+    let family = walker_concrete_ref_object(ctx, family_const)
+        .map(|p| p as *const pyre_object::nestedscope::CellFamily)
+        .unwrap_or(family);
     walker_pin_cell_family_ever_mutated(ctx, op.pc, family)?;
     let cls_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         class_cell_op,
         crate::descr::cell_contents_descr(),
     );
+    let concrete_cls = walker_concrete_ref_object(ctx, cls_const).unwrap_or(concrete_cls);
     if !matches!(
         ctx.trace_ctx.box_value(cls_op),
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
@@ -1918,7 +1939,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_cls as usize)),
         );
     }
+    let concrete_self = walker_concrete_ref_object(ctx, self_const).unwrap_or(concrete_self);
+    let objtype = walker_concrete_ref_object(ctx, objtype_const).unwrap_or(objtype);
     let proxy_op = if let Some(apparent) = apparent {
+        let apparent = ApparentSuperClass {
+            objtype,
+            receiver_type: receiver_type_const
+                .and_then(|c| walker_concrete_ref_object(ctx, c))
+                .unwrap_or(apparent.receiver_type),
+            receiver_map: receiver_map_const
+                .and_then(|c| {
+                    walker_concrete_ref_object(ctx, c)
+                        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+                })
+                .unwrap_or(apparent.receiver_map),
+        };
         walker_emit_apparent_super_proxy(
             ctx,
             op.pc,

@@ -11289,6 +11289,139 @@ fn load_deref_red_pins_forwarded_family_after_guard_class_collects() {
 }
 
 #[test]
+fn bare_super_virtual_pins_forwarded_family_after_guard_value_collects() {
+    // `try_walker_specialize_bare_super_virtual` interned `family` after
+    // GuardValue / GuardClass. CellFamily is a moving nursery object;
+    // those guards append to `Trace._ops` and can minor-collect
+    // (`history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::{ConstantData, compile_exec};
+
+    fn find_code_named(
+        code: &pyre_interpreter::CodeObject,
+        name: &str,
+    ) -> Option<pyre_interpreter::CodeObject> {
+        if code.obj_name.as_str() == name {
+            return Some(code.clone());
+        }
+        for constant in code.constants.iter() {
+            if let ConstantData::Code { code } = constant
+                && let Some(found) = find_code_named(code, name)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    pyre_interpreter::typedef::init_typeobjects();
+    let module = compile_exec("class C:\n    def m(self):\n        super()\n").expect("compile");
+    let method = find_code_named(&module, "m").expect("method m");
+    let layout = pyre_interpreter::builtins::bare_super_frame_layout(&method).expect("layout");
+    let class_slot = layout.class_slot.expect("__class__ freevar");
+    assert!(
+        !layout.self_is_cell,
+        "method `self` is a local, not a cellvar"
+    );
+    let method = Box::new(method);
+    let code_ptr = method.as_ref() as *const pyre_interpreter::CodeObject;
+    let super_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::descriptor::SUPER_TYPE);
+    let w_type = pyre_object::typeobject::w_type_new(
+        "BareSuperFamilyFwd",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+    let term = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        w_type,
+        pyre_object::mapdict::TerminatorKind::Dict,
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_terminator(w_type, term);
+    }
+    let inst = pyre_object::w_instance_new(w_type);
+    let old_family = pyre_object::nestedscope::new_cell_family("__class__".to_string());
+    let new_family = pyre_object::nestedscope::new_cell_family("__class__".to_string());
+    let cell = pyre_object::w_cell_new(w_type, old_family);
+    let _restore = [
+        RestoreConstPtr::intern(old_family as usize),
+        RestoreConstPtr::intern(new_family as usize),
+        RestoreConstPtr::intern(cell as usize),
+        RestoreConstPtr::intern(inst as usize),
+        RestoreConstPtr::intern(w_type as usize),
+        RestoreConstPtr::intern(super_type as usize),
+    ];
+    PTR_FORWARD.with(|slot| slot.set(Some((old_family as usize, new_family as usize))));
+    super::later_collect_hook::set_after_fold_guard(Some(run_ptr_forward));
+    let _clear_hook = super::later_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearPtrForward;
+
+    let mut tc = fresh_trace_ctx();
+    let self_op = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.set_opref_concrete(
+        self_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(inst as usize)),
+    );
+    let cell_op = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.set_opref_concrete(
+        cell_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+    );
+    let callable_op = tc.const_ref(super_type as i64);
+    let null_op = tc.const_null();
+    let mut shadow = CalleeLocalsShadow {
+        fold_frame_reg: u16::MAX,
+        frame_box: self_op,
+        code_ptr,
+        ..Default::default()
+    };
+    shadow.set_opref(0, self_op);
+    shadow.set_opref(class_slot as i64, cell_op);
+    let jitcode = [0u8, 0, 2, 0, 1];
+    let op = DecodedOp {
+        key: "residual_call_ir_r/iIRd>r",
+        opname: "residual_call_ir_r",
+        argcodes: "iIRd>r",
+        pc: 0,
+        next_pc: jitcode.len(),
+    };
+    let r_args = [callable_op, null_op];
+    let mut regs_r = [callable_op, null_op, OpRef::NONE];
+    let mut concrete_r = [
+        ConcreteValue::Ref(super_type),
+        ConcreteValue::Ref(pyre_object::PY_NULL),
+        ConcreteValue::Null,
+    ];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        wc.frame_state.borrow_mut().callee_shadow = Some(shadow);
+        try_walker_specialize_bare_super_virtual(wc, &jitcode, &op, &r_args, 2).expect("fold")
+    });
+    assert_eq!(
+        folded,
+        Some(()),
+        "bare super() fold must accept this class method"
+    );
+
+    let recorder = tc.into_recorder();
+    let expected = crate::descr::cell_family_ever_mutated_descr();
+    let family_ptrs: Vec<u64> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .filter_map(|op| {
+            let descr = op.getdescr()?;
+            let qd = descr.as_quasi_immut_descr()?;
+            std::sync::Arc::ptr_eq(qd.fielddescr(), &expected).then_some(qd.struct_ptr())
+        })
+        .collect();
+    assert_eq!(
+        family_ptrs,
+        [new_family as u64],
+        "pinned family must be the forwarded object, not the pre-guard address {old_family:?}"
+    );
+}
+
+#[test]
 fn load_deref_constant_interns_forwarded_contents_after_family_pin_collects() {
     // `try_walker_specialize_load_deref` interned `contents` after
     // `walker_pin_cell_family_ever_mutated`. That pin records
