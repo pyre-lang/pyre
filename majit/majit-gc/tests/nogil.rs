@@ -4,7 +4,7 @@
 use majit_gc::collector::{GcConfig, MiniMarkGC};
 use majit_gc::nursery::NURSERY_CHUNK_SIZE;
 use majit_gc::shadow_stack::{self, MutatorExtraWalkFn};
-use majit_gc::{GcAllocator, TypeInfo, gc_sync, gc_write_barrier_from_array, rgil};
+use majit_gc::{GcAllocator, GcHandle, TypeInfo, gc_sync, gc_write_barrier_from_array, rgil};
 use majit_ir::GcRef;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -431,6 +431,64 @@ fn concurrent_full_collections_all_run() {
     );
 }
 
+/// The STW drain parks registered mutators only. An unregistered thread's
+/// `gc_op` takes `gc_lock` alone, so the owner holds that lock for as long
+/// as it borrows `&mut MiniMarkGC`.
+fn stw_owner_excludes_unregistered_gc_op() {
+    register_worker();
+    struct Die;
+    impl Drop for Die {
+        fn drop(&mut self) {
+            gc_sync::gc_thread_die();
+        }
+    }
+    let _die = Die;
+    let entered = Arc::new(AtomicBool::new(false));
+    let about_to_enter = Arc::new(std::sync::Barrier::new(2));
+    let unreg = {
+        let entered = entered.clone();
+        let about_to_enter = about_to_enter.clone();
+        thread::spawn(move || {
+            about_to_enter.wait();
+            gc_sync::gc_op(|_gc| {
+                entered.store(true, Ordering::SeqCst);
+            });
+        })
+    };
+    gc_sync::gc_op_stw(&mut [], |_gc, _| {
+        about_to_enter.wait();
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "unregistered gc_op entered while the STW owner held the collector"
+        );
+    });
+    unreg.join().unwrap();
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "unregistered gc_op must run once the STW owner releases the collector"
+    );
+}
+
+/// A GIL-off young nonmoving birth whose size would trip `threshold_reached`
+/// takes the collecting path (`minor_collection_with_major_progress`) rather
+/// than allocating and only arming a deferred major.
+fn nonmoving_alloc_collects_at_threshold(type_id: u32) {
+    let minor_before = gc_sync::gc_query(|gc| gc.collection_counts().0);
+    gc_sync::gc_op(|gc| gc.set_next_major_collection_threshold(0.0));
+    let mut handle = GcHandle;
+    let obj = handle.alloc_young_nonmoving_typed(type_id, 16);
+    assert!(
+        !obj.is_null(),
+        "young nonmoving alloc at threshold returned null"
+    );
+    let minor_after = gc_sync::gc_query(|gc| gc.collection_counts().0);
+    assert!(
+        minor_after > minor_before,
+        "threshold_reached must collect before the nonmoving birth: before={minor_before} after={minor_after}"
+    );
+}
+
 fn with_watchdog(seconds: u64, f: impl FnOnce()) {
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = {
@@ -472,6 +530,20 @@ fn gil_disabled_non_singleton_bumps_own_nursery() {
     let _serial = lock_nogil();
     let _ = install_gc();
     non_singleton_minimark_bumps_its_own_nursery();
+}
+
+#[test]
+fn gil_disabled_stw_owner_excludes_unregistered_gc_op() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    with_watchdog(15, stw_owner_excludes_unregistered_gc_op);
+}
+
+#[test]
+fn gil_disabled_nonmoving_alloc_collects_at_threshold() {
+    let _serial = lock_nogil();
+    let (simple, _) = install_gc();
+    with_watchdog(15, || nonmoving_alloc_collects_at_threshold(simple));
 }
 
 #[test]

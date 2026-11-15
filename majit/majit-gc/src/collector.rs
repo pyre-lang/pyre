@@ -2903,6 +2903,22 @@ impl MiniMarkGC {
         self.finish_bumped_nursery_object::<false>(ptr, type_id)
     }
 
+    /// GIL-off first attempt for `alloc_young_nonmoving_typed`: the young
+    /// birth only when `incminimark.py external_malloc` would not run
+    /// `minor_collection_with_major_progress` first. Null when the threshold
+    /// is reached or the birth is refused; the caller then takes the
+    /// collecting path under `gc_op_stw`.
+    pub fn try_alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
+            return GcRef(0);
+        };
+        if self.threshold_reached(total_size) {
+            return GcRef(0);
+        }
+        self.try_alloc_young_nonmoving_clear(type_id, total_size)
+            .unwrap_or(GcRef(0))
+    }
+
     /// GIL-off first attempt for `alloc_varsize_typed`: bump/refill only.
     /// Null means the caller should collect under `gc_op_stw`.
     pub fn try_alloc_varsize_typed_bump(
@@ -6585,6 +6601,12 @@ impl MiniMarkGC {
     /// i.e. it is time to make incremental major-collection progress.
     fn threshold_reached(&self, extra: usize) -> bool {
         (self.next_major_collection_threshold - self.get_total_memory_used() as f64) < extra as f64
+    }
+
+    /// Test hook: pin `next_major_collection_threshold` so a later
+    /// nonmoving allocation observes `threshold_reached`.
+    pub fn set_next_major_collection_threshold(&mut self, threshold: f64) {
+        self.next_major_collection_threshold = threshold;
     }
 
     /// incminimark.py `set_major_threshold_from`. Set the next-major

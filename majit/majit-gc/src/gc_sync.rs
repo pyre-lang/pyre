@@ -766,18 +766,9 @@ fn gc_op_nogil<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
         );
         return f(unsafe { singleton_mut() });
     }
-    if mutators_quiesced() {
-        GC_THREAD.with(|t| t.in_gc_op.set(true));
-        struct StwReentry;
-        impl Drop for StwReentry {
-            fn drop(&mut self) {
-                GC_THREAD.with(|t| t.in_gc_op.set(false));
-            }
-        }
-        let _g = StwReentry;
-        return f(unsafe { singleton_mut() });
-    }
-    // Leaf lock; paired with `GcOpNogilGuard::drop`.
+    // Leaf lock; paired with `GcOpNogilGuard::drop`. The STW owner takes it
+    // too: an unregistered thread is not in the RUNNING census, so the drain
+    // does not stop it, and only `gc_lock` keeps its `gc_op` out.
     GC_SYNC.gc_lock.lock();
     GC_THREAD.with(|t| {
         t.holds_gc_lock.set(true);
@@ -989,7 +980,7 @@ fn gc_op_stw_nogil<R>(
     f: impl FnOnce(&mut MiniMarkGC, &[crate::GcRef]) -> R,
 ) -> R {
     assert!(
-        !GC_THREAD.with(|t| t.holds_gc_lock.get()),
+        !GC_THREAD.with(|t| t.holds_gc_lock.get()) || mutators_quiesced(),
         "gc_op_stw must not run while gc_lock is held; acquire stop-the-world before &mut MiniMarkGC"
     );
     assert!(
@@ -1016,6 +1007,7 @@ fn gc_op_stw_nogil<R>(
         let _g = StwOpGuard {
             clear_in_gc_op: !already,
         };
+        let _lock = StwGcLock::take();
         return f(unsafe { singleton_mut() }, roots);
     }
 
@@ -1040,7 +1032,42 @@ fn gc_op_stw_nogil<R>(
     let _g = StwOpGuard {
         clear_in_gc_op: true,
     };
+    let _lock = StwGcLock::take();
     f(unsafe { singleton_mut() }, roots)
+}
+
+/// `gc_lock` held by the STW owner for the length of its `&mut MiniMarkGC`.
+///
+/// The drain parks registered mutators only. An unregistered thread runs
+/// [`gc_op_nogil`] under `gc_lock` alone, so the owner takes that lock after
+/// the drain, keeping the collector exclusive the way the GIL holder is in
+/// `rgil.py acquire`. No waiter holds `gc_lock` (see [`quiesce_mutators`]),
+/// so taking it after the drain cannot deadlock. Already held when this
+/// owner nests inside its own STW operation.
+struct StwGcLock(bool);
+
+impl StwGcLock {
+    fn take() -> Self {
+        if GC_THREAD.with(|t| t.holds_gc_lock.get()) {
+            return StwGcLock(false);
+        }
+        GC_SYNC.gc_lock.lock();
+        GC_THREAD.with(|t| t.holds_gc_lock.set(true));
+        StwGcLock(true)
+    }
+}
+
+impl Drop for StwGcLock {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let held = GC_THREAD.with(|t| t.holds_gc_lock.replace(false));
+        if held {
+            // SAFETY: `StwGcLock::take` took the lock on this thread.
+            unsafe { GC_SYNC.gc_lock.unlock() };
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────

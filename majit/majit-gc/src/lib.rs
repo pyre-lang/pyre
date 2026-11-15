@@ -2063,7 +2063,7 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op_alloc(
-            |gc| gc.alloc_young_nonmoving_typed_no_collect(type_id, size),
+            |gc| gc.try_alloc_young_nonmoving_typed(type_id, size),
             |gc| gc.alloc_young_nonmoving_typed(type_id, size),
         )
     }
