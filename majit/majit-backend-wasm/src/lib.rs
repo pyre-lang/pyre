@@ -2400,19 +2400,6 @@ fn publish_ca_initial_locs(
     ensure_ca_cell(token);
 }
 
-/// Force-tail words carried on `WasmFailDescr` so `force_arg_word` reconstructs
-/// `FrameGeometry::force_slot_ofs` from the compact live fail-arg index.
-fn force_tail_fields(frame: codegen::FrameGeometry) -> (u32, u32, u32) {
-    if !frame.has_tail() {
-        return (0, 0, 0);
-    }
-    (
-        frame.force_tail_base() as u32,
-        frame.prefix_force_slots as u32,
-        frame.value_tail_index() as u32,
-    )
-}
-
 fn call_assembler_token_from_descr(
     descr: &majit_ir::DescrRef,
 ) -> Option<&std::sync::Arc<JitCellToken>> {
@@ -4481,10 +4468,7 @@ impl WasmBackend {
                     fail_arg_types: g.fail_arg_types.clone(),
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
-                    force_args_offset: inputs.frame.force_slot_base as u32,
-                    force_tail_base: force_tail_fields(inputs.frame).0,
-                    force_prefix_slots: force_tail_fields(inputs.frame).1,
-                    value_tail_index: force_tail_fields(inputs.frame).2,
+                    force_locs: inputs.frame.force_locs_for(&g.fail_locs),
                     force_gcmap_ptr: g.exit_gcmap_ptr,
                     bridge_cell: g.bridge_cell,
                     fail_arg_advanced: previous
@@ -5119,36 +5103,18 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     ))
 }
 
-fn compact_live_fail_index(fail_descr: &WasmFailDescr, index: usize) -> usize {
-    if fail_descr.fail_locs.is_empty() {
-        return index;
-    }
-    fail_descr
-        .fail_locs
-        .iter()
-        .take(index)
-        .filter(|slot| slot.is_some())
-        .count()
-}
-
+/// `llmodel.py` `AbstractLLCPU._decode_pos` returns
+/// `descr.rd_locs[index] * WORD`. Force words are stored at
+/// `FrameGeometry::force_slot_ofs(compact_rank)` by `emit_force_arm`; those
+/// byte offsets are parked on the descr as `force_locs` when it is built.
 fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
-    if fail_descr.frame_slot(index).is_none() {
+    let Some(&ofs) = fail_descr.force_locs.get(index) else {
+        return 0;
+    };
+    if ofs == codegen::FORCE_LOC_HOLE {
         return 0;
     }
-    // `emit_force_arm` writes compact live fail args at `force_slot_ofs(i)`.
-    // The reader uses that same live rank: prefix words at
-    // `force_args_offset + i * 8`, tail words at
-    // `force_tail_base + 3 * (i - prefix_force_slots) * 8`.
-    let compact = compact_live_fail_index(fail_descr, index);
-    let offset = if fail_descr.force_tail_base != 0
-        && compact >= fail_descr.force_prefix_slots as usize
-    {
-        fail_descr.force_tail_base as usize
-            + 3 * (compact - fail_descr.force_prefix_slots as usize) * std::mem::size_of::<i64>()
-    } else {
-        fail_descr.force_args_offset as usize + compact * std::mem::size_of::<i64>()
-    };
-    unsafe { *((frame_ptr + offset) as *const i64) }
+    unsafe { *((frame_ptr + ofs as usize) as *const i64) }
 }
 
 fn decoded_force_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
@@ -5666,10 +5632,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_arg_types: g.fail_arg_types.clone(),
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
-                    force_args_offset: frame.force_slot_base as u32,
-                    force_tail_base: force_tail_fields(frame).0,
-                    force_prefix_slots: force_tail_fields(frame).1,
-                    value_tail_index: force_tail_fields(frame).2,
+                    force_locs: frame.force_locs_for(&g.fail_locs),
                     force_gcmap_ptr: g.exit_gcmap_ptr,
                     bridge_cell: g.bridge_cell,
                     fail_arg_advanced: Vec::new(),
@@ -6766,10 +6729,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_arg_types: g.fail_arg_types.clone(),
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
-                    force_args_offset: source_frame.force_slot_base as u32,
-                    force_tail_base: force_tail_fields(source_frame).0,
-                    force_prefix_slots: force_tail_fields(source_frame).1,
-                    value_tail_index: force_tail_fields(source_frame).2,
+                    force_locs: source_frame.force_locs_for(&g.fail_locs),
                     force_gcmap_ptr: g.exit_gcmap_ptr,
                     bridge_cell: g.bridge_cell,
                     fail_arg_advanced: bridge_advanced.get(index).cloned().unwrap_or_default(),
@@ -7402,6 +7362,56 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_arg_word_reads_precomputed_locs_with_holes_and_tail() {
+        let source = codegen::FrameGeometry::compact(1, 0, 0, 2);
+        let frame = source.extend(1, 0, 4);
+        assert!(frame.has_tail());
+        assert_eq!(frame.prefix_force_slots, 2);
+        let fail_locs = vec![None, Some(0), None, Some(1), Some(2), None, Some(3)];
+        let force_locs = frame.force_locs_for(&fail_locs);
+        let live = [1usize, 3, 4, 6];
+        let values = [0x11i64, 0x22, 0x33, 0x44];
+        for (rank, &index) in live.iter().enumerate() {
+            assert_eq!(force_locs[index], frame.force_slot_ofs(rank as u64) as u32);
+        }
+        for (index, slot) in fail_locs.iter().enumerate() {
+            if slot.is_none() {
+                assert_eq!(force_locs[index], codegen::FORCE_LOC_HOLE);
+            }
+        }
+        let descr = WasmFailDescr {
+            fail_index: 0,
+            trace_id: 0,
+            fail_arg_types: vec![majit_ir::Type::Int; fail_locs.len()],
+            fail_locs,
+            is_finish: false,
+            force_locs,
+            force_gcmap_ptr: 0,
+            bridge_cell: 0,
+            fail_arg_advanced: Vec::new(),
+            trace_ref_homes: 0,
+            trace_label_homes: 0,
+            param_dispatch: false,
+            bridge_slot: std::sync::atomic::AtomicU32::new(0),
+            meta_descr: None,
+        };
+        let words = frame.frame_bytes as usize / std::mem::size_of::<i64>();
+        let mut buf = vec![0i64; words];
+        let frame_ptr = buf.as_mut_ptr() as usize;
+        for (rank, &value) in values.iter().enumerate() {
+            let ofs = frame.force_slot_ofs(rank as u64) as usize;
+            buf[ofs / std::mem::size_of::<i64>()] = value;
+        }
+        for (rank, &index) in live.iter().enumerate() {
+            assert_eq!(force_arg_word(frame_ptr, &descr, index), values[rank]);
+        }
+        for hole in [0usize, 2, 5] {
+            assert_eq!(force_arg_word(frame_ptr, &descr, hole), 0);
+        }
+        assert_eq!(force_arg_word(frame_ptr, &descr, 99), 0);
+    }
 
     #[test]
     fn pre_rewrite_interior_field_decline_stays_retryable() {

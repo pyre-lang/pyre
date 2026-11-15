@@ -13866,10 +13866,7 @@ fn tail_fail_args_decode_through_the_deadframe() {
         fail_arg_types: exit.fail_arg_types.clone(),
         fail_locs: exit.fail_locs.clone(),
         is_finish: false,
-        force_args_offset: frame.force_slot_base as u32,
-        force_tail_base: frame.force_tail_base() as u32,
-        force_prefix_slots: frame.prefix_force_slots as u32,
-        value_tail_index: frame.value_tail_index() as u32,
+        force_locs: frame.force_locs_for(&exit.fail_locs),
         force_gcmap_ptr: exit.exit_gcmap_ptr,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
@@ -14181,14 +14178,7 @@ fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
         fail_arg_types: exit.fail_arg_types.clone(),
         fail_locs: exit.fail_locs.clone(),
         is_finish: false,
-        force_args_offset: frame.force_slot_base as u32,
-        force_tail_base: frame.force_tail_base() as u32,
-        force_prefix_slots: frame.prefix_force_slots as u32,
-        value_tail_index: if frame.has_tail() {
-            frame.value_tail_index() as u32
-        } else {
-            0
-        },
+        force_locs: frame.force_locs_for(&exit.fail_locs),
         force_gcmap_ptr: exit.exit_gcmap_ptr,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),

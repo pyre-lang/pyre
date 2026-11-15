@@ -121,6 +121,9 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 pub const FRAME_SLOT_BASE: u64 = 8;
 pub(crate) const SLOT_SIZE: u64 = 8;
 
+/// Unused `WasmFailDescr.force_locs` entry: a logical hole owns no force word.
+pub const FORCE_LOC_HOLE: u32 = u32::MAX;
+
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
@@ -697,6 +700,31 @@ impl FrameGeometry {
             );
             self.tail_base + (3 * (slot - prefix) + 1) * SLOT_SIZE
         }
+    }
+
+    /// Byte offsets `emit_force_arm` stores to, parallel to `fail_locs`.
+    /// Live entries are [`Self::force_slot_ofs`] at compact rank; holes are
+    /// [`FORCE_LOC_HOLE`]. [`Self::force_slot_ofs`] needs a tail when
+    /// `rank >= prefix_force_slots`; a no-tail geometry keeps
+    /// `force_slot_base + rank * SLOT_SIZE` for those ranks.
+    pub fn force_locs_for(self, fail_locs: &[Option<usize>]) -> Vec<u32> {
+        let mut rank = 0u64;
+        fail_locs
+            .iter()
+            .map(|slot| {
+                if slot.is_some() {
+                    let ofs = if rank < self.prefix_force_slots as u64 || self.has_tail() {
+                        self.force_slot_ofs(rank) as u32
+                    } else {
+                        (self.force_slot_base + rank * SLOT_SIZE) as u32
+                    };
+                    rank += 1;
+                    ofs
+                } else {
+                    FORCE_LOC_HOLE
+                }
+            })
+            .collect()
     }
 
     /// Byte offset of the first tail force word. Zero when [`Self::has_tail`]

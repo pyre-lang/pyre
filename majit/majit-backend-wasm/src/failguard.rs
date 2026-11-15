@@ -19,20 +19,12 @@ pub struct WasmFailDescr {
     /// and backend-only synthetic descriptors.
     pub fail_locs: Vec<Option<usize>>,
     pub is_finish: bool,
-    /// Byte offset of GUARD_NOT_FORCED(_2)'s force-only spill area. Native
-    /// backends carry these coordinates in their fail locations; keeping a
-    /// disjoint area is essential because a following FINISH overwrites the
-    /// ordinary exit slots and CALL_ASSEMBLER owns the dispatch-key slot.
-    pub force_args_offset: u32,
-    /// `0` when every force arg is `force_args_offset + loc * 8` (no tail, or
-    /// the loc is still the prefix index). Otherwise `force_tail_base` is the
-    /// first tail force word. A physical value index at or past
-    /// `force_prefix_slots` names
-    /// `force_tail_base + (loc - value_tail_index) * 8`: tail value items are
-    /// three apart, and so are the force words beside them.
-    pub force_tail_base: u32,
-    pub force_prefix_slots: u32,
-    pub value_tail_index: u32,
+    /// Byte offset of each fail-arg's GUARD_NOT_FORCED(_2) force word,
+    /// parallel to `fail_locs`. Live entries are
+    /// `FrameGeometry::force_slot_ofs(compact_rank)` (`emit_force_arm`);
+    /// holes are `FORCE_LOC_HOLE`. `force_arg_word` indexes this the way
+    /// `llmodel.py` `_decode_pos` indexes `descr.rd_locs`.
+    pub force_locs: Vec<u32>,
     /// Compile-time guard gcmap retained for FINISH after a
     /// GUARD_NOT_FORCED_2, matching `assembler._finish_gcmap`.
     pub force_gcmap_ptr: usize,
@@ -129,7 +121,7 @@ pub struct WasmFrameData {
     /// [`Self::boxed`] only. A live frame reads `jf_savedata`.
     pub savedata: i64,
     frame: Option<LiveFrame>,
-    /// `force()` snapshot: fail args live at `force_args_offset`, tagged.
+    /// `force()` snapshot: fail args live at `force_locs`, tagged.
     read_force: bool,
     /// Off-GC host-buffer owner. Keeps the entry JitFrame alive after
     /// `execute_token` returns. The wasm32 host-buffer path.
@@ -322,10 +314,7 @@ mod tests {
             fail_arg_types,
             fail_locs: Vec::new(),
             is_finish: false,
-            force_args_offset: 8,
-            force_tail_base: 0,
-            force_prefix_slots: 0,
-            value_tail_index: 0,
+            force_locs: Vec::new(),
             force_gcmap_ptr: 0,
             bridge_cell: 0,
             fail_arg_advanced: Vec::new(),
@@ -754,10 +743,7 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         fail_arg_types: reserved_fail_arg_types(exit_index),
         fail_locs: Vec::new(),
         is_finish: true,
-        force_args_offset: 0,
-        force_tail_base: 0,
-        force_prefix_slots: 0,
-        value_tail_index: 0,
+        force_locs: Vec::new(),
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
@@ -844,10 +830,7 @@ pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
         fail_arg_types: Vec::new(),
         fail_locs: Vec::new(),
         is_finish: false,
-        force_args_offset: 0,
-        force_tail_base: 0,
-        force_prefix_slots: 0,
-        value_tail_index: 0,
+        force_locs: Vec::new(),
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
@@ -939,10 +922,7 @@ fn propagate_wasm_descr(meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
         fail_arg_types: Vec::new(),
         fail_locs: Vec::new(),
         is_finish: false,
-        force_args_offset: 0,
-        force_tail_base: 0,
-        force_prefix_slots: 0,
-        value_tail_index: 0,
+        force_locs: Vec::new(),
         force_gcmap_ptr: 0,
         bridge_cell: 0,
         fail_arg_advanced: Vec::new(),
