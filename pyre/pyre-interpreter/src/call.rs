@@ -4613,6 +4613,10 @@ fn call_with_kwargs_in_ctx_impl(
 
             // `result` was published before the defaults fill. The tail
             // objects below are the allocations still ahead of the frame.
+            // `w_tuple_new` / `store_collected_keyword` can collect; pin
+            // `w_code` before those allocations.
+            let w_code_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_code);
             let mut packed_tail_slots = Vec::new();
             if has_varargs {
                 let extra_pos: Vec<PyObjectRef> = if npos > n_pos_params {
@@ -4625,13 +4629,7 @@ fn call_with_kwargs_in_ctx_impl(
                 let _ = pyre_object::gc_roots::pin_root(packed);
                 packed_tail_slots.push(slot);
             }
-            // `store_collected_keyword` reaches `__hash__` and can collect.
-            // Pin `w_code` before the dict allocation. The unpinned copy is
-            // taken only on the other arm, so this pin's argument is not read
-            // again; a later match of that same local would keep it live.
-            let (w_code_slot, w_code_else) = if has_varkw {
-                let w_code_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_code);
+            if has_varkw {
                 // `_match_signature` — `space.newdict(kwargs=True)`.
                 let kw_dict = pyre_object::w_dict_new_kwargs();
                 let kw_dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4649,10 +4647,7 @@ fn call_with_kwargs_in_ctx_impl(
                     }
                 }
                 packed_tail_slots.push(kw_dict_slot);
-                (Some(w_code_slot), None)
-            } else {
-                (None, Some(w_code))
-            };
+            }
             let mut final_args: Vec<PyObjectRef> = (0..result.len())
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(bound_root_base + i))
                 .collect();
@@ -4668,13 +4663,7 @@ fn call_with_kwargs_in_ctx_impl(
             // and pass that same word in; it is not read again afterwards.
             let w_globals = unsafe { function_get_globals_obj(current_callable()) };
             let closure = unsafe { function_get_closure(current_callable()) };
-            let w_code_now = match (w_code_slot, w_code_else) {
-                (Some(slot), _) => pyre_object::gc_roots::shadow_stack_get(slot),
-                (None, Some(word)) => word,
-                (None, None) => {
-                    unreachable!("varkw publishes a slot or the other arm keeps the word")
-                }
-            };
+            let w_code_now = pyre_object::gc_roots::shadow_stack_get(w_code_slot);
             let code_flags = unsafe { (*(crate::w_code_get_ptr(w_code_now))).flags };
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(

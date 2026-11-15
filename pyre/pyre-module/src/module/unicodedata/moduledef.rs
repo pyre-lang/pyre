@@ -42,6 +42,8 @@ pyre_interpreter::py_module! {
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
         let mut ns = ns;
+        let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        ns = pyre_object::gc_roots::pin_root(ns);
         // Optional `default` is a trailing positional (`UCD.digit` /
         // `interp2app._getdefaults`). Omitted slots stay `PY_NULL` so
         // `char_and_default` still distinguishes absence from `None`.
@@ -49,12 +51,14 @@ pyre_interpreter::py_module! {
             if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
                 function =
                     pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+                ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
                 pyre_interpreter::__pyre_store!(ns, name, function);
             }
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "iter_graphemes") } {
             function =
                 pyre_interpreter::gateway::function_set_null_positional_defaults(function, 2);
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
             pyre_interpreter::__pyre_store!(ns, "iter_graphemes", function);
         }
         let ucd_type = pyre_object::with_roots!(ns => interp_ucd::type_object());

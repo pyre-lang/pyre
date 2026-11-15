@@ -399,6 +399,8 @@ pub mod deque_iter {
             let _ = pyre_object::gc_roots::pin_root(self_obj);
             let ty =
                 unsafe { instance_getclass(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+            let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ty);
             let deque = unsafe {
                 (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeIter)).deque
             };
@@ -420,7 +422,7 @@ pub mod deque_iter {
             let state_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(state);
             w_tuple_new(vec![
-                ty,
+                pyre_object::gc_roots::shadow_stack_get(ty_slot),
                 pyre_object::gc_roots::shadow_stack_get(state_slot),
             ])
         }
@@ -546,6 +548,8 @@ pub mod deque_rev_iter {
             let _ = pyre_object::gc_roots::pin_root(self_obj);
             let ty =
                 unsafe { instance_getclass(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+            let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ty);
             let deque = unsafe {
                 (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeRevIter))
                     .deque
@@ -568,7 +572,7 @@ pub mod deque_rev_iter {
             let state_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(state);
             w_tuple_new(vec![
-                ty,
+                pyre_object::gc_roots::shadow_stack_get(ty_slot),
                 pyre_object::gc_roots::shadow_stack_get(state_slot),
             ])
         }
@@ -729,7 +733,13 @@ fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     }
     deque.len -= 1;
     let item = block_get(deque.rightblock, deque.rightindex);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(item);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let deque = W_Deque::from_obj(self_obj).expect("deque");
     block_set(deque.rightblock, deque.rightindex, w_none());
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let deque = W_Deque::from_obj(self_obj).expect("deque");
     let mut ri = deque.rightindex - 1;
     if ri < 0 {
         if deque.len == 0 {
@@ -745,7 +755,7 @@ fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     }
     deque.rightindex = ri;
     modified(self_obj);
-    Ok(item)
+    Ok(pyre_object::gc_roots::shadow_stack_get(item_slot))
 }
 
 fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -760,7 +770,13 @@ fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     }
     deque.len -= 1;
     let item = block_get(deque.leftblock, deque.leftindex);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(item);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let deque = W_Deque::from_obj(self_obj).expect("deque");
     block_set(deque.leftblock, deque.leftindex, w_none());
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let deque = W_Deque::from_obj(self_obj).expect("deque");
     let mut li = deque.leftindex + 1;
     if li >= BLOCKLEN {
         if deque.len == 0 {
@@ -776,7 +792,7 @@ fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     }
     deque.leftindex = li;
     modified(self_obj);
-    Ok(item)
+    Ok(pyre_object::gc_roots::shadow_stack_get(item_slot))
 }
 
 /// `space.decode_index4` index-only case — reject a slice with a
@@ -1001,15 +1017,27 @@ pub(crate) fn deque_repeat(
     }
 }
 
-fn reverse_unlocked(self_obj: PyObjectRef) {
+fn reverse_unlocked(mut self_obj: PyObjectRef) {
     let len = deque_len(self_obj);
     for index in 0..(len >> 1) {
         let (left_block, left_index) = locate(self_obj, index);
         let (right_block, right_index) = locate(self_obj, len - index - 1);
         let left = block_get(left_block, left_index);
         let right = block_get(right_block, right_index);
-        block_set(left_block, left_index, right);
-        block_set(right_block, right_index, left);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base =
+            pyre_object::gc_roots::pin_roots(&[self_obj, left, right, left_block, right_block]);
+        block_set(
+            pyre_object::gc_roots::shadow_stack_get(base + 3),
+            left_index,
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        );
+        block_set(
+            pyre_object::gc_roots::shadow_stack_get(base + 4),
+            right_index,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
+        self_obj = pyre_object::gc_roots::shadow_stack_get(base);
     }
 }
 
@@ -1447,15 +1475,15 @@ impl W_Deque {
         let items_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(items);
         let m = maxlen_obj(self_obj());
+        let m_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(m);
         let args_slot;
-        if unsafe { is_none(m) } {
+        if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(m_slot)) } {
             args_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
         } else {
             let empty_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
-            let m_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(m);
             let args = w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(empty_slot),
                 pyre_object::gc_roots::shadow_stack_get(m_slot),

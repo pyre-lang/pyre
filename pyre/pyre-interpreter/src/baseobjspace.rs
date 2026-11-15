@@ -21193,8 +21193,18 @@ pub(crate) fn product_next_w(obj: PyObjectRef) -> PyResult {
                     .expect("product gear index in range");
                 let item = pyre_object::w_list_getitem(gear, stored_index as i64)
                     .expect("product item index in range");
+                let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(item);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
                 pyre_object::w_list_setitem(state.indices, position as i64, w_index);
-                pyre_object::w_list_setitem(state.lst, position as i64, item);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
+                pyre_object::w_list_setitem(
+                    state.lst,
+                    position as i64,
+                    pyre_object::gc_roots::shadow_stack_get(item_slot),
+                );
                 if advanced {
                     break;
                 }
@@ -21543,8 +21553,18 @@ pub(crate) fn permutations_descr_next(obj: PyObjectRef) -> PyResult {
                     .expect("permutations left swap index in range");
                 let right = pyre_object::w_list_getitem(state.indices, swap_index as i64)
                     .expect("permutations right swap index in range");
+                let left_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(left);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
                 pyre_object::w_list_setitem(state.indices, i as i64, right);
-                pyre_object::w_list_setitem(state.indices, swap_index as i64, left);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+                pyre_object::w_list_setitem(
+                    state.indices,
+                    swap_index as i64,
+                    pyre_object::gc_roots::shadow_stack_get(left_slot),
+                );
                 return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
             }
 
@@ -21556,13 +21576,23 @@ pub(crate) fn permutations_descr_next(obj: PyObjectRef) -> PyResult {
             // Rotate indices[i:] one position to the left.
             let first = pyre_object::w_list_getitem(state.indices, i as i64)
                 .expect("permutations rotation index in range");
+            let first_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(first);
             let last = n - 1;
             for k in i..last {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
                 let next = pyre_object::w_list_getitem(state.indices, (k + 1) as i64)
                     .expect("permutations rotation source in range");
                 pyre_object::w_list_setitem(state.indices, k as i64, next);
             }
-            pyre_object::w_list_setitem(state.indices, last as i64, first);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+            pyre_object::w_list_setitem(
+                state.indices,
+                last as i64,
+                pyre_object::gc_roots::shadow_stack_get(first_slot),
+            );
         }
 
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);

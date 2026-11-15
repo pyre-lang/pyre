@@ -1196,12 +1196,16 @@ pyre_interpreter::py_module! {
                 pyre_interpreter::__pyre_store!(ns, name, function);
             }
         }
+        let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        ns = pyre_object::gc_roots::pin_root(ns);
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "hmac_new") } {
             function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 2);
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
             pyre_interpreter::__pyre_store!(ns, "hmac_new", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "pbkdf2_hmac") } {
             function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
             pyre_interpreter::__pyre_store!(ns, "pbkdf2_hmac", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "scrypt") } {

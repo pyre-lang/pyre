@@ -5954,7 +5954,7 @@ pub fn __majit_wrap_list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if args.is_empty() || args[0].is_null() {
         return list_init_need_arg();
     }
-    let list = args[0];
+    let mut list = args[0];
     if !unsafe { pyre_object::is_list(list) } {
         return list_init_bad_self(list);
     }
@@ -5966,11 +5966,17 @@ pub fn __majit_wrap_list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     // allocate_instance is already Empty, so the clear is skipped there.
     // [3.15-spec] `list___init___impl`: `if (self->ob_item != NULL) list_clear`.
     // SizeListStrategy's sizehint is that allocation, even at live length 0.
+    let extend = args.len() > 1;
+    let mut iterable = if extend {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
     if !unsafe { pyre_object::listobject::w_list_uses_empty_storage(list) } {
-        list_init_clear(list);
+        pyre_object::with_roots!(list, iterable => list_init_clear(list));
     }
-    if args.len() > 1 {
-        crate::type_methods::list_extend_items(list, args[1])?;
+    if extend {
+        crate::type_methods::list_extend_items(list, iterable)?;
     }
     Ok(pyre_object::w_none())
 }
@@ -6048,8 +6054,15 @@ fn list_init_from(
             params.len() - 1
         )));
     }
-    unsafe { pyre_object::w_list_clear(list) };
-    if let Some(&iterable) = params.get(1) {
+    let mut list = list;
+    let extend = params.len() > 1;
+    let mut iterable = if extend {
+        params[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    pyre_object::with_roots!(list, iterable => unsafe { pyre_object::w_list_clear(list) });
+    if extend {
         crate::type_methods::list_method_extend(&[list, iterable])?;
     }
     Ok(pyre_object::w_none())
@@ -7720,18 +7733,18 @@ pub fn __majit_wrap_list_descr_sort(args: &[PyObjectRef]) -> Result<PyObjectRef,
     if args.is_empty() || args[0].is_null() {
         return list_sort_need_arg();
     }
-    let list = args[0];
+    let mut list = args[0];
     if !unsafe { pyre_object::is_list(list) } {
         return list_sort_bad_self(list);
     }
     // Signature slots: index.  `args.len()` is `arraylen_gc` of the
     // gateway r0 the descent scan already knows.
-    let key = if args.len() > 1 {
+    let mut key = if args.len() > 1 {
         args[1]
     } else {
         pyre_object::PY_NULL
     };
-    let reverse_obj = if args.len() > 2 {
+    let mut reverse_obj = if args.len() > 2 {
         args[2]
     } else {
         pyre_object::PY_NULL
@@ -7750,7 +7763,9 @@ pub fn __majit_wrap_list_descr_sort(args: &[PyObjectRef]) -> Result<PyObjectRef,
     };
     if key_absent
         && let Some(reverse) = reverse
-        && crate::builtins::sort_list_without_key_native(list, reverse)
+        && pyre_object::with_roots!(list, key, reverse_obj => {
+            crate::builtins::sort_list_without_key_native(list, reverse)
+        })
     {
         return Ok(pyre_object::w_none());
     }
@@ -13719,7 +13734,7 @@ fn init_slice_type(ns: PyObjectRef) {
 /// free parameters with `items`, then fold the substituted members back into
 /// a union with `|`.
 fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
-    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let mut self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if !unsafe { pyre_object::is_union(self_) } {
         return Err(crate::PyError::type_error(
             "descriptor '__getitem__' requires a 'types.UnionType' object",
@@ -13729,7 +13744,7 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let items = if unsafe { pyre_object::is_tuple(items_raw) } {
         items_raw
     } else {
-        pyre_object::w_tuple_new(vec![items_raw])
+        pyre_object::with_roots!(self_ => pyre_object::w_tuple_new(vec![items_raw]))
     };
     let params = unsafe { pyre_object::w_union_get_parameters(self_) };
     let union_args = unsafe { pyre_object::w_union_get_args(self_) };

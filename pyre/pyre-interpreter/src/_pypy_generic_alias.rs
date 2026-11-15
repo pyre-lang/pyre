@@ -429,9 +429,12 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(items_slot),
     )?;
     let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let origin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(unsafe { w_generic_alias_get_origin(self_) });
+    let args = w_tuple_new(newargs);
     let res = make_generic_alias(
-        unsafe { w_generic_alias_get_origin(self_) },
-        w_tuple_new(newargs),
+        pyre_object::gc_roots::shadow_stack_get(origin_slot),
+        args,
         pyre_object::PY_NULL,
     )?;
     if unsafe { w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(self_slot)) } {
@@ -981,6 +984,8 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     }
     // `(type(self), (origin, args))`.
     let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
+    let ga_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ga_type);
     let args = w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(pair),
         pyre_object::gc_roots::shadow_stack_get(pair + 1),
@@ -988,7 +993,7 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args);
     Ok(w_tuple_new(vec![
-        ga_type,
+        pyre_object::gc_roots::shadow_stack_get(ga_type_slot),
         pyre_object::gc_roots::shadow_stack_get(args_slot),
     ]))
 }
@@ -1259,7 +1264,7 @@ impl UnionBuilder {
             )),
             [slot] => Ok(pyre_object::gc_roots::shadow_stack_get(*slot)),
             _ => {
-                let hashable_args = pyre_object::w_frozenset_new();
+                let mut hashable_args = pyre_object::w_frozenset_new();
                 unsafe {
                     pyre_object::w_set_copy_storage_from(
                         hashable_args,
@@ -1269,18 +1274,17 @@ impl UnionBuilder {
                 let unhashable_args = if self.unhashable_slots.is_empty() {
                     pyre_object::PY_NULL
                 } else {
-                    pyre_object::w_tuple_new(
+                    pyre_object::with_roots!(hashable_args => pyre_object::w_tuple_new(
                         self.unhashable_slots
                             .iter()
                             .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
                             .collect(),
-                    )
+                    ))
                 };
                 // Read the members and the parameters tuple out of the shadow
                 // stack only here: the frozenset copy and the tuple above are
                 // collection points, and a `Vec` or a by-value argument built
-                // before them holds addresses the walk cannot forward.  The
-                // frozenset itself is allocated old-gen and does not move.
+                // before them holds addresses the walk cannot forward.
                 let members: Vec<_> = self
                     .member_slots
                     .iter()
