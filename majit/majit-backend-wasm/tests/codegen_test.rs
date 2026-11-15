@@ -865,8 +865,24 @@ fn rewrite_module_inputs(mut inputs: codegen::ModuleBuildInputs) -> codegen::Mod
         let homes = codegen::count_ref_homes(&inputs.inputargs, &inputs.ops)
             .max(inputs.frame.ordinary_home_slots());
         let label_refs = inputs.frame.label_ref_slots;
-        inputs.frame = codegen::FrameGeometry::compact(value_slots, homes + label_refs, label_refs);
+        let force_slots = codegen::frame_force_slots(&inputs.inputargs, &inputs.ops)
+            .max(inputs.frame.force_slots);
+        inputs.frame = codegen::FrameGeometry::compact(
+            value_slots,
+            homes + label_refs,
+            label_refs,
+            force_slots,
+        );
     }
+    let mut needed_force = codegen::frame_force_slots(&inputs.inputargs, &inputs.ops);
+    for region in &inputs.inlined_bridges {
+        needed_force = needed_force.max(codegen::frame_force_slots(&region.inputargs, &region.ops));
+    }
+    inputs.frame = inputs.frame.extend(
+        inputs.frame.value_slots,
+        inputs.frame.addressable_ordinary_homes(),
+        needed_force,
+    );
     inputs
 }
 
@@ -1335,7 +1351,7 @@ fn build_module_with_write_barrier_target(
         // their homes in the shared helper geometry.  The value count is the
         // fail index, this trace's three-slot value area, and the trace-wide
         // GUARD_VALUE counter slot `normal_frame_value_slots` always reserves.
-        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        frame: codegen::FrameGeometry::compact(5, 2, 0, codegen::frame_force_slots(inputargs, ops)),
         ca: codegen::CaParams::default(),
     };
     let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
@@ -1373,7 +1389,7 @@ fn build_module_with_gc_table(
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        frame: codegen::FrameGeometry::compact(5, 2, 0, codegen::frame_force_slots(inputargs, ops)),
         ca: codegen::CaParams::default(),
     };
     let (bytes, _, _, _) =
@@ -1410,8 +1426,10 @@ fn module_with_collecting_calls(call_count: usize) -> Vec<u8> {
     // helper must be configured (`gcrootmap and wbdescr`).
     let mut ca = codegen::CaParams::default();
     ca.ca_reload_fn_ptr = 1;
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let force_slots = codegen::frame_force_slots(&inputargs, &ops);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: vec![InputArg::from_type_rc(Type::Ref, 0)],
+        inputargs,
         ops,
         inlined_bridges: Vec::new(),
         vtable_offset: Some(0),
@@ -1433,7 +1451,7 @@ fn module_with_collecting_calls(call_count: usize) -> Vec<u8> {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        frame: codegen::FrameGeometry::compact(5, 2, 0, force_slots),
         ca,
     };
     let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
@@ -1596,7 +1614,7 @@ fn guard_exit_module(guard_count: usize, ref_fail: bool, exit_table_base: u32) -
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(8, 4, 0),
+        frame: codegen::FrameGeometry::compact(8, 4, 0, 0),
         ca,
     };
     let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
@@ -2909,7 +2927,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(4, 1, 0),
+        frame: codegen::FrameGeometry::compact(4, 1, 0, 0),
         ca: codegen::CaParams {
             emit_ca: true,
             targets: HashMap::from([(
@@ -2960,7 +2978,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     // The CA arm no longer memory.fills the frozen home range; the
     // callee key-0 prologue nulls only marked slots. The bump itself
     // must not refill `ca_frame_bytes`.
-    let frame = codegen::FrameGeometry::compact(4, 1, 0);
+    let frame = codegen::FrameGeometry::compact(4, 1, 0, 0);
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
         "inline CA bump must not memory.fill ca_frame_bytes; fills were {fill_lengths:?}"
@@ -2974,7 +2992,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
 fn entry_prologue_does_not_null_unmarked_home_padding() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])];
-    let frame = codegen::FrameGeometry::compact(64, 128, 2);
+    let frame = codegen::FrameGeometry::compact(64, 128, 2, 0);
     let home_fill_bytes = (frame.home_slots as i32) * 8;
     let inputs = codegen::ModuleBuildInputs {
         inputargs,
@@ -3505,7 +3523,7 @@ fn compute_home_gcmap_simple_loop_is_valid() {
     ];
     let mut ca = codegen::CaParams::default();
     ca.compute_home_gcmap = true;
-    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2, 0);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
@@ -3575,7 +3593,7 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
     let mut ca = codegen::CaParams::default();
     ca.compute_home_gcmap = true;
     ca.ca_reload_fn_ptr = 1;
-    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2, 0);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
@@ -3650,7 +3668,7 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
     let mut ca = codegen::CaParams::default();
     ca.compute_home_gcmap = true;
     ca.ca_reload_fn_ptr = 1;
-    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2, 0);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
@@ -3722,7 +3740,7 @@ fn reemit_nulls_grown_label_homes_and_builds() {
     ca.home_gcmap_has_prior = true;
     ca.home_gcmap_null_grown_labels = true;
     ca.home_gcmap_min_labels = 0;
-    let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+    let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2, 0);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
@@ -3783,7 +3801,7 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
     ];
     let mut ca = codegen::CaParams::default();
     ca.compute_home_gcmap = true;
-    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2, 0);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
@@ -3847,7 +3865,7 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(16, 8, 0),
+        frame: codegen::FrameGeometry::compact(16, 8, 0, 0),
         ca: codegen::CaParams::default(),
     }) {
         Err(err) => err,
@@ -5760,7 +5778,7 @@ fn wide_label_dispatch_key_preserves_every_argument() {
     ops.push(Op::new(OpCode::Jump, &label_args));
 
     let slots = codegen::frame_value_slots(&inputargs, &ops);
-    let frame = codegen::FrameGeometry::compact(slots, 0, 0);
+    let frame = codegen::FrameGeometry::compact(slots, 0, 0, 0);
     let (bytes, _) = build_module_with_frame(
         &inputargs,
         &ops,
@@ -6024,7 +6042,7 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(5, 3, 1),
+        frame: codegen::FrameGeometry::compact(5, 3, 1, 0),
         ca: codegen::CaParams::default(),
     };
     let (bytes, _, _, _) =
@@ -6114,6 +6132,7 @@ fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
         codegen::frame_value_slots(&inputargs, &ops),
         ordinary_homes + 1,
         1,
+        codegen::frame_force_slots(&inputargs, &ops),
     );
     assert_eq!(
         codegen::label_resume_info(&inputargs, &ops, frame),
@@ -6250,7 +6269,7 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
     // `FROZEN_LABEL_PARAM_ARITY` still publishes it: the shim zero-pads
     // parameters whose spill slots would reach the dispatch key.
     let compact =
-        codegen::FrameGeometry::compact(codegen::frame_value_slots(&inputargs, &ops), 0, 0);
+        codegen::FrameGeometry::compact(codegen::frame_value_slots(&inputargs, &ops), 0, 0, 0);
     assert!(
         compact.value_slots < majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
         "this peeled loop is the size that used to miss the wide type"
@@ -6291,7 +6310,9 @@ fn compile_loop_publishes_trace_sized_jitframe_for_a_small_recursive_loop() {
     let value_slots = codegen::frame_value_slots(&inputargs, &ops_plain);
     let homes = codegen::count_ref_homes(&inputargs, &ops_plain);
     let labels = codegen::label_ref_capture_slots(&inputargs, &ops_plain);
-    let expected = codegen::FrameGeometry::compact(value_slots, homes + labels, labels);
+    let force_slots = codegen::frame_force_slots(&inputargs, &ops_plain);
+    let expected =
+        codegen::FrameGeometry::compact(value_slots, homes + labels, labels, force_slots);
     assert!(
         expected.value_slots < majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
         "this shape must not pay the label-parameter TYPE width as JITFRAME bytes"
@@ -6303,15 +6324,13 @@ fn compile_loop_publishes_trace_sized_jitframe_for_a_small_recursive_loop() {
             compiled.frame.value_slots,
             compiled.frame.home_slots,
             compiled.frame.label_ref_slots,
+            compiled.frame.force_slots,
         )
     );
     assert_eq!(compiled.frame.frame_bytes, compiled.frame.ca_frame_bytes);
     assert_eq!(
-        compiled.frame.frame_bytes as u64,
-        compiled
-            .frame
-            .force_slot_ofs((expected.value_slots as u64).saturating_sub(1))
-            + 8
+        compiled.frame.ca_frame_bytes as u64,
+        compiled.frame.force_slot_base + compiled.frame.force_slots as u64 * 8
     );
     let depth = token
         .compiled_loop_token()
@@ -6428,8 +6447,8 @@ fn a_jump_wider_than_sixteen_args_uses_the_wide_entry() {
 /// growth the bridge would request.
 #[test]
 fn cross_geometry_jump_delivers_label_args() {
-    let ga = codegen::FrameGeometry::compact(8, 2, 0);
-    let gb = codegen::FrameGeometry::compact(40, 12, 2);
+    let ga = codegen::FrameGeometry::compact(8, 2, 0, 0);
+    let gb = codegen::FrameGeometry::compact(40, 12, 2, 0);
     assert!(gb.signed_item_count() > ga.signed_item_count());
     assert_ne!(ga.dispatch_key_ofs, gb.dispatch_key_ofs);
     assert_ne!(ga.home_slot_base, gb.home_slot_base);
@@ -7464,7 +7483,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
     );
 
     let mut inputs = inline_region_inputs(&inputargs, ops, vec![]);
-    inputs.frame = codegen::FrameGeometry::compact(8, 4, 0);
+    inputs.frame = codegen::FrameGeometry::compact(8, 4, 0, 0);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -9333,7 +9352,8 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
             Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
         ];
         assert_eq!(codegen::frame_value_slots(&inputargs, &ops), 5);
-        let frame = codegen::FrameGeometry::compact(5, 0, 0);
+        let frame =
+            codegen::FrameGeometry::compact(5, 0, 0, codegen::frame_force_slots(&inputargs, &ops));
         let (bytes, guards) = build_module_with_frame(
             &inputargs,
             &ops,
@@ -9528,7 +9548,7 @@ fn build_module_with_barrier_helpers(
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(6, 3, 0),
+        frame: codegen::FrameGeometry::compact(6, 3, 0, 0),
         ca: codegen::CaParams::default(),
     };
     let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
@@ -10060,6 +10080,7 @@ fn cond_call_n_reloads_when_effectinfo_cannot_collect() {
             codegen::frame_value_slots(&inputargs, &ops),
             codegen::count_ref_homes(&inputargs, &ops),
             0,
+            codegen::frame_force_slots(&inputargs, &ops),
         );
         let (bytes, _) = build_module_with_frame(
             &inputargs,
@@ -10712,6 +10733,7 @@ fn cond_call_reload_sits_on_the_arm_that_called() {
         codegen::frame_value_slots(&inputargs, &ops),
         codegen::count_ref_homes(&inputargs, &ops),
         0,
+        codegen::frame_force_slots(&inputargs, &ops),
     );
     let (bytes, _) = build_module_with_frame(
         &inputargs,
@@ -11374,7 +11396,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         .collect();
     ops.push(Op::new(OpCode::Finish, &refs.map(rb)));
     let mut inputs = inline_region_inputs(&[], ops, vec![]);
-    inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
+    inputs.frame = codegen::FrameGeometry::compact(5, 2, 0, 0);
     inputs.alloc.new_fn_ptr = 1;
     inputs.nursery = None;
     let home_base = inputs.frame.home_slot_base as usize;
@@ -12505,6 +12527,7 @@ fn call_malloc_nursery_varsize_helper_publishes_the_site_gcmap() {
             codegen::frame_value_slots(&inputs.inputargs, &inputs.ops),
             codegen::count_ref_homes(&inputs.inputargs, &inputs.ops),
             0,
+            codegen::frame_force_slots(&inputs.inputargs, &inputs.ops),
         );
         inputs.ca.compute_home_gcmap = true;
         inputs.ca.ca_reload_fn_ptr = 1;
@@ -12601,7 +12624,7 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        frame: codegen::FrameGeometry::compact(5, 2, 0, 0),
         ca: codegen::CaParams::default(),
     };
     let nursery = Some(codegen::NurseryAllocParams {
@@ -13486,14 +13509,19 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
         rb(OpRef::const_int(99)),
     ]);
     let ops = vec![add, guard, finish];
-    let source = codegen::FrameGeometry::compact(4, 1, 0);
+    let source = codegen::FrameGeometry::compact(4, 1, 0, 0);
     let needed_values = codegen::frame_value_slots(&inputargs, &ops);
     let needed_homes = codegen::count_ref_homes(&inputargs, &ops);
+    let needed_force = codegen::frame_force_slots(&inputargs, &ops);
     assert!(needed_values > source.value_slots);
     assert!(needed_homes > source.ordinary_home_slots());
     // The stored loop frame is already tailed; this bridge extends it again.
-    let tailed = source.extend(source.value_slots + 1, source.ordinary_home_slots());
-    let frame = tailed.extend(needed_values, needed_homes);
+    let tailed = source.extend(
+        source.value_slots + 1,
+        source.ordinary_home_slots(),
+        needed_force,
+    );
+    let frame = tailed.extend(needed_values, needed_homes, needed_force);
     assert!(frame.has_tail());
     assert_eq!(frame.tail_base, tailed.tail_base);
     assert_eq!(frame.spill_slot_ofs(4), tailed.spill_slot_ofs(4));
@@ -13637,13 +13665,14 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
 /// `Some(0), Some(1), ...`.
 #[test]
 fn geometry_without_a_tail_keeps_identity_fail_locations() {
-    let frame = codegen::FrameGeometry::compact(8, 1, 0);
+    let frame = codegen::FrameGeometry::compact(8, 1, 0, 0);
     assert!(!frame.has_tail());
     for i in 0..8u64 {
         assert_eq!(frame.spill_slot_index(i), i);
         assert_eq!(frame.spill_slot_ofs(i), codegen::FRAME_SLOT_BASE + i * 8);
-        assert_eq!(frame.force_slot_ofs(i), frame.force_slot_base + i * 8);
     }
+    assert_eq!(frame.force_slots, 0);
+    assert_eq!(frame.ca_frame_bytes as u64, frame.force_slot_base);
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let guard = make_guard(
         OpCode::GuardTrue,
@@ -13698,13 +13727,14 @@ fn tail_fail_args_decode_through_the_deadframe() {
         Type::Ref,
         Type::Int,
     ]);
-    let source = codegen::FrameGeometry::compact(4, 1, 0);
+    let source = codegen::FrameGeometry::compact(4, 1, 0, 0);
     let needed_values = codegen::frame_value_slots(&inputargs, &[guard.clone()]);
     let needed_homes = codegen::count_ref_homes(&inputargs, &[guard.clone()]);
+    let needed_force = codegen::frame_force_slots(&inputargs, &[guard.clone()]);
     assert!(needed_values > source.value_slots);
     // Compile the guard against a geometry that already has a tail.
-    let tailed = source.extend(source.value_slots + 1, needed_homes);
-    let frame = tailed.extend(needed_values, needed_homes);
+    let tailed = source.extend(source.value_slots + 1, needed_homes, needed_force);
+    let frame = tailed.extend(needed_values, needed_homes, needed_force);
     assert!(frame.has_tail());
     assert_eq!(frame.tail_base, tailed.tail_base);
     assert_eq!(frame.spill_slot_ofs(4), tailed.spill_slot_ofs(4));
@@ -13838,7 +13868,7 @@ fn tail_fail_args_decode_through_the_deadframe() {
         is_finish: false,
         force_args_offset: frame.force_slot_base as u32,
         force_tail_base: frame.force_tail_base() as u32,
-        force_prefix_slots: frame.prefix_value_slots as u32,
+        force_prefix_slots: frame.prefix_force_slots as u32,
         value_tail_index: frame.value_tail_index() as u32,
         force_gcmap_ptr: exit.exit_gcmap_ptr,
         bridge_cell: 0,
@@ -13867,8 +13897,8 @@ fn tail_fail_args_decode_through_the_deadframe() {
 #[test]
 fn realloc_zero_takes_the_memory_error_exit() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let source = codegen::FrameGeometry::compact(2, 0, 0);
-    let frame = source.extend(4, 0);
+    let source = codegen::FrameGeometry::compact(2, 0, 0, 0);
+    let frame = source.extend(4, 0, 0);
     assert!(frame.has_tail());
     let mut ca = codegen::CaParams::default();
     ca.realloc_fn_ptr = 1;
@@ -14017,7 +14047,7 @@ fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::compact(8, 2, 0),
+        frame: codegen::FrameGeometry::compact(8, 2, 0, 0),
         ca: codegen::CaParams {
             jf_top_addr: Some(0x2000),
             ..codegen::CaParams::default()
@@ -14026,7 +14056,7 @@ fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
     inputs = rewrite_module_inputs(inputs);
     let value_slots = codegen::frame_value_slots(&inputs.inputargs, &inputs.ops).max(8);
     let homes = codegen::count_ref_homes(&inputs.inputargs, &inputs.ops).max(1);
-    inputs.frame = codegen::FrameGeometry::compact(value_slots, homes, 0);
+    inputs.frame = codegen::FrameGeometry::compact(value_slots, homes, 0, 0);
     let frame = inputs.frame;
     let home = frame.home_ofs(0) as usize;
     let (bytes, guards, homes, _) =
@@ -14153,7 +14183,7 @@ fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
         is_finish: false,
         force_args_offset: frame.force_slot_base as u32,
         force_tail_base: frame.force_tail_base() as u32,
-        force_prefix_slots: frame.prefix_value_slots as u32,
+        force_prefix_slots: frame.prefix_force_slots as u32,
         value_tail_index: if frame.has_tail() {
             frame.value_tail_index() as u32
         } else {

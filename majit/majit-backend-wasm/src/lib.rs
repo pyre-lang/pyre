@@ -258,6 +258,7 @@ pub(crate) enum FrameShortageKind {
     OrdinaryRefHomes = 2,
     LabelResumeRefSlots = 3,
     LabelResumeCaptureSlots = 4,
+    ForceSlots = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -2400,14 +2401,14 @@ fn publish_ca_initial_locs(
 }
 
 /// Force-tail words carried on `WasmFailDescr` so `force_arg_word` reconstructs
-/// `FrameGeometry::force_slot_ofs` from the physical value index in `fail_locs`.
+/// `FrameGeometry::force_slot_ofs` from the compact live fail-arg index.
 fn force_tail_fields(frame: codegen::FrameGeometry) -> (u32, u32, u32) {
     if !frame.has_tail() {
         return (0, 0, 0);
     }
     (
         frame.force_tail_base() as u32,
-        frame.prefix_value_slots as u32,
+        frame.prefix_force_slots as u32,
         frame.value_tail_index() as u32,
     )
 }
@@ -4427,12 +4428,19 @@ impl WasmBackend {
                 Err(error) => {
                     let frame = inputs.frame;
                     let grown = match shortage.map(|s| (s.kind, s.needed)) {
-                        Some((FrameShortageKind::FrameValueSlots, needed)) => {
-                            frame.extend(needed, frame.addressable_ordinary_homes())
-                        }
+                        Some((FrameShortageKind::FrameValueSlots, needed)) => frame.extend(
+                            needed,
+                            frame.addressable_ordinary_homes(),
+                            frame.force_slots,
+                        ),
                         Some((FrameShortageKind::OrdinaryRefHomes, needed)) => {
-                            frame.extend(frame.value_slots, needed)
+                            frame.extend(frame.value_slots, needed, frame.force_slots)
                         }
+                        Some((FrameShortageKind::ForceSlots, needed)) => frame.extend(
+                            frame.value_slots,
+                            frame.addressable_ordinary_homes(),
+                            needed,
+                        ),
                         _ => frame,
                     };
                     if grown == frame {
@@ -5111,21 +5119,35 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     ))
 }
 
+fn compact_live_fail_index(fail_descr: &WasmFailDescr, index: usize) -> usize {
+    if fail_descr.fail_locs.is_empty() {
+        return index;
+    }
+    fail_descr
+        .fail_locs
+        .iter()
+        .take(index)
+        .filter(|slot| slot.is_some())
+        .count()
+}
+
 fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
-    let Some(slot) = fail_descr.frame_slot(index) else {
+    if fail_descr.frame_slot(index).is_none() {
         return 0;
+    }
+    // `emit_force_arm` writes compact live fail args at `force_slot_ofs(i)`.
+    // The reader uses that same live rank: prefix words at
+    // `force_args_offset + i * 8`, tail words at
+    // `force_tail_base + 3 * (i - prefix_force_slots) * 8`.
+    let compact = compact_live_fail_index(fail_descr, index);
+    let offset = if fail_descr.force_tail_base != 0
+        && compact >= fail_descr.force_prefix_slots as usize
+    {
+        fail_descr.force_tail_base as usize
+            + 3 * (compact - fail_descr.force_prefix_slots as usize) * std::mem::size_of::<i64>()
+    } else {
+        fail_descr.force_args_offset as usize + compact * std::mem::size_of::<i64>()
     };
-    // `slot` is the physical value-item index (`spill_slot_index`). Prefix
-    // indices are the identity, so `force_args_offset + slot * 8` is
-    // `force_slot_ofs`. A tail index steps by three from `value_tail_index`;
-    // `force_tail_base` is the first tail force word, three items apart as well.
-    let offset =
-        if fail_descr.force_tail_base != 0 && slot >= fail_descr.force_prefix_slots as usize {
-            let delta = slot - fail_descr.value_tail_index as usize;
-            fail_descr.force_tail_base as usize + delta * std::mem::size_of::<i64>()
-        } else {
-            fail_descr.force_args_offset as usize + slot * std::mem::size_of::<i64>()
-        };
     unsafe { *((frame_ptr + offset) as *const i64) }
 }
 
@@ -5449,6 +5471,7 @@ impl majit_backend::Backend for WasmBackend {
             Some(target) => target.frame.extend(
                 inputargs.len().max(target.frame.value_slots),
                 target.frame.addressable_ordinary_homes(),
+                target.frame.force_slots,
             ),
             None => codegen::FrameGeometry::fixed(),
         };
@@ -5466,6 +5489,7 @@ impl majit_backend::Backend for WasmBackend {
         // geometry for both the loop and each nursery-allocated self callee.
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        let raw_force_slots = codegen::frame_force_slots(inputargs, ops);
         let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
         // An entry bridge (`compile.py ResumeFromInterpDescr`) is sent
         // to the backend through `compile_loop` like any loop, but it is not one:
@@ -5483,13 +5507,16 @@ impl majit_backend::Backend for WasmBackend {
         // The label-parameter TYPE stays `FROZEN_LABEL_PARAM_ARITY` wide;
         // `jfi_frame_size` does not follow that arity.
         let frame = match entry_bridge_target {
-            Some(target) => target
-                .frame
-                .extend(raw_frame_value_slots, raw_num_ref_homes),
+            Some(target) => {
+                target
+                    .frame
+                    .extend(raw_frame_value_slots, raw_num_ref_homes, raw_force_slots)
+            }
             None => codegen::FrameGeometry::compact(
                 raw_frame_value_slots,
                 raw_num_ref_homes + label_ref_slots,
                 label_ref_slots,
+                raw_force_slots,
             ),
         };
         // `x86/assembler.py::assemble_loop` installs the generated frame
@@ -6136,8 +6163,10 @@ impl majit_backend::Backend for WasmBackend {
         // and `_check_frame_depth` grows the live frame at entry.
         let bridge_value_slots = codegen::frame_value_slots(inputargs, ops);
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        let bridge_force_slots = codegen::frame_force_slots(inputargs, ops);
         let frozen_frame = source_frame;
-        let source_frame = frozen_frame.extend(bridge_value_slots, bridge_ref_homes);
+        let source_frame =
+            frozen_frame.extend(bridge_value_slots, bridge_ref_homes, bridge_force_slots);
 
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
         // source loop through `source_func_handle` — the function entry. For a
@@ -7966,7 +7995,7 @@ mod tests {
     fn home_gcmap_marks_used_homes_and_label_captures_only() {
         let _compile_guard = failguard::lock_cpu();
         let sign = std::mem::size_of::<isize>();
-        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2, 0);
         let map = codegen::build_home_gcmap(frame, 5, 2);
         let idx = |h: usize| (frame.home_slot_base as usize + h * 8) / sign;
         for h in 0..5 {
@@ -7988,7 +8017,7 @@ mod tests {
     #[test]
     fn union_gcmap_covers_incomparable_ordinary_and_label_maps() {
         let _compile_guard = failguard::lock_cpu();
-        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2, 0);
         let owner = codegen::build_home_gcmap(frame, 8, 0);
         let bridge = codegen::build_home_gcmap(frame, 3, 2);
         let union = wasm_jit_union_gcmap(
@@ -8017,7 +8046,7 @@ mod tests {
         let _compile_guard = failguard::lock_cpu();
         // value_slots=16, 4200 homes: last signed index is past 64 data words
         // on a 64-bit host (`build_home_gcmap` word count).
-        let frame = codegen::FrameGeometry::compact(16, 4200, 2);
+        let frame = codegen::FrameGeometry::compact(16, 4200, 2, 0);
         let owner = codegen::build_home_gcmap(frame, 4100, 0);
         let bridge = codegen::build_home_gcmap(frame, 3, 2);
         assert!(owner[0] > 64, "fixture must exceed the old 64-word cap");
@@ -8093,7 +8122,7 @@ mod tests {
         // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
         // stays set after a guard spill overwrites the slot with an integer,
         // and `is_nursery_object_start` is only a nursery range check.
-        let frame = codegen::FrameGeometry::compact(4, 2, 0);
+        let frame = codegen::FrameGeometry::compact(4, 2, 0, 0);
         let buf = codegen::build_home_gcmap(frame, 2, 0);
         let sign = std::mem::size_of::<isize>();
         let input0 = codegen::FRAME_SLOT_BASE as usize / sign;
@@ -8748,7 +8777,7 @@ mod tests {
             external_jump_slot: 0,
             external_jump_wide_slot: 0,
             external_jump_key: 0,
-            frame: codegen::FrameGeometry::compact(5, 2, 0),
+            frame: codegen::FrameGeometry::compact(5, 2, 0, 0),
             ca: codegen::CaParams::default(),
         }
     }
