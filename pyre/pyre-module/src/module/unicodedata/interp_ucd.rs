@@ -4,10 +4,11 @@
 //! Real implementation backed by the runtime-independent
 //! `rustpython-unicode` crate.  The module-level functions read the latest
 //! bundled database; `unicodedata.ucd_3_2_0` reads the Unicode 3.2.0 view
-//! (used by `stringprep`).  `normalize` / `is_normalized` are
-//! version-independent, matching the crate, so the 3.2.0 instance shares those
-//! callables with the module. `lookup` consults the instance's UCD: the
-//! modern view resolves name aliases and named sequences; `ucd_3_2_0` does not.
+//! (used by `stringprep`).  `normalize` / `is_normalized` go through the
+//! instance's `Ucd` (`interp_ucd.py UCD.normalize` via `self._unicodedb`), so
+//! the 3.2.0 view applies that version's decomposition corrections. `lookup`
+//! consults the instance's UCD: the modern view resolves name aliases and
+//! named sequences; `ucd_3_2_0` does not.
 //!
 //! Signatures and error types/messages follow CPython 3.14.
 //!
@@ -290,6 +291,10 @@ fn normalize_text(func: &str, obj: PyObjectRef) -> Result<&'static Wtf8, PyError
 }
 
 pub(super) fn normalize(args: &[PyObjectRef]) -> PyResult {
+    normalize_impl(ucd(false), args)
+}
+
+fn normalize_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "normalize expected 2 arguments, got {}",
@@ -308,10 +313,14 @@ pub(super) fn normalize(args: &[PyObjectRef]) -> PyResult {
     {
         return Ok(args[1]);
     }
-    Ok(w_str_from_wtf8_managed(ucd_core::normalize(form, text)))
+    Ok(w_str_from_wtf8_managed(db.normalize(form, text)))
 }
 
 pub(super) fn is_normalized(args: &[PyObjectRef]) -> PyResult {
+    is_normalized_impl(ucd(false), args)
+}
+
+fn is_normalized_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "is_normalized expected 2 arguments, got {}",
@@ -320,7 +329,7 @@ pub(super) fn is_normalized(args: &[PyObjectRef]) -> PyResult {
     }
     let form = normalize_form("is_normalized", args[0])?;
     let text = normalize_text("is_normalized", args[1])?;
-    Ok(w_bool_from(ucd_core::is_normalized(form, text)))
+    Ok(w_bool_from(db.is_normalized(form, text)))
 }
 
 /// `unicodedata.isxidstart` — `XID_Start`. A lone surrogate is not a `char`,
@@ -632,19 +641,19 @@ impl W_UCD {
         lookup_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn normalize(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        normalize(ucd_method_args(args))
+        normalize_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn is_normalized(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        is_normalized(ucd_method_args(args))
+        is_normalized_impl(ucd(self.legacy), ucd_method_args(args))
     }
 
     #[getter]
     fn unidata_version(&self) -> PyObjectRef {
-        if self.legacy {
-            w_str_new("3.2.0")
+        w_str_new(if self.legacy {
+            ucd_core::UNICODE_VERSION_LEGACY
         } else {
-            w_str_new(&ucd_core::unicode_version())
-        }
+            ucd_core::UNICODE_VERSION
+        })
     }
 }
 
@@ -685,5 +694,43 @@ mod tests {
             unsafe { w_str_get_wtf8(W_UCD::from_obj(obj).unwrap().unidata_version()) }.to_string(),
             "3.2.0"
         );
+    }
+
+    #[test]
+    fn ucd_legacy_normalize_uses_3_2_decomposition() {
+        pyre_interpreter::test_hooks::install_hash_hook();
+        pyre_interpreter::typedef::init_typeobjects();
+        let _ = type_object();
+        let legacy = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: true,
+        });
+        let modern = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: false,
+        });
+        // U+1D2C is unassigned in 3.2.0, so the 3.2 view leaves it alone;
+        // the current tables compatibility-decompose it to 'A'.
+        let nfkd = w_str_new("NFKD");
+        let ch = w_str_new("\u{1d2c}");
+        let legacy_out = W_UCD::from_obj(legacy)
+            .unwrap()
+            .normalize(&[legacy, nfkd, ch])
+            .expect("legacy normalize");
+        let modern_out = W_UCD::from_obj(modern)
+            .unwrap()
+            .normalize(&[modern, nfkd, ch])
+            .expect("modern normalize");
+        assert_eq!(
+            unsafe { w_str_get_wtf8(legacy_out) }.to_string(),
+            "\u{1d2c}"
+        );
+        assert_eq!(unsafe { w_str_get_wtf8(modern_out) }.to_string(), "A");
     }
 }

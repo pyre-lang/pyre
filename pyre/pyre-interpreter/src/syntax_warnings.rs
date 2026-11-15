@@ -785,9 +785,6 @@ pub fn compile_with_codegen_warnings_and_module(
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(module);
     let source = crate::compile::universal_newline(source);
-    let filename_s = filename.to_string_lossy();
-    crate::lazyimport::check_misplaced_lazy_import(&source, filename_s.as_ref(), mode)
-        .map_err(SourceCompileError::Compile)?;
     emit_tokenizer_syntax_warnings_and_module(
         &source,
         filename,

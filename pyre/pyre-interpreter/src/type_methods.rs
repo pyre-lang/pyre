@@ -12,13 +12,9 @@
 use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
 use pyre_object::*;
-// `classify`/`case`/`identifier` back the `str` predicate and `casefold`
-// methods with the runtime-independent Unicode tables shared with the
-// `unicodedata` module.  Those tables track Unicode 17.0.0, one release ahead
-// of Python 3.14's 16.0.0, so predicates read a property on the ~500 code
-// points release 17 newly assigns (unassigned under 16.0.0) — the same
-// data-version skew already noted in `module/unicodedata`, kept consistent
-// across `str` and `unicodedata` here.
+// `classify`/`case`/`identifier` back the `str` predicate and case-mapping
+// methods with the runtime-independent Unicode 17.0.0 tables shared with the
+// `unicodedata` module. Rust 1.100's `char`/`str` tables are Unicode 18.0.0.
 use rustpython_unicode::{case, classify, identifier};
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 // ── Arity checks for builtin methods ─────────────────────────────────
@@ -2231,8 +2227,8 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `unicodeobject.py W_UnicodeObject._upper_unicode` is `@jit.elidable`.
 #[majit_macros::elidable]
 unsafe fn upper_unicode(obj: PyObjectRef) -> PyObjectRef {
-    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
-    w_str_from_wtf8_managed(wtf8_map_str_runs(&s, str::to_uppercase))
+    let s = unsafe { w_str_get_wtf8(obj) };
+    w_str_from_wtf8_managed(case::uppercase_wtf8(s))
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2243,8 +2239,8 @@ pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `unicodeobject.py W_UnicodeObject._lower_unicode` is `@jit.elidable`.
 #[majit_macros::elidable]
 unsafe fn lower_unicode(obj: PyObjectRef) -> PyObjectRef {
-    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
-    w_str_from_wtf8_managed(wtf8_map_str_runs(&s, str::to_lowercase))
+    let s = unsafe { w_str_get_wtf8(obj) };
+    w_str_from_wtf8_managed(case::lowercase_wtf8(s))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5384,27 +5380,6 @@ pub fn call_registered_encode_error_handler(
     Ok((replacement, newpos as usize))
 }
 
-fn wtf8_map_str_runs(s: &Wtf8, f: impl Fn(&str) -> String) -> Wtf8Buf {
-    let mut out = Wtf8Buf::with_capacity(s.len());
-    let mut run = String::new();
-    for cp in s.code_points() {
-        match cp.to_char() {
-            Some(c) => run.push(c),
-            None => {
-                if !run.is_empty() {
-                    out.push_str(&f(&run));
-                    run.clear();
-                }
-                out.push(cp);
-            }
-        }
-    }
-    if !run.is_empty() {
-        out.push_str(&f(&run));
-    }
-    out
-}
-
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "isdigit")?;
     // A lone surrogate satisfies no character class, so a non-UTF-8
@@ -5447,13 +5422,13 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // any other non-cased code point (the `None` arm / `else`).
         match cp.to_char() {
             Some(c) => {
-                if c.is_uppercase() || case::is_titlecase(c) {
+                if case::is_uppercase(c) || case::is_titlecase(c) {
                     if prev_cased {
                         return Ok(w_bool_from(false));
                     }
                     prev_cased = true;
                     cased = true;
-                } else if c.is_lowercase() {
+                } else if case::is_lowercase(c) {
                     if !prev_cased {
                         return Ok(w_bool_from(false));
                     }
@@ -6029,9 +6004,15 @@ fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
         // (Lu + Other_Uppercase) nor `is_lowercase` (Ll + Other_Lowercase);
         // it disqualifies both predicates.
         let (rejects, qualifies) = if want_upper {
-            (c.is_lowercase() || case::is_titlecase(c), c.is_uppercase())
+            (
+                case::is_lowercase(c) || case::is_titlecase(c),
+                case::is_uppercase(c),
+            )
         } else {
-            (c.is_uppercase() || case::is_titlecase(c), c.is_lowercase())
+            (
+                case::is_uppercase(c) || case::is_titlecase(c),
+                case::is_lowercase(c),
+            )
         };
         if rejects {
             return false;

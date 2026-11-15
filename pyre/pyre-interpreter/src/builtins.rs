@@ -30272,7 +30272,7 @@ mod tests {
         for b in &bigs {
             assert_eq!(
                 _hash_long(b),
-                rustpython_common::hash::hash_bigint(&crate::rbigint_to_compiler_bigint(b)),
+                rustpython_common::hash::hash_bigint(&crate::rbigint_to_compiler_bigint(b)) as i64,
                 "rbigint.hash vs independent compiler-bigint hash"
             );
         }
@@ -30330,7 +30330,7 @@ mod tests {
         for &f in &cases {
             assert_eq!(
                 Some(_hash_float(f)),
-                hash::hash_float(f),
+                hash::hash_float(f).map(|h| h as i64),
                 "hash_float divergence for {f}"
             );
         }

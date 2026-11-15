@@ -124,7 +124,6 @@ pub fn compile_source_with_opts(
         ..opts
     };
     let source = universal_newline(source);
-    crate::lazyimport::check_misplaced_lazy_import(&source, filename, mode)?;
     match rp_compile(&source, mode, filename, opts.clone()) {
         Ok(mut code) => {
             crate::pycode::fixup_code_get_iter(&mut code);

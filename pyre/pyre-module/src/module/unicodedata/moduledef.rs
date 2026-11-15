@@ -9,7 +9,7 @@ use super::interp_ucd;
 pyre_interpreter::py_module! {
     "unicodedata",
     interpleveldefs: {
-        "unidata_version" => w_str_new(&rustpython_unicode::unicode_version()),
+        "unidata_version" => w_str_new(rustpython_unicode::UNICODE_VERSION),
     },
     functions: {
         "category"         / 1 = interp_ucd::category,
