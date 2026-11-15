@@ -58,6 +58,9 @@ const CODEGEN_CACHE_STALE_VERSION: std::time::Duration =
 /// Names the directory the two settings above are read out of.
 const CODEGEN_CACHE_DIR_ENV: &str = "PYRE_JIT_TRACE_CACHE_DIR";
 const CODEGEN_CACHE_ENTRIES_ENV: &str = "PYRE_JIT_TRACE_CACHE_ENTRIES";
+/// Names the largest peak resident set size, in MiB, this build script may
+/// reach. Unset: the peak is only reported.
+const PEAK_RSS_BUDGET_ENV: &str = "PYRE_PREPASS_PEAK_RSS_BUDGET_MIB";
 /// Rewritten on every cache hit; its mtime is the entry's last-use stamp.
 const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
@@ -879,6 +882,40 @@ fn run_worker() {
         .expect("spawn build-script worker")
         .join()
         .expect("build-script worker panicked");
+    check_peak_rss_budget();
+}
+
+/// Report the peak resident set size of this build script, and fail the
+/// build when it is above [`PEAK_RSS_BUDGET_ENV`]. The peak covers whatever
+/// the worker did: a cache hit stays small, an analysis run is the prepass.
+/// Under `CI` the report is a cargo warning, so it shows in the job log.
+fn check_peak_rss_budget() {
+    let peak_mib = majit_translate::peak_rss_bytes() / (1024 * 1024);
+    if peak_mib == 0 {
+        // No `getrusage` on this platform.
+        return;
+    }
+    let budget_mib = std::env::var(PEAK_RSS_BUDGET_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let budget_text = match budget_mib {
+        Some(budget) => format!(" (budget {budget} MiB)"),
+        None => String::new(),
+    };
+    let report = format!("[pyre-jit-trace build.rs] peak RSS {peak_mib} MiB{budget_text}");
+    if std::env::var_os("CI").is_some() {
+        println!("cargo::warning={report}");
+    } else {
+        eprintln!("{report}");
+    }
+    if budget_mib.is_some_and(|budget| peak_mib > budget) {
+        eprintln!(
+            "[pyre-jit-trace build.rs] error: the build script's peak RSS is above \
+             {PEAK_RSS_BUDGET_ENV}. Find what raised the prepass working set before \
+             raising the budget."
+        );
+        std::process::exit(1);
+    }
 }
 
 fn opcode_published_descr_members(
@@ -2473,6 +2510,7 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     // to re-run this script when they move so the outputs land in, and are
     // pruned against, the directory now in force.
     println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_DIR_ENV}");
+    println!("cargo::rerun-if-env-changed={PEAK_RSS_BUDGET_ENV}");
     println!("cargo::rerun-if-env-changed=CI");
     println!("cargo::rerun-if-env-changed=PYRE_SHARED_BUILD");
     println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_ENTRIES_ENV}");

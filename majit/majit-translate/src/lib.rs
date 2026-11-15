@@ -1123,7 +1123,7 @@ impl Default for PhaseProfiler {
 /// so the difference between two marks is what the span between them added to
 /// the peak. macOS reports bytes, Linux kilobytes.
 #[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+pub fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return 0;
@@ -1137,7 +1137,7 @@ fn peak_rss_bytes() -> u64 {
 }
 
 #[cfg(not(unix))]
-fn peak_rss_bytes() -> u64 {
+pub fn peak_rss_bytes() -> u64 {
     0
 }
 
