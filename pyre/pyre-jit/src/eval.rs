@@ -9985,7 +9985,7 @@ fn tuple_hash_merge_point_jit(
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
     let hot = driver
         .meta_interp_mut()
-        .maybe_compile_and_run_step_on_driver(jd_no, cell_key, (0, 0), &[])
+        .maybe_compile_and_run_step_on_driver(jd_no, cell_key, 0, 0, &[])
         .0;
     match hot {
         majit_metainterp::warmstate::HotResult::StartTracing => {
@@ -10085,7 +10085,8 @@ fn drive_tuple_hash_trace(
         install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(
             green_key,
-            (0, 0),
+            0,
+            0,
             Some((&gk.values, &gk.types)),
             Some(std::sync::Arc::new(descriptor)),
             &live_values,
