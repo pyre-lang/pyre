@@ -30,6 +30,26 @@ pub fn rsocket_startup() {
 #[cfg(not(windows))]
 pub fn rsocket_startup() {}
 
+/// `rsocket.py` `constants`: `_c.constants` plus the `AF_ALG` names it
+/// adds when the headers leave them out.
+pub fn constants() -> impl Iterator<Item = (&'static str, i64)> {
+    const AF_ALG_EXTRAS: &[(&str, i64)] = &[
+        ("SOL_ALG", 279),
+        ("ALG_SET_AEAD_ASSOCLEN", 4),
+        ("ALG_SET_AEAD_AUTHSIZE", 5),
+        ("ALG_OP_SIGN", 2),
+        ("ALG_OP_VERIFY", 3),
+    ];
+    crate::_rsocket_rffi::CONSTANTS
+        .iter()
+        .copied()
+        .chain(AF_ALG_EXTRAS.iter().copied().filter(|(name, _)| {
+            !crate::_rsocket_rffi::CONSTANTS
+                .iter()
+                .any(|(existing, _)| existing == name)
+        }))
+}
+
 #[cfg(unix)]
 type Fd = INT;
 #[cfg(windows)]
@@ -632,10 +652,34 @@ pub fn close(fd: INT) -> Result<(), CSocketError> {
     Ok(())
 }
 
-/// `accept`. The bytes are a `sockaddr_storage`. The new descriptor has
-/// `FD_CLOEXEC` set. `addrlen` is the length the call wrote.
+/// `RSocket.accept`. The bytes are a `sockaddr_storage`. The new descriptor
+/// has `FD_CLOEXEC` set. `addrlen` is the length the call wrote.
+///
+/// `HAS_AF_ALG` sockets pass a NULL address buffer (`RSocket.accept`).
 #[cfg(unix)]
-pub fn accept(fd: INT) -> Result<(INT, Vec<u8>, i32), CSocketError> {
+pub fn accept(fd: INT, family: SIGNED) -> Result<(INT, Vec<u8>, i32), CSocketError> {
+    #[cfg(rsocket_have_sockaddr_alg)]
+    if family as i64 == af_alg() {
+        let newfd = unsafe {
+            crate::_rsocket_rffi::socketaccept(fd, core::ptr::null_mut(), core::ptr::null_mut())
+        };
+        if newfd < 0 {
+            return Err(last_error());
+        }
+        unsafe {
+            crate::_rsocket_rffi::fcntl(newfd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        storage.ss_family = family as libc::sa_family_t;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const storage).cast::<u8>(),
+                std::mem::size_of::<libc::sockaddr_storage>(),
+            )
+        };
+        return Ok((newfd, bytes.to_vec(), 0));
+    }
+    let _ = family;
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let newfd = unsafe {
@@ -836,6 +880,110 @@ pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
     Ok(result)
 }
 
+/// `rsocket.py` `HAS_AF_ALG` / `AF_ALG` from `constants`.
+#[cfg(rsocket_have_sockaddr_alg)]
+pub fn af_alg() -> i64 {
+    constants()
+        .find(|(name, _)| *name == "AF_ALG")
+        .map(|(_, value)| value)
+        .expect("AF_ALG")
+}
+
+/// `rsocket.py` `class AlgAddress(Address)`.
+#[cfg(rsocket_have_sockaddr_alg)]
+pub struct AlgAddress {
+    addr: crate::_rsocket_rffi::sockaddr_alg,
+}
+
+#[cfg(rsocket_have_sockaddr_alg)]
+impl AlgAddress {
+    /// `AlgAddress.__init__`.
+    pub fn new(algtype: &[u8], algname: &[u8], salg_feat: i64, salg_mask: i64) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_alg = unsafe { std::mem::zeroed() };
+        crate::setintfield!(&mut addr, c_salg_family, af_alg());
+        unsafe {
+            crate::rffi::str2chararray(algtype, addr.c_salg_type.as_mut_ptr().cast(), 14);
+            crate::setintfield!(&mut addr, c_salg_feat, salg_feat);
+            crate::setintfield!(&mut addr, c_salg_mask, salg_mask);
+            crate::rffi::str2chararray(algname, addr.c_salg_name.as_mut_ptr().cast(), 64);
+        }
+        Self { addr }
+    }
+
+    /// Copy a `sockaddr_alg` out of `sockaddr_storage` bytes.
+    pub fn from_sockaddr(bytes: &[u8]) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_alg = unsafe { std::mem::zeroed() };
+        let n = bytes.len().min(std::mem::size_of_val(&addr));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut addr).cast::<u8>(), n);
+        }
+        Self { addr }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (&raw const self.addr).cast::<u8>(),
+                std::mem::size_of_val(&self.addr),
+            )
+        }
+    }
+}
+
+/// `rsocket.py` `HAS_AF_QIPCRTR` / `AF_QIPCRTR` from `constants`.
+#[cfg(rsocket_have_sockaddr_qrtr)]
+pub fn af_qipcrtr() -> i64 {
+    constants()
+        .find(|(name, _)| *name == "AF_QIPCRTR")
+        .map(|(_, value)| value)
+        .expect("AF_QIPCRTR")
+}
+
+/// `rsocket.py` `class QrtrAddress(Address)`.
+#[cfg(rsocket_have_sockaddr_qrtr)]
+pub struct QrtrAddress {
+    addr: crate::_rsocket_rffi::sockaddr_qrtr,
+}
+
+#[cfg(rsocket_have_sockaddr_qrtr)]
+impl QrtrAddress {
+    /// `QrtrAddress.__init__`.
+    pub fn new(node: i64, port: i64) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_qrtr = unsafe { std::mem::zeroed() };
+        crate::setintfield!(&mut addr, c_sq_family, af_qipcrtr());
+        crate::setintfield!(&mut addr, c_sq_node, node);
+        crate::setintfield!(&mut addr, c_sq_port, port);
+        Self { addr }
+    }
+
+    /// `QrtrAddress.get_data`. Unsigned fields widen to a non-negative `i64`.
+    pub fn get_data(&self) -> (i64, i64) {
+        (
+            crate::rffi::cast::<i64>(self.addr.c_sq_node),
+            crate::rffi::cast::<i64>(self.addr.c_sq_port),
+        )
+    }
+
+    /// Copy a `sockaddr_qrtr` out of `sockaddr_storage` bytes.
+    pub fn from_sockaddr(bytes: &[u8]) -> Self {
+        let mut addr: crate::_rsocket_rffi::sockaddr_qrtr = unsafe { std::mem::zeroed() };
+        let n = bytes.len().min(std::mem::size_of_val(&addr));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut addr).cast::<u8>(), n);
+        }
+        Self { addr }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (&raw const self.addr).cast::<u8>(),
+                std::mem::size_of_val(&self.addr),
+            )
+        }
+    }
+}
+
 #[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 fn defining_module() -> &'static str {
     module_path!()
@@ -844,6 +992,41 @@ fn defining_module() -> &'static str {
 #[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn constants_table() {
+        let table: Vec<_> = constants().collect();
+        let lookup = |name: &str| table.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        assert_eq!(lookup("AF_INET"), Some(i64::from(libc::AF_INET)));
+        assert_eq!(lookup("SOCK_STREAM"), Some(i64::from(libc::SOCK_STREAM)));
+        assert_eq!(lookup("SOMAXCONN"), Some(i64::from(libc::SOMAXCONN)));
+        assert_eq!(lookup("INADDR_NONE"), Some(0xffff_ffff));
+        assert!(lookup("SOL_ALG").is_some());
+        assert!(lookup("ALG_SET_PUB_KEY").is_none());
+        for (i, (name, _)) in table.iter().enumerate() {
+            assert!(
+                table[..i].iter().all(|(n, _)| n != name),
+                "duplicate {name}"
+            );
+        }
+    }
+
+    #[cfg(rsocket_have_sockaddr_alg)]
+    #[test]
+    fn alg_address_writes_family_and_names() {
+        let addr = AlgAddress::new(b"hash", b"sha256", 1, 2);
+        let bytes = addr.as_bytes();
+        assert!(bytes.len() >= 2);
+        let roundtrip = AlgAddress::from_sockaddr(bytes);
+        assert_eq!(roundtrip.as_bytes(), bytes);
+        assert_eq!(
+            crate::getintfield!(&addr.addr, c_salg_family) as i64,
+            af_alg()
+        );
+        assert_eq!(crate::getintfield!(&addr.addr, c_salg_feat), 1);
+        assert_eq!(crate::getintfield!(&addr.addr, c_salg_mask), 2);
+    }
 
     #[test]
     fn stream_socket_option_and_family() {
@@ -1109,13 +1292,19 @@ mod tests {
                 libc::poll(&raw mut pfd, 1, 2000) > 0,
                 "listener not readable"
             );
-            let (newfd, bytes, addrlen) = accept(listener).expect("accept");
+            let (newfd, bytes, addrlen) =
+                accept(listener, libc::AF_INET as SIGNED).expect("accept");
             assert!(newfd >= 0);
             assert!(addrlen > 0);
             assert_eq!(bytes.len(), std::mem::size_of::<libc::sockaddr_storage>());
             let flags = crate::_rsocket_rffi::fcntl(newfd, libc::F_GETFD, 0);
             assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
-            assert_eq!(accept(-1).expect_err("bad fd").errno, libc::EBADF);
+            assert_eq!(
+                accept(-1, libc::AF_INET as SIGNED)
+                    .expect_err("bad fd")
+                    .errno,
+                libc::EBADF
+            );
             close(newfd).expect("close accepted");
             close(listener).expect("close listener");
         }

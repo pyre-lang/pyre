@@ -1,6 +1,8 @@
 //! `clibffi` `cConfig` (`configure_simple_type`), `rdynload` `cConfig`
 //! (`DefinedConstantInteger` RTLD_*), `rtime` `cConfig` (Struct / Has /
-//! `DefinedConstantInteger` CLOCK_*), `rposix` `cConfig` (the module-level
+//! `DefinedConstantInteger` CLOCK_*), `_rsocket_rffi` `CConfig`
+//! (`DefinedConstantInteger` / Windows `ConstantInteger` socket constants),
+//! `rposix` `cConfig` (the module-level
 //! `configure(CConfig)`), `rposix.py` `pipe_config`, `advise_config`, and
 //! the "f... and ...at families" `CConfig`, the `AT_*`/`UTIME_*`/
 //! `TIMESPEC` `CConfig`, `ConfConfig` (`pathconf_consts_defs` /
@@ -60,6 +62,8 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rposix_have_sched_getparam)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_memfd_create)");
     println!("cargo:rustc-check-cfg=cfg(rposix_have_unshare)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_qrtr)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_alg)");
     let pipe_config = if target_is_unix_or_windows() {
         Some(rposix_pipe_config())
     } else {
@@ -87,6 +91,11 @@ fn main() {
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         write_rtime_cconfig();
     }
+    let rsocket_haves = if target_is_unix_or_windows() {
+        write_rsocket_cconfig()
+    } else {
+        RsocketHaves::default()
+    };
     majit_eci::build::compile_crate_ecis(&ExternalCompilationInfo {
         pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
         ..Default::default()
@@ -107,6 +116,14 @@ fn main() {
         haves.memfd_create as u8
     );
     println!("cargo::metadata=HAVE_UNSHARE={}", haves.unshare as u8);
+    println!(
+        "cargo::metadata=HAVE_SOCKADDR_QRTR={}",
+        rsocket_haves.sockaddr_qrtr as u8
+    );
+    println!(
+        "cargo::metadata=HAVE_SOCKADDR_ALG={}",
+        rsocket_haves.sockaddr_alg as u8
+    );
 }
 
 fn target_is_unix_or_windows() -> bool {
@@ -1662,6 +1679,843 @@ fn rtime_libraries(target_os: &str) -> Vec<String> {
         vec!["rt".into()]
     } else {
         vec![]
+    }
+}
+
+/// `_rsocket_rffi.py` `constant_names`.
+const RSOCKET_CONSTANT_NAMES: &[&str] = &[
+    "AF_AAL5",
+    "AF_ALG",
+    "AF_APPLETALK",
+    "AF_ASH",
+    "AF_ATMPVC",
+    "AF_ATMSVC",
+    "AF_AX25",
+    "AF_BLUETOOTH",
+    "AF_BRIDGE",
+    "AF_CAN",
+    "AD_DECnet",
+    "AF_DEC",
+    "AF_DECnet",
+    "AF_DIVERT",
+    "AF_ECONET",
+    "AF_HYPERV",
+    "AF_INET",
+    "AF_INET6",
+    "AF_IPX",
+    "AF_IRDA",
+    "AF_KEY",
+    "AF_LINK",
+    "AF_LLC",
+    "AF_NETBEUI",
+    "AF_NETLINK",
+    "AF_NETROM",
+    "AF_PACKET",
+    "AF_PPPOX",
+    "AF_QIPCRTR",
+    "AF_RDS",
+    "AF_ROSE",
+    "AF_ROUTE",
+    "AF_SECURITY",
+    "AF_SNA",
+    "AF_SYSTEM",
+    "AF_TIPC",
+    "AF_UNIX",
+    "AF_VSOCK",
+    "AF_WANPIPE",
+    "AF_X25",
+    "AF_UNSPEC",
+    "AI_ADDRCONFIG",
+    "AI_ALL",
+    "AI_CANONNAME",
+    "AI_DEFAULT",
+    "AI_MASK",
+    "AI_NUMERICHOST",
+    "AI_NUMERICSERV",
+    "AI_PASSIVE",
+    "AI_V4MAPPED",
+    "AI_V4MAPPED_CFG",
+    "BTPROTO_HCI",
+    "BTPROTO_L2CAP",
+    "BTPROTO_SCO",
+    "BTPROTO_RFCOMM",
+    "ALG_OP_DECRYPT",
+    "ALG_OP_ENCRYPT",
+    "ALG_OP_SIGN",
+    "ALG_OP_VERIFY",
+    "ALG_SET_AEAD_ASSOCLEN",
+    "ALG_SET_AEAD_AUTHSIZE",
+    "ALG_SET_IV",
+    "ALG_SET_KEY",
+    "ALG_SET_OP",
+    "ALG_SET_PUBKEY",
+    "SOL_ALG",
+    "HCI_DATA_DIR",
+    "HCI_FILTER",
+    "HCI_TIME_STAMP",
+    "HV_PROTOCOL_RAW",
+    "HVSOCKET_ADDRESS_FLAG_PASSTHRU",
+    "HVSOCKET_CONNECTED_SUSPEND",
+    "HVSOCKET_CONNECT_TIMEOUT",
+    "HVSOCKET_CONNECT_TIMEOUT_MAX",
+    "INADDR_ALLHOSTS_GROUP",
+    "INADDR_ANY",
+    "INADDR_BROADCAST",
+    "INADDR_LOOPBACK",
+    "INADDR_MAX_LOCAL_GROUP",
+    "INADDR_NONE",
+    "INADDR_UNSPEC_GROUP",
+    "IOCTL_VM_SOCKETS_GET_LOCAL_CID",
+    "EAI_ADDRFAMILY",
+    "EAI_AGAIN",
+    "EAI_BADFLAGS",
+    "EAI_BADHINTS",
+    "EAI_FAIL",
+    "EAI_FAMILY",
+    "EAI_MAX",
+    "EAI_MEMORY",
+    "EAI_NODATA",
+    "EAI_NONAME",
+    "EAI_OVERFLOW",
+    "EAI_PROTOCOL",
+    "EAI_SERVICE",
+    "EAI_SOCKTYPE",
+    "EAI_SYSTEM",
+    "IPPROTO_AH",
+    "IPPROTO_BIP",
+    "IPPROTO_CBT",
+    "IPPROTO_DSTOPTS",
+    "IPPROTO_EGP",
+    "IPPROTO_EON",
+    "IPPROTO_ESP",
+    "IPPROTO_FRAGMENT",
+    "IPPROTO_GGP",
+    "IPPROTO_GRE",
+    "IPPROTO_HELLO",
+    "IPPROTO_HOPOPTS",
+    "IPPROTO_ICLFXBM",
+    "IPPROTO_ICMPV6",
+    "IPPROTO_IDP",
+    "IPPROTO_IGP",
+    "IPPROTO_IGMP",
+    "IPPROTO_IPCOMP",
+    "IPPROTO_IPIP",
+    "IPPROTO_IPV4",
+    "IPPROTO_IPV6",
+    "IPPROTO_L2TP",
+    "IPPROTO_MAX",
+    "IPPROTO_MOBILE",
+    "IPPROTO_ND",
+    "IPPROTO_NONE",
+    "IPPROTO_PGM",
+    "IPPROTO_PIM",
+    "IPPROTO_PUP",
+    "IPPROTO_RDP",
+    "IPPROTO_ROUTING",
+    "IPPROTO_RSVP",
+    "IPPROTO_MPTCP",
+    "IPPROTO_ST",
+    "IPPROTO_TCP",
+    "IPPROTO_TP",
+    "IPPROTO_UDPLITE",
+    "IPPROTO_VRRP",
+    "IPPROTO_XTP",
+    "IPPROTO_SCTP",
+    "IPV6_CHECKSUM",
+    "IPV6_DONTFRAG",
+    "IPV6_DSTOPTS",
+    "IPV6_HOPLIMIT",
+    "IPV6_HOPOPTS",
+    "IPV6_JOIN_GROUP",
+    "IPV6_LEAVE_GROUP",
+    "IPV6_MULTICAST_HOPS",
+    "IPV6_MULTICAST_IF",
+    "IPV6_MULTICAST_LOOP",
+    "IPV6_NEXTHOP",
+    "IPV6_PATHMTU",
+    "IPV6_PKTINFO",
+    "IPV6_RECVDSTOPTS",
+    "IPV6_RECVHOPLIMIT",
+    "IPV6_RECVHOPOPTS",
+    "IPV6_RECVPATHMTU",
+    "IPV6_RECVPKTINFO",
+    "IPV6_RECVRTHDR",
+    "IPV6_RECVTCLASS",
+    "IPV6_RTHDR",
+    "IPV6_RTHDRDSTOPTS",
+    "IPV6_RTHDR_TYPE_0",
+    "IPV6_TCLASS",
+    "IPV6_UNICAST_HOPS",
+    "IPV6_USE_MIN_MTU",
+    "IPV6_V6ONLY",
+    "IP_ADD_MEMBERSHIP",
+    "IP_ADD_SOURCE_MEMBERSHIP",
+    "IP_BIND_ADDRESS_NO_PORT",
+    "IP_BLOCK_SOURCE",
+    "IP_DEFAULT_MULTICAST_LOOP",
+    "IP_DEFAULT_MULTICAST_TTL",
+    "IP_DROP_MEMBERSHIP",
+    "IP_DROP_SOURCE_MEMBERSHIP",
+    "IP_HDRINCL",
+    "IP_MAX_MEMBERSHIPS",
+    "IP_MULTICAST_IF",
+    "IP_MULTICAST_LOOP",
+    "IP_MULTICAST_TTL",
+    "IP_OPTIONS",
+    "IP_PKTINFO",
+    "IP_RECVDSTADDR",
+    "IP_RECVOPTS",
+    "IP_RECVRETOPTS",
+    "IP_RECVTOS",
+    "IP_RETOPTS",
+    "IP_TOS",
+    "IP_TRANSPARENT",
+    "IP_TTL",
+    "IP_UNBLOCK_SOURCE",
+    "MSG_BCAST",
+    "MSG_BTAG",
+    "MSG_CMSG_CLOEXEC",
+    "MSG_CONFIRM",
+    "MSG_CTRUNC",
+    "MSG_DONTROUTE",
+    "MSG_DONTWAIT",
+    "MSG_EOF",
+    "MSG_ERRQUEUE",
+    "MSG_EOR",
+    "MSG_ETAG",
+    "MSG_FASTOPEN",
+    "MSG_MCAST",
+    "MSG_MORE",
+    "MSG_NOSIGNAL",
+    "MSG_NOTIFICATION",
+    "MSG_OOB",
+    "MSG_PEEK",
+    "MSG_TRUNC",
+    "MSG_WAITALL",
+    "NI_DGRAM",
+    "NI_IDN",
+    "NI_MAXHOST",
+    "NI_MAXSERV",
+    "NI_NAMEREQD",
+    "NI_NOFQDN",
+    "NI_NUMERICHOST",
+    "NI_NUMERICSERV",
+    "NETLINK_ARPD",
+    "NETLINK_CRYPTO",
+    "NETLINK_DNRTMSG",
+    "NETLINK_FIREWALL",
+    "NETLINK_IP6_FW",
+    "NETLINK_NFLOG",
+    "NETLINK_ROUTE",
+    "NETLINK_ROUTE6",
+    "NETLINK_SKIP",
+    "NETLINK_TAPBASE",
+    "NETLINK_TCPDIAG",
+    "NETLINK_USERSOCK",
+    "NETLINK_W1",
+    "NETLINK_XFRM",
+    "PACKET_HOST",
+    "PACKET_BROADCAST",
+    "PACKET_MULTICAST",
+    "PACKET_OTHERHOST",
+    "PACKET_OUTGOING",
+    "PACKET_LOOPBACK",
+    "PACKET_FASTROUTE",
+    "PF_CAN",
+    "PF_DIVERT",
+    "PF_PACKET",
+    "PF_RDS",
+    "PF_SYSTEM",
+    "RCVALL_IPLEVEL",
+    "RCVALL_MAX",
+    "RCVALL_OFF",
+    "RCVALL_ON",
+    "RCVALL_SOCKETLEVELONLY",
+    "RDS_CANCEL_SENT_TO",
+    "RDS_CMSG_RDMA_ARGS",
+    "RDS_CMSG_RDMA_DEST",
+    "RDS_CMSG_RDMA_MAP",
+    "RDS_CMSG_RDMA_STATUS",
+    "RDS_CMSG_RDMA_UPDATE",
+    "RDS_CONG_MONITOR",
+    "RDS_FREE_MR",
+    "RDS_GET_MR",
+    "RDS_GET_MR_FOR_DEST",
+    "RDS_RDMA_DONTWAIT",
+    "RDS_RDMA_FENCE",
+    "RDS_RDMA_INVALIDATE",
+    "RDS_RDMA_NOTIFY_ME",
+    "RDS_RDMA_READWRITE",
+    "RDS_RDMA_SILENT",
+    "RDS_RDMA_USE_ONCE",
+    "RDS_RECVERR",
+    "SOCK_DGRAM",
+    "SOCK_RAW",
+    "SOCK_RDM",
+    "SOCK_SEQPACKET",
+    "SOCK_STREAM",
+    "SOCK_CLOEXEC",
+    "SOCK_NONBLOCK",
+    "SOL_SOCKET",
+    "SOL_IPX",
+    "SOL_AX25",
+    "SOL_ATALK",
+    "SOL_NETROM",
+    "SOL_ROSE",
+    "SO_ACCEPTCONN",
+    "SO_BINDTODEVICE",
+    "SO_BINDTOIFINDEX",
+    "SO_BROADCAST",
+    "SO_DEBUG",
+    "SO_DOMAIN",
+    "SO_DONTROUTE",
+    "SO_ERROR",
+    "SO_EXCLUSIVEADDRUSE",
+    "SO_INCOMING_CPU",
+    "SO_J1939_ERRQUEUE",
+    "SO_J1939_FILTER",
+    "SO_J1939_PROMISC",
+    "SO_J1939_SEND_PRIO",
+    "SO_KEEPALIVE",
+    "SO_LINGER",
+    "SO_MARK",
+    "SO_OOBINLINE",
+    "SO_PASSCRED",
+    "SO_PASSSEC",
+    "SO_PEERCRED",
+    "SO_PEERSEC",
+    "SO_PRIORITY",
+    "SO_PROTOCOL",
+    "SO_RCVBUF",
+    "SO_RCVLOWAT",
+    "SO_RCVTIMEO",
+    "SO_REUSEADDR",
+    "SO_REUSEPORT",
+    "SO_RTABLE",
+    "SO_SETFIB",
+    "SO_SNDBUF",
+    "SO_SNDLOWAT",
+    "SO_SNDTIMEO",
+    "SO_TYPE",
+    "SO_USELOOPBACK",
+    "SO_USER_COOKIE",
+    "SO_VM_SOCKETS_BUFFER_MAX_SIZE",
+    "SO_VM_SOCKETS_BUFFER_MIN_SIZE",
+    "SO_VM_SOCKETS_BUFFER_SIZE",
+    "SIO_KEEPALIVE_VALS",
+    "SIO_LOOPBACK_FAST_PATH",
+    "SIO_RCVALL",
+    "SYSPROTO_CONTROL",
+    "TCP_CC_INFO",
+    "TCP_CONGESTION",
+    "TCP_CONNECTION_INFO",
+    "TCP_CORK",
+    "TCP_DEFER_ACCEPT",
+    "TCP_FASTOPEN",
+    "TCP_FASTOPEN_CONNECT",
+    "TCP_FASTOPEN_KEY",
+    "TCP_FASTOPEN_NO_COOKIE",
+    "TCP_INFO",
+    "TCP_INQ",
+    "TCP_KEEPALIVE",
+    "TCP_KEEPCNT",
+    "TCP_KEEPIDLE",
+    "TCP_KEEPINTVL",
+    "TCP_LINGER2",
+    "TCP_MAXSEG",
+    "TCP_MD5SIG",
+    "TCP_MD5SIG_EXT",
+    "TCP_NODELAY",
+    "TCP_NOTSENT_LOWAT",
+    "TCP_QUEUE_SEQ",
+    "TCP_QUICKACK",
+    "TCP_REPAIR",
+    "TCP_REPAIR_OPTIONS",
+    "TCP_REPAIR_QUEUE",
+    "TCP_REPAIR_WINDOW",
+    "TCP_SAVED_SYN",
+    "TCP_SAVE_SYN",
+    "TCP_SYNCNT",
+    "TCP_THIN_DUPACK",
+    "TCP_THIN_LINEAR_TIMEOUTS",
+    "TCP_TIMESTAMP",
+    "TCP_TX_DELAY",
+    "TCP_ULP",
+    "TCP_USER_TIMEOUT",
+    "TCP_WINDOW_CLAMP",
+    "TCP_ZEROCOPY_RECEIVE",
+    "IPX_TYPE",
+    "LOCAL_CREDS",
+    "LOCAL_CREDS_PERSISTENT",
+    "LOCAL_PEERCRED",
+    "SCM_CREDENTIALS",
+    "SCM_CREDS",
+    "SCM_CREDS2",
+    "SCM_J1939_DEST_ADDR",
+    "SCM_J1939_DEST_NAME",
+    "SCM_J1939_ERRQUEUE",
+    "SCM_J1939_PRIO",
+    "SCM_RIGHTS",
+    "CAN_BCM",
+    "CAN_BCM_CAN_FD_FRAME",
+    "CAN_BCM_RX_ANNOUNCE_RESUME",
+    "CAN_BCM_RX_CHANGED",
+    "CAN_BCM_RX_CHECK_DLC",
+    "CAN_BCM_RX_DELETE",
+    "CAN_BCM_RX_FILTER_ID",
+    "CAN_BCM_RX_NO_AUTOTIMER",
+    "CAN_BCM_RX_READ",
+    "CAN_BCM_RX_RTR_FRAME",
+    "CAN_BCM_RX_SETUP",
+    "CAN_BCM_RX_STATUS",
+    "CAN_BCM_RX_TIMEOUT",
+    "CAN_BCM_SETTIMER",
+    "CAN_BCM_STARTTIMER",
+    "CAN_BCM_TX_ANNOUNCE",
+    "CAN_BCM_TX_COUNTEVT",
+    "CAN_BCM_TX_CP_CAN_ID",
+    "CAN_BCM_TX_DELETE",
+    "CAN_BCM_TX_EXPIRED",
+    "CAN_BCM_TX_READ",
+    "CAN_BCM_TX_RESET_MULTI_IDX",
+    "CAN_BCM_TX_SEND",
+    "CAN_BCM_TX_SETUP",
+    "CAN_BCM_TX_STATUS",
+    "CAN_EFF_FLAG",
+    "CAN_EFF_MASK",
+    "CAN_ERR_FLAG",
+    "CAN_ERR_MASK",
+    "CAN_ISOTP",
+    "CAN_J1939",
+    "CAN_RAW",
+    "CAN_RAW_ERR_FILTER",
+    "CAN_RAW_FD_FRAMES",
+    "CAN_RAW_FILTER",
+    "CAN_RAW_JOIN_FILTERS",
+    "CAN_RAW_LOOPBACK",
+    "CAN_RAW_RECV_OWN_MSGS",
+    "CAN_RTR_FLAG",
+    "CAN_SFF_MASK",
+    "J1939_EE_INFO_NONE",
+    "J1939_EE_INFO_TX_ABORT",
+    "J1939_FILTER_MAX",
+    "J1939_IDLE_ADDR",
+    "J1939_MAX_UNICAST_ADDR",
+    "J1939_NLA_BYTES_ACKED",
+    "J1939_NLA_PAD",
+    "J1939_NO_ADDR",
+    "J1939_NO_NAME",
+    "J1939_NO_PGN",
+    "J1939_PGN_ADDRESS_CLAIMED",
+    "J1939_PGN_ADDRESS_COMMANDED",
+    "J1939_PGN_MAX",
+    "J1939_PGN_PDU1_MAX",
+    "J1939_PGN_REQUEST",
+    "ETH_P_ALL",
+    "ETHERTYPE_ARP",
+    "ETHERTYPE_IP",
+    "ETHERTYPE_IPV6",
+    "ETHERTYPE_VLAN",
+    "UDPLITE_RECV_CSCOV",
+    "UDPLITE_SEND_CSCOV",
+    "TIPC_ADDR_ID",
+    "TIPC_ADDR_NAME",
+    "TIPC_ADDR_NAMESEQ",
+    "TIPC_CFG_SRV",
+    "TIPC_CLUSTER_SCOPE",
+    "TIPC_CONN_TIMEOUT",
+    "TIPC_CRITICAL_IMPORTANCE",
+    "TIPC_DEST_DROPPABLE",
+    "TIPC_HIGH_IMPORTANCE",
+    "TIPC_IMPORTANCE",
+    "TIPC_LOW_IMPORTANCE",
+    "TIPC_MEDIUM_IMPORTANCE",
+    "TIPC_NODE_SCOPE",
+    "TIPC_PUBLISHED",
+    "TIPC_SRC_DROPPABLE",
+    "TIPC_SUBSCR_TIMEOUT",
+    "TIPC_SUB_CANCEL",
+    "TIPC_SUB_PORTS",
+    "TIPC_SUB_SERVICE",
+    "TIPC_TOP_SRV",
+    "TIPC_WAIT_FOREVER",
+    "TIPC_WITHDRAWN",
+    "TIPC_ZONE_SCOPE",
+    "VMADDR_CID_ANY",
+    "VMADDR_CID_HOST",
+    "VMADDR_PORT_ANY",
+    "VM_SOCKETS_INVALID_VERSION",
+    "POLLIN",
+    "POLLPRI",
+    "POLLOUT",
+    "POLLERR",
+    "POLLHUP",
+    "POLLNVAL",
+    "POLLRDNORM",
+    "POLLRDBAND",
+    "POLLWRNORM",
+    "POLLWEBAND",
+    "POLLMSG",
+    "FD_READ",
+    "FD_WRITE",
+    "FD_ACCEPT",
+    "FD_CONNECT",
+    "FD_CLOSE",
+    "WSA_WAIT_TIMEOUT",
+    "WSA_WAIT_FAILED",
+    "INFINITE",
+    "FD_CONNECT_BIT",
+    "FD_CLOSE_BIT",
+    "WSA_IO_PENDING",
+    "WSA_IO_INCOMPLETE",
+    "WSA_INVALID_HANDLE",
+    "WSA_INVALID_PARAMETER",
+    "WSA_NOT_ENOUGH_MEMORY",
+    "WSA_OPERATION_ABORTED",
+    "WSA_FLAG_OVERLAPPED",
+    "WSA_FLAG_NO_HANDLE_INHERIT",
+    "SIO_RCVALL",
+    "SIO_KEEPALIVE_VALS",
+    "SIOCGIFNAME",
+    "SIOCGIFINDEX",
+    "SO_DOMAIN",
+    "SO_PROTOCOL",
+    "SO_PEERSEC",
+    "SO_PASSSEC",
+    "TCP_USER_TIMEOUT",
+    "TCP_CONGESTION",
+    "TCP_NOTSENT_LOWAT",
+];
+
+/// `_rsocket_rffi.py` `_WIN32` `ConstantInteger` names some SDKs define with an enum.
+const RSOCKET_WIN32_ENUM_CONSTANT_NAMES: &[&str] = &[
+    "RCVALL_ON",
+    "RCVALL_OFF",
+    "RCVALL_SOCKETLEVELONLY",
+    "TCP_FASTOPEN",
+];
+
+/// `_rsocket_rffi.py` `constants_w_defaults`.
+const RSOCKET_CONSTANTS_W_DEFAULTS: &[(&str, i64)] = &[
+    ("SOL_IP", 0),
+    ("SOL_TCP", 6),
+    ("SOL_UDP", 17),
+    ("SOMAXCONN", 5),
+    ("IPPROTO_IP", 6),
+    ("IPPROTO_IPV6", 41),
+    ("IPPROTO_ICMP", 1),
+    ("IPPROTO_TCP", 6),
+    ("IPPROTO_UDP", 17),
+    ("IPPROTO_RAW", 255),
+    ("IPPORT_RESERVED", 1024),
+    ("IPPORT_USERRESERVED", 5000),
+    ("INADDR_ANY", 0x00000000),
+    ("INADDR_BROADCAST", 0xffffffff),
+    ("INADDR_LOOPBACK", 0x7F000001),
+    ("INADDR_UNSPEC_GROUP", 0xe0000000),
+    ("INADDR_ALLHOSTS_GROUP", 0xe0000001),
+    ("INADDR_MAX_LOCAL_GROUP", 0xe00000ff),
+    ("INADDR_NONE", 0xffffffff),
+    ("SHUT_RD", 0),
+    ("SHUT_WR", 1),
+    ("SHUT_RDWR", 2),
+    ("POLLIN", 1),
+    ("POLLPRI", 2),
+    ("POLLOUT", 4),
+    ("POLLERR", 8),
+    ("POLLHUP", 16),
+    ("FD_SETSIZE", 64),
+];
+
+/// `_rsocket_rffi.py` `eci`.
+fn rsocket_eci() -> ExternalCompilationInfo {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
+    if windows {
+        let mut includes = Vec::new();
+        let libraries = vec!["ws2_32".into(), "Iphlpapi".into()];
+        let mut header_lines = vec![
+            "#include <WinSock2.h>".to_string(),
+            "#include <WS2tcpip.h>".to_string(),
+            // winsock2 defines AF_UNIX, but not sockaddr_un
+            "#undef AF_UNIX".to_string(),
+        ];
+        if target_env == "msvc" {
+            header_lines.extend([
+                "#include <Mstcpip.h>".to_string(),
+                // these types do not exist on microsoft compilers
+                "#ifdef _WIN64".to_string(),
+                "typedef long long ssize_t;".to_string(),
+                "typedef unsigned long long size_t;".to_string(),
+                "#else".to_string(),
+                "typedef int ssize_t;".to_string(),
+                "typedef unsigned int size_t;".to_string(),
+                "#endif".to_string(),
+                "typedef unsigned __int16 uint16_t;".to_string(),
+                "typedef unsigned __int32 uint32_t;".to_string(),
+            ]);
+        } else {
+            includes = vec!["stdint.h".into()];
+            header_lines.extend([
+                "            #ifndef _WIN32_WINNT\n            #define _WIN32_WINNT 0x0501\n            #endif".to_string(),
+                "#define SIO_RCVALL             _WSAIOW(IOC_VENDOR,1)".to_string(),
+                "#define SIO_KEEPALIVE_VALS     _WSAIOW(IOC_VENDOR,4)".to_string(),
+                "#define RCVALL_OFF             0".to_string(),
+                "#define RCVALL_ON              1".to_string(),
+                "#define RCVALL_SOCKETLEVELONLY 2".to_string(),
+                "            #ifndef __MINGW32__\n            struct tcp_keepalive {\n                u_long  onoff;\n                u_long  keepalivetime;\n                u_long  keepaliveinterval;\n            };\n            #endif\n            ".to_string(),
+            ]);
+        }
+        ExternalCompilationInfo {
+            includes,
+            libraries,
+            post_include_bits: vec![header_lines.join("\n"), String::new()],
+            ..Default::default()
+        }
+    } else {
+        let mut includes = vec![
+            "sys/types.h".into(),
+            "sys/socket.h".into(),
+            "sys/un.h".into(),
+            "poll.h".into(),
+            "sys/select.h".into(),
+            "sys/types.h".into(),
+            "netinet/in.h".into(),
+            "netinet/tcp.h".into(),
+            "unistd.h".into(),
+            "fcntl.h".into(),
+            "stdio.h".into(),
+            "netdb.h".into(),
+            "arpa/inet.h".into(),
+            "stdint.h".into(),
+            "errno.h".into(),
+            "limits.h".into(),
+            "net/if.h".into(),
+        ];
+        if target_os == "linux" || target_os == "android" {
+            includes.push("netpacket/packet.h".into());
+            includes.push("sys/ioctl.h".into());
+        }
+        // [3.15-spec] socketmodule.c / socketmodule.h header context that decides which constant_names are defined.
+        let mut pre_include_bits = Vec::new();
+        if std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default() == "apple" {
+            pre_include_bits.push("#define __APPLE_USE_RFC_3542 1".into());
+            includes.push("net/ethernet.h".into());
+            includes.push("sys/sys_domain.h".into());
+            includes.push("sys/kern_control.h".into());
+        } else if target_os == "linux" || target_os == "android" {
+            includes.push("net/ethernet.h".into());
+            // socketmodule.h `HAVE_LINUX_VM_SOCKETS_H`
+            includes.push("linux/vm_sockets.h".into());
+        }
+        let header: String = includes
+            .iter()
+            .map(|filename| format!("#include <{filename}>\n"))
+            .collect();
+        let mut cond_header = "\
+#ifdef AF_NETLINK
+#include <linux/netlink.h>
+#endif
+#ifdef AF_ALG
+#include <linux/if_alg.h>
+#endif
+#ifdef AF_QIPCRTR
+#include <linux/qrtr.h>
+#endif
+"
+        .to_string();
+        // Appended to COND_HEADER so post_include_bits stays the upstream
+        // HEADER / COND_HEADER pair. socketmodule.h `#undef AF_VSOCK` when
+        // `HAVE_LINUX_VM_SOCKETS_H` is absent.
+        if target_os != "linux" && target_os != "android" {
+            cond_header.push_str("#undef AF_VSOCK\n");
+        }
+        let libraries = if target_os == "solaris" || target_os == "illumos" {
+            vec!["socket".into(), "nsl".into()]
+        } else {
+            vec![]
+        };
+        ExternalCompilationInfo {
+            pre_include_bits,
+            includes,
+            libraries,
+            post_include_bits: vec![header, cond_header],
+            ..Default::default()
+        }
+    }
+}
+
+fn rsocket_cconfig_int(results: &[(String, ConfigValue)], name: &str) -> Option<i128> {
+    match cconfig_lookup(results, name) {
+        ConfigValue::Int(v) => Some(*v),
+        ConfigValue::None => None,
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+fn rsocket_constants_insert<'a>(constants: &mut Vec<(&'a str, i128)>, name: &'a str, value: i128) {
+    if let Some((_, slot)) = constants.iter_mut().find(|(n, _)| *n == name) {
+        *slot = value;
+    } else {
+        constants.push((name, value));
+    }
+}
+
+fn rsocket_intmask(name: &str, value: i128) -> i64 {
+    if (0..(1i128 << 64)).contains(&value) {
+        value as u64 as i64
+    } else {
+        i64::try_from(value).unwrap_or_else(|_| panic!("{name} does not fit i64: {value}"))
+    }
+}
+
+/// The `rsocket` probe results `main` re-publishes as cfgs and `cargo::metadata`.
+#[derive(Default)]
+struct RsocketHaves {
+    sockaddr_qrtr: bool,
+    sockaddr_alg: bool,
+}
+
+/// `_rsocket_rffi.py` `CConfig` / `configure(CConfig)`, then `constants`.
+/// Returns whether `cConfig.sockaddr_qrtr` / `cConfig.sockaddr_alg` are structs.
+fn write_rsocket_cconfig() -> RsocketHaves {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let windows = std::env::var("CARGO_CFG_WINDOWS").is_ok();
+    let has_af_packet = target_os == "linux" || target_os == "android";
+
+    let mut entries = Vec::new();
+    for name in RSOCKET_CONSTANT_NAMES {
+        if entries.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    if windows {
+        for name in RSOCKET_WIN32_ENUM_CONSTANT_NAMES {
+            let entry = CConfigEntry::ConstantInteger((*name).into());
+            if let Some((_, slot)) = entries.iter_mut().find(|(n, _)| n == name) {
+                *slot = entry;
+            } else {
+                entries.push(((*name).to_string(), entry));
+            }
+        }
+    }
+    for (name, _) in RSOCKET_CONSTANTS_W_DEFAULTS {
+        if entries.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        entries.push((
+            (*name).to_string(),
+            CConfigEntry::DefinedConstantInteger((*name).into()),
+        ));
+    }
+    // `_rsocket_rffi.py` `CConfig.sockaddr_alg`
+    entries.push((
+        "sockaddr_alg".into(),
+        CConfigEntry::struct_type(
+            "struct sockaddr_alg",
+            vec![
+                ("salg_family".into(), FieldType::int()),
+                (
+                    "salg_type".into(),
+                    FieldType::fixed_array(FieldType::char(), 14),
+                ),
+                ("salg_feat".into(), FieldType::short()),
+                ("salg_mask".into(), FieldType::short()),
+                (
+                    "salg_name".into(),
+                    FieldType::fixed_array(FieldType::char(), 64),
+                ),
+            ],
+            Some("AF_ALG".into()),
+        ),
+    ));
+    // `_rsocket_rffi.py` `CConfig.sockaddr_qrtr`
+    entries.push((
+        "sockaddr_qrtr".into(),
+        CConfigEntry::struct_type(
+            "struct sockaddr_qrtr",
+            vec![
+                ("sq_family".into(), FieldType::int()),
+                ("sq_node".into(), FieldType::int()),
+                ("sq_port".into(), FieldType::int()),
+            ],
+            Some("AF_QIPCRTR".into()),
+        ),
+    ));
+
+    let cconfig = CConfig {
+        compilation_info: rsocket_eci(),
+        entries,
+        single_entries: vec![],
+    };
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
+
+    let ni_maxhost = rsocket_cconfig_int(&results, "NI_MAXHOST").unwrap_or(1025);
+    let ni_maxserv = rsocket_cconfig_int(&results, "NI_MAXSERV").unwrap_or(32);
+
+    let mut constants = Vec::new();
+    let mut names: Vec<&str> = RSOCKET_CONSTANT_NAMES.to_vec();
+    if windows {
+        names.extend_from_slice(RSOCKET_WIN32_ENUM_CONSTANT_NAMES);
+    }
+    for name in names {
+        let value = if name == "NI_MAXHOST" {
+            Some(ni_maxhost)
+        } else if name == "NI_MAXSERV" {
+            Some(ni_maxserv)
+        } else {
+            rsocket_cconfig_int(&results, name)
+        };
+        if let Some(value) = value {
+            rsocket_constants_insert(&mut constants, name, value);
+        }
+    }
+    for (name, default) in RSOCKET_CONSTANTS_W_DEFAULTS {
+        let value = rsocket_cconfig_int(&results, name).unwrap_or(i128::from(*default));
+        rsocket_constants_insert(&mut constants, name, value);
+    }
+    if !has_af_packet {
+        constants.retain(|(n, _)| *n != "AF_PACKET");
+    }
+
+    let mut text = String::from("// _rsocket_rffi.py constants\n");
+    text.push_str("pub const CONSTANTS: &[(&str, i64)] = &[\n");
+    for (name, value) in constants {
+        let value = rsocket_intmask(name, value);
+        text.push_str(&format!("    (\"{name}\", {value}),\n"));
+    }
+    text.push_str("];\n");
+
+    let have_sockaddr_alg = match cconfig_lookup(&results, "sockaddr_alg") {
+        ConfigValue::Struct(layout) => {
+            text.push_str(&layout.rust_struct_source("sockaddr_alg", &[]));
+            println!("cargo:rustc-cfg=rsocket_have_sockaddr_alg");
+            true
+        }
+        ConfigValue::None => false,
+        other => panic!("sockaddr_alg: {other:?}"),
+    };
+    let have_sockaddr_qrtr = match cconfig_lookup(&results, "sockaddr_qrtr") {
+        ConfigValue::Struct(layout) => {
+            text.push_str(&layout.rust_struct_source("sockaddr_qrtr", &[]));
+            println!("cargo:rustc-cfg=rsocket_have_sockaddr_qrtr");
+            true
+        }
+        ConfigValue::None => false,
+        other => panic!("sockaddr_qrtr: {other:?}"),
+    };
+
+    let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("rsocket_cconfig.rs");
+    std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    RsocketHaves {
+        sockaddr_qrtr: have_sockaddr_qrtr,
+        sockaddr_alg: have_sockaddr_alg,
     }
 }
 

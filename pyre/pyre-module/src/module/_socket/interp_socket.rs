@@ -401,6 +401,246 @@ fn socket_writebuf(
     }
 }
 
+/// [3.15-spec] The condition socketmodule.c's `socket_exec` publishes a
+/// `rsocket.constants` name under, where it is more than `#ifdef NAME`.
+/// `moduledef.py` publishes every entry (`if constant in (): continue`);
+/// pyre skips the ones 3.15 would not publish on the same headers.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SocketmoduleGuard {
+    /// Never published by socketmodule.c.
+    Never,
+    /// Published only with a family header (`USE_BLUETOOTH`,
+    /// `HAVE_LINUX_TIPC_H`, `HAVE_LINUX_CAN_*_H`,
+    /// `HAVE_AF_HYPERV`) that `_rsocket_rffi.eci` does not include.
+    FamilyHeader,
+    /// Published only when this other constant is defined.
+    Requires(&'static str),
+    /// `#ifdef MS_WINDOWS` / `SIO_RCVALL`.
+    Windows,
+    /// `#if defined(__APPLE__)`.
+    Apple,
+}
+
+#[cfg(unix)]
+const SOCKETMODULE_GUARDS: &[(&str, SocketmoduleGuard)] = &[
+    // socketmodule.c: never published
+    ("AD_DECnet", SocketmoduleGuard::Never),
+    ("AF_DEC", SocketmoduleGuard::Never),
+    ("NETLINK_ARPD", SocketmoduleGuard::Never),
+    ("NETLINK_ROUTE6", SocketmoduleGuard::Never),
+    ("NETLINK_SKIP", SocketmoduleGuard::Never),
+    ("NETLINK_TAPBASE", SocketmoduleGuard::Never),
+    ("NETLINK_TCPDIAG", SocketmoduleGuard::Never),
+    ("NETLINK_W1", SocketmoduleGuard::Never),
+    ("POLLIN", SocketmoduleGuard::Never),
+    ("POLLPRI", SocketmoduleGuard::Never),
+    ("POLLOUT", SocketmoduleGuard::Never),
+    ("POLLERR", SocketmoduleGuard::Never),
+    ("POLLHUP", SocketmoduleGuard::Never),
+    ("POLLNVAL", SocketmoduleGuard::Never),
+    ("POLLRDNORM", SocketmoduleGuard::Never),
+    ("POLLRDBAND", SocketmoduleGuard::Never),
+    ("POLLWRNORM", SocketmoduleGuard::Never),
+    ("POLLWEBAND", SocketmoduleGuard::Never),
+    ("POLLMSG", SocketmoduleGuard::Never),
+    ("FD_READ", SocketmoduleGuard::Never),
+    ("FD_WRITE", SocketmoduleGuard::Never),
+    ("FD_ACCEPT", SocketmoduleGuard::Never),
+    ("FD_CONNECT", SocketmoduleGuard::Never),
+    ("FD_CLOSE", SocketmoduleGuard::Never),
+    ("WSA_WAIT_TIMEOUT", SocketmoduleGuard::Never),
+    ("WSA_WAIT_FAILED", SocketmoduleGuard::Never),
+    ("INFINITE", SocketmoduleGuard::Never),
+    ("FD_CONNECT_BIT", SocketmoduleGuard::Never),
+    ("FD_CLOSE_BIT", SocketmoduleGuard::Never),
+    ("WSA_IO_PENDING", SocketmoduleGuard::Never),
+    ("WSA_IO_INCOMPLETE", SocketmoduleGuard::Never),
+    ("WSA_INVALID_HANDLE", SocketmoduleGuard::Never),
+    ("WSA_INVALID_PARAMETER", SocketmoduleGuard::Never),
+    ("WSA_NOT_ENOUGH_MEMORY", SocketmoduleGuard::Never),
+    ("WSA_OPERATION_ABORTED", SocketmoduleGuard::Never),
+    ("WSA_FLAG_OVERLAPPED", SocketmoduleGuard::Never),
+    ("WSA_FLAG_NO_HANDLE_INHERIT", SocketmoduleGuard::Never),
+    ("SIOCGIFNAME", SocketmoduleGuard::Never),
+    ("SIOCGIFINDEX", SocketmoduleGuard::Never),
+    ("FD_SETSIZE", SocketmoduleGuard::Never),
+    ("ALG_SET_PUB_KEY", SocketmoduleGuard::Never),
+    // socketmodule.c USE_BLUETOOTH
+    ("AF_BLUETOOTH", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_HCI", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_L2CAP", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_SCO", SocketmoduleGuard::FamilyHeader),
+    ("BTPROTO_RFCOMM", SocketmoduleGuard::FamilyHeader),
+    ("HCI_DATA_DIR", SocketmoduleGuard::FamilyHeader),
+    ("HCI_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("HCI_TIME_STAMP", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_LINUX_TIPC_H
+    ("AF_TIPC", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_ID", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_NAME", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ADDR_NAMESEQ", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CFG_SRV", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CLUSTER_SCOPE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CONN_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_CRITICAL_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_DEST_DROPPABLE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_HIGH_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_LOW_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_MEDIUM_IMPORTANCE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_NODE_SCOPE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_PUBLISHED", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SRC_DROPPABLE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUBSCR_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_CANCEL", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_PORTS", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_SUB_SERVICE", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_TOP_SRV", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_WAIT_FOREVER", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_WITHDRAWN", SocketmoduleGuard::FamilyHeader),
+    ("TIPC_ZONE_SCOPE", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c `#ifdef AF_VSOCK`
+    ("IOCTL_VM_SOCKETS_GET_LOCAL_CID", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_MAX_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_MIN_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("SO_VM_SOCKETS_BUFFER_SIZE", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_CID_ANY", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_CID_HOST", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VMADDR_PORT_ANY", SocketmoduleGuard::Requires("AF_VSOCK")),
+    ("VM_SOCKETS_INVALID_VERSION", SocketmoduleGuard::Requires("AF_VSOCK")),
+    // socketmodule.c HAVE_AF_HYPERV
+    ("AF_HYPERV", SocketmoduleGuard::FamilyHeader),
+    ("HV_PROTOCOL_RAW", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_ADDRESS_FLAG_PASSTHRU", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECTED_SUSPEND", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECT_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("HVSOCKET_CONNECT_TIMEOUT_MAX", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_LINUX_CAN_*_H / HAVE_NETCAN_CAN_H
+    ("SO_J1939_ERRQUEUE", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_PROMISC", SocketmoduleGuard::FamilyHeader),
+    ("SO_J1939_SEND_PRIO", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_DEST_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_DEST_NAME", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_ERRQUEUE", SocketmoduleGuard::FamilyHeader),
+    ("SCM_J1939_PRIO", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_CAN_FD_FRAME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_ANNOUNCE_RESUME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_CHANGED", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_CHECK_DLC", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_DELETE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_FILTER_ID", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_NO_AUTOTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_READ", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_RTR_FRAME", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_SETUP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_STATUS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_RX_TIMEOUT", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_SETTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_STARTTIMER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_ANNOUNCE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_COUNTEVT", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_CP_CAN_ID", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_DELETE", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_EXPIRED", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_READ", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_RESET_MULTI_IDX", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_SEND", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_SETUP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_BCM_TX_STATUS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_EFF_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_EFF_MASK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ERR_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ERR_MASK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_ISOTP", SocketmoduleGuard::FamilyHeader),
+    ("CAN_J1939", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_ERR_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_FD_FRAMES", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_FILTER", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_JOIN_FILTERS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_LOOPBACK", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RAW_RECV_OWN_MSGS", SocketmoduleGuard::FamilyHeader),
+    ("CAN_RTR_FLAG", SocketmoduleGuard::FamilyHeader),
+    ("CAN_SFF_MASK", SocketmoduleGuard::FamilyHeader),
+    ("J1939_EE_INFO_NONE", SocketmoduleGuard::FamilyHeader),
+    ("J1939_EE_INFO_TX_ABORT", SocketmoduleGuard::FamilyHeader),
+    ("J1939_FILTER_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_IDLE_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_MAX_UNICAST_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NLA_BYTES_ACKED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NLA_PAD", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_ADDR", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_NAME", SocketmoduleGuard::FamilyHeader),
+    ("J1939_NO_PGN", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_ADDRESS_CLAIMED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_ADDRESS_COMMANDED", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_PDU1_MAX", SocketmoduleGuard::FamilyHeader),
+    ("J1939_PGN_REQUEST", SocketmoduleGuard::FamilyHeader),
+    // socketmodule.c HAVE_SOCKADDR_ALG
+    ("ALG_OP_DECRYPT", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_ENCRYPT", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_SIGN", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_OP_VERIFY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_AEAD_ASSOCLEN", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_AEAD_AUTHSIZE", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_IV", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_KEY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_OP", SocketmoduleGuard::Requires("AF_ALG")),
+    ("ALG_SET_PUBKEY", SocketmoduleGuard::Requires("AF_ALG")),
+    ("SOL_ALG", SocketmoduleGuard::Requires("AF_ALG")),
+    // socketmodule.c `#ifdef AF_NETLINK`
+    ("NETLINK_CRYPTO", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_DNRTMSG", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_FIREWALL", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_IP6_FW", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_NFLOG", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_ROUTE", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_USERSOCK", SocketmoduleGuard::Requires("AF_NETLINK")),
+    ("NETLINK_XFRM", SocketmoduleGuard::Requires("AF_NETLINK")),
+    // socketmodule.c IPPROTO_UDPLITE
+    ("UDPLITE_RECV_CSCOV", SocketmoduleGuard::Requires("IPPROTO_UDPLITE")),
+    ("UDPLITE_SEND_CSCOV", SocketmoduleGuard::Requires("IPPROTO_UDPLITE")),
+    // socketmodule.c SOL_CAN_RAW
+    ("CAN_RAW", SocketmoduleGuard::Requires("SOL_CAN_RAW")),
+    // socketmodule.c `#ifdef MS_WINDOWS`
+    ("IPPROTO_CBT", SocketmoduleGuard::Windows),
+    ("IPPROTO_ICLFXBM", SocketmoduleGuard::Windows),
+    ("IPPROTO_IGP", SocketmoduleGuard::Windows),
+    ("IPPROTO_L2TP", SocketmoduleGuard::Windows),
+    ("IPPROTO_PGM", SocketmoduleGuard::Windows),
+    ("IPPROTO_RDP", SocketmoduleGuard::Windows),
+    ("IPPROTO_ST", SocketmoduleGuard::Windows),
+    // socketmodule.c `#ifdef SIO_RCVALL`
+    ("RCVALL_IPLEVEL", SocketmoduleGuard::Windows),
+    ("RCVALL_MAX", SocketmoduleGuard::Windows),
+    ("RCVALL_OFF", SocketmoduleGuard::Windows),
+    ("RCVALL_ON", SocketmoduleGuard::Windows),
+    ("RCVALL_SOCKETLEVELONLY", SocketmoduleGuard::Windows),
+    // socketmodule.c `#if defined(__APPLE__) && defined(TCP_KEEPALIVE)`
+    ("TCP_KEEPALIVE", SocketmoduleGuard::Apple),
+];
+
+#[cfg(unix)]
+fn socketmodule_publishes(name: &str) -> bool {
+    for &(n, guard) in SOCKETMODULE_GUARDS {
+        if n == name {
+            return match guard {
+                SocketmoduleGuard::Never
+                | SocketmoduleGuard::FamilyHeader
+                | SocketmoduleGuard::Windows => false,
+                SocketmoduleGuard::Apple => cfg!(target_vendor = "apple"),
+                SocketmoduleGuard::Requires(other) => {
+                    majit_rlib::rsocket::constants().any(|(constant, _)| constant == other)
+                }
+            };
+        }
+    }
+    true
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -413,352 +653,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     #[cfg(any(unix, windows))]
     rffi::init();
 
-    // `_rsocket_rffi.py constant_names` + `:234-262
-    // constants_w_defaults` — populated through the libc crate where
-    // available, hardcoded for platform-specific constants the crate
-    // does not expose.  Mirrors PyPy's
-    // `for constant, value in rsocket.constants.iteritems(): wrap(value)`
-    // loop in `_socket/moduledef.py:48-50`.
+    // `_socket/moduledef.py` `buildloaders`:
+    // `for constant, value in rsocket.constants.iteritems(): wrap(value)`.
     #[cfg(unix)]
-    {
-        macro_rules! cst {
-            ($name:literal, $val:expr) => {
-                pyre_interpreter::__pyre_put_new!(
-                    ns_slot,
-                    $name,
-                    pyre_object::w_int_new($val as i64)
-                );
-            };
+    for (name, value) in majit_rlib::rsocket::constants() {
+        if !socketmodule_publishes(name) {
+            continue;
         }
-        // ── Address families ──
-        cst!("AF_UNSPEC", libc::AF_UNSPEC);
-        cst!("AF_UNIX", libc::AF_UNIX);
-        cst!("AF_INET", libc::AF_INET);
-        cst!("AF_INET6", libc::AF_INET6);
-        cst!("AF_ROUTE", libc::AF_ROUTE);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("AF_PACKET", libc::AF_PACKET);
-            cst!("AF_NETLINK", libc::AF_NETLINK);
-            cst!("AF_VSOCK", libc::AF_VSOCK);
-        }
-        // ── Socket types ──
-        cst!("SOCK_STREAM", libc::SOCK_STREAM);
-        cst!("SOCK_DGRAM", libc::SOCK_DGRAM);
-        cst!("SOCK_RAW", libc::SOCK_RAW);
-        cst!("SOCK_RDM", libc::SOCK_RDM);
-        cst!("SOCK_SEQPACKET", libc::SOCK_SEQPACKET);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("SOCK_CLOEXEC", libc::SOCK_CLOEXEC);
-            cst!("SOCK_NONBLOCK", libc::SOCK_NONBLOCK);
-        }
-        // ── Protocols ──
-        cst!("IPPROTO_IP", libc::IPPROTO_IP);
-        cst!("IPPROTO_HOPOPTS", libc::IPPROTO_HOPOPTS);
-        cst!("IPPROTO_ICMP", libc::IPPROTO_ICMP);
-        cst!("IPPROTO_IGMP", libc::IPPROTO_IGMP);
-        cst!("IPPROTO_IPIP", libc::IPPROTO_IPIP);
-        cst!("IPPROTO_TCP", libc::IPPROTO_TCP);
-        cst!("IPPROTO_EGP", libc::IPPROTO_EGP);
-        cst!("IPPROTO_PUP", libc::IPPROTO_PUP);
-        cst!("IPPROTO_UDP", libc::IPPROTO_UDP);
-        cst!("IPPROTO_IDP", libc::IPPROTO_IDP);
-        cst!("IPPROTO_TP", libc::IPPROTO_TP);
-        cst!("IPPROTO_IPV6", libc::IPPROTO_IPV6);
-        cst!("IPPROTO_ROUTING", libc::IPPROTO_ROUTING);
-        cst!("IPPROTO_FRAGMENT", libc::IPPROTO_FRAGMENT);
-        cst!("IPPROTO_ESP", libc::IPPROTO_ESP);
-        cst!("IPPROTO_AH", libc::IPPROTO_AH);
-        cst!("IPPROTO_ICMPV6", libc::IPPROTO_ICMPV6);
-        cst!("IPPROTO_NONE", libc::IPPROTO_NONE);
-        cst!("IPPROTO_DSTOPTS", libc::IPPROTO_DSTOPTS);
-        cst!("IPPROTO_PIM", libc::IPPROTO_PIM);
-        cst!("IPPROTO_SCTP", libc::IPPROTO_SCTP);
-        cst!("IPPROTO_RAW", libc::IPPROTO_RAW);
-        // libc deprecates this: the kernel raised the value and libc will
-        // follow upstream in a later release (rust-lang/libc#1896). Keep
-        // reading it from libc rather than freezing a literal, so the new
-        // value arrives with the dependency; `socketmodule.c` likewise takes
-        // whatever the platform header defines.
-        #[allow(deprecated)]
-        {
-            cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
-        }
-        cst!("IPPROTO_GRE", libc::IPPROTO_GRE);
-        cst!("IPPROTO_RSVP", libc::IPPROTO_RSVP);
-        // `_rsocket_rffi.py constants_w_defaults` — SOL_IP/TCP/UDP
-        // and IPPROTO_* duplicates kept for PyPy compatibility.
-        cst!("SOL_IP", 0);
-        cst!("SOL_TCP", 6);
-        cst!("SOL_UDP", 17);
-        // ── INADDR_* (host byte order) ──
-        cst!("INADDR_ANY", libc::INADDR_ANY);
-        cst!("INADDR_LOOPBACK", libc::INADDR_LOOPBACK);
-        cst!("INADDR_BROADCAST", libc::INADDR_BROADCAST);
-        cst!("INADDR_NONE", libc::INADDR_NONE);
-        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32);
-        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32);
-        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32);
-        cst!("IPPORT_RESERVED", 1024);
-        cst!("IPPORT_USERRESERVED", 5000);
-        // ── SOL_* / SO_* (socket level) ──
-        cst!("SOL_SOCKET", libc::SOL_SOCKET);
-        cst!("SO_REUSEADDR", libc::SO_REUSEADDR);
-        cst!("SO_REUSEPORT", libc::SO_REUSEPORT);
-        cst!("SO_KEEPALIVE", libc::SO_KEEPALIVE);
-        cst!("SO_BROADCAST", libc::SO_BROADCAST);
-        cst!("SO_DEBUG", libc::SO_DEBUG);
-        cst!("SO_DONTROUTE", libc::SO_DONTROUTE);
-        cst!("SO_LINGER", libc::SO_LINGER);
-        cst!("SO_OOBINLINE", libc::SO_OOBINLINE);
-        cst!("SO_RCVBUF", libc::SO_RCVBUF);
-        cst!("SO_SNDBUF", libc::SO_SNDBUF);
-        cst!("SO_RCVTIMEO", libc::SO_RCVTIMEO);
-        cst!("SO_SNDTIMEO", libc::SO_SNDTIMEO);
-        cst!("SO_RCVLOWAT", libc::SO_RCVLOWAT);
-        cst!("SO_SNDLOWAT", libc::SO_SNDLOWAT);
-        cst!("SO_ERROR", libc::SO_ERROR);
-        cst!("SO_TYPE", libc::SO_TYPE);
-        cst!("SO_ACCEPTCONN", libc::SO_ACCEPTCONN);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("SO_DOMAIN", libc::SO_DOMAIN);
-            cst!("SO_PROTOCOL", libc::SO_PROTOCOL);
-            cst!("SO_PEERCRED", libc::SO_PEERCRED);
-            cst!("SO_PASSCRED", libc::SO_PASSCRED);
-            cst!("SO_PEERSEC", libc::SO_PEERSEC);
-            cst!("SO_PASSSEC", libc::SO_PASSSEC);
-        }
-        // ── TCP-level ──
-        cst!("TCP_NODELAY", libc::TCP_NODELAY);
-        cst!("TCP_MAXSEG", libc::TCP_MAXSEG);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("TCP_KEEPIDLE", libc::TCP_KEEPIDLE);
-            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
-            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
-            cst!("TCP_CORK", libc::TCP_CORK);
-            cst!("TCP_DEFER_ACCEPT", libc::TCP_DEFER_ACCEPT);
-            cst!("TCP_INFO", libc::TCP_INFO);
-            cst!("TCP_LINGER2", libc::TCP_LINGER2);
-            cst!("TCP_QUICKACK", libc::TCP_QUICKACK);
-            cst!("TCP_SYNCNT", libc::TCP_SYNCNT);
-            cst!("TCP_WINDOW_CLAMP", libc::TCP_WINDOW_CLAMP);
-            cst!("TCP_USER_TIMEOUT", libc::TCP_USER_TIMEOUT);
-            cst!("TCP_CONGESTION", libc::TCP_CONGESTION);
-            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
-            cst!("TCP_NOTSENT_LOWAT", libc::TCP_NOTSENT_LOWAT);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            cst!("TCP_KEEPALIVE", libc::TCP_KEEPALIVE);
-        }
-        // ── IP-level ──
-        cst!("IP_TTL", libc::IP_TTL);
-        cst!("IP_TOS", libc::IP_TOS);
-        cst!("IP_MULTICAST_TTL", libc::IP_MULTICAST_TTL);
-        cst!("IP_MULTICAST_LOOP", libc::IP_MULTICAST_LOOP);
-        cst!("IP_MULTICAST_IF", libc::IP_MULTICAST_IF);
-        cst!("IP_ADD_MEMBERSHIP", libc::IP_ADD_MEMBERSHIP);
-        cst!("IP_DROP_MEMBERSHIP", libc::IP_DROP_MEMBERSHIP);
-        cst!("IP_HDRINCL", libc::IP_HDRINCL);
-        // IP_OPTIONS / IP_RECVOPTS / IP_RECVRETOPTS / IP_RETOPTS are
-        // POSIX but the libc crate does not expose them; `_rsocket_rffi.py`
-        // lists them in `constant_names`, and
-        // `platform.DefinedConstantInteger` drops them when the header does
-        // not define them.  The darwin values are spelled out below; on the
-        // other unices they stay unexposed.
-        cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
-        cst!("IP_DEFAULT_MULTICAST_TTL", 1);
-        // `<netinet/in.h>` sizes the membership table per platform: 4095 on
-        // darwin, 20 on linux.
-        #[cfg(target_vendor = "apple")]
-        cst!("IP_MAX_MEMBERSHIPS", 4095);
-        #[cfg(not(target_vendor = "apple"))]
-        cst!("IP_MAX_MEMBERSHIPS", 20);
-        // ── IPv6 ──
-        cst!("IPV6_V6ONLY", libc::IPV6_V6ONLY);
-        cst!("IPV6_MULTICAST_HOPS", libc::IPV6_MULTICAST_HOPS);
-        cst!("IPV6_MULTICAST_LOOP", libc::IPV6_MULTICAST_LOOP);
-        cst!("IPV6_MULTICAST_IF", libc::IPV6_MULTICAST_IF);
-        cst!("IPV6_UNICAST_HOPS", libc::IPV6_UNICAST_HOPS);
-        cst!("IPV6_CHECKSUM", libc::IPV6_CHECKSUM);
-        // `<netinet/in.h>` IPV6_JOIN_GROUP=20 / IPV6_LEAVE_GROUP=21 on Linux;
-        // libc crate omits the symbols on linux-gnu though the kernel headers
-        // define them.  Apple / BSD expose them with the BSD numbering (12 /
-        // 13) — keep using `libc::*` there for header parity.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("IPV6_JOIN_GROUP", 20);
-            cst!("IPV6_LEAVE_GROUP", 21);
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            cst!("IPV6_JOIN_GROUP", libc::IPV6_JOIN_GROUP);
-            cst!("IPV6_LEAVE_GROUP", libc::IPV6_LEAVE_GROUP);
-        }
-        cst!("IPV6_RECVTCLASS", libc::IPV6_RECVTCLASS);
-        cst!("IPV6_TCLASS", libc::IPV6_TCLASS);
-        cst!("IPV6_RECVPKTINFO", libc::IPV6_RECVPKTINFO);
-        cst!("IPV6_PKTINFO", libc::IPV6_PKTINFO);
-        cst!("IPV6_RECVHOPLIMIT", libc::IPV6_RECVHOPLIMIT);
-        cst!("IPV6_HOPLIMIT", libc::IPV6_HOPLIMIT);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            cst!("IPV6_DSTOPTS", libc::IPV6_DSTOPTS);
-            cst!("IPV6_HOPOPTS", libc::IPV6_HOPOPTS);
-            cst!("IPV6_NEXTHOP", libc::IPV6_NEXTHOP);
-            cst!("IPV6_RECVDSTOPTS", libc::IPV6_RECVDSTOPTS);
-            cst!("IPV6_RECVHOPOPTS", libc::IPV6_RECVHOPOPTS);
-            cst!("IPV6_RECVRTHDR", libc::IPV6_RECVRTHDR);
-            cst!("IPV6_RTHDR", libc::IPV6_RTHDR);
-            cst!("IPV6_RTHDRDSTOPTS", libc::IPV6_RTHDRDSTOPTS);
-            // `<netinet/in.h>` IPV6_RTHDR_TYPE_0=0; symbol omitted from
-            // libc crate on linux-gnu but the kernel header defines it.
-            cst!("IPV6_RTHDR_TYPE_0", 0);
-        }
-        // ── shutdown how ──
-        cst!("SHUT_RD", libc::SHUT_RD);
-        cst!("SHUT_WR", libc::SHUT_WR);
-        cst!("SHUT_RDWR", libc::SHUT_RDWR);
-        // ── Message flags ──
-        cst!("MSG_OOB", libc::MSG_OOB);
-        cst!("MSG_PEEK", libc::MSG_PEEK);
-        cst!("MSG_DONTROUTE", libc::MSG_DONTROUTE);
-        cst!("MSG_DONTWAIT", libc::MSG_DONTWAIT);
-        cst!("MSG_WAITALL", libc::MSG_WAITALL);
-        cst!("MSG_CTRUNC", libc::MSG_CTRUNC);
-        cst!("MSG_TRUNC", libc::MSG_TRUNC);
-        cst!("MSG_EOR", libc::MSG_EOR);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        cst!("MSG_ERRQUEUE", libc::MSG_ERRQUEUE);
-        // ── Address-info flags ──
-        cst!("AI_PASSIVE", libc::AI_PASSIVE);
-        cst!("AI_CANONNAME", libc::AI_CANONNAME);
-        cst!("AI_NUMERICHOST", libc::AI_NUMERICHOST);
-        cst!("AI_NUMERICSERV", libc::AI_NUMERICSERV);
-        cst!("AI_ADDRCONFIG", libc::AI_ADDRCONFIG);
-        cst!("AI_V4MAPPED", libc::AI_V4MAPPED);
-        cst!("AI_ALL", libc::AI_ALL);
-        #[cfg(target_os = "macos")]
-        {
-            cst!("AI_DEFAULT", libc::AI_DEFAULT);
-            cst!("AI_MASK", libc::AI_MASK);
-            cst!("AI_V4MAPPED_CFG", libc::AI_V4MAPPED_CFG);
-        }
-        // ── Name-info flags ──
-        cst!("NI_NUMERICHOST", libc::NI_NUMERICHOST);
-        cst!("NI_NUMERICSERV", libc::NI_NUMERICSERV);
-        cst!("NI_NOFQDN", libc::NI_NOFQDN);
-        cst!("NI_NAMEREQD", libc::NI_NAMEREQD);
-        cst!("NI_DGRAM", libc::NI_DGRAM);
-        cst!("NI_MAXHOST", libc::NI_MAXHOST);
-        // POSIX <netdb.h> NI_MAXSERV = 32; libc crate omits it on linux-gnu
-        cst!("NI_MAXSERV", 32);
-        // ── EAI_* (gai_strerror codes) ──
-        cst!("EAI_AGAIN", libc::EAI_AGAIN);
-        cst!("EAI_BADFLAGS", libc::EAI_BADFLAGS);
-        cst!("EAI_FAIL", libc::EAI_FAIL);
-        cst!("EAI_FAMILY", libc::EAI_FAMILY);
-        cst!("EAI_MEMORY", libc::EAI_MEMORY);
-        cst!("EAI_NODATA", libc::EAI_NODATA);
-        cst!("EAI_NONAME", libc::EAI_NONAME);
-        cst!("EAI_OVERFLOW", libc::EAI_OVERFLOW);
-        cst!("EAI_SERVICE", libc::EAI_SERVICE);
-        cst!("EAI_SOCKTYPE", libc::EAI_SOCKTYPE);
-        cst!("EAI_SYSTEM", libc::EAI_SYSTEM);
-        // `_rsocket_rffi.py` names these four alongside the rest and
-        // `platform.DefinedConstantInteger` keeps whichever the platform's
-        // `<netdb.h>` defines.  Darwin defines all four; the libc crate does
-        // not re-export them, so they are spelled out here the way
-        // `NI_MAXSERV` above is.
-        #[cfg(target_vendor = "apple")]
-        {
-            cst!("EAI_ADDRFAMILY", 1);
-            cst!("EAI_BADHINTS", 12);
-            cst!("EAI_PROTOCOL", 13);
-            cst!("EAI_MAX", 15);
-        }
-        // ── SCM_* (ancillary data types) ──
-        cst!("SCM_RIGHTS", libc::SCM_RIGHTS);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        cst!("SCM_CREDENTIALS", libc::SCM_CREDENTIALS);
-        // ── socket-level cap ──
-        cst!("SOMAXCONN", libc::SOMAXCONN);
-
-        // Names `<sys/socket.h>`, `<netinet/in.h>`, `<netinet/tcp.h>`,
-        // `<net/ethernet.h>` and `<sys/sys_domain.h>` define only on darwin,
-        // or define there with a different value than on linux.  Every value
-        // was read back from the headers themselves.  `socketmodule.c` guards
-        // the RFC 3542 half with `#define __APPLE_USE_RFC_3542 1`, which is
-        // why those names exist on this platform at all.
-        #[cfg(target_vendor = "apple")]
-        {
-            // ── Address / protocol families ──
-            cst!("AF_APPLETALK", libc::AF_APPLETALK);
-            cst!("AF_DECnet", libc::AF_DECnet);
-            cst!("AF_IPX", libc::AF_IPX);
-            cst!("AF_LINK", libc::AF_LINK);
-            cst!("AF_SNA", libc::AF_SNA);
-            cst!("AF_SYSTEM", libc::AF_SYSTEM);
-            cst!("PF_SYSTEM", libc::PF_SYSTEM);
-            cst!("SYSPROTO_CONTROL", libc::SYSPROTO_CONTROL);
-            // ── IPPROTO_* ──
-            cst!("IPPROTO_EON", libc::IPPROTO_EON);
-            cst!("IPPROTO_GGP", libc::IPPROTO_GGP);
-            cst!("IPPROTO_HELLO", libc::IPPROTO_HELLO);
-            cst!("IPPROTO_IPCOMP", libc::IPPROTO_IPCOMP);
-            cst!("IPPROTO_IPV4", 4);
-            cst!("IPPROTO_ND", libc::IPPROTO_ND);
-            cst!("IPPROTO_XTP", libc::IPPROTO_XTP);
-            // ── IPv4 socket options ──
-            cst!("IP_ADD_SOURCE_MEMBERSHIP", libc::IP_ADD_SOURCE_MEMBERSHIP);
-            cst!("IP_BLOCK_SOURCE", libc::IP_BLOCK_SOURCE);
-            cst!("IP_DROP_SOURCE_MEMBERSHIP", libc::IP_DROP_SOURCE_MEMBERSHIP);
-            cst!("IP_UNBLOCK_SOURCE", libc::IP_UNBLOCK_SOURCE);
-            cst!("IP_OPTIONS", 1);
-            cst!("IP_RECVOPTS", 5);
-            cst!("IP_RECVRETOPTS", 6);
-            cst!("IP_RETOPTS", 8);
-            cst!("IP_PKTINFO", libc::IP_PKTINFO);
-            cst!("IP_RECVDSTADDR", libc::IP_RECVDSTADDR);
-            cst!("IP_RECVTOS", libc::IP_RECVTOS);
-            cst!("IP_RECVTTL", libc::IP_RECVTTL);
-            // ── IPv6 socket options ──
-            cst!("IPV6_DONTFRAG", libc::IPV6_DONTFRAG);
-            cst!("IPV6_DSTOPTS", 50);
-            cst!("IPV6_HOPOPTS", 49);
-            cst!("IPV6_NEXTHOP", 48);
-            cst!("IPV6_PATHMTU", 44);
-            cst!("IPV6_RECVDSTOPTS", 40);
-            cst!("IPV6_RECVHOPOPTS", 39);
-            cst!("IPV6_RECVPATHMTU", 43);
-            cst!("IPV6_RECVRTHDR", 38);
-            cst!("IPV6_RTHDR", 51);
-            cst!("IPV6_RTHDRDSTOPTS", 57);
-            cst!("IPV6_RTHDR_TYPE_0", 0);
-            cst!("IPV6_USE_MIN_MTU", 42);
-            // ── TCP ──
-            cst!("TCP_CONNECTION_INFO", libc::TCP_CONNECTION_INFO);
-            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
-            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
-            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
-            cst!("TCP_NOTSENT_LOWAT", 513);
-            // ── SO_* / MSG_* / SCM_* ──
-            cst!("SO_BINDTODEVICE", 4404);
-            cst!("SO_USELOOPBACK", libc::SO_USELOOPBACK);
-            cst!("LOCAL_PEERCRED", libc::LOCAL_PEERCRED);
-            cst!("MSG_EOF", libc::MSG_EOF);
-            cst!("MSG_NOSIGNAL", libc::MSG_NOSIGNAL);
-            cst!("SCM_CREDS", libc::SCM_CREDS);
-            // ── `<net/ethernet.h>` ──
-            cst!("ETHERTYPE_ARP", 2054);
-            cst!("ETHERTYPE_IP", 2048);
-            cst!("ETHERTYPE_IPV6", 34525);
-            cst!("ETHERTYPE_VLAN", 33024);
-        }
+        pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(value));
     }
+    // [3.15-spec] socketmodule.c publishes IP_RECVTTL under #ifdef; rsocket's constant_names lacks it.
+    #[cfg(all(unix, target_vendor = "apple"))]
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "IP_RECVTTL",
+        pyre_object::w_int_new(i64::from(libc::IP_RECVTTL))
+    );
 
     // `_rsocket_rffi.py` keeps a separate `_MSVC` constant list because the
     // two headers name overlapping but different sets; this is that list.
@@ -2977,6 +2887,361 @@ fn get_cmsg_space(length: usize) -> Option<usize> {
     Some(tmp)
 }
 
+/// `interp_socket.py` `_pack_uint32`. Host-endian four bytes.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn pack_uint32(v: i64) -> [u8; 4] {
+    (v as u32).to_ne_bytes()
+}
+
+/// `RSocket.sendmsg` / `W_Socket.sendmsg_w` after the buffers are copied.
+#[cfg(unix)]
+fn unix_sendmsg(
+    obj_slot: usize,
+    fd: rffi::Socket,
+    data_buffers: &mut [Vec<u8>],
+    cmsgs: &[(libc::c_int, libc::c_int, Vec<u8>)],
+    flags: libc::c_int,
+    addr: Option<(*const libc::c_void, rffi::SockLen)>,
+) -> Result<isize, pyre_interpreter::PyError> {
+    let mut iovs: Vec<libc::iovec> = data_buffers
+        .iter_mut()
+        .map(|s| libc::iovec {
+            iov_base: s.as_mut_ptr() as *mut libc::c_void,
+            iov_len: s.len(),
+        })
+        .collect();
+    let mut control = {
+        let mut controllen = 0usize;
+        let mut controllen_last = 0usize;
+        for (_, _, data) in cmsgs {
+            let Some(space) = get_cmsg_space(data.len()) else {
+                return Err(pyre_interpreter::PyError::os_error(
+                    "ancillary data item too large",
+                ));
+            };
+            controllen += space;
+            if controllen > SOCKLEN_T_LIMIT || controllen < controllen_last {
+                return Err(pyre_interpreter::PyError::os_error(
+                    "too much ancillary data",
+                ));
+            }
+            controllen_last = controllen;
+        }
+        let mut control = vec![0u8; controllen];
+        if controllen > 0 {
+            let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            packing_msg.msg_controllen = controllen as _;
+            let mut cur = unsafe { libc::CMSG_FIRSTHDR(&packing_msg) };
+            for (level, ty, data) in cmsgs {
+                if cur.is_null() {
+                    break;
+                }
+                let cmsg_len = unsafe { libc::CMSG_LEN(data.len() as libc::c_uint) };
+                unsafe {
+                    (*cur).cmsg_level = *level;
+                    (*cur).cmsg_type = *ty;
+                    (*cur).cmsg_len = cmsg_len as _;
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cur), data.len());
+                    cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                }
+            }
+        }
+        control
+    };
+    let total_control = control.len();
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iovs.as_mut_ptr();
+    msg.msg_iovlen = iovs.len() as _;
+    if let Some((name, namelen)) = addr {
+        msg.msg_name = name as *mut libc::c_void;
+        msg.msg_namelen = namelen;
+    }
+    if total_control > 0 {
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = total_control as _;
+    }
+
+    socket_wait_writable(pyre_object::gc_roots::shadow_stack_get(obj_slot), fd)?;
+    loop {
+        let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
+            libc::sendmsg(fd, &msg, flags)
+        });
+        if r >= 0 {
+            return Ok(r);
+        }
+        if !rffi::error_is_interrupted(errno) {
+            return Err(socket_io_err_for_operation(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+    }
+}
+
+/// `rsocket.py` `constants` lookup used by `sendmsg_afalg_w`.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn rsocket_constant(name: &'static str) -> i64 {
+    majit_rlib::rsocket::constants()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("{name}"))
+}
+
+/// [3.15-spec] `sock_sendmsg_afalg` checks the family before parsing, tells
+/// an omitted `iv`/`assoclen` apart from an explicit `None` (`O!`/`y*`), and
+/// rejects the None.  PyPy `W_Socket.sendmsg_afalg_w` takes
+/// `unwrap_spec(op=int, flags=int, w_iv=WrappedDefault(None),
+/// w_assoclen=WrappedDefault(None))`, so an omitted argument equals `None`.
+/// The `__args__` passthrough follows `functional.py` `min_max`'s way of
+/// reading keywords.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_w(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let msg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[
+        self_,
+        msg,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    ]);
+    sendmsg_afalg_check_family(slot)?;
+    if args.len() > 2 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() takes at most 1 positional argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    sendmsg_afalg_body(slot)
+}
+
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_args(
+    self_: pyre_object::PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_]);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    let npos = pos.len();
+    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
+    let pos_base = pyre_object::gc_roots::publish_roots(&pos);
+    let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
+    pyre_object::gc_roots::normalize_roots(pos_base, npos + 1);
+    sendmsg_afalg_check_family(self_slot)?;
+    if npos > 1 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() takes at most 1 positional argument ({npos} given)"
+        )));
+    }
+    let kwargs = sendmsg_afalg_kwargs(kwargs_slot);
+    pyre_interpreter::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["msg", "op", "iv", "assoclen", "flags"],
+        "sendmsg_afalg",
+    )?;
+    let kwargs = sendmsg_afalg_kwargs(kwargs_slot);
+    let msg_kw = pyre_interpreter::builtins::kwarg_get(kwargs, "msg");
+    if npos >= 1 && msg_kw.is_some() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "argument for sendmsg_afalg() given by name ('msg') and position (1)",
+        ));
+    }
+    let msg = if npos >= 1 {
+        pyre_object::gc_roots::shadow_stack_get(pos_base)
+    } else {
+        msg_kw.unwrap_or(pyre_object::PY_NULL)
+    };
+    let op = pyre_interpreter::builtins::kwarg_get(kwargs, "op").unwrap_or(pyre_object::PY_NULL);
+    let iv = pyre_interpreter::builtins::kwarg_get(kwargs, "iv").unwrap_or(pyre_object::PY_NULL);
+    let assoclen =
+        pyre_interpreter::builtins::kwarg_get(kwargs, "assoclen").unwrap_or(pyre_object::PY_NULL);
+    let flags =
+        pyre_interpreter::builtins::kwarg_get(kwargs, "flags").unwrap_or(pyre_object::PY_NULL);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let slot = pyre_object::gc_roots::pin_roots(&[self_, msg, op, iv, assoclen, flags]);
+    sendmsg_afalg_body(slot)
+}
+
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_kwargs(kwargs_slot: usize) -> Option<pyre_object::PyObjectRef> {
+    let dict = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
+    if dict.is_null() {
+        None
+    } else {
+        Some(dict)
+    }
+}
+
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_check_family(obj_slot: usize) -> Result<(), pyre_interpreter::PyError> {
+    let family = socket_get_attr_i64(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "_family",
+    );
+    if family != majit_rlib::rsocket::af_alg() {
+        return Err(pyre_interpreter::PyError::os_error(
+            "algset is only supported for AF_ALG",
+        ));
+    }
+    Ok(())
+}
+
+/// `converterr`: None prints as `"None"`, otherwise the type's name.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_arg_type(obj: pyre_object::PyObjectRef) -> String {
+    if unsafe { pyre_object::is_none(obj) } {
+        "None".to_string()
+    } else {
+        pyre_interpreter::type_methods::arg_type_name(obj)
+    }
+}
+
+/// Conversions and send after the family check. Six consecutive shadow-stack
+/// slots, pinned by the caller: `slot` is self, then msg, op, iv, assoclen,
+/// flags; `PY_NULL` means omitted.
+#[cfg(all(unix, rsocket_have_sockaddr_alg))]
+fn sendmsg_afalg_body(
+    slot: usize,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let op_obj = pyre_object::gc_roots::shadow_stack_get(slot + 2);
+    if !op_obj.is_null() && !unsafe { pyre_interpreter::baseobjspace::isinstance_int_w(op_obj) } {
+        let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 2));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() argument 'op' must be int, not {t}"
+        )));
+    }
+
+    let mut iv_bytes: Option<Vec<u8>> = None;
+    if !pyre_object::gc_roots::shadow_stack_get(slot + 3).is_null() {
+        match pyre_interpreter::baseobjspace::simple_buffer_bytes(
+            pyre_object::gc_roots::shadow_stack_get(slot + 3),
+        )? {
+            Some(buffer) => {
+                let bytes = buffer.as_bytes().to_vec();
+                buffer.release();
+                iv_bytes = Some(bytes);
+            }
+            None => {
+                let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 3));
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "sendmsg_afalg() argument 'iv' must be bytes-like object, not {t}"
+                )));
+            }
+        }
+    }
+
+    let assoclen_obj = pyre_object::gc_roots::shadow_stack_get(slot + 4);
+    if !assoclen_obj.is_null()
+        && !unsafe { pyre_interpreter::baseobjspace::isinstance_int_w(assoclen_obj) }
+    {
+        let t = sendmsg_afalg_arg_type(pyre_object::gc_roots::shadow_stack_get(slot + 4));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "sendmsg_afalg() argument 'assoclen' must be int, not {t}"
+        )));
+    }
+
+    let flags = if pyre_object::gc_roots::shadow_stack_get(slot + 5).is_null() {
+        0
+    } else {
+        // The `i` format unit converts through `__index__`, not `__int__`.
+        let value = pyre_interpreter::baseobjspace::index_int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 5,
+        ))?;
+        libc::c_int::try_from(value).map_err(|_| {
+            pyre_interpreter::PyError::overflow_error(if value > i64::from(libc::c_int::MAX) {
+                "signed integer is greater than maximum"
+            } else {
+                "signed integer is less than minimum"
+            })
+        })?
+    };
+
+    let op = if pyre_object::gc_roots::shadow_stack_get(slot + 2).is_null() {
+        -1
+    } else {
+        pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(slot + 2))
+            .ok()
+            .and_then(|v| libc::c_int::try_from(v).ok())
+            .map_or(-1, i64::from)
+    };
+    if op < 0 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "Invalid or missing argument 'op'",
+        ));
+    }
+
+    let mut assoclen: i64 = -1;
+    if !pyre_object::gc_roots::shadow_stack_get(slot + 4).is_null() {
+        assoclen = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 4,
+        ))
+        .ok()
+        .and_then(|v| libc::c_int::try_from(v).ok())
+        .map(i64::from)
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+        })?;
+        if assoclen < 0 {
+            return Err(pyre_interpreter::PyError::type_error(
+                "assoclen must be positive",
+            ));
+        }
+    }
+
+    let fd = socket_fd(pyre_object::gc_roots::shadow_stack_get(slot))?;
+
+    let mut data_buffers: Vec<Vec<u8>> = Vec::new();
+    let msg = pyre_object::gc_roots::shadow_stack_get(slot + 1);
+    if !msg.is_null() {
+        let data_items = pyre_interpreter::baseobjspace::unpackiterable(msg, -1)?;
+        let items_base = pyre_object::gc_roots::pin_roots(&data_items);
+        for i in 0..data_items.len() {
+            let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
+            let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(item)? else {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "sendmsg: data items must be bytes-like",
+                ));
+            };
+            data_buffers.push(buffer.as_bytes().to_vec());
+            buffer.release();
+        }
+    }
+
+    let sol_alg = rsocket_constant("SOL_ALG") as libc::c_int;
+    let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+    cmsgs.push((
+        sol_alg,
+        rsocket_constant("ALG_SET_OP") as libc::c_int,
+        pack_uint32(op).to_vec(),
+    ));
+    if let Some(iv_bytes) = iv_bytes {
+        let mut payload = pack_uint32(iv_bytes.len() as i64).to_vec();
+        payload.extend_from_slice(&iv_bytes);
+        cmsgs.push((
+            sol_alg,
+            rsocket_constant("ALG_SET_IV") as libc::c_int,
+            payload,
+        ));
+    }
+    if assoclen >= 0 {
+        cmsgs.push((
+            sol_alg,
+            rsocket_constant("ALG_SET_AEAD_ASSOCLEN") as libc::c_int,
+            pack_uint32(assoclen).to_vec(),
+        ));
+    }
+
+    let sent = unix_sendmsg(slot, fd, &mut data_buffers, &cmsgs, flags, None)?;
+    Ok(pyre_object::w_int_new(sent as i64))
+}
+
 /// Release the interpreter around a WinSock call and return the code
 /// `last_error_code` reported. WinSock does not write the C runtime's `errno`.
 /// `recvmsg` and `sendmsg` stay on `call_external_function`.
@@ -4306,6 +4571,97 @@ fn pack_inet_addr(
         return Ok((storage, addrlen));
     }
 
+    // `interp_socket.py` `addr_from_object` `AF_ALG` / `AlgAddress`.
+    #[cfg(rsocket_have_sockaddr_alg)]
+    if family as i64 == majit_rlib::rsocket::af_alg() {
+        let pieces = pyre_interpreter::baseobjspace::unpackiterable(addr, -1)?;
+        if !(2..=4).contains(&pieces.len()) {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "AF_ALG address must be a tuple of length 2 to 4 not {}",
+                pieces.len()
+            )));
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::pin_roots(&pieces);
+        let algtype = pyre_interpreter::baseobjspace::text_w(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        )?
+        .to_owned();
+        let algname = pyre_interpreter::baseobjspace::text_w(
+            pyre_object::gc_roots::shadow_stack_get(slot + 1),
+        )?
+        .to_owned();
+        if algtype.len() > 13 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "AF_ALG type too long.",
+            ));
+        }
+        if algname.len() > 63 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "AF_ALG name too long.",
+            ));
+        }
+        let salg_feat = if pieces.len() > 2 {
+            pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+                slot + 2,
+            ))?
+        } else {
+            0
+        };
+        let salg_mask = if pieces.len() > 3 {
+            pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+                slot + 3,
+            ))?
+        } else {
+            0
+        };
+        let alg = majit_rlib::rsocket::AlgAddress::new(
+            algtype.as_bytes(),
+            algname.as_bytes(),
+            salg_feat,
+            salg_mask,
+        );
+        let src = alg.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (&raw mut storage).cast::<u8>(),
+                src.len(),
+            );
+        }
+        return Ok((storage, src.len() as rffi::SockLen));
+    }
+
+    // `interp_socket.py` `addr_from_object` `AF_QIPCRTR` / `QrtrAddress`.
+    #[cfg(rsocket_have_sockaddr_qrtr)]
+    if family as i64 == majit_rlib::rsocket::af_qipcrtr() {
+        let pieces = pyre_interpreter::baseobjspace::unpackiterable(addr, -1)?;
+        if pieces.len() != 2 {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "AF_QIPCRTR address must be a tuple of length 2 not {}",
+                pieces.len()
+            )));
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::pin_roots(&[pieces[0], pieces[1]]);
+        let node = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot,
+        ))?;
+        let port = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
+            slot + 1,
+        ))?;
+        let qrtr = majit_rlib::rsocket::QrtrAddress::new(node, port);
+        let src = qrtr.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (&raw mut storage).cast::<u8>(),
+                src.len(),
+            );
+        }
+        return Ok((storage, src.len() as rffi::SockLen));
+    }
+
     if !unsafe { pyre_object::is_tuple(addr) } {
         // [3.14-spec] PyPy's tuple unpacking exposes its generic iterable
         // error here; 3.14 names the operation and rejected type
@@ -4475,9 +4831,10 @@ fn storage_from_rsocket(bytes: &[u8], slen: i32) -> (rffi::sockaddr_storage, rff
 fn accept_socket(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
+    family: libc::c_int,
 ) -> Result<(rffi::Socket, rffi::sockaddr_storage, rffi::SockLen), pyre_interpreter::PyError> {
     loop {
-        match majit_rlib::rsocket::accept(fd) {
+        match majit_rlib::rsocket::accept(fd, family as majit_rlib::rffi::SIGNED) {
             Ok((cfd, bytes, addrlen)) => {
                 let (storage, slen) = storage_from_rsocket(&bytes, addrlen);
                 return Ok((cfd, storage, slen));
@@ -4579,6 +4936,24 @@ fn unpack_inet_addr(
         #[cfg(windows)]
         if family == AF_BTH {
             return unpack_bluetooth_addr(storage);
+        }
+        #[cfg(rsocket_have_sockaddr_qrtr)]
+        if family as i64 == majit_rlib::rsocket::af_qipcrtr() {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (storage as *const rffi::sockaddr_storage).cast::<u8>(),
+                    core::mem::size_of::<rffi::sockaddr_storage>(),
+                )
+            };
+            let (node, port) = majit_rlib::rsocket::QrtrAddress::from_sockaddr(bytes).get_data();
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(node));
+            fields.push(pyre_object::w_int_new(port));
+            return pyre_object::w_tuple_new(fields.take());
+        }
+        #[cfg(rsocket_have_sockaddr_alg)]
+        if family as i64 == majit_rlib::rsocket::af_alg() {
+            return pyre_object::w_none();
         }
         pyre_object::w_tuple_new(vec![])
     }
@@ -5556,7 +5931,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let proto = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_proto"))
                     as libc::c_int;
                 #[cfg(unix)]
-                let (cfd, storage, slen) = accept_socket(obj, fd)?;
+                let (cfd, storage, slen) = accept_socket(obj, fd, family)?;
                 #[cfg(windows)]
                 let (cfd, storage, slen) = {
                     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -5609,8 +5984,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = pyre_object::with_roots!(obj => socket_fd(obj))?;
                 pyre_object::with_roots!(obj => socket_wait_readable(obj, fd))?;
+                let family = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_family"))
+                    as libc::c_int;
                 #[cfg(unix)]
-                let (cfd, storage, slen) = accept_socket(obj, fd)?;
+                let (cfd, storage, slen) = accept_socket(obj, fd, family)?;
                 #[cfg(windows)]
                 let (cfd, storage, slen) = {
                     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -6721,13 +7098,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     data_buffers.push(buffer.as_bytes().to_vec());
                     buffer.release();
                 }
-                let mut iovs: Vec<libc::iovec> = data_buffers
-                    .iter()
-                    .map(|s| libc::iovec {
-                        iov_base: s.as_ptr() as *mut libc::c_void,
-                        iov_len: s.len(),
-                    })
-                    .collect();
 
                 // Build ancillary control buffer from args[2] (optional).
                 let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
@@ -6825,86 +7195,32 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     (None, 0)
                 };
 
-                // Lay out cmsgs into a single control buffer.
-                // `sendmsg_implementation` sums `CMSG_SPACE` per item with a
-                // wrap check against `SOCKLEN_T_LIMIT`.
-                let mut control = {
-                    let mut controllen = 0usize;
-                    let mut controllen_last = 0usize;
-                    for (_, _, data) in &cmsgs {
-                        let Some(space) = get_cmsg_space(data.len()) else {
-                            return Err(pyre_interpreter::PyError::os_error(
-                                "ancillary data item too large",
-                            ));
-                        };
-                        controllen += space;
-                        if controllen > SOCKLEN_T_LIMIT || controllen < controllen_last {
-                            return Err(pyre_interpreter::PyError::os_error(
-                                "too much ancillary data",
-                            ));
-                        }
-                        controllen_last = controllen;
-                    }
-                    let mut control = vec![0u8; controllen];
-                    if controllen > 0 {
-                        let mut packing_msg: libc::msghdr = std::mem::zeroed();
-                        packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                        packing_msg.msg_controllen = controllen as _;
-                        let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
-                        for (level, ty, data) in &cmsgs {
-                            if cur.is_null() {
-                                break;
-                            }
-                            let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
-                            (*cur).cmsg_level = *level;
-                            (*cur).cmsg_type = *ty;
-                            (*cur).cmsg_len = cmsg_len as _;
-                            std::ptr::copy_nonoverlapping(
-                                data.as_ptr(),
-                                libc::CMSG_DATA(cur),
-                                data.len(),
-                            );
-                            cur = libc::CMSG_NXTHDR(&packing_msg, cur);
-                        }
-                    }
-                    control
-                };
-                let total_control = control.len();
-                let mut msg: libc::msghdr = { std::mem::zeroed() };
-                msg.msg_iov = iovs.as_mut_ptr();
-                msg.msg_iovlen = iovs.len() as _;
-                if let Some(ref s) = addr_storage {
-                    msg.msg_name = s as *const _ as *mut libc::c_void;
-                    msg.msg_namelen = addr_len;
-                }
-                if total_control > 0 {
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = total_control as _;
-                }
-
-                socket_wait_writable(pyre_object::gc_roots::shadow_stack_get(obj_slot), fd)?;
-                let sent = loop {
-                    let (r, errno) =
-                        pyre_interpreter::module::thread::call_external_function(|| {
-                            libc::sendmsg(fd, &msg, flags)
-                        });
-                    if r >= 0 {
-                        break r;
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                };
+                let addr = addr_storage
+                    .as_ref()
+                    .map(|s| (s as *const _ as *const libc::c_void, addr_len));
+                let sent = unix_sendmsg(obj_slot, fd, &mut data_buffers, &cmsgs, flags, addr)?;
                 Ok(pyre_object::w_int_new(sent as i64))
             })
         )
     };
+
+    // `interp_socket.py` `socketmethodnames` appends `sendmsg_afalg` when
+    // `HAS_AF_ALG`.
+    #[cfg(rsocket_have_sockaddr_alg)]
+    {
+        const DOC: &str = "sendmsg_afalg([msg], *, op[, iv[, assoclen[, flags=MSG_MORE]]])\n\nSet operation mode, IV and length of associated data for an AF_ALG\noperation socket.";
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(
+            pyre_interpreter::gateway::make_method_descriptor_passthrough1_with_doc(
+                "sendmsg_afalg",
+                sendmsg_afalg_w,
+                sendmsg_afalg_args,
+                DOC,
+            ),
+        );
+        pyre_interpreter::__pyre_put_new!(ns_slot, "sendmsg_afalg", roots.get(fn_slot));
+    }
 
     pyre_interpreter::__pyre_put_new!(
         ns_slot,

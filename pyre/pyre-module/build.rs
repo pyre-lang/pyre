@@ -230,6 +230,16 @@ const CURSES_NAMES: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(pyre_minimal_curses)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_qrtr)");
+    println!("cargo:rustc-check-cfg=cfg(rsocket_have_sockaddr_alg)");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_SOCKADDR_QRTR");
+    println!("cargo:rerun-if-env-changed=DEP_MAJIT_RLIB_HAVE_SOCKADDR_ALG");
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_SOCKADDR_QRTR").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rsocket_have_sockaddr_qrtr");
+    }
+    if std::env::var("DEP_MAJIT_RLIB_HAVE_SOCKADDR_ALG").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rsocket_have_sockaddr_alg");
+    }
     majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     if curses_probe_enabled() {
         configure_minimal_curses();

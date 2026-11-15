@@ -10,6 +10,22 @@
 
 #![allow(non_camel_case_types)]
 
+/// `_rsocket_rffi.py` `cConfig = platform.configure(CConfig)`.
+#[cfg(any(unix, windows))]
+#[allow(non_snake_case, non_camel_case_types)]
+pub mod cConfig {
+    include!(concat!(env!("OUT_DIR"), "/rsocket_cconfig.rs"));
+}
+/// `_rsocket_rffi.py` `constants`.
+#[cfg(any(unix, windows))]
+pub use cConfig::CONSTANTS;
+/// `_rsocket_rffi.py` `if cConfig.sockaddr_alg is not None: sockaddr_alg = cConfig.sockaddr_alg`.
+#[cfg(rsocket_have_sockaddr_alg)]
+pub use cConfig::sockaddr_alg;
+/// `_rsocket_rffi.py` `if cConfig.sockaddr_qrtr is not None: sockaddr_qrtr = cConfig.sockaddr_qrtr`.
+#[cfg(rsocket_have_sockaddr_qrtr)]
+pub use cConfig::sockaddr_qrtr;
+
 #[cfg(unix)]
 mod posix {
     use crate::rffi::{INT, RFFI_SAVE_ERRNO, UINT, USHORT};

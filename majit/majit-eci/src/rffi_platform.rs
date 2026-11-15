@@ -83,6 +83,14 @@ impl FieldType {
         })
     }
 
+    /// `rffi.SHORT`.
+    pub fn short() -> Self {
+        FieldType::Int(IntType {
+            signed: true,
+            bits: 16,
+        })
+    }
+
     /// `lltype.Signed` (`rffi.LONG` on LP64).
     pub fn signed_word() -> Self {
         FieldType::Int(IntType {
