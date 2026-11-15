@@ -2528,12 +2528,14 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     // before the subclass's own fields.  Consequently a subclass SizeDescr
     // legitimately contains the base's FieldDescr at the same slot even
     // though their parent STRUCT keys differ (`rclass.InstanceRepr._setup_repr`
-    // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
-    // serializes the flattened row under the variant parent while a read of
-    // that row can name the enum, so recover that one proven inheritance edge
-    // from the qualified owners.  Two *different* variants of one enum are not
-    // that edge -- their payloads are different fields sharing an address --
-    // and neither is a same-name/same-offset field from an arbitrary struct.
+    // creates exactly this `super` edge).  The tag is interned as that base
+    // STRUCT's FieldDescr object, so an Err store and an Ok read of
+    // `__discriminant` already share one descr.  This helper recovers the
+    // variant ↔ enum-base `super` edge for payload rows whose qualified
+    // owners still differ (`Result::Ok.__pos_0` vs the enum spelling).
+    // Two *different* variants of one enum are not that edge for a payload
+    // -- those are different fields sharing an address -- and neither is a
+    // same-name/same-offset field from an arbitrary struct.
     fn is_registered_std_shell(owner: &str) -> bool {
         // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
         // uses, plus the enum roots the inherited-tag edge names. A name
@@ -2567,11 +2569,17 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         ) else {
             return false;
         };
-        if slot_enum != field_enum
-            || !(slot_variant == field_variant
-                || slot_variant.is_empty()
-                || field_variant.is_empty())
-        {
+        if slot_enum != field_enum {
+            return false;
+        }
+        // Variant ↔ enum-base is the `super` edge: the variant's flattened
+        // list holds the base's fields. Two different variants are not that
+        // edge for a payload. The tag is the base STRUCT's FieldDescr
+        // (`heaptracker.all_fielddescrs` recurse into `'super'`), so Ok and
+        // Err `__discriminant` reads share that object without a name test.
+        let same_or_base =
+            slot_variant == field_variant || slot_variant.is_empty() || field_variant.is_empty();
+        if !same_or_base {
             return false;
         }
         // Spelling is not identity. When the StructId table is populated,
@@ -3762,6 +3770,37 @@ mod tests {
         )
         .with_parent_descr(template_parent, 1);
         assert!(!slot_holds_field(&ok, &err));
+    }
+
+    #[test]
+    fn slot_identity_shares_the_tag_across_result_ok_and_err() {
+        // `front/mir` shells Result as `[tag@0 | payload@8]`. An Err store
+        // and a later Ok match read both use the enum-base `__discriminant`
+        // FieldDescr (`rclass.InstanceRepr._get_field` walks `rbase`;
+        // `heaptracker.all_fielddescrs` reuses that object).
+        let descr = |owner: &str| {
+            let size_descr = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                format!("{owner}.__discriminant"),
+                "__discriminant",
+            )
+            .with_parent_descr(parent.clone(), 0);
+            (field, parent)
+        };
+        let (store, _store_parent) = descr("result::Result<*mut PyObject,PyError>");
+        let (read, _read_parent) = descr("result::Result<*mut PyObject,PyError>");
+        assert!(
+            slot_holds_field(&store, &read),
+            "Err store and Ok read share the enum-base discriminant FieldDescr"
+        );
+        assert!(slot_holds_field(&read, &store), "the tag edge is symmetric");
     }
 
     #[test]
@@ -5457,6 +5496,85 @@ mod tests {
             "a read whose slot does not hold it must answer the zeroed \
              allocation; forwarding the populated slot hands back a different \
              field's value"
+        );
+    }
+
+    /// An Err allocation stores the tag through the enum-base
+    /// `__discriminant` FieldDescr. A later match reads that same descr.
+    /// `virtualize.py` `optimize_GETFIELD_GC_I` answers
+    /// `opinfo.getfield(op.getdescr())`; descr identity forwards the stored
+    /// tag rather than the zeroed allocation `field_slot_identifies` used to
+    /// take.
+    #[test]
+    fn result_ok_discriminant_read_forwards_the_err_allocation_tag() {
+        let disc = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                "result::Result.__discriminant".to_string(),
+                "__discriminant",
+            )
+            .with_index_in_parent(0),
+        );
+        let err_payload = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                1,
+                8,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "result::Result::Err.__pos_0".to_string(),
+                "__pos_0",
+            )
+            .with_index_in_parent(1),
+        );
+        let err_alloc: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0e00, 16, 1).with_all_fielddescrs(vec![
+                disc.clone() as Arc<dyn FieldDescr>,
+                err_payload.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        disc.set_parent_descr(&err_alloc);
+        err_payload.set_parent_descr(&err_alloc);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], err_alloc),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 100),
+                ],
+                disc.clone() as DescrRef,
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                disc.clone() as DescrRef,
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass_typed(&ops, &[100, 200]);
+        assert_eq!(
+            folded_read_answer(&result),
+            None,
+            "the enum-base __discriminant on an Err virtual must forward the \
+             stored tag, not fold to the zeroed allocation"
         );
     }
 
