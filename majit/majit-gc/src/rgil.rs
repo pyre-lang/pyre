@@ -33,7 +33,7 @@
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 // thread_pthread.c's mutex1_t and mutex2_t own native synchronization objects.
 // rpy_init_mutexes resets them in the forked child. A parking_lot mutex also
 // has waiters in a process-global queue: replacing its local bytes would leave
@@ -46,6 +46,11 @@ use crate::gc_sync;
 /// thread_gil.c:86 `Signed rpy_fastgil`. 0 when the GIL is unlocked, otherwise
 /// the ident of the thread holding it (point (3)).
 static RPY_FASTGIL: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-wide "GIL disabled" mode. Off by default; [`disable_gil`] is
+/// one-way. Several registered mutators then run GC operations concurrently
+/// and collections stop the world.
+static GIL_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// thread_gil.c:87 `rpy_waiting_threads`, the number of threads inside
 /// [`acquire_slow_path`]. Negative until [`allocate`] has run.
@@ -347,6 +352,48 @@ pub fn gil_is_initialized() -> bool {
     RPY_WAITING_THREADS.load(Ordering::Relaxed) != GIL_NOT_INITIALIZED
 }
 
+/// Whether this process has turned the GIL off. Relaxed: the word is stored
+/// once, before a second mutator registers, and never cleared.
+#[inline]
+pub fn gil_disabled() -> bool {
+    GIL_DISABLED.load(Ordering::Relaxed)
+}
+
+/// A mutator may touch the collector: either this thread holds the GIL, or
+/// the GIL is disabled and several mutators run concurrently.
+#[inline]
+pub fn mutator_may_run() -> bool {
+    gil_disabled() || am_i_holding_the_gil()
+}
+
+/// Turn the GIL off for the rest of the process.
+///
+/// Allowed only while at most one thread is registered and nobody waits for
+/// the GIL. Releases the GIL if this thread holds it, pins the nursery
+/// arena cursor on the GC-owned fallback pair, and arms the published-bump
+/// sentinel so `malloc_fast` reads the calling thread's chunk.
+pub fn disable_gil() {
+    if gil_disabled() {
+        return;
+    }
+    assert!(
+        gc_sync::registered_threads() <= 1,
+        "disable_gil requires at most one registered mutator"
+    );
+    let waiting = RPY_WAITING_THREADS.load(Ordering::Relaxed);
+    assert!(
+        waiting <= 0,
+        "disable_gil requires nobody waiting for the GIL"
+    );
+    if am_i_holding_the_gil() {
+        release();
+    } else {
+        gc_sync::release_nursery_cursor_to_fallback();
+    }
+    GIL_DISABLED.store(true, Ordering::Release);
+    crate::arm_gil_disabled_published_bump();
+}
+
 /// `rpy_init_mutexes` re-runs through `pthread_atfork` (thread_gil.c:105-107).
 /// Only the forking thread survives, so nothing can be waiting and the surviving
 /// holder's claim, if any, is restored by the caller.
@@ -357,7 +404,7 @@ pub fn gil_is_initialized() -> bool {
 /// longer exists.
 pub(crate) fn after_fork_child() {
     debug_assert!(
-        am_i_holding_the_gil(),
+        gil_disabled() || am_i_holding_the_gil(),
         "the forking thread must hold the GIL across fork()"
     );
     init_mutexes();
@@ -377,6 +424,10 @@ fn acquire_fast_path(ident: usize) -> bool {
 /// call and when a thread starts running pyre code.
 #[inline]
 pub fn acquire() {
+    if gil_disabled() {
+        crate::gc_thread_run();
+        return;
+    }
     let ident = gc_sync::my_ident();
     if !acquire_fast_path(ident) {
         acquire_slow_path(ident);
@@ -391,6 +442,10 @@ pub fn acquire() {
 /// `rthread.get_or_make_ident()`.
 #[inline]
 pub fn acquire_maybe_in_new_thread() {
+    if gil_disabled() {
+        crate::gc_thread_run();
+        return;
+    }
     allocate();
     acquire();
 }
@@ -401,6 +456,9 @@ pub fn acquire_maybe_in_new_thread() {
 /// [`release_signal`].
 #[inline]
 pub fn release() {
+    if gil_disabled() {
+        return;
+    }
     debug_assert!(
         am_i_holding_the_gil(),
         "releasing the GIL without holding it"
@@ -438,6 +496,9 @@ pub fn gil_get_holder() -> usize {
 /// idiom of thread_gil.c:19-21.
 #[inline]
 pub fn am_i_holding_the_gil() -> bool {
+    if gil_disabled() {
+        return false;
+    }
     gil_get_holder() == gc_sync::my_ident()
 }
 
@@ -544,6 +605,9 @@ fn acquire_slow_path(ident: usize) {
 /// enqueues this thread at the end of the stealer queue behind the threads that
 /// were already waiting.
 pub fn yield_thread() -> bool {
+    if gil_disabled() {
+        return false;
+    }
     debug_assert!(am_i_holding_the_gil(), "yielding a GIL we do not hold");
     if RPY_WAITING_THREADS.load(Ordering::Relaxed) <= 0 {
         return false;

@@ -237,7 +237,13 @@ what supplies its exclusive-heap-access requirement has changed once.
   instructions / +1.4 cycles through `_tlv_get_addr`, about the same
   through a direct `tpidrro_el0` TSD read, and +3.3 instructions / +0.4
   cycles through a cached block pointer, which is why Rust code keeps the
-  published address pair while the GIL exists.
+  published address pair while the GIL exists. GIL-disabled mode is off by
+  default (`rgil::disable_gil`, one-way): `gc_op` then takes a process-wide
+  leaf lock and releases it across the STW quiescence wait so a blocked
+  mutator is not a safepoint; each mutator bumps a 32 KiB chunk carved from
+  the arena fallback cursor, and a minor (or wholesale cursor rewrite) zeros
+  every registered pair. `malloc_fast` keeps the published-address load and
+  a `free_addr <= 1` branch; the sentinel `1` is the cold per-thread bump.
 
 ### 3.4 Backends: three thin backends, not six hand-written
 

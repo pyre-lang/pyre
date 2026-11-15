@@ -1646,6 +1646,9 @@ impl MiniMarkGC {
 
     /// Copy the live cursor onto this thread's `tlfield_nursery_*` words.
     pub fn claim_this_thread_cursor(&mut self) {
+        if crate::rgil::gil_disabled() {
+            return;
+        }
         let me = crate::threadlocal::threadlocal_nursery_ptrs();
         unsafe { self.nursery.claim_cursor(me) };
         crate::threadlocal::note_cursor_owner();
@@ -1674,6 +1677,64 @@ impl MiniMarkGC {
                 || self.nursery.cursor() == crate::threadlocal::threadlocal_nursery_ptrs(),
             "collection must run on the cursor owner or the fallback pair"
         );
+    }
+
+    /// Nursery bump: GIL-on uses the live cursor; GIL-off bumps this
+    /// thread's chunk and refills from the arena cursor under the GC lock.
+    #[inline]
+    fn bump_nursery(&mut self, total_size: usize) -> *mut u8 {
+        if crate::rgil::gil_disabled() {
+            let ptr = self.bump_thread_chunk(total_size);
+            if !ptr.is_null() {
+                return ptr;
+            }
+            self.refill_thread_chunk(total_size)
+        } else {
+            self.nursery.alloc(total_size)
+        }
+    }
+
+    #[inline]
+    fn bump_thread_chunk(&mut self, total_size: usize) -> *mut u8 {
+        let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+        let total_size = (total_size + crate::header::MEMORY_ALIGNMENT - 1)
+            & !(crate::header::MEMORY_ALIGNMENT - 1);
+        let ptrs = crate::threadlocal::threadlocal_nursery_ptrs();
+        let result = unsafe { (*ptrs).free };
+        let new_free = result.wrapping_add(total_size);
+        if (new_free as usize) > (unsafe { (*ptrs).top } as usize) {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*ptrs).free = new_free };
+        result
+    }
+
+    /// Carve a new chunk, or serve a large request from the arena cursor.
+    /// Collection stays on the existing slow path.
+    fn refill_thread_chunk(&mut self, total_size: usize) -> *mut u8 {
+        let aligned = Self::nursery_allocation_size(total_size);
+        if aligned > crate::nursery::NURSERY_CHUNK_SIZE / 4 {
+            return self.nursery.alloc(total_size);
+        }
+        let Some(chunk) = self.nursery.try_carve_chunk(aligned) else {
+            return std::ptr::null_mut();
+        };
+        let ptrs = crate::threadlocal::threadlocal_nursery_ptrs();
+        unsafe { *ptrs = chunk };
+        self.bump_thread_chunk(total_size)
+    }
+
+    fn clear_mutator_nursery_chunks(&self) {
+        if crate::rgil::gil_disabled() {
+            crate::shadow_stack::clear_all_mutator_nursery_chunks();
+        }
+    }
+
+    /// Park other mutators for a collection. `None` means another collection
+    /// already ran ([`crate::gc_sync::StwGuard::superseded`]).
+    fn quiesce_for_collection(&self) -> Option<crate::gc_sync::StwGuard> {
+        let stw = crate::gc_sync::quiesce_mutators();
+        if stw.superseded() { None } else { Some(stw) }
     }
 
     // ── incminimark.py card_marking_words_for_length card marking geometry ──
@@ -2037,7 +2098,7 @@ impl MiniMarkGC {
         }
 
         if total_size < self.config.large_object_threshold {
-            let ptr = self.nursery.alloc(total_size);
+            let ptr = self.bump_nursery(total_size);
             if !ptr.is_null() {
                 return self.finish_nursery_object(ptr, type_id);
             }
@@ -2091,51 +2152,55 @@ impl MiniMarkGC {
         // Nursery full: trigger minor collection and retry. Carry the triggering
         // allocation size so a bounded major collection applies the
         // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
-        self.pending_reserving_size = total_size;
-        self.do_collect_nursery();
-        self.pending_reserving_size = 0;
-        // incminimark.py `major_collection_step` — a bounded major collection
-        // that leaves the heap over `max_heap_size` asks this allocation to
-        // fail so the caller raises MemoryError. `transform.py`
-        // `_ll_malloc_fixedsize` stores that exception in `exc_data` before
-        // returning NULL; the compiled `CHECK_MEMORY_ERROR` path is the same
-        // store. Never taken in the unbounded default (`PYPY_GC_MAX` unset).
-        if std::mem::take(&mut self.oom_pending) {
-            crate::raise_memory_error_if_installed();
-            return GcRef(0);
-        }
-        let ptr = self.nursery.alloc(total_size);
-        let mut ptr = if ptr.is_null() {
-            self.reserve_nursery_gap(total_size)
-        } else {
-            ptr
-        };
-        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-            // Production incminimark keeps `nonlarge_max` below the
-            // nursery size. Tiny backend tests can configure the two
-            // independently; retain their external-allocation fallback
-            // only for an object that cannot physically fit anywhere, born
-            // young as the large arm above births it.
-            if self.young_birth_allowed(type_id) {
-                return self
-                    .try_alloc_young_nonmoving_clear(type_id, total_size)
-                    .unwrap_or(GcRef(0));
+        let mut ptr = std::ptr::null_mut();
+        for _ in 0..64 {
+            self.pending_reserving_size = total_size;
+            self.do_collect_nursery();
+            self.pending_reserving_size = 0;
+            // incminimark.py `major_collection_step` — a bounded major collection
+            // that leaves the heap over `max_heap_size` asks this allocation to
+            // fail so the caller raises MemoryError. `transform.py`
+            // `_ll_malloc_fixedsize` stores that exception in `exc_data` before
+            // returning NULL; the compiled `CHECK_MEMORY_ERROR` path is the same
+            // store. Never taken in the unbounded default (`PYPY_GC_MAX` unset).
+            if std::mem::take(&mut self.oom_pending) {
+                crate::raise_memory_error_if_installed();
+                return GcRef(0);
             }
-            // Otherwise it is born old, and a `CALL_MALLOC_NURSERY` caller
-            // then stamps the whole `HDR.tid` word over the old-generation
-            // flags (see `make_tid_field_descr`).
-            return self.alloc_in_oldgen_clear(type_id, total_size);
-        }
-        if ptr.is_null() {
-            // `IncrementalMiniMarkGC.collect_and_reserve`: finalizer or
-            // rawrefcount work run by the wrapper may have filled the nursery
-            // again.  The second attempt is exactly `_minor_collection()` —
-            // no major step and no second callback — so the retry sees an
-            // empty nursery apart from pinned barriers.
-            self.minor_collection_only();
-            ptr = self.nursery.alloc(total_size);
+            ptr = self.bump_nursery(total_size);
             if ptr.is_null() {
                 ptr = self.reserve_nursery_gap(total_size);
+            }
+            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+                // Production incminimark keeps `nonlarge_max` below the
+                // nursery size. Tiny backend tests can configure the two
+                // independently; retain their external-allocation fallback
+                // only for an object that cannot physically fit anywhere, born
+                // young as the large arm above births it.
+                if self.young_birth_allowed(type_id) {
+                    return self
+                        .try_alloc_young_nonmoving_clear(type_id, total_size)
+                        .unwrap_or(GcRef(0));
+                }
+                // Otherwise it is born old, and a `CALL_MALLOC_NURSERY` caller
+                // then stamps the whole `HDR.tid` word over the old-generation
+                // flags (see `make_tid_field_descr`).
+                return self.alloc_in_oldgen_clear(type_id, total_size);
+            }
+            if ptr.is_null() {
+                // `IncrementalMiniMarkGC.collect_and_reserve`: finalizer or
+                // rawrefcount work run by the wrapper may have filled the nursery
+                // again.  The second attempt is exactly `_minor_collection()` —
+                // no major step and no second callback — so the retry sees an
+                // empty nursery apart from pinned barriers.
+                self.minor_collection_only();
+                ptr = self.bump_nursery(total_size);
+                if ptr.is_null() {
+                    ptr = self.reserve_nursery_gap(total_size);
+                }
+            }
+            if !ptr.is_null() {
+                break;
             }
         }
         assert!(
@@ -2310,7 +2375,7 @@ impl MiniMarkGC {
         }
 
         if total_size < self.config.large_object_threshold {
-            let ptr = self.nursery.alloc(total_size);
+            let ptr = self.bump_nursery(total_size);
             if !ptr.is_null() {
                 return self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
             }
@@ -2388,42 +2453,48 @@ impl MiniMarkGC {
             return self.finish_nursery_object(ptr, type_id);
         }
 
+        let mut ptr = std::ptr::null_mut();
         self.pending_reserving_size = total_size;
         for i in 0..root_count {
             unsafe { self.roots.add(roots.add(i)) };
         }
-        self.do_collect_nursery();
-        self.pending_reserving_size = 0;
-        if std::mem::take(&mut self.oom_pending) {
-            crate::raise_memory_error_if_installed();
-            for i in (0..root_count).rev() {
-                self.roots.remove(unsafe { roots.add(i) });
+        for _ in 0..64 {
+            self.do_collect_nursery();
+            if std::mem::take(&mut self.oom_pending) {
+                crate::raise_memory_error_if_installed();
+                self.pending_reserving_size = 0;
+                for i in (0..root_count).rev() {
+                    self.roots.remove(unsafe { roots.add(i) });
+                }
+                return GcRef(0);
             }
-            return GcRef(0);
-        }
-        let ptr = self.nursery.alloc(total_size);
-        let mut ptr = if ptr.is_null() {
-            self.reserve_nursery_gap(total_size)
-        } else {
-            ptr
-        };
-        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-            for i in (0..root_count).rev() {
-                self.roots.remove(unsafe { roots.add(i) });
-            }
-            unsafe { *needs_write_barrier = true };
-            return self.alloc_in_oldgen_clear(type_id, total_size);
-        }
-        if ptr.is_null() {
-            // Keep the exceptional native-stack slot registered across the
-            // second bare minor as well; it is precisely another moving
-            // collection, even though no major/callback tail follows it.
-            self.minor_collection_only();
-            ptr = self.nursery.alloc(total_size);
+            ptr = self.bump_nursery(total_size);
             if ptr.is_null() {
                 ptr = self.reserve_nursery_gap(total_size);
             }
+            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+                self.pending_reserving_size = 0;
+                for i in (0..root_count).rev() {
+                    self.roots.remove(unsafe { roots.add(i) });
+                }
+                unsafe { *needs_write_barrier = true };
+                return self.alloc_in_oldgen_clear(type_id, total_size);
+            }
+            if ptr.is_null() {
+                // Keep the exceptional native-stack slot registered across the
+                // second bare minor as well; it is precisely another moving
+                // collection, even though no major/callback tail follows it.
+                self.minor_collection_only();
+                ptr = self.bump_nursery(total_size);
+                if ptr.is_null() {
+                    ptr = self.reserve_nursery_gap(total_size);
+                }
+            }
+            if !ptr.is_null() {
+                break;
+            }
         }
+        self.pending_reserving_size = 0;
         for i in (0..root_count).rev() {
             self.roots.remove(unsafe { roots.add(i) });
         }
@@ -2655,7 +2726,7 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
-        let ptr = self.nursery.alloc(total_size);
+        let ptr = self.bump_nursery(total_size);
         if ptr.is_null() {
             // malloc_fixedsize overflow is collect_and_reserve. A WEAKREF
             // (`contains_weakptr`) is always nursery-sized, so it never takes
@@ -2781,7 +2852,7 @@ impl MiniMarkGC {
         }
 
         if total_size < self.config.large_object_threshold {
-            let ptr = self.nursery.alloc(total_size);
+            let ptr = self.bump_nursery(total_size);
             if !ptr.is_null() {
                 let obj = self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
                 unsafe { *needs_write_barrier = false };
@@ -2806,7 +2877,7 @@ impl MiniMarkGC {
         {
             return GcRef(0);
         }
-        let ptr = self.nursery.alloc(total_size);
+        let ptr = self.bump_nursery(total_size);
         if ptr.is_null() {
             return GcRef(0);
         }
@@ -4339,10 +4410,8 @@ impl MiniMarkGC {
     /// `IncrementalMiniMarkGC._minor_collection`, including pyre's
     /// stop-the-world ownership but deliberately excluding the wrapper tail.
     fn minor_collection_only(&mut self) {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return;
         };
         self.minor_collection_body();
     }
@@ -4354,10 +4423,8 @@ impl MiniMarkGC {
     /// 3. Schedule rawrefcount work queued by either collection.
     pub fn do_collect_nursery(&mut self) {
         self.debug_assert_cursor_owner();
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return;
         };
         self.minor_collection_body();
         self.run_major_progress_after_minor(false);
@@ -7104,11 +7171,7 @@ impl MiniMarkGC {
         if generation == 1 {
             return;
         }
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         let roots = self.enumerate_all_root_values();
         let mut pending = roots.clone();
         let mut result = Vec::new();
@@ -7203,11 +7266,7 @@ impl MiniMarkGC {
     /// exactly once, without the reachability traversal used by
     /// `rgc.do_get_objects`.
     pub fn do_get_rpy_roots(&mut self, visitor: &mut dyn FnMut(GcRef)) -> bool {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         let roots = self.enumerate_all_root_values();
         if roots.len() > self.totalroots_rpy {
             self.totalroots_rpy = roots.len() + roots.len() / 8 + 10;
@@ -7242,11 +7301,7 @@ impl MiniMarkGC {
         {
             return true;
         }
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         self.visit_referents_with_type_id(obj.0, type_id, visitor);
         true
     }
@@ -7256,11 +7311,7 @@ impl MiniMarkGC {
     /// reachable objects. `GCFLAG_EXTRA` is the forwarded/PtrInfo-equivalent
     /// visited slot used by upstream, so no address side table is introduced.
     pub fn do_dump_rpy_heap(&mut self, fd: i32) -> Result<bool, i32> {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         let roots = self.enumerate_all_root_values();
         let mut root_pending = Vec::new();
         for &root in &roots {
@@ -7295,11 +7346,7 @@ impl MiniMarkGC {
         // The forced-top store below rewrites the same published free/top words
         // compiled code reads inline, so park the other mutators for it the way
         // every other entry point that mutates published allocator state does.
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         if !object.is_null() && self.is_managed_heap_object(object.0) {
             let type_id = unsafe { (*header_of(object.0)).type_id() };
             if (type_id as usize) < self.types.len()
@@ -7323,6 +7370,7 @@ impl MiniMarkGC {
             // barrier: moving top backwards would discard that barrier.
             let top = self.nursery.top_ptr();
             unsafe { self.nursery.set_free_ptr(top.cast_mut()) };
+            self.clear_mutator_nursery_chunks();
         }
     }
 
@@ -7331,11 +7379,7 @@ impl MiniMarkGC {
     /// `GCFLAG_EXTRA` is the upstream walker slot; no address side table is
     /// introduced.
     pub fn do_count_memory_pressure(&mut self) -> isize {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         let roots = self.enumerate_all_root_values();
         let mut pending = Vec::new();
         for &root in &roots {
@@ -7485,11 +7529,7 @@ impl MiniMarkGC {
         if self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() } {
             return;
         }
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
+        let _stw = crate::gc_sync::quiesce_mutators_owned();
         let mut pending: Vec<GcRef> = Vec::new();
         let mut result: Vec<GcRef> = Vec::new();
         let mut i = 0usize;
@@ -9817,10 +9857,8 @@ impl MiniMarkGC {
     /// 3. Sweep phase: free all unmarked old-gen objects.
     pub fn do_collect_full(&mut self) {
         self.debug_assert_cursor_owner();
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return;
         };
         // incminimark.py `minor_and_major_collection` /
         // `gc_step_until`: first finish the current major cycle, if any, with
@@ -9895,10 +9933,8 @@ impl MiniMarkGC {
             self.do_collect_full();
             return;
         }
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return;
         };
         if generation < 0 {
             // "Dangerous! this makes no progress on the major GC cycle.  If
@@ -9943,10 +9979,12 @@ impl MiniMarkGC {
 
     /// incminimark.py `collect_step`.
     pub fn collect_step(&mut self) -> crate::GcStepTransition {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            let state = self.gc_state.encoded();
+            return crate::GcStepTransition {
+                old_state: state,
+                new_state: state,
+            };
         };
         let old_state = self.gc_state;
 
@@ -9988,10 +10026,8 @@ impl MiniMarkGC {
     /// remembered set is left untouched: a non-moving major does not consume
     /// `old -> young` edges, so the next minor still finds them.
     pub fn do_collect_oldgen_nonmoving(&mut self) {
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return;
         };
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_young_marks.clear();
@@ -10780,10 +10816,8 @@ impl MiniMarkGC {
         }
         // `collect_step` takes the same pause: a leading minor moves the
         // nursery, so every registered mutator has to be off the heap.
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
+        let Some(_stw) = self.quiesce_for_collection() else {
+            return true;
         };
         self.minor_collection_body();
         self.major_collection_step();
@@ -10845,6 +10879,7 @@ impl MiniMarkGC {
             self.nursery.set_top_ptr(first_top as *const u8);
             self.nursery.set_free_ptr(nursery_start as *mut u8);
         }
+        self.clear_mutator_nursery_chunks();
     }
 
     /// incminimark.py `pin`.

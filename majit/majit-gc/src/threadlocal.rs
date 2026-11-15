@@ -201,10 +201,14 @@ pub(crate) fn note_cursor_owner() {
 
 /// `rthread.py` `gc_thread_run` / `shadowstack.py thread_run`.
 ///
-/// If this thread is already the cursor owner, one compare and return.
-/// Otherwise copy the live `(free, top)` pair into this thread's words,
-/// zero the previous owner, repoint the nursery, and republish the bump
-/// addresses.
+/// With the GIL on: if this thread is already the cursor owner, one compare
+/// and return. Otherwise copy the live `(free, top)` pair into this thread's
+/// words, zero the previous owner, repoint the nursery, and republish the
+/// bump addresses.
+///
+/// With the GIL off the arena cursor stays on the GC-owned fallback pair
+/// and this is a no-op: each thread's pair is a chunk, empty until the
+/// allocation slow path carves one.
 #[inline]
 pub fn gc_thread_run() {
     crate::gc_sync::claim_nursery_cursor_for_current_thread();
