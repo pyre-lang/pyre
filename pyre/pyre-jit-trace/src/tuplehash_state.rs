@@ -354,8 +354,16 @@ mod tests {
         let squatter = colliding_squatter_key(&typed);
         assert_eq!(squatter.get_uhash(), hash);
         assert_ne!(squatter, typed);
-        jd3.disable_noninlinable_function_for_key(&squatter);
-        let minted = jd3.ensure_cell_key(&typed);
+        {
+            let pin = majit_metainterp::GreenRefPin::pin(&squatter);
+            let mut live = pin.live_clone(&squatter);
+            jd3.disable_noninlinable_function_for_key(&pin, &mut live);
+        }
+        let minted = {
+            let pin = majit_metainterp::GreenRefPin::pin(&typed);
+            let mut live = pin.live_clone(&typed);
+            jd3.ensure_cell_key(&pin, &mut live)
+        };
         assert_ne!(
             minted, hash,
             "the squatter keeps the raw hash; the typed cell is minted"
