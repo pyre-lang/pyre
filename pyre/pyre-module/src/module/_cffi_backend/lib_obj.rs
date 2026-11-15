@@ -65,7 +65,9 @@ pub fn new_lib(
     let ffi_slot = roots.base();
     let _ = roots.pin_root(w_ffi);
     let dict_slot = ffi_slot + 1;
-    let _ = roots.pin_root(pyre_object::dictmultiobject::w_module_dict_new());
+    // `lib_obj.py` `self.dict_w = {}`: interned-str map, same shape as
+    // `W_TypeObject.dict_w`.
+    let _ = roots.pin_root(pyre_object::dictmultiobject::w_dict_new());
     let name_slot = dict_slot + 1;
     let _ = roots.pin_root(pyre_object::w_str_new(libname));
     let obj = W_LibObject::allocate_stable(W_LibObject {
@@ -188,11 +190,17 @@ fn build_cpython_func(
 /// `dict_w` right after it, and an elidable call that raised is never folded
 /// to its result. `w_attr` is the attribute's string object, the one word
 /// `elidable_promote` guards on.
+///
+/// `dict_w` is the interned-str `{}` `lib_obj.py` stores. The read uses the
+/// same exact-str probe as `_pure_getdictvalue_no_unwrapping` so the
+/// elidable graph cannot reach `eq_w_hooked`.
 #[majit_macros::elidable_promote]
 fn get_attr_elidable(lib: &W_LibObject, w_attr: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let mut w_attr = w_attr;
     let attr = pyre_object::with_roots!(w_attr => pyre_interpreter::baseobjspace::text_w(w_attr))?;
-    match unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) } {
+    match unsafe {
+        pyre_object::dictmultiobject::w_type_dict_getitem_bytes(lib.dict_w, attr.as_bytes())
+    } {
         Some(w_value) => Ok(w_value),
         // `self.dict_w[attr]` raises an interp-level `KeyError`; both callers
         // catch it and go to `_build_attr`, so no app-level `repr` is built.

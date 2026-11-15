@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=argument_shapes,hot,missing_window
+# pyre-check: selfcheck-compiles=argument_shapes,hot,missing_window,subclass_hot
 # pyre-check: spec-folds=kwonly_defaults_inline
 # pyre-check: trace-shape=argument_shapes:max=CallMayForceR:12
 # Self-checking guard for the pins under an inlined callee's keyword-only
@@ -28,6 +28,9 @@
 #   D  keep calling after that rebind.  A plain dict has no version to pin, so
 #      the resolve declines and the callee seeds through the ordinary path --
 #      which must still see a later in-place mutation.
+#   E  assign a dict subclass whose `__getitem__` counts.  The cell fold
+#      declines (the mapping is not an exact versioned dict).  The residual
+#      binder reads storage, so `__getitem__` stays at 0.
 N = 20000
 
 
@@ -112,6 +115,27 @@ def hot(n, want_step, want_tag):
     return bad
 
 
+count = [0]
+
+
+class CountDict(dict):
+    def __getitem__(self, k):
+        count[0] += 1
+        return dict.__getitem__(self, k)
+
+
+def h(x, *, step=3):
+    return x + step
+
+
+def subclass_hot(n):
+    """Site E: dict-subclass `__kwdefaults__` whose `__getitem__` counts."""
+    last = 0
+    for i in range(n):
+        last = h(i)
+    return last, count[0]
+
+
 def main():
     if argument_shapes(N):
         print("FAIL argument default shapes disagreed")
@@ -151,6 +175,14 @@ def main():
     bad = hot(N, 11, "q")
     if bad:
         print(f"FAIL site D missed a mutation after the rebind on {bad} of {N} calls")
+        return 1
+
+    count[0] = 0
+    h.__kwdefaults__ = CountDict(step=3)
+    last, seen = subclass_hot(N)
+    print(last, seen)
+    if last != (N - 1) + 3 or seen != 0:
+        print(f"FAIL subclass storage lookup last={last} count={seen}")
         return 1
 
     print("PASS kwdefaults invalidation")

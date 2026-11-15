@@ -6234,8 +6234,19 @@ impl OptContext {
         self.store_final_boxes_in_guard(op, knowledge, pending_setfields);
     }
 
+    fn snapshot_maps_present(&self) -> bool {
+        self.snapshot_boxes.iter().any(Option::is_some)
+    }
+
     fn resume_snapshot_ready(&self, pos: i32) -> bool {
-        snapshot_contains(&self.snapshot_boxes, pos) || self.byte_resume_contains(pos)
+        // resume.py `finish` numbers one snapshot at `rd_resume_position`.
+        // The prebuilt maps are that snapshot. A byte-buffer feed is the
+        // `Trace.get_snapshot_iter` stand-in only when those maps were
+        // never filled (byte-mode bridge). A miss inside a filled map
+        // falls through to `patchguardop` (`unroll.py` extra_guards /
+        // `inline_short_preamble` copy `patchguardop.rd_resume_position`).
+        snapshot_contains(&self.snapshot_boxes, pos)
+            || (!self.snapshot_maps_present() && self.byte_resume_contains(pos))
     }
 
     fn byte_resume_contains(&self, pos: i32) -> bool {
@@ -6349,7 +6360,12 @@ impl OptContext {
         // Byte-mode bridges have no prebuilt box list. Number from
         // `SnapshotIterator` before any `snapshot_boxes` borrow: the feed
         // has to move out of `self` for the `BoxEnv` borrow.
-        let use_byte = self.byte_resume_contains(resume_pos)
+        // `resume.py finish` has one numbering path (`get_snapshot_iter`).
+        // When the maps exist they are that path; do not decode the same
+        // guard through `unique_cache` just because the offset sits
+        // inside `_snapshot_data`.
+        let use_byte = !self.snapshot_maps_present()
+            && self.byte_resume_contains(resume_pos)
             && !snapshot_contains(&self.snapshot_boxes, resume_pos);
         let byte_numbered = if use_byte {
             let min_vable = self.minimum_virtualizable_size;

@@ -7949,6 +7949,32 @@ pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     op_pc: usize,
     descent: &HelperDescent,
 ) -> Option<OrthodoxDescentPrep<Sym>> {
+    prepare_orthodox_descent_returning(ctx, op_pc, descent, nested_orthodox_helper_return(ctx))
+}
+
+/// Converted at the root portal (no helper level; guards resume at the
+/// Python CALL). CallResult only under a CallResult orthodox chain
+/// (`allow_numbered_may_force`): Converted under a numbered builtin
+/// wrapper is HEAD, and Converted under Numbered is Unresumable
+/// (`helper_subwalk_level`). Nested finditem under `_match_signature`
+/// inherits the flag and keeps a section.
+fn nested_orthodox_helper_return<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> HelperReturn {
+    if ctx.fbw_mode.allow_numbered_may_force {
+        HelperReturn::CallResult
+    } else {
+        HelperReturn::Converted
+    }
+}
+
+/// Same resolve as [`prepare_orthodox_descent`], with an explicit resume
+/// shape. `_match_signature` passes [`HelperReturn::CallResult`] so it is a
+/// real `MIFrame` (`pyjitpl.py` `perform_call` / `newframe`).
+pub(crate) fn prepare_orthodox_descent_returning<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    descent: &HelperDescent,
+    helper_return: HelperReturn,
+) -> Option<OrthodoxDescentPrep<Sym>> {
     let decline = |why: &str| {
         if fbw_debug_abort_enabled() {
             eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
@@ -7969,7 +7995,7 @@ pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, helper_return) else {
         return decline("NESTED-ENTRY");
     };
     Some(OrthodoxDescentPrep {
@@ -8112,7 +8138,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     if boxed_out.is_some() {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        // `finishframe` writes dest only when `resultbox is not None`.
+        // Void-bank `boxed_out` is that None case: the caller writes the
+        // CALL dest later, so this must not set `residual_dest_written`.
+        if dst_bank != 'v' {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        }
     } else {
         write_no_driver_finishframe_dest(
             ctx,
@@ -8159,11 +8190,10 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
         Some(&mut boxed),
     )? {
         Some(DispatchOutcome::Continue) => {
-            helper_blackhole_after_no_driver_finishframe(
-                ctx,
-                no_driver_finishframe_latch(ctx, op_pc),
-                op_pc,
-            )?;
+            // `finishframe(None)` pops and does not `make_result_of_lastop`.
+            // The enclosing Python CALL dest is still unwritten, so abort
+            // convert resumes at that CALL (`op_pc`), not `residual_call_next_pc`.
+            helper_blackhole_after_no_driver_finishframe(ctx, op_pc, op_pc)?;
             if allow_void {
                 Ok(Some(boxed))
             } else {
@@ -8183,6 +8213,12 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
 /// leaves the trace cut back to the call site.  The descent itself must
 /// produce the concrete; missing it declines rather than allocating a
 /// second shadow.
+///
+/// `_match_signature` is `@jit.unroll_safe`. A constructor that
+/// crosses `trace_limit` is `pyjitpl.py blackhole_if_trace_too_long`
+/// (`SwitchToBlackhole(ABORT_TOO_LONG)`); `do_residual_or_indirect_call`
+/// is the next-trace path after `dont_trace_here`, not a same-walk
+/// residual of the enclosing Python CALL.
 pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8200,6 +8236,9 @@ pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
 
 /// Walk `w_dict_store` for one `_match_signature` keyword that named no
 /// parameter (`space.setitem(w_kwds, w_key, w_value)`).
+///
+/// `TraceTooLong` is `pyjitpl.py blackhole_if_trace_too_long` and
+/// propagates; a genuine constructor decline is `Ok(None)`.
 pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

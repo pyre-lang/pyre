@@ -969,6 +969,10 @@ pub(crate) fn discover_transparent_scalar_kinds(
         if super::frame_anchor::is_anchor_path(decl.item_meta.name_path_str()) {
             continue;
         }
+        // Only the defining crate's field list defines the linked kind.
+        if !decl.item_meta.is_local {
+            continue;
+        }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };

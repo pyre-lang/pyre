@@ -82,4 +82,81 @@ for trial in range(30):
     if s != 19900:
         short.append((trial, s))
 assert not short, f"sum over list(range(200)) came out wrong, (trial, sum): {short}"
+
+# Nested `readline` with its own FOR_ITER, called from user `__next__`,
+# interleaved with a short FOR_ITER. `fbw_foriter_inflight_capture` runs
+# after `__next__` returns, so the first `instance_next` consume has an
+# empty stash and used to inline that nested body; `popleft` then
+# `collect_callee_active_boxes` aborted the enclosing loop and the
+# header/body blank reappeared in the payload.
+from email.feedparser import FeedParser
+
+SAMPLE = """\
+Return-Path: <gkj@gregorykjohnson.com>
+X-Original-To: gkj+person@localhost
+Delivered-To: gkj+person@localhost
+Received: from localhost (localhost [127.0.0.1])
+        by andy.gregorykjohnson.com (Postfix) with ESMTP id 356ED9DD17
+        for <gkj+person@localhost>; Wed, 13 Jul 2005 17:23:16 -0400 (EDT)
+Delivered-To: gkj@sundance.gregorykjohnson.com
+Received: from localhost [127.0.0.1]
+        by localhost with POP3 (fetchmail-6.2.5)
+        for gkj+person@localhost (single-drop); Wed, 13 Jul 2005 17:23:16 -0400 (EDT)
+Received: from andy.gregorykjohnson.com (andy.gregorykjohnson.com [64.32.235.228])
+        by sundance.gregorykjohnson.com (Postfix) with ESMTP id 5B056316746
+        for <gkj@gregorykjohnson.com>; Wed, 13 Jul 2005 17:23:11 -0400 (EDT)
+Received: by andy.gregorykjohnson.com (Postfix, from userid 1000)
+        id 490CD9DD17; Wed, 13 Jul 2005 17:23:11 -0400 (EDT)
+Date: Wed, 13 Jul 2005 17:23:11 -0400
+From: "Gregory K. Johnson" <gkj@gregorykjohnson.com>
+To: gkj@gregorykjohnson.com
+Subject: Sample message
+Message-ID: <20050713212311.GC4701@andy.gregorykjohnson.com>
+Mime-Version: 1.0
+Content-Type: multipart/mixed; boundary="NMuMz9nt05w80d4+"
+Content-Disposition: inline
+User-Agent: Mutt/1.5.9i
+
+
+--NMuMz9nt05w80d4+
+Content-Type: text/plain; charset=us-ascii
+Content-Disposition: inline
+
+This is a sample message.
+
+--
+Gregory K. Johnson
+
+--NMuMz9nt05w80d4+
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="text.gz"
+Content-Transfer-Encoding: base64
+
+H4sICM2D1UIAA3RleHQAC8nILFYAokSFktSKEoW0zJxUPa7wzJIMhZLyfIWczLzUYj0uAHTs
+3FYlAAAA
+
+--NMuMz9nt05w80d4+--
+"""
+GZIP_B64 = """H4sICM2D1UIAA3RleHQAC8nILFYAokSFktSKEoW0zJxUPa7wzJIMhZLyfIWczLzUYj0uAHTs
+3FYlAAAA
+"""
+
+
+def only_iter(x):
+    n = 0
+    for a in x:
+        n += 1
+    return n
+
+
+pairs = [("From", "a@b.c"), ("Content-Type", "text/plain")] * 20
+for i in range(80):
+    for t in pairs:
+        only_iter(t)
+    fp = FeedParser()
+    fp.feed(SAMPLE)
+    msg = fp.close()
+    p1 = msg.get_payload()[1].get_payload()
+    assert p1 == GZIP_B64, (i, p1[:80] if isinstance(p1, str) else p1)
+
 print("OK")

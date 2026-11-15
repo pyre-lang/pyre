@@ -281,11 +281,10 @@ fn monomorphic_caller_specializes_by_value_type_only_generic() {
     );
 }
 
-/// `dict_entries_value_set_at` is monomorphic (`ObjectDictStorage`) and
-/// calls type-only `set_slot_value<K,V,S>`. The call binds a spec copy
-/// so `entries_item_ptr` sees concrete `K, V` and recovers the items
-/// offset (`array_items_base`). The unsubstituted generic
-/// `entries_item_ptr` still LowerErrors (no offset guess).
+/// `dict_entries_value_set_at` is the object-key overwrite of
+/// `_ll_dict_setitem_lookup_done`. The body contains
+/// `d.entries[i].value = value` so ARRAY.OF is
+/// `Entry<ObjectKey, OBJECTPTR>` (`get_ll_dict`).
 #[test]
 fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -302,9 +301,30 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
         .iter()
         .find(|f| f.name == "dict_entries_value_set_at")
         .expect("dict_entries_value_set_at graph");
+    let interiors: Vec<_> = setter
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::InteriorFieldWrite {
+                field,
+                array_type_id,
+                ..
+            } => Some((field.name.clone(), array_type_id.clone())),
+            _ => None,
+        })
+        .collect();
+    let object_key_interior = interiors.iter().any(|(field, atid)| {
+        field == "value"
+            && atid.as_deref().is_some_and(|id| {
+                id.contains("ObjectKey")
+                    && (id.contains("*mut PyObject") || id.contains("PyObjectRef"))
+            })
+    });
     assert!(
-        graph_calls_spec_leaf(setter.graph(), "set_slot_value__spec_"),
-        "dict_entries_value_set_at must bind set_slot_value__spec_, ops {:?}",
+        object_key_interior,
+        "dict_entries_value_set_at must write object-key interior (`d.entries[i].value = value`); interiors={interiors:?} ops {:?}",
         op_kinds(setter.graph())
     );
     assert!(
@@ -312,29 +332,70 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
         "dict_entries_value_set_at must not bind unspecialized set_slot_value, ops {:?}",
         op_kinds(setter.graph())
     );
+    assert!(
+        !graph_calls_leaf(setter.graph(), "entry_ptr")
+            && !graph_calls_leaf(setter.graph(), "entries_item_ptr"),
+        "dict_entries_value_set_at must not return a GCREF of the item run, ops {:?}",
+        op_kinds(setter.graph())
+    );
+}
 
-    let item_ptrs: Vec<_> = program
+/// `dict_entries_value_at` is the object-key `ll_dict_getitem` value
+/// read. The body contains `d.entries[i].value` so ARRAY.OF is
+/// `Entry<ObjectKey, OBJECTPTR>` (`get_ll_dict`).
+#[test]
+fn dict_entries_value_at_binds_spec_slot_value() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict", "rordereddict_entries"],
+        &["dict_entries_value_at"],
+    )
+    .expect("lower dict_entries_value_at");
+
+    let getter = program
         .functions
         .iter()
-        .filter(|f| f.name.contains("entries_item_ptr__spec_"))
+        .find(|f| f.name == "dict_entries_value_at")
+        .expect("dict_entries_value_at graph");
+    let interiors: Vec<_> = getter
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::InteriorFieldRead {
+                field,
+                array_type_id,
+                ..
+            } => Some((field.name.clone(), array_type_id.clone())),
+            _ => None,
+        })
         .collect();
+    let object_key_interior = interiors.iter().any(|(field, atid)| {
+        field == "value"
+            && atid.as_deref().is_some_and(|id| {
+                id.contains("ObjectKey")
+                    && (id.contains("*mut PyObject") || id.contains("PyObjectRef"))
+            })
+    });
     assert!(
-        !item_ptrs.is_empty(),
-        "expected entries_item_ptr__spec_ graphs, got {:?}",
-        program
-            .functions
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
+        object_key_interior,
+        "dict_entries_value_at must read object-key interior (`d.entries[i].value`); interiors={interiors:?} ops {:?}",
+        op_kinds(getter.graph())
     );
-    for spec in &item_ptrs {
-        assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
-            spec.name,
-            op_kinds(spec.graph())
-        );
-    }
+    assert!(
+        !graph_calls_leaf(getter.graph(), "slot_value"),
+        "dict_entries_value_at must not bind unspecialized slot_value, ops {:?}",
+        op_kinds(getter.graph())
+    );
+    assert!(
+        !graph_calls_leaf(getter.graph(), "entry_ptr")
+            && !graph_calls_leaf(getter.graph(), "entries_item_ptr"),
+        "dict_entries_value_at must not return a GCREF of the item run, ops {:?}",
+        op_kinds(getter.graph())
+    );
 }
 
 /// `w_set` storage is `RDict<ObjectKey, ()>`. Its `entries_item_ptr`
@@ -359,27 +420,94 @@ fn objectkey_unit_entries_item_ptr_emits_direct_arrayitems() {
         .iter()
         .filter(|f| f.name.contains("entries_item_ptr__spec_ObjectKey____"))
         .collect();
-    assert!(
-        !unit_ptrs.is_empty(),
-        "expected ObjectKey+() entries_item_ptr spec, got {names:?}"
-    );
-    for spec in &unit_ptrs {
+    if unit_ptrs.is_empty() {
+        // `try_lower_rordereddict_item_ptr` inlines `entry_ptr` /
+        // `entries_item_ptr` (`ll_get_value` is `d.entries[i].value`
+        // getinteriorfield; rordereddict.py has no item-pointer
+        // function). The ObjectKey+() property holds on those
+        // inliners.
+        use majit_translate::model::cast_instance_root;
+        let inliners: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|f| {
+                f.name.contains("entry_at__spec_ObjectKey")
+                    || f.name.contains("entry_valid__spec_ObjectKey")
+            })
+            .collect();
         assert!(
-            graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
-            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
-            spec.name,
-            op_kinds(spec.graph())
+            !inliners.is_empty(),
+            "expected ObjectKey+() entry_at/entry_valid inliners of entries_item_ptr, got {names:?}"
         );
-        let has_items_field =
-            spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+        for spec in &inliners {
+            assert!(
+                !graph_calls_leaf(spec.graph(), "entries_item_ptr"),
+                "{} must not bind unspecialized entries_item_ptr, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_items_field = spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
                 |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "items"),
             );
-        assert!(
-            !has_items_field,
-            "{} must not getattr items, ops {:?}",
-            spec.name,
-            op_kinds(spec.graph())
-        );
+            assert!(
+                !has_items_field,
+                "{} must not getattr items, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let gc_entries_cast =
+                spec.graph()
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| {
+                        cast_instance_root(&op.kind)
+                            .is_some_and(|root| root.rsplit("::").next() == Some("GcEntries"))
+                    });
+            assert!(
+                !gc_entries_cast,
+                "{} must not cast onto unsuffixed GcEntries, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_interior = spec
+                .graph()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. }
+                    )
+                });
+            let has_direct_arrayitems = graph_calls_leaf(spec.graph(), "cast_int_to_ptr")
+                || graph_calls_leaf(spec.graph(), "cast_ptr_to_int");
+            assert!(
+                has_interior || has_direct_arrayitems,
+                "{} must emit interior-field or direct_arrayitems, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+        }
+    } else {
+        for spec in &unit_ptrs {
+            assert!(
+                graph_calls_leaf(spec.graph(), "cast_int_to_ptr"),
+                "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+            let has_items_field = spec.graph().blocks.iter().flat_map(|b| &b.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "items"),
+            );
+            assert!(
+                !has_items_field,
+                "{} must not getattr items, ops {:?}",
+                spec.name,
+                op_kinds(spec.graph())
+            );
+        }
     }
 }
 

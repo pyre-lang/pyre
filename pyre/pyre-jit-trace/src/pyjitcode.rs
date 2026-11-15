@@ -415,8 +415,8 @@ pub(crate) fn compute_blackhole_resume_facts(
     pc: usize,
     in_flight_callee_may_raise: bool,
 ) -> BlackholeResumeFacts {
-    match crate::jitcode_runtime::blackhole_resume_reachable_starts(
-        jitcode.code.as_slice(),
+    match crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+        jitcode,
         pc,
         in_flight_callee_may_raise,
     ) {
@@ -1030,6 +1030,24 @@ impl PyJitCode {
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
         Self::predecessor_index(search).map(|i| table[i].1.as_slice())
+    }
+
+    /// Color→slot map for a snapshot *entry* coordinate.
+    ///
+    /// An exact `pcdep_by_jit_pc` hit is that coordinate's own row, including
+    /// an empty one. An absent coordinate — `-live-` marker or interior
+    /// offset — falls back to the predecessor row (`pcdep_for_jitcode_pc`),
+    /// matching `get_live_vars_info` (`jitcode.py`) walking BACK onto a
+    /// `-live-` and the pre-`pcdep_for_snapshot_entry` decode path.
+    pub fn pcdep_for_snapshot_entry(&self, jit_pc: usize) -> Vec<(u8, u16, u16)> {
+        let table = &self.metadata.pcdep_by_jit_pc;
+        match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            Ok(i) => table[i].1.clone(),
+            Err(_) => self
+                .pcdep_for_jitcode_pc(jit_pc)
+                .map(ToOwned::to_owned)
+                .unwrap_or_default(),
+        }
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
