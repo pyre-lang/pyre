@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn wrapper_for(code: &CodeObject) -> pyre_object::PyObjectRef {
-        crate::box_code_object(code.clone())
+        crate::box_code_object(code.clone()).unwrap()
     }
 
     fn dominating_backedge_targets(code: &CodeObject) -> Vec<usize> {

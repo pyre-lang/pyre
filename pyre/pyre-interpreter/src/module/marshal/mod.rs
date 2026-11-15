@@ -938,10 +938,10 @@ impl PyreMarshalBag {
         } else {
             &[]
         };
-        let code = Rooted::new(crate::pycode::box_code_object_with_interned_name_slots(
-            code,
-            interned_name_slots,
-        ));
+        let code = Rooted::new(
+            crate::pycode::box_code_object_with_interned_name_slots(code, interned_name_slots)
+                .map_err(|error| self.remember_python_error(error))?,
+        );
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
         // list to `PyCode.__init__`; replace the compiler-boundary eager values
@@ -1652,7 +1652,7 @@ mod tests {
 
     #[test]
     fn decoded_code_constant_uses_the_wrapped_pycode_as_authority() {
-        let w_code = crate::pycode::w_code_new(std::ptr::null());
+        let w_code = crate::pycode::w_code_new(std::ptr::null()).unwrap();
         let rooted = Rooted::new(w_code);
         let roots = pyre_object::gc_roots::push_roots();
         let mut pending_error = None;

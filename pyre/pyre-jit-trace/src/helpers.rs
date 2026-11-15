@@ -2364,7 +2364,7 @@ mod tests {
             })
             .expect("expected nested function code");
         let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-        let code_obj = pyre_interpreter::w_code_new(code_ptr);
+        let code_obj = pyre_interpreter::w_code_new(code_ptr).unwrap();
         let func = jit_make_function_from_globals(PY_NULL, code_obj);
 
         unsafe {

@@ -5108,7 +5108,7 @@ pub fn appleveldef_install_seeded(
     } else {
         let code = compile_source_with_filename(source, Mode::Exec, filename)
             .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
-        let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+        let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true)?;
         let _ = pyre_object::gc_roots::pin_root(w_code);
         crate::module::imp::interp_imp::applevel_cache_store(
             &cache_key,
@@ -5244,7 +5244,7 @@ fn load_source_module(
             }
             crate::syntax_warnings::SourceCompileError::Warning(error) => error,
         })?;
-        Ok(crate::box_code_object(code))
+        crate::box_code_object(code)
     };
     // `_bootstrap_external._validate_timestamp_pyc` / `check_compiled_module`:
     // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
@@ -9194,7 +9194,8 @@ mod tests {
             crate::call::set_last_exec_ctx(ec.as_ptr());
             let code = crate::compile::compile_source("x = 1\n", crate::compile::Mode::Exec)
                 .expect("compile");
-            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_code =
+                crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap();
             let w_globals = ec.fresh_module_globals();
             let path = rustpython_wtf8::Wtf8Buf::from("/tmp/m.py");
             exec_code_module(w_code, w_globals, ec.as_ptr(), Some(&path), None, false)
@@ -9214,7 +9215,8 @@ mod tests {
             crate::call::set_last_exec_ctx(ec.as_ptr());
             let code = crate::compile::compile_source("y = 2\n", crate::compile::Mode::Exec)
                 .expect("compile");
-            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_code =
+                crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap();
             let w_globals = ec.fresh_module_globals();
             let path = rustpython_wtf8::Wtf8Buf::from("<frozen importlib._bootstrap>");
             exec_code_module(w_code, w_globals, ec.as_ptr(), Some(&path), None, true)

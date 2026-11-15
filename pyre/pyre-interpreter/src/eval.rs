@@ -4280,7 +4280,7 @@ impl ConstantOpcodeHandler for PyFrame {
         // today, though `opcode_load_const` is registered as a JIT call target.
         // So the copy this makes is not on a measured path; see
         // `box_code_constant` for why removing it is not worth its price.
-        Ok(crate::pycode::box_code_constant(code))
+        crate::pycode::box_code_constant(code)
     }
 
     fn constant_at(

@@ -6394,7 +6394,7 @@ mod pack_varargs_tests {
         // Dict, function and the default string are born before the collecting
         // heap exists, so they are off-heap and do not move with the probe.
         crate::test_hooks::install_hash_hook();
-        let w_code = crate::pycode::box_code_object(code);
+        let w_code = crate::pycode::box_code_object(code).unwrap();
         let func = crate::function::function_new_from_code(w_code, pyre_object::w_dict_new());
         let kwdefaults = pyre_object::w_dict_new();
         let default_value = pyre_object::w_str_new("v");
@@ -6503,7 +6503,7 @@ mod pack_varargs_tests {
         assert!(code.flags.contains(crate::CodeFlags::VARKEYWORDS));
         assert_eq!(code.arg_count, 0);
         crate::test_hooks::install_hash_hook();
-        let w_code = crate::pycode::box_code_object(code);
+        let w_code = crate::pycode::box_code_object(code).unwrap();
         let func = crate::function::function_new_from_code(w_code, pyre_object::w_dict_new());
         let names = pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new("a"),
@@ -6787,11 +6787,11 @@ except TypeError as e:
         let code_gself = nested("gself");
         let w_globals = pyre_object::w_dict_new();
         let func_g = crate::function::function_new_from_code(
-            crate::pycode::box_code_object(code_g),
+            crate::pycode::box_code_object(code_g).unwrap(),
             w_globals,
         );
         let func_gself = crate::function::function_new_from_code(
-            crate::pycode::box_code_object(code_gself),
+            crate::pycode::box_code_object(code_gself).unwrap(),
             w_globals,
         );
         let dummy = pyre_object::w_int_new(0);

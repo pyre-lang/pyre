@@ -135,9 +135,8 @@ def start_error_capture():
         let globals_slot = roots.pin_roots(&[pyre_object::dictmultiobject::w_dict_new()]);
         let code = pyre_interpreter::compile::compile_exec(START_ERROR_CAPTURE)
             .map_err(|_| PyError::system_error("could not compile start_error_capture"))?;
-        let code_slot = roots.pin_roots(&[
-            pyre_interpreter::pycode::box_code_object_with_hidden_applevel(code, true),
-        ]);
+        let w_code = pyre_interpreter::pycode::box_code_object_with_hidden_applevel(code, true)?;
+        let code_slot = roots.pin_roots(&[w_code]);
         pyre_interpreter::builtins::exec_or_eval(
             roots.get(code_slot),
             roots.get(globals_slot),

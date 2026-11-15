@@ -2782,7 +2782,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     // `code_ptr.is_null()` fixture bail: the assertion is about the publish
     // path, not merely its parent-count predicate.
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe { w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let mut builder = majit_metainterp::JitCodeBuilder::default();
     let live_patch = builder.live_placeholder();
@@ -8087,7 +8087,7 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
     use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };
@@ -10591,7 +10591,7 @@ fn walker_pin_pycode_w_globals_records_quasiimmut_from_mutate_descr() {
     use crate::state::ConcreteValue;
 
     let _hook_guard = WalkerQmutHookGuard::install();
-    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
+    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ()).unwrap();
 
     let mut tc = fresh_trace_ctx();
     let mut regs_r: [OpRef; 0] = [];
@@ -10656,7 +10656,7 @@ fn pycode_w_globals_pin_on_stamped_getfield_gcr_is_quasi_immut_descr() {
     use crate::state::ConcreteValue;
 
     let _hook_guard = WalkerQmutHookGuard::install();
-    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
+    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ()).unwrap();
 
     let mut tc = fresh_trace_ctx();
     let mut regs_r: [OpRef; 0] = [];
@@ -11145,7 +11145,7 @@ fn store_attr_add_bakes_forwarded_new_map_after_shape_guard_collects() {
         .iter()
         .position(|n| n.as_str() == "obj")
         .expect("STORE_ATTR name is in co_names");
-    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ());
+    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ()).unwrap();
     let _restore = [
         RestoreConstPtr::intern(old_map as usize),
         RestoreConstPtr::intern(old_term as usize),
@@ -11476,7 +11476,7 @@ fn store_attr_add_rereads_receiver_after_terminator_pin_collects() {
         .iter()
         .position(|n| n.as_str() == "obj")
         .expect("STORE_ATTR name is in co_names");
-    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ());
+    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ()).unwrap();
     let int_probe = pyre_object::w_int_new(0);
     let int_map_descr = unsafe { crate::descr::mapdict_map_descr(int_probe) };
     let object_map_descr = crate::descr::object_map_descr();
@@ -24751,7 +24751,7 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
     let source = "boxed_out_void_bank_parent = None";
     let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
     let raw = Box::into_raw(Box::new(py_code));
-    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ()).unwrap();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("boxed_out_void_bank_parent");
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![void_ret],
@@ -24894,7 +24894,7 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
     let source = "orthodox_helper_boxed_parent = None";
     let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
     let raw = Box::into_raw(Box::new(py_code));
-    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ()).unwrap();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("orthodox_helper_boxed_parent");
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![void_ret],
@@ -25332,7 +25332,7 @@ fn install_named_helper_jitcode(
     let source = format!("{name} = None");
     let py_code = pyre_interpreter::compile_exec(&source).expect("test code should compile");
     let raw = Box::into_raw(Box::new(py_code));
-    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ()).unwrap();
     let mut pyjit = crate::PyJitCode::skeleton(raw);
     pyjit.jitcode = jitcode;
     let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
@@ -25670,7 +25670,8 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
     // and would fill the canonical portal instead of this helper. The key
     // must be a real `PyCode`: `canonical_code_key_opt` reads its `code_ptr`.
     let code = pyre_interpreter::compile_exec("None").expect("test code should compile");
-    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap()
+        as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = jitcode.clone();
     let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
@@ -25873,8 +25874,8 @@ fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
     });
     let jitcode = std::sync::Arc::new(runtime_jc);
     let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
-    let key =
-        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()).unwrap()
+        as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = jitcode.clone();
     let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
@@ -26570,8 +26571,8 @@ fn install_carrier_latch_helper(
     });
     let jitcode = std::sync::Arc::new(runtime_jc);
     let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
-    let key =
-        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()).unwrap()
+        as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = jitcode.clone();
     let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
@@ -29704,7 +29705,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
 fn test_pycode_ptr() -> *const () {
     use pyre_interpreter::{compile_exec, w_code_new};
     let code = compile_exec("None").expect("test code should compile");
-    w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ()
+    w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ()
 }
 
 /// `jit_merge_point/cIRFIRF` reached_loop_header behaviour: first
@@ -30918,7 +30919,8 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         0x00, // rf
     ];
     let code_obj = pyre_interpreter::compile_exec("None").expect("test code should compile");
-    let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code_obj)) as *const ());
+    let w_code =
+        pyre_interpreter::w_code_new(Box::into_raw(Box::new(code_obj)) as *const ()).unwrap();
     let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
     pyre_interpreter::register_live_code_wrapper(raw_code as *const (), w_code);
     assert!(
@@ -32751,7 +32753,7 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
     });
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };
@@ -33035,7 +33037,7 @@ fn after_residual_pcdep_does_not_publish_stack_slot_at_or_above_valuestackdepth(
     });
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };
@@ -33275,7 +33277,7 @@ fn after_residual_overlay_does_not_publish_stack_slot_at_or_above_valuestackdept
     });
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };
@@ -33520,7 +33522,7 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
     });
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };
@@ -33753,7 +33755,7 @@ fn builtin_wrapper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
     });
 
     let code = compile_exec("None").expect("test code should compile");
-    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
     let raw_code = unsafe {
         w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
     };

@@ -668,8 +668,8 @@ fn ffi_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let code = pyre_interpreter::compile::compile_eval(DECORATOR)
         .map_err(|_| PyError::system_error("could not compile the callback decorator"))?;
     let code_slot = globals_slot + 1;
-    let _ =
-        roots.pin_root(pyre_interpreter::pycode::box_code_object_with_hidden_applevel(code, true));
+    let w_code = pyre_interpreter::pycode::box_code_object_with_hidden_applevel(code, true)?;
+    let _ = roots.pin_root(w_code);
     pyre_interpreter::builtins::exec_or_eval(
         roots.get(code_slot),
         roots.get(globals_slot),

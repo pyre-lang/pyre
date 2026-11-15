@@ -8516,7 +8516,7 @@ mod tests {
         let _pins = pyre_object::gc_roots::push_roots();
 
         let code = compile_exec("None").expect("test code should compile");
-        let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+        let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
         let raw_code = unsafe { w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
 
         let mut builder = majit_metainterp::JitCodeBuilder::default();

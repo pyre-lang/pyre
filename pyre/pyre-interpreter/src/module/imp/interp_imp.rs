@@ -609,7 +609,7 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     .map_err(|error| {
         crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
     })?;
-    let mut w_code = crate::box_code_object(code);
+    let mut w_code = crate::box_code_object(code)?;
     if cache_ok {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
@@ -1599,7 +1599,7 @@ mod frozen_cache_tests {
         let text = std::str::from_utf8(source).expect("source is utf-8");
         let code = crate::compile::compile_source(text, crate::compile::Mode::Exec)
             .expect("compile source");
-        crate::box_code_object(code)
+        crate::box_code_object(code).unwrap()
     }
 
     fn store(key: &str, source: &[u8]) {

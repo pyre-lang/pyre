@@ -13075,7 +13075,7 @@ mod tests {
         let _hook_guard = QmutHookGuard::install();
 
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = pyre_interpreter::w_code_new(raw_code);
+        let w_code = pyre_interpreter::w_code_new(raw_code).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let func =
             pyre_interpreter::function_new(w_code as *const (), "myfunc".to_string(), w_globals);
@@ -13158,7 +13158,7 @@ mod tests {
         let _hook_guard = QmutHookGuard::install();
 
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = pyre_interpreter::w_code_new(raw_code);
+        let w_code = pyre_interpreter::w_code_new(raw_code).unwrap();
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let obj = ctx.const_ref(w_code as i64);
@@ -16210,8 +16210,9 @@ mod tests {
         // frame here, so build a standalone wrapper (pattern B). The three
         // live Ref colors map to local0/stack0/stack1 in registers_r.
         let code = compile_exec("len(x)").expect("test code should compile");
-        let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-            as *const ();
+        let w_code =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                .unwrap() as *const ();
         let jc_ptr = bind_real_jitcode(&mut sym, w_code, &[], &[0, 1, 2], &[]);
 
         let mut state = MIFrame {
@@ -18186,7 +18187,7 @@ mod indirectcalltargets_tests {
     fn make_code(source: &str) -> (*const (), *const CodeObject) {
         let raw_code = pyre_interpreter::compile_exec(source).expect("source must compile");
         let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
-            as *const ();
+            .unwrap() as *const ();
         let raw_code =
             unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         (code, raw_code)

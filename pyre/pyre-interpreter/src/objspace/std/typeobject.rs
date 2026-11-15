@@ -629,7 +629,8 @@ mod tests {
         let code = crate::compile::compile_source("42", crate::compile::Mode::Eval).unwrap();
         let _roots = gc_roots::push_roots();
         let code_slot = gc_roots::shadow_stack_len();
-        let _ = gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()));
+        let _ =
+            gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()).unwrap());
         let globals = w_module_dict_new();
         let function = crate::function::function_new_with_fixed_code(
             gc_roots::shadow_stack_get(code_slot).cast(),
@@ -676,7 +677,8 @@ mod tests {
         let code = crate::compile::compile_source("42", crate::compile::Mode::Eval).unwrap();
         let _roots = gc_roots::push_roots();
         let code_slot = gc_roots::shadow_stack_len();
-        let _ = gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()));
+        let _ =
+            gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()).unwrap());
         let globals = w_module_dict_new();
         let function = crate::function::function_new_with_fixed_code(
             gc_roots::shadow_stack_get(code_slot).cast(),

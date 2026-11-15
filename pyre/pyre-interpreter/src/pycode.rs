@@ -1267,8 +1267,9 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// boxes the `PyCode` through the managed allocator and its per-name cache
 /// tables through direct raw allocations. Residualise the whole
-/// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
-/// built at import/compile time, never on a traced hot path.
+/// constructor. A refused `malloc_fixedsize` raises MemoryError
+/// (`pycode.py` `PyCode._initialize`). Code objects are built at
+/// import/compile time, never on a traced hot path.
 ///
 /// `pycode.py` makes `PyCode` an ordinary GC object
 /// (`instantiate` → `malloc_fixedsize`). The wrapper is a nursery
@@ -1278,7 +1279,10 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// wrappers created before GC installation fall back to the prebuilt
 /// family and use the explicit root walkers.
 #[majit_macros::dont_look_inside]
-pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
+pub fn w_code_new_with_hidden_applevel(
+    code_ptr: *const (),
+    hidden_applevel: bool,
+) -> crate::PyResult {
     // Zero owner: this entry point's contract is that the body is never
     // released, so the wrapper takes no part in `CodeUnit` retirement.
     w_code_new_owned(code_ptr, hidden_applevel, 0, &[], true)
@@ -1302,9 +1306,11 @@ unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
         payload,
     );
     if raw.is_null() {
-        // `w_code_new` has no error channel; a refused table aborts as before.
+        // `_ll_malloc_fixedsize` stored MemoryError (`allocated_or_raise`).
+        // `w_code_new_owned` fetches it and returns `Err`; nothing half-built
+        // is published (`pycode.py` `PyCode._initialize`).
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
-            pyre_object::gc_hook::gc_alloc_failed(payload);
+            return std::ptr::null_mut();
         }
         let zeros = vec![pyre_object::PY_NULL; len];
         return unsafe { pyre_object::alloc_mro_block_gc(&zeros) };
@@ -1328,7 +1334,7 @@ unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
 /// # Safety
 /// The slot must hold a `PyCode` whose `code_ptr` is readable and whose
 /// constant table has more than `idx` entries.
-unsafe fn realize_code_constant(code_slot: usize, idx: usize) -> PyObjectRef {
+unsafe fn realize_code_constant(code_slot: usize, idx: usize) -> crate::PyResult {
     // `box_code_constant_inheriting_unit` snapshots what it reads from the
     // parent before it allocates; nothing reads `w_code` afterwards.
     let w_code = unsafe { &*(pyre_object::gc_roots::shadow_stack_get(code_slot) as *const PyCode) };
@@ -1337,8 +1343,21 @@ unsafe fn realize_code_constant(code_slot: usize, idx: usize) -> PyObjectRef {
         crate::bytecode::ConstantData::Code { code } => unsafe {
             box_code_constant_inheriting_unit(&**code as *const crate::CodeObject, w_code)
         },
-        constant => crate::pyframe::pyobject_from_constant(constant),
+        constant => Ok(crate::pyframe::pyobject_from_constant(constant)),
     }
+}
+
+/// Pending MemoryError from `allocated_or_raise` as a `PyError`
+/// (`rpyexc_fetch_exception`).
+fn code_new_memory_error() -> crate::PyError {
+    crate::runtime_ops::fetch_memory_error()
+}
+
+/// Residual ABI for a refused `w_code_new_owned`: republish the fetched
+/// MemoryError and return null (`jit_publish_residual_error`).
+fn code_new_residual_null(error: crate::PyError) -> PyObjectRef {
+    let _ = crate::runtime_ops::jit_publish_residual_error(error);
+    pyre_object::PY_NULL
 }
 
 #[majit_macros::dont_look_inside]
@@ -1348,7 +1367,7 @@ fn w_code_new_owned(
     owner: usize,
     interned_name_slots: &[usize],
     realize_consts: bool,
-) -> PyObjectRef {
+) -> crate::PyResult {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
     // bitwise AND of `cast_ptr_to_int(p)` against `(power_of_two_align - 1)`
@@ -1508,6 +1527,9 @@ fn w_code_new_owned(
     // spill on overflow. Pin `obj` immediately after the malloc
     // (`gctransform/shadowstack.py`).
     let obj = pyre_object::lltype::malloc_typed_managed(obj) as PyObjectRef;
+    if obj.is_null() {
+        return Err(code_new_memory_error());
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
@@ -1545,18 +1567,21 @@ fn w_code_new_owned(
     // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name)
     // for name in cellvars]`, laid out by localsplus slot. Minted after the
     // wrapper is pinned so the array is a young child of an old-gen PyCode
-    // (same order as `co_consts_w`). `new_cell_family` is
-    // `malloc_typed_managed` and does not collect; `allocated_or_raise`
-    // stores MemoryError and returns null. `w_code_new` has no error
-    // channel: abort the way `alloc_co_consts_array` does, so a refused
-    // family is not stored into a published table. Empty cellvars leave
-    // the field null.
+    // (same order as `co_consts_w`). `new_cell_family` is collecting
+    // `malloc_fixedsize`; the wrapper, families table, and already-stored
+    // families (reached through the table) stay on the shadow stack and the
+    // table is re-read after each malloc. A refused allocation leaves
+    // MemoryError pending (`allocated_or_raise`); this returns `Err` and
+    // publishes nothing. Empty cellvars leave the field null.
     if code_ptr_aligned {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         if !code_ref.cellvars.is_empty() {
             let nvarnames = code_ref.varnames.len();
             let nslots = nvarnames + npure_cellvars as usize;
             let families_table = unsafe { alloc_co_consts_array(nslots) };
+            if families_table.is_null() {
+                return Err(code_new_memory_error());
+            }
             let families_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(families_table as pyre_object::PyObjectRef);
             let mut pure = 0usize;
@@ -1564,9 +1589,7 @@ fn w_code_new_owned(
                 let cellname: &str = cellvar.as_ref();
                 let family = pyre_object::nestedscope::new_cell_family(cellname.to_string());
                 if family.is_null() {
-                    pyre_object::gc_hook::gc_alloc_failed(std::mem::size_of::<
-                        pyre_object::nestedscope::CellFamily,
-                    >());
+                    return Err(code_new_memory_error());
                 }
                 let slot = match code_ref.varnames.iter().position(|varname| {
                     let varname: &str = varname.as_ref();
@@ -1597,6 +1620,9 @@ fn w_code_new_owned(
     // One barrier remembers the old wrapper; a second barrier is a no-op once
     // TRACK_YOUNG_PTRS is clear, so both field stores follow the same barrier.
     let names_table = unsafe { alloc_co_consts_array(names_len) };
+    if names_table.is_null() {
+        return Err(code_new_memory_error());
+    }
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(names_table as pyre_object::PyObjectRef);
     // `pycode.py self.co_names_w = [space.new_interned_str(aname) for aname in names]`.
@@ -1619,11 +1645,17 @@ fn w_code_new_owned(
                 pyre_object::unicodeobject::intern_str_value(code_ref.names[index].as_ref())
             }
         };
+        if realized.is_null() && pyre_object::gc_hook::gc_alloc_failed_pending() {
+            return Err(code_new_memory_error());
+        }
         let names_table =
             pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
         unsafe { (*names_table).set_ref(index, realized) };
     }
     let table = unsafe { alloc_co_consts_array(consts_len) };
+    if table.is_null() {
+        return Err(code_new_memory_error());
+    }
     let table_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
     // Marshal fills `co_consts_w` from the decoded objects
@@ -1632,7 +1664,7 @@ fn w_code_new_owned(
     // then throw the wrappers away.
     if realize_consts {
         for index in 0..consts_len {
-            let realized = unsafe { realize_code_constant(obj_slot, index) };
+            let realized = unsafe { realize_code_constant(obj_slot, index)? };
             let table =
                 pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
             unsafe { (*table).set_ref(index, realized) };
@@ -1646,7 +1678,7 @@ fn w_code_new_owned(
         (*owner).co_names_w =
             pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
     }
-    pyre_object::gc_roots::shadow_stack_get(obj_slot)
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 /// pypy/interpreter/pycode.py `PyCode.__init__` shorthand —
@@ -1660,7 +1692,7 @@ fn w_code_new_owned(
 /// and never moved. `pycode_destructor` releases the wrapper's side tables
 /// but never `code_ptr`, so a leaked box and a constant reached through one
 /// both qualify.
-pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
+pub fn w_code_new(code_ptr: *const ()) -> crate::PyResult {
     w_code_new_with_hidden_applevel(code_ptr, false)
 }
 
@@ -1692,7 +1724,7 @@ pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
 /// `Box::into_raw`s a `CodeObject` (unlifted raw allocation) before forwarding
 /// to the residualised `w_code_new`.
 #[majit_macros::dont_look_inside]
-pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
+pub fn box_code_object(code: crate::CodeObject) -> crate::PyResult {
     box_code_object_with_hidden_applevel(code, false)
 }
 
@@ -1706,7 +1738,7 @@ pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
 pub fn box_code_object_with_interned_name_slots(
     code: crate::CodeObject,
     name_slots: &[usize],
-) -> PyObjectRef {
+) -> crate::PyResult {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     w_code_new_owned(code_ptr, false, code_ptr as usize, name_slots, false)
 }
@@ -1717,7 +1749,7 @@ pub fn box_code_object_with_interned_name_slots(
 pub fn box_code_object_with_hidden_applevel(
     code: crate::CodeObject,
     hidden_applevel: bool,
-) -> PyObjectRef {
+) -> crate::PyResult {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize, &[], true)
 }
@@ -1745,7 +1777,7 @@ pub fn box_code_object_with_hidden_applevel(
 /// `CodeObject` out of the shared compiler crate — the crate that keeps the
 /// translation and interpreter halves separate.
 #[majit_macros::dont_look_inside]
-pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
+pub fn box_code_constant(code: &crate::CodeObject) -> crate::PyResult {
     box_code_object(code.clone())
 }
 
@@ -1764,7 +1796,7 @@ unsafe fn box_code_constant_in_place(
     code: *const crate::CodeObject,
     hidden_applevel: bool,
     owner: usize,
-) -> PyObjectRef {
+) -> crate::PyResult {
     w_code_new_owned(code as *const (), hidden_applevel, owner, &[], true)
 }
 
@@ -1781,7 +1813,7 @@ unsafe fn box_code_constant_in_place(
 unsafe fn box_code_constant_inheriting_unit(
     code: *const crate::CodeObject,
     parent: &PyCode,
-) -> PyObjectRef {
+) -> crate::PyResult {
     let owner = code_unit_owner(parent.code_ptr as *const ());
     let hidden_applevel = parent.hidden_applevel;
     let inherited_filename = if parent.filename_inherits_to_nested
@@ -1796,13 +1828,13 @@ unsafe fn box_code_constant_inheriting_unit(
     // Boxing can collect and move `parent`. Snapshot every value needed from
     // it first, just as RPython's GC transform spills live fields before the
     // allocation rather than retaining a native reference into the object.
-    let mut obj = unsafe { box_code_constant_in_place(code, hidden_applevel, owner) };
+    let mut obj = unsafe { box_code_constant_in_place(code, hidden_applevel, owner)? };
     if let Some(bytes) = inherited_filename {
         pyre_object::with_roots!(obj => unsafe { set_filename_bytes(obj, Some(bytes)) });
         unsafe { (*(obj as *mut PyCode)).filename_inherits_to_nested = true };
-        obj
+        Ok(obj)
     } else {
-        obj
+        Ok(obj)
     }
 }
 
@@ -1979,8 +2011,8 @@ pub(crate) unsafe fn code_filename_bytes(w_code: PyObjectRef) -> Vec<u8> {
     }
 }
 
-fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -> PyObjectRef {
-    let obj = box_code_object(code);
+fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -> crate::PyResult {
+    let obj = box_code_object(code)?;
     unsafe {
         (*(obj as *mut PyCode)).co_firstlineno_raw = firstlineno;
         // The stamp is one of the two inputs `addr2line_memo` caches against.
@@ -1995,7 +2027,7 @@ fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -
     if !code_ptr.is_null() {
         record_deferred_locations_firstlineno(code_ptr, firstlineno);
     }
-    obj
+    Ok(obj)
 }
 
 /// Fill a newly-created code object's `co_consts_w` from the wrapped tuple
@@ -2495,7 +2527,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let result = box_code_object_with_firstlineno(
         code,
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-    );
+    )?;
     // `PyCode.__init__` stores `self.co_name = name` beside
     // `self.w_filename = space.newfilename(filename)`. Keep the constructor
     // objects so `co_name` / `code_objects_equal` observe a str subclass.
@@ -3499,7 +3531,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // the line table until a reader asks. `code_locations` rebuilds it.
     code.locations = Vec::new().into_boxed_slice();
 
-    let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
+    let mut result = box_code_object_with_firstlineno(code, firstlineno_raw)?;
     let w_name = name_slot.map(pyre_object::gc_roots::shadow_stack_get);
     let w_qualname = qual_slot.map(pyre_object::gc_roots::shadow_stack_get);
     result = install_code_name_objects(result, w_name, w_qualname);
@@ -3892,7 +3924,10 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         return existing;
     }
 
-    let realized = unsafe { realize_code_constant(code_slot, idx) };
+    let realized = match unsafe { realize_code_constant(code_slot, idx) } {
+        Ok(obj) => obj,
+        Err(error) => return code_new_residual_null(error),
+    };
     let realized_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(realized);
     let table = pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
@@ -5856,7 +5891,7 @@ mod tests {
         // dereferenced; the guard returns PY_NULL so the caller falls back to
         // its own constant realization. Construction still publishes an empty
         // `co_consts_w` so `getconstant_w` is an array read.
-        let w_code = w_code_new(std::ptr::null());
+        let w_code = w_code_new(std::ptr::null()).unwrap();
         let table = unsafe { (*(w_code as *const PyCode)).co_consts_w };
         assert!(!table.is_null());
         assert_eq!(unsafe { (*table).len() }, 0);
@@ -5932,7 +5967,7 @@ mod tests {
                 .iter()
                 .position(|name| name == "answer")
                 .expect("answer");
-            let w_code = box_code_object(code);
+            let w_code = box_code_object(code).unwrap();
             let py = unsafe { &*(w_code as *const PyCode) };
             let slot = unsafe { &*py.co_names_w };
             let published = slot[idx];
@@ -5963,7 +5998,7 @@ mod tests {
                 slots.push(slot);
             }
             let expected = pyre_object::gc_roots::shadow_stack_get(slots[0]);
-            let w_code = box_code_object_with_interned_name_slots(code, &slots);
+            let w_code = box_code_object_with_interned_name_slots(code, &slots).unwrap();
             let stored = unsafe {
                 let py = &*(w_code as *const PyCode);
                 assert!(!py.co_names_w.is_null());
@@ -5999,7 +6034,7 @@ mod tests {
             })
             .expect("generator code");
         let bits = nested.flags.bits();
-        let w_code = box_code_object(nested);
+        let w_code = box_code_object(nested).unwrap();
         let pycode = unsafe { &*(w_code as *const PyCode) };
         assert_ne!(
             pycode.co_flags & crate::astcompiler::consts::CO_GENERATOR,
@@ -6014,7 +6049,7 @@ mod tests {
         let source_storage = code.source_path.as_ptr();
         let instruction_storage = code.instructions.as_ptr();
 
-        let w_code = box_code_object(code);
+        let w_code = box_code_object(code).unwrap();
         let stored = unsafe { &*(w_code_get_ptr(w_code)) };
 
         assert_eq!(stored.source_path.as_ptr(), source_storage);
@@ -6039,7 +6074,7 @@ mod tests {
             "def outer():\n    def inner():\n        return 'body'\n    return inner\n",
         )
         .expect("compile failed");
-        let w_code = box_code_object(code);
+        let w_code = box_code_object(code).unwrap();
         let owner = unsafe { w_code_get_ptr(w_code) } as usize;
 
         let nested: Vec<usize> = {
@@ -6087,7 +6122,7 @@ mod tests {
     #[test]
     fn a_pinned_code_graph_survives_its_last_wrapper() {
         let code = compile_exec("def f():\n    return 'kept'\n").expect("compile failed");
-        let w_code = box_code_object(code);
+        let w_code = box_code_object(code).unwrap();
         let owner = unsafe { w_code_get_ptr(w_code) } as usize;
         pin_code_unit(owner as *const ());
 
@@ -6115,7 +6150,7 @@ mod tests {
         // wrappers register nothing and detaching one retires nothing.
         let code = compile_exec("x = 1\n").expect("compile failed");
         let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-        let _w_code = w_code_new(code_ptr);
+        let _w_code = w_code_new(code_ptr).unwrap();
         assert_eq!(code_unit_owner(code_ptr), 0);
         detach_code_unit_wrapper(code_ptr);
         let body = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -6138,7 +6173,7 @@ mod tests {
                 )
             })
             .expect("large integer constant");
-        let w_code = box_code_constant(&code);
+        let w_code = box_code_constant(&code).unwrap();
 
         let eager = unsafe { (&*(*(w_code as *const PyCode)).co_consts_w)[idx] };
         assert_ne!(
@@ -6200,8 +6235,8 @@ mod tests {
         assert!(integer_indices.len() >= 2);
         let first_idx = integer_indices[0];
         let second_idx = integer_indices[1];
-        let src = box_code_constant(&code);
-        let dst = box_code_constant(&code);
+        let src = box_code_constant(&code).unwrap();
+        let dst = box_code_constant(&code).unwrap();
         let first = unsafe { w_code_const(src, first_idx) };
         let second = unsafe { w_code_const(src, second_idx) };
 
@@ -6255,7 +6290,7 @@ mod tests {
             })
             .expect("nested large integer");
 
-        let w_top = box_code_constant(&code);
+        let w_top = box_code_constant(&code).unwrap();
         let w_outer = unsafe { w_code_const(w_top, outer_idx) };
         let w_inner = unsafe { w_code_const(w_outer, inner_idx) };
         let w_bigint = unsafe { w_code_const(w_inner, bigint_idx) };
@@ -6316,7 +6351,7 @@ mod tests {
                 )
             })
             .expect("large integer constant");
-        let w_code = box_code_constant(&code) as usize;
+        let w_code = box_code_constant(&code).unwrap() as usize;
         // The constructor publishes every slot eagerly, so readers would all
         // observe that one store and never reach the path the identity
         // guarantee actually rests on. Clear the slot under test first: each
@@ -6370,8 +6405,8 @@ mod tests {
     #[test]
     fn co_names_w_slots_are_interned_at_construction() {
         let source = "def f(a):\n    return a.x + global_name\n";
-        let w_code = box_code_object(compile_exec(source).expect("compile failed"));
-        let w_code_again = box_code_object(compile_exec(source).expect("compile failed"));
+        let w_code = box_code_object(compile_exec(source).expect("compile failed")).unwrap();
+        let w_code_again = box_code_object(compile_exec(source).expect("compile failed")).unwrap();
         let table = co_names_table(w_code);
         let slots = unsafe { &*table };
         let again = unsafe { &*co_names_table(w_code_again) };
@@ -6389,12 +6424,12 @@ mod tests {
         for (src, dst) in slots.as_slice().iter().zip(copied.as_slice()) {
             assert_eq!(src, dst);
         }
-        let stub = w_code_new(std::ptr::null());
+        let stub = w_code_new(std::ptr::null()).unwrap();
         assert_eq!(unsafe { (*co_names_table(stub)).len() }, 0);
         assert!(unsafe { !w_code_name_index_covered(stub, 0) });
         let minted = unsafe { w_code_getname_w_or_new(stub, 0, "x") };
         assert_eq!(minted, pyre_object::unicodeobject::intern_str_value("x"));
-        let unaligned = w_code_new(0xDEAD_BEEF as *const ());
+        let unaligned = w_code_new(0xDEAD_BEEF as *const ()).unwrap();
         assert_eq!(unsafe { (*co_names_table(unaligned)).len() }, 0);
         assert!(unsafe { !w_code_name_index_covered(unaligned, 0) });
     }
@@ -6402,7 +6437,7 @@ mod tests {
     #[test]
     fn co_names_w_empty_replace_and_fill_keep_the_gc_table() {
         // `(lambda: 1).__code__` / `def f(): return 1` has empty `co_names`.
-        let empty = box_code_object(nested_code("def f():\n    return 1\n"));
+        let empty = box_code_object(nested_code("def f():\n    return 1\n")).unwrap();
         let empty_table = co_names_table(empty);
         assert_eq!(unsafe { (*empty_table).len() }, 0);
         let replaced = unsafe { code_replace(&[empty]).expect("replace empty names") };
@@ -6414,7 +6449,7 @@ mod tests {
         unsafe { w_code_copy_name_slots(empty, replaced) };
         assert_eq!(co_names_table(empty), empty_table);
 
-        let named = box_code_object(nested_code("def g():\n    return a + b\n"));
+        let named = box_code_object(nested_code("def g():\n    return a + b\n")).unwrap();
         let named_table = co_names_table(named);
         assert_eq!(unsafe { (*named_table).len() }, 2);
         let first = pyre_object::unicodeobject::intern_str_value("x");
@@ -6429,7 +6464,7 @@ mod tests {
         let slots = unsafe { &*named_table };
         assert_eq!(slots[0], first);
         assert_eq!(slots[1], second);
-        let copy_dst = box_code_object(nested_code("def h():\n    return a + b\n"));
+        let copy_dst = box_code_object(nested_code("def h():\n    return a + b\n")).unwrap();
         let copy_table = co_names_table(copy_dst);
         unsafe { w_code_copy_name_slots(copy_dst, named) };
         assert_eq!(co_names_table(copy_dst), copy_table);

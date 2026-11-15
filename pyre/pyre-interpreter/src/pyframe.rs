@@ -4938,7 +4938,7 @@ impl PyFrame {
         let _root = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(execution_context.as_ptr() as PyObjectRef);
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-        let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code));
+        let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code)?);
         let ctx_ptr = execution_context.as_ptr();
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
@@ -7220,7 +7220,10 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         // too.  Either way the compiler does not emit a code object inside a
         // container, so the copy is defensive; `box_code_constant` records why
         // it is kept rather than removed.
-        ConstantData::Code { code } => crate::pycode::box_code_constant(code),
+        ConstantData::Code { code } => match crate::pycode::box_code_constant(code) {
+            Ok(obj) => obj,
+            Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+        },
         // `eval.rs` `none_constant`.
         ConstantData::None => pyre_object::w_none(),
         // `eval.rs` `ellipsis_constant`.
@@ -7789,7 +7792,7 @@ mod tests {
                 _ => None,
             })
             .expect("nested function code");
-        let w_code = crate::pycode::box_code_constant(code);
+        let w_code = crate::pycode::box_code_constant(code).unwrap();
         let first_globals = pyre_object::w_dict_new();
         let other_globals = pyre_object::w_dict_new();
 
@@ -7819,7 +7822,7 @@ mod tests {
         // do not force: pyre residualizes LOAD_GLOBAL / STORE_NAME through
         // them while `pyopcode.py` looks those opcodes inside.
         let code = crate::compile_exec("x = 1\n").expect("compile");
-        let w_code = crate::pycode::box_code_constant(&code);
+        let w_code = crate::pycode::box_code_constant(&code).unwrap();
         let globals = pyre_object::w_dict_new();
         let mut frame =
             super::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
@@ -7860,7 +7863,7 @@ mod tests {
                 _ => None,
             })
             .expect("nested function code");
-        let w_code = crate::pycode::box_code_constant(code);
+        let w_code = crate::pycode::box_code_constant(code).unwrap();
         unsafe { crate::pycode::w_code_yields_inside_try(w_code) }
     }
 
@@ -8040,7 +8043,7 @@ x = 7
             code.flags.contains(crate::CodeFlags::OPTIMIZED),
             "function frames expose FrameLocalsProxy"
         );
-        let w_code = crate::pycode::box_code_constant(code);
+        let w_code = crate::pycode::box_code_constant(code).unwrap();
         let w_globals = pyre_object::w_dict_new();
         super::createframe_obj(w_code as *const (), w_globals, std::ptr::null(), None)
             .expect("frame")

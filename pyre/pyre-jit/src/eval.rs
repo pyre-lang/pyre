@@ -19647,7 +19647,7 @@ mod tests {
         // enter this worker through the same per-thread runtime/GIL bootstrap
         // as production before allocating.
         init_gc_subsystem();
-        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null()).unwrap();
         assert!(!w_code.is_null());
 
         let hash =

@@ -82,13 +82,54 @@ pub unsafe fn cell_family_destructor(obj_addr: usize) {
 }
 
 /// nestedscope.py `CellFamily(name)` — `lltype.malloc` of a GC instance
-/// (`gct_fv_gc_malloc`). Same nursery allocator as mapdict `intern_node`
-/// (`malloc_typed_managed` / `try_gc_alloc`: old-gen fallback, no collection
-/// at the malloc). The object is moving: a trace that bakes it as a
-/// `ConstPtr` is rewritten to `LoadFromGcTable` (`rewrite.py
-/// remove_constptrs_in`) and `gcreftracer.py` updates the slot when it moves.
+/// (`gct_fv_gc_malloc`). Upstream `malloc_fixedsize` collects when the
+/// nursery is full (`incminimark.py IncrementalMiniMarkGC.malloc_fixedsize`
+/// `collect_and_reserve`). Callers keep every live GC pointer on the
+/// shadow stack across this call and re-read it afterwards
+/// (`gctransform/framework.py` `gct_fv_gc_malloc`). The object is moving:
+/// a trace that bakes it as a `ConstPtr` is rewritten to `LoadFromGcTable`
+/// (`rewrite.py remove_constptrs_in`) and `gcreftracer.py` updates the slot
+/// when it moves.
 pub fn new_cell_family(name: String) -> *const CellFamily {
-    crate::lltype::malloc_typed_managed(CellFamily::new(name)) as *const CellFamily
+    let value = CellFamily::new(name);
+    debug_assert_eq!(
+        std::mem::size_of::<CellFamily>(),
+        CellFamily::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match CellFamily::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    // Headerless payload: no GC child to preserve. The dummy root satisfies
+    // `try_gc_alloc_collecting_rooted`; live pointers in the caller sit on
+    // the shadow stack (`w_code_new_owned` pins the wrapper and families
+    // table).
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            type_id,
+            CellFamily::SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_raise()
+    .unwrap_or(std::ptr::null_mut());
+    if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null();
+        }
+        return crate::lltype::malloc_typed(value) as *const CellFamily;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut CellFamily, value);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
+        }
+    }
+    raw as *const CellFamily
 }
 
 impl CellFamily {
