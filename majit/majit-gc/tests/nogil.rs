@@ -2,13 +2,24 @@
 //! and one-way.
 
 use majit_gc::collector::{GcConfig, MiniMarkGC};
+use majit_gc::nursery::NURSERY_CHUNK_SIZE;
 use majit_gc::shadow_stack::{self, MutatorExtraWalkFn};
 use majit_gc::{GcAllocator, TypeInfo, gc_sync, gc_write_barrier_from_array, rgil};
 use majit_ir::GcRef;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// The GIL-off mode is process-global; keep the tests in this binary off
+/// each other's mutator registry and singleton.
+static NOGIL_SERIAL: Mutex<()> = Mutex::new(());
+
+fn lock_nogil() -> std::sync::MutexGuard<'static, ()> {
+    NOGIL_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const NURSERY: usize = 256 * 1024;
 const THREADS: usize = 4;
@@ -22,6 +33,10 @@ unsafe fn walk_roots(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
 }
 
 fn install_gc() -> (u32, u32) {
+    if gc_sync::is_initialized() {
+        rgil::disable_gil();
+        return (0, 1);
+    }
     let mut gc = MiniMarkGC::with_config(GcConfig {
         nursery_size: NURSERY,
         large_object_threshold: 32 * 1024,
@@ -33,6 +48,141 @@ fn install_gc() -> (u32, u32) {
     gc_sync::store_singleton(Box::new(gc));
     rgil::disable_gil();
     (simple, array)
+}
+
+fn tls_nursery_ptrs() -> majit_gc::nursery::NurseryPtrs {
+    unsafe { *majit_gc::threadlocal::threadlocal_nursery_ptrs() }
+}
+
+fn tls_nursery_is_empty() -> bool {
+    let ptrs = tls_nursery_ptrs();
+    ptrs.free.is_null() && ptrs.top.is_null()
+}
+
+/// Advance the singleton arena cursor so a later unregistered bump sits
+/// away from the nursery start that `_minor_collection` resets to.
+fn fill_nursery_past_first_chunk(type_id: u32) {
+    let h = thread::spawn(move || {
+        register_worker();
+        loop {
+            let remaining = gc_sync::gc_query(|gc| {
+                (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize)
+            });
+            if remaining <= NURSERY_CHUNK_SIZE * 2 {
+                break;
+            }
+            let obj = gc_sync::gc_op(|gc| gc.try_alloc_nursery_bump_typed(type_id, 16));
+            if obj.is_null() {
+                break;
+            }
+        }
+        gc_sync::gc_thread_die();
+    });
+    h.join().unwrap();
+}
+
+/// An unregistered thread must bump the arena, not a thread chunk. After a
+/// foreign minor, the next allocation must not land in the pre-reset range.
+fn unregistered_thread_alloc_not_in_stale_chunk(type_id: u32) {
+    fill_nursery_past_first_chunk(type_id);
+
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let after_first = Arc::new(std::sync::Barrier::new(2));
+    let after_minor = Arc::new(std::sync::Barrier::new(2));
+
+    let unreg = {
+        let start = start.clone();
+        let after_first = after_first.clone();
+        let after_minor = after_minor.clone();
+        thread::spawn(move || {
+            start.wait();
+            let first = alloc_small(type_id);
+            assert!(!first.is_null());
+            assert!(
+                tls_nursery_is_empty(),
+                "unregistered alloc must not install a thread chunk"
+            );
+            let old_lo = first.0;
+            let old_hi = first.0.saturating_add(NURSERY_CHUNK_SIZE);
+            after_first.wait();
+            after_minor.wait();
+            let second = alloc_small(type_id);
+            assert!(!second.is_null());
+            assert!(
+                tls_nursery_is_empty(),
+                "unregistered pair stays empty across a foreign minor"
+            );
+            assert!(
+                second.0 < old_lo || second.0 >= old_hi,
+                "stale chunk reuse: first={:#x} second={:#x}",
+                first.0,
+                second.0
+            );
+        })
+    };
+
+    let collector = {
+        let start = start.clone();
+        let after_first = after_first.clone();
+        let after_minor = after_minor.clone();
+        thread::spawn(move || {
+            register_worker();
+            start.wait();
+            after_first.wait();
+            gc_sync::gc_op_stw(&mut [], |gc, _| gc.collect_nursery());
+            after_minor.wait();
+            gc_sync::gc_thread_die();
+        })
+    };
+
+    unreg.join().unwrap();
+    collector.join().unwrap();
+}
+
+/// Removing the mutator registry entry empties this thread's pair under
+/// the same lock, so a pair never outlives the entry a minor would clear.
+fn unregister_empties_tls_nursery_pair(type_id: u32) {
+    let h = thread::spawn(move || {
+        shadow_stack::register_mutator();
+        let obj = alloc_small(type_id);
+        assert!(!obj.is_null());
+        assert!(
+            !tls_nursery_is_empty(),
+            "a registered mutator must receive a thread chunk"
+        );
+        shadow_stack::unregister_mutator();
+        assert!(
+            tls_nursery_is_empty(),
+            "unregister empties the thread nursery pair"
+        );
+    });
+    h.join().unwrap();
+}
+
+/// A non-singleton `MiniMarkGC` bumps `self.nursery`, like
+/// `incminimark.py` `malloc_fixedsize` bumping `self.nursery_free`.
+fn non_singleton_minimark_bumps_its_own_nursery() {
+    let h = thread::spawn(|| {
+        shadow_stack::register_mutator();
+        let before = tls_nursery_ptrs();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: NURSERY,
+            large_object_threshold: 32 * 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(type_id, 16);
+        assert!(!obj.is_null());
+        assert!(gc.is_in_nursery(obj.0));
+        let after = tls_nursery_ptrs();
+        assert_eq!(
+            (before.free, before.top),
+            (after.free, after.top),
+            "non-singleton must not install a thread chunk"
+        );
+        shadow_stack::unregister_mutator();
+    });
+    h.join().unwrap();
 }
 
 fn register_worker() {
@@ -304,7 +454,29 @@ fn with_watchdog(seconds: u64, f: impl FnOnce()) {
 }
 
 #[test]
+fn gil_disabled_unregistered_thread_chunk_does_not_survive_minor() {
+    let _serial = lock_nogil();
+    let (simple, _) = install_gc();
+    unregistered_thread_alloc_not_in_stale_chunk(simple);
+}
+
+#[test]
+fn gil_disabled_unregister_clears_thread_nursery_chunk() {
+    let _serial = lock_nogil();
+    let (simple, _) = install_gc();
+    unregister_empties_tls_nursery_pair(simple);
+}
+
+#[test]
+fn gil_disabled_non_singleton_bumps_own_nursery() {
+    let _serial = lock_nogil();
+    let _ = install_gc();
+    non_singleton_minimark_bumps_its_own_nursery();
+}
+
+#[test]
 fn gil_disabled_concurrent_mutators() {
+    let _serial = lock_nogil();
     let (simple, array) = install_gc();
     chunks_are_disjoint(simple);
     write_barrier_races_with_collection(simple, array);

@@ -563,6 +563,21 @@ pub fn mutator_is_registered() -> bool {
         .any(|entry| entry.thread_id == thread_id)
 }
 
+/// Whether this thread has a registry entry whose `nursery_ptrs` is this
+/// thread's `tlfield_nursery_*` pair — the pair
+/// [`clear_all_mutator_nursery_chunks`] empties.
+///
+/// `register_thread`'s per-thread `registered` flag can disagree with a
+/// [`register_mutator`] entry, so the predicate reads the registry rather
+/// than that flag.
+#[inline]
+pub(crate) fn mutator_nursery_chunk_is_registered() -> bool {
+    let me = crate::threadlocal::threadlocal_nursery_ptrs();
+    lock_mutator_registry()
+        .iter()
+        .any(|entry| entry.nursery_ptrs == me)
+}
+
 /// Append an opaque root area to the current registered mutator.
 ///
 /// # Safety
@@ -871,7 +886,16 @@ pub fn unregister_mutator() {
         live_scoped.is_empty(),
         "unregistering a mutator with live scoped root areas: {live_scoped:?}"
     );
-    registry.swap_remove(index);
+    let entry = registry.swap_remove(index);
+    // GIL-off: a thread chunk must not outlive the registry entry
+    // `_minor_collection` walks. `incminimark.py` `_minor_collection`
+    // resets `self.nursery_free` unconditionally; emptying the pair here
+    // keeps an unregistered thread from bumping a range that reset dropped.
+    if crate::rgil::gil_disabled() && !entry.nursery_ptrs.is_null() {
+        unsafe {
+            *entry.nursery_ptrs = crate::nursery::NurseryPtrs::empty();
+        }
+    }
 }
 
 /// Discard root areas owned by threads which disappeared across `fork()`.

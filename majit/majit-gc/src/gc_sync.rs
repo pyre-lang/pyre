@@ -180,6 +180,24 @@ pub fn is_initialized() -> bool {
     GC_INITIALIZED.load(Ordering::Acquire)
 }
 
+/// Whether `ptr` is the process singleton collector.
+///
+/// Address compare only: [`store_singleton`] publishes the Box once and
+/// never moves or replaces it. No TLS and no side table.
+#[inline]
+pub(crate) fn is_singleton(ptr: *const MiniMarkGC) -> bool {
+    if !GC_INITIALIZED.load(Ordering::Acquire) {
+        return false;
+    }
+    // SAFETY: `GC_INITIALIZED` is released only after the Box is stored,
+    // and the singleton lives for the process.
+    let stored = unsafe { (*GC_STORE.0.get()).as_ref() };
+    match stored {
+        Some(boxed) => std::ptr::eq(Box::as_ptr(boxed), ptr),
+        None => false,
+    }
+}
+
 /// Access the GC singleton mutably.
 /// SAFETY: caller must hold the GIL.
 unsafe fn singleton_mut() -> &'static mut MiniMarkGC {

@@ -1681,19 +1681,29 @@ impl MiniMarkGC {
         );
     }
 
-    /// Nursery bump: GIL-on uses the live cursor; GIL-off bumps this
-    /// thread's chunk and refills from the arena cursor under the GC lock.
+    /// Nursery bump: GIL-on uses the live cursor; GIL-off uses a thread
+    /// chunk only for the process singleton on a registered mutator.
+    ///
+    /// `incminimark.py` `malloc_fixedsize` bumps `self.nursery_free`, the
+    /// receiving collector's own cursor. `_minor_collection` resets that
+    /// cursor unconditionally. A thread chunk is emptied only through the
+    /// mutator registry, so a non-singleton collector or an unregistered
+    /// thread bumps `self.nursery` directly — the singleton already holds
+    /// `gc_lock` / STW ownership on that path.
     #[inline]
     fn bump_nursery(&mut self, total_size: usize) -> *mut u8 {
-        if crate::rgil::gil_disabled() {
+        if crate::rgil::gil_disabled() && crate::gc_sync::is_singleton(self as *const MiniMarkGC) {
             let ptr = self.bump_thread_chunk(total_size);
             if !ptr.is_null() {
                 return ptr;
             }
-            self.refill_thread_chunk(total_size)
-        } else {
-            self.nursery.alloc(total_size)
+            // An unregistered thread's pair is always empty (never refilled,
+            // emptied on unregister), so the registry is read only here.
+            if crate::shadow_stack::mutator_nursery_chunk_is_registered() {
+                return self.refill_thread_chunk(total_size);
+            }
         }
+        self.nursery.alloc(total_size)
     }
 
     #[inline]
