@@ -2285,15 +2285,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // item slot as a Ref; NULL-initialized spare slots past the
     // live length are benign.
     //
-    // This typeid governs blocks allocated *through the GC*, which is
-    // the default path (`object_array::alloc_*_block_gc` →
-    // `try_gc_alloc`); the nursery walker traces each item slot of such
-    // a block, and the list/tuple custom traces forward the block
-    // pointer. Under the `MAJIT_GC_ITEMSBLOCK=0` fallback the blocks come
-    // from `std::alloc` instead and no allocation carries this typeid.
-    // See comments on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID`
-    // and `pyre_object::object_array::ItemsBlock` for the companion
-    // notices.
+    // This typeid governs blocks allocated *through the GC*
+    // (`object_array::alloc_*_block_gc` → `try_gc_alloc`); the nursery
+    // walker traces each item slot of such a block, and the list/tuple
+    // custom traces forward the block pointer. See comments on
+    // `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
+    // `pyre_object::object_array::ItemsBlock` for the companion notices.
     let items_token = &pyre_object::object_array::ITEMS_BLOCK_TOKEN;
     let py_object_array_tid = gc.get_type_id(
         GcTypeKey::of(&pyre_object::object_array::PY_OBJECT_ARRAY_GC_TYPE_ID_CELL),

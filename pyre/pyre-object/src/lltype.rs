@@ -757,7 +757,6 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
 /// looked-inside caller never stores that header.
 pub trait GcArrayType {
     fn type_id() -> u32;
-    fn gc_enabled() -> bool;
     fn payload_layout(n: i64) -> Option<std::alloc::Layout>;
     /// Store the GcArray length header. Called only from [`malloc_varsize_clear`].
     unsafe fn write_length_header(ptr: *mut Self, n: i64);
@@ -773,34 +772,32 @@ pub trait GcArrayType {
 /// [`crate::gc_hook::try_gc_owns_object`].
 #[inline]
 pub unsafe fn malloc_varsize_clear<T: GcArrayType>(n: i64) -> *mut T {
-    if T::gc_enabled() {
-        match T::payload_layout(n) {
-            Some(payload) => {
-                match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-                    T::type_id(),
-                    payload.size(),
-                ))
-                .allocated_or_raise()
-                {
-                    Some(raw) => unsafe {
-                        // IncrementalMiniMark does not zero-fill. Publish
-                        // the length header only after the payload is NULL:
-                        // the walker traces `items[0..length]` as soon as
-                        // this block is a root. Zero through `*mut u8`
-                        // (`GCREF` is `*mut GCREFOpaque`, `size_of` 0).
-                        std::ptr::write_bytes(raw as *mut u8, 0, payload.size());
-                        let ptr = raw as *mut T;
-                        T::write_length_header(ptr, n);
-                        return ptr;
-                    },
-                    None if crate::gc_hook::gc_alloc_failed_pending() => {
-                        return std::ptr::null_mut();
-                    }
-                    None => {}
+    match T::payload_layout(n) {
+        Some(payload) => {
+            match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+                T::type_id(),
+                payload.size(),
+            ))
+            .allocated_or_raise()
+            {
+                Some(raw) => unsafe {
+                    // IncrementalMiniMark does not zero-fill. Publish
+                    // the length header only after the payload is NULL:
+                    // the walker traces `items[0..length]` as soon as
+                    // this block is a root. Zero through `*mut u8`
+                    // (`GCREF` is `*mut GCREFOpaque`, `size_of` 0).
+                    std::ptr::write_bytes(raw as *mut u8, 0, payload.size());
+                    let ptr = raw as *mut T;
+                    T::write_length_header(ptr, n);
+                    return ptr;
+                },
+                None if crate::gc_hook::gc_alloc_failed_pending() => {
+                    return std::ptr::null_mut();
                 }
+                None => {}
             }
-            None => return std::ptr::null_mut(),
         }
+        None => return std::ptr::null_mut(),
     }
     match T::payload_layout(n) {
         Some(layout) => match unsafe { T::alloc_fallback(layout) } {

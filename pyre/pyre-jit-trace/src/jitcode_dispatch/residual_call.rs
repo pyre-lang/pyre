@@ -199,16 +199,14 @@ fn list_wb_records_before_invalidate<Sym: WalkSym>(
 /// `base + jit_wb_if_flag_byteofs` with no null check (aarch64
 /// `emit_write_barrier_fastpath_for_base` `LDRB` the same), so a
 /// Getfield of `items` / `ascii_items.block` / `bytes_items.block` that
-/// is not on the Object arm must not be barred. Skip `ItemsBlock`
-/// std::alloc (`try_gc_owns_object` is false in the helper):
-/// `CondCallGcWb` on a non-header pointer is undefined.
+/// is not on the Object arm must not be barred.
 fn record_list_and_items_cond_call_gc_wb<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     list_op: OpRef,
     barrier_items_if_object: bool,
 ) -> OpRef {
     let wb = ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]);
-    if !barrier_items_if_object || !pyre_object::object_array::itemsblock_gc_enabled() {
+    if !barrier_items_if_object {
         return wb;
     }
     if !list_strategy_is_object(ctx, list_op) {

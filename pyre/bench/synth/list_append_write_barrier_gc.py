@@ -13,9 +13,7 @@
 # executor.py:446). These cases pin what that suppression must not break: an
 # OLD list whose block is already promoted receiving YOUNG elements. If the
 # store went unremembered, a minor collection would never scan the slot and the
-# element would be freed or read back stale. Run with MAJIT_GC_ITEMSBLOCK=0 too
-# — there the block is std::alloc with no GC header, the barrier on the
-# W_ListObject is load-bearing, and the walker must keep emitting it.
+# element would be freed or read back stale.
 # Output verified against CPython/PyPy.
 N = 40000
 CHURN = 300

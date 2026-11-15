@@ -159,33 +159,6 @@ pub fn gc_object_items_array_gc_type_id() -> u32 {
     GC_OBJECT_ITEMS_ARRAY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Route items-block allocations through the moving nursery instead of
-/// `std::alloc`. Read once; default ON — the nursery path mirrors the
-/// `GcArray` body upstream allocates (rlist.py:84) and is validated identical
-/// to the `std::alloc` fallback (check.py 158 both backends, both gate states;
-/// fannkuch/nbody/spectral_norm timings unchanged). `MAJIT_GC_ITEMSBLOCK=0`
-/// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
-/// suspected block-GC regression.
-///
-/// Reads (and lazily initialises) the runtime-mutable `ENABLED` `OnceLock`,
-/// not a build-time constant, so the JIT residualizes the call instead of
-/// tracing into it. The `-> bool` return fits a single word and it cannot
-/// raise.
-///
-/// This gates every items block, including the `GcArray(OBJECTPTR)` one that
-/// lives with the object model — that block is the same lowering of the same
-/// upstream file, so one gate answers for both.
-#[majit_macros::dont_look_inside]
-pub fn itemsblock_gc_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MAJIT_GC_ITEMSBLOCK")
-            .map(|v| !matches!(v.trim(), "0" | "off" | "false" | ""))
-            .unwrap_or(true)
-    })
-}
-
 /// `#[repr(C)] { capacity, items: [u64; 0] }` — the `GcArray(Float)` /
 /// `GcArray(Signed)` body. Layout: offset 0 = `capacity` (GcArray length
 /// header), offset 8 = items[0..capacity]. Items are 8-byte words read as
@@ -309,7 +282,7 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
     // backend is installed a null is the GC refusing, and the caller must see
     // that rather than a block outside the managed heap
     // (`majit_gc::gc_allocator_installed`).
-    if itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+    if majit_gc::gc_allocator_installed() {
         // Past this point the id is written into the block's GC header and the
         // collector will index its type registry with it, so an undeclared one
         // cannot be defaulted: any value picked here would name some other
@@ -379,7 +352,7 @@ pub unsafe fn try_alloc_typed_items_block_nursery_rooted(
 ) -> Option<*mut TypedItemsBlock> {
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
-    if itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+    if majit_gc::gc_allocator_installed() {
         assert!(
             tid != UNSET_GC_TYPE_ID,
             "items block allocated with an undeclared GC type id"

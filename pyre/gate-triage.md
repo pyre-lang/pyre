@@ -53,7 +53,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 | var | subsystem | retire when |
 |---|---|---|
 | MAJIT_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
-| MAJIT_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
+| PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
 | MAJIT_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
 | PYRE_NO_BINOP_REWIND | rewind at the `BINARY_OP` / `COMPARE_OP` dunder entry | #1526 binop-dunder inline (explicit rollback hatch) |
 | PYRE_NO_BINOP_DEFAULTED_PARAMS | admitting such a dunder whose signature carries parameters past the two the operands bind | #1526 binop-dunder inline (explicit rollback hatch) |
