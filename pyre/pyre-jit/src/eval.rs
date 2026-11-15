@@ -9983,10 +9983,15 @@ fn tuple_hash_merge_point_jit(
         return enter_compiled_tuple_hash(cell_key, token, &raw, w_tuple, len, acc, i);
     }
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
-    let hot = driver
-        .meta_interp_mut()
-        .maybe_compile_and_run_step_on_driver(jd_no, cell_key, 0, 0, &[])
-        .0;
+    // `code_slot` names the shadow-stack slot holding the Ref green
+    // (`GreenRefPin::adopt`), so `w_type` is pinned there for the step.
+    let hot = {
+        let pin = majit_metainterp::GreenRefPin::pin_one(w_type as usize);
+        driver
+            .meta_interp_mut()
+            .maybe_compile_and_run_step_on_driver(jd_no, cell_key, pin.save(), 0, &[])
+            .0
+    };
     match hot {
         majit_metainterp::warmstate::HotResult::StartTracing => {
             if majit_metainterp::majit_log_enabled() {
@@ -10065,8 +10070,13 @@ fn drive_tuple_hash_trace(
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
-    let w_type = roots.get(base);
     let w_tuple = roots.get(base + 1);
+    // `force_start_tracing` reloads the Ref green from `code_slot`
+    // (`GreenRefPin::adopt`); pin `w_type` on `majit_gc::shadow_stack` the
+    // way the generator-entry path pins its pycode
+    // (`gctransform/shadowstack.py`).
+    let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
+    let w_type = pin.get() as pyre_object::PyObjectRef;
 
     let live_values = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
         len as i64, acc as i64, i as i64, w_tuple,
@@ -10078,14 +10088,14 @@ fn drive_tuple_hash_trace(
             pyre_jit_trace::tuplehash_state::TupleHashJitState::tuple_hash_driver_descriptor();
         descriptor.index = Some(jd_no);
         // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
-        // (`w_type`); `(0, 0)` is the no-raw-pair sentinel.
-        // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
-        // so that pair never rebuilds the pypyjit 3-tuple.
+        // (`w_type`). `force_start_tracing` keeps passing
+        // `Some((&gk.values, &gk.types))` so it never rebuilds the pypyjit
+        // 3-tuple; `pin.save()` is the slot it reloads `w_type` from.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(
             green_key,
-            0,
+            pin.save(),
             0,
             Some((&gk.values, &gk.types)),
             Some(std::sync::Arc::new(descriptor)),
@@ -10123,6 +10133,7 @@ fn drive_tuple_hash_trace(
     if !matches!(action, BackEdgeAction::StartedTracing) {
         return None;
     }
+    let w_type = pin.get() as pyre_object::PyObjectRef;
     let meta = driver.meta_interp_mut();
     // `JitDriver::force_start_tracing` opens the frontend envelope that
     // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
