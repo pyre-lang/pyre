@@ -431,6 +431,11 @@ pub(in crate::front::mir) struct AggregateField {
     /// raw cell address (`rdtoa.py` `strtod` `end_ptr`). `history.getkind`
     /// of a raw Ptr is `'int'`.
     pub(in crate::front::mir) cell_address: bool,
+    /// Closure-env shared borrow of a primitive: FORCE seeds the attr as
+    /// the peeled scalar (`tyref_shared_borrow_primitive_value`). A cell
+    /// address stored here is converted by `emit_cell_load`
+    /// (`InstanceRepr.rtype_setattr` / `hop.inputargs`).
+    pub(in crate::front::mir) peeled_shared_primitive: bool,
 }
 
 /// Owner of a constructor `setfield`.

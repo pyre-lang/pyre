@@ -5440,22 +5440,13 @@ fn published_struct_field_layout(
         // `rlist.py` `FixedSizeListRepr`: the tuple's `wrappeditems` is
         // `Ptr(GcArray(OBJECTPTR))`. `getitem` is `getarrayitem_gc`.
         "[*mut PyObject]".to_string()
-    } else if let Some(inner) =
-        closure_env_field_is_cell_address(owner_is_closure_env, field_ty, llbc)
-    {
-        // Raw cell address (`rdtoa.py` `strtod` `end_ptr`). `history.getkind`
-        // of a raw Ptr is `'int'`; `*mut T` is `raw_thin_pointer_spelling`
-        // so `get_type_flag` banks Int instead of tracing `&mut T` as
-        // FLAG_POINTER.
-        format!(
-            "*mut {}",
-            tyref_to_field_layout_string(
-                &TyRef::Other(inner.into()),
-                llbc,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        )
+    } else if closure_env_field_is_cell_address(owner_is_closure_env, field_ty, llbc).is_some() {
+        // Char-varsize cell (`rdtoa.py` `strtod` `end_ptr`,
+        // `RAW_SCALAR_CELL_OWNER` Array(Char)). CCHARP `*const u8` is
+        // FLAG_UNSIGNED (`descr.py` `get_type_flag` of a raw Ptr).
+        // `*mut u8` stays on the Ref fallback for GCREF / STR producers
+        // (`raw_thin_pointer_spelling`).
+        "*const u8".to_string()
     } else {
         // `FloatArray.block` / `IntArray.block` stay `*mut TypedItemsBlock`.
         // That spelling projects as `SomePtr(GcArray(ITEM))` of the

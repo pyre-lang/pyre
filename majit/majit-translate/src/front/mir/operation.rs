@@ -3400,6 +3400,14 @@ impl<'a> Lowering<'a> {
                         .one()?;
                     return Ok((None, v));
                 }
+                // `&mut *(*env).flag` of a cell-address field is that
+                // field value. The reborrow does not load.
+                if borrow_kind_is_exclusive(&kind)
+                    && let Some(inner) = self.exclusive_reborrow_cell_address_inner(&place)
+                {
+                    let v = self.resolve_place(mir_bb, inner)?;
+                    return Ok((None, v));
+                }
                 if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
                     return Ok((None, address));
                 }
@@ -3876,6 +3884,10 @@ impl<'a> Lowering<'a> {
                         // Owner → window is only for a window field
                         // (`FmtArg::Bytes.__pos_0: &[u8]`). A `(&String,)`
                         // format interpolant stays the rust-heap header.
+                        let operand_is_cell_addr: Vec<bool> = operands
+                            .iter()
+                            .map(|op| self.operand_is_cell_address_repr(op))
+                            .collect();
                         let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
                         let mut pair_lens: Vec<Option<Variable>> =
                             Vec::with_capacity(operands.len());
@@ -3963,15 +3975,27 @@ impl<'a> Lowering<'a> {
                                 "bb{mir_bb}: pair slice item of an array aggregate"
                             )));
                         }
-                        for (i, arg) in arg_vars.iter().enumerate() {
+                        for (i, arg) in arg_vars.iter_mut().enumerate() {
                             let Some(field) = ctor.fields.get(i) else {
                                 continue;
                             };
-                            if field.cell_address && !self.variable_is_cell_ptr(arg) {
+                            if field.cell_address
+                                && !operand_is_cell_addr.get(i).copied().unwrap_or(false)
+                                && !self.variable_is_cell_ptr(arg)
+                            {
                                 return Err(LowerError::Unsupported(format!(
                                     "bb{mir_bb}: closure env field {} stores a raw cell address (`rdtoa.py` `strtod` `end_ptr`) but the operand is not the address of a cell local",
                                     field.name,
                                 )));
+                            }
+                            // `InstanceRepr.rtype_setattr`: `hop.inputargs`
+                            // converts the stored value to the field repr.
+                            // A peeled shared-`&T` scalar whose operand is a
+                            // cell address loads the cell (`rewrite_op_raw_load`).
+                            if field.peeled_shared_primitive
+                                && let Some(local) = self.cell_local_of_ptr(arg)
+                            {
+                                *arg = self.emit_cell_load(mir_bb, local)?;
                             }
                         }
                         let bb_id = self.emit_bb(mir_bb);
@@ -8429,7 +8453,11 @@ impl<'a> Lowering<'a> {
                 }
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
-                    && (tyref_is_raw_pointer(&inner.ty, self.llbc) || scalar_address)
+                    && (tyref_is_raw_pointer(&inner.ty, self.llbc)
+                        || scalar_address
+                        || self
+                            .closure_env_cell_address_field_pointee(&inner)
+                            .is_some())
                     && !matches!(inner.kind, PlaceKind::Local(local)
                         if self.atomic_ref_place.contains_key(&(local as usize))
                             || self.index_elem_alias.contains_key(&(local as usize)))
@@ -9309,6 +9337,10 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                         )
                         .is_some()
+                    }),
+                    peeled_shared_primitive: declared_ty.is_some_and(|ty| {
+                        tyref_is_closure_env(dest_ty, self.llbc)
+                            && tyref_shared_borrow_primitive_value(ty, self.llbc).is_some()
                     }),
                 }
             })
