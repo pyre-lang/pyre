@@ -6,6 +6,7 @@ Cross-platform Python translation of pyre/check.sh.
 
 import argparse
 import ast
+import atexit
 import difflib
 import hashlib
 import math
@@ -823,6 +824,22 @@ def child_env_base():
 # 4MB: env.py NURSERY_SIZE_UNKNOWN_CACHE / collector.rs DEFAULT_NURSERY_SIZE
 PYPY_GC_NURSERY_PIN = str(4 * 1024 * 1024)
 
+_EMPTY_PYCACHE_PREFIX = None
+
+
+def empty_pycache_prefix():
+    """One empty bytecode-cache directory per check.py process, removed at
+    exit, so a cache written by an earlier run is never read."""
+    global _EMPTY_PYCACHE_PREFIX
+    if _EMPTY_PYCACHE_PREFIX is None:
+        target = Path(__file__).resolve().parent.parent / "target"
+        target.mkdir(exist_ok=True)
+        _EMPTY_PYCACHE_PREFIX = tempfile.mkdtemp(
+            prefix="check-empty-pycache-", dir=target
+        )
+        atexit.register(shutil.rmtree, _EMPTY_PYCACHE_PREFIX, True)
+    return _EMPTY_PYCACHE_PREFIX
+
 
 def pyre_env():
     """Child environment for pyre runs: strict JIT plus one-line stats.
@@ -1041,11 +1058,17 @@ def pyre_env():
     # CRT text mode turned every `\n` into `\r\n` — so the same tree read one
     # set of counters while the cache was dead and another once it worked.
     #
-    # This suppresses writing only; a stale cache from before this pin is still
-    # read, so an A/B against an older tree wants `__pycache__` cleared first.
-    # `launch_env::finalize` folds the name as an integer flag, so an explicit
-    # PYTHONDONTWRITEBYTECODE=0 turns it back off. It reaches the wasm guest
-    # too: the name is in `LAUNCH_ENV_NAMES`, which the runner forwards through
+    # PYTHONDONTWRITEBYTECODE stops writes. Reads still go through
+    # `importlib._bootstrap_external` `cache_from_source`, which would open a
+    # stale `__pycache__` next to the source, including one an earlier unpinned
+    # run wrote. PYTHONPYCACHEPREFIX redirects both reading and writing to a
+    # directory created fresh for this check.py process and removed at exit,
+    # so no cache an earlier run left (including one written under an
+    # explicit PYTHONDONTWRITEBYTECODE=0) is read. An explicit
+    # PYTHONPYCACHEPREFIX still wins.
+    # `launch_env::finalize` folds PYTHONDONTWRITEBYTECODE as an integer flag,
+    # so an explicit PYTHONDONTWRITEBYTECODE=0 turns writing back on. Both
+    # names are in `LAUNCH_ENV_NAMES`, which the runner forwards through
     # `pyre_set_launch_env`.
     #
     # Only pyre is pinned this way. The oracles are spawned with the inherited
@@ -1058,6 +1081,8 @@ def pyre_env():
     # on what earlier runs left behind, and a ratio that moves with disk state
     # is worse than one that is consistently cold.
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    if "PYTHONPYCACHEPREFIX" not in env:
+        env["PYTHONPYCACHEPREFIX"] = empty_pycache_prefix()
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
