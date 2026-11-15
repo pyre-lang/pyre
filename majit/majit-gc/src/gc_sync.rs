@@ -318,12 +318,13 @@ pub fn register_thread() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
+    // Counted under `quiesce`, which `rgil::disable_gil` holds across its
+    // census check and the mode switch.
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
     }
-
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
         .resumed
         .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
@@ -354,6 +355,8 @@ pub fn register_thread_parked() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
+    // Counted under `quiesce`; see [`register_thread`].
+    let _state = GC_SYNC.quiesce.lock().unwrap();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
@@ -1143,6 +1146,14 @@ fn park_as_mutator_for_foreign_stw() {
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire)),
     );
+}
+
+/// Run `f` with mutator registration held off: [`register_thread`] and
+/// [`register_thread_parked`] count a new mutator under the same lock, so
+/// the registered census `f` reads cannot change before `f` returns.
+pub(crate) fn with_registration_blocked<R>(f: impl FnOnce() -> R) -> R {
+    let _state = GC_SYNC.quiesce.lock().unwrap();
+    f()
 }
 
 /// Whether this thread currently owns or is nested inside collector-side STW.

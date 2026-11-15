@@ -368,30 +368,41 @@ pub fn mutator_may_run() -> bool {
 
 /// Turn the GIL off for the rest of the process.
 ///
-/// Allowed only while at most one thread is registered and nobody waits for
-/// the GIL. Releases the GIL if this thread holds it, pins the nursery
+/// Allowed only for the GIL holder (or before the GIL is initialized), while
+/// at most one thread is registered and nobody waits for the GIL. Releases the GIL if this thread holds it, pins the nursery
 /// arena cursor on the GC-owned fallback pair, and arms the published-bump
 /// sentinel so `malloc_fast` reads the calling thread's chunk.
 pub fn disable_gil() {
     if gil_disabled() {
         return;
     }
+    // Only the GIL holder may move the live cursor, so the caller holds the
+    // GIL, or the GIL is not initialized and no other thread runs pyre code.
+    let holding = am_i_holding_the_gil();
     assert!(
-        gc_sync::registered_threads() <= 1,
-        "disable_gil requires at most one registered mutator"
+        holding || !gil_is_initialized(),
+        "disable_gil requires the GIL holder or an uninitialized GIL"
     );
-    let waiting = RPY_WAITING_THREADS.load(Ordering::Relaxed);
-    assert!(
-        waiting <= 0,
-        "disable_gil requires nobody waiting for the GIL"
-    );
-    if am_i_holding_the_gil() {
-        release();
-    } else {
-        gc_sync::release_nursery_cursor_to_fallback();
-    }
-    GIL_DISABLED.store(true, Ordering::Release);
-    crate::arm_gil_disabled_published_bump();
+    // A thread that registers meanwhile would see the GIL on and then run
+    // with it off; registration waits until the switch is published.
+    gc_sync::with_registration_blocked(|| {
+        assert!(
+            gc_sync::registered_threads() <= 1,
+            "disable_gil requires at most one registered mutator"
+        );
+        let waiting = RPY_WAITING_THREADS.load(Ordering::Relaxed);
+        assert!(
+            waiting <= 0,
+            "disable_gil requires nobody waiting for the GIL"
+        );
+        if holding {
+            release();
+        } else {
+            gc_sync::release_nursery_cursor_to_fallback();
+        }
+        GIL_DISABLED.store(true, Ordering::Release);
+        crate::arm_gil_disabled_published_bump();
+    });
 }
 
 /// `rpy_init_mutexes` re-runs through `pthread_atfork` (thread_gil.c:105-107).
