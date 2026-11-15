@@ -3881,13 +3881,13 @@ dependencies = [
 [[package]]
 name = "serde_json"
 version = "1.0.150"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
+source = "git+https://github.com/pyre-lang/serde-json?rev=d0032ab083f9d541fbf949791c6d22925b016a1a#d0032ab083f9d541fbf949791c6d22925b016a1a"
 dependencies = [
  "itoa",
  "memchr",
  "serde",
  "serde_core",
+ "vecset",
  "zmij",
 ]
 

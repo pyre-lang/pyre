@@ -295,6 +295,16 @@ insta = "1"
 [patch.crates-io]
 xz-core = { git = "https://github.com/simnalamburt/xz-rs", rev = "5bf95411d0307e052ca2aeb06f0d75565c9a7362" }
 
+# serde_json's `Map<String, Value>` is a `BTreeMap`, whose leaf node costs about
+# 600 bytes even for a one-key object. The translation prepass keeps Charon type
+# bodies, trait rows and layouts as `Value` trees, nearly all of them objects of
+# one to three keys. This fork backs `Map` with `vecset::VecMap` (a `Vec` sorted
+# by key): the public API and the key-ordered iteration are those of 1.0.150.
+# The prepass peak drops 6.48 GB -> 5.26 GB with identical output. Nothing in
+# the workspace depends on the fork: without this line the build is the same,
+# with the larger maps.
+serde_json = { git = "https://github.com/pyre-lang/serde-json", rev = "d0032ab083f9d541fbf949791c6d22925b016a1a" }
+
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;
 # codegen-units=1 additionally lets LLVM optimize the interpreter's large
