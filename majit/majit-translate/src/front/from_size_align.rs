@@ -79,6 +79,10 @@ pub(crate) struct FromSizeAlignSite {
     /// The `Layout` ADT `name_path` — the nested transparent-ctor owner and its
     /// `__pos_0`/`__pos_1` field owner.
     pub layout_owner: String,
+    /// Instance STRUCT of the built `Some`.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `None`.
+    pub none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// A recorded `Layout::from_size_align(..).expect(msg)` call whose result is a
@@ -117,6 +121,10 @@ pub(crate) struct FromSizeAlignCallSite {
     pub layout_owner: String,
     /// The `Ok` payload `Layout` as a [`ValueType`].
     pub payload_ty: ValueType,
+    /// Instance STRUCT of the built `Ok`.
+    pub ok_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `Err`.
+    pub err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// A recorded `Layout::size` / `Layout::align` call.  Both are opaque core
@@ -624,6 +632,7 @@ fn rewire_one_from_size_align_call_site(
         err_disc,
         ["Ok", "Err"],
         Some((site.ok_owner.as_str(), layout, site.payload_ty.clone())),
+        [site.ok_vsid, site.err_vsid],
     );
     Ok(())
 }
@@ -829,8 +838,16 @@ fn rewire_one_from_size_align_site(
         &site.option_owner,
         1,
         Some((&site.some_owner, layout, site.payload_ty.clone())),
+        site.some_vsid,
     );
-    let none = emit_option_variant(graph, none_block, &site.option_owner, 0, None);
+    let none = emit_option_variant(
+        graph,
+        none_block,
+        &site.option_owner,
+        0,
+        None,
+        site.none_vsid,
+    );
     for (arm, value, sources, inputs) in [
         (some_block, some, &some_sources, &some_inputs),
         (none_block, none, &carried, &none_inputs),
@@ -1132,6 +1149,8 @@ mod tests {
             some_owner: "core::option::Option::Some".to_string(),
             payload_ty: ValueType::Ref(Some("core::alloc::layout::Layout".to_string())),
             layout_owner: "core::alloc::layout::Layout".to_string(),
+            some_vsid: None,
+            none_vsid: None,
         }
     }
 
@@ -1907,6 +1926,8 @@ mod tests {
             ok_owner: "core::result::Result<Layout, LayoutError>::Ok".to_string(),
             layout_owner: "core::alloc::layout::Layout".to_string(),
             payload_ty: ValueType::Ref(Some("core::alloc::layout::Layout".to_string())),
+            ok_vsid: None,
+            err_vsid: None,
         }
     }
 

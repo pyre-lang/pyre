@@ -307,8 +307,7 @@ fn callee_stays_residual(
     if !fd.has_unstructured_body() {
         return true;
     }
-    let path = super::strip_crate_prefix(fd.item_meta.name_path_str());
-    dont_look_inside.contains(&path)
+    crate::front::llbc_hints::fun_decl_has_harvested_hint(llbc, fd, dont_look_inside)
 }
 
 /// `is_some` / `is_none` on `Option<OwnerRootGuard>` call the core
@@ -379,7 +378,7 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
             if !forward_blocks[bb_idx] {
                 continue;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             if let Some(callee) = residual_escape(&call, llbc, &dont_look_inside) {

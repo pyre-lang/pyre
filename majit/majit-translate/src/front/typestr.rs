@@ -173,8 +173,10 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     }
     // `{cap, ptr, len}` — the indexed pointer is the buffer, which has
     // no length word. Length lives in the third word of the Vec value.
-    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
-    if vec_tail.starts_with("Vec<") {
+    // Compare the ADT constructor path (`alloc::vec::Vec`), not a
+    // crate-stripped leaf: a qualified type argument (`Vec<module::T>`)
+    // still names this declaration.
+    if crate::vec_layout::spelling_is_alloc_vec(inner) {
         return true;
     }
     // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
@@ -198,9 +200,11 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
 /// the `nolength` hint: `lltype.GcArray` is `'gc'` even with
 /// `_hints['nolength']`; `lltype.Array` / `rffi.CArray` is `'raw'`.
 /// A `Vec<T>` identity is the GC item-buffer of a `Box<[T]>` fat data
-/// word (`getfield_gc_r` then `getarrayitem_gc_*`). A headerless
-/// `*const T` / `[T; N]` / `[u32]` item-run is `'raw'`. Missing
-/// identity keeps the `getattr(ARRAY, '_gckind', 'gc')` default.
+/// word (`getfield_gc_r` then `getarrayitem_gc_*`). Classify with the
+/// same `spelling_is_alloc_vec` predicate as `nolength_from_array_type_id`:
+/// a qualified type argument (`Vec<module::T>`) is still this ADT.
+/// A headerless `*const T` / `[T; N]` / `[u32]` item-run is `'raw'`.
+/// Missing identity keeps the `getattr(ARRAY, '_gckind', 'gc')` default.
 pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::ArrayGcKind {
     if !nolength_from_array_type_id(array_type_id) {
         return crate::model::ArrayGcKind::Gc;
@@ -212,8 +216,7 @@ pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::A
     while let Some(rest) = peel_pointer_prefix(inner) {
         inner = rest;
     }
-    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
-    if vec_tail.starts_with("Vec<") {
+    if crate::vec_layout::spelling_is_alloc_vec(inner) {
         crate::model::ArrayGcKind::Gc
     } else {
         crate::model::ArrayGcKind::Raw
@@ -290,7 +293,13 @@ mod tests {
 
     #[test]
     fn rust_vec_buffer_has_no_length_header() {
-        for id in ["Vec<u8>", "alloc::vec::Vec<u8>", "&mut Vec<i64>"] {
+        for id in [
+            "Vec<u8>",
+            "alloc::vec::Vec<u8>",
+            "&mut Vec<i64>",
+            "Vec<module::marshal::Rooted>",
+            "vec::Vec<module::marshal::Rooted>",
+        ] {
             assert!(
                 nolength_from_array_type_id(Some(id)),
                 "{id} indexes a headerless buffer"

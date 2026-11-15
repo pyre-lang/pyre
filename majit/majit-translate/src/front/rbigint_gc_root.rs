@@ -133,7 +133,7 @@ pub(super) fn tyref_is_option_of_root(ty: &TyRef, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    crate::front::result_exc::tyref_option_payload(&TyRef::Other(node.clone()), llbc)
+    crate::front::result_exc::tyref_option_payload(&TyRef::Other(node.clone().into()), llbc)
         .is_some_and(|payload| tyref_is_root(&payload, llbc))
 }
 
@@ -215,7 +215,7 @@ fn root_erasure_ready(llbc: &Llbc) -> bool {
 /// with the erased `RBigInt` type. `None` when `ty` does not name the handle.
 pub(super) fn erase_tyref(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let node = super::tyref_node(ty, llbc)?;
-    rewrite_type_node(node, llbc, 0).map(TyRef::Other)
+    rewrite_type_node(node, llbc, 0).map(|node| TyRef::Other(node.into()))
 }
 
 fn rewrite_type_node(
@@ -729,7 +729,7 @@ mod tests {
     }
 
     fn ty(node: serde_json::Value) -> TyRef {
-        TyRef::Other(node)
+        TyRef::Other(node.into())
     }
 
     fn root_type_decl() -> serde_json::Value {

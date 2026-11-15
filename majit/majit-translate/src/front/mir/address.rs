@@ -271,7 +271,7 @@ fn declared_residual_scalar_ref(
         return true;
     }
     tyref_peel_one_ref_node(declared, llbc)
-        .is_some_and(|pointee| tyref_is_type_var(&TyRef::Other(pointee.clone()), llbc))
+        .is_some_and(|pointee| tyref_is_type_var(&TyRef::Other(pointee.clone().into()), llbc))
 }
 
 /// One-word Copy value the residual ABI can store in a `Tuple<i64>`
@@ -294,7 +294,7 @@ fn tyref_is_ref_of_residual_scalar_word(
         return false;
     }
     tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| {
-        tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone()), llbc, gc_struct_ids)
+        tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone().into()), llbc, gc_struct_ids)
     })
 }
 
@@ -345,11 +345,12 @@ fn residual_arg_store_descr(
 }
 
 fn residual_scalar_ref_callee(
+    llbc: &Llbc,
     fd: &FunDecl,
     dont_look_inside: &std::collections::HashSet<String>,
     oopspec_fns: &OopspecFns<'_>,
 ) -> bool {
-    fun_decl_is_residual(fd, dont_look_inside)
+    fun_decl_is_residual(llbc, fd, dont_look_inside)
         && !fun_decl_has_oopspec(fd, oopspec_fns)
         && !is_inlined_mem_exchange_path(fd.item_meta.name_path_str())
 }
@@ -386,7 +387,8 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
         let inputs = subst_inputs
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
-        let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
+        let residual_ref_callee =
+            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns);
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref =
                 residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
@@ -426,8 +428,8 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             let Some(arg_node) = arg_node else {
                 continue;
             };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
+            let param_pointee = TyRef::Other(param_node.clone().into());
+            let arg_pointee = TyRef::Other(arg_node.clone().into());
             let arg_store = residual_arg_store_descr(&arg_pointee, llbc, gc_struct_ids);
             let Some((_, itemsize, _)) =
                 residual_arg_store_descr(&param_pointee, llbc, gc_struct_ids)
@@ -522,7 +524,8 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
         let inputs = subst_inputs
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
-        let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
+        let residual_ref_callee =
+            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns);
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref =
                 residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
@@ -569,8 +572,8 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             let Some(arg_node) = arg_node else {
                 continue;
             };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
+            let param_pointee = TyRef::Other(param_node.clone().into());
+            let arg_pointee = TyRef::Other(arg_node.clone().into());
             let arg_store = residual_arg_store_descr(&arg_pointee, llbc, gc_struct_ids);
             let Some((_, itemsize, _)) =
                 residual_arg_store_descr(&param_pointee, llbc, gc_struct_ids)
@@ -1249,7 +1252,7 @@ impl<'a> Lowering<'a> {
                 // has `&mut T` in its signature: wrap so pycall of the
                 // defining graph (`FunctionDesc.pycall`) sees the cell
                 // (`expand_pop_roots`).
-                if fun_decl_is_dont_look_inside(fd, self.dont_look_inside) {
+                if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) {
                     return None;
                 }
                 let mut cells = Vec::new();
@@ -1640,7 +1643,7 @@ impl<'a> Lowering<'a> {
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
         let residual_ref_callee =
-            residual_scalar_ref_callee(fd, self.dont_look_inside, &self.oopspec_fns);
+            residual_scalar_ref_callee(self.llbc, fd, self.dont_look_inside, &self.oopspec_fns);
         let mut spills = Vec::new();
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref = residual_ref_callee
@@ -1694,8 +1697,8 @@ impl<'a> Lowering<'a> {
             let Some(arg_node) = arg_node else {
                 continue;
             };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
+            let param_pointee = TyRef::Other(param_node.clone().into());
+            let arg_pointee = TyRef::Other(arg_node.clone().into());
             let arg_descr = self.raw_word_descr(&arg_pointee).or_else(|| {
                 residual_scalar_word_descr(&arg_pointee, self.llbc, self.gc_struct_ids)
             });
@@ -1772,7 +1775,7 @@ impl<'a> Lowering<'a> {
         else {
             return false;
         };
-        tyref_is_gc_reference(&TyRef::Other(payload.clone()), self.llbc)
+        tyref_is_gc_reference(&TyRef::Other(payload.clone().into()), self.llbc)
     }
 
     /// Store the aliased word into a fresh raw address and pass that
@@ -3225,7 +3228,7 @@ pub(in crate::front::mir) fn substitute_spill_typevars(
 ) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
     let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
-    Some(TyRef::Other(value))
+    Some(TyRef::Other(value.into()))
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is

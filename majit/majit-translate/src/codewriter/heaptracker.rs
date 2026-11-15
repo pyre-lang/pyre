@@ -52,16 +52,122 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
     }
 }
 
-/// `jtransform.py is_typeptr_getset` / `jtransform.rs is_typeptr_field`:
-/// the class word of the object header.  Upstream keys on `typeptr` and
-/// the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
-/// w_class }`, and only `ob_type` is the class the tracer guards on.
-pub fn is_typeptr_field(field: &crate::model::FieldDescriptor) -> bool {
-    let owner_leaf = field
-        .owner_root
-        .as_deref()
-        .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
-    field.name == "ob_type" && owner_leaf == Some("PyObject")
+/// Last path component is the class-word leaf (`rclass.OBJECT.typeptr`;
+/// pyre's header spells it `ob_type`).
+fn is_typeptr_leaf(name: &str) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    leaf == "typeptr" || leaf == "ob_type"
+}
+
+/// Ordered first field of `owner` (`STRUCT._names[0]`).
+///
+/// Rows come from [`CallControl::struct_field_entries`]
+/// (`lookup_fields` / `field_name_at`). Nested follow uses
+/// `is_known_struct`, the same test [`callcontrol_has_vtable`] uses
+/// when walking `has_gcstruct_a_vtable` / `_first_struct_owned`.
+fn callcontrol_first_field(cc: &CallControl, owner: &str) -> Option<(String, Option<String>)> {
+    let entries = cc.struct_field_entries(owner)?;
+    let first = entries.first()?;
+    let nested = cc.is_known_struct(&first.ty).then(|| first.ty.clone());
+    Some((first.name.clone(), nested))
+}
+
+/// Whether `field_path` on `owner` is the typeptr reached by following
+/// only first fields (offset 0) from that owner.
+///
+/// lltype inlines a GcStruct only as the first field of another
+/// GcStruct (`has_gcstruct_a_vtable` / `_first_struct_owned`).
+/// `rclass.OBJECT` is a GcStruct, so the only reachable typeptr inside
+/// any GC struct is the one at the end of that chain — which is why
+/// `heaptracker.py all_fielddescrs` can `if name == 'typeptr': continue`
+/// at every recursion level, and why `jtransform.py is_typeptr_getset` /
+/// `handle_getfield_typeptr`
+/// (`op.args[0].concretetype.TO._hints.get('typeptr')`) only ever see
+/// the object's own class word.
+///
+/// Pyre can embed an object at a non-zero offset (`GcFramePrefix.frame`
+/// after `gc_header`). That contained `ob_type` is an ordinary data
+/// word: the census publishes it and `is_typeptr_getset` does not drop
+/// the store.
+pub fn is_first_field_chain_typeptr(
+    owner: &str,
+    field_path: &str,
+    first_field: &dyn Fn(&str) -> Option<(String, Option<String>)>,
+) -> bool {
+    if !is_typeptr_leaf(field_path) {
+        return false;
+    }
+    let mut cursor = majit_ir::descr::canonical_struct_name(owner);
+    let mut remaining = field_path;
+    loop {
+        let Some((first_name, nested)) = first_field(&cursor) else {
+            return false;
+        };
+        if remaining == first_name {
+            return is_typeptr_leaf(&first_name);
+        }
+        let Some(rest) = remaining
+            .strip_prefix(first_name.as_str())
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            return false;
+        };
+        let Some(next) = nested else {
+            return false;
+        };
+        cursor = majit_ir::descr::canonical_struct_name(&next);
+        remaining = rest;
+    }
+}
+
+/// `rclass.py OBJECT` / `heaptracker.py has_gcstruct_a_vtable`: the
+/// object-header STRUCT is the one whose own first field is the typeptr.
+///
+/// `OBJECT = GcStruct('object', ('typeptr', CLASSTYPE), hints={...,
+/// 'typeptr': True})`. `has_gcstruct_a_vtable` returns False for OBJECT
+/// because that first field is the typeptr itself. A subclass inlines
+/// the parent as field 0 (`struct X { struct Y super; ... }`); that
+/// first field is the parent struct, not the typeptr, and the walk
+/// follows `_first_struct` until the header.
+///
+/// Zero-length first-field chain: the owner's first field entry is the
+/// typeptr leaf itself — not a nested struct and not a dotted path
+/// through an inlined header (`ob_header.ob_type`).
+pub(crate) fn is_object_header_owner(cc: &CallControl, owner: &str) -> bool {
+    let Some((name, nested)) = callcontrol_first_field(cc, owner) else {
+        return false;
+    };
+    if nested.is_some() || name.contains('.') {
+        return false;
+    }
+    is_first_field_chain_typeptr(owner, &name, &|o| callcontrol_first_field(cc, o))
+}
+
+/// Host Python instance header for `InstanceRepr._setup_repr`.
+///
+/// `rclass.OBJECT` / `virtualref.ObjectHeader` is a one-word typeptr.
+/// Pyre's instance root is that header plus the mutable class word
+/// (`PyObject.ob_type`, then `w_class`). `minted_exception_instance_layout`
+/// roots at that host header, not a one-word typeptr. A subclass still
+/// fails [`is_object_header_owner`]: its first field is the inlined
+/// parent, not the typeptr leaf.
+pub(crate) fn is_host_object_header_owner(cc: &CallControl, owner: &str) -> bool {
+    if !is_object_header_owner(cc, owner) {
+        return false;
+    }
+    cc.struct_field_entries(owner)
+        .is_some_and(|rows| rows.len() > 1)
+}
+
+/// `jtransform.py is_typeptr_getset` / `handle_getfield_typeptr`: the
+/// class word of this owner's object header, the typeptr at the end of
+/// the offset-0 first-field chain ([`is_first_field_chain_typeptr`]).
+pub fn is_typeptr_field(cc: &CallControl, field: &crate::model::FieldDescriptor) -> bool {
+    is_first_field_chain_typeptr(
+        field.owner_root.as_deref().unwrap_or(""),
+        &field.name,
+        &|owner| callcontrol_first_field(cc, owner),
+    )
 }
 
 /// `has_gcstruct_a_vtable` over ordered field entries (`STRUCT._names`).
@@ -83,7 +189,9 @@ pub fn owner_has_vtable_from_fields(
         let Some((field, nested)) = first_field(&cursor) else {
             return false;
         };
-        if is_typeptr_field(&field) {
+        // Already on the first-field walk (`_first_struct_owned`). The
+        // header struct is the one whose first field is the typeptr.
+        if is_typeptr_leaf(&field.name) {
             return cursor != start;
         }
         let Some(next) = nested else {
@@ -117,13 +225,12 @@ pub fn attrs_have_vtable(
 pub fn callcontrol_has_vtable(cc: &CallControl, owner: &str) -> bool {
     owner_has_vtable_from_fields(owner, &|o| {
         let key = majit_ir::descr::canonical_struct_name(o);
-        let entries = cc.struct_field_entries(&key)?;
-        let first = entries.first()?;
-        let field = crate::model::FieldDescriptor::new(first.name.clone(), Some(key));
-        let nested = cc
-            .is_known_struct(&first.ty)
-            .then(|| majit_ir::descr::canonical_struct_name(&first.ty));
-        Some((field, nested))
+        let (name, nested) = callcontrol_first_field(cc, o)?;
+        let field = crate::model::FieldDescriptor::new(name, Some(key));
+        Some((
+            field,
+            nested.map(|ty| majit_ir::descr::canonical_struct_name(&ty)),
+        ))
     })
 }
 
@@ -179,25 +286,18 @@ pub fn set_testing_vtable_for_gcstruct<V>(
         .insert(gcstruct._name.clone(), vtable);
 }
 
-/// `heaptracker.py:64-66` `if name == 'typeptr': continue`, spelled in the
-/// source field-name domain this walker actually sees.
+/// `heaptracker.py all_fielddescrs` skip of `typeptr`, spelled for the
+/// first-field-chain typeptr of `struct_name` (the census owner).
 ///
-/// Upstream's positional census never numbers the vtable word: `typeptr`
-/// lives in `OBJECT`, the substructure every instance embeds first, and the
-/// walk skips it by name. Pyre embeds that word as `ob_type` inside
-/// `PyObject { ob_type, w_class }`. The other header leaf is an ordinary
-/// field: `all_fielddescrs` recurses into the inlined struct and appends
-/// `get_field_descr(gccache, INNER, name)` (`heaptracker.py:68-71`), so
-/// `w_class` is a row of every outer object's list, keyed `(PyObject,
-/// w_class)`.
-///
-/// A containment path whose last component is that word (`ob_header.ob_type`
-/// on an instance) is the same unnumbered header word. Upstream
-/// `all_fielddescrs` skips `typeptr` by bare name at every recursion level
-/// (`heaptracker.py` `if name == 'typeptr': continue`).
-pub(crate) fn is_header_word(_struct_name: &str, field_name: &str) -> bool {
-    let leaf = field_name.rsplit('.').next().unwrap_or(field_name);
-    leaf == "typeptr" || leaf == "ob_type"
+/// Upstream skips `typeptr` by name at every recursion level because
+/// lltype inlines a GcStruct only as the first field, so every
+/// `typeptr` the walk meets is that owner's class word. A typeptr at a
+/// non-zero offset (`GcFramePrefix.frame.ob_header.ob_type`) is not on
+/// this chain and is published like any other field.
+pub(crate) fn is_header_word(cc: &CallControl, struct_name: &str, field_name: &str) -> bool {
+    is_first_field_chain_typeptr(struct_name, field_name, &|owner| {
+        callcontrol_first_field(cc, owner)
+    })
 }
 
 pub fn all_fielddescrs(
@@ -306,6 +406,17 @@ pub fn get_fielddescr_index_in(
     fieldname: &str,
     cur_index: isize,
 ) -> isize {
+    get_fielddescr_index_in_from(gccache, struct_name, struct_name, "", fieldname, cur_index)
+}
+
+fn get_fielddescr_index_in_from(
+    gccache: &CallControl,
+    root_owner: &str,
+    struct_name: &str,
+    field_prefix: &str,
+    fieldname: &str,
+    cur_index: isize,
+) -> isize {
     let mut cur_index = cur_index;
     let Some(fields) = gccache.struct_field_entries(struct_name) else {
         return -cur_index - 1;
@@ -329,17 +440,32 @@ pub fn get_fielddescr_index_in(
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        if is_header_word(struct_name, name) {
+        let full_name = if field_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{field_prefix}{name}")
+        };
+        // Skip only the original owner's first-field-chain typeptr, not
+        // an inner `ob_type` reached through a later field.
+        if is_header_word(gccache, root_owner, &full_name) {
             continue;
         }
         if gccache.is_known_struct(field_type) {
+            let nested_prefix = format!("{full_name}.");
             // The dotted `outer.inner` spelling names one leaf of this
             // nested struct on the outer owner.
             if let Some(rest) = fieldname
                 .strip_prefix(name.as_str())
                 .and_then(|rest| rest.strip_prefix('.'))
             {
-                let r = get_fielddescr_index_in(gccache, field_type, rest, cur_index);
+                let r = get_fielddescr_index_in_from(
+                    gccache,
+                    root_owner,
+                    field_type,
+                    &nested_prefix,
+                    rest,
+                    cur_index,
+                );
                 if r >= 0 {
                     return r;
                 }
@@ -348,10 +474,24 @@ pub fn get_fielddescr_index_in(
             }
             if has_direct {
                 // Count inner leaves; do not return an inner name match.
-                let r = get_fielddescr_index_in(gccache, field_type, "", cur_index);
+                let r = get_fielddescr_index_in_from(
+                    gccache,
+                    root_owner,
+                    field_type,
+                    &nested_prefix,
+                    "",
+                    cur_index,
+                );
                 cur_index = -r - 1;
             } else {
-                let r = get_fielddescr_index_in(gccache, field_type, fieldname, cur_index);
+                let r = get_fielddescr_index_in_from(
+                    gccache,
+                    root_owner,
+                    field_type,
+                    &nested_prefix,
+                    fieldname,
+                    cur_index,
+                );
                 if r >= 0 {
                     return r;
                 }
@@ -376,6 +516,17 @@ fn all_fielddescrs_into(
     only_gc: bool,
     res: &mut Vec<majit_ir::descr::DescrRef>,
 ) {
+    all_fielddescrs_into_from(gccache, struct_name, struct_name, "", only_gc, res);
+}
+
+fn all_fielddescrs_into_from(
+    gccache: &CallControl,
+    root_owner: &str,
+    struct_name: &str,
+    field_prefix: &str,
+    only_gc: bool,
+    res: &mut Vec<majit_ir::descr::DescrRef>,
+) {
     let Some(fields) = gccache
         .struct_field_entries(struct_name)
         .map(|f| f.to_vec())
@@ -389,11 +540,24 @@ fn all_fielddescrs_into(
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        if name.starts_with("c__pad") || is_header_word(struct_name, name) {
+        let full_name = if field_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{field_prefix}{name}")
+        };
+        if name.starts_with("c__pad") || is_header_word(gccache, root_owner, &full_name) {
             continue;
         }
         if gccache.is_known_struct(field_type) {
-            all_fielddescrs_into(gccache, field_type, only_gc, res);
+            let nested_prefix = format!("{full_name}.");
+            all_fielddescrs_into_from(
+                gccache,
+                root_owner,
+                field_type,
+                &nested_prefix,
+                only_gc,
+                res,
+            );
         } else if !only_gc || flag == majit_ir::descr::ArrayFlag::Pointer {
             let owner = Some(struct_name.to_string());
             let idx = gccache.descr_indices.field_index(&owner, name);
@@ -408,15 +572,239 @@ fn all_fielddescrs_into(
 mod tests {
     use super::*;
 
+    fn layout_cc(rows: &[(&str, &[(&str, &str)])]) -> CallControl {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let mut known = std::collections::HashSet::new();
+        for (owner, fs) in rows {
+            known.insert((*owner).to_string());
+            fields.fields.insert(
+                (*owner).to_string(),
+                fs.iter()
+                    .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        cc.set_known_struct_names(known);
+        cc.set_struct_fields(fields);
+        cc
+    }
+
+    fn object_layout_cc() -> CallControl {
+        layout_cc(&[
+            (
+                "PyObject",
+                &[("ob_type", "*const PyType"), ("w_class", "*mut PyObject")],
+            ),
+            ("object", &[("typeptr", "*const PyType")]),
+            (
+                "W_BytesObject",
+                &[("ob_header", "PyObject"), ("data", "*mut u8")],
+            ),
+            (
+                "W_FloatObject",
+                &[("ob_header", "PyObject"), ("value", "f64")],
+            ),
+            (
+                "Method",
+                &[
+                    ("ob", "PyObject"),
+                    ("w_function", "*mut PyObject"),
+                    ("w_self", "*mut PyObject"),
+                    ("w_class", "*mut PyObject"),
+                    ("w_module", "*mut PyObject"),
+                ],
+            ),
+            ("Outer", &[("typeptr", "*const PyType"), ("payload", "i64")]),
+            (
+                "OuterLater",
+                &[("payload", "i64"), ("typeptr", "*const PyType")],
+            ),
+            (
+                "PyFrame",
+                &[("ob_header", "PyObject"), ("pycode", "*mut u8")],
+            ),
+            (
+                "GcFramePrefix",
+                &[("gc_header", "u64"), ("frame", "PyFrame")],
+            ),
+            (
+                "pyframe::GcFramePrefix",
+                &[("gc_header", "u64"), ("frame", "PyFrame")],
+            ),
+        ])
+    }
+
     #[test]
-    fn header_word_matches_last_path_component() {
-        assert!(is_header_word("PyObject", "ob_type"));
-        assert!(is_header_word("PyObject", "typeptr"));
-        assert!(is_header_word("W_BytesObject", "ob_header.ob_type"));
-        assert!(is_header_word("W_BytesObject", "ob_header.typeptr"));
-        assert!(!is_header_word("PyObject", "w_class"));
-        assert!(!is_header_word("W_BytesObject", "ob_header.w_class"));
-        assert!(!is_header_word("Method", "ob"));
+    fn header_word_is_the_first_field_chain_typeptr() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let cc = object_layout_cc();
+        assert!(is_header_word(&cc, "PyObject", "ob_type"));
+        assert!(is_header_word(&cc, "object", "typeptr"));
+        assert!(is_header_word(&cc, "W_BytesObject", "ob_header.ob_type"));
+        assert!(is_header_word(&cc, "W_FloatObject", "ob_header.ob_type"));
+        assert!(!is_header_word(&cc, "PyObject", "w_class"));
+        assert!(!is_header_word(&cc, "W_BytesObject", "ob_header.w_class"));
+        assert!(!is_header_word(&cc, "Method", "ob"));
+        assert!(is_header_word(&cc, "Method", "ob.ob_type"));
+        assert!(is_header_word(&cc, "Outer", "typeptr"));
+        assert!(!is_header_word(&cc, "OuterLater", "typeptr"));
+        assert!(!is_header_word(
+            &cc,
+            "pyframe::GcFramePrefix",
+            "frame.ob_header.ob_type"
+        ));
+    }
+
+    /// `rclass.py OBJECT` is the STRUCT whose own first field is the
+    /// typeptr. A subclass inlines the parent (`ob_header`) or publishes
+    /// a dotted path (`ob_header.ob_type`); those are the chain, not OBJECT.
+    #[test]
+    fn object_header_owner_is_the_struct_whose_own_first_field_is_the_typeptr() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let cc = object_layout_cc();
+        assert!(is_object_header_owner(&cc, "PyObject"));
+        assert!(is_object_header_owner(&cc, "object"));
+        assert!(is_object_header_owner(&cc, "Outer"));
+        assert!(is_host_object_header_owner(&cc, "PyObject"));
+        assert!(!is_host_object_header_owner(&cc, "object"));
+        assert!(is_host_object_header_owner(&cc, "Outer"));
+        assert!(!is_object_header_owner(&cc, "W_BytesObject"));
+        assert!(!is_object_header_owner(&cc, "W_FloatObject"));
+        assert!(!is_object_header_owner(&cc, "Method"));
+        assert!(!is_object_header_owner(&cc, "OuterLater"));
+        assert!(!is_object_header_owner(&cc, "GcFramePrefix"));
+        assert!(!is_object_header_owner(&cc, "pyframe::GcFramePrefix"));
+        assert!(!is_host_object_header_owner(&cc, "W_BytesObject"));
+        let flat = layout_cc(&[(
+            "W_Flat",
+            &[("ob_header.ob_type", "*const PyType"), ("value", "f64")],
+        )]);
+        assert!(!is_object_header_owner(&flat, "W_Flat"));
+        assert!(!is_host_object_header_owner(&flat, "W_Flat"));
+        assert!(is_header_word(&flat, "W_Flat", "ob_header.ob_type"));
+        let leaf = crate::model::FieldDescriptor::new("ob_header.ob_type", Some("W_Flat".into()));
+        assert!(is_typeptr_field(&flat, &leaf));
+    }
+
+    #[test]
+    fn typeptr_field_matches_nested_header_word() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let cc = object_layout_cc();
+        let leaf = crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into()));
+        assert!(is_typeptr_field(&cc, &leaf));
+        let float_header =
+            crate::model::FieldDescriptor::new("ob_header.ob_type", Some("W_FloatObject".into()));
+        assert!(is_typeptr_field(&cc, &float_header));
+        let nested = crate::model::FieldDescriptor::new(
+            "frame.ob_header.ob_type",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(!is_typeptr_field(&cc, &nested));
+        let first_typeptr = crate::model::FieldDescriptor::new("typeptr", Some("Outer".into()));
+        assert!(is_typeptr_field(&cc, &first_typeptr));
+        let later_typeptr =
+            crate::model::FieldDescriptor::new("typeptr", Some("OuterLater".into()));
+        assert!(!is_typeptr_field(&cc, &later_typeptr));
+        let w_class_leaf = crate::model::FieldDescriptor::new("w_class", Some("PyObject".into()));
+        assert!(!is_typeptr_field(&cc, &w_class_leaf));
+        let w_class = crate::model::FieldDescriptor::new(
+            "frame.ob_header.w_class",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(!is_typeptr_field(&cc, &w_class));
+    }
+
+    /// `jtransform.py is_typeptr_getset` requires the typeptr-bearing
+    /// object. `GcFramePrefix.frame` sits after the GC header, so a
+    /// GuardClass on the prefix base would read the wrong word.
+    #[test]
+    fn typeptr_field_declines_gc_frame_prefix_contained_object() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let cc = object_layout_cc();
+        let nested = crate::model::FieldDescriptor::new(
+            "frame.ob_header.ob_type",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(!is_typeptr_field(&cc, &nested));
+        assert!(!is_header_word(
+            &cc,
+            "pyframe::GcFramePrefix",
+            "frame.ob_header.ob_type"
+        ));
+        let method_header = crate::model::FieldDescriptor::new("ob.ob_type", Some("Method".into()));
+        assert!(is_typeptr_field(&cc, &method_header));
+    }
+
+    /// Harvest keys the full def-path; FieldWrite `owner_root` is the
+    /// relative path (`pyobject::PyObject`). `lookup_fields` is the
+    /// STRUCT identity (`field_name_at`); exact HashMap lookup is not.
+    #[test]
+    fn first_field_chain_uses_harvested_field_row_identity() {
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("PyObject".to_string(), "pyre_object::pyobject".to_string());
+        let _registry = crate::test_support::register_struct_origins_serialized(origins);
+        let cc = layout_cc(&[(
+            "pyre_object::pyobject::PyObject",
+            &[("ob_type", "*const PyType"), ("w_class", "*mut PyObject")],
+        )]);
+        let leaf = crate::model::FieldDescriptor::new("ob_type", Some("pyobject::PyObject".into()));
+        assert!(is_typeptr_field(&cc, &leaf));
+        assert!(is_header_word(&cc, "pyobject::PyObject", "ob_type"));
+        let w_class =
+            crate::model::FieldDescriptor::new("w_class", Some("pyobject::PyObject".into()));
+        assert!(!is_typeptr_field(&cc, &w_class));
+    }
+
+    /// `heaptracker.py all_fielddescrs` skips `typeptr` at every
+    /// recursion because lltype inlines a GcStruct only as the first
+    /// field. A typeptr at a non-zero offset is published.
+    #[test]
+    fn census_publishes_nonzero_offset_typeptr_and_skips_first_field_chain() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let cc = object_layout_cc();
+        assert!(
+            get_fielddescr_index_in(&cc, "GcFramePrefix", "frame.ob_header.ob_type", 0) >= 0,
+            "contained-object typeptr is a numbered leaf of GcFramePrefix"
+        );
+        assert!(
+            get_fielddescr_index_in(&cc, "W_FloatObject", "ob_header.ob_type", 0) < 0,
+            "first-field-chain typeptr stays out of the census"
+        );
+        assert!(
+            get_fielddescr_index_in(&cc, "PyObject", "ob_type", 0) < 0,
+            "PyObject.ob_type is the owner's own typeptr"
+        );
+        assert_eq!(
+            get_fielddescr_index_in(&cc, "W_FloatObject", "ob_header.w_class", 0),
+            0
+        );
+    }
+
+    /// `lookup_fields` strips `<…>` before the map lookup. The census
+    /// must keep the generic harvest key so `Option<T>::Some.__pos_0`
+    /// is numbered (`descr.py` `get_fielddescr_index_in`).
+    #[test]
+    fn census_numbers_generic_option_variant_payload() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let owner = "option::Option<(usize,usize,bool)>::Some";
+        let cc = layout_cc(&[(owner, &[("__pos_0", "(usize, usize, bool)")])]);
+        assert!(
+            get_fielddescr_index_in(&cc, owner, "__pos_0", 0) >= 0,
+            "generic Option::Some payload is a numbered leaf"
+        );
     }
 
     #[test]

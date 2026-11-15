@@ -540,7 +540,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
         "bit_length",
         "bit_count",
     ] {
-        let path = format!("rbigint::<Impl>::{name}");
+        let path = format!("rbigint::RBigInt::{name}");
         assert!(
             hints
                 .get(&path)
@@ -585,7 +585,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
         "gcd",
         "isqrt",
     ] {
-        let path = format!("rbigint::<Impl>::{name}");
+        let path = format!("rbigint::RBigInt::{name}");
         assert!(
             !hints
                 .get(&path)
@@ -612,7 +612,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
         );
     }
     for name in ["fromlong", "tolong"] {
-        let path = format!("rbigint::<Impl>::{name}");
+        let path = format!("rbigint::RBigInt::{name}");
         assert!(
             hints
                 .get(&path)
@@ -640,7 +640,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
         "lqshift",
         "_normalize",
     ] {
-        let path = format!("rbigint::<Impl>::{name}");
+        let path = format!("rbigint::RBigInt::{name}");
         assert!(
             hints
                 .get(&path)
@@ -664,12 +664,12 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
     }
     assert!(
         hints
-            .get("rbigint::<Impl>::rshift")
+            .get("rbigint::RBigInt::rshift")
             .is_some_and(|values| values.iter().any(|hint| hint == "always_inline_try")),
-        "missing upstream _always_inline_='try' marker for rbigint::<Impl>::rshift: {hints:?}"
+        "missing upstream _always_inline_='try' marker for rbigint::RBigInt::rshift: {hints:?}"
     );
     assert!(
-        !hints.contains_key("rbigint::<Impl>::rshift::try_rshift"),
+        !hints.contains_key("rbigint::RBigInt::rshift::try_rshift"),
         "_always_inline_try_ must not also match the shorter _always_inline_ prefix"
     );
     assert!(

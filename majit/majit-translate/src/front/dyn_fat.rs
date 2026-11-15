@@ -117,6 +117,12 @@ pub(crate) fn splice_fat_dyn_returns(
     // the compiled loop.
     rewrite_remaining_fat_vtable_reads(graph, &fat_len);
     drop_unused_fat_len_casts(graph);
+    // Splice remaps callee `Input` results onto a caller Variable
+    // (`remap_value_in_graph`) that later ops in the spliced body use
+    // as a dominating name. `SSA_to_SSI` (`ssa.py`) threads every
+    // used-but-not-defined Variable through incoming link args —
+    // `thread_undefined_op_operands` is that census on this graph.
+    crate::model::thread_undefined_op_operands(graph);
 }
 
 fn graph_has_vtable_method(graph: &FunctionGraph) -> bool {

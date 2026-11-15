@@ -498,6 +498,13 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
+        // A declared two-field `{integer, [T; 0]}` GcArray
+        // (`TypedItemsBlock`) is `lltype.nullptr(GcArray(ITEM))`:
+        // `try_lower_gcarray_ptr_null` emits `cast_int_to_ptr`. A spelled
+        // `core.ptr.null_mut` of the wrapper class would steal that dest.
+        if self.tyref_is_scalar_flexible_gcarray(&call.dest.ty) {
+            return Ok(false);
+        }
         if !is_core_ptr_null_fun_path(&path) {
             return Ok(false);
         }
@@ -1215,7 +1222,14 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
         );
         self.toint_call_results
-            .push((result, suffix, ValueType::Int));
+            .push(crate::front::result_exc::ResultExcCall {
+                result,
+                suffix,
+                payload_ty: ValueType::Int,
+                sum: None,
+                ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
+                err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
+            });
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);

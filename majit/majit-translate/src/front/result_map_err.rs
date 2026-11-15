@@ -10,6 +10,7 @@
 use crate::flowspace::model::Variable;
 use crate::front::option_variant::{
     close_goto_mixed, emit_narrow, emit_sum_variant, map_source, reproduce_exit_args,
+    struct_id_from_enum_owner_spelling,
 };
 use crate::front::result_exc::emit_callable;
 use crate::model::{
@@ -40,6 +41,9 @@ pub(crate) struct ResultMapErrSite {
     /// Other closure environments stay on the fail-closed path until MIR Drop
     /// lowering can preserve their conditional destruction on the Ok arm.
     pub closure_env_is_trivially_dropless: bool,
+    pub receiver_ok_vsid: Option<majit_ir::descr::StructId>,
+    pub receiver_err_vsid: Option<majit_ir::descr::StructId>,
+    pub result_err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 fn is_map_err_call(kind: &OpKind) -> bool {
@@ -284,6 +288,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             ok_block,
             receiver_ok,
             &site.receiver_ok_owner,
+            site.receiver_ok_vsid,
             site.ok_ty.clone(),
         )
     };
@@ -305,6 +310,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         err_block,
         receiver_err,
         &site.receiver_err_owner,
+        site.receiver_err_vsid,
         site.err_ty.clone(),
     );
     let err_payload = emit_narrow(graph, err_block, err_payload, &site.err_class_root);
@@ -350,6 +356,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             "Err",
             1,
             Some((&site.result_err_owner, mapped, site.mapped_err_ty.clone())),
+            site.result_err_vsid,
         );
         let (rewrap_target, rewrap_args) = bypass_rewrap_handler_args(
             graph,
@@ -378,7 +385,9 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             field: FieldDescriptor {
                 name: "__discriminant".to_string(),
                 owner_root: Some(site.receiver_owner.clone()),
-                owner_id: None,
+                owner_id: site
+                    .receiver_ok_vsid
+                    .or_else(|| struct_id_from_enum_owner_spelling(&site.receiver_owner)),
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -534,6 +543,7 @@ fn read_payload(
     block: crate::model::BlockId,
     receiver: Variable,
     owner: &str,
+    owner_id: Option<majit_ir::descr::StructId>,
     ty: ValueType,
 ) -> Variable {
     let payload = graph.alloc_value_var();
@@ -544,7 +554,7 @@ fn read_payload(
             field: FieldDescriptor {
                 name: "__pos_0".to_string(),
                 owner_root: Some(owner.to_string()),
-                owner_id: None,
+                owner_id: owner_id.or_else(|| struct_id_from_enum_owner_spelling(owner)),
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -647,6 +657,9 @@ mod tests {
             args_tuple_suffix: "<str>".into(),
             fn_item_segments: None,
             closure_env_is_trivially_dropless: false,
+            receiver_ok_vsid: None,
+            receiver_err_vsid: None,
+            result_err_vsid: None,
         }
     }
 
@@ -689,6 +702,7 @@ mod tests {
             reconstructed,
             ValueType::Ref(None),
             "<i64,Error>",
+            None,
         );
         let (downstream, _) = graph.create_block_with_arg_vars(2);
         graph.set_return(downstream, None);

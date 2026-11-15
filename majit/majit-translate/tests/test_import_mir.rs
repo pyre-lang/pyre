@@ -13,7 +13,9 @@ use majit_translate::{
     ErrorCarrierSpec,
     FunctionGraph,
     HostStaticAddrs,
-    annotator::classdesc::register_struct_fields_with_layout,
+    annotator::classdesc::{
+        register_flattened_list_storage_leaves, register_struct_fields_with_layout,
+    },
     codewriter::{
         CodeWriter,
         call::CallControl,
@@ -377,6 +379,7 @@ fn pycode_code_ptr_is_raw_int_kind() {
                 });
             register_struct_fields_with_layout(qualified, fields, layout_pairs.as_deref());
         }
+        register_flattened_list_storage_leaves(&program.struct_field_attrs);
     }
     let is_coroutine = program
         .functions

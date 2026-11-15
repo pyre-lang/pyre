@@ -562,8 +562,9 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     let objptr = serde_json::json!({
         "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
     });
-    let kind =
-        |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+    let kind = |node: serde_json::Value| {
+        super::tyref_pair_slice_item_kind(&TyRef::Other(node.into()), &llbc)
+    };
     assert_eq!(
         kind(serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })),
         Some(VecItemKind::Int)
@@ -671,7 +672,7 @@ fn spelling_pair_field_kind_matches_tyref_pair_shapes() {
     let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
     let slice = serde_json::json!({ "Slice": [usize_ty, null] });
     let field_kind =
-        |node: serde_json::Value| super::tyref_pair_field_kind(&TyRef::Other(node), &llbc);
+        |node: serde_json::Value| super::tyref_pair_field_kind(&TyRef::Other(node.into()), &llbc);
 
     assert_eq!(
         super::spelling_pair_field_kind("&[usize]"),
@@ -727,4 +728,27 @@ fn spelling_pair_field_kind_matches_tyref_pair_shapes() {
         })),
         None
     );
+}
+
+/// `rbuiltin.py BuiltinFunctionRepr.findbltintyper` keys the actual
+/// `alloc::vec::from_elem` builtin. A user `application::vec::from_elem`
+/// is an ordinary function.
+#[test]
+fn alloc_vec_from_elem_requires_the_allocator_namespace() {
+    assert!(super::is_alloc_vec_from_elem(&[
+        "alloc".into(),
+        "vec".into(),
+        "from_elem".into(),
+    ]));
+    assert!(!super::is_alloc_vec_from_elem(&[
+        "application".into(),
+        "vec".into(),
+        "from_elem".into(),
+    ]));
+    assert!(!super::is_alloc_vec_from_elem(&[
+        "core".into(),
+        "alloc".into(),
+        "vec".into(),
+        "from_elem".into(),
+    ]));
 }

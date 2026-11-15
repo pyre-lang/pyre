@@ -3577,28 +3577,35 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
     ];
     let llbc = llbc_with_types("pyre_object", vec![], funs);
     let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
-    let drop_place =
-        |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb].term(&llbc) {
-            Ok(TermKind::Drop { place, target, .. }) => match place.kind {
-                PlaceKind::Local(l) => Some((l, target)),
-                _ => None,
-            },
+    let drop_place = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
+        .term_ref(&llbc)
+    {
+        Ok(TermKind::Drop { place, target, .. }) => match place.kind {
+            PlaceKind::Local(l) => Some((l, *target)),
             _ => None,
-        };
+        },
+        _ => None,
+    };
     let mut u = llbc.fn_by_id(4).unwrap().unstructured().unwrap();
     super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
     // The temporary's only move is the `mem::drop` operand, and that
-    // move is not a move-out. The close stays a call.
+    // move is not a move-out, so the call is Drop of the guard.
     assert_eq!(
         u.body[2].statements.len(),
-        1,
-        "the move into the call stays"
+        0,
+        "the move into the call is stripped"
     );
-    assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
-    assert_eq!(drop_place(&u, 3), Some((2, 7)));
+    assert_eq!(drop_place(&u, 2), Some((2, 3)));
+    assert!(
+        matches!(
+            u.body[3].term_ref(&llbc),
+            Ok(TermKind::Goto { target }) if *target == 7
+        ),
+        "scope-end Drop of the closed guard becomes Goto"
+    );
     assert_eq!(drop_place(&u, 6), Some((4, 4)));
     assert_eq!(drop_place(&u, 4), Some((2, 5)));
-    assert!(super::moved_out_locals(&u, &llbc).contains(2));
+    assert!(!super::moved_out_locals(&u, &llbc).contains(2));
 
     let mut u = llbc.fn_by_id(5).unwrap().unstructured().unwrap();
     super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
@@ -3607,7 +3614,10 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
         1,
         "a guard closed on one arm is left"
     );
-    assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
+    assert!(matches!(
+        u.body[2].term_ref(&llbc),
+        Ok(TermKind::Call { .. })
+    ));
     assert_eq!(drop_place(&u, 3), Some((2, 4)));
 
     // The bracket closes every pin `operands` makes, so its caller sees
@@ -3780,7 +3790,7 @@ fn published_field_ty<'a>(llbc: &'a Llbc, id: u64, field: &str) -> Option<&'a se
             .iter()
             .find(|row| row.name.as_deref() == Some(field))
             .and_then(|row| match &row.ty {
-                TyRef::Other(value) => Some(value),
+                TyRef::Other(value) => Some(value.as_ref()),
                 _ => None,
             }),
         _ => None,
@@ -5097,5 +5107,429 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
     assert!(
         !analyzer.regular_call_touches_root_stack(&caller),
         "the map caller does not inherit an unknown drop"
+    );
+}
+
+/// `ll_call_destructor` (`gctransform/support.py`) always invokes the
+/// registered destructor. A Drop that removes a root and also writes a
+/// counter is not exactly Remove, so the add-root constructor stays.
+fn registration_guard_llbc(drop_writes_counter: bool) -> Llbc {
+    let span = serde_json::json!({
+        "data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }
+    });
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": name,
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let unit_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let guard_adt = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let guard_value = serde_json::json!({"Value": [1, guard_adt.clone()]});
+    let slot_ref_ty = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let guard_ref_ty = serde_json::json!({"Ref": [null, guard_adt.clone(), "Mut"]});
+    let local = |index: u64, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": null,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let stmt = |kind: serde_json::Value| serde_json::json!({"span": span, "kind": kind});
+    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| {
+        serde_json::json!({
+            "statements": statements,
+            "kind": "Regular",
+            "terminator": {"span": span, "kind": terminator}
+        })
+    };
+    let call = |fun_id: u64,
+                args: Vec<serde_json::Value>,
+                dest: u64,
+                dest_ty: &serde_json::Value,
+                target: u64,
+                unwind: u64| {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": fun_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": args
+            },
+            "dest": place(dest, dest_ty),
+            "target": target,
+            "on_unwind": unwind
+        }})
+    };
+    let fun = |def_id: u64,
+               name: Vec<serde_json::Value>,
+               is_local: bool,
+               inputs: Vec<serde_json::Value>,
+               output: serde_json::Value,
+               body: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta(name, is_local),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": output
+            },
+            "body": body
+        })
+    };
+    let opaque = serde_json::json!("Opaque");
+    let unstructured =
+        |arg_count: u64, locals: Vec<serde_json::Value>, blocks: Vec<serde_json::Value>| {
+            serde_json::json!({"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": arg_count, "locals": locals},
+                "body": blocks
+            }})
+        };
+    let drop_impl_seg = serde_json::json!({"Impl": {
+        "Ty": {
+            "skip_binder": guard_value.clone(),
+            "kind": "TraitImpl"
+        },
+        "Trait": 0
+    }});
+    let add_root = fun(
+        2,
+        vec![
+            ident("pyre_object"),
+            ident("gc_hook"),
+            ident("try_gc_add_root"),
+        ],
+        false,
+        vec![slot_ref_ty.clone()],
+        bool_ty.clone(),
+        opaque.clone(),
+    );
+    let remove_root = fun(
+        3,
+        vec![
+            ident("pyre_object"),
+            ident("gc_hook"),
+            ident("try_gc_remove_root"),
+        ],
+        false,
+        vec![guard_ref_ty.clone()],
+        unit_ty.clone(),
+        opaque.clone(),
+    );
+    let register_root = fun(
+        1,
+        vec![ident("fixture"), ident("register_root")],
+        true,
+        vec![slot_ref_ty.clone()],
+        guard_adt.clone(),
+        unstructured(
+            1,
+            vec![
+                local(0, &guard_adt),
+                local(1, &slot_ref_ty),
+                local(2, &bool_ty),
+            ],
+            vec![
+                block(
+                    vec![],
+                    call(
+                        2,
+                        vec![serde_json::json!({"Read": place(1, &slot_ref_ty)})],
+                        2,
+                        &bool_ty,
+                        1,
+                        2,
+                    ),
+                ),
+                block(vec![], serde_json::json!("Return")),
+                block(vec![], serde_json::json!("UnwindResume")),
+            ],
+        ),
+    );
+    let drop_blocks = if drop_writes_counter {
+        vec![
+            block(
+                vec![],
+                call(
+                    3,
+                    vec![serde_json::json!({"Read": place(1, &guard_ref_ty)})],
+                    2,
+                    &unit_ty,
+                    1,
+                    3,
+                ),
+            ),
+            block(vec![], call(5, vec![], 3, &unit_ty, 2, 3)),
+            block(vec![], serde_json::json!("Return")),
+            block(vec![], serde_json::json!("UnwindResume")),
+        ]
+    } else {
+        vec![
+            block(
+                vec![],
+                call(
+                    3,
+                    vec![serde_json::json!({"Read": place(1, &guard_ref_ty)})],
+                    0,
+                    &unit_ty,
+                    1,
+                    2,
+                ),
+            ),
+            block(vec![], serde_json::json!("Return")),
+            block(vec![], serde_json::json!("UnwindResume")),
+        ]
+    };
+    let drop_locals = if drop_writes_counter {
+        vec![
+            local(0, &unit_ty),
+            local(1, &guard_ref_ty),
+            local(2, &unit_ty),
+            local(3, &unit_ty),
+        ]
+    } else {
+        vec![local(0, &unit_ty), local(1, &guard_ref_ty)]
+    };
+    let drop_fn = fun(
+        4,
+        vec![ident("fixture"), drop_impl_seg, ident("drop")],
+        true,
+        vec![guard_ref_ty.clone()],
+        unit_ty.clone(),
+        unstructured(1, drop_locals, drop_blocks),
+    );
+    let subject = fun(
+        0,
+        vec![ident("fixture"), ident("with_root")],
+        true,
+        vec![],
+        unit_ty.clone(),
+        unstructured(
+            0,
+            vec![
+                local(0, &unit_ty),
+                local(1, &i64_ty),
+                local(2, &slot_ref_ty),
+                local(3, &guard_adt),
+            ],
+            vec![
+                block(
+                    vec![
+                        stmt(serde_json::json!({"Assign": [
+                            place(1, &i64_ty),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "0"]}},
+                                i64_ty.clone()
+                            ]}, "No"]}
+                        ]})),
+                        stmt(serde_json::json!({"Assign": [
+                            place(2, &slot_ref_ty),
+                            {"Ref": {
+                                "place": place(1, &i64_ty),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }}
+                        ]})),
+                    ],
+                    call(
+                        1,
+                        vec![serde_json::json!({"Read": place(2, &slot_ref_ty)})],
+                        3,
+                        &guard_adt,
+                        1,
+                        3,
+                    ),
+                ),
+                block(
+                    vec![],
+                    serde_json::json!({"Drop": {
+                        "place": place(3, &guard_adt),
+                        "fn_ptr": {
+                            "kind": {"Fun": 4},
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        },
+                        "target": 2,
+                        "on_unwind": 3
+                    }}),
+                ),
+                block(
+                    vec![stmt(serde_json::json!({"Assign": [
+                        place(0, &unit_ty),
+                        {"Aggregate": ["Tuple", []]}
+                    ]}))],
+                    serde_json::json!("Return"),
+                ),
+                block(vec![], serde_json::json!("UnwindResume")),
+            ],
+        ),
+    );
+    let mut funs = vec![subject, register_root, add_root, remove_root, drop_fn];
+    if drop_writes_counter {
+        funs.push(fun(
+            5,
+            vec![ident("fixture"), ident("increment_counter")],
+            true,
+            vec![],
+            unit_ty.clone(),
+            opaque,
+        ));
+    }
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                null,
+                {
+                    "def_id": 1,
+                    "item_meta": item_meta(
+                        vec![ident("fixture"), ident("RootGuard")],
+                        true
+                    ),
+                    "kind": {"Struct": []}
+                }
+            ],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": item_meta(
+                    vec![
+                        ident("core"),
+                        ident("ops"),
+                        ident("drop"),
+                        ident("Drop")
+                    ],
+                    false
+                ),
+                "methods": []
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [guard_value],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("registration guard fixture parses")
+}
+
+fn registration_guard_ty(llbc: &Llbc) -> majit_charon_reader::ullbc::TyRef {
+    llbc.local_fn("with_root")
+        .and_then(|fd| fd.unstructured())
+        .expect("with_root body")
+        .locals
+        .locals
+        .get(3)
+        .expect("guard dest local")
+        .ty
+        .clone()
+}
+
+fn registration_leaves(graph: &FunctionGraph) -> Vec<String> {
+    graph_call_leaves(graph)
+}
+
+/// `ll_call_destructor` keeps a Drop that removes and also writes a
+/// counter; the add-root constructor is not erased with it.
+#[test]
+fn add_root_drop_that_writes_a_counter_is_not_erased() {
+    use super::super::gc_root_registration::drop_glue_effect;
+    let llbc = registration_guard_llbc(true);
+    let cache = std::sync::Mutex::new(std::collections::HashMap::new());
+    let dest_ty = registration_guard_ty(&llbc);
+    assert_eq!(
+        drop_glue_effect(&dest_ty, &llbc, &cache),
+        None,
+        "a Drop that removes and writes a counter is not exactly Remove"
+    );
+    let graph = super::lower_function(&llbc, "with_root")
+        .expect("lower with_root when Drop writes a counter");
+    let leaves = registration_leaves(&graph);
+    assert!(
+        leaves.iter().any(|leaf| leaf == "register_root"),
+        "add-root constructor must remain: {leaves:?}"
+    );
+}
+
+/// Constructor Add plus Drop exactly Remove still erases the local
+/// registration, the `shadow_stack_erase` erased-Call shape.
+#[test]
+fn proven_add_and_remove_erases_local_registration() {
+    use super::super::gc_root_registration::{RootRegistration, drop_glue_effect};
+    let llbc = registration_guard_llbc(false);
+    let cache = std::sync::Mutex::new(std::collections::HashMap::new());
+    let dest_ty = registration_guard_ty(&llbc);
+    assert_eq!(
+        drop_glue_effect(&dest_ty, &llbc, &cache),
+        Some(RootRegistration::Remove),
+        "a Drop that only removes is exactly Remove"
+    );
+    let graph = super::lower_function(&llbc, "with_root")
+        .expect("lower with_root when Drop is exactly Remove");
+    let leaves = registration_leaves(&graph);
+    assert!(
+        leaves
+            .iter()
+            .all(|leaf| leaf != "register_root" && leaf != "try_gc_add_root"),
+        "proven Add/Remove must erase the constructor: {leaves:?}"
     );
 }
