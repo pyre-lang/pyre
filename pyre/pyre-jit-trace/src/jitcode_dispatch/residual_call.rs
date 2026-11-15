@@ -5454,6 +5454,43 @@ fn may_force_call_value(
     }
 }
 
+/// `dont_look_inside_cannot_raise` helpers whose descr stays
+/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
+/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
+/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
+/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
+/// `default_importlib_import_word` are the same kind of lookup: a miss is
+/// null, and neither calls `_handle_fromlist`.
+fn records_inside_transparent_helper(addr: i64) -> bool {
+    if addr <= 0 {
+        return false;
+    }
+    pyre_interpreter::jit_trace_fnaddrs()
+        .iter()
+        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
+}
+
+fn transparent_helper_recordable_leaf(path: &str) -> bool {
+    path.rsplit("::").next().is_some_and(|leaf| {
+        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+        matches!(
+            leaf,
+            "tuple_from_exact_list"
+                | "dict_get_plain"
+                | "exc_init_one_positional"
+                | "value_error_one_arg"
+                | "extend_from_frame_locals_proxy"
+                | "proxy_list_new"
+                | "proxy_list_append"
+                | "append_extra_locals"
+                | "append_extra_locals_items"
+                | "module_spec_get_initializing"
+                | "bootstrap_handle_fromlist"
+                | "default_importlib_import_word"
+        )
+    })
+}
+
 /// Conjuncts of the transparent-helper may-force gate other than
 /// `helper_may_force_resumes_in_frame`. True means the residual is declined
 /// unless that pre-check reports the post-call guards resume in the helper.
@@ -5552,11 +5589,16 @@ fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
     if w_code.is_null() {
         return Ok(None);
     }
+    // Nursery `W_Code`: pin before `const_ptr` intern (`history.py`
+    // `ConstPtr` / `id_or_identityhash`; `gctransform/shadowstack.py`
+    // `push_roots`).
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+    let w_code = pin.get() as *const ();
     let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
     let next_instr = unsafe { (*frame).next_instr() };
     let next_instr_box = ctx.trace_ctx.const_int(next_instr as i64);
     let profiled_box = ctx.trace_ctx.const_int(i64::from(is_being_profiled));
-    let pycode_box = OpRef::const_ptr(majit_ir::GcRef(w_code as usize));
+    let pycode_box = OpRef::const_ptr(majit_ir::GcRef(pin.get()));
     ctx.trace_ctx.set_opref_concrete(
         frame_box,
         majit_ir::Value::Ref(majit_ir::GcRef(frame as usize)),
@@ -8939,10 +8981,36 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
         'v' => {}
         _ => unreachable!("dst_bank validated by caller"),
     }
-    // `make_result_of_lastop` has populated dest; abort convert resumes
-    // at the already-advanced `MIFrame.pc` (`_get_opimpl_method`).
-    if ctx.frame_state.borrow().residual_call_next_pc.is_some() {
-        ctx.frame_state.borrow_mut().residual_dest_written = true;
+    note_residual_dest_populated(
+        ctx,
+        dst_bank == 'v' || dest_concrete_is_reconstructable(concrete_for_shadow),
+    );
+    Ok(())
+}
+
+/// `make_result_of_lastop` (`pyjitpl.py`) after `_get_opimpl_method`
+/// advanced `MIFrame.pc`. Abort convert (`blackhole.py`
+/// `_copy_data_from_miframe`) copies that pc only once dest is populated.
+///
+/// An inlined residual CALL writes dest through `write_ref_reg` rather
+/// than [`write_residual_call_result_to_dst`]. Without this stamp the
+/// next opcode's `clear_residual_pc_advanced` parks the CALL as
+/// unpopulated, and a later abort (`ForceQuasiImmutable` in a STORE_GLOBAL
+/// of `C()`'s result) rewinds to the CALL. The instance already occupies
+/// dest (often the callable colour), so the interpreter calls the instance.
+pub(crate) fn note_residual_dest_populated<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    dest_reconstructable: bool,
+) {
+    note_residual_dest_populated_in_state(&mut ctx.frame_state.borrow_mut(), dest_reconstructable);
+}
+
+pub(crate) fn note_residual_dest_populated_in_state(
+    state: &mut WalkFrameStateData,
+    dest_reconstructable: bool,
+) {
+    if state.residual_call_next_pc.is_some() {
+        state.residual_dest_written = true;
     }
     // `_copy_data_from_miframe` copies `getref_base()` / `getint()`, which
     // may be NULL: `jit_next` (`runtime_ops.rs`) returns `PY_NULL` for
@@ -8950,12 +9018,10 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     // the walker's unknown sentinel, not that executed NULL. Keep
     // `residual_call_pc` only then so the next opcode's missing-value
     // abort re-runs a CALL that did not produce a reconstructable dest.
-    if dst_bank == 'v' || dest_concrete_is_reconstructable(concrete_for_shadow) {
-        let mut state = ctx.frame_state.borrow_mut();
+    if dest_reconstructable {
         state.residual_call_pc = None;
         state.unpopulated_residual_call_pc = None;
     }
-    Ok(())
 }
 
 /// Whether dest holds a value `_copy_data_from_miframe` can copy.
@@ -10329,6 +10395,13 @@ fn try_perform_call<Sym: WalkSym>(
     if ctx.fbw_mode.transparent_helper_jitcode_index == Some(jitcode.index()) {
         // Already walking this jitcode. `perform_call` would push
         // another `MIFrame`; the walker is one walk with a reentry flag.
+        return Ok(None);
+    }
+    if jitcode.jitdriver_sd().is_some() {
+        // Portal jitcode. `pyjitpl.py` `newframe` increments
+        // `portal_call_depth`; this helper walk cannot host that frame.
+        // The EvalFn residual rebuilds greens/reds through
+        // `_opimpl_recursive_call`.
         return Ok(None);
     }
     let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
@@ -11766,13 +11839,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // An exact `range(...)` records `W_Range.descr_new` (`RANGE_NEW_*_DESCENT`)
     // with the raw bound boxes. The leaf applies `space.index` and the
     // zero-step `ValueError`. Not a spec-fold row — HelperDescent, the
-    // `newfloat` twin.
+    // `newfloat` twin. `HelperReturn::CallResult` like GET_ITER: a
+    // raising `__index__` is `finishframe_exception`, not a residualized
+    // CALL whose dest was never written.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && try_walker_orthodox_range_new(ctx, code, op, &r_args, dst)?.is_some()
+        && let Some(outcome) = try_walker_orthodox_range_new(ctx, code, op, &r_args, dst)?
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return Ok((outcome, op.next_pc));
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
@@ -14616,6 +14691,31 @@ mod tests {
             abort_latch_resume_pc_from_state(&state.borrow(), 1137),
             1137,
             "executed NULL dest must resume past the CALL"
+        );
+    }
+
+    /// An inlined residual CALL writes dest through `write_ref_reg`.
+    /// `make_result_of_lastop` (`pyjitpl.py`) still populated dest, so the
+    /// next opcode's abort must not rewind to the CALL
+    /// (`_get_opimpl_method` already advanced `MIFrame.pc`).
+    #[test]
+    fn abort_latch_does_not_rerun_inlined_residual_after_dest_write() {
+        let state = WalkFrameState::default();
+        state.borrow_mut().residual_call_next_pc = Some(326);
+        state.borrow_mut().residual_call_pc = Some(318);
+        note_residual_dest_populated_in_state(&mut state.borrow_mut(), true);
+        {
+            let mut data = state.borrow_mut();
+            if let Some(pc) = data.residual_call_pc.take() {
+                data.unpopulated_residual_call_pc = Some(pc);
+            }
+            data.residual_call_next_pc = None;
+            data.residual_dest_written = false;
+        }
+        assert_eq!(
+            abort_latch_resume_pc_from_state(&state.borrow(), 370),
+            370,
+            "inlined CALL dest populated; later opcode abort must not rewind"
         );
     }
 

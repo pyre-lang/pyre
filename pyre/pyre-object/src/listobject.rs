@@ -4020,28 +4020,6 @@ pub fn ll_list_bytes_set_len(l: &mut W_ListObject, n: usize) {
     l.bytes_items.set_len(n);
 }
 
-/// `_ll_list_resize_hint_really` `l.items = newitems` for Bytes storage.
-///
-/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
-/// jtransform can emit `setfield_gc_r(bytes_items.block)`. rustc otherwise
-/// inlines the store as `FieldWrite(block)` on the nested `BytesArray`.
-#[inline(never)]
-#[majit_macros::oopspec("list.bytes_set_items(l, items)")]
-pub fn ll_list_bytes_set_items(l: &mut W_ListObject, items: *mut ItemsBlock) {
-    l.bytes_items.block = items;
-}
-
-/// `rlist.py LIST.ll_items` for Bytes storage (`l.items`).
-///
-/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
-/// jtransform can emit `getfield_gc_r(bytes_items.block)`. rustc otherwise
-/// inlines the load as `FieldRead(block)` on a nested `BytesArray` copy.
-#[inline(never)]
-#[majit_macros::oopspec("list.bytes_items(l)")]
-pub fn ll_list_bytes_items(l: &W_ListObject) -> *mut ItemsBlock {
-    l.bytes_items.block
-}
-
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
 #[majit_macros::oopspec("list.ascii_len(l)")]

@@ -4132,6 +4132,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             return Ok(None);
         }
     }
+    // `foreign_callee_admits_call_assembler` compiles (`jitcode_for`).
+    // Re-read both wrappers (`payload.w_code` is walked;
+    // `gctransform/shadowstack.py` `push_roots`).
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
+    let caller_code = unsafe { (&(*sym.jitcode()).payload).w_code.get() as *const () };
     // The operand stack below the call's own operands (`r_args = [callable,
     // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
     // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
@@ -4740,7 +4745,7 @@ fn loop_callee_portal_call_preflight<Sym: WalkSym>(
     })
 }
 
-fn loop_callee_portal_call_can_record<Sym: WalkSym>(
+pub(crate) fn loop_callee_portal_call_can_record<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame: OpRef,
     w_code: *const (),
@@ -4811,7 +4816,7 @@ fn loop_bearing_header_call_assembler(
 ///
 /// `finishframe(..., leave_portal_frame=False)` already popped the callee.
 /// The op is recorded only once the assembler or residual call is in the trace.
-fn record_deferred_portal_leave(jd_no: Option<usize>) {
+pub(crate) fn record_deferred_portal_leave(jd_no: Option<usize>) {
     let Some(jd_no) = jd_no else {
         return;
     };
@@ -5515,6 +5520,13 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             && let Some((instance, instance_concrete)) = constructor_result
         {
             write_ref_reg(ctx, pc, dst, instance, instance_concrete)?;
+            // `W_TypeObject.descr_call` then `make_result_of_lastop`
+            // (`pyjitpl.py`): dest is `w_newobject`, parent pc already past
+            // the CALL.
+            residual_call::note_residual_dest_populated(
+                ctx,
+                residual_call::dest_concrete_is_reconstructable(instance_concrete),
+            );
         }
     }
 
@@ -5577,6 +5589,168 @@ fn live_pyframe_ptr(ptr: usize) -> Option<*mut pyre_interpreter::PyFrame> {
     Some(ptr as *mut pyre_interpreter::PyFrame)
 }
 
+pub(crate) fn opref_as_live_pyframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    arg: OpRef,
+) -> Option<*mut pyre_interpreter::PyFrame> {
+    opref_live_value(ctx, arg)
+        .and_then(value_as_ptr)
+        .and_then(live_pyframe_ptr)
+}
+
+fn consider_eval_frame(
+    arg: OpRef,
+    frame: *mut pyre_interpreter::PyFrame,
+    portal: Option<usize>,
+    best: &mut Option<(OpRef, *mut pyre_interpreter::PyFrame, bool)>,
+) {
+    if frame.is_null() || portal == Some(frame as usize) {
+        return;
+    }
+    if unsafe { (*frame).pycode }.is_null() {
+        return;
+    }
+    let fresh = unsafe { (*frame).last_instr } < 0;
+    match *best {
+        None => *best = Some((arg, frame, fresh)),
+        Some((_, _, was_fresh)) if fresh && !was_fresh => {
+            *best = Some((arg, frame, true));
+        }
+        Some(_) => {}
+    }
+}
+
+/// EvalFn / portal `inline_call` argument: a live `PyFrame` that is not
+/// the tracing portal virtualizable. Prefers a just-created frame
+/// (`last_instr < 0`).
+fn eval_frame_for_portal_inline<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    ref_args: &[OpRef],
+) -> Option<(OpRef, *mut pyre_interpreter::PyFrame)> {
+    let portal = ctx.trace_ctx.standard_virtualizable_ptr();
+    let mut best = None;
+    // Only the call's ref args. Scanning `registers_r` can pick a live
+    // PyFrame that is not this portal red (a sibling constructor, the
+    // tracing virtualizable's neighbour) and walk the wrong per-fn body.
+    for &arg in ref_args {
+        if let Some(frame) = opref_as_live_pyframe(ctx, arg) {
+            consider_eval_frame(arg, frame, portal, &mut best);
+        }
+    }
+    best.map(|(arg, frame, _)| (arg, frame))
+}
+
+/// Codewriter `inline_call` of a portal jitcode (`jitdriver_sd` set).
+/// `pyjitpl.py` `try_perform_call` declines that jitcode; the walker
+/// rebuilds greens/reds and enters `_opimpl_recursive_call` so the
+/// user per-fn body is the portal frame.
+fn try_dispatch_portal_inline_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    descr_index: usize,
+    sub_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    float_args: &[OpRef],
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index) else {
+        return Ok(None);
+    };
+    if jc.jitdriver_sd() != Some(crate::state::PyreJitState::PYPYJIT_JD_INDEX) {
+        return Ok(None);
+    }
+    if let Some((frame_box, frame)) = eval_frame_for_portal_inline(ctx, ref_args) {
+        let w_code = unsafe { (*frame).pycode };
+        if !w_code.is_null() {
+            // Nursery `W_Code`: pin before `const_ptr` intern
+            // (`gctransform/shadowstack.py` `push_roots`).
+            let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+            let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
+            let next_instr = unsafe { (*frame).next_instr() };
+            let next_instr_box = ctx.trace_ctx.const_int(next_instr as i64);
+            let profiled_box = ctx.trace_ctx.const_int(i64::from(is_being_profiled));
+            let pycode_box = OpRef::const_ptr(majit_ir::GcRef(pin.get()));
+            ctx.trace_ctx.set_opref_concrete(
+                frame_box,
+                majit_ir::Value::Ref(majit_ir::GcRef(frame as usize)),
+            );
+            let mut callee_ec = {
+                let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                if sym_ptr.is_null() {
+                    OpRef::NONE
+                } else {
+                    unsafe { (*sym_ptr).execution_context() }
+                }
+            };
+            if callee_ec.is_none() {
+                callee_ec = crate::helpers::emit_current_execution_context(
+                    ctx.trace_ctx,
+                    "ExecutionContext::PortalInlineCall",
+                );
+            }
+            if !matches!(
+                ctx.trace_ctx.concrete_of_opref(callee_ec),
+                Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+            ) {
+                super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+            }
+            let greens_i = [next_instr_box, profiled_box];
+            let greens_r = [pycode_box];
+            let greens_f: [OpRef; 0] = [];
+            let reds_i: [OpRef; 0] = [];
+            let reds_r = [frame_box, callee_ec];
+            let reds_f: [OpRef; 0] = [];
+            let rec_op = crate::jitcode_runtime::DecodedOp {
+                key: op.key,
+                opname: "recursive_call_r",
+                argcodes: "",
+                pc: op.pc,
+                next_pc: op.next_pc,
+            };
+            let (outcome, next_pc) = super::recursive_call_from_green_red_boxes(
+                ctx,
+                &rec_op,
+                crate::state::PyreJitState::PYPYJIT_JD_INDEX,
+                dst_bank,
+                dst,
+                &greens_i,
+                &greens_r,
+                &greens_f,
+                &reds_i,
+                &reds_r,
+                &reds_f,
+            )?;
+            return Ok(Some((outcome, next_pc)));
+        }
+    }
+    // Portal jitcode with no recoverable frame: residualize rather than
+    // Helper-walk `eval_loop_jit_portal`.
+    let residual = residualize_inline_call_via_fnaddr(
+        ctx,
+        code,
+        op.pc,
+        descr_index,
+        int_args,
+        ref_args,
+        float_args,
+    )?;
+    match residual.outcome {
+        DispatchOutcome::SubReturn { .. } => {
+            helper_blackhole_after_inline_finishframe(
+                ctx,
+                op.next_pc,
+                op.pc,
+                residual.finishframe,
+            )?;
+            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+        }
+        other => Ok(Some((other, op.next_pc))),
+    }
+}
+
 fn opref_live_value<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     arg: OpRef,
@@ -5623,9 +5797,7 @@ fn helper_portal_call_numbers_frames<Sym: WalkSym>(
     session
         .framestack
         .iter()
-        .rev()
-        .skip_while(|frame| frame.is_helper_level())
-        .filter(|frame| !frame.is_portal)
+        .filter(|frame| !frame.is_portal && !frame.is_helper_level())
         .all(|frame| !frame.parents.is_empty())
 }
 
@@ -5657,7 +5829,6 @@ pub(crate) fn portal_parent_from_helper_outer<Sym: WalkSym>(
         InlineParentFrame {
             jitcode_index,
             call_jitcode_pc: Some(call_jit_pc),
-            call_pc: Some(call_jit_pc),
             resume_pc: Some(marker),
             call_stack_overrides: Vec::new(),
             blackhole: None,
@@ -5673,6 +5844,81 @@ pub(crate) fn portal_parent_from_helper_outer<Sym: WalkSym>(
         }
         .with_caller_py_pc(jitcode_index, call_jit_pc),
     )
+}
+
+/// `do_recursive_call(..., assembler_call=True)` for a helper-yielded portal
+/// Python frame that reached its own loop header (`opimpl_jit_merge_point`).
+fn finish_portal_perform_call_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    blackhole_result: Option<(usize, char, usize)>,
+    frame_box: OpRef,
+    callee_ec: OpRef,
+    w_code: *const (),
+    is_being_profiled: bool,
+    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    target_pc: usize,
+    portal_jd: Option<usize>,
+) -> Result<Option<ResidualExecOutcome>, DispatchError> {
+    if w_code.is_null() || !loop_callee_portal_call_can_record(ctx, frame_box, w_code, target_pc) {
+        record_deferred_portal_leave(portal_jd);
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    if !matches!(
+        ctx.trace_ctx.concrete_of_opref(callee_ec),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+    }
+    // `get_assembler_token` (`warmstate.py`) hashes the Ref green
+    // (`get_uhash` → `id_or_identityhash`) and can collect. Pin the
+    // nursery `W_Code` and adopt the slot (`GreenRefPin::adopt`).
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+    let token = match token {
+        Some(token) => Some(token),
+        None => super::portal_assembler_token(pin.save(), target_pc, is_being_profiled),
+    };
+    let w_code = pin.get() as *const ();
+    let dst = blackhole_result.map(|(_, bank, color)| (bank, color));
+    let resume_pc = blackhole_result.map(|(next_pc, _, _)| next_pc);
+    match record_walker_loop_callee_portal_call(
+        ctx,
+        op_pc,
+        dst,
+        resume_pc,
+        frame_box,
+        callee_ec,
+        token,
+        target_pc,
+        w_code,
+        is_being_profiled,
+        false,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(Some(recorded)) => {
+            record_deferred_portal_leave(portal_jd);
+            if let Some((exc, exc_concrete)) = recorded.raised {
+                ctx.set_last_exc_value(exc, exc_concrete);
+                return Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                    result: Err(concrete_value_word(exc_concrete)),
+                }));
+            }
+            Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                result: Ok(residual_result_word(ctx, recorded.result)),
+            }))
+        }
+        Ok(None) => {
+            record_deferred_portal_leave(portal_jd);
+            Err(DispatchError::callee_inline_unsupported(op_pc))
+        }
+        Err(error) => {
+            record_deferred_portal_leave(portal_jd);
+            Err(error)
+        }
+    }
 }
 
 fn try_portal_call_assembler_from_helper<Sym: WalkSym>(
@@ -5706,6 +5952,7 @@ fn try_portal_call_assembler_from_helper<Sym: WalkSym>(
         w_code,
         is_being_profiled,
         false,
+        None,
         None,
         None,
         None,
@@ -5759,6 +6006,7 @@ fn portal_perform_call_from_subwalk_result<Sym: WalkSym>(
     op_pc: usize,
     blackhole_result: Option<(usize, char, usize)>,
     done: Result<DispatchOutcome, DispatchError>,
+    allboxes: &[OpRef],
 ) -> Result<Option<ResidualExecOutcome>, DispatchError> {
     let outcome = match done {
         Ok(outcome) => outcome,
@@ -5782,8 +6030,34 @@ fn portal_perform_call_from_subwalk_result<Sym: WalkSym>(
                 result: Err(concrete_value_word(exc_concrete)),
             }))
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. }
-        | DispatchOutcome::Continue
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            let Some((frame_box, frame)) = existing_eval_frame_arg(ctx, allboxes) else {
+                return Err(DispatchError::callee_inline_unsupported(op_pc));
+            };
+            let w_code = unsafe { (*frame).pycode };
+            let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
+            let sym_ptr = ctx.fbw_mode.snapshot_sym;
+            if sym_ptr.is_null() {
+                return Err(DispatchError::callee_inline_unsupported(op_pc));
+            }
+            let callee_ec = unsafe { (*sym_ptr).execution_context() };
+            if callee_ec.is_none() {
+                return Err(DispatchError::callee_inline_unsupported(op_pc));
+            }
+            finish_portal_perform_call_assembler(
+                ctx,
+                op_pc,
+                blackhole_result,
+                frame_box,
+                callee_ec,
+                w_code,
+                is_being_profiled,
+                token,
+                target_pc,
+                None,
+            )
+        }
+        DispatchOutcome::Continue
         | DispatchOutcome::Terminate { .. }
         | DispatchOutcome::SwitchToBlackhole { .. }
         | DispatchOutcome::CloseLoop { .. }
@@ -5801,7 +6075,13 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
     blackhole_result: Option<(usize, char, usize)>,
 ) -> Result<Option<ResidualExecOutcome>, DispatchError> {
     if let Some(done) = take_completed_nested_subwalk(ctx, op_pc) {
-        return portal_perform_call_from_subwalk_result(ctx, op_pc, blackhole_result, done);
+        return portal_perform_call_from_subwalk_result(
+            ctx,
+            op_pc,
+            blackhole_result,
+            done,
+            allboxes,
+        );
     }
     let Some((frame_box, frame)) = existing_eval_frame_arg(ctx, allboxes) else {
         return Ok(None);
@@ -5813,8 +6093,17 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
     let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
     let w_globals = unsafe { (*frame).get_w_globals() };
     let next_instr = unsafe { (*frame).next_instr() };
-    let green_key = crate::driver::make_green_key_typed(w_code, next_instr, is_being_profiled);
-    let callee_code_key = w_code as usize;
+    // Nursery-born `W_Code`: pin before `can_inline_callable` (`warmstate.py`).
+    // That lookup hashes the Ref green (`get_uhash` → `id_or_identityhash`)
+    // and can collect (`gctransform/shadowstack.py`).
+    let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+    let mut green_key = crate::driver::make_green_key_typed(
+        pin.live() as usize as *const (),
+        next_instr,
+        is_being_profiled,
+    );
+    pin.reload(&mut green_key);
+    let callee_code_key = pin.get();
     // Helpers on the framestack are not Python callees (`last_inline` would
     // name one). Recursion is Python-level (`last_python_inline` /
     // `python_inline_depth`).
@@ -5829,52 +6118,50 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let can_inline = crate::driver::try_driver_pair()
         .map(|(driver, _)| {
+            pin.reload(&mut green_key);
             driver
                 .meta_interp_mut()
                 .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .can_inline_callable_for_key(&green_key)
+                .can_inline_callable_for_key(&pin, &green_key)
         })
         .unwrap_or(true);
+    let callee_code_key = pin.get();
     if python_depth >= max_unroll
         || (same_python_callee
             && fbw_inline_recursion_count(ctx, callee_code_key, is_being_profiled) >= max_unroll)
     {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            pin.reload(&mut green_key);
             driver
                 .meta_interp_mut()
                 .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .disable_noninlinable_function_for_key(&green_key);
+                .disable_noninlinable_function_for_key(&pin, &mut green_key);
         }
     }
+    let callee_code_key = pin.get();
     let not_inlinable = !can_inline
         || python_depth >= max_unroll
         || fbw_inline_recursion_count(ctx, callee_code_key, is_being_profiled) >= max_unroll
         || super::ec_hook_installed();
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+    // Each of these compiles (`jitcode_for` / `call.py` `get_jitcode`) and
+    // can collect. Re-read the nursery wrapper from the pin
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let Some(body) = crate::state::sub_jitcode_body_for_code(pin.get() as *const ()) else {
         return Ok(None);
     };
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(pin.get() as *const ()) else {
         return Ok(None);
     };
     if body_facts.has_abort_permanent {
         return Ok(None);
     }
-    // Converted helpers resume a portal CALL through
-    // `helper_outer_call_parent` (`publish_helper_outer_call_image`).
-    // `prepare_walker_inline_index` already refuses a writing `__index__`
-    // (`index_sample_safe`: `STORE_ATTR` is not a sample-safe residual)
-    // because CALL-entry would run the store twice. This path used to
-    // walk the body anyway; `store_attr_direct` commits inside the
-    // resolver, so the refuse has to happen here, before the walk.
-    if !body_facts.index_sample_safe && ctx.session.borrow().helper_outer_call_parent.is_some() {
-        return Ok(None);
-    }
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
-        crate::state::sub_jitcode_descr_pool_for_code(w_code)
+        crate::state::sub_jitcode_descr_pool_for_code(pin.get() as *const ())
     else {
         return Ok(None);
     };
-    let Some(callee_jitcode_index) = crate::state::ensure_jitcode_index(w_code) else {
+    let Some(callee_jitcode_index) = crate::state::ensure_jitcode_index(pin.get() as *const ())
+    else {
         return Ok(None);
     };
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index);
@@ -5895,13 +6182,6 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
     if callee_ec.is_none() {
         return Ok(None);
     }
-    let paused_helper = match super::resume_snapshot::compute_paused_helper_caller_frame(ctx, op_pc)
-    {
-        Ok(parent) => parent,
-        Err(_) => {
-            return Ok(None);
-        }
-    };
     if !matches!(
         ctx.trace_ctx.concrete_of_opref(callee_ec),
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
@@ -5915,13 +6195,13 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
             blackhole_result,
             frame_box,
             callee_ec,
-            w_code,
+            pin.get() as *const (),
             is_being_profiled,
         );
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.pin_roots(&[w_code as pyre_object::PyObjectRef, w_globals]);
+    let root_base = _roots.pin_roots(&[pin.get() as pyre_object::PyObjectRef, w_globals]);
     let live_w_code = pyre_object::gc_roots::shadow_stack_get(root_base) as *const ();
     let live_w_globals = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let code_ptr =
@@ -5967,36 +6247,21 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
     callee_state.borrow_mut().concrete_registers_r[ec_reg as usize] =
         ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef);
 
-    let mut parent_frame = paused_helper;
-    super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
-    // `capture_resumedata` numbers every `MIFrame` outermost-first
-    // (`ResumeDataLoopMemo.number`). Flatten paused levels already on
-    // `framestack`, then the CALL image captured at helper entry when no
-    // Python section is among them (converted portal-root helpers do not
-    // push `HelperLevel`s, so flatten would otherwise number only the
-    // paused helper as the vable portal frame).
-    let mut parents: Vec<InlineParentFrame> = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect()
-    };
-    let has_python_section = parents
-        .iter()
-        .any(|frame| super::resume_snapshot::jitcode_index_names_python_code(frame.jitcode_index));
-    if !has_python_section {
-        if let Some(portal) = portal_parent_from_helper_outer(ctx) {
-            parents.insert(0, portal);
-        }
+    // `try_walker_inline_user_call` stores the immediate caller only
+    // (`pyjitpl.py` `perform_call` / `newframe`; `resume.py`
+    // `capture_resumedata` one section per jitcode header). Flattening
+    // `framestack[].parents` at enter omits this callee as a section of
+    // the next recursive same-`PyCode` frame. A helper EvalFn CALL that
+    // cannot pause the helper would bind `_setup_return_value_*` to the
+    // outer residual dest (`BINARY_SLICE`); decline to the residual
+    // EvalFn instead.
+    let parents = recursive_portal_inline_parents(ctx, op_pc);
+    if parents.is_empty()
+        && (ctx.fbw_mode.transparent_helper_subwalk
+            || ctx.fbw_mode.transparent_helper_jitcode_index.is_some())
+    {
+        return Ok(None);
     }
-    // Converted portal-root helpers stay off `framestack`. Nested CallResult
-    // helpers pause them on the explicit driver; splice those sections so
-    // blackhole continues the Converted body after this portal returns
-    // (`_setup_return_value_*` / `rebuild_from_resumedata`).
-    insert_paused_driver_helper_parents(ctx, &mut parents);
-    parents.push(parent_frame);
     let inline_consts = InlineCalleeConsts {
         jitcode_index: callee_jitcode_index,
     };
@@ -6038,7 +6303,13 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
                 session: ctx.session,
             },
             _inline_frame: Some(inline_frame),
-            _inline_concrete_frame: Some(InlineConcreteFrameGuard::enter(frame)),
+            _inline_concrete: Some(InlineConcreteFrameGuard::enter(frame)),
+            iter_checkpoint_at_call: None,
+            send_ex_caller: None,
+            pending_generator_bind: None,
+            // `portal_leave` below closes this frame at its pop.
+            portal_jd_no: None,
+            pending_raise: None,
             _open_activation: None,
             portal_leave: Some(PortalPerformLeave {
                 frame_box,
@@ -6052,7 +6323,9 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
             caller_exc_before: ctx.last_exc_value(),
             pc: 0,
             body: body.clone(),
-            seed_from_active_resume: true,
+            // `perform_call` / `MIFrame.setup_call` is a fresh valuestack.
+            // Seeding from `ActiveResumeFrame` of the same `PyCode` overlays
+            // the outer frame's stack on the inner one (`fmt` calling `fmt`).
             registers_r: callee_regs_r,
             registers_i,
             registers_f,
@@ -6079,11 +6352,6 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
             outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             pending_subreturn: None,
@@ -6145,7 +6413,7 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
         (majit_metainterp::JitArgKind::Ref, frame_box, frame_bits),
         (majit_metainterp::JitArgKind::Ref, callee_ec, ec_bits),
     ];
-    let (callee_outcome, class_of_last_exc_is_const) = {
+    let (callee_outcome, class_of_last_exc_is_const, deferred_portal_leave) = {
         let registers_i = RegisterBank::with_constants(callee_regs_i, body.num_regs_i);
         let registers_f = RegisterBank::with_constants(callee_regs_f, body.num_regs_f);
         let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
@@ -6171,11 +6439,6 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
@@ -6225,11 +6488,34 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
             }
             return Err(error);
         }
-        if subwalk_jd.is_some() {
-            crate::state::note_inline_subwalk_end();
-        }
+        // `opimpl_jit_merge_point` (`portal_call_depth != 0`):
+        // `finishframe(None, leave_portal_frame=False)` pops the
+        // inlined portal without `LEAVE_PORTAL_FRAME`. `do_recursive_call`
+        // is recorded next, and `leave_portal_frame` follows that call.
+        let deferred_portal_leave = if let Some(jd_no) = subwalk_jd {
+            if matches!(
+                result,
+                Ok((DispatchOutcome::SubLoopCalleeCallAssembler { .. }, _))
+            ) {
+                if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                    let meta = driver.meta_interp_mut();
+                    assert!(
+                        meta.framestack.frames.len() >= 2,
+                        "opimpl_jit_merge_point: recursive portal call needs a caller frame"
+                    );
+                    let _ = meta.finishframe(None, false);
+                }
+                sub_wc.clear_last_exc_value();
+                Some(jd_no)
+            } else {
+                crate::state::note_inline_subwalk_end();
+                None
+            }
+        } else {
+            None
+        };
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
-        (result, class_of_last_exc_is_const)
+        (result, class_of_last_exc_is_const, deferred_portal_leave)
     };
     if let Some(open_activation) = entered_ec {
         let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
@@ -6280,8 +6566,21 @@ pub(crate) fn perform_portal_call_from_helper<'frame, 'a: 'frame, Sym: WalkSym>(
                 result: Err(concrete_value_word(exc_concrete)),
             }))
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. }
-        | DispatchOutcome::Continue
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            finish_portal_perform_call_assembler(
+                ctx,
+                op_pc,
+                blackhole_result,
+                frame_box,
+                callee_ec,
+                live_w_code,
+                is_being_profiled,
+                token,
+                target_pc,
+                deferred_portal_leave,
+            )
+        }
+        DispatchOutcome::Continue
         | DispatchOutcome::Terminate { .. }
         | DispatchOutcome::SwitchToBlackhole { .. }
         | DispatchOutcome::CloseLoop { .. }
@@ -7351,12 +7650,20 @@ impl SubWalkRewind {
     }
 }
 
-fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
-    let body = crate::state::sub_jitcode_body_for_code(code)?;
-    let (descr_refs, _, _) = crate::state::sub_jitcode_descr_pool_for_code(code)?;
+pub(crate) fn sub_jitcode_body_facts_for_code(
+    code: *const (),
+) -> Option<crate::pyjitcode::InlineBodyFacts> {
+    if code.is_null() {
+        return None;
+    }
+    // Nursery `PyCode`: each helper below can compile (`jitcode_for`).
+    // Pin and re-read (`gctransform/shadowstack.py` `push_roots`).
+    let pin = majit_metainterp::GreenRefPin::pin_one(code as usize);
+    let body = crate::state::sub_jitcode_body_for_code(pin.get() as *const ())?;
+    let (descr_refs, _, _) = crate::state::sub_jitcode_descr_pool_for_code(pin.get() as *const ())?;
     // Resolved after the two lookups above so that a code object without an
     // installed body never caches a verdict computed from an absent one.
-    let pjc = crate::state::pyjitcode_for_code(code)?;
+    let pjc = crate::state::pyjitcode_for_code(pin.get() as *const ())?;
     Some(*pjc.inline_body_facts.get_or_init(|| {
         crate::pyjitcode::InlineBodyFacts {
             contains_raise: callee_body_contains_raise(body.code, descr_refs),
@@ -7386,7 +7693,7 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
             ),
             owns_loop_header: callee_body_owns_loop_header(body.code, descr_refs),
             has_exception_table: unsafe {
-                let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef);
+                let raw = pyre_interpreter::w_code_get_ptr(pin.get() as pyre_object::PyObjectRef);
                 !raw.is_null() && !(&(*raw).exceptiontable).is_empty()
             },
         }
@@ -11225,7 +11532,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         return resolved_inline_decline(op.pc, line!());
     }
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+    let Some(body) = crate::state::sub_jitcode_body_for_code(
+        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+    ) else {
         return resolved_inline_decline(op.pc, line!());
     };
     if nparams > body.num_regs_r {
@@ -11255,7 +11564,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // re-scanned here on every call site that reaches this recipe.  `None`
     // means no installed body or descr pool, which the pool fetch immediately
     // below declines on regardless.
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(
+        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+    ) else {
         return resolved_inline_decline(op.pc, line!());
     };
     if body_facts.has_abort_permanent {
@@ -11282,7 +11593,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // wrong descr at the first `getfield_vable_r` / `residual_call`
     // (`VableArrayDescrMalformed` / `ResidualCallDescrNotCallDescr`).
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
-        crate::state::sub_jitcode_descr_pool_for_code(w_code)
+        crate::state::sub_jitcode_descr_pool_for_code(pyre_object::gc_roots::shadow_stack_get(
+            inline_code_slot,
+        ) as *const ())
     else {
         return resolved_inline_decline(op.pc, line!());
     };
@@ -11332,10 +11645,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // this frame reg (see the `*_vable_via_metainterp` short-circuits).
     // `u16::MAX` for a non-portal callee keeps the strict predicate
     // byte-identical (`inline_resolvable_seeded_frame_op` declines).
-    let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
-        .filter(|&jc| crate::state::built_as_portal_at(jc))
-        .map(|jc| crate::state::portal_red_regs_at(jc).0)
-        .unwrap_or(u16::MAX);
+    let callee_portal_frame_reg = crate::state::ensure_jitcode_index(
+        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+    )
+    .filter(|&jc| crate::state::built_as_portal_at(jc))
+    .map(|jc| crate::state::portal_red_regs_at(jc).0)
+    .unwrap_or(u16::MAX);
+    w_code = pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const ();
     let fresh_debugdata = fresh_frame_debugdata_for_callee(w_code, live_callable());
     let dispatch_switch_pc =
         crate::state::pyjitcode_for_code(w_code).and_then(|pjc| pjc.metadata.dispatch_switch_pc);
@@ -11495,6 +11811,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A canonical-helper subwalk's `op.pc` is a byte offset in the helper
     // jitcode. The paused caller is the Python CALL that entered the
     // outermost helper, kept on `entry_py_pc`.
+    //
+    // A helper on top has `w_code == 0`; `compute_inline_caller_frame`
+    // would `ensure_jitcode_index` the codeless slot
+    // (`Unavail::Nested/NoJitcodeIndex`). Pause the helper at this CALL
+    // (`pyjitpl.py` `MIFrame.perform_call` / `newframe`; `opencoder.py`
+    // `capture_resumedata`; `blackhole.py` `_setup_return_value_*`), the
+    // same parent list a helper-reached EvalFn uses
+    // (`recursive_portal_inline_parents`).
+    let in_helper = ctx.fbw_mode.transparent_helper_subwalk
+        || ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+        || ctx.session.borrow().helper_chain() == super::HelperChain::Numbered;
+    let mut helper_inline_parents = if in_helper {
+        let parents = recursive_portal_inline_parents(ctx, op.pc);
+        if parents.is_empty() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        Some(parents)
+    } else {
+        None
+    };
+    // Helper-reached `funccall` is this CALL's callee (`perform_call`).
+    // `call_trace` is a prologue inside `execute_frame`, not that callee.
+    let _parked_helper_call_driver = in_helper.then(ParkedSubwalkDriver::park);
     let caller_frame_pc =
         if ctx.fbw_mode.inline_subwalk && ctx.session.borrow().last_inline().is_none() {
             match ctx.entry_py_pc {
@@ -11504,11 +11843,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         } else {
             op.pc
         };
-    let precomputed_parent_frame = match compute_inline_caller_frame(ctx, caller_frame_pc) {
-        Ok(parent) => parent,
-        Err(InlineCallerFrameDecline::Unavailable) => {
-            return resolved_inline_decline(op.pc, line!());
-        }
+    let precomputed_parent_frame = match helper_inline_parents.as_ref() {
+        Some(parents) => parents[parents.len() - 1].clone(),
+        None => match compute_inline_caller_frame(ctx, caller_frame_pc) {
+            Ok(parent) => parent,
+            Err(InlineCallerFrameDecline::Unavailable) => {
+                return resolved_inline_decline(op.pc, line!());
+            }
+        },
     };
     // Every reason `latch_operator_tail_return` can refuse (mirror, paused
     // parents, this caller, the tail parent, blackhole preflight) is known
@@ -12634,12 +12976,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         }
 
-        // Copy before each call: a `borrow()` temporary lives until the end of
-        // the statement, and later `FrameBox::new` collects.
-        let inline_w_code = callee_state.borrow().inline_w_code;
-        let inline_w_globals = callee_state.borrow().inline_w_globals;
-        let pycode_const = ctx.trace_ctx.const_ref(inline_w_code as i64);
-        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_w_globals as i64);
+        // `const_ref` intern hashes the referent (`history.py` `ConstPtr` /
+        // `id_or_identityhash`) and can collect. Re-read each word from the
+        // extra-area slot that already holds it (`gctransform/shadowstack.py`
+        // `push_roots`), not a copy taken before the first intern.
+        let pycode_const = ctx
+            .trace_ctx
+            .const_ref(pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as i64);
+        let w_globals_obj_const = ctx
+            .trace_ctx
+            .const_ref(pyre_object::gc_roots::shadow_stack_get(inline_globals_slot) as i64);
         let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
         // `finish_for_call_with_globals_obj` fills the cell band in two
         // halves: one fresh `w_cell_new(PY_NULL, family)` per pure cellvar,
@@ -13062,6 +13408,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Those recordings can minor-collect. Re-read the rooted holders
     // before the copy is published on the session.
     super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
+    if let Some(ref mut helper_parents) = helper_inline_parents {
+        for parent in helper_parents.iter_mut() {
+            super::resume_snapshot::refresh_paused_parent_concretes(ctx, parent);
+        }
+    }
     // The callee frame that owns the FOR_ITER items its own loops consume.
     let caller_inflight_owner = InflightForiterOwner::current(ctx.session);
     let callee_inflight_owner;
@@ -13149,7 +13500,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `MIFrame` between them.  Recording it on this level is what puts it
         // at its own depth for every guard below, including one inside a
         // callee `__init__` itself inlines.
-        let mut parents: Vec<InlineParentFrame> = vec![parent_frame];
+        let mut parents: Vec<InlineParentFrame> =
+            if let Some(mut helper_parents) = helper_inline_parents {
+                if let Some(last) = helper_parents.last_mut() {
+                    *last = parent_frame;
+                }
+                helper_parents
+            } else {
+                vec![parent_frame]
+            };
         if let Some((instance, _)) = constructor_result
             && callee_frame_materialized_has_resume
         {
@@ -14477,10 +14836,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     'v' => {}
                     _ => return Ok(None),
                 }
+                // `finishframe` / `make_result_of_lastop` (`pyjitpl.py`):
+                // parent pc is already past the call. Stamp dest so a later
+                // opcode abort does not rewind to this CALL
+                // (`note_residual_dest_populated`).
+                residual_call::note_residual_dest_populated(
+                    ctx,
+                    dst_bank == 'v'
+                        || residual_call::dest_concrete_is_reconstructable(concrete_for_shadow),
+                );
                 Ok(Some((DispatchOutcome::Continue, op.next_pc)))
             }
             None => {
                 if dst_bank == 'v' {
+                    residual_call::note_residual_dest_populated(ctx, true);
                     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
                 } else {
                     Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
@@ -14525,34 +14894,55 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 *ptr = pin.get().0 as pyre_object::PyObjectRef;
             }
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                // The handler this routes to is part of the trace, so once the
-                // trace runs compiled it catches the exception itself and this
-                // frame never surfaces an error the interpreter's
-                // `handle_exception` could record a node from.  Emit the node
-                // at runtime as well as applying it for the recording pass.
-                let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
-                let emit_runtime = node.is_none();
-                record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
-                record_inline_application_traceback(
-                    ctx,
-                    exc,
-                    &mut exc_concrete,
-                    op.pc,
-                    true,
-                    emit_runtime,
-                    node,
-                );
-                record_top_level_application_traceback(
-                    ctx,
-                    exc,
-                    &mut exc_concrete,
-                    op.pc,
-                    true,
-                    emit_runtime,
-                    node,
-                );
-                ctx.set_last_exc_value(exc, exc_concrete);
-                Ok(Some((DispatchOutcome::Continue, target)))
+                // Helper-reached `perform_call` (`pyjitpl.py` `MIFrame.perform_call`):
+                // the raise leaves the callee as `SubRaise` so the helper
+                // walk's `finishframe_exception` (`MetaInterp.finishframe_exception`)
+                // finds `catch_exception` once, drains `BH_LAST_EXC_VALUE`, and
+                // runs `helper_blackhole_after_run_one_step`. Catching here
+                // Continues into the helper handler without that hand-off;
+                // `space.index` then sees a non-int dest and TypeErrors.
+                if !entry_is_call_boundary && in_helper {
+                    if fbw_inline_diag_enabled() {
+                        eprintln!(
+                            "[helper-funccall-subraise] pc={} catch_target={} surface=subraise",
+                            op.pc, target
+                        );
+                    }
+                    ctx.set_last_exc_value(exc, exc_concrete);
+                    Ok(Some((
+                        DispatchOutcome::SubRaise { exc, exc_concrete },
+                        op.next_pc,
+                    )))
+                } else {
+                    // The handler this routes to is part of the trace, so once the
+                    // trace runs compiled it catches the exception itself and this
+                    // frame never surfaces an error the interpreter's
+                    // `handle_exception` could record a node from.  Emit the node
+                    // at runtime as well as applying it for the recording pass.
+                    let node = record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
+                    let emit_runtime = node.is_none();
+                    record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
+                    record_inline_application_traceback(
+                        ctx,
+                        exc,
+                        &mut exc_concrete,
+                        op.pc,
+                        true,
+                        emit_runtime,
+                        node,
+                    );
+                    record_top_level_application_traceback(
+                        ctx,
+                        exc,
+                        &mut exc_concrete,
+                        op.pc,
+                        true,
+                        emit_runtime,
+                        node,
+                    );
+                    ctx.set_last_exc_value(exc, exc_concrete);
+                    Ok(Some((DispatchOutcome::Continue, target)))
+                }
             } else {
                 Ok(Some((
                     DispatchOutcome::SubRaise { exc, exc_concrete },
@@ -15092,6 +15482,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
             instance,
             ConcreteValue::Ref(concrete_instance),
         )?;
+        residual_call::note_residual_dest_populated(ctx, true);
         return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
     };
 
@@ -18837,7 +19228,10 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     if !generator_table_is_only_the_stopiteration_wrapper(code) {
         decline!(V::RealExceptionTable)
     }
-    let w_pycode = shape.w_pycode as *const ();
+    // Nursery `PyCode`: pin before `jitcode_for` compiles
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let code_pin = majit_metainterp::GreenRefPin::pin_one(shape.w_pycode as usize);
+    let w_pycode = code_pin.get() as *const ();
     // `sub_jitcode_body_for_code` first: it is the one that BUILDS the per-fn
     // jitcode on demand (`jitcode_for`).  Asking `pyjitcode_for_code` ahead of
     // it reads the store before anything has installed a payload for a code
@@ -18846,7 +19240,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_pycode) else {
         decline!(V::NoJitcode)
     };
-    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
+    let Some(pjc) = crate::state::pyjitcode_for_code(code_pin.get() as *const ()) else {
         decline!(V::NoJitcode)
     };
     census.owns_loop_header = !pjc.metadata.loop_header_by_green.is_empty();
@@ -20661,7 +21055,10 @@ fn walk_generator_resume<Sym: WalkSym>(
         gen_resume_decline("cannot_capture_resumedata");
         return Ok(None);
     }
-    let w_pycode = shape.w_pycode as *const ();
+    // Nursery `PyCode`: pin before `jitcode_for` compiles
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let code_pin = majit_metainterp::GreenRefPin::pin_one(shape.w_pycode as usize);
+    let w_pycode = code_pin.get() as *const ();
     // Same on-demand install as a user-call inline: the body is the thing
     // we are about to walk.  Census-only must not take this path; the walk
     // itself is the reason to install.
@@ -20669,7 +21066,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         gen_resume_decline("no_jitcode");
         return Ok(None);
     };
-    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
+    let Some(pjc) = crate::state::pyjitcode_for_code(code_pin.get() as *const ()) else {
         gen_resume_decline("no_pjc");
         return Ok(None);
     };
@@ -20717,7 +21114,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     }
     let w_pycode = pin.get() as *const ();
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
-        crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
+        crate::state::sub_jitcode_descr_pool_for_code(code_pin.get() as *const ())
     else {
         gen_resume_decline("no_descr_pool");
         return Ok(None);
@@ -20735,7 +21132,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     let frame_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(shape.frame as pyre_object::PyObjectRef);
     let code_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(shape.w_pycode);
+    let _ = pyre_object::gc_roots::pin_root(code_pin.get() as pyre_object::PyObjectRef);
     let Some(send_ex_tail) = send_ex_continuation_parent_frame(iter_op) else {
         gen_resume_decline("no_send_ex_continuation");
         return Ok(None);
@@ -21104,6 +21501,8 @@ fn walk_generator_resume<Sym: WalkSym>(
                 &extra_ref_seeds,
                 pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
                 SubwalkFrameKind::PythonPortal(portal_site),
+                None,
+                None,
             );
             // `opimpl_jit_merge_point` (`portal_call_depth != 0`):
             // `finishframe(None, leave_portal_frame=False)` pops the
@@ -23610,6 +24009,31 @@ pub(crate) fn set_subwalk_driver(pointer: *mut ()) {
     SUBWALK_DRIVER.with(|slot| slot.set(pointer));
 }
 
+/// Park the helper `SubWalkDriver` for a nested in-process walk.
+///
+/// `pyframe.py execute_frame` runs `call_trace` (`_opimpl_inline_call1`)
+/// inside that frame, not as the callee of the Function `funccall` CALL
+/// (`pyjitpl.py` `MIFrame.perform_call`). pyre has no `execute_frame`
+/// JitCode, so `walker_walk_call_trace` walks the prologue at that CALL.
+/// With a driver already installed for the helper that owns the CALL,
+/// `run_sub_jitcode_walk_from` would suspend `call_trace` as that CALL's
+/// child; its `void_return/` then becomes `UnexpectedVoidSubReturn` for
+/// the Function result. Park the driver so the prologue and the Python
+/// body complete in-process (`perform_call` / `newframe`).
+struct ParkedSubwalkDriver(*mut ());
+
+impl ParkedSubwalkDriver {
+    fn park() -> Self {
+        Self(take_subwalk_driver())
+    }
+}
+
+impl Drop for ParkedSubwalkDriver {
+    fn drop(&mut self) {
+        set_subwalk_driver(self.0);
+    }
+}
+
 static SUBWALK_DIRECT_RESUME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUBWALK_CALL_REPLAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUBWALK_HEAP_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -23740,7 +24164,6 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// Concrete `PyFrame` of a nested Python-portal child, published with
     /// `_inline_frame`. Helpers have none.
     _inline_concrete: Option<InlineConcreteFrameGuard>,
-    _inline_concrete_frame: Option<InlineConcreteFrameGuard>,
     _open_activation: Option<OpenInlineActivation<'a>>,
     portal_leave: Option<PortalPerformLeave>,
     id: usize,
@@ -23987,7 +24410,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                     Ok(outcome)
                         if matches!(
                             outcome,
-                            DispatchOutcome::SubReturn { .. } | DispatchOutcome::SubRaise { .. }
+                            DispatchOutcome::SubReturn { .. }
+                                | DispatchOutcome::SubRaise { .. }
+                                | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
                         ) =>
                     {
                         Ok((outcome, pc))
@@ -24029,7 +24454,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 }
             }
             self._open_activation = None;
-            self._inline_concrete_frame = None;
+            self._inline_concrete = None;
         }
         result
     }
@@ -25408,6 +25833,31 @@ pub(crate) fn insert_paused_driver_helper_parents<Sym: WalkSym>(
     }
 }
 
+/// Journal mark of the outermost paused helper on the explicit driver.
+/// Nested `compute_range_length` stamps a later mark; the `range(...)`
+/// CALL's helper is this first ancestor (`capture_resumedata`).
+pub(crate) fn outermost_paused_driver_helper_journal_mark<Sym: WalkSym>(
+    _ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<FbwEffectJournalMark> {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: same exchange as `collect_paused_driver_helper_parents`.
+        let exchange = unsafe { &*(pointer as *const SubWalkExchange<'_, Sym>) };
+        if exchange.ancestor_len == 0 {
+            return None;
+        }
+        let ancestors =
+            unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
+        ancestors
+            .iter()
+            .find(|frame| frame.fbw_mode.transparent_helper_subwalk)
+            .and_then(|frame| frame.fbw_mode.transparent_helper_journal_at_entry)
+    })
+}
+
 fn collect_paused_driver_helper_parents<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Vec<InlineParentFrame> {
@@ -25746,38 +26196,6 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
     splice_helper_frames_before_innermost(helpers)
 }
 
-/// Whether `opref` is a recorded result at or after `cut_at`.
-///
-/// `OpRef::raw` panics on `Const*`. Constants are not `History.cut` victims:
-/// they do not live in `value_slots`. `InputArg*` are the loop's inputs,
-/// captured before any residual preamble.
-fn opref_is_recorded_at_or_after(
-    opref: OpRef,
-    cut_at: &majit_metainterp::recorder::TracePosition,
-) -> bool {
-    match opref {
-        OpRef::IntOp(i) | OpRef::RefOp(i) | OpRef::FloatOp(i) => i >= cut_at._index,
-        _ => false,
-    }
-}
-
-/// A pending callee `MIFrame` still holds a box `History.cut(cut_at)` would
-/// drop. Mirrors `pyjitpl.py` `compile_trace` taking `cut_at` after every
-/// live register is recorded (`history.py` `History.cut`).
-fn pending_frame_holds_recorded_after<Sym: WalkSym>(
-    pending: &Option<SubWalkFrame<'_, Sym>>,
-    cut_at: &majit_metainterp::recorder::TracePosition,
-) -> bool {
-    pending.as_ref().is_some_and(|frame| {
-        frame
-            .registers_r
-            .iter()
-            .chain(frame.registers_i.iter())
-            .chain(frame.registers_f.iter())
-            .any(|op| opref_is_recorded_at_or_after(op, cut_at))
-    })
-}
-
 /// Keep ops the active residual handler recorded before it yields.
 ///
 /// `SubWalkDriver::drive` cuts a residual step back to the opcode start and
@@ -26022,32 +26440,6 @@ mod subwalk_checkpoint_tests {
         assert!(exchange.step_heap_cache.is_none());
     }
 
-    #[test]
-    fn recorded_box_index_at_or_after_the_cut_is_a_live_callee_register() {
-        let cut_at = majit_metainterp::recorder::TracePosition {
-            _pos: 0,
-            _count: 178,
-            _index: 178,
-            snapshot_data_len: 0,
-            snapshot_array_data_len: 0,
-        };
-        assert!(opref_is_recorded_at_or_after(OpRef::RefOp(180), &cut_at));
-        assert!(opref_is_recorded_at_or_after(OpRef::RefOp(178), &cut_at));
-        assert!(!opref_is_recorded_at_or_after(OpRef::RefOp(177), &cut_at));
-        assert!(!opref_is_recorded_at_or_after(OpRef::IntOp(10), &cut_at));
-        assert!(!opref_is_recorded_at_or_after(
-            OpRef::ConstInt(180),
-            &cut_at
-        ));
-        assert!(!opref_is_recorded_at_or_after(OpRef::NONE, &cut_at));
-        assert!(!opref_is_recorded_at_or_after(
-            OpRef::InputArgRef(180),
-            &cut_at
-        ));
-        let empty: Option<SubWalkFrame<'_, crate::state::PyreSym>> = None;
-        assert!(!pending_frame_holds_recorded_after(&empty, &cut_at));
-    }
-
     /// Two callees entered by one CALL step: the replay after the second
     /// finishes has to hand the first entry its own result again, and only
     /// leaving the step spends the log.
@@ -26235,15 +26627,221 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         &[],
         0,
         SubwalkFrameKind::Helper,
+        None,
+        None,
     )
+}
+
+/// Parents of a recursive portal (`try_walker_inline_user_call`
+/// `parents: vec![parent_frame]` for Python-to-Python).
+///
+/// A helper EvalFn CALL (`perform_portal_call_from_helper`) pauses that
+/// helper at the CALL (`pyjitpl.py` `perform_call` / `newframe`;
+/// `resume.py` `capture_resumedata` one section per jitcode header;
+/// `blackhole.py` `_setup_return_value_*`). Converted portal-root helpers
+/// do not push `HelperLevel`, so `helper_chain` is `NoHelper` and
+/// `helper_outer_call_parent` is the Python CALL
+/// (`publish_helper_outer_call_image`). That CALL is section 0 (a
+/// `CodeObject` for `rebuild_from_resumedata`); the helper is the
+/// immediate parent. Using the Python CALL as the only parent binds the
+/// portal return to the helper residual dest (`BINARY_SLICE` /
+/// `range(...)`) instead of the EvalFn dest.
+///
+/// Python-to-Python still stores the immediate caller only. Flattening
+/// `framestack[].parents` at enter omits this callee itself, so a
+/// same-`PyCode` recursive frame's chain skips the inner `fmt`.
+fn recursive_portal_inline_parents<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_pc: usize,
+) -> Vec<InlineParentFrame> {
+    let in_helper = ctx.fbw_mode.transparent_helper_subwalk
+        || ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+        || ctx.session.borrow().helper_chain() == super::HelperChain::Numbered;
+    if in_helper {
+        let Some(mut helper) =
+            super::resume_snapshot::compute_paused_helper_caller_frame(ctx, call_pc).ok()
+        else {
+            return Vec::new();
+        };
+        super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut helper);
+        super::resume_snapshot::refresh_paused_parent_blackhole(&mut helper);
+        let mut parents = Vec::new();
+        if ctx.session.borrow().helper_chain() != super::HelperChain::Numbered {
+            if let Some(mut portal) = portal_parent_from_helper_outer(ctx) {
+                super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut portal);
+                super::resume_snapshot::refresh_paused_parent_blackhole(&mut portal);
+                parents.push(portal);
+            }
+        }
+        insert_paused_driver_helper_parents(ctx, &mut parents);
+        let helper_index = helper.jitcode_index;
+        parents.retain(|parent| parent.jitcode_index != helper_index);
+        parents.push(helper);
+        return parents;
+    }
+
+    let helper_on_top = ctx
+        .session
+        .borrow()
+        .last_inline()
+        .is_some_and(|frame| frame.is_helper_level());
+    let caller_pc = if helper_on_top
+        || (ctx.fbw_mode.inline_subwalk && ctx.session.borrow().last_inline().is_none())
+    {
+        match ctx.entry_py_pc {
+            EntryPyPc::Jit(pc) => pc,
+            EntryPyPc::Py(_) => call_pc,
+        }
+    } else {
+        call_pc
+    };
+    // A helper on top has `w_code == 0`; `compute_inline_caller_frame`
+    // would `ensure_jitcode_index` slot 0. Capture the Python caller
+    // (`last_python_inline`) at the CALL (`pyjitpl.py` `newframe`).
+    let mut parent = if let Some(code) = ctx
+        .session
+        .borrow()
+        .last_python_inline()
+        .map(|frame| frame.w_code)
+        .filter(|&code| code != 0)
+    {
+        super::resume_snapshot::compute_nested_inline_caller_frame(ctx, caller_pc, code).ok()
+    } else {
+        None
+    };
+    if parent.is_none() {
+        parent = super::resume_snapshot::compute_inline_caller_frame(ctx, caller_pc).ok();
+    }
+    match parent {
+        Some(mut parent) => {
+            super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent);
+            super::resume_snapshot::refresh_paused_parent_blackhole(&mut parent);
+            vec![parent]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Unpackiterable / generatorentry portal: the driver jitcode *is* the
+/// body, so greens+reds seed regs 0.. (`MIFrame.setup_call`).
+pub(crate) fn run_driver_portal_subwalk<'frame, 'a: 'frame, Sym: WalkSym>(
+    ctx: &mut WalkContext<'frame, 'a, Sym>,
+    pc: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+    inline_w_code: usize,
+) -> Result<DispatchOutcome, DispatchError> {
+    let parent_inline_subwalk = ctx.fbw_mode.inline_subwalk;
+    let portal_site = python_portal_subwalk_site(ctx, pc, parent_inline_subwalk);
+    run_sub_jitcode_walk_from(
+        ctx,
+        pc,
+        0,
+        sub_body,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+        &[],
+        &[],
+        inline_w_code,
+        SubwalkFrameKind::PythonPortal(portal_site),
+        None,
+        None,
+    )
+}
+
+/// `_opimpl_recursive_call` `perform_call(portal_code, allboxes, greenkey)`:
+/// walk the USER per-fn portal body as a portal `MIFrame`.
+///
+/// pyre FBW traces per-fn jitcodes (`walk_generator_resume`), so the
+/// recursive portal is that callee `PyCode`, not `eval_loop_jit_portal`.
+/// Empty call-args + `extra_ref_seeds` for `portal_frame_reg` /
+/// `portal_ec_reg` (`interp_jit.py` reds = `['frame', 'ec']`). Nested
+/// `jit_merge_point` follows `opimpl_jit_merge_point`'s
+/// `portal_call_depth` branch.
+pub(crate) fn run_recursive_portal_subwalk<'frame, 'a: 'frame, Sym: WalkSym>(
+    ctx: &mut WalkContext<'frame, 'a, Sym>,
+    pc: usize,
+    start_pc: usize,
+    sub_body: &SubJitCodeBody,
+    extra_int_seeds: &[(usize, OpRef, ConcreteValue)],
+    extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
+    inline_w_code: usize,
+    is_being_profiled: bool,
+    frame_ptr: *mut pyre_interpreter::PyFrame,
+) -> Result<DispatchOutcome, DispatchError> {
+    // Nursery `W_Code`: pin before descr-pool / walk setup
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let code_pin = majit_metainterp::GreenRefPin::pin_one(inline_w_code);
+    let w_code = code_pin.get() as *const ();
+    let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
+        crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Err(DispatchError::callee_inline_unsupported(pc));
+    };
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.descr_refs = static_descr_table(callee_descr_refs);
+    ctx.raw_descrs = RawDescrPool::PerFn(callee_perfn_descrs);
+    ctx.sub_jitcode_lookup = callee_lookup;
+
+    let parents = recursive_portal_inline_parents(ctx, pc);
+    let parent_inline_subwalk = ctx.fbw_mode.inline_subwalk;
+    let portal_site = python_portal_subwalk_site(ctx, pc, parent_inline_subwalk);
+    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    // `sub_jitcode_descr_pool_for_code` compiles (`jitcode_for`). Re-read
+    // the nursery `W_Code` before storing it on the walked `InlineFrame`
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let inline_w_code = code_pin.get();
+    let inline_frame = InlineFrameGuard::enter(
+        ctx.session,
+        inline_w_code,
+        is_being_profiled,
+        true,
+        parents,
+        callee_entry_trace_index,
+    );
+    let inline_concrete = if frame_ptr.is_null() {
+        None
+    } else {
+        Some(InlineConcreteFrameGuard::enter(frame_ptr))
+    };
+    let result = run_sub_jitcode_walk_from(
+        ctx,
+        pc,
+        start_pc,
+        sub_body,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        extra_int_seeds,
+        extra_ref_seeds,
+        inline_w_code,
+        SubwalkFrameKind::PythonPortal(portal_site),
+        Some(inline_frame),
+        inline_concrete,
+    );
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+    result
 }
 
 /// How [`run_sub_jitcode_walk_from`] tags the child walk frame.
 ///
 /// Helpers stay transparent (`MIFrame` with no Python pc). A generator
-/// resume is a recursive portal (`_opimpl_recursive_call` → `perform_call`
-/// → `newframe` in `pyjitpl.py`), so it is numbered like an inlined
-/// Python callee.
+/// resume and `_opimpl_recursive_call` `perform_call(portal_code)` are
+/// recursive portals (`newframe` in `pyjitpl.py`), so they are numbered
+/// like an inlined Python callee.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SubwalkFrameKind {
     Helper,
@@ -26356,10 +26954,49 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
     }
 }
 
-/// Locals shadow for a generator-resume portal frame (`newframe` of the
-/// body's jitcode). `active_frame_nlocals` / `active_frame_code` read this
-/// so `setarrayitem_vable` splits the generator's locals from its operand
-/// stack, not the driver's.
+/// Portal-frame red seeded into `extra_ref_seeds` (`interp_jit.py`
+/// reds=`['frame','ec']`; `pyjitpl.py` `setup_call` writes those boxes
+/// into the new `MIFrame`). A live `PyFrame` at `portal_frame_reg` is
+/// this walk's frame; `ec` is not.
+fn recursive_portal_frame_seed(
+    extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
+    callee_concrete_r: &[ConcreteValue],
+    sub_body: &SubJitCodeBody,
+) -> (OpRef, usize) {
+    let frame_reg = sub_body
+        .jitcode_index
+        .and_then(|index| i32::try_from(index).ok())
+        .map(|index| crate::state::portal_red_regs_at(index).0)
+        .filter(|&reg| reg != u16::MAX);
+    for &(reg, opref, concrete) in extra_ref_seeds {
+        if let Some(frame_reg) = frame_reg
+            && reg != frame_reg as usize
+        {
+            continue;
+        }
+        let ptr = match concrete {
+            ConcreteValue::Ref(ptr) if !ptr.is_null() => ptr as usize,
+            _ => match callee_concrete_r.get(reg) {
+                Some(ConcreteValue::Ref(ptr)) if !ptr.is_null() => *ptr as usize,
+                _ => continue,
+            },
+        };
+        if live_pyframe_ptr(ptr).is_some() {
+            return (opref, ptr);
+        }
+    }
+    (OpRef::NONE, 0)
+}
+
+/// Locals shadow for a Python-portal `MIFrame` (`pyjitpl.py`
+/// `perform_call` / `newframe` / `setup_call`).
+///
+/// Generator resume fills `frame_box` from `generator_resume` and then
+/// seeds live locals from `extra_ref_seeds` via pcdep.
+/// `_opimpl_recursive_call` seeds only the portal frame/ec reds; those
+/// are not locals, so the pcdep loop does not run. `fold_frame_reg`
+/// stays `u16::MAX` as in `perform_portal_call_from_helper`
+/// (`_nonstandard_virtualizable`).
 fn python_portal_callee_shadow<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     inline_w_code: usize,
@@ -26383,7 +27020,7 @@ fn python_portal_callee_shadow<Sym: WalkSym>(
             resume.frame_box,
             pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize,
         ),
-        None => (OpRef::NONE, 0),
+        None => recursive_portal_frame_seed(extra_ref_seeds, callee_concrete_r, sub_body),
     };
     let mut shadow = CalleeLocalsShadow {
         code_ptr,
@@ -26393,6 +27030,12 @@ fn python_portal_callee_shadow<Sym: WalkSym>(
         ..Default::default()
     };
     if concrete_frame == 0 {
+        return shadow;
+    }
+    // Recursive `perform_call` extra_ref_seeds are frame/ec only. The
+    // pcdep local-color loop below is generator-resume: those seeds also
+    // carry every live local at the merge point.
+    if resume.is_none() {
         return shadow;
     }
     let Some(index) = sub_body.jitcode_index else {
@@ -26451,9 +27094,9 @@ fn python_portal_callee_shadow<Sym: WalkSym>(
 /// other caller passes 0: a Python callee already stores its own code on
 /// its `WalkFrameStateData`, and a helper has none.
 ///
-/// `frame_kind` is [`SubwalkFrameKind::Helper`] for every caller except
-/// `walk_generator_resume`, which opens the generator body as
-/// [`SubwalkFrameKind::PythonPortal`].
+/// `frame_kind` is [`SubwalkFrameKind::Helper`] for helper jitcodes.
+/// `walk_generator_resume` and `_opimpl_recursive_call`'s
+/// `perform_call(portal_code)` open a [`SubwalkFrameKind::PythonPortal`].
 pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     ctx: &mut WalkContext<'frame, 'a, Sym>,
     pc: usize,
@@ -26468,6 +27111,8 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
     inline_w_code: usize,
     frame_kind: SubwalkFrameKind,
+    inline_frame: Option<InlineFrameGuard<'a>>,
+    inline_concrete: Option<InlineConcreteFrameGuard>,
 ) -> Result<DispatchOutcome, DispatchError> {
     // A parent frame re-enters its inline_call opcode after the explicit
     // driver popped the callee. Consume that result before allocating or
@@ -26643,6 +27288,21 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     } else {
         None
     };
+    // `pyframe.py get_w_globals` of this portal MIFrame. The helper door
+    // (`perform_portal_call_from_helper`) already stores it on
+    // `WalkFrameStateData.inline_w_globals`; without it,
+    // `guard_current_frame_globals_identity` sees 0 and declines the
+    // LOAD_GLOBAL cell fold, and
+    // `replace_movable_load_global_namespace_with_frame_globals` stamps a
+    // NULL concrete onto the namespace box.
+    let inline_w_globals_raw = callee_shadow
+        .as_ref()
+        .and_then(|shadow| live_pyframe_ptr(shadow.concrete_frame))
+        .map(|frame| unsafe { (*frame).get_w_globals() as usize })
+        .unwrap_or(0);
+    let globals_pin = (inline_w_globals_raw != 0)
+        .then(|| majit_metainterp::GreenRefPin::pin_one(inline_w_globals_raw));
+    let inline_w_globals = globals_pin.as_ref().map(|pin| pin.get()).unwrap_or(0);
     let frame_state = WalkFrameState::new(WalkFrameStateData {
         callee_shadow,
         concrete_registers_r: callee_concrete_r,
@@ -26650,8 +27310,13 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
         outer_active_boxes,
         inline_w_code,
+        inline_w_globals,
         ..Default::default()
     });
+    // Same setup root as `perform_portal_call_from_helper`:
+    // `inline_w_globals` / `callee_shadow.concrete_frame` are live until
+    // `SubWalkDriver::push_frame` enters its own `InlineFrameStateGuard`.
+    let _setup_state_guard = crate::trace::InlineFrameStateGuard::enter(&frame_state);
     super::vable_ops::push_helper_live(
         ctx.session,
         &callee_regs_r,
@@ -26659,6 +27324,9 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         &registers_f,
         &frame_state,
     );
+    // Keep the globals pin until the state guard above publishes
+    // `walk_frame_state_roots` (`gctransform/shadowstack.py` `push_roots`).
+    let _keep_inline_w_globals = globals_pin;
     let (fbw_mode, entry_py_pc, outer_resume_marker_jit_pc, outer_jitcode_index) = match portal_site
     {
         Some(site) => {
@@ -26790,9 +27458,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 
         // The innermost MIFrame's jitcode is the body this sub-walk executes (`pyjitpl.py` `newframe(jitcode)`).
         inline_callee_consts,
-        _inline_frame: None,
-        _inline_concrete: None,
-        _inline_concrete_frame: None,
+        // Nested `SubWalkSuspended` moves this frame onto the explicit
+        // driver; keep the Python portal guard here so it outlives the
+        // caller's stack (`walk_generator_resume` holds its own).
+        _inline_frame: inline_frame,
+        _inline_concrete: inline_concrete,
         _open_activation: None,
         portal_leave: None,
         fbw_mode,
@@ -26923,6 +27593,396 @@ fn record_caller_frame_traceback<Sym: WalkSym>(
     Ok(())
 }
 
+/// Whether `obj` carries a Python `ob_type` that is itself a type.
+///
+/// A rtyper `FixedSizeListRepr` argument is `Ptr(GcArray(GCREF))`. Reading
+/// that block as a `PyObject` puts the length word on `ob_type`; lengths
+/// for `Function.funccall` (`nargs < 5`) sit below one page, so they are
+/// rejected before `is_type` would dereference them.
+fn walker_ref_is_python_object(obj: pyre_object::PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
+    if (obj as usize) % std::mem::align_of::<usize>() != 0 {
+        return false;
+    }
+    let ty = unsafe { (*obj).ob_type };
+    if ty.is_null() {
+        return false;
+    }
+    let ty_addr = ty as *const () as usize;
+    if ty_addr < 4096 || ty_addr % std::mem::align_of::<usize>() != 0 {
+        return false;
+    }
+    unsafe { pyre_object::is_type(ty as pyre_object::PyObjectRef) }
+}
+
+/// Unpack a rtyper `SomeList` / `GcArray(GCREF)` of `nparams` objects into
+/// argument boxes. Heapcache hits reuse the stores that built `&[w_obj]`;
+/// a miss records `getarrayitem_gc_r` (`pyjitpl.py` `_do_getarrayitem_gc_any`).
+fn unpack_helper_funccall_gcarray<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    array_op: OpRef,
+    nparams: usize,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    let descr = crate::state::pyobject_gcarray_descr();
+    let descr_idx = descr.index();
+    let len = if let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(array_op) {
+        match len_op
+            .inline_const_to_value()
+            .or_else(|| ctx.trace_ctx.box_value(len_op))
+        {
+            Some(majit_ir::Value::Int(n)) if n >= 0 => n as usize,
+            _ => return None,
+        }
+    } else {
+        let array_obj = walker_concrete_ref_object(ctx, array_op)?;
+        match ctx.trace_ctx.arraylen_sanity_load(array_obj as i64, &descr) {
+            Some(majit_ir::Value::Int(n)) if n >= 0 => n as usize,
+            _ => return None,
+        }
+    };
+    if len != nparams {
+        return None;
+    }
+    let mut args = Vec::with_capacity(nparams);
+    let mut concretes = Vec::with_capacity(nparams);
+    let mut all_cached = true;
+    for i in 0..nparams {
+        let idx = OpRef::ConstInt(i as i64);
+        match ctx
+            .trace_ctx
+            .heapcache_getarrayitem(array_op, idx, descr_idx)
+        {
+            Some(elem) => {
+                let concrete = walker_concrete_ref_object(ctx, elem)?;
+                args.push(elem);
+                concretes.push(ConcreteValue::Ref(concrete));
+            }
+            None => {
+                all_cached = false;
+                break;
+            }
+        }
+    }
+    if all_cached {
+        return Some((args, concretes));
+    }
+    args.clear();
+    concretes.clear();
+    for i in 0..nparams {
+        let idx = ctx.trace_ctx.const_int(i as i64);
+        let elem = crate::state::trace_array_getitem_value(ctx.trace_ctx, array_op, idx);
+        let concrete = walker_concrete_ref_object(ctx, elem)?;
+        args.push(elem);
+        concretes.push(ConcreteValue::Ref(concrete));
+    }
+    Some((args, concretes))
+}
+
+/// Positional boxes for a helper-reached `Function.funccall`.
+///
+/// `function.py` `Function.funccall` / `funccall_flat_from_args` take the
+/// function, its `PyCode`, and the argument list. Flattened args are
+/// admitted only after skipping that matching `PyCode`, so `invert(f)` /
+/// `f + x` with `f` a Function cannot look like a Python call.
+fn extract_helper_reached_funccall_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    w_code: *const (),
+    nparams: usize,
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if ref_args.is_empty() {
+        return None;
+    }
+    let packed_len = match int_arg_concretes {
+        [ConcreteValue::Int(n)] if *n >= 0 => Some(*n as usize),
+        [] => None,
+        _ => None,
+    };
+    let rest = &ref_args[1..];
+    let (skipped_code, rest) = match rest.split_first() {
+        Some((&code_op, after)) => {
+            if let Some(code_obj) = walker_concrete_ref_object(ctx, code_op) {
+                if unsafe { pyre_interpreter::pycode::is_code(code_obj) }
+                    && code_obj as *const () == w_code
+                {
+                    (true, after)
+                } else {
+                    (false, rest)
+                }
+            } else {
+                (false, rest)
+            }
+        }
+        None => (false, rest),
+    };
+    if skipped_code && rest.len() == nparams {
+        let mut args = Vec::with_capacity(nparams);
+        let mut concretes = Vec::with_capacity(nparams);
+        let mut all_python = true;
+        for &arg in rest {
+            let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
+                all_python = false;
+                break;
+            };
+            if nparams > 0 && !walker_ref_is_python_object(concrete) {
+                // `funccall_flat_from_args` with `nparams == 1` is
+                // `[func, code, GcArray]`; the array is not a Python
+                // object. Fall through to unpack rather than declining.
+                all_python = false;
+                break;
+            }
+            args.push(arg);
+            concretes.push(ConcreteValue::Ref(concrete));
+        }
+        if all_python && args.len() == nparams {
+            return Some((args, concretes));
+        }
+    }
+    if rest.len() == 1 {
+        let array_op = rest[0];
+        let array_obj = walker_concrete_ref_object(ctx, array_op)?;
+        let python = walker_ref_is_python_object(array_obj);
+        // A rtyper `GcArray` is not a Python object. A binary helper's
+        // other operand is (`f - x` with `f` a Function); `packed_len`
+        // can equal `nparams` because `binary_op_tag` uses 0..=26.
+        if !python {
+            return unpack_helper_funccall_gcarray(ctx, array_op, nparams);
+        }
+        if skipped_code && packed_len == Some(nparams) {
+            return unpack_helper_funccall_gcarray(ctx, array_op, nparams);
+        }
+        if skipped_code && nparams == 1 {
+            return Some((vec![array_op], vec![ConcreteValue::Ref(array_obj)]));
+        }
+    }
+    // `descroperation.py get_and_call_function(w_descr, w_obj, w_type, args_w)`
+    // then `w_descr.funccall(w_obj, *args_w)`. Invert / pos / binop already
+    // ran; those are nref 1 or 2. A Function dunder from `space.index` is
+    // this 3-rest shape (`baseobjspace.rs get_and_call_function`).
+    if rest.len() >= 2 {
+        let obj_op = rest[0];
+        let type_op = rest[1];
+        if let Some(obj) = walker_concrete_ref_object(ctx, obj_op)
+            && let Some(ty) = walker_concrete_ref_object(ctx, type_op)
+            && walker_ref_is_python_object(obj)
+            && unsafe { pyre_object::is_type(ty) }
+        {
+            let n_extra = nparams.saturating_sub(1);
+            let extra = if rest.len() == 2 {
+                if n_extra == 0 {
+                    Some((Vec::new(), Vec::new()))
+                } else {
+                    None
+                }
+            } else if rest.len() == 3 {
+                unpack_get_and_call_extra_args(ctx, rest[2], n_extra)
+            } else {
+                None
+            };
+            if let Some((extra_ops, extra_concretes)) = extra
+                && extra_ops.len() == n_extra
+            {
+                let mut args = Vec::with_capacity(nparams);
+                let mut concretes = Vec::with_capacity(nparams);
+                args.push(obj_op);
+                concretes.push(ConcreteValue::Ref(obj));
+                args.extend(extra_ops);
+                concretes.extend(extra_concretes);
+                return Some((args, concretes));
+            }
+        }
+    }
+    // Four-ref `get_and_call_function` (`w_descr, w_obj, w_type, args_w`)
+    // with a 1-arg dunder (`__index__`): the type slot is not always an
+    // exact `TYPE_TYPE` instance, and arity-0 `args_w` is an empty slice
+    // pointer (`space.index` passes `&[]`). Invert / pos / binop stay
+    // nref 1 or 2, so they cannot match `rest.len() >= 3`.
+    // `pyjitpl.py` `MIFrame.perform_call` / `descroperation.py`
+    // `get_and_call_function`.
+    if nparams == 1 && rest.len() >= 3 {
+        let obj_op = rest[0];
+        if let Some(obj) = walker_concrete_ref_object(ctx, obj_op)
+            && walker_ref_is_python_object(obj)
+        {
+            return Some((vec![obj_op], vec![ConcreteValue::Ref(obj)]));
+        }
+    }
+    // `function.py` `funccall_flat_from_args(func, code, args)` after the
+    // matching PyCode skip. A 1-arg call may carry an extra slice/len
+    // slot beside the receiver; invert / pos never skip a PyCode.
+    if nparams == 1 && skipped_code && !rest.is_empty() {
+        let obj_op = rest[0];
+        if let Some(obj) = walker_concrete_ref_object(ctx, obj_op) {
+            if walker_ref_is_python_object(obj) {
+                return Some((vec![obj_op], vec![ConcreteValue::Ref(obj)]));
+            }
+            if let Some(unpacked) = unpack_helper_funccall_gcarray(ctx, obj_op, nparams) {
+                return Some(unpacked);
+            }
+        }
+    }
+    None
+}
+
+/// Extra `args_w` after `w_obj` in `get_and_call_function`. An empty
+/// slice is a null or zero-length `GcArray`; `__index__` has none.
+/// Arity 0 must not inspect the slice pointer: `&[]` is not a Python
+/// object and may not be a readable `GcArray`.
+fn unpack_get_and_call_extra_args<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    args_op: OpRef,
+    n_extra: usize,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if n_extra == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let Some(args_obj) = walker_concrete_ref_object(ctx, args_op) else {
+        return None;
+    };
+    if args_obj.is_null() {
+        return None;
+    }
+    if !walker_ref_is_python_object(args_obj) {
+        return unpack_helper_funccall_gcarray(ctx, args_op, n_extra);
+    }
+    None
+}
+
+/// `pyjitpl.py` `MIFrame.perform_call` for a Python `Function` reached
+/// from a helper (`function.py` `Function.funccall` / `funccall_flat_from_args`).
+///
+/// Walking that body hits `FrameBox::new` / `try_gc_alloc_collecting_rooted`,
+/// whose collecting malloc is a symbolic `__dyn_call` the residual ABI
+/// cannot express. Skip it and emit the callee with
+/// `emit_new_pyframe_inline_with_params` (`new_with_vtable`), the recording
+/// `perform_call` gets from looking inside `createframe`.
+fn try_walker_inline_helper_reached_funccall<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    dst: usize,
+    dst_bank: char,
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `pyjitpl.py` `MIFrame.perform_call` from a helper MIFrame. A portal
+    // Python walk's `inline_call` of a helper is not that call.
+    let in_helper = ctx.fbw_mode.transparent_helper_subwalk
+        || ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+        || ctx.session.borrow().helper_chain() == super::HelperChain::Numbered;
+    if !ctx.is_authoritative_executor
+        || !ctx.fbw_mode.inline_subwalk
+        || !in_helper
+        || dst_bank != 'r'
+    {
+        return Ok(None);
+    }
+    let Some(&func_op) = ref_args.first() else {
+        return Ok(None);
+    };
+    let Some(callable) = walker_concrete_ref_object(ctx, func_op) else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
+    else {
+        return Ok(None);
+    };
+    let pre = ctx.trace_ctx.get_trace_position();
+    let Some((callee_args, callee_arg_concretes)) =
+        extract_helper_reached_funccall_args(ctx, w_code, nparams, int_arg_concretes, ref_args)
+    else {
+        if ctx.trace_ctx.get_trace_position() != pre {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre);
+            ctx.trace_ctx.heap_cache_mut().reset();
+        }
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[helper-funccall-decline] pc={} why=args nparams={nparams} nref={}",
+                op.pc,
+                ref_args.len(),
+            );
+        }
+        return Ok(None);
+    };
+    if fbw_inline_diag_enabled() {
+        eprintln!(
+            "[helper-funccall-admit] pc={} nparams={nparams} nref={} nargs={}",
+            op.pc,
+            ref_args.len(),
+            callee_args.len(),
+        );
+    }
+    let mut arg_concretes = Vec::with_capacity(2 + callee_arg_concretes.len());
+    arg_concretes.push(ConcreteValue::Ref(callable));
+    arg_concretes.push(ConcreteValue::Null);
+    arg_concretes.extend_from_slice(&callee_arg_concretes);
+    let exc_before = ctx.last_exc_value();
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        dst_bank,
+        dst,
+        callable,
+        func_op,
+        callable,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        // Helper-reached: the abort resumes in the paused helper
+        // (`recursive_portal_inline_parents` / `compute_paused_helper_caller_frame`),
+        // not at the enclosing Python CALL.
+        false,
+        false,
+        None,
+    )?;
+    if inlined.is_none() && ctx.trace_ctx.get_trace_position() != pre {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    if inlined.is_none() && fbw_inline_diag_enabled() {
+        eprintln!(
+            "[helper-funccall-decline] pc={} why=resolved nparams={nparams} nref={}",
+            op.pc,
+            ref_args.len()
+        );
+    }
+    // Inner catch-and-Continue jumps to the helper `catch_exception` without
+    // `finishframe_exception` (`pyjitpl.py` `MetaInterp.finishframe_exception`).
+    // Surface `SubRaise` so the helper walk's SubRaise arm does that once.
+    if let Some((DispatchOutcome::Continue, target)) = inlined
+        && target != op.next_pc
+        && let Some(exc) = ctx.last_exc_value().filter(|&exc| Some(exc) != exc_before)
+    {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[helper-funccall-subraise] pc={} catch_target={target} surface=intercept",
+                op.pc
+            );
+        }
+        return Ok(Some((
+            DispatchOutcome::SubRaise {
+                exc,
+                exc_concrete: ctx.last_exc_value_concrete(),
+            },
+            op.next_pc,
+        )));
+    }
+    Ok(inlined)
+}
+
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -26964,6 +28024,25 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + 2 + arg_width] as usize
+    };
+    if let Some(outcome) = try_dispatch_portal_inline_call(
+        ctx,
+        code,
+        op,
+        dst,
+        dst_bank,
+        descr_index,
+        sub_index,
+        &[],
+        &args,
+        &[],
+    )? {
+        return Ok(outcome);
+    }
 
     if dst_bank == 'r'
         && args.len() == 1
@@ -27069,6 +28148,15 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+    }
+
+    // `pyjitpl.py` `MIFrame.perform_call` for a helper-reached Function.
+    // Invert / pos / binop run first so a Function operand is not stolen.
+    if dst_bank == 'r'
+        && let Some(inlined) =
+            try_walker_inline_helper_reached_funccall(ctx, op, code, dst, dst_bank, &[], &args)?
+    {
+        return Ok(inlined);
     }
 
     // Bracket the session-wide exception slot around the callee so a NULL
@@ -27296,6 +28384,25 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + 2 + int_width + ref_width] as usize
+    };
+    if let Some(outcome) = try_dispatch_portal_inline_call(
+        ctx,
+        code,
+        op,
+        dst,
+        dst_bank,
+        descr_index,
+        sub_index,
+        &int_args,
+        &ref_args,
+        &[],
+    )? {
+        return Ok(outcome);
+    }
 
     if dst_bank == 'r'
         && int_args.len() == 1
@@ -27518,6 +28625,22 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+    }
+
+    // `pyjitpl.py` `MIFrame.perform_call` for a helper-reached Function.
+    // Invert / pos / binop run first so a Function operand is not stolen.
+    if dst_bank == 'r'
+        && let Some(inlined) = try_walker_inline_helper_reached_funccall(
+            ctx,
+            op,
+            code,
+            dst,
+            dst_bank,
+            &int_arg_concretes,
+            &ref_args,
+        )?
+    {
+        return Ok(inlined);
     }
 
     // `w_complex_new` is `malloc_typed` of a header-plus-payload struct.
@@ -27758,6 +28881,25 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize
+    };
+    if let Some(outcome) = try_dispatch_portal_inline_call(
+        ctx,
+        code,
+        op,
+        dst,
+        dst_bank,
+        descr_index,
+        sub_index,
+        &int_args,
+        &ref_args,
+        &float_args,
+    )? {
+        return Ok(outcome);
+    }
 
     // The `w_int_new` boundary of `dispatch_inline_call_dir_kind`, for the
     // float box.  `w_float_new`'s translated body builds the whole

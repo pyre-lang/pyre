@@ -772,7 +772,7 @@ impl InlineFrame {
         }
     }
 
-    fn is_helper_level(&self) -> bool {
+    pub(crate) fn is_helper_level(&self) -> bool {
         !self.is_portal && self.w_code == 0
     }
 
@@ -4805,7 +4805,35 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     let inline = can_inline && count < max_unroll;
     if inline {
-        if let Some(index) = portal_index {
+        // PYPYJIT: walk the user per-fn portal (`walk_generator_resume`
+        // shape). Walking `eval_loop_jit_portal` as the body replays
+        // interpreter dispatch; nested `jit_merge_point` then CALL_ASSEMBLERs
+        // at the wrong valuestackdepth (`loop_callee_portal_call_can_record`).
+        if jd_index == crate::state::PyreJitState::PYPYJIT_JD_INDEX {
+            if let Some(done) = try_walk_recursive_user_portal(
+                ctx,
+                op,
+                dst,
+                dst_bank,
+                greens_i,
+                greens_r,
+                greens_f,
+                reds_i,
+                reds_r,
+                reds_f,
+                &green_key,
+                portal_index,
+                jd_index,
+            )? {
+                return Ok(Some(done));
+            }
+            // Declined the user per-fn body. `_opimpl_recursive_call`
+            // still `do_recursive_call(..., assembler_call=True)` for a
+            // portal (`direct_assembler_call`); we cannot Helper-walk
+            // `eval_loop_jit_portal`. Fall through to that assembler
+            // path. Residual `assembler_call=False` `execute_varargs`s
+            // the portal runner and forces the virtualizable.
+        } else if let Some(index) = portal_index {
             if let Some(body) = sub_jitcode_body_by_index(index) {
                 let int_args: Vec<OpRef> = greens_i
                     .iter()
@@ -4834,13 +4862,29 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .iter()
                     .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
                     .collect();
+                // Replay after a nested SubWalkDriver yield: the first
+                // entry already `perform_call`ed. Do not push a second
+                // portal `MIFrame`.
+                if let Some(done) = inline_call::take_completed_nested_subwalk(ctx, op.pc) {
+                    let walked = match done {
+                        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+                        Err(error) => {
+                            close_nested_recursive_portal(true);
+                            return Err(error);
+                        }
+                        Ok(outcome) => outcome,
+                    };
+                    return Ok(Some(finish_recursive_inline(
+                        ctx, op, dst, dst_bank, walked, greens_i, greens_r, reds_r, jd_index,
+                    )?));
+                }
                 // pyjitpl.py `_opimpl_recursive_call`: `perform_call(portal_code, allboxes, greenkey=greenboxes)`.
                 // `get_uhash` → `id_or_identityhash` / `_find_shadow`. Hash
                 // the reloaded key, then reload again before the log clone.
                 pin.reload(&mut live);
                 let hash = live.get_uhash();
                 pin.reload(&mut live);
-                let subwalk_jd = crate::state::note_inline_subwalk_start(
+                let _subwalk_jd = crate::state::note_inline_subwalk_start(
                     (hash, live.clone()),
                     Some(index),
                     &recursive_call_argboxes(
@@ -4854,7 +4898,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     ctx.walk_jitcode_index(),
                     op.next_pc,
                 );
-                let walked = match inline_call::run_sub_jitcode_walk(
+                let inline_w_code = recursive_call_inline_w_code(ctx, jd_index, greens_r);
+                let walked = match inline_call::run_driver_portal_subwalk(
                     ctx,
                     op.pc,
                     &body,
@@ -4863,18 +4908,26 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     &ref_args,
                     &ref_concretes,
                     &float_args,
+                    inline_w_code,
                 ) {
                     // `popframe` records `LEAVE_PORTAL_FRAME`. The raise has
                     // already left `_interpret`, so the close must not run.
                     Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+                    // Nested driver still owns the portal `MIFrame`
+                    // `note_inline_subwalk_start` pushed. Close it when
+                    // the completed child is replayed.
+                    Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
                     other => other,
                 };
-                if subwalk_jd.is_some() {
-                    crate::state::note_inline_subwalk_end();
-                }
-                let walked = walked?;
+                let walked = match walked {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        close_nested_recursive_portal(true);
+                        return Err(error);
+                    }
+                };
                 return Ok(Some(finish_recursive_inline(
-                    ctx, op, dst, dst_bank, walked,
+                    ctx, op, dst, dst_bank, walked, greens_i, greens_r, reds_r, jd_index,
                 )?));
             }
         }
@@ -5115,15 +5168,275 @@ fn recursive_call_allboxes(
     )
 }
 
+fn recursive_call_inline_w_code<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jd_index: usize,
+    greens_r: &[OpRef],
+) -> usize {
+    if jd_index != crate::state::PyreJitState::PYPYJIT_JD_INDEX {
+        return 0;
+    }
+    greens_r
+        .first()
+        .copied()
+        .and_then(|op| opref_known_i64(ctx, op))
+        .filter(|&bits| bits != 0)
+        .map(|bits| bits as usize)
+        .unwrap_or(0)
+}
+
+/// `popframe` the nested portal `note_inline_subwalk_start` pushed, when it
+/// is still on `framestack`. `leave_portal_frame=False` is
+/// `opimpl_jit_merge_point`'s assembler-call arm.
+fn close_nested_recursive_portal(leave_portal_frame: bool) {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return;
+    };
+    let meta = driver.meta_interp_mut();
+    if meta.framestack.frames.len() >= 2 {
+        if leave_portal_frame {
+            meta.popframe(true);
+        } else {
+            let _ = meta.finishframe(None, false);
+        }
+    }
+}
+
+/// PYPYJIT recursive portal: walk the callee `PyCode` as a portal frame.
+///
+/// `pyjitpl.py` `_opimpl_recursive_call` → `perform_call` → `newframe`
+/// (`jitcode.jitdriver_sd` set, `portal_call_depth += 1`). pyre FBW's
+/// portal equivalent is the per-fn jitcode (`walk_generator_resume`),
+/// not `eval_loop_jit_portal`. Missing per-fn body falls through to
+/// `do_recursive_call(assembler_call=True)`.
+fn try_walk_recursive_user_portal<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    greens_f: &[OpRef],
+    reds_i: &[OpRef],
+    reds_r: &[OpRef],
+    reds_f: &[OpRef],
+    green_key: &majit_ir::GreenKey,
+    portal_index: Option<usize>,
+    jd_index: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(index) = portal_index else {
+        return Ok(None);
+    };
+    if reds_r.len() < 2 || greens_r.is_empty() {
+        return Ok(None);
+    }
+    // Nursery `W_Code` is a Ref green: pin before `sub_jitcode_body_for_code`
+    // / `ensure_jitcode_index` / `get_uhash` (`warmstate.py` `get_uhash` →
+    // `id_or_identityhash`; `gctransform/shadowstack.py`).
+    let pin = majit_metainterp::GreenRefPin::pin(green_key);
+    let mut live = pin.live_clone(green_key);
+    let w_code = pin.get() as *const ();
+    if w_code.is_null() {
+        return Ok(None);
+    }
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    pin.reload(&mut live);
+    let w_code = pin.get() as *const ();
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !pjc.metadata.built_as_portal {
+        return Ok(None);
+    }
+    pin.reload(&mut live);
+    let w_code = pin.get() as *const ();
+    if crate::state::sub_jitcode_descr_pool_for_code(w_code).is_none() {
+        return Ok(None);
+    }
+    pin.reload(&mut live);
+    let w_code = pin.get() as *const ();
+    let Some(callee_jc) = crate::state::ensure_jitcode_index(w_code) else {
+        return Ok(None);
+    };
+    let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jc);
+    if frame_reg == u16::MAX
+        || ec_reg == u16::MAX
+        || frame_reg as usize >= body.num_regs_r
+        || ec_reg as usize >= body.num_regs_r
+    {
+        return Ok(None);
+    }
+    let next_instr = greens_i
+        .first()
+        .copied()
+        .and_then(|opref| opref_known_i64(ctx, opref))
+        .unwrap_or(0) as usize;
+    let is_being_profiled = greens_i
+        .get(1)
+        .copied()
+        .and_then(|opref| opref_known_i64(ctx, opref))
+        .is_some_and(|value| value != 0);
+    // `warmspot.py split_before_jit_merge_point`: enter at the portal
+    // `jit_merge_point`, past the startblock `ref_copy`s that would
+    // overwrite `portal_frame_reg` with an unbound null. User-call
+    // (`inline_merge_pc`) already starts there; `setup_call` + pc=0 is
+    // the eval_loop sequential-arg shape, not a per-fn portal that seeds
+    // reds at their final colors (`interp_jit.py` reds=`['frame','ec']`).
+    let start_pc = crate::trace::static_entry_merge_point(body.code, pjc.loop_scan(), next_instr)
+        .map(|op| op.pc)
+        .or_else(|| pjc.merge_entry_for(next_instr))
+        .unwrap_or(0);
+    let frame_box = reds_r[0];
+    let ec_box = reds_r[1];
+    // The callee frame red may still be virtual (`pyjitpl.py`
+    // `perform_call` / `setup_call`); `InlineConcreteFrameGuard` is
+    // only installed when the box already names a live `PyFrame`.
+    let frame_ptr =
+        inline_call::opref_as_live_pyframe(ctx, frame_box).unwrap_or(std::ptr::null_mut());
+    let _roots = pyre_object::gc_roots::push_roots();
+    if !frame_ptr.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+    }
+    pin.reload(&mut live);
+    let w_code = pin.get() as *const ();
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    let extra_ref_seeds = [
+        (
+            frame_reg as usize,
+            frame_box,
+            opref_concrete(ctx.trace_ctx.concrete_of_opref(frame_box)),
+        ),
+        (
+            ec_reg as usize,
+            ec_box,
+            opref_concrete(ctx.trace_ctx.concrete_of_opref(ec_box)),
+        ),
+    ];
+    // Int greens `[next_instr, is_being_profiled]` at the merge colors.
+    // Startblock `int_copy` that wrote them is skipped with the merge-pc
+    // entry (`static_entry_merge_point_green_regs`).
+    let extra_int_seeds: Vec<(usize, OpRef, crate::state::ConcreteValue)> =
+        crate::trace::static_entry_merge_point_green_regs(body.code, pjc.loop_scan(), next_instr)
+            .map(|gi| {
+                let values = [next_instr as i64, i64::from(is_being_profiled)];
+                gi.iter()
+                    .copied()
+                    .zip(values)
+                    .zip(greens_i.iter().copied())
+                    .map(|((color, value), opref)| {
+                        (
+                            color as usize,
+                            opref,
+                            crate::state::ConcreteValue::Int(value),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let int_args: Vec<OpRef> = greens_i
+        .iter()
+        .copied()
+        .chain(reds_i.iter().copied())
+        .collect();
+    let ref_args: Vec<OpRef> = greens_r
+        .iter()
+        .copied()
+        .chain(reds_r.iter().copied())
+        .collect();
+    let float_args: Vec<OpRef> = greens_f
+        .iter()
+        .copied()
+        .chain(reds_f.iter().copied())
+        .collect();
+    let int_concretes: Vec<crate::state::ConcreteValue> = int_args
+        .iter()
+        .map(|opref| opref_concrete(ctx.trace_ctx.concrete_of_opref(*opref)))
+        .collect();
+    let ref_concretes: Vec<crate::state::ConcreteValue> = ref_args
+        .iter()
+        .map(|opref| opref_concrete(ctx.trace_ctx.concrete_of_opref(*opref)))
+        .collect();
+    let float_concretes: Vec<crate::state::ConcreteValue> = float_args
+        .iter()
+        .map(|opref| opref_concrete(ctx.trace_ctx.concrete_of_opref(*opref)))
+        .collect();
+    if let Some(done) = inline_call::take_completed_nested_subwalk(ctx, op.pc) {
+        let walked = match done {
+            Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+            Err(error) => {
+                close_nested_recursive_portal(true);
+                return Err(error);
+            }
+            Ok(outcome) => outcome,
+        };
+        return Ok(Some(finish_recursive_inline(
+            ctx, op, dst, dst_bank, walked, greens_i, greens_r, reds_r, jd_index,
+        )?));
+    }
+    // `note_inline_subwalk_start` still names mainjitcode: the metainterp
+    // portal `MIFrame` is `eval_loop`; the walker executes the per-fn body.
+    // Hash the reloaded key (`get_uhash` → `id_or_identityhash` can collect).
+    pin.reload(&mut live);
+    let hash = live.get_uhash();
+    pin.reload(&mut live);
+    let _subwalk_jd = crate::state::note_inline_subwalk_start(
+        (hash, live.clone()),
+        Some(index),
+        &recursive_call_argboxes(
+            &int_args,
+            &int_concretes,
+            &ref_args,
+            &ref_concretes,
+            &float_args,
+            &float_concretes,
+        ),
+        ctx.walk_jitcode_index(),
+        op.next_pc,
+    );
+    pin.reload(&mut live);
+    let walked = match inline_call::run_recursive_portal_subwalk(
+        ctx,
+        op.pc,
+        start_pc,
+        &body,
+        &extra_int_seeds,
+        &extra_ref_seeds,
+        pin.get(),
+        is_being_profiled,
+        frame_ptr,
+    ) {
+        Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
+        other => other,
+    };
+    let walked = match walked {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            close_nested_recursive_portal(true);
+            return Err(error);
+        }
+    };
+    Ok(Some(finish_recursive_inline(
+        ctx, op, dst, dst_bank, walked, greens_i, greens_r, reds_r, jd_index,
+    )?))
+}
+
 fn finish_recursive_inline<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
     dst_bank: char,
     walked: DispatchOutcome,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    reds_r: &[OpRef],
+    jd_index: usize,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     match walked {
         DispatchOutcome::SubReturn { result } => {
+            close_nested_recursive_portal(true);
             if let Some(result) = result {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, result)?;
             }
@@ -5131,10 +5444,69 @@ fn finish_recursive_inline<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            close_nested_recursive_portal(true);
             ctx.set_last_exc_value(exc, exc_concrete);
             Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
         }
-        other => Ok((other, op.next_pc)),
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }
+            if jd_index == crate::state::PyreJitState::PYPYJIT_JD_INDEX
+                && reds_r.len() >= 2
+                && !greens_r.is_empty() =>
+        {
+            // `opimpl_jit_merge_point` (`portal_call_depth != 0`):
+            // `finishframe(None, leave_portal_frame=False)` then
+            // `do_recursive_call(..., assembler_call=True)` then
+            // `leave_portal_frame`.
+            close_nested_recursive_portal(false);
+            ctx.clear_last_exc_value();
+            let frame_box = reds_r[0];
+            let ec_box = reds_r[1];
+            let w_code = opref_known_i64(ctx, greens_r[0]).unwrap_or(0) as *const ();
+            let is_being_profiled = greens_i
+                .get(1)
+                .copied()
+                .and_then(|op| opref_known_i64(ctx, op))
+                .is_some_and(|value| value != 0);
+            if w_code.is_null()
+                || !inline_call::loop_callee_portal_call_can_record(
+                    ctx, frame_box, w_code, target_pc,
+                )
+            {
+                inline_call::record_deferred_portal_leave(Some(jd_index));
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            // `get_assembler_token` (`warmstate.py`) hashes the Ref green
+            // and can collect. Pin the nursery `W_Code` and adopt the slot.
+            let pin = majit_metainterp::GreenRefPin::pin_one(w_code as usize);
+            let token = match token {
+                Some(token) => Some(token),
+                None => portal_assembler_token(pin.save(), target_pc, is_being_profiled),
+            };
+            let w_code = pin.get() as *const ();
+            let emitted = inline_call::emit_walker_loop_callee_call_assembler(
+                ctx,
+                op,
+                dst_bank,
+                dst,
+                frame_box,
+                ec_box,
+                0,
+                token,
+                target_pc,
+                w_code,
+                is_being_profiled,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            inline_call::record_deferred_portal_leave(Some(jd_index));
+            emitted.ok_or_else(|| DispatchError::callee_inline_unsupported(op.pc))
+        }
+        other => {
+            close_nested_recursive_portal(true);
+            Ok((other, op.next_pc))
+        }
     }
 }
 
@@ -8692,7 +9064,18 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                             // loop cut decline it. A NULL shadow still loses to
                             // the register (`nested_break_not_hot`).
                             if let (Some(w), Some(s)) = (walk_real, shadow_real) {
-                                if w != s && w.is_input_arg() {
+                                // wrap() (`warmstate.py`, startindex >= 0) and
+                                // `read_boxes` (`virtualizable.py`) yield
+                                // FrontendOp, never Const. A Const walk against
+                                // a live FrontendOp extra is the interned
+                                // `setarrayitem_vable` value in a sidecar
+                                // color; `get_list_of_active_boxes`
+                                // (`pyjitpl.py`) would then encode TAGCONSTPTR
+                                // and a DoneWithThisFrame bridge bakes that
+                                // Const into BUILD_STRING. Prefer the wrap box.
+                                // A real Const store also writes the extra, so
+                                // walk and shadow are the same Const.
+                                if w != s && (w.is_input_arg() || w.is_constant()) {
                                     s
                                 } else if carried_pc_proves_slot {
                                     w
@@ -9544,7 +9927,7 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         }
     }
     if let Some(parent) = session.helper_outer_call_parent.as_mut() {
-        walk_parent(parent);
+        walk_inline_parent_frame(parent, visitor);
     }
 }
 

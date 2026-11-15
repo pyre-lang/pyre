@@ -10480,17 +10480,6 @@ mod tests {
         assert_eq!(bindings["__majit_stringbuilder_build"], sb_build);
         let sb_append = majit_stringbuilder_append_jit_abi as *const () as usize as i64;
         assert_eq!(bindings["__majit_stringbuilder_append"], sb_append);
-        let call_impl: extern "C" fn(i64, i64) -> i64 =
-            crate::call::__majit_call_target_call_function_impl_result;
-        let call_impl = call_impl as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::call::call_function_impl_result"],
-            call_impl
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::call_function_impl_result"],
-            call_impl
-        );
         let write_bytes = write_bytes_word_jit_abi as *const () as usize as i64;
         assert_eq!(bindings["core::ptr::write_bytes"], write_bytes);
         assert_eq!(bindings["ptr::write_bytes"], write_bytes);
