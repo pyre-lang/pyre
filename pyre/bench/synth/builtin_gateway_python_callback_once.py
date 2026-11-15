@@ -2,8 +2,10 @@
 # pyre-check: jitstats-band=guard_failures=232
 # wasm guard_failures reads 7539, 7539, 7539 on this macOS arm64 wasm-host
 # binary at check.py's 4MB PYPY_GC_NURSERY pin, 7754 at PYPY_GC_NURSERY=2M
-# (bridges 23 -> 25), and 7522 at 8M. dynasm and cranelift read 7522 on
-# every run. The wasm guest runs the minor-GC schedule off its allocation
+# (bridges 23 -> 25), and 7522 at 8M. dynasm, cranelift and wasm read 8136 on
+# every run (16 loops, 23 bridges; the two function-entry traces `use_int`
+# and `use_contains` are ones PyPy compiles too).
+# The wasm guest runs the minor-GC schedule off its allocation
 # volume, and moving the builtin module from each ExecutionContext to the
 # object space changed that volume. At the 4MB pin loops and bridges match
 # the baseline; the band covers guard_failures only. The width is the

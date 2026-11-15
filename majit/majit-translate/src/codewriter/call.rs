@@ -5697,9 +5697,10 @@ impl CallControl {
     }
 
     /// Field-row owner for ARRAY.OF. Prefer a harvested instantiation
-    /// (`get_ll_dict` DICTENTRY) when interned OF kept `<K,V>`; fall back
-    /// to the TypeDecl template when that key is absent (one-word keys
-    /// share the template layout).
+    /// (`get_ll_dict` DICTENTRY) when interned OF kept `<K,V>`. The
+    /// TypeDecl template is used only when both the instantiation and the
+    /// template have registered layouts with equal `size`, `align`,
+    /// `gckind` and `fields` (`get_interiorfield_descr` keys on ARRAY.OF).
     fn array_of_field_owner(&self, elem_name: &str) -> Option<String> {
         let compact = elem_name.replace(", ", ",");
         if self.struct_fields.fields.contains_key(&compact) {
@@ -5709,7 +5710,16 @@ impl CallControl {
         if template.as_ref() != compact.as_str()
             && self.struct_fields.fields.contains_key(template.as_ref())
         {
-            return Some(template.into_owned());
+            let actual = self.struct_layout_for(&compact)?;
+            let generic = self.struct_layout_for(template.as_ref())?;
+            if actual.size == generic.size
+                && actual.align == generic.align
+                && actual.gckind == generic.gckind
+                && actual.fields == generic.fields
+            {
+                return Some(template.into_owned());
+            }
+            return None;
         }
         None
     }
@@ -24727,6 +24737,139 @@ mod tests {
             .offset();
         assert_eq!(offset, inst_valid);
         assert_ne!(offset, template_valid);
+    }
+
+    /// `get_ll_dict` one DICTENTRYARRAY per DICTKEY: interned ARRAY.OF
+    /// names keep `<K,V>`, so two key sizes mint distinct interior
+    /// descrs (`get_interiorfield_descr` keys on ARRAY).
+    #[test]
+    fn interiorfielddescrof_keyed_two_key_sizes_mint_distinct_descrs() {
+        let template = "two_key_entry::Entry";
+        let narrow_key = "i64";
+        let wide_key = "WideKey";
+        let narrow = format!("{template}<{narrow_key},*mut Inst>");
+        let wide = format!("{template}<{wide_key},*mut Inst>");
+        let template_sid = majit_ir::descr::StructId::from_canonical(template);
+        let narrow_sid = template_sid.instantiate(&format!("<{narrow_key},*mut Inst>"));
+        let wide_sid = template_sid.instantiate(&format!("<{wide_key},*mut Inst>"));
+        let wide_key_sid = majit_ir::descr::StructId::from_canonical(wide_key);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (template.to_string(), Some(template_sid)),
+                (narrow.clone(), Some(narrow_sid)),
+                (wide.clone(), Some(wide_sid)),
+                (wide_key.to_string(), Some(wide_key_sid)),
+            ]));
+        let template_rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut Inst".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let wide_rows = [
+            ("key".into(), wide_key.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut Inst".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            template.to_string(),
+            narrow.clone(),
+            wide.clone(),
+            wide_key.to_string(),
+        ]);
+        let template_layout = StructLayout::from_type_strings(
+            &template_rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let key_sizes = std::collections::HashMap::from([(wide_key.to_string(), 16usize)]);
+        let key_aligns = std::collections::HashMap::from([(wide_key.to_string(), 8usize)]);
+        let wide_layout = StructLayout::from_type_strings(
+            &wide_rows,
+            &names,
+            &key_sizes,
+            &key_aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(template.to_string(), template_rows.to_vec());
+        fields.fields.insert(narrow.clone(), template_rows.to_vec());
+        fields.fields.insert(wide.clone(), wide_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(template_sid, template_layout.clone());
+        cc.set_struct_layout(narrow_sid, template_layout.clone());
+        cc.set_struct_layout(wide_sid, wide_layout.clone());
+
+        let mint = |elem: &str| {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            let arr = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    ("key".into(), LowLevelType::Signed),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))));
+            let atid = format!("GcArray<{elem}>");
+            cc.interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+                .expect("interior field descr")
+                .0
+        };
+        let narrow_descr = mint(&narrow);
+        let wide_descr = mint(&wide);
+        let narrow_ifd = narrow_descr
+            .as_interior_field_descr()
+            .expect("narrow InteriorFieldDescr");
+        let wide_ifd = wide_descr
+            .as_interior_field_descr()
+            .expect("wide InteriorFieldDescr");
+        assert!(!std::sync::Arc::ptr_eq(&narrow_descr, &wide_descr));
+        assert_eq!(narrow_ifd.array_descr().item_size(), template_layout.size);
+        assert_eq!(wide_ifd.array_descr().item_size(), wide_layout.size);
+        assert_eq!(
+            narrow_ifd.field_descr().offset(),
+            template_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("narrow f_valid")
+                .offset
+        );
+        assert_eq!(
+            wide_ifd.field_descr().offset(),
+            wide_layout
+                .fields
+                .iter()
+                .find(|field| field.name == "f_valid")
+                .expect("wide f_valid")
+                .offset
+        );
+        assert_ne!(
+            narrow_ifd.array_descr().item_size(),
+            wide_ifd.array_descr().item_size()
+        );
+        assert_ne!(
+            narrow_ifd.field_descr().offset(),
+            wide_ifd.field_descr().offset()
+        );
+        if crate::layout::target_word_size() == 8 {
+            assert_eq!(narrow_ifd.field_descr().offset(), 8);
+            assert_eq!(wide_ifd.field_descr().offset(), 16);
+            assert_eq!(narrow_ifd.array_descr().item_size(), 32);
+            assert_eq!(wide_ifd.array_descr().item_size(), 40);
+        }
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

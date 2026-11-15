@@ -665,6 +665,39 @@ pub fn keep_operation_unchanged(
     op.clone()
 }
 
+fn interior_array_of_struct_name(
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> Option<&str> {
+    match &arr.OF {
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
+            Some(s._name.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Keep emitted ARRAY `a` when `from_ct` `b` is its TypeDecl template
+/// (`b.OF._name == strip_generic_args(a.OF._name)`). `jtransform.py
+/// rewrite_op_getinteriorfield` sets `ARRAY = op.args[0].concretetype.TO`;
+/// `rordereddict.py get_ll_dict` builds one DICTENTRYARRAY per
+/// DICTKEY/DICTVALUE, so a template ARRAY must not replace that instance.
+fn prefer_emitted_interior_array(
+    emitted: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
+    from_ct: crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    match emitted {
+        Some(a) if a != &from_ct => {
+            let keep = interior_array_of_struct_name(a)
+                .zip(interior_array_of_struct_name(&from_ct))
+                .is_some_and(|(a_name, b_name)| {
+                    b_name == majit_ir::descr::strip_generic_args(a_name).as_ref()
+                });
+            if keep { a.clone() } else { from_ct }
+        }
+        _ => from_ct,
+    }
+}
+
 /// JIT graph transformer.
 ///
 /// RPython equivalent: `jtransform.py` class `Transformer`.
@@ -11534,6 +11567,9 @@ impl<'a> Transformer<'a> {
     /// `jtransform.py rewrite_op_getinteriorfield`:
     /// `ARRAY = op.args[0].concretetype.TO` then
     /// `cpu.interiorfielddescrof(ARRAY, name)`.
+    /// `rordereddict.py get_ll_dict` mints one DICTENTRYARRAY per
+    /// DICTKEY/DICTVALUE; a template ARRAY.OF must not replace that
+    /// concrete ARRAY already on the op.
     fn rewrite_op_getinteriorfield(
         &mut self,
         op: &SpaceOperation,
@@ -11560,7 +11596,7 @@ impl<'a> Transformer<'a> {
         if let Some(from_ct) =
             crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
         {
-            array = Some(from_ct);
+            array = Some(prefer_emitted_interior_array(array.as_ref(), from_ct));
         }
         if array != had_array {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -11580,6 +11616,8 @@ impl<'a> Transformer<'a> {
 
     /// `jtransform.py rewrite_op_setinteriorfield`:
     /// `interiorfielddescrof(v_inst.concretetype.TO, c_field.value)`.
+    /// Same ARRAY.OF rule as `rewrite_op_getinteriorfield`
+    /// (`rordereddict.py get_ll_dict`).
     fn rewrite_op_setinteriorfield(
         &mut self,
         op: &SpaceOperation,
@@ -11608,7 +11646,7 @@ impl<'a> Transformer<'a> {
         if let Some(from_ct) =
             crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
         {
-            array = Some(from_ct);
+            array = Some(prefer_emitted_interior_array(array.as_ref(), from_ct));
         }
         if array != had_array {
             return RewriteResult::Replace(vec![SpaceOperation {
