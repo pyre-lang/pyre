@@ -8199,6 +8199,10 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     // jitcode. `snapshot_sym` stays live for this full-body walk.
     let sym = unsafe { &*prep.sym_ptr };
     let exc_before_subwalk = ctx.last_exc_value();
+    // A `'v'` boxed descent hands its return back to this walk, which is
+    // still inside the CALL at `op_pc`: the return is not that CALL's result.
+    let saved_call_entry_helper_chain = ctx.fbw_mode.call_entry_helper_chain;
+    ctx.fbw_mode.call_entry_helper_chain |= boxed_out.is_some() && dst_bank == 'v';
     let walk = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
@@ -8211,6 +8215,7 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
         &ref_concretes,
         &float_oprefs,
     );
+    ctx.fbw_mode.call_entry_helper_chain = saved_call_entry_helper_chain;
     let (walk_outcome, _walk_start) = match walk {
         // The body reached a helper this build did not lower.  The arms an
         // exact builtin takes are reads that allocate at most their result,
@@ -8283,7 +8288,14 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     if boxed_out.is_some() {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        // A `'v'` boxed descent (`orthodox_helper_boxed`) hands its result
+        // back to the walk: the enclosing CALL has not produced its own
+        // result yet, so this is not `make_result_of_lastop`, and
+        // `residual_dest_written` must stay clear for an abort to resume at
+        // that CALL.
+        if dst_bank != 'v' {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        }
     } else {
         write_no_driver_finishframe_dest(
             ctx,

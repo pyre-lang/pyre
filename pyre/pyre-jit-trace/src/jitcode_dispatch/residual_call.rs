@@ -1518,19 +1518,30 @@ pub(crate) fn abort_latch_resume_pc<Sym: WalkSym>(
 /// Whether a helper abort / `blackhole_if_trace_too_long` (`pyjitpl.py`)
 /// must resume the enclosing Python CALL instead of this helper.
 ///
-/// `HelperReturn::CalleePrologue` (`call_trace` / nested `gettrace`):
-/// `pyframe.py execute_frame` runs the helper before the body; its void
-/// return is not the CALL's result. The helper is not latched as innermost
-/// (`blackhole.py convert_and_run_from_pyjitpl` would dest-write a generic
-/// object into the CALL). Too-long still uses [`helper_too_long_decision`];
-/// a declined latch with nothing executed Aborts so the enclosing Python
-/// CALL latches the CALL-entry image. Converted helpers latch as their own
-/// frames.
+/// A helper whose return is not the CALL's result, or any helper nested
+/// under one, is not latched: `blackhole.py convert_and_run_from_pyjitpl`
+/// would dest-write the helper's return into the CALL.
+///
+/// - `HelperReturn::CalleePrologue` (`call_trace` / nested `gettrace`):
+///   `pyframe.py execute_frame` runs the helper before the body, and its
+///   void return is not the CALL's result.
+/// - [`FbwWalkMode::call_entry_helper_chain`]: a `'v'` boxed descent whose
+///   return the walk takes back while still inside the CALL, as with
+///   `_match_signature`'s `space.newdict(kwargs=True)`, and every helper
+///   below it.
+///
+/// A `Converted` descent that writes its return to the CALL's dest still
+/// latches as its own frame.
+///
+/// Too-long still uses [`helper_too_long_decision`]; a declined latch with
+/// nothing executed Aborts so the enclosing Python CALL latches the
+/// CALL-entry image.
 pub(crate) fn helper_blackhole_resumes_at_call<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
     ctx.fbw_mode.transparent_helper_subwalk
-        && ctx.fbw_mode.helper_return == HelperReturn::CalleePrologue
+        && (ctx.fbw_mode.helper_return == HelperReturn::CalleePrologue
+            || ctx.fbw_mode.call_entry_helper_chain)
 }
 
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
@@ -1543,7 +1554,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         return false;
     }
     if helper_blackhole_resumes_at_call(ctx) {
-        latchdbg!("origin={origin} callee-prologue-call-entry");
+        latchdbg!("origin={origin} call-entry-helper");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {

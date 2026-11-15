@@ -2352,6 +2352,19 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// When the prologue itself returns, the Python walk's check at the
     /// callee's first step latches the callee-entry multi-frame image.
     pub helper_return: HelperReturn,
+    /// Whether this walk, or a helper walk enclosing it, is a descent whose
+    /// return the walk takes back (`orthodox_helper_boxed`, bank `'v'`)
+    /// instead of writing it to the CALL's result. Nested walks inherit it
+    /// while [`Self::helper_return`] restarts from `CallResult`.
+    ///
+    /// Such a helper runs inside a CALL the walk performs itself, such as
+    /// `argument.py _match_signature`'s `space.newdict(kwargs=True)`. No
+    /// `MIFrame` holds the code between the helper's return and the CALL's
+    /// result, so a blackhole image that ends in that helper or below it
+    /// writes the helper's return into the CALL's result register.
+    /// `latch_abort_blackhole` declines under it, and the enclosing Python
+    /// CALL latches its CALL-entry image instead.
+    pub(crate) call_entry_helper_chain: bool,
     /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
     /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
     /// again so convert vs residualize is per-CALL
@@ -2429,6 +2442,7 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             transparent_helper_subwalk: self.transparent_helper_subwalk,
             transparent_helper_jitcode_index: self.transparent_helper_jitcode_index,
             helper_return: self.helper_return,
+            call_entry_helper_chain: self.call_entry_helper_chain,
             transparent_helper_effects_at_entry: self.transparent_helper_effects_at_entry,
             transparent_helper_journal_at_entry: self.transparent_helper_journal_at_entry,
             transparent_helper_heap_writing_at_entry: self.transparent_helper_heap_writing_at_entry,
@@ -2465,6 +2479,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             helper_return: HelperReturn::CallResult,
+            call_entry_helper_chain: false,
             transparent_helper_effects_at_entry: None,
             transparent_helper_journal_at_entry: None,
             transparent_helper_heap_writing_at_entry: None,
