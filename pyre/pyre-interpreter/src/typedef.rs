@@ -16767,17 +16767,18 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::with_roots!(w_type, w_value => {
             check_set_special_type_attr(w_type, w_value, "__bases__")
         })?;
-        let type_name = pyre_object::w_type_get_name(w_type);
         if w_value.is_null() || !pyre_object::is_tuple(w_value) {
             return Err(crate::PyError::type_error(format!(
-                "can only assign tuple to {type_name}.__bases__, not {}",
+                "can only assign tuple to {}.__bases__, not {}",
+                pyre_object::w_type_get_name(w_type),
                 crate::error::type_name_of(w_value)
             )));
         }
         let n = pyre_object::w_tuple_len(w_value);
         if n == 0 {
             return Err(crate::PyError::type_error(format!(
-                "can only assign non-empty tuple to {type_name}.__bases__, not ()"
+                "can only assign non-empty tuple to {}.__bases__, not ()",
+                pyre_object::w_type_get_name(w_type)
             )));
         }
         // typeobject.py:1108-1115 — reject cycles and non-class entries
@@ -16797,7 +16798,8 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
             if !pyre_object::is_type(w_base) {
                 return Err(crate::PyError::type_error(format!(
-                    "{type_name}.__bases__ must be tuple of classes, not '{}'",
+                    "{}.__bases__ must be tuple of classes, not '{}'",
+                    pyre_object::w_type_get_name(w_type),
                     crate::error::type_name_of(w_base)
                 )));
             }
