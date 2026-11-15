@@ -8,8 +8,9 @@ use crate::pypyjit_driver_layout;
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
-    BridgeInlineCarrier, BridgeVirtualCache, JitDriverStaticData, JitState, PendingRefArrayWrite,
-    ReconstructRecipe, TraceAction, TraceCtx, decode_fieldnum, materialize_bridge_virtual,
+    BridgeInlineCarrier, BridgeVirtualCache, GreenRefPin, JitDriverStaticData, JitState,
+    PendingRefArrayWrite, ReconstructRecipe, TraceAction, TraceCtx, decode_fieldnum,
+    materialize_bridge_virtual,
 };
 #[cfg(test)]
 use pyre_interpreter::{locals_w, locals_w_mut};
@@ -818,11 +819,21 @@ pub fn ensure_finish_setup() {
 /// `code` is the wrapper, never a raw `CodeObject*`.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
+    if code.is_null() {
+        if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
+            return existing;
+        }
+        return METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None));
+    }
+    // Nursery `PyCode` (`pycode.py` `class PyCode(W_Root)` /
+    // `malloc_fixedsize`): `ensure_majit_jitcode` compiles and can collect.
+    // Pin the wrapper and re-read it (`gctransform/shadowstack.py`
+    // `push_roots`). `compiled_jitcode_lookup` unwraps via
+    // `w_code_get_ptr`; a from-space copy is a use-after-free.
+    let pin = GreenRefPin::pin_one(code as usize);
+    let code = pin.get() as *const ();
     if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
         return existing;
-    }
-    if code.is_null() {
-        return METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None));
     }
     let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
     if !raw_code.is_null() {
@@ -832,20 +843,17 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
                 code
             )
         });
-        // `ensure_majit_jitcode` compiles and can collect. The inner
-        // `CodeObject` is immortal; look up by that key after the call
-        // rather than the copied wrapper (`gctransform/shadowstack.py`).
-        if !(callbacks.ensure_majit_jitcode)(raw_code, code) {
+        if !(callbacks.ensure_majit_jitcode)(raw_code, pin.get() as *const ()) {
             return std::ptr::null();
         }
         if let Some(existing) =
-            METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(raw_code as *const ()))
+            METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(pin.get() as *const ()))
         {
             return existing;
         }
         return std::ptr::null();
     }
-    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None))
+    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(pin.get() as *const (), None))
 }
 
 /// Install one CodeWriter-owned PyJitCode payload into trace-side
@@ -988,7 +996,7 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
 }
 
 /// `framework.py root_walker.walk_roots` parity for the persistent
-/// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
+/// `MetaInterpStaticData.jitcodes` list (warmspot.py
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
 /// wrapper is the payload `w_code` slot.
 ///
@@ -1032,14 +1040,6 @@ fn walk_jitcode_code_roots_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    let mut visit_one = |wrapper: &mut pyre_object::PyObjectRef| {
-        if *wrapper as usize == 0 {
-            return;
-        }
-        let root =
-            unsafe { &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
-        visitor(root);
-    };
     for jc in sd.jitcodes.iter() {
         walk_payload_w_code(&jc.payload, visitor);
     }
@@ -1457,10 +1457,14 @@ pub(crate) fn sub_jitcode_body_for_code(
     if code.is_null() {
         return None;
     }
-    if jitcode_for(code).is_null() {
+    // `jitcode_for` compiles (`call.py` `get_jitcode`). Pin across that
+    // call and re-read before `pyjitcode_for_code` (`canonical_code_key_opt`
+    // → `w_code_get_ptr`; `gctransform/shadowstack.py` `push_roots`).
+    let pin = GreenRefPin::pin_one(code as usize);
+    if jitcode_for(pin.get() as *const ()).is_null() {
         return None;
     }
-    let pjc = pyjitcode_for_code(code)?;
+    let pjc = pyjitcode_for_code(pin.get() as *const ())?;
     sub_jitcode_body_from_payload(&pjc)
 }
 
@@ -1532,10 +1536,16 @@ pub(crate) type SubDescrPool = (
 /// refinements, not per trace attempt). `'static` coerces to the walker's
 /// `'static_a`.
 pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDescrPool> {
-    if code.is_null() || jitcode_for(code).is_null() {
+    if code.is_null() {
         return None;
     }
-    let pjc = pyjitcode_for_code(code)?;
+    // `jitcode_for` compiles. Pin and re-read before the payload lookup
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let pin = GreenRefPin::pin_one(code as usize);
+    if jitcode_for(pin.get() as *const ()).is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(pin.get() as *const ())?;
     Some(sub_descr_pool_for_payload(&pjc))
 }
 
@@ -15730,7 +15740,6 @@ mod tests {
                 py_floor_by_jit_pc: Vec::new(),
                 py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
-                resume_entry_by_py_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
                 dispatch_switch_pc: None,
@@ -15740,7 +15749,6 @@ mod tests {
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
-                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),
@@ -15938,7 +15946,6 @@ mod tests {
                 py_floor_by_jit_pc: Vec::new(),
                 py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
-                resume_entry_by_py_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
                 dispatch_switch_pc: None,
@@ -15948,7 +15955,6 @@ mod tests {
                 depth_trivia_marker_by_jit_pc: vec![(portal_live_pc, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
-                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),
@@ -17389,7 +17395,15 @@ fn recipe_frame_live_w_globals(
         && !frame_ref.is_null()
         && frame_ref != majit_ir::GcRef::NO_CONCRETE
     {
-        let frame = frame_ref.as_usize() as *mut pyre_interpreter::PyFrame;
+        // `PyFrame.pycode == w_code` is pointer identity. Pin both words
+        // before the compare (`gctransform/shadowstack.py` `push_roots`).
+        let _id_roots = pyre_object::gc_roots::push_roots();
+        let id_slot = _id_roots.pin_roots(&[
+            w_code as pyre_object::PyObjectRef,
+            frame_ref.as_usize() as pyre_object::PyObjectRef,
+        ]);
+        let w_code = _id_roots.get(id_slot) as *const ();
+        let frame = _id_roots.get(id_slot + 1) as *mut pyre_interpreter::PyFrame;
         if unsafe { (*frame).pycode == w_code } {
             let g = unsafe { (*frame).get_w_globals() };
             if !g.is_null() {
@@ -17471,6 +17485,11 @@ pub(crate) fn assemble_bridge_inline_pending(
     // `getcode(callable)`, so keying the reconstructed frame's greenkey by it
     // preserves the recursion-depth / inline-position identity.
     let w_code = recover_inline_callee_code(recipe.jitcode_index) as *const ();
+    // Nursery `PyCode`: pin before `recover_inline_callee_globals_from_recipe`
+    // / `recipe_slot_to_pyobj` / `jitcode_for` (`gctransform/shadowstack.py`
+    // `push_roots`). Re-read the slot at every use.
+    let _pending_roots = pyre_object::gc_roots::push_roots();
+    let pending_code_slot = _pending_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
 
     // pyframe.py get_w_globals: the resume-decoded callee frame, when it
     // still has a concrete `PyFrame` or a heapcached `debugdata` override,
@@ -17483,6 +17502,9 @@ pub(crate) fn assemble_bridge_inline_pending(
         !w_globals.is_null(),
         "setup_reconstructed_callee_frame declined a PY_NULL globals result"
     );
+    let _ = _pending_roots.pin_root(w_globals);
+    let pending_ns_slot = pending_code_slot + 1;
+    let w_code = _pending_roots.get(pending_code_slot) as *const ();
 
     // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
     // into the symbolic frame below. `setup_reconstructed_callee_frame`
@@ -17530,6 +17552,7 @@ pub(crate) fn assemble_bridge_inline_pending(
         concrete_stack.push(concrete_value_from_slot(recipe_slot_to_pyobj(live)));
     }
     sym.concrete_stack = concrete_stack;
+    let w_globals = _pending_roots.get(pending_ns_slot);
     sym.publish_concrete_namespace(w_globals);
     sym.frame_w_globals = ctx.const_ref(sym.current_concrete_namespace() as usize as i64);
     sym.concrete_execution_context = execution_context;
@@ -17562,8 +17585,12 @@ pub(crate) fn assemble_bridge_inline_pending(
         // The reconstructed frame represents the same inlined call the
         // forward trace pushed at function entry; match its (code, 0)
         // greenkey identity for recursion-depth + inline-position tracking.
-        green_key: crate::driver::make_green_key(w_code, 0, is_being_profiled),
-        green_key_raw: (w_code as usize, 0),
+        green_key: crate::driver::make_green_key(
+            _pending_roots.get(pending_code_slot) as *const (),
+            0,
+            is_being_profiled,
+        ),
+        green_key_raw: (_pending_roots.get(pending_code_slot) as usize, 0),
         parent_frames,
         nargs: recipe.nargs,
         caller_result_stack_idx: None,
@@ -18038,10 +18065,15 @@ fn resume_reconstructed_callee_frame(
         return None;
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let pin = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(frame_ref.as_usize() as pyre_object::PyObjectRef);
-    let concrete_frame =
-        pyre_object::gc_roots::shadow_stack_get(pin) as *mut pyre_interpreter::PyFrame;
+    // Pin the frame and the nursery `W_Code` together: `pin_root` can
+    // collect, and `PyFrame.pycode == w_code` is pointer identity
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let pin = _roots.pin_roots(&[
+        frame_ref.as_usize() as pyre_object::PyObjectRef,
+        w_code as pyre_object::PyObjectRef,
+    ]);
+    let concrete_frame = _roots.get(pin) as *mut pyre_interpreter::PyFrame;
+    let w_code = _roots.get(pin + 1) as *const ();
     if concrete_frame.is_null() {
         return None;
     }
@@ -18296,13 +18328,21 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
 
     let w_code = recover_inline_callee_code(recipe.jitcode_index) as *const ();
+    // Nursery `PyCode`: pin before `recover_inline_callee_globals_from_recipe`
+    // / `restamp` / `resume_reconstructed_callee_frame`
+    // (`gctransform/shadowstack.py` `push_roots`).
+    let _setup_roots = pyre_object::gc_roots::push_roots();
+    let setup_code_slot = _setup_roots.pin_roots(&[w_code as pyre_object::PyObjectRef]);
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
     if w_globals.is_null() {
         return None;
     }
+    let _ = _setup_roots.pin_root(w_globals);
+    let setup_ns_slot = setup_code_slot + 1;
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     // The resume section's own frame red (`resume.py consume_boxes`).
     // Building a second frame would split the traceback `f_back` chain.
+    let w_code = _setup_roots.get(setup_code_slot) as *const ();
     let resumed = if w_code.is_null() {
         None
     } else {
@@ -18347,6 +18387,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // A callee whose payload carries no owner PyCode cannot receive a
     // concrete frame; its residual calls and the blackhole preflight would
     // both decline on the unset frame pointer, so decline here.
+    let w_code = _setup_roots.get(setup_code_slot) as *const ();
     if w_code.is_null() {
         return None;
     }
@@ -18400,14 +18441,19 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // frontend op becomes its trace root.
         let concrete_roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
-        let _ = pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(_setup_roots.get(setup_code_slot));
+        let _ = pyre_object::gc_roots::pin_root(_setup_roots.get(setup_ns_slot));
         // Pin the parent-trace frame before reading it: a nursery object
         // moves on the FrameBox allocation below. Dead locals at the
         // loop-header live list (`get_list_of_active_boxes`) still sit in
         // that array; `consume_virtualizable_boxes` does not write them,
         // and the prefix and operand pins both fall back to it.
-        let orig_frame = original_callee_concrete_frame(ctx, recipe, w_code, stack_base);
+        let orig_frame = original_callee_concrete_frame(
+            ctx,
+            recipe,
+            pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            stack_base,
+        );
         if let Some(orig) = orig_frame {
             let _ = pyre_object::gc_roots::pin_root(orig as pyre_object::PyObjectRef);
         }

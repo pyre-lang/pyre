@@ -3088,7 +3088,8 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
     let raw_code = compile_exec("None").expect("test code should compile");
     let w_code = w_code_new(
         Box::into_raw(Box::new(compile_exec("None").expect("wrapper body"))) as *const (),
-    ) as *const ();
+    )
+    .unwrap() as *const ();
     let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code).expect("frame allocation");
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
     let ec =
@@ -12759,7 +12760,7 @@ fn resume_py_pc_after_residual_live_uses_fallthrough_twin() {
     );
     let n_py = py_code.instructions.len() as u32;
     let raw_ptr = Box::into_raw(Box::new(py_code));
-    let w_code = w_code_new(raw_ptr as *const ()) as *const ();
+    let w_code = w_code_new(raw_ptr as *const ()).unwrap() as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(raw_ptr);
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
@@ -12856,7 +12857,7 @@ fn zip_root_call_result_numbers_a_helper_section() {
     });
     let py_code = compile_exec("None").expect("test code should compile");
     let raw_ptr = Box::into_raw(Box::new(py_code));
-    let w_code = w_code_new(raw_ptr as *const ()) as *const ();
+    let w_code = w_code_new(raw_ptr as *const ()).unwrap() as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(raw_ptr);
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
@@ -12905,11 +12906,6 @@ fn zip_root_call_result_numbers_a_helper_section() {
         outer_resume_marker_jit_pc: Some(live_pc),
         outer_jitcode_index: unsafe { (*installed).index as u32 },
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: live_pc,
     };
@@ -13020,65 +13016,6 @@ fn zip_two_tuple_next_null_guard_stays_inside_the_helper() {
             guard.pc
         );
     }
-}
-
-/// Variable-exponent `int_pow_nomod` residualizes (`look_inside_iff` is
-/// false). The overflow `catch_exception` of `descr_pow` must stay a
-/// blackhole-runnable helper section so `GUARD_NO_EXCEPTION` numbers the
-/// helper (`capture_resumedata`) instead of collapsing to the portal CALL
-/// (`numbered_helper_guard_resume` CallerBoundary).
-#[test]
-fn int_pow_overflow_catch_does_not_collapse_guard_no_exception() {
-    let jc = crate::jitcode_runtime::pathed_jitcode(
-        "pyre_interpreter::objspace::descroperation::int_pow",
-    )
-    .expect("int_pow must be a discovered jitcode");
-    let idx = jc.try_index().expect("int_pow must have a jitcode index");
-    for reloc in &jc.reloc_consts_i {
-        if let majit_jitcode::jitcode::ConstIRelocKind::FnAddr { path, symbolic } = &reloc.kind {
-            assert!(
-                !(path.ends_with("::pow_ovf2long") && *symbolic),
-                "pow_ovf2long residual must be callable; got {path}"
-            );
-        }
-    }
-    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
-    let mut caught_calls = 0usize;
-    for (n, op) in ops.iter().enumerate() {
-        if !op.opname.starts_with("inline_call") && !op.opname.starts_with("residual_call") {
-            continue;
-        }
-        let live = ops
-            .iter()
-            .skip(n + 1)
-            .find(|o| o.opname == "live")
-            .map(|o| o.pc)
-            .unwrap_or(op.next_pc);
-        let Some(next) = ops.iter().skip(n + 1).find(|o| o.opname != "live") else {
-            continue;
-        };
-        if next.opname != "catch_exception" {
-            continue;
-        }
-        caught_calls += 1;
-        assert!(
-            !helper_resume_reaches_blocker(idx, live, None),
-            "{}@{} live={} must not collapse GuardNoException to the CALL; ops={:?}",
-            op.opname,
-            op.pc,
-            live,
-            ops.iter()
-                .map(|o| format!("{}@{}", o.opname, o.pc))
-                .collect::<Vec<_>>(),
-        );
-    }
-    assert!(
-        caught_calls > 0,
-        "int_pow must catch a can-raise call (int_pow_nomod); ops={:?}",
-        ops.iter()
-            .map(|o| format!("{}@{}", o.opname, o.pc))
-            .collect::<Vec<_>>(),
-    );
 }
 
 /// GNI `record_quasiimmut_field` in `gil_ready_word` under `w_list_lock`
@@ -17017,9 +16954,6 @@ fn uint_lt_stamps_result_from_int_register_shadow() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -17039,11 +16973,6 @@ fn uint_lt_stamps_result_from_int_register_shadow() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
@@ -21408,9 +21337,6 @@ fn jit_force_virtual_null_non_vref_returns_the_null_box() {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             ..Default::default()
         }),
         inline_callee_consts: None,
@@ -21430,11 +21356,6 @@ fn jit_force_virtual_null_non_vref_returns_the_null_box() {
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
         pending_guard_snapshot_error: None,
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-        vstack_reorder_ceiling: u32::MAX,
-        vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };

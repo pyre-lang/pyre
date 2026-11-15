@@ -475,6 +475,13 @@ impl CallControl {
         // rebuilt when a later registration carries a different merge-point
         // PC: pyre observes merge-point PCs at runtime, but the first
         // registration's skeleton stands (no recompile-on-refine).
+        // Nursery `PyCode` (`pycode.py` `class PyCode(W_Root)` /
+        // `malloc_fixedsize`): pin before `pin_code_unit` / skeleton
+        // insert, which can collect, and stamp the forwarded word
+        // (`gctransform/shadowstack.py` `push_roots`).
+        let roots = pyre_object::gc_roots::push_roots();
+        let w_slot = roots.base();
+        let _ = roots.pin_root(w_code as pyre_object::PyObjectRef);
         let needs_rebuild = !self.jitcodes.contains_key(&key);
         if needs_rebuild {
             // The payload keeps this raw body address and trace-side readers
@@ -488,12 +495,12 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.reset_jitcode_skeleton(key, code_ptr, w_code);
+            self.reset_jitcode_skeleton(key, code_ptr, roots.get(w_slot) as *const ());
             // call.py `self.unfinished_graphs.append(graph)`.
             self.unfinished_graphs.push(code_ptr);
         }
         let pyjit = std::sync::Arc::clone(self.jitcodes.get(&key).unwrap());
-        pyjit.stamp_w_code(w_code);
+        pyjit.stamp_w_code(roots.get(w_slot) as *const ());
         pyjit
     }
 

@@ -1482,7 +1482,7 @@ impl MIFrame {
         // frame-less MIFrame did before. `last_instr` / `valuestackdepth` stay
         // sourced from `concrete_frame_addr` below.
         let wrapper = if !self.sym().jitcode.is_null() {
-            unsafe { (*self.sym().jitcode).payload.w_code.get() as pyre_object::PyObjectRef }
+            unsafe { (&(*self.sym().jitcode).payload).w_code.get() as pyre_object::PyObjectRef }
         } else {
             pyre_object::PY_NULL
         };

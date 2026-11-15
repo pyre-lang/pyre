@@ -18589,8 +18589,8 @@ impl CodeWriter {
 
         // The assembler refill has no wrapper of its own. Copy the
         // skeleton stamp (`get_jitcode` at enqueue) onto the new
-        // payload; `replace_with` also keeps a non-zero skeleton slot
-        // when this value is null.
+        // payload after assemble: `walk_writer_jitcode_code_roots`
+        // forwards that slot on a minor (`gctransform/shadowstack.py`).
         let payload_w_code = self
             .callcontrol()
             .jitcodes
@@ -18800,6 +18800,11 @@ fn function_entry_green_pc(code: &CodeObject) -> Option<usize> {
 pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool {
     let writer = CodeWriter::instance();
     let code_ptr = code as *const pyre_interpreter::CodeObject;
+    // Nursery `PyCode`: pin across the compiled-arc lookup / stamp /
+    // `get_jitcode` (`gctransform/shadowstack.py` `push_roots`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_slot = roots.base();
+    let _ = roots.pin_root(w_code as pyre_object::PyObjectRef);
     // `call.py get_jitcode` / `self.jitcodes[graph]` after the one
     // `codewriter.py make_jitcodes` drain. RPython runs that drain once at
     // warmspot; a later `compile_and_run_once` of the same portal only looks
@@ -18815,7 +18820,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *c
             .is_some()
     {
         if let Some(existing) = writer.callcontrol().find_compiled_jitcode_arc(code_ptr) {
-            existing.stamp_w_code(w_code);
+            existing.stamp_w_code(roots.get(w_slot) as *const ());
         }
         return true;
     }
@@ -18832,7 +18837,9 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *c
     // Stamp the portal wrapper on the skeleton before
     // `grab_initial_jitcodes` queues the same graph with no wrapper
     // of its own. Cache-hit `get_jitcode` keeps this stamp.
-    let _ = writer.callcontrol().get_jitcode(code, w_code);
+    let _ = writer
+        .callcontrol()
+        .get_jitcode(code, roots.get(w_slot) as *const ());
     // codewriter.py `make_jitcodes()` — drain everything pending.
     let jitcodes = writer.make_jitcodes();
     // RPython warmspot.py:281-282 stores the complete
@@ -18982,10 +18989,16 @@ pub fn compile_jitcode_for_callee(
     w_code: *const (),
 ) -> Vec<std::sync::Arc<PyJitCode>> {
     let writer = CodeWriter::instance();
+    // Nursery `PyCode`: pin across `get_jitcode` (`gctransform/shadowstack.py`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_slot = roots.base();
+    let _ = roots.pin_root(w_code as pyre_object::PyObjectRef);
     // call.py `get_jitcode(graph)` — insert skeleton if missing and
     // queue the graph for the drain. Stamp `payload.w_code` at enqueue
     // from the wrapper the caller already holds.
-    let _ = writer.callcontrol().get_jitcode(code, w_code);
+    let _ = writer
+        .callcontrol()
+        .get_jitcode(code, roots.get(w_slot) as *const ());
     // codewriter.py:79-85 — drain the queued graph(s), then assembler.finished.
     writer.drain_unfinished_graphs()
 }
@@ -19006,11 +19019,17 @@ pub fn ensure_trace_jitcode_for_w_code(
     raw_code: *const pyre_interpreter::CodeObject,
     w_code: *const (),
 ) -> Option<std::sync::Arc<PyJitCode>> {
-    let pyjit = compile_jitcode_via_raw_code(raw_code, w_code)?;
-    // `compile_jitcode_via_raw_code` can collect. The inner `CodeObject` is
-    // immortal, so install under that key (`gctransform/shadowstack.py`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_slot = roots.base();
+    let _ = roots.pin_root(w_code as pyre_object::PyObjectRef);
+    let pyjit = compile_jitcode_via_raw_code(raw_code, roots.get(w_slot) as *const ())?;
+    // `compile_jitcode_via_raw_code` can collect. SD lookup keys by
+    // `canonical_code_key_opt` (`w_code_get_ptr` on a `PyCode` wrapper);
+    // a raw `CodeObject*` here is read as a wrapper and misses the
+    // already-stamped slot, then `stamp_payload_index` panics
+    // (`codewriter.py` `jitcode.index = index` once).
     pyre_jit_trace::state::install_jitcode_for(
-        raw_code as *const (),
+        roots.get(w_slot) as *const (),
         std::sync::Arc::clone(&pyjit),
     );
     Some(pyjit)
@@ -19046,8 +19065,8 @@ fn compile_jitcode_via_raw_code(
     // before the drain.
     let _ = CodeWriter::instance()
         .callcontrol()
-        .get_jitcode(code, w_code);
-    let drained = compile_jitcode_for_callee(code, w_code);
+        .get_jitcode(code, roots.get(w_slot) as *const ());
+    let drained = compile_jitcode_for_callee(code, roots.get(w_slot) as *const ());
     if !drained.is_empty() {
         pyre_jit_trace::state::install_jitcodes(drained);
     }
@@ -21421,7 +21440,7 @@ mod tests {
         // the drain refill copies that stamp onto the populated payload.
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
 
@@ -21449,7 +21468,7 @@ mod tests {
         // root walk must forward that slot without waiting for sd.jitcodes.
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
 

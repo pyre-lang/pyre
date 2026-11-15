@@ -369,6 +369,57 @@ impl Drop for CaptureScratch<'_> {
     }
 }
 
+/// Number each paused caller once, outermost-first.
+///
+/// `opencoder.py` `capture_resumedata` / `_ensure_parent_resumedata`
+/// walks `metainterp.framestack` and numbers each `MIFrame` once
+/// (`ResumeDataLoopMemo.number`). Each `InlineFrame.parents` is the paused
+/// chain this level recorded at enter: Python-to-Python stores the
+/// immediate caller, a helper-reached portal copies the parked driver
+/// helpers (`recursive_portal_inline_parents`). Concatenating every list
+/// duplicates that helper prefix, so a guard inside `__index__` from
+/// `range(...)` rebuilt `w_range_new_stop` / `range_index_bound` /
+/// `space_index` twice (`blackhole.py` `convert_and_run_from_pyjitpl`).
+fn framestack_resume_parent_frames(framestack: &[InlineFrame]) -> Vec<InlineParentFrame> {
+    let mut chain = Vec::new();
+    for frame in framestack {
+        extend_resume_parent_chain(&mut chain, &frame.parents);
+    }
+    chain
+}
+
+fn extend_resume_parent_chain(chain: &mut Vec<InlineParentFrame>, parents: &[InlineParentFrame]) {
+    if parents.is_empty() {
+        return;
+    }
+    let mut overlap = 0;
+    let max = chain.len().min(parents.len());
+    for candidate in (1..=max).rev() {
+        if chain[chain.len() - candidate..]
+            .iter()
+            .zip(&parents[..candidate])
+            .all(|(a, b)| same_paused_helper_parent(a, b))
+        {
+            overlap = candidate;
+            break;
+        }
+    }
+    chain.extend(parents[overlap..].iter().cloned());
+}
+
+/// Cloned helper prefix, not a second Python `MIFrame`.
+///
+/// A helper-reached portal copies the parked driver helpers
+/// (`recursive_portal_inline_parents`); concatenating every
+/// `InlineFrame.parents` list duplicates that prefix. Those clones share a
+/// helper jitcode. Python frames of the same jitcode are distinct recursive
+/// `MIFrame`s (`pyjitpl.py` `newframe` / `perform_call`);
+/// `_ensure_parent_resumedata` (`opencoder.py`) numbers each once.
+fn same_paused_helper_parent(a: &InlineParentFrame, b: &InlineParentFrame) -> bool {
+    a.jitcode_index == b.jitcode_index
+        && crate::state::jitcode_is_transparent_helper(a.jitcode_index as i32)
+}
+
 fn fill_vable_vref_into(
     ctx: &majit_metainterp::TraceCtx,
     vable: &mut Vec<majit_metainterp::recorder::SnapshotTagged>,
@@ -562,16 +613,29 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
         return false;
     }
     let session = ctx.session.borrow();
+    // Helper levels (`w_code == 0`) are looked-inside helper MIFrames, not
+    // Python callees. `capture_resumedata` (`pyjitpl.py`) numbers each
+    // Python `MIFrame`; a helper-reached `perform_call` records the paused
+    // helper on that Python frame's parents
+    // (`recursive_portal_inline_parents`). Counting helpers here made a
+    // helper-reached `__index__` look like a short chain and collapsed
+    // its guards to the CALL (`blackhole.py` `convert_and_run_from_pyjitpl`
+    // re-enters the helper and compiles the dunder as a nested portal).
     let n_parents = session
         .framestack
         .iter()
-        .filter(|frame| !frame.parents.is_empty())
+        .filter(|frame| !frame.is_portal && !frame.is_helper_level() && !frame.parents.is_empty())
         .count();
-    let n_callees = session.inline_depth();
+    let n_callees = session.python_inline_depth();
+    // Helpers sit on `framestack` too (`inline_depth`); they are numbered
+    // from the live helper section, not this Python parent-chain test.
+    if session.inline_depth() < n_callees {
+        return false;
+    }
     let complete = inline_snapshot_has_complete_parent_chain(n_parents, n_callees);
     debug_assert!(
         session
-            .last_inline()
+            .last_python_inline()
             .is_none_or(|frame| frame.parents.is_empty() || complete),
         "inlined level has parents but the chain is incomplete \
          (n_parents={n_parents} n_callees={n_callees}); every admitted \
@@ -708,11 +772,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if inline_subwalk {
         let parent_frames = {
             let session = ctx.session.borrow();
-            session
-                .framestack
-                .iter()
-                .flat_map(|frame| frame.parents.iter().cloned())
-                .collect::<Vec<_>>()
+            framestack_resume_parent_frames(&session.framestack)
         };
         // Fire the multi-frame snapshot only when the paused-caller chain
         // covers the FULL current inline depth. A nested straight-line callee
@@ -2406,8 +2466,11 @@ fn report_caller_image_ref_box<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, col
 }
 
 /// Python `MIFrame` paused under a transparent helper. The helper's own
-/// banks are a different jitcode; `framestack[-1].live` is the caller
-/// (`pyjitpl.py` keeps that frame while the looked-inside body runs).
+/// banks are a different jitcode; the portal or inlined Python callee
+/// below any helper levels holds the caller (`pyjitpl.py` keeps that
+/// frame while the looked-inside body runs). A numbered helper on top
+/// has `live == None`; `last_inline().paused_live()` would miss the
+/// Python banks `bind_paused_caller_regs` stored.
 fn paused_python_live<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<crate::jitcode_dispatch::LiveFrameRegs> {
@@ -2417,7 +2480,9 @@ fn paused_python_live<Sym: WalkSym>(
     ctx.session
         .borrow()
         .framestack
-        .last()
+        .iter()
+        .rev()
+        .find(|frame| !frame.is_helper_level())
         .and_then(|frame| frame.paused_live())
 }
 
@@ -3144,7 +3209,19 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         return Err(unavail("Unavail::Nested/DepthZero"));
     }
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
-    let banks = [ctx.registers_i, ctx.registers_r, ctx.registers_f];
+    // A transparent helper's `ctx.registers_*` are the helper jitcode.
+    // The paused Python `MIFrame` (`bind_paused_caller_regs`) is the
+    // caller `compute_inline_caller_frame` must snapshot
+    // (`pyjitpl.py` keeps that frame while the looked-inside body runs).
+    let paused = paused_python_live(ctx);
+    let paused_regs_r = paused.as_ref().map(|live| live.registers_r.clone());
+    let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
+    let paused_regs_f = paused.as_ref().map(|live| live.registers_f.clone());
+    let registers_r = paused_regs_r.as_ref().unwrap_or(ctx.registers_r);
+    let registers_i = paused_regs_i.as_ref().unwrap_or(ctx.registers_i);
+    let registers_f = paused_regs_f.as_ref().unwrap_or(ctx.registers_f);
+    let caller_state = paused.as_ref().map(|live| live.frame_state().clone());
+    let banks = [registers_i, registers_r, registers_f];
     let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
@@ -3155,9 +3232,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
     let boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
+        registers_i,
+        registers_r,
+        registers_f,
         jitcode_index,
         call_jit_pc,
         caller_liveness_word,
@@ -3194,7 +3271,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > result_slots {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
             let Some(frame_red) = (frame_reg != u16::MAX)
-                .then(|| ctx.registers_r.get(frame_reg as usize))
+                .then(|| registers_r.get(frame_reg as usize))
                 .flatten()
                 .filter(|&r| r != OpRef::NONE)
             else {
@@ -3237,7 +3314,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     caller_liveness_word,
                 );
                 for &color in &banks.ref_ {
-                    let Some(operand) = ctx.registers_r.get(color as usize) else {
+                    let Some(operand) = registers_r.get(color as usize) else {
                         continue;
                     };
                     if operand == OpRef::NONE {
@@ -3299,10 +3376,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         result_slot: CallResultSlot::Unknown,
     }
     .attach_live_caller(
-        ctx.registers_r,
-        ctx.registers_i,
-        ctx.registers_f,
-        &ctx.frame_state,
+        registers_r,
+        registers_i,
+        registers_f,
+        caller_state.as_ref().unwrap_or(&ctx.frame_state),
     )
     .with_caller_py_pc(jitcode_index, call_jit_pc))
 }
@@ -3682,12 +3759,28 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     if ctx.fbw_mode.transparent_helper_subwalk {
         let chain = ctx.session.borrow().helper_chain();
         return Ok(match chain {
-            HelperChain::Numbered => Some(
-                (!ret.resumes_at_call_entry())
-                    .then(|| compute_paused_helper_caller_frame(ctx, call_jit_pc).ok())
-                    .flatten()
-                    .map_or_else(HelperLevel::unresumable, HelperLevel::nested_section),
-            ),
+            HelperChain::Numbered => {
+                // `pyframe.py execute_frame` has no JitCode. A callee
+                // prologue (`executioncontext.py call_trace` /
+                // `gettrace`) under a numbered helper — `space.index`
+                // looking inside `__index__` from `get_and_call_function`
+                // — must not become `Unresumable`. That refuses every
+                // `jit.promote(w_tracefunc)` guard (`callee_inline_unsupported`)
+                // and aborts the enclosing loop. Skip the level so guards
+                // number the enclosing chain and resume at the CALL
+                // (`HelperReturn::CalleePrologue` / `HelperResume::CallEntry`;
+                // `pyjitpl.py` `_opimpl_inline_call1`).
+                if ret == HelperReturn::CalleePrologue {
+                    None
+                } else {
+                    Some(
+                        (!ret.resumes_at_call_entry())
+                            .then(|| compute_paused_helper_caller_frame(ctx, call_jit_pc).ok())
+                            .flatten()
+                            .map_or_else(HelperLevel::unresumable, HelperLevel::nested_section),
+                    )
+                }
+            }
             HelperChain::NoHelper | HelperChain::Collapsed | HelperChain::Unresumable => None,
         });
     }
@@ -3749,6 +3842,40 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
 /// `ResumeDataLoopMemo.number` numbers every framestack level, so the
 /// snapshot is the portal CALL image, the paused driver ancestors, and
 /// this helper at the guard. No `HelperLevel` is pushed.
+/// Journal mark of the outermost live helper, taken at the CALL that
+/// entered the chain (`range(...)` / `space.index`). Nested helpers
+/// (`compute_range_length`) stamp a later mark, after a helper-reached
+/// `__index__` store; using that later mark would CALL-collapse and
+/// re-run the store (`blackhole.py` `convert_and_run_from_pyjitpl`).
+fn outermost_helper_journal_mark<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<FbwEffectJournalMark> {
+    let session = ctx.session.borrow();
+    if let Some(mark) = session
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+        .last()
+        .map(|frame| frame.entry_journal_mark)
+    {
+        return Some(mark);
+    }
+    drop(session);
+    super::inline_call::outermost_paused_driver_helper_journal_mark(ctx)
+        .or(ctx.fbw_mode.transparent_helper_journal_at_entry)
+}
+
+/// `store_attr_direct` bumps the executed odometer without a list/cell
+/// journal entry. CALL-entry collapse re-applies that store
+/// (`capture_converted_driver_helper_guard`; `functional.py` `__index__`).
+fn helper_unjournaled_effect_since(mark: FbwEffectJournalMark) -> bool {
+    let now = fbw_effect_journal_mark();
+    let journaled = fbw_journaled_effect_delta_since(mark);
+    let executed = now.executed.saturating_sub(mark.executed);
+    now.stores > mark.stores || executed > journaled
+}
+
 fn capture_converted_driver_helper_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3773,17 +3900,19 @@ fn capture_converted_driver_helper_guard<Sym: WalkSym>(
     // `__index__` is a pure load; its executed-effect delta is the cell/gc
     // journal of W_Range setfields (`fbw_gc_store_journal_push`) and must
     // keep the CALL-entry snapshot (stable failargs).
-    let Some(mark) = ctx.fbw_mode.transparent_helper_journal_at_entry else {
+    let Some(mark) = outermost_helper_journal_mark(ctx) else {
         return false;
     };
-    let now = fbw_effect_journal_mark();
-    let journaled = fbw_journaled_effect_delta_since(mark);
-    let executed = now.executed.saturating_sub(mark.executed);
-    if now.stores <= mark.stores && executed <= journaled {
+    if !helper_unjournaled_effect_since(mark) {
         return false;
     }
-    let Ok(innermost) = helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope)
-    else {
+    let Ok(innermost) = helper_innermost_resume_frame(
+        ctx,
+        op_pc,
+        after_residual_call,
+        scope,
+        ctx.live_after_jit_pc,
+    ) else {
         return false;
     };
     let mut frames = parent_frames.to_vec();
@@ -3896,12 +4025,17 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // `walker_inline_guard_resumes_in_callee` gives the same Python level.
     let python_chain_complete = {
         let session = ctx.session.borrow();
+        // `skip_while(is_helper_level)` only drops a helper prefix. A
+        // helper-reached Python frame on top stops that skip, then
+        // ancestor helpers with empty `.parents` made the chain look
+        // incomplete. Helpers are numbered from the live helper section
+        // (`helper_innermost_resume_frame` / `capture_resumedata`); only
+        // Python callees need a paused-caller image
+        // (`pyjitpl.py` `MIFrame.perform_call`).
         session
             .framestack
             .iter()
-            .rev()
-            .skip_while(|frame| frame.is_helper_level())
-            .filter(|frame| !frame.is_portal)
+            .filter(|frame| !frame.is_portal && !frame.is_helper_level())
             .all(|frame| !frame.parents.is_empty())
     };
     // `capture_resumedata` numbers every frame on `framestack`. A
@@ -3922,7 +4056,7 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
     // unless a heap write already ran, in which case the guard is refused.
-    let (sections_have_markers, any_blocker) =
+    let (sections_have_markers, any_blocker, _) =
         numbered_helper_sections_blocker_free(ctx, &parent_frames);
     Ok((
         parent_frames,
@@ -3941,7 +4075,11 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
 fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     parent_frames: &[InlineParentFrame],
-) -> (bool /* markers */, bool /* any_blocker */) {
+) -> (
+    bool, /* markers */
+    bool, /* any_blocker */
+    bool, /* trailing_blocker */
+) {
     let session = ctx.session.borrow();
     let helper_level_count = session
         .framestack
@@ -3957,7 +4095,8 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
         .take_while(|frame| frame.is_helper_level())
         .collect();
     let mut sections_have_markers = true;
-    let mut any_blocker = false;
+    let mut ancestor_blocker = false;
+    let mut trailing_blocker = false;
     // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
     for frame in &parent_frames[..split] {
         if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
@@ -3966,12 +4105,12 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
         match frame.resume_marker_jit_pc {
             Some(pc) => {
                 if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
-                    any_blocker = true;
+                    ancestor_blocker = true;
                 }
             }
             None => {
                 sections_have_markers = false;
-                any_blocker = true;
+                ancestor_blocker = true;
             }
         }
     }
@@ -3983,16 +4122,29 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
                     pc,
                     level.helper_entry_array_len,
                 ) {
-                    any_blocker = true;
+                    trailing_blocker = true;
                 }
             }
             None => {
                 sections_have_markers = false;
-                any_blocker = true;
+                trailing_blocker = true;
             }
         }
     }
-    (sections_have_markers, any_blocker)
+    // A carrier walk already rebuilt every captured `MIFrame`
+    // (`resume.py` `rebuild_from_resumedata`; `pyjitpl.py`
+    // `prepare_resume_from_failure`). Ancestor helpers sit in this
+    // level's `.parents` rather than as their own framestack levels
+    // (`drive_bridge_frame_subwalk` pending tails), so their CALL
+    // pcs look like blockers even though `blackhole.py`
+    // `_setup_return_value_*` already consumed them. The trailing
+    // zip is the live innermost helper.
+    let any_blocker = if ctx.fbw_mode.carrier_resume {
+        trailing_blocker
+    } else {
+        ancestor_blocker || trailing_blocker
+    };
+    (sections_have_markers, any_blocker, trailing_blocker)
 }
 
 /// Resume of a guard at `op_pc` inside a numbered helper chain:
@@ -4031,7 +4183,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         pc: op_pc,
         symbolic: 0,
     };
-    let (heap_moved, journal_delta, outer_index) = {
+    let (heap_moved, journal_delta, outer_index, helper_effect_past_call) = {
         let session = ctx.session.borrow();
         let helper_levels = session
             .framestack
@@ -4045,7 +4197,29 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         };
         let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
         let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
-        (heap_moved, journal_delta, outer_index)
+        // `store_attr_direct` (`self.n += 1` in `__index__`) bumps the
+        // executed odometer and not the list/cell journals
+        // (`capture_converted_driver_helper_guard`). The portal `outer`
+        // mark also contains that body's own stores (`stop.value = i % 7`);
+        // the outermost helper's mark is taken at the `range(...)` CALL,
+        // after those, so a pure-load `__index__` still CALL-collapses
+        // (`functional.py` `compute_range_length` emptiness). A store
+        // inside the helper-reached callee is past that CALL
+        // (`pyjitpl.py` `capture_resumedata`; `blackhole.py`
+        // `convert_and_run_from_pyjitpl` copies `MIFrame.pc`).
+        let helper_effect_past_call = session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .last()
+            .is_some_and(|frame| helper_unjournaled_effect_since(frame.entry_journal_mark));
+        (
+            heap_moved,
+            journal_delta,
+            outer_index,
+            helper_effect_past_call,
+        )
     };
     if runnable {
         if fbw_debug_abort_enabled() {
@@ -4053,32 +4227,20 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         }
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
-    if heap_moved || journal_delta != 0 {
-        // The residual already ran. `capture_resumedata` still numbers the
-        // live helper at this guard (`pyjitpl.py`); CALL-entry collapse
-        // would re-enter the Python CALL and run the callback twice
-        // (`blackhole.py` `convert_and_run_from_pyjitpl` copies `MIFrame.pc`,
-        // never a pc before an effect that frame applied).
-        if python_chain_complete && sections_have_markers {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[numbered-helper-guard] frames-after-effect op_pc={op_pc} \
-                     blocker={any_blocker} heap_moved={heap_moved} journal_delta={journal_delta}"
-                );
-            }
+    if heap_moved || journal_delta != 0 || helper_effect_past_call {
+        // The residual already ran. CALL-entry collapse would re-enter
+        // the Python CALL and run the callback twice (`blackhole.py`
+        // `convert_and_run_from_pyjitpl` copies `MIFrame.pc`). Forward
+        // `capture_resumedata` still numbers the live helper
+        // (`pyjitpl.py`). A carrier walk that numbers a blocked
+        // innermost remaining body is `bhimpl_cast_ptr_to_int`.
+        let (sections_have_markers, _, trailing_blocker) =
+            numbered_helper_sections_blocker_free(ctx, &parent_frames);
+        if python_chain_complete
+            && sections_have_markers
+            && !(ctx.fbw_mode.carrier_resume && trailing_blocker)
+        {
             return Ok(NumberedHelperGuard::Frames(parent_frames));
-        }
-        if fbw_debug_abort_enabled() {
-            for (i, frame) in parent_frames.iter().enumerate() {
-                let blocker = frame.resume_marker_jit_pc.map(|pc| {
-                    helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None)
-                });
-                eprintln!(
-                    "[numbered-helper-guard] refuse op_pc={op_pc} parent[{i}] jc={} \
-                     resume={:?} blocker={blocker:?} heap_moved={heap_moved} journal_delta={journal_delta}",
-                    frame.jitcode_index, frame.resume_marker_jit_pc
-                );
-            }
         }
         return Err(refused);
     }
@@ -4099,10 +4261,8 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         HelperCallEntry::Unavailable => Err(refused),
         HelperCallEntry::CallerBoundary => Ok(NumberedHelperGuard::CallerBoundary),
         HelperCallEntry::Frame(entry) => {
-            let mut frames: Vec<InlineParentFrame> = session.framestack[..outer_index]
-                .iter()
-                .flat_map(|frame| frame.parents.iter().cloned())
-                .collect();
+            let mut frames: Vec<InlineParentFrame> =
+                framestack_resume_parent_frames(&session.framestack[..outer_index]);
             frames.push(entry.clone());
             Ok(NumberedHelperGuard::Frames(frames))
         }
@@ -4180,7 +4340,7 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
         post_call_pc,
     ) {
         Ok((frames, runnable, _)) => {
-            let (sections_have_markers, any_blocker) =
+            let (sections_have_markers, any_blocker, _) =
                 numbered_helper_sections_blocker_free(ctx, &frames);
             runnable && sections_have_markers && !any_blocker
         }
@@ -4188,11 +4348,38 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
     }
 }
 
+/// Trailing `-live-` after a helper CALL.
+///
+/// `jtransform.py` `handle_regular_call` / `handle_residual_call` emit
+/// `[inline_call|residual_call, -live-]`. `jitcode.py` `get_live_vars_info`
+/// decodes a `-live-` at `pc` or the `OFFSET_SIZE+1` byte immediately
+/// before it; a CALL has the marker after it, so
+/// `plain_guard_resume_jitcode_pc` cannot. After `_get_opimpl_method`
+/// decodes the CALL, `MIFrame.pc` sits on that trailing marker
+/// (`pyjitpl.py` `MIFrame.perform_call`). Helpers have no Python `pc_map`
+/// for the fallback `can_decode_live_vars` documents. Same coordinate
+/// `compute_paused_helper_caller_frame` already uses
+/// (`inline_call_return_marker`; `blackhole.py` `_setup_return_value_*`).
+fn helper_call_trailing_live(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), op_pc)?;
+    if !crate::jitcode_runtime::is_python_call_jit_op(call.opname) {
+        return None;
+    }
+    inline_call_return_marker(payload, op_pc)
+        .or_else(|| trailing_live_marker(payload, op_pc))
+        .filter(|&pc| {
+            payload
+                .jitcode
+                .can_decode_live_vars(pc, crate::state::op_live())
+        })
+}
+
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
 /// `after_residual_guard_marker` / `live_after_jit_pc`, else
-/// `plain_guard_resume_jitcode_pc`. Box count must equal
+/// `plain_guard_resume_jitcode_pc`, else the CALL's trailing `-live-`
+/// ([`helper_call_trailing_live`]). Box count must equal
 /// `frame_value_count_at`.
 fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -4227,7 +4414,16 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
         if pc < 0 {
             return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
         }
-        pc as usize
+        let pc = pc as usize;
+        if pjc
+            .jitcode
+            .can_decode_live_vars(pc, crate::state::op_live())
+        {
+            pc
+        } else {
+            helper_call_trailing_live(&pjc, op_pc)
+                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?
+        }
     };
     if !pjc
         .jitcode
@@ -4342,11 +4538,7 @@ fn walker_capture_operator_tail_after_call_guard<Sym: WalkSym>(
     refresh_paused_parent_blackhole(&mut caller);
     let mut parent_frames = {
         let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect::<Vec<_>>()
+        framestack_resume_parent_frames(&session.framestack)
     };
     parent_frames.push(caller);
     parent_frames.push(tail_frame);
@@ -4389,11 +4581,7 @@ pub(crate) fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
 ) -> Result<(), DispatchError> {
     let mut parent_frames = {
         let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect::<Vec<_>>()
+        framestack_resume_parent_frames(&session.framestack)
     };
     // `capture_resumedata` walks every `MetaInterp.framestack` entry.
     // The constructor path passes the rooted `InlineParentFrame` taken
@@ -4478,11 +4666,7 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
 ) -> Option<Vec<InlineParentFrame>> {
     let parent_frames = {
         let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect::<Vec<_>>()
+        framestack_resume_parent_frames(&session.framestack)
     };
     let caller = parent_frames.last()?;
     if caller.result_slot == CallResultSlot::Unknown {
@@ -4678,11 +4862,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     // and other ancestors would resume without that callee's caller.
     let mut parent_frames = {
         let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .flat_map(|frame| frame.parents.iter().cloned())
-            .collect::<Vec<_>>()
+        framestack_resume_parent_frames(&session.framestack)
     };
     parent_frames.push(caller);
     parent_frames.push(tail_frame);
