@@ -1536,11 +1536,17 @@ pub struct PyFrame {
 /// Asserts the same id is returned by `gc.register_type(...)` so any
 /// drift panics on startup.
 pub const PYFRAME_GC_TYPE_ID: u32 = 37;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `PyFrame`.
+pub static PYFRAME_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(PYFRAME_GC_TYPE_ID);
 
 /// GC type id appended after the existing runtime registration census.
 /// `FrameDebugData` is stationary old-gen for a GC-owned frame.  Keep this
 /// at the tail of `pyre-jit::eval::build_gc` so older type ids never shift.
 pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 99;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `FrameDebugData`.
+pub static FRAME_DEBUG_DATA_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(FRAME_DEBUG_DATA_GC_TYPE_ID);
 
 /// GC header size in bytes — single source of truth is
 /// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and

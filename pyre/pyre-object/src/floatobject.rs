@@ -42,10 +42,16 @@ pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, flo
 /// Held as a constant here (rather than runtime-queried) so the
 /// allocation hook can reach it without a back-channel.
 pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_FloatObject`.
+pub static W_FLOAT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_FLOAT_GC_TYPE_ID);
 /// User-subclass float layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (161) ahead of the
 /// target-gated tail.
 pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 162;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_FloatObjectUser`.
+pub static W_FLOAT_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_FLOAT_USER_GC_TYPE_ID);
 pub const W_FLOAT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObjectUser>();
 
 /// Fixed payload size for `W_FloatObject`, mirroring `info.fixedsize`

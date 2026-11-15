@@ -51,6 +51,9 @@ crate::mapdict_mixin_access! {
 /// User-subclass big-int layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
 pub const W_LONG_USER_GC_TYPE_ID: u32 = 200;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_LongObjectUser`.
+pub static W_LONG_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_LONG_USER_GC_TYPE_ID);
 pub const W_LONG_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_LongObjectUser>();
 
 impl crate::lltype::GcType for W_LongObjectUser {
@@ -66,6 +69,9 @@ pub const LONG_VALUE_OFFSET: usize = std::mem::offset_of!(W_LongObject, value);
 
 /// GC type id assigned to `W_LongObject` at JitDriver init time.
 pub const W_LONG_GC_TYPE_ID: u32 = 35;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_LongObject`.
+pub static W_LONG_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_LONG_GC_TYPE_ID);
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_LONG_OBJECT_SIZE: usize = std::mem::size_of::<W_LongObject>();

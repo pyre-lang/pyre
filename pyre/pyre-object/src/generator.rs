@@ -117,6 +117,15 @@ pub struct AsyncGenAThrow {
 
 /// GC type id assigned to `GeneratorIterator` at JitDriver init time.
 pub const W_GENERATOR_GC_TYPE_ID: u32 = 32;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `GeneratorIterator`.
+pub static W_GENERATOR_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_GENERATOR_GC_TYPE_ID);
+/// Distinct lltype STRUCT identity for `Coroutine` (`TypeLayoutBuilder.get_type_id`).
+pub static COROUTINE_VTABLE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+/// Distinct lltype STRUCT identity for `AsyncGenerator` (`TypeLayoutBuilder.get_type_id`).
+pub static ASYNC_GENERATOR_VTABLE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_GENERATOR_OBJECT_SIZE: usize = std::mem::size_of::<GeneratorIterator>();

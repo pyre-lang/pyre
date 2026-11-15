@@ -37,6 +37,13 @@ pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
 /// UNICODE base size has no trailing null.
 pub const LOWLEVEL_UNICODE_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for rstr `STR`.
+pub static LOWLEVEL_STR_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for rstr `UNICODE`.
+pub static LOWLEVEL_UNICODE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 static LOWLEVEL_STR_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LOWLEVEL_UNICODE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);

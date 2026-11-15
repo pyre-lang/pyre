@@ -136,6 +136,9 @@ pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(PyTraceback, w
 /// (`W_CODE_GC_TYPE_ID = 43`), so it takes the next slot (44); the
 /// registration site pins this with a `debug_assert_eq!`.
 pub const PYTRACEBACK_GC_TYPE_ID: u32 = 44;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `PyTraceback`.
+pub static PYTRACEBACK_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(PYTRACEBACK_GC_TYPE_ID);
 
 pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<PyTraceback>();
 

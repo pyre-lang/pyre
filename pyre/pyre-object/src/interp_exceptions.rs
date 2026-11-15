@@ -734,6 +734,9 @@ pub const W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS: [usize; 35] = [
 
 /// GC type id assigned to slim `W_BaseException` at JitDriver init time.
 pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for slim `W_BaseException`.
+pub static W_BASE_EXCEPTION_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BASE_EXCEPTION_GC_TYPE_ID);
 
 /// Closed tid of [`W_ExceptionExtended`]. Registered in `build_gc` immediately
 /// after the `_io.FileIO` user layout and before [`W_BaseExceptionUser`], so
@@ -741,13 +744,22 @@ pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
 /// `try_gc_alloc_collecting_rooted` with no hook is `NoRoute` and the
 /// allocator falls through to `malloc_typed`.
 pub const W_EXCEPTION_EXTENDED_GC_TYPE_ID: u32 = 215;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ExceptionExtended`.
+pub static W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_EXCEPTION_EXTENDED_GC_TYPE_ID);
 
 /// `W_BaseExceptionUser` (`typedef.py` `_getusercls`). Parents on
 /// [`W_BASE_EXCEPTION_GC_TYPE_ID`].
 pub const W_BASE_EXCEPTION_USER_GC_TYPE_ID: u32 = 216;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BaseExceptionUser`.
+pub static W_BASE_EXCEPTION_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BASE_EXCEPTION_USER_GC_TYPE_ID);
 
 /// `W_ExceptionExtendedUser`. Parents on [`W_EXCEPTION_EXTENDED_GC_TYPE_ID`].
 pub const W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID: u32 = 217;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ExceptionExtendedUser`.
+pub static W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID);
 
 /// Publish the GC tid for the extra-field exception layout. `build_gc`
 /// calls this with the constant tid as a registration-order check.
@@ -778,16 +790,19 @@ pub const RLIST_SIZE: usize = std::mem::size_of::<RList>();
 pub const RLIST_LENGTH_OFFSET: usize = std::mem::offset_of!(RList, length);
 pub const RLIST_ITEMS_OFFSET: usize = std::mem::offset_of!(RList, items);
 
-static RLIST_GC_TYPE_ID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for rlist `LIST`.
+pub static RLIST_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+
+static RLIST_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn set_rlist_gc_type_id(tid: u32) {
     debug_assert_ne!(tid, 0, "0 is the unpublished sentinel");
-    RLIST_GC_TYPE_ID_CELL.store(tid, std::sync::atomic::Ordering::Release);
+    RLIST_GC_TYPE_ID.store(tid, std::sync::atomic::Ordering::Release);
 }
 
 #[majit_macros::dont_look_inside]
 pub fn rlist_gc_type_id() -> u32 {
-    RLIST_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
+    RLIST_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl crate::lltype::GcType for RList {

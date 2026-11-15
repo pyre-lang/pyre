@@ -74,6 +74,10 @@ crate::define_prebuilt_dict_strategy_ref!(
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).
 pub type KwargsDictStorage = (Vec<PyObjectRef>, Vec<PyObjectRef>);
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`KwargsDictStorage`].
+pub static KWARGS_DICT_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the [`KwargsDictStorage`] box.
 static KWARGS_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);

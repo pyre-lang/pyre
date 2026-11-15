@@ -50,10 +50,16 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 /// mismatch panics on startup instead of silently misclassifying the
 /// type at collection time.
 pub const W_INT_GC_TYPE_ID: u32 = 1;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_IntObject`.
+pub static W_INT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_INT_GC_TYPE_ID);
 /// User-subclass int layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (159) ahead of the
 /// target-gated tail.
 pub const W_INT_USER_GC_TYPE_ID: u32 = 159;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_IntObjectUser`.
+pub static W_INT_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_INT_USER_GC_TYPE_ID);
 pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>();
 
 // ── Prebuilt-int cache ───────────────────────────────────────────────

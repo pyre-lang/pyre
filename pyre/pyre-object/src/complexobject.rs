@@ -46,10 +46,16 @@ pub const COMPLEX_IMAG_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, ima
 /// Like `W_FLOAT_GC_TYPE_ID`, held as a constant so the allocation hook
 /// can reach it without a back-channel.
 pub const W_COMPLEX_GC_TYPE_ID: u32 = 54;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ComplexObject`.
+pub static W_COMPLEX_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_COMPLEX_GC_TYPE_ID);
 /// User-subclass complex layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (162) ahead of the
 /// target-gated tail.
 pub const W_COMPLEX_USER_GC_TYPE_ID: u32 = 163;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ComplexObjectUser`.
+pub static W_COMPLEX_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_COMPLEX_USER_GC_TYPE_ID);
 pub const W_COMPLEX_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ComplexObjectUser>();
 
 /// Fixed payload size for `W_ComplexObject`.

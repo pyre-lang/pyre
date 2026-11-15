@@ -86,10 +86,16 @@ crate::mapdict_mixin_access! {
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BytearrayObject`.
+pub static W_BYTEARRAY_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BYTEARRAY_GC_TYPE_ID);
 /// User-subclass bytearray layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (164) ahead of the
 /// target-gated tail.
 pub const W_BYTEARRAY_USER_GC_TYPE_ID: u32 = 165;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_BytearrayObjectUser`.
+pub static W_BYTEARRAY_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_BYTEARRAY_USER_GC_TYPE_ID);
 pub const W_BYTEARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObjectUser>();
 
 impl W_BytearrayObject {

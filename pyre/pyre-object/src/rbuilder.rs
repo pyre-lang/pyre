@@ -28,6 +28,10 @@ pub const STRINGPIECE_SIZE: usize = 16;
 pub const STRINGPIECE_BUF_OFFSET: usize = 0;
 pub const STRINGPIECE_PREV_PIECE_OFFSET: usize = 8;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `STRINGBUILDER`.
+pub static STRINGBUILDER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the `StringBuilder` box. Published by
 /// `pyre-jit::eval` at the tail of `build_gc`; read by the size descriptor in
 /// `pyre-jit-trace::descr` and by `bh_new`.
@@ -59,6 +63,10 @@ pub fn stringbuilder_gc_type_id() -> u32 {
 /// traced GC references, matching the RPython definition. Registered by
 /// `pyre-jit::eval` right after the builder tid; read by `pyre-jit-trace`'s size
 /// descriptor and by the grow primitive's `malloc(STRINGPIECE)`.
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `STRINGPIECE`.
+pub static STRINGPIECE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 static STRINGPIECE_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Record the GC type id registered for the `StringPiece` node. `Release` so

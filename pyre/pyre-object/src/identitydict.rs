@@ -62,6 +62,10 @@ pub type IdentityDictStorage = crate::rordereddict::RDict<
     crate::dictmultiobject::ObjectKeyBuildHasher,
 >;
 
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`IdentityDictStorage`].
+pub static IDENTITY_DICT_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
+
 /// Runtime-assigned GC type id for the [`IdentityDictStorage`] box.
 static IDENTITY_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);

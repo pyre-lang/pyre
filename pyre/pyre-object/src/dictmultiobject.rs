@@ -1170,6 +1170,9 @@ pub unsafe fn w_dict_bytes_storage_mut<'a>(obj: PyObjectRef) -> &'a mut BytesDic
 
 /// GC type id assigned to `W_DictObject` at JitDriver init time.
 pub const W_DICT_GC_TYPE_ID: u32 = 29;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_DictObject`.
+pub static W_DICT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_DICT_GC_TYPE_ID);
 
 // ── dstorage GC-managed storage boxes ───────────────────────────────
 //
@@ -1255,7 +1258,9 @@ pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHas
 pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
 
 macro_rules! dict_storage_gc_type_id {
-    ($atomic:ident, $setter:ident, $getter:ident, $ty:ty, $doc:literal) => {
+    ($atomic:ident, $cell:ident, $setter:ident, $getter:ident, $ty:ty, $doc:literal) => {
+        /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for this storage box.
+        pub static $cell: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
         #[doc = $doc]
         static $atomic: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         #[doc = concat!("Record the GC type id registered for the `", stringify!($ty), "` box.")]
@@ -1272,6 +1277,7 @@ macro_rules! dict_storage_gc_type_id {
 
 dict_storage_gc_type_id!(
     OBJECT_DICT_STORAGE_GC_TYPE_ID,
+    OBJECT_DICT_STORAGE_GC_TYPE_ID_CELL,
     set_object_dict_storage_gc_type_id,
     object_dict_storage_gc_type_id,
     ObjectDictStorage,
@@ -1279,6 +1285,7 @@ dict_storage_gc_type_id!(
 );
 dict_storage_gc_type_id!(
     INT_DICT_STORAGE_GC_TYPE_ID,
+    INT_DICT_STORAGE_GC_TYPE_ID_CELL,
     set_int_dict_storage_gc_type_id,
     int_dict_storage_gc_type_id,
     IntDictStorage,
@@ -1286,6 +1293,7 @@ dict_storage_gc_type_id!(
 );
 dict_storage_gc_type_id!(
     BYTES_DICT_STORAGE_GC_TYPE_ID,
+    BYTES_DICT_STORAGE_GC_TYPE_ID_CELL,
     set_bytes_dict_storage_gc_type_id,
     bytes_dict_storage_gc_type_id,
     BytesDictStorage,
@@ -1293,6 +1301,7 @@ dict_storage_gc_type_id!(
 );
 dict_storage_gc_type_id!(
     DICT_STRATEGY_REF_GC_TYPE_ID,
+    DICT_STRATEGY_REF_GC_TYPE_ID_CELL,
     set_dict_strategy_ref_gc_type_id,
     dict_strategy_ref_gc_type_id,
     DictStrategyRef,
@@ -2031,6 +2040,9 @@ const _: () = assert!(
 /// NOTIMPLEMENTED_TYPE (44), ELLIPSIS_TYPE (45), CODE_TYPE (46)
 /// and PYTRACEBACK_TYPE (47).
 pub const W_MODULE_DICT_GC_TYPE_ID: u32 = 48;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ModuleDictObject`.
+pub static W_MODULE_DICT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_MODULE_DICT_GC_TYPE_ID);
 
 /// Fixed payload size used by `gct_fv_gc_malloc`.
 pub const W_MODULE_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleDictObject>();
@@ -6716,6 +6728,9 @@ pub const DICT_VIEW_W_DICT_OFFSET: usize = std::mem::offset_of!(W_DictViewObject
 /// 32 is taken by `W_GENERATOR_GC_TYPE_ID`; the next free slot is 39
 /// (one past `W_DICT_PROXY_GC_TYPE_ID = 38`).
 pub const W_DICT_VIEW_GC_TYPE_ID: u32 = 39;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_DictViewObject`.
+pub static W_DICT_VIEW_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_DICT_VIEW_GC_TYPE_ID);
 
 pub const W_DICT_VIEW_OBJECT_SIZE: usize = std::mem::size_of::<W_DictViewObject>();
 

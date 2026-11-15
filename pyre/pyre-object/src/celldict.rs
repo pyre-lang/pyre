@@ -91,9 +91,15 @@ pub static INT_MUTABLE_CELL_TYPE: PyType = new_pytype("__IntMutableCell");
 /// GC type id assigned to `ObjectMutableCell` — slot 49, immediately
 /// after `W_MODULE_DICT_GC_TYPE_ID=48`.
 pub const W_OBJECT_MUTABLE_CELL_GC_TYPE_ID: u32 = 49;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `ObjectMutableCell`.
+pub static W_OBJECT_MUTABLE_CELL_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_OBJECT_MUTABLE_CELL_GC_TYPE_ID);
 
 /// GC type id assigned to `IntMutableCell`.
 pub const W_INT_MUTABLE_CELL_GC_TYPE_ID: u32 = 50;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `IntMutableCell`.
+pub static W_INT_MUTABLE_CELL_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_INT_MUTABLE_CELL_GC_TYPE_ID);
 
 /// `typeobject.py ObjectMutableCell`.
 #[repr(C)]
@@ -409,6 +415,9 @@ pub static VERSION_TAG_TYPE: PyType = new_pytype("__VersionTag");
 /// GC type id assigned to `VersionTag` — slot 56, immediately after
 /// `W_MAPDICT_STORAGE_GC_TYPE_ID=55`.
 pub const W_VERSION_TAG_GC_TYPE_ID: u32 = 56;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `VersionTag`.
+pub static W_VERSION_TAG_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_VERSION_TAG_GC_TYPE_ID);
 
 /// `celldict.py VersionTag` — header-only `W_Root`.
 #[repr(C)]
@@ -550,6 +559,10 @@ pub type GlobalCacheRegistry = std::collections::HashMap<
     std::sync::Arc<parking_lot::Mutex<GlobalCache>>,
     crate::dictmultiobject::StrKeyBuildHasher,
 >;
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`ModuleDictStorage`].
+pub static MODULE_DICT_STORAGE_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`ModuleDictStorage`] box.
 static MODULE_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -839,6 +852,10 @@ impl crate::lltype::GcType for ModuleDictStrategy {
 /// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
 pub const MODULE_DICT_MUTATE_VERSION_OFFSET: usize =
     std::mem::offset_of!(ModuleDictStrategy, mutate_version);
+
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for [`ModuleDictStrategy`].
+pub static MODULE_DICT_STRATEGY_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::auto();
 
 /// Runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
 static MODULE_DICT_STRATEGY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =

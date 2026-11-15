@@ -43,6 +43,9 @@ pub struct W_DictProxyObject {
 /// stay sequential and `debug_assert_eq!(tid, W_DICT_PROXY_GC_TYPE_ID)`
 /// catches any future drift.
 pub const W_DICT_PROXY_GC_TYPE_ID: u32 = 38;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_DictProxyObject`.
+pub static W_DICT_PROXY_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_DICT_PROXY_GC_TYPE_ID);
 
 /// Fixed payload size.
 pub const W_DICT_PROXY_OBJECT_SIZE: usize = std::mem::size_of::<W_DictProxyObject>();

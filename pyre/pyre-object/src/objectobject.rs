@@ -106,12 +106,18 @@ pub const W_OBJECT_OBJECT_USER_SIZE: usize = std::mem::size_of::<W_ObjectObjectU
 /// (`W_Root`). Its `_getusercls` child is
 /// [`W_OBJECT_OBJECT_USER_GC_TYPE_ID`].
 pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ObjectObject`.
+pub static W_OBJECT_OBJECT_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_OBJECT_OBJECT_GC_TYPE_ID);
 
 /// GC type id for `W_ObjectObjectUserDictWeakrefable`
 /// (`typedef.py` `_getusercls(W_ObjectObject)`). Same size and
 /// `object_object_custom_trace` as [`W_OBJECT_OBJECT_GC_TYPE_ID`];
 /// that id is the parent.
 pub const W_OBJECT_OBJECT_USER_GC_TYPE_ID: u32 = 218;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_ObjectObjectUser`.
+pub static W_OBJECT_OBJECT_USER_GC_TYPE_ID_CELL: crate::lltype::TypeIdCell =
+    crate::lltype::TypeIdCell::with(W_OBJECT_OBJECT_USER_GC_TYPE_ID);
 
 impl crate::lltype::GcType for W_ObjectObject {
     fn type_id() -> u32 {

@@ -575,6 +575,9 @@ pub const fn function_mutate_field_offset(slot: QuasiImmutSlot) -> usize {
 /// instances of those PyTypes share this tid via the
 /// `register_vtable_for_type` mapping.
 pub const FUNCTION_GC_TYPE_ID: u32 = 14;
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `Function`.
+pub static FUNCTION_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::with(FUNCTION_GC_TYPE_ID);
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
 /// (`framework.py:811`).
