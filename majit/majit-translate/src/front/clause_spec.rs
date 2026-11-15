@@ -1406,6 +1406,9 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliase
     if let Some(fnptr) = obj.get("FnPtr") {
         return spec_fn_ptr(fnptr, llbc, depth, expand_aliases);
     }
+    if let Some(fndef) = obj.get("FnDef") {
+        return spec_fn_def(fndef, llbc, depth, expand_aliases);
+    }
     canonical_type_json(v, llbc, depth)
 }
 
@@ -1436,8 +1439,15 @@ fn spec_trait_ref_name(v: &Value, llbc: &Llbc) -> String {
     }
 }
 
-/// `impl_trait`: the trait's `name_path` and its `<types>`. Self is one of
-/// those generics.
+/// An `Ident` path segment: `name#N` when the disambiguator is nonzero.
+pub(crate) fn spec_ident_name(name: &str, disambiguator: u64) -> String {
+    if disambiguator > 0 {
+        format!("{name}#{disambiguator}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// The function's name with each impl segment spelled by what it
 /// implements. `name_path` renders every impl block as `<Impl>`, so two
 /// methods of the same name in sibling impls share it.
@@ -1448,13 +1458,7 @@ fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> Str
         .map(|seg| match seg {
             NameSeg::Ident {
                 ident: (name, disambiguator),
-            } => {
-                if *disambiguator > 0 {
-                    format!("{name}#{disambiguator}")
-                } else {
-                    name.clone()
-                }
-            }
+            } => spec_ident_name(name, *disambiguator),
             NameSeg::Impl {
                 trait_id,
                 skip_binder,
@@ -1484,6 +1488,10 @@ fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> Str
 }
 
 pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
+    render_trait_impl_at(llbc, impl_id, 0)
+}
+
+fn render_trait_impl_at(llbc: &Llbc, impl_id: u64, depth: usize) -> Option<String> {
     let row = llbc.trait_impls_raw().get(impl_id as usize)?;
     let impl_trait = row.get("impl_trait")?;
     let trait_id = impl_trait.get("id")?.as_u64()?;
@@ -1494,7 +1502,7 @@ pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
         .map(|items| {
             items
                 .iter()
-                .map(|ty| spec_type_name(ty, llbc, 0, false))
+                .map(|ty| spec_type_name(ty, llbc, depth + 1, false))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1504,7 +1512,7 @@ pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
         .map(|items| {
             items
                 .iter()
-                .map(|cg| spec_const_name(cg, llbc, 0))
+                .map(|cg| spec_const_name(cg, llbc, depth + 1))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1666,6 +1674,67 @@ fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -
     } else {
         format!("fn({inputs}) -> {output}")
     }
+}
+
+/// A function-item type, spelled as that item's path (`#N` included) plus
+/// the `FnDef` node's generic arguments. Nested `FnDef` / `FnPtr` args
+/// reuse [`spec_type_name`].
+fn spec_fn_def(fndef: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
+    let inner = fndef.get("skip_binder").unwrap_or(fndef);
+    let path = inner
+        .get("kind")
+        .and_then(|kind| kind.get("Fun"))
+        .and_then(Value::as_u64)
+        .and_then(|id| llbc.fn_by_id(id))
+        .map(|fd| spec_fn_item_path(&fd.item_meta, llbc, depth, expand_aliases))
+        .unwrap_or_else(|| "FnDef".to_string());
+    let (types, consts) = inner
+        .get("generics")
+        .and_then(Value::as_object)
+        .map(|args| spec_generic_args(args, llbc, depth, expand_aliases))
+        .unwrap_or_default();
+    format!("{path}{}", angle_args(&types, &consts))
+}
+
+/// Name-segment path of a function item named by a `FnDef` type.
+/// Instantiated wrappers are omitted; the `FnDef` node's generics are
+/// appended by [`spec_fn_def`].
+fn spec_fn_item_path(
+    meta: &majit_charon_reader::ullbc::ItemMeta,
+    llbc: &Llbc,
+    depth: usize,
+    expand_aliases: bool,
+) -> String {
+    use majit_charon_reader::ullbc::NameSeg;
+    meta.template_name()
+        .filter_map(|seg| match seg {
+            NameSeg::Ident {
+                ident: (name, disambiguator),
+            } => Some(spec_ident_name(name, *disambiguator)),
+            NameSeg::Impl {
+                trait_id,
+                skip_binder,
+            } => {
+                let inner = if let Some(id) = trait_id {
+                    render_trait_impl_at(llbc, *id, depth).unwrap_or_else(|| "?".to_string())
+                } else if let Some(skip_binder) = skip_binder {
+                    spec_type_name(skip_binder, llbc, depth + 1, expand_aliases)
+                } else {
+                    "Impl".to_string()
+                };
+                Some(format!("<impl {inner}>"))
+            }
+            NameSeg::Instantiated { .. } => None,
+            other => {
+                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(other) {
+                    Some(label)
+                } else {
+                    Some(format!("<{}>", other.first_key_label()))
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 fn angle_args(types: &[String], consts: &[String]) -> String {
@@ -2100,6 +2169,92 @@ mod tests {
             spec_leaf("with_lock", 7, &wrapped, &llbc),
             spec_leaf("with_lock", 7, &plain, &llbc)
         );
+    }
+
+    /// A `FnPtr` type is the signature, so arity-distinct wrappers stay
+    /// distinct (`WrapFor<fn(A) -> R>` vs `WrapFor<fn(A, B) -> R>`).
+    #[test]
+    fn spec_type_name_fn_ptr_uses_signature() {
+        let llbc = empty_llbc();
+        let i64 = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let bool_ty = json!({"Scalar": "Bool"});
+        let usize_ty = json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let unary = json!({"FnPtr": {"skip_binder": {
+            "inputs": [i64.clone()],
+            "output": usize_ty.clone(),
+            "is_unsafe": false
+        }}});
+        let binary = json!({"FnPtr": {"skip_binder": {
+            "inputs": [i64, bool_ty],
+            "output": usize_ty,
+            "is_unsafe": true
+        }}});
+        assert_eq!(spec_type_name(&unary, &llbc, 0, false), "fn(i64) -> usize");
+        assert_eq!(
+            spec_type_name(&binary, &llbc, 0, false),
+            "unsafe fn(i64,bool) -> usize"
+        );
+    }
+
+    /// A `FnDef` type is the named FunDecl path, including Ident `#N`.
+    #[test]
+    fn spec_type_name_fn_def_uses_fun_decl_path() {
+        let span = json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let ident = |s: &str, n: u64| json!({"Ident": [s, n]});
+        let meta = |name: Vec<Value>| {
+            json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let sig = json!({"is_unsafe": false, "inputs": [], "output": {"Tuple": []}});
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(vec![
+                            ident("fixture", 0),
+                            ident("parent", 2),
+                            ident("closure", 0),
+                            ident("call", 0),
+                        ]),
+                        "signature": sig,
+                        "body": "Opaque"
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(vec![
+                            ident("fixture", 0),
+                            ident("parent", 3),
+                            ident("closure", 0),
+                            ident("call", 0),
+                        ]),
+                        "signature": sig,
+                        "body": "Opaque"
+                    }
+                ],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("llbc");
+        let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+        let ty0 = json!({"FnDef": {"kind": {"Fun": 0}, "generics": generics.clone()}});
+        let ty1 = json!({"FnDef": {"kind": {"Fun": 1}, "generics": generics}});
+        let named0 = spec_type_name(&ty0, &llbc, 0, false);
+        let named1 = spec_type_name(&ty1, &llbc, 0, false);
+        assert!(named0.contains("parent#2"), "{named0}");
+        assert!(named1.contains("parent#3"), "{named1}");
+        assert_ne!(named0, named1);
+        assert_ne!(named0, "FnDef");
     }
 
     /// TypeVars under a `RegionBinder` are `Bound(1, i)` (`move_under_binder`).

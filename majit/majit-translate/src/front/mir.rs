@@ -358,6 +358,12 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names<
 }
 
 pub(crate) fn semantic_function_dedup_key(f: &crate::front::semantic::SemanticFunction) -> String {
+    // `CallControl.graphs_from` / `Bookkeeper.getdesc` keys on the
+    // function object. `scope_owner_identity` is that identity across
+    // LLBC artifacts; the human `source_identity` label is not.
+    if let Some(identity) = f.funcobj_identity.as_deref() {
+        return identity.to_string();
+    }
     let path = if f.module_path.is_empty() {
         f.name.clone()
     } else {
@@ -367,10 +373,6 @@ pub(crate) fn semantic_function_dedup_key(f: &crate::front::semantic::SemanticFu
         Some(owner) => format!("{path}@{owner}"),
         None => path,
     };
-    // `CallControl.graphs_from` / `Bookkeeper.getdesc` keys on the
-    // function object. A non-ADT `Self` (`cmp::impls::<Impl>::le` for
-    // `char` vs `i64`) shares `{module_path}::{name}`; the impl's trait
-    // ref and Self type is that identity across LLBC artifacts.
     match f.trait_impl_identity.as_deref() {
         Some(identity) => format!("{path}::<impl {identity}>"),
         None => path,
@@ -684,18 +686,10 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
         profilefunc_spellings,
     );
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
-    // Dedup key combines `self_ty_root` (the impl owner, when known),
-    // `trait_impl_id` (Charon's function-object identity for a trait
-    // impl), `module_path`, and `name`.  Without `self_ty_root`, two
-    // distinct impl methods would collide on a shared
-    // `{module_path}::{name}`: both `impl FrameDebugData { fn new(...) }`
-    // and `impl PyFrame { fn new(...) }` land under
-    // `module_path = "pyframe::<Impl>"` (the Impl NameSeg renders as
-    // `<Impl>`), so without the owner in the key the second would be
-    // silently dropped.  Without `trait_impl_id`, every
-    // `cmp::impls::<Impl>::le` width collapses the same way.  Falls
-    // back to the bare `{module_path}::{name}` shape (or just `name`)
-    // for entries that have neither.
+    // Dedup key is `scope_owner_identity` (`funcobj_identity`) when the
+    // header stamped it: that string is injective over local bodies and
+    // matches across crates for the same rustc item. Synthetic graphs
+    // without it fall back to `{module_path}::{name}@{owner}::<impl identity>`.
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
@@ -4133,7 +4127,9 @@ impl<'l> CrateLowering<'l> {
             .llbc
             .fn_by_id(spec.body.fn_id)
             .expect("a declared specialization names its FunDecl");
-        let mut graph = crate::model::FunctionGraph::new(spec.body.segments.join("::"));
+        let mut graph = crate::model::FunctionGraph::new(
+            spec_segments(self.llbc, fd, &spec.body.name).join("::"),
+        );
         let residual = fun_decl_is_dont_look_inside(self.llbc, fd, &self.state.dont_look_inside);
         let cells = gc_mut_ref_param_locals(
             &spec.body.body.locals,
@@ -4225,6 +4221,9 @@ impl<'l> CrateLowering<'l> {
         let body = &spec.body;
         let accum = AccumulatorFacts::build(llbc, body);
         let builder_mode = accum.has_builder;
+        // Graph names stay on `spec_segments` so `.jitstats` /
+        // snapshots do not move. Call resolution uses `spec.segments`.
+        let graph_name = spec_segments(llbc, fd, &spec.name).join("::");
         let mut graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -4245,7 +4244,7 @@ impl<'l> CrateLowering<'l> {
             root_stack,
             Some(spec_queue),
             true,
-            Some(spec.segments.join("::")),
+            Some(graph_name.clone()),
             Some(value_type_by_id),
             self.state.cross_crate(),
             Some(&self.state.gc_root_effects),
@@ -4261,7 +4260,7 @@ impl<'l> CrateLowering<'l> {
                 return None;
             }
         };
-        graph.name = spec.segments.join("::");
+        graph.name = graph_name;
         Some(graph)
     }
 }
@@ -4302,24 +4301,45 @@ impl DeclaredSpec {
 
 impl DeclaredSpec {
     /// The funcobj under the path the specialization's call sites name,
-    /// with the stamps its registration carries.
+    /// with the stamps its registration carries. Harvest is the display
+    /// spelling; identity is `header.call_segments` from this spec's own
+    /// FunDecl (`Bookkeeper.getdesc`).
     #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn into_declared(
         self,
         graph: crate::model::LazyGraph,
-    ) -> crate::codewriter::call::DeclaredFuncObj {
-        let path = crate::parse::CallPath::from_segments(self.body.segments.iter().cloned());
+    ) -> Vec<crate::codewriter::call::DeclaredFuncObj> {
+        let harvest = crate::parse::CallPath::from_segments(self.body.segments.iter().cloned());
+        let unique = if self.header.call_segments.is_empty() {
+            None
+        } else {
+            Some(crate::parse::CallPath::from_segments(
+                self.header.call_segments.iter().cloned(),
+            ))
+        };
         let lowered = self.into_semantic(graph);
-        crate::codewriter::call::DeclaredFuncObj {
-            path,
-            graph: lowered.lazy_graph().clone(),
-            transform: crate::codewriter::call::GraphTransform {
-                return_type: lowered.return_type,
-                return_class_root: lowered.return_class_root,
-                return_can_be_none: lowered.return_can_be_none,
-                hints: lowered.hints,
-            },
+        let graph = lowered.lazy_graph().clone();
+        let transform = crate::codewriter::call::GraphTransform {
+            return_type: lowered.return_type,
+            return_class_root: lowered.return_class_root,
+            return_can_be_none: lowered.return_can_be_none,
+            hints: lowered.hints,
+        };
+        let mut declared = vec![crate::codewriter::call::DeclaredFuncObj {
+            path: harvest.clone(),
+            graph: graph.clone(),
+            transform: transform.clone(),
+        }];
+        if let Some(unique) = unique {
+            if unique != harvest {
+                declared.push(crate::codewriter::call::DeclaredFuncObj {
+                    path: unique,
+                    graph,
+                    transform,
+                });
+            }
         }
+        declared
     }
 }
 
@@ -4586,6 +4606,8 @@ pub(crate) struct SemanticFunctionHeader {
     trait_qualified: Option<String>,
     returns_objectptr: bool,
     source_identity: String,
+    funcobj_identity: String,
+    call_segments: Vec<String>,
     module: Option<String>,
 }
 
@@ -4655,6 +4677,8 @@ impl SemanticFunctionHeader {
             (None, None, Some(impl_id)) => format!("{fn_path}::<Impl#{impl_id}>"),
             (None, None, None) => fn_path.clone(),
         };
+        let funcobj_identity = scope_owner_identity(llbc, fd);
+        let call_segments = identity_segments(llbc, fd, &name);
         // Trait-impl methods carry the trait leaf so registration calls
         // `register_trait_method`. Inherent impls leave `trait_root` empty.
         // Trait-default bodies match the parent ident against `known_trait_names`.
@@ -4796,6 +4820,8 @@ impl SemanticFunctionHeader {
             trait_qualified,
             returns_objectptr,
             source_identity,
+            funcobj_identity,
+            call_segments,
             module: fundecl_module(fd),
         }
     }
@@ -4837,6 +4863,7 @@ impl SemanticFunctionHeader {
         GraphStamp {
             owner_root: self.self_ty_root.clone(),
             source_identity: self.source_identity.clone(),
+            funcobj_identity: self.funcobj_identity.clone(),
             fun_decl_id: self.fun_decl_id,
             module: self.module.clone(),
             hints: self.hints.clone(),
@@ -4864,6 +4891,8 @@ impl SemanticFunctionHeader {
             trait_impl_id: self.trait_impl_id,
             trait_impl_identity: self.trait_impl_identity,
             fun_decl_id: Some(self.fun_decl_id),
+            funcobj_identity: Some(self.funcobj_identity),
+            call_segments: self.call_segments,
             module_path: self.module_path,
             hints: self.hints,
             trait_root: self.trait_root,
@@ -4920,6 +4949,7 @@ fn graph_calls_unresolved_trait_const(graph: &FunctionGraph) -> bool {
 pub(crate) struct GraphStamp {
     owner_root: Option<String>,
     source_identity: String,
+    funcobj_identity: String,
     fun_decl_id: u64,
     module: Option<String>,
     hints: Vec<String>,
@@ -4942,6 +4972,7 @@ impl GraphStamp {
         };
         let mut graph = graph
             .with_source_identity(self.source_identity.clone())
+            .with_funcobj_identity(self.funcobj_identity.clone())
             .with_fun_decl_id(self.fun_decl_id);
         graph.func.module = self.module.clone();
         if !self.hints.is_empty() {
@@ -9114,7 +9145,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
-    lower_unstructured_with_static_addrs_and_attrs(
+    let graph = lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
         &u,
@@ -9139,7 +9170,13 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         Some(gc_root_effects),
         func_hints,
-    )
+    )?;
+    // Whole-program lowering stamps the header (`graph_stamp`) after the
+    // body. This single-decl entry is the same funcobj; GraphKey occupancy
+    // is `scope_owner_identity`.
+    Ok(graph
+        .with_funcobj_identity(scope_owner_identity(llbc, fd))
+        .with_fun_decl_id(fd.def_id))
 }
 
 /// Lower a same-crate callee whose return is a fat `&dyn` / `Box<dyn>`,
@@ -9314,6 +9351,7 @@ pub(crate) use self::desugar::callee::{
     discover_profilefunc_spellings, fnptr_field_family_member_fn_ids, fnptr_field_under_use,
     fnptr_struct_field_target, release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
 };
+pub use self::desugar::callee::{harvest_path_for_fun_decl, registered_path_for_fun_decl};
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,
     is_core_default_path,
@@ -11141,6 +11179,7 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },

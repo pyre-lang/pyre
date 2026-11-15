@@ -890,6 +890,7 @@ impl<'a> Lowering<'a> {
                         .into_iter()
                         .map(str::to_string)
                         .collect(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1161,6 +1162,7 @@ impl<'a> Lowering<'a> {
                                     segments: vec![
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -1409,14 +1411,13 @@ impl<'a> Lowering<'a> {
             Some((owner_root, leaf, _)) => CallTarget::method(leaf, Some(owner_root)),
             None => CallTarget::FunctionPath {
                 segments,
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
         };
         target = target.with_fun_decl_id(fd.def_id);
-        if matches!(target, CallTarget::Method { .. }) {
-            target = target.with_resolved_path(registered_path_for_fun_decl(self.llbc, fd));
-        }
+        target = stamp_call_target_fun_decl(target, self.llbc, fd);
         target
     }
 
@@ -3408,6 +3409,7 @@ impl<'a> Lowering<'a> {
                     segments: vec![
                         crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -3423,6 +3425,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -3453,6 +3456,7 @@ impl<'a> Lowering<'a> {
                         crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
                             .to_string(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -3519,6 +3523,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -4834,12 +4839,16 @@ impl<'a> Lowering<'a> {
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let target = CallTarget::FunctionPath {
+        let mut target = CallTarget::FunctionPath {
             segments,
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
         .with_fun_decl_id(fun_decl_id);
+        if let Some(fd) = self.llbc.fn_by_id(fun_decl_id) {
+            target = stamp_call_target_fun_decl(target, self.llbc, fd);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
@@ -5066,7 +5075,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(check_id) else {
             return Ok(false);
         };
-        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let segments = spec_segments(self.llbc, fd, &registered_leaf(self.llbc, fd));
         let output_ty = clone_tyref(&fd.signature.output);
         let Some((result_owner, _, _, _, _, _)) = self.resolve_result_owners(&output_ty) else {
             return Ok(false);
@@ -5500,7 +5509,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(decode_id) else {
             return Ok(false);
         };
-        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let segments = spec_segments(self.llbc, fd, &registered_leaf(self.llbc, fd));
         let output_ty = clone_tyref(&fd.signature.output);
         let Some((result_owner, ok_owner, _, _, _, _)) = self.resolve_result_owners(&output_ty)
         else {
@@ -7280,6 +7289,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -7299,6 +7309,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__getslice_rangefrom".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -7614,6 +7625,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7624,6 +7636,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8931,6 +8944,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -9209,6 +9223,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -9299,8 +9314,9 @@ impl<'a> Lowering<'a> {
     /// - Otherwise the impl's `methods` table binds the single `From`
     ///   method to the concrete `from` FunDecl. Its owner, trait-impl id,
     ///   and method form the devirtualized call target —
-    ///   [`IntoDevirt::Target`]. The id is load-bearing: several
-    ///   `impl From<_> for Dynamic` bodies share the same owner/method pair.
+    ///   [`IntoDevirt::Target`]. The FunDecl id is load-bearing: several
+    ///   `impl From<_> for Dynamic` bodies share the same owner/method pair,
+    ///   and stamp uses that `from` FunDecl (`Bookkeeper.getdesc`).
     ///   `from` is an associated function (no `self` receiver), so the caller
     ///   must keep the `FunctionPath` shape (a `CallTarget::Method` hint would
     ///   bind the *argument* as a receiver).
@@ -9355,7 +9371,7 @@ impl<'a> Lowering<'a> {
 
     /// Walk `U: From<T>` trait refs: equal args are
     /// [`IntoDevirt::Identity`]; a selected impl is
-    /// [`IntoDevirt::Target`] of that `from` (`spec_segments`).
+    /// [`IntoDevirt::Target`] of that `from` (`spec_segments` plus its FunDecl id).
     pub(in crate::front::mir) fn from_obligation_devirt(
         &self,
         trait_refs: &[serde_json::Value],
@@ -9396,9 +9412,22 @@ impl<'a> Lowering<'a> {
             let fd = self.llbc.fn_by_id(fn_id)?;
             let path = fd.item_meta.name_path_str();
             let leaf = path.rsplit("::").next().unwrap_or("from");
-            return Some(IntoDevirt::Target(spec_segments(self.llbc, fd, leaf)));
+            return Some(IntoDevirt::Target {
+                segments: spec_segments(self.llbc, fd, leaf),
+                fn_id,
+            });
         }
         None
+    }
+
+    /// FunDecl of the graph [`Self::call_target_segments`] names. Blanket
+    /// `Into` retargets harvest to the selected `From::from`; stamp that
+    /// FunDecl, not the Into declaration still sitting on the RegularCall.
+    pub(in crate::front::mir) fn call_target_fun_decl_id(&self, reg: &RegularCall) -> Option<u64> {
+        match self.blanket_into_devirt(reg) {
+            Some(IntoDevirt::Target { fn_id, .. }) => Some(fn_id),
+            _ => regular_call_fun_decl_id(&reg.kind),
+        }
     }
 
     /// Blanket `Into` whose instantiated source and destination are the

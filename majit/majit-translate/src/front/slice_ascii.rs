@@ -374,6 +374,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: is_ascii_segments(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
