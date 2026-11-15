@@ -12315,14 +12315,24 @@ fn drive_list_extend_trace(
         // can carry other greens than the one it started from. One that
         // `has_compiled_targets` is jumped into (`compile_trace` with a
         // `ResumeFromInterpDescr` resumekey, an entry bridge filed under
-        // the starting greens).
-        let jump_into = meta
-            .trace_ctx()
-            .and_then(|ctx| ctx.take_close_jump_into_key())
-            .filter(|&target| meta.partial_trace().is_none() && meta.has_compiled_targets(target));
+        // the starting greens). Target is `take_close_jump_into_key` if
+        // set, else `reached_loop_header_key` (`get_procedure_token(greenboxes)`).
+        let jump_into = {
+            let target = meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.take_close_jump_into_key())
+                .or_else(|| meta.reached_loop_header_key());
+            target.filter(|&target| {
+                meta.partial_trace().is_none() && meta.has_compiled_targets(target)
+            })
+        };
         if let Some(target) = jump_into {
             let jump_boxes = jump_boxes_of(meta, &jump_args);
-            let outcome = meta.compile_trace_from_interp(target, &jump_boxes, green_key);
+            let original = meta
+                .trace_ctx()
+                .map(|ctx| ctx.root_green_key())
+                .unwrap_or(green_key);
+            let outcome = meta.compile_trace_from_interp(target, &jump_boxes, original);
             if dbg {
                 eprintln!("[jd3] compile_trace outcome={outcome:?}");
             }
@@ -12679,10 +12689,39 @@ fn drive_filter_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let jump_boxes = jump_boxes_of(meta, &jump_args);
-        let outcome = meta.compile_loop(&jump_boxes);
-        if dbg {
-            eprintln!("[jd4] compile_loop outcome={outcome:?}");
+        // `pyjitpl.py reached_loop_header` `get_procedure_token(greenboxes)`:
+        // jump into an already compiled merge point, else compile_loop.
+        let jump_into = {
+            let target = meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.take_close_jump_into_key())
+                .or_else(|| meta.reached_loop_header_key());
+            target.filter(|&target| {
+                meta.partial_trace().is_none() && meta.has_compiled_targets(target)
+            })
+        };
+        if let Some(target) = jump_into {
+            let jump_boxes = jump_boxes_of(meta, &jump_args);
+            let original = meta
+                .trace_ctx()
+                .map(|ctx| ctx.root_green_key())
+                .unwrap_or(green_key);
+            let outcome = meta.compile_trace_from_interp(target, &jump_boxes, original);
+            if dbg {
+                eprintln!("[jd4] compile_trace outcome={outcome:?}");
+            }
+            if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                meta.finish_trace_live();
+                meta.clear_pending_abort();
+            } else if meta.is_tracing() {
+                meta.abort_trace(false);
+            }
+        } else {
+            let jump_boxes = jump_boxes_of(meta, &jump_args);
+            let outcome = meta.compile_loop(&jump_boxes);
+            if dbg {
+                eprintln!("[jd4] compile_loop outcome={outcome:?}");
+            }
         }
     } else if let Some(TraceAction::Finish {
         finish_args,
@@ -13273,10 +13312,39 @@ fn drive_unpack_into_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let jump_boxes = jump_boxes_of(meta, &jump_args);
-        let outcome = meta.compile_loop(&jump_boxes);
-        if dbg {
-            eprintln!("[jd6] compile_loop outcome={outcome:?}");
+        // `pyjitpl.py reached_loop_header` `get_procedure_token(greenboxes)`:
+        // jump into an already compiled merge point, else compile_loop.
+        let jump_into = {
+            let target = meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.take_close_jump_into_key())
+                .or_else(|| meta.reached_loop_header_key());
+            target.filter(|&target| {
+                meta.partial_trace().is_none() && meta.has_compiled_targets(target)
+            })
+        };
+        if let Some(target) = jump_into {
+            let jump_boxes = jump_boxes_of(meta, &jump_args);
+            let original = meta
+                .trace_ctx()
+                .map(|ctx| ctx.root_green_key())
+                .unwrap_or(green_key);
+            let outcome = meta.compile_trace_from_interp(target, &jump_boxes, original);
+            if dbg {
+                eprintln!("[jd6] compile_trace outcome={outcome:?}");
+            }
+            if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                meta.finish_trace_live();
+                meta.clear_pending_abort();
+            } else if meta.is_tracing() {
+                meta.abort_trace(false);
+            }
+        } else {
+            let jump_boxes = jump_boxes_of(meta, &jump_args);
+            let outcome = meta.compile_loop(&jump_boxes);
+            if dbg {
+                eprintln!("[jd6] compile_loop outcome={outcome:?}");
+            }
         }
     } else if let Some(TraceAction::Finish {
         finish_args,

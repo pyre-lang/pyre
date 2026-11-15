@@ -6763,17 +6763,15 @@ fn compile_bridge_jump(
                 .map(|r| ctx.operand_for(r))
                 .collect()
         };
-        // Target is the reached merge point's greens (`pyjitpl.py
-        // reached_loop_header` `get_procedure_token(greenboxes)`), falling
-        // back to the bridge's key.
+        // Target is `take_close_jump_into_key` if set, else
+        // `reached_loop_header_key` (`pyjitpl.py` `reached_loop_header`
+        // `get_procedure_token(greenboxes)`), falling back to the bridge's key.
         let jump_into = {
             let meta = driver.meta_interp_mut();
             let target = meta
                 .trace_ctx()
-                .and_then(|ctx| {
-                    ctx.take_close_jump_into_key()
-                        .or_else(|| ctx.cut_inner_green_key.as_ref().map(|k| k.get_uhash()))
-                })
+                .and_then(|ctx| ctx.take_close_jump_into_key())
+                .or_else(|| meta.reached_loop_header_key())
                 .unwrap_or(green_key);
             Some(target).filter(|&target| {
                 meta.partial_trace().is_none() && meta.has_compiled_targets(target)
