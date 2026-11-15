@@ -3305,6 +3305,12 @@ impl<'a> Lowering<'a> {
         if self.multi_assigned_locals.contains(&local) {
             return None;
         }
+        // `*(&mut x) = …` / `&raw mut x` / a field store through a
+        // deref does not rebind `x`. `compute_mutably_borrowed_locals`
+        // is the set of locals that can change that way.
+        if compute_mutably_borrowed_locals(self.llbc, self.body).contains(&local) {
+            return None;
+        }
         let mut found = None;
         for bb in &self.body.body {
             for stmt in &bb.statements {
@@ -3335,12 +3341,33 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Shared-borrow alias only. `Mut` / `TwoPhaseMut` / `RawPtr` mut
+    /// can write the referent, so they are not a compile-time tag hop.
+    fn result_alias_hop_local(rvalue: &Rvalue) -> Option<usize> {
+        match rvalue {
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => {
+                Self::result_disc_place_local(place)
+            }
+            Rvalue::Ref { place, kind, .. } if kind.as_str() == Some("Shared") => {
+                Self::result_disc_place_local(place)
+            }
+            Rvalue::RawPtr { place, kind, .. } if kind.as_str() == Some("Const") => {
+                Self::result_disc_place_local(place)
+            }
+            _ => None,
+        }
+    }
+
     /// Compile-time Result discriminant of a single-assignment local,
-    /// walking `Use` / `Ref` aliases to a Result `Aggregate` or const ADT.
+    /// walking `Use` / shared `Ref` / const `RawPtr` aliases to a Result
+    /// `Aggregate` or const ADT. A local that
+    /// `compute_mutably_borrowed_locals` can write, or a `Mut` /
+    /// `TwoPhaseMut` / `RawPtr` mut hop, is not a compile-time tag.
     fn result_local_const_disc(&self, start: usize) -> Option<i64> {
+        let mutably_borrowed = compute_mutably_borrowed_locals(self.llbc, self.body);
         let mut local = start;
         for _ in 0..8 {
-            if self.multi_assigned_locals.contains(&local) {
+            if self.multi_assigned_locals.contains(&local) || mutably_borrowed.contains(&local) {
                 return None;
             }
             if let Some(&tag) = self.const_discriminant_locals.get(&local) {
@@ -3358,12 +3385,9 @@ impl<'a> Lowering<'a> {
                 Rvalue::Use(Operand::Const(value), _) => {
                     return self.result_const_expr_disc(value);
                 }
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
-                | Rvalue::Ref { place, .. }
-                | Rvalue::RawPtr { place, .. } => {
-                    local = Self::result_disc_place_local(place)?;
+                _ => {
+                    local = Self::result_alias_hop_local(rvalue)?;
                 }
-                _ => return None,
             }
         }
         None
