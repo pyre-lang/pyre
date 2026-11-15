@@ -5383,7 +5383,6 @@ mod tests {
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
             &mut builder,
             std::slice::from_ref(&runtime),
-            &rd_numb,
             &[],
             &all_liveness,
             FailArgSource::Slice(&[]),
@@ -5394,7 +5393,7 @@ mod tests {
             None,
             None, // all_virtuals
             &NullAllocator,
-            Some(&rd_numb),
+            &rd_numb,
         );
 
         assert_eq!(virtualizable_ptr, 0);
@@ -5483,7 +5482,6 @@ mod tests {
             blackhole_from_resumedata(
                 &mut builder,
                 std::slice::from_ref(&runtime),
-                &rd_numb,
                 &[],
                 &all_liveness,
                 FailArgSource::Slice(&deadframe),
@@ -5494,7 +5492,7 @@ mod tests {
                 None,
                 all_virtuals,
                 &NullAllocator,
-                Some(&rd_numb),
+                &rd_numb,
             )
         };
 
@@ -5552,7 +5550,6 @@ mod tests {
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
             &mut builder,
             std::slice::from_ref(&runtime),
-            &rd_numb,
             &[],
             &all_liveness,
             FailArgSource::Slice(&deadframe),
@@ -5563,7 +5560,7 @@ mod tests {
             None, // ginfo
             None, // all_virtuals
             &NullAllocator,
-            Some(&rd_numb),
+            &rd_numb,
         );
         (virtualizable_ptr, bh.registers_r[0])
     }
@@ -9082,7 +9079,6 @@ fn setposition_from_jitcodes<'a>(
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>],
-    rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
@@ -9093,12 +9089,11 @@ pub fn blackhole_from_resumedata<'a>(
     ginfo: Option<&dyn GreenfieldInfo>,
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
-    numb_root: Option<&'a majit_ir::NumberingRef>,
+    numb_root: &'a majit_ir::NumberingRef,
 ) -> (Box<BlackholeInterpreter>, i64) {
     blackhole_from_resumedata_with(
         builder,
         |jitcode_pos, pc| setposition_from_jitcodes(jitcodes, jitcode_pos, pc),
-        rd_numb,
         rd_consts,
         all_liveness,
         deadframe,
@@ -9120,7 +9115,6 @@ pub fn blackhole_from_resumedata<'a>(
 pub fn blackhole_from_resumedata_with<'a, 'jc, F>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: F,
-    rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
@@ -9137,7 +9131,7 @@ pub fn blackhole_from_resumedata_with<'a, 'jc, F>(
     // the already-forced virtualizable alone.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
-    numb_root: Option<&'a majit_ir::NumberingRef>,
+    numb_root: &'a majit_ir::NumberingRef,
 ) -> (Box<BlackholeInterpreter>, i64)
 where
     F: Fn(i32, i32) -> Option<ResolvedJitCode<'jc>>,
@@ -9153,17 +9147,19 @@ where
     let _cc_guard = crate::CriticalCodeGuard::enter();
     // resume.py:1317-1321
     let resuming_after_guard_not_forced = all_virtuals.is_some();
+    // Slice the numbering here (`resume.py` `blackhole_from_resumedata`
+    // reads `storage.rd_numb`). The caller may allocate before this call,
+    // and a minor would then decode the header from a stale slice while
+    // the bind below reloads the rest.
     let mut resumereader = ResumeDataDirectReader::new(
-        rd_numb,
+        numb_root.as_slice(),
         rd_consts,
         all_liveness,
         deadframe,
         all_virtuals,
         allocator,
     );
-    if let Some(numb) = numb_root {
-        resumereader.resumecodereader.bind_numbering(numb);
-    }
+    resumereader.resumecodereader.bind_numbering(numb_root);
 
     // resume.py: `_prepare` — and so both `_prepare_virtuals` and
     // `_prepare_pendingfields` — runs only in the `all_virtuals is None`
@@ -9223,25 +9219,22 @@ where
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc).
         let resolved = resolve_jitcode(jitcode_pos, pc).unwrap_or_else(|| {
-            if let Some(numb) = numb_root {
-                let live = numb.as_slice();
-                let n = live.len().min(16);
-                let unpacked = majit_ir::resumecode::unpack_all(live);
-                eprintln!(
-                    "STALE_NUMBERING site=blackhole_from_resumedata payload={:#x} len={} first={:02x?} \
-                     jitcode_pos={jitcode_pos} pc={pc} cur_pos={} items_read={} \
-                     items_resume={} count={} slice_ptr={:#x} live_ptr={:#x} unpacked={unpacked:?}",
-                    numb.payload_addr(),
-                    live.len(),
-                    &live[..n],
-                    resumereader.resumecodereader.cur_pos,
-                    resumereader.resumecodereader.items_read,
-                    resumereader.items_resume_section,
-                    resumereader.count,
-                    rd_numb.as_ptr() as usize,
-                    live.as_ptr() as usize,
-                );
-            }
+            let live = numb_root.as_slice();
+            let n = live.len().min(16);
+            let unpacked = majit_ir::resumecode::unpack_all(live);
+            eprintln!(
+                "STALE_NUMBERING site=blackhole_from_resumedata payload={:#x} len={} first={:02x?} \
+                 jitcode_pos={jitcode_pos} pc={pc} cur_pos={} items_read={} \
+                 items_resume={} count={} live_ptr={:#x} unpacked={unpacked:?}",
+                numb_root.payload_addr(),
+                live.len(),
+                &live[..n],
+                resumereader.resumecodereader.cur_pos,
+                resumereader.resumecodereader.items_read,
+                resumereader.items_resume_section,
+                resumereader.count,
+                live.as_ptr() as usize,
+            );
             panic!("blackhole_from_resumedata: invalid jitcode index {jitcode_pos} at pc {pc}")
         });
         if crate::bh_debug_enabled() {
@@ -9294,7 +9287,6 @@ where
 )]
 pub fn force_from_resumedata<'a>(
     profiler: &crate::jitprof::JitProfiler,
-    rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
@@ -9304,7 +9296,7 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-    numb_root: Option<&'a majit_ir::NumberingRef>,
+    numb_root: &'a majit_ir::NumberingRef,
 ) -> (Vec<i64>, Vec<i64>, i64) {
     let _bh_phase = majit_gc::BhProbePhase::enter("resume");
     // resume.py:1346
@@ -9313,15 +9305,10 @@ pub fn force_from_resumedata<'a>(
     // Slice the numbering here, not at the caller. The caller may
     // allocate before this call, and a minor would then decode the
     // header from a stale slice while the bind below reloads the rest.
-    let rd_numb = match numb_root {
-        Some(numb) => numb.as_slice(),
-        None => rd_numb,
-    };
+    let rd_numb = numb_root.as_slice();
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, all_liveness, deadframe, None, allocator);
-    if let Some(numb) = numb_root {
-        resumereader.resumecodereader.bind_numbering(numb);
-    }
+    resumereader.resumecodereader.bind_numbering(numb_root);
     let mut resumereader = resumereader.bind_deadframe_root();
     // resume.py common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.

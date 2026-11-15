@@ -8210,7 +8210,6 @@ impl<S: JitState> JitDriver<S> {
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     jitcodes,
-                    rd_numb.as_slice(),
                     rd_consts_slice,
                     &all_liveness,
                     fail_args,
@@ -8226,7 +8225,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // ginfo
                     all_virtuals,
                     allocator,
-                    Some(rd_numb),
+                    rd_numb,
                 )
             };
             {

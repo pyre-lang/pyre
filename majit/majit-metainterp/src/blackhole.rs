@@ -3155,6 +3155,11 @@ impl BlackholeInterpBuilder {
     /// `blackhole.py` `BlackholeInterpBuilder.release_interp`
     pub fn release_interp(&mut self, mut interp: Box<BlackholeInterpreter>) {
         interp.cleanup_registers();
+        // A pooled interpreter stays registered with the GC, and the walker
+        // visits `virtualizable_ptr`; leave it null so a finished frame is
+        // not kept alive while idle
+        // (`blackhole.py BlackholeInterpBuilder.release_interp`).
+        interp.virtualizable_ptr = 0;
         // Owning `Box` link: abort-arm `release_bh_rd` (call_jit.rs) releases a
         // frame whose caller chain is still attached; single-frame seating
         // (jitdriver.rs) does not assign it, and `resume_mainloop` reads it.
@@ -6860,9 +6865,18 @@ mod tests {
             let previous = super::StateFieldLayout::with_ref_scalars(1, 0, 0, 2, 8, 0);
             let mut bh = builder.acquire_interp();
             bh.state_field_layout = previous.clone();
+            bh.virtualizable_ptr = 0x7f00_0000_1234;
             assert_eq!(bh.state_field_layout.ref_scalar_slot(0), 8);
 
             builder.release_interp(bh);
+            assert_eq!(
+                builder
+                    .blackholeinterps
+                    .as_ref()
+                    .expect("release_interp pools the interp")
+                    .virtualizable_ptr,
+                0,
+            );
             let reused = builder.acquire_interp();
             assert_eq!(
                 reused.state_field_layout, previous,

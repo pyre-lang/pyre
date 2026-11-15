@@ -17023,8 +17023,10 @@ impl<M: Clone> MetaInterp<M> {
         // heap writes were dropped on async forcing.
         let storage = crate::resume::get_resumestorage(descr);
         let storage = storage.as_deref();
-        let numb_root = storage.and_then(|s| s.rd_numb_ref());
-        let rd_numb = numb_root.map(|n| n.as_slice()).unwrap_or(&[]);
+        let numb_root = storage.and_then(|s| s.rd_numb_ref()).expect(
+            "force_from_resumedata reads storage.rd_numb (resume.py force_from_resumedata)",
+        );
+        let rd_numb = numb_root.as_slice();
         let rd_consts: &[Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
         // entries before handling_async_forcing. The decoder needs the
@@ -17068,7 +17070,6 @@ impl<M: Clone> MetaInterp<M> {
         let all_liveness = all_liveness_bytes.as_ref();
         let (all_virtuals_ptr, all_virtuals_int, _) = crate::resume::force_from_resumedata(
             &self.staticdata.profiler,
-            rd_numb,
             rd_consts,
             all_liveness,
             fail_values,

@@ -721,13 +721,16 @@ impl JitCodeSetup {
     /// Field load of the `setup` payload. Reading before `JitCode.setup`
     /// (`set_body`) is an error: `jitcode.py` `self.code` does not exist
     /// until `setup`. A caller that must handle a shell uses `try_body`.
+    /// The assertion is live in every build: `Deref` panics on an unset
+    /// payload.
     #[inline(always)]
     fn published(&self) -> &JitCodeBody {
-        debug_assert!(
+        assert!(
             self.is_set(),
             "JitCode body not yet set — call set_body() before reading body fields"
         );
-        // SAFETY: `set_body` writes `data` before any resume reader; the
+        // SAFETY: `assert!(self.is_set())` above is live in every build, so
+        // this pointer is the payload `set_once` published. The
         // `Arc<JitCode>` that holds this `JitCode` pins the allocation
         // (`BlackholeInterpreter.jitcode`). After that write the payload
         // is immutable except `ConstSlotR` atomics and `&mut` `body_mut`.
@@ -742,11 +745,12 @@ impl JitCodeSetup {
         if self.set.load(Ordering::Acquire) {
             panic!("JitCode body already set");
         }
-        // SAFETY: no `&JitCodeBody` obtained from this shell exists before
-        // `set_once` returns (enforced in debug builds by `published`'s
-        // `debug_assert!(self.is_set())`). One writer (`JitCode.setup` /
-        // `set_body`) on this shell; `CallControl::get_jitcode` fills the
-        // `Arc` on the assembler thread before compiled code can resume it.
+        // SAFETY: `published`'s `assert!(self.is_set())` is live in every
+        // build, so a `&JitCodeBody` from this shell exists only after
+        // `set_once` stores the payload and publishes `set`. One writer
+        // (`JitCode.setup` / `set_body`) on this shell;
+        // `CallControl::get_jitcode` fills the `Arc` on the assembler
+        // thread before compiled code can resume it.
         unsafe {
             *self.data.get() = body;
         }

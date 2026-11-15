@@ -3367,7 +3367,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         resume::blackhole_from_resumedata_with(
             &mut builder,
             resolve_jitcode,
-            rd_numb.as_slice(),
             rd_consts,
             &all_liveness,
             deadframe.clone(),
@@ -3378,7 +3377,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             None,      // resume.py blackhole_from_resumedata greenfield_info unused in pyre
             all_virtuals, // resume.py blackhole_from_resumedata GUARD_NOT_FORCED cache
             &allocator,
-            Some(rd_numb),
+            rd_numb,
         )
     };
 

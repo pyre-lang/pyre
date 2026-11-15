@@ -3988,8 +3988,8 @@ mod tests {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
         let b10 = rop(Type::Int, 10);
         let mut sb = ShortBoxes::with_label_args(&[b10.clone()]);
-        sb.add_short_input_arg(&mut __ctx, b10);
-        let pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 10), rop(Type::Int, 999)]);
+        sb.add_short_input_arg(&mut __ctx, b10.clone());
+        let pure = Op::new(OpCode::IntAdd, &[b10.clone(), rop(Type::Int, 999)]);
         pure.pos().set(OpRef::int_op(20));
         let pure_rc = OpRc::new(pure);
         let pure_res = Operand::from_bound_op(&pure_rc);
