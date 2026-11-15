@@ -4134,13 +4134,13 @@ impl TraceCtx {
     /// the flat `[arr0_elem0.., arr1_elem0.., ..]` layout — the array portion of
     /// `virtualizable_boxes`, excluding the `num_static_extra_boxes` leading
     /// static-field slots and the trailing identity slot
-    /// (`virtualizable_boxes[-1]`). Each slot's bits come from
+    /// (`virtualizable_boxes[-1]`). Each slot comes from
     /// [`Self::virtualizable_entry_at`] (the box's own result, or the live
     /// virtualizable when the box carries no runtime concrete). `None` when no
     /// standard virtualizable is active. Used by the single-pass close
     /// to transfer walk-mutated loop-carried array state into native `state`
     /// before re-entering the compiled loop (`live_arg_boxes += virtualizable_boxes`).
-    pub fn collect_virtualizable_element_values(&self) -> Option<Vec<i64>> {
+    pub fn collect_virtualizable_element_values(&self) -> Option<Vec<Value>> {
         let boxes = self.virtualizable_boxes.as_ref()?;
         let static_count = self
             .virtualizable_info
@@ -4152,8 +4152,8 @@ impl TraceCtx {
             (start..end)
                 .map(|i| {
                     self.virtualizable_entry_at(i)
-                        .map(|(_, v)| value_to_raw_bits(v))
-                        .unwrap_or(0)
+                        .map(|(_, v)| v)
+                        .unwrap_or(Value::Int(0))
                 })
                 .collect(),
         )

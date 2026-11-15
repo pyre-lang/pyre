@@ -1741,19 +1741,19 @@ mod tests {
     fn transparent_scalar_kind_resolves_unique_leaf_and_refuses_collision() {
         let mut reg = StructFieldRegistry::default();
         reg.transparent_scalar_kinds.insert(
-            "eval::FrameAnchor".to_string(),
+            "eval::ScalarWrapper".to_string(),
             crate::model::ValueType::Unsigned,
         );
         reg.transparent_scalar_kinds.insert(
-            "pyre_interpreter::eval::FrameAnchor".to_string(),
+            "pyre_interpreter::eval::ScalarWrapper".to_string(),
             crate::model::ValueType::Unsigned,
         );
         assert_eq!(
-            reg.transparent_scalar_kind("&FrameAnchor"),
+            reg.transparent_scalar_kind("&ScalarWrapper"),
             Some(crate::model::ValueType::Unsigned)
         );
         assert_eq!(
-            reg.transparent_scalar_kind("FrameAnchor"),
+            reg.transparent_scalar_kind("ScalarWrapper"),
             Some(crate::model::ValueType::Unsigned)
         );
         reg.transparent_scalar_kinds.insert(

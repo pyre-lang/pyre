@@ -13727,7 +13727,7 @@ pub(in crate::front::mir) fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> Str
 ///
 /// [`tyref_is_borrowed_transparent_scalar`] is the same predicate
 /// `place_borrow_takes_address` uses to alias `Rvalue::Ref` onto the
-/// depth word: a `&FrameAnchor` local is `Unsigned`, so the layout row
+/// inner word: a `&Wrapper` local is that scalar, so the layout row
 /// of a capture of that borrow must be the inner scalar too. A GC
 /// handle borrow (`&PyError`) is not this predicate and keeps `&T`.
 fn borrowed_transparent_scalar_field_layout_spelling(
@@ -13776,6 +13776,16 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
+    // A `FrameAnchor` / `&FrameAnchor` field is the frame pointer
+    // (`tyref_to_ast_string` of a `RawPtr` to an ADT uses the TypeDecl
+    // leaf). `Option<FrameAnchor>` is `Option` of that pointer.
+    if frame_anchor::tyref_is_anchor(ty, llbc) || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
+    {
+        return "*mut PyFrame".to_string();
+    }
+    if frame_anchor::tyref_is_option_of_anchor(ty, llbc) {
+        return "Option<*mut PyFrame>".to_string();
+    }
     // A borrow of a fieldless enum is the tag word
     // (`tyref_to_value_type` / `tyref_is_borrowed_fieldless_enum_free`).
     // Spell it as the discriminant scalar before the reference arm, which
@@ -13789,8 +13799,8 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // before the reference arm, which would otherwise keep `&Wrapper` as
     // a pointer row against an Int FORCE. `project_struct_field_type`
     // peels `&` and then `raw_struct_ptr_annotation` mints
-    // `Ptr(eval::FrameAnchor)` for a raw-word owner; setattr of the
-    // captured depth word is `unionof` Integer ∪ Ptr
+    // `Ptr(the wrapper)` for a raw-word owner; setattr of the
+    // captured inner word is `unionof` Integer ∪ Ptr
     // (`annotator/model.py`; `rclass.py` field reprs).
     if let Some(spelling) = borrowed_transparent_scalar_field_layout_spelling(
         ty,

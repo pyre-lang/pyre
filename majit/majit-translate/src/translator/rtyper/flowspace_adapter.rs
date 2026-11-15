@@ -9052,7 +9052,7 @@ mod tests {
     fn derive_subject_inputcells_seeds_transparent_scalar_ref_as_unsigned() {
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
-        let owner = "eval::FrameAnchor";
+        let owner = "eval::ScalarWrapper";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
         let _ids =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
@@ -9116,7 +9116,7 @@ mod tests {
                 cells[0]
             );
         };
-        assert!(i.unsigned, "FrameAnchor.depth is usize");
+        assert!(i.unsigned, "ScalarWrapper.depth is usize");
         assert!(
             bk.raw_struct_ptr_annotation(owner).is_none(),
             "a transparent scalar must not mint SomePtr of the wrapper"
@@ -9125,7 +9125,7 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_transparent_scalar_int_as_unsigned() {
-        let owner = "eval::FrameAnchor";
+        let owner = "eval::ScalarWrapper";
         let mut graph = LegacyGraph::new("from_raw_user");
         let entry = graph.startblock;
         let anchor = graph
@@ -9156,7 +9156,7 @@ mod tests {
                 cells[0]
             );
         };
-        assert!(i.unsigned, "FrameAnchor.depth is usize");
+        assert!(i.unsigned, "ScalarWrapper.depth is usize");
     }
 
     #[test]

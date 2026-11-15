@@ -390,7 +390,7 @@ pub struct PendingAbortBlackhole {
     /// have to be pushed into native `state` before the chain runs — the
     /// blackhole's `getarrayitem_vable_*` read the real object.  `None` when
     /// the state has no virtualizable array.
-    pub virt_array_values: Option<Vec<i64>>,
+    pub virt_array_values: Option<Vec<majit_ir::Value>>,
     /// The trace's virtualizable identity (`initialize_virtualizable` writes
     /// it onto the ctx; `set_vable_ptr` only seeds `pending_vable_ptr`).
     /// `0` when the state has none.
@@ -3516,7 +3516,11 @@ impl<S: JitState> JitDriver<S> {
         // live struct, so it has to see the walk's elements, not the
         // trace-start ones.
         if let Some(values) = virt_array_values {
-            state.writeback_virt_array_state_fields_from_values(&values);
+            let bits: Vec<i64> = values
+                .iter()
+                .map(|v| crate::trace_ctx::value_to_raw_bits(*v))
+                .collect();
+            state.writeback_virt_array_state_fields_from_values(&bits);
             self.meta.single_pass_virt_array_values = None;
         }
         // Guard-failure resume still uses `seed_deopt_vinfo_ptr` (null for a
@@ -4029,7 +4033,11 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn writeback_virt_array_state_fields(&mut self, state: &mut S) {
         if let Some(values) = self.meta.single_pass_virt_array_values.take() {
-            state.writeback_virt_array_state_fields_from_values(&values);
+            let bits: Vec<i64> = values
+                .iter()
+                .map(|v| crate::trace_ctx::value_to_raw_bits(*v))
+                .collect();
+            state.writeback_virt_array_state_fields_from_values(&bits);
         }
     }
 

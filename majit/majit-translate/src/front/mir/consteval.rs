@@ -965,6 +965,10 @@ pub(crate) fn discover_transparent_scalar_kinds(
         if decl.published_struct_copy {
             continue;
         }
+        // The anchor is the frame reference in a JIT graph, not its host depth word (`front/frame_anchor.rs`).
+        if super::frame_anchor::is_anchor_path(decl.item_meta.name_path_str()) {
+            continue;
+        }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };
@@ -1011,7 +1015,7 @@ pub(crate) fn discover_transparent_scalar_kinds(
 }
 
 /// Full path and, when it still names a module, the crate-stripped path.
-/// Interned class_roots use the stripped spelling (`eval::FrameAnchor`);
+/// Interned class_roots use the stripped spelling (`bytecode::CodeFlags`);
 /// `Llbc::transparent_scalar_kind` is an exact key match. A two-segment
 /// path strips to the leaf (`bitflags::InternalBitFlags`); those leaves
 /// collide across crates, so they stay off the register.

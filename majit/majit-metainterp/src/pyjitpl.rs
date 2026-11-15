@@ -2432,7 +2432,7 @@ pub struct MetaInterp<M: Clone> {
     /// instead of re-executing the traced iteration — the analog of PyPy's
     /// `live_arg_boxes += virtualizable_boxes` (pyjitpl.py). `None`
     /// outside single-pass or when the state has no virtualizable array.
-    pub(crate) single_pass_virt_array_values: Option<Vec<i64>>,
+    pub(crate) single_pass_virt_array_values: Option<Vec<Value>>,
     /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` input, staged
     /// across the two borrows it needs.  The Abort arm of `merge_point` holds
     /// the aborting framestack and the live sym but no native `state`; the
@@ -2767,7 +2767,7 @@ pub struct MetaInterp<M: Clone> {
     /// publishing `aborted_framestack` itself.
     pub(crate) interpret_framestack_for_abort: bool,
     /// virtualizable array values and heap pointer captured by `capture_interpret_abort_values`
-    pub(crate) interpret_abort_virtualizable: Option<(Option<Vec<i64>>, i64)>,
+    pub(crate) interpret_abort_virtualizable: Option<(Option<Vec<Value>>, i64)>,
     /// `Counters.ABORT_*` from the interpret walk's `aborted_tracing`.
     /// `None` when that walk did not abort.
     pub last_interpret_abort_reason: Option<i32>,
@@ -2875,7 +2875,7 @@ pub(crate) struct ParkedTraceAttempt<M: Clone> {
     back_edge_finish_word: Option<i64>,
     single_pass_scalar_values: Option<Vec<i64>>,
     single_pass_ref_scalar_values: Option<Vec<i64>>,
-    single_pass_virt_array_values: Option<Vec<i64>>,
+    single_pass_virt_array_values: Option<Vec<Value>>,
     pending_abort_blackhole: Option<crate::PendingAbortBlackhole>,
     single_pass_compiled_key: Option<u64>,
     pending_green_key: Option<u64>,
@@ -2928,7 +2928,7 @@ pub(crate) struct ParkedTraceAttempt<M: Clone> {
     pending_abort_has_merge_points: bool,
     pending_abort_reason: Option<i32>,
     interpret_framestack_for_abort: bool,
-    interpret_abort_virtualizable: Option<(Option<Vec<i64>>, i64)>,
+    interpret_abort_virtualizable: Option<(Option<Vec<Value>>, i64)>,
     last_interpret_abort_reason: Option<i32>,
     interpret_bail_residual: Option<String>,
     last_exc_box: Option<OpRef>,
@@ -3366,6 +3366,19 @@ fn walk_raw_gcref_i64(slot: &mut i64, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// `history.py RefFrontendOp`: a snapshot value that is a reference is
+/// a GC root until its consumer reads it.
+fn walk_value_refs(values: &mut [Value], visitor: &mut dyn FnMut(&mut GcRef)) {
+    for value in values.iter_mut() {
+        if let Value::Ref(gcref) = value
+            && !gcref.is_null()
+            && *gcref != GcRef::NO_CONCRETE
+        {
+            visitor(gcref);
+        }
+    }
+}
+
 fn walk_raw_gcref_ptr(slot: &mut *const u8, visitor: &mut dyn FnMut(&mut GcRef)) {
     if slot.is_null() {
         return;
@@ -3418,6 +3431,9 @@ fn walk_pending_abort_blackhole_refs(
 ) {
     walk_raw_gcref_i64(&mut pending.last_exc_value, visitor);
     walk_raw_gcref_i64(&mut pending.virtualizable_ptr, visitor);
+    if let Some(values) = pending.virt_array_values.as_mut() {
+        walk_value_refs(values, visitor);
+    }
     for value in pending.ref_scalar_values.iter_mut() {
         walk_raw_gcref_i64(value, visitor);
     }
@@ -4351,6 +4367,8 @@ impl<M: Clone> MetaInterp<M> {
         forced_virtualizable: &mut i64,
         pending_vable_ptr: &mut *const u8,
         single_pass_ref_scalar_values: Option<&mut Vec<i64>>,
+        single_pass_virt_array_values: Option<&mut Vec<Value>>,
+        interpret_abort_virtualizable: Option<&mut (Option<Vec<Value>>, i64)>,
         pending_abort_blackhole: Option<&mut crate::PendingAbortBlackhole>,
         tracing: Option<&mut TraceCtx>,
         visitor: &mut dyn FnMut(&mut GcRef),
@@ -4392,6 +4410,15 @@ impl<M: Clone> MetaInterp<M> {
                 walk_raw_gcref_i64(value, visitor);
             }
         }
+        if let Some(values) = single_pass_virt_array_values {
+            walk_value_refs(values, visitor);
+        }
+        if let Some((values, ptr)) = interpret_abort_virtualizable {
+            if let Some(values) = values.as_mut() {
+                walk_value_refs(values, visitor);
+            }
+            walk_raw_gcref_i64(ptr, visitor);
+        }
         if let Some(pending) = pending_abort_blackhole {
             walk_pending_abort_blackhole_refs(pending, visitor);
         }
@@ -4419,6 +4446,8 @@ impl<M: Clone> MetaInterp<M> {
             let forced_virtualizable = &mut self.forced_virtualizable;
             let pending_vable_ptr = &mut self.pending_vable_ptr;
             let single_pass_ref_scalar_values = self.single_pass_ref_scalar_values.as_mut();
+            let single_pass_virt_array_values = self.single_pass_virt_array_values.as_mut();
+            let interpret_abort_virtualizable = self.interpret_abort_virtualizable.as_mut();
             let pending_abort_blackhole = self.pending_abort_blackhole.as_mut();
             let tracing = self
                 .tracing
@@ -4434,6 +4463,8 @@ impl<M: Clone> MetaInterp<M> {
                 forced_virtualizable,
                 pending_vable_ptr,
                 single_pass_ref_scalar_values,
+                single_pass_virt_array_values,
+                interpret_abort_virtualizable,
                 pending_abort_blackhole,
                 tracing,
                 &mut visitor,
@@ -4463,6 +4494,8 @@ impl<M: Clone> MetaInterp<M> {
                 &mut parked.forced_virtualizable,
                 &mut parked.pending_vable_ptr,
                 parked.single_pass_ref_scalar_values.as_mut(),
+                parked.single_pass_virt_array_values.as_mut(),
+                parked.interpret_abort_virtualizable.as_mut(),
                 parked.pending_abort_blackhole.as_mut(),
                 parked
                     .tracing
@@ -32427,6 +32460,36 @@ mod tests {
             Some(GcRef(0xB000))
         );
         assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_abort_snapshot_refs() {
+        // history.py `RefFrontendOp`: abort snapshots keep typed Values so
+        // the extra-root walker can forward Ref elements.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.interpret_abort_virtualizable =
+            Some((Some(vec![Value::Ref(GcRef(0x1000)), Value::Int(7)]), 0x2000));
+        meta.single_pass_virt_array_values = Some(vec![Value::Ref(GcRef(0x3000))]);
+
+        meta.walk_active_trace_refs(|slot| {
+            if !slot.is_null() {
+                slot.0 += 0x10;
+            }
+        });
+
+        let (values, ptr) = meta
+            .interpret_abort_virtualizable
+            .as_ref()
+            .expect("abort snapshot still parked");
+        assert_eq!(
+            values.as_deref(),
+            Some([Value::Ref(GcRef(0x1010)), Value::Int(7)].as_slice())
+        );
+        assert_eq!(*ptr, 0x2010);
+        assert_eq!(
+            meta.single_pass_virt_array_values.as_deref(),
+            Some([Value::Ref(GcRef(0x3010))].as_slice())
+        );
     }
 
     /// `warmstate.py` `bound_reached` constructs a fresh MetaInterp; pyre

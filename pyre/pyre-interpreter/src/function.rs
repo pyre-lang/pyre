@@ -4639,7 +4639,7 @@ pub fn funccall_valuestack(
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(code as PyObjectRef);
-                let _ = roots.pin_root(frame.peekvalue(0));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(0));
                 unsafe { &mut *caller.live() }.dropvalues(dropvalues);
                 unsafe { crate::builtin_code_call(roots.get(base), &[roots.get(base + 1)]) }
             }
@@ -4647,8 +4647,8 @@ pub fn funccall_valuestack(
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(code as PyObjectRef);
-                let _ = roots.pin_root(frame.peekvalue(1));
-                let _ = roots.pin_root(frame.peekvalue(0));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(1));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(0));
                 unsafe { &mut *caller.live() }.dropvalues(dropvalues);
                 unsafe {
                     crate::builtin_code_call(
@@ -4661,9 +4661,9 @@ pub fn funccall_valuestack(
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(code as PyObjectRef);
-                let _ = roots.pin_root(frame.peekvalue(2));
-                let _ = roots.pin_root(frame.peekvalue(1));
-                let _ = roots.pin_root(frame.peekvalue(0));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(2));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(1));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(0));
                 unsafe { &mut *caller.live() }.dropvalues(dropvalues);
                 unsafe {
                     crate::builtin_code_call(
@@ -4680,10 +4680,10 @@ pub fn funccall_valuestack(
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(code as PyObjectRef);
-                let _ = roots.pin_root(frame.peekvalue(3));
-                let _ = roots.pin_root(frame.peekvalue(2));
-                let _ = roots.pin_root(frame.peekvalue(1));
-                let _ = roots.pin_root(frame.peekvalue(0));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(3));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(2));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(1));
+                let _ = roots.pin_root(unsafe { &*caller.live() }.peekvalue(0));
                 unsafe { &mut *caller.live() }.dropvalues(dropvalues);
                 unsafe {
                     crate::builtin_code_call(

@@ -31,6 +31,10 @@ pub(super) const PATH: &str = "pyre_interpreter::eval::FrameAnchor";
 
 const FRAME_PATH: &str = "pyre_interpreter::pyframe::PyFrame";
 
+/// Crate-stripped class root [`frame_class_root`] / `adt_node_class_root_with`
+/// yield for [`FRAME_PATH`]. A field of this class is the frame pointer.
+const FRAME_CLASS_ROOT: &str = "pyframe::PyFrame";
+
 const FREE_FNS: &[&str] = &[
     "frame_anchor_push",
     "frame_anchor_live",
@@ -55,11 +59,48 @@ pub(super) enum Op {
     Drop,
 }
 
-pub(super) fn is_anchor_path(path: &str) -> bool {
+pub(crate) fn is_anchor_path(path: &str) -> bool {
     path == PATH
         || path.ends_with(&format!("::{PATH}"))
         || path == "eval::FrameAnchor"
         || super::strip_crate_prefix(path) == "eval::FrameAnchor"
+}
+
+fn is_anchor_field_core(core: &str) -> bool {
+    matches!(
+        core,
+        "FrameAnchor" | "eval::FrameAnchor" | "pyre_interpreter::eval::FrameAnchor"
+    )
+}
+
+fn peel_leading_ref(spelling: &str) -> &str {
+    spelling
+        .strip_prefix("&mut ")
+        .or_else(|| spelling.strip_prefix('&'))
+        .unwrap_or(spelling)
+        .trim()
+}
+
+/// Replacement FieldRow spelling for an anchor field: the `*mut PyFrame`
+/// (or `Option<*mut PyFrame>`) row a raw frame pointer already uses.
+///
+/// The pointee is [`FRAME_CLASS_ROOT`], the crate-stripped class root
+/// [`frame_class_root`] yields for [`FRAME_PATH`].
+pub(crate) fn field_spelling_frame_ptr(spelling: &str) -> Option<String> {
+    let core = peel_leading_ref(spelling.trim());
+    if is_anchor_field_core(core) {
+        return Some(format!("*mut {FRAME_CLASS_ROOT}"));
+    }
+    let inner = core
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .map(str::trim)
+        .map(peel_leading_ref)?;
+    if is_anchor_field_core(inner) {
+        Some(format!("Option<*mut {FRAME_CLASS_ROOT}>"))
+    } else {
+        None
+    }
 }
 
 fn is_frame_type_path(path: &str) -> bool {
@@ -698,6 +739,25 @@ mod tests {
         assert!(is_anchor_path("eval::FrameAnchor"));
         assert!(!is_anchor_path("other::FrameAnchor"));
         assert!(!is_anchor_path("pyre_interpreter::eval::frame_anchor_push"));
+    }
+
+    #[test]
+    fn field_spelling_frame_ptr_maps_anchor_cores_only() {
+        assert_eq!(
+            field_spelling_frame_ptr("&FrameAnchor").as_deref(),
+            Some("*mut pyframe::PyFrame")
+        );
+        assert_eq!(
+            field_spelling_frame_ptr("eval::FrameAnchor").as_deref(),
+            Some("*mut pyframe::PyFrame")
+        );
+        assert_eq!(
+            field_spelling_frame_ptr("Option<FrameAnchor>").as_deref(),
+            Some("Option<*mut pyframe::PyFrame>")
+        );
+        assert_eq!(field_spelling_frame_ptr("other::FrameAnchor"), None);
+        assert_eq!(field_spelling_frame_ptr("FrameAnchorX"), None);
+        assert_eq!(field_spelling_frame_ptr("usize"), None);
     }
 
     #[test]

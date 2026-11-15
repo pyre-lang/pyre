@@ -103,7 +103,6 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_erased_drop(&place.ty, self.llbc)
             || frame_anchor::tyref_is_erased_drop(&place.ty, self.llbc)
-            || drop_place_is_frame_anchor(place, self.body, self.llbc)
         {
             return Ok(true);
         }
@@ -1204,12 +1203,6 @@ pub(in crate::front::mir) fn frame_anchor_drop_glue_path(name: &str) -> bool {
     (last == Some("drop_in_place") || last == Some("drop")) && segments.contains(&"FrameAnchor")
 }
 
-pub(in crate::front::mir) fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
-    frame_anchor::tyref_is_anchor(ty, llbc)
-        || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
-        || frame_anchor::tyref_is_option_of_anchor(ty, llbc)
-}
-
 pub(in crate::front::mir) fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
     let adt = node.get("Adt")?;
     if let Some(id) = adt.as_u64() {
@@ -1220,27 +1213,6 @@ pub(in crate::front::mir) fn adt_id_flexible(node: &serde_json::Value) -> Option
         return Some(n);
     }
     id.get("Adt").and_then(serde_json::Value::as_u64)
-}
-
-/// Dedup `place.ty` often has no Adt name. Opcode handlers name the
-/// one-word local `anchor` / `frame_anchor`; those locals are
-/// [`FrameAnchor`] (every `let anchor` in the interpreter is one).
-pub(in crate::front::mir) fn drop_place_is_frame_anchor(
-    place: &Place,
-    body: &Unstructured,
-    llbc: &Llbc,
-) -> bool {
-    if tyref_is_frame_anchor(&place.ty, llbc) {
-        return true;
-    }
-    let PlaceKind::Local(local) = place.kind else {
-        return false;
-    };
-    let Some(decl) = body.locals.locals.get(local as usize) else {
-        return false;
-    };
-    matches!(decl.name.as_deref(), Some("anchor") | Some("frame_anchor"))
-        || tyref_is_frame_anchor(&decl.ty, llbc)
 }
 
 /// The release residual an `ObjectLockGuard` drop lowers to (`rthread.py`

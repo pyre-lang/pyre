@@ -12862,26 +12862,26 @@ fn saturating_sub_wrapper_diamond_real() {
     });
 }
 
-/// `FrameAnchor` is the depth `usize`. `live`'s `&self` is that word.
+/// `FrameAnchor` is the frame reference. `live`'s `&self` is that Ref.
 ///
-/// `mergeinputargs` of `live` unions Integer ∪ Ptr when a caller seeds
-/// SomePtr of the wrapper. The harvest records the type as a transparent
-/// unsigned scalar so the annotator keeps the inner word.
+/// The harvest does not record the host depth word as a transparent
+/// scalar; the field and the value share the frame-pointer annotation
+/// (`rclass.py` `InstanceRepr` field reprs).
 #[test]
 #[ignore]
-fn frame_anchor_live_input_is_the_depth_word() {
+fn frame_anchor_live_input_is_the_frame_ref() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     crate::front::mir::link_transparent_scalar_types(std::slice::from_ref(&llbc));
     assert_eq!(
         llbc.transparent_scalar_kind("pyre_interpreter::eval::FrameAnchor"),
-        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
-        "FrameAnchor is the depth usize"
+        None,
+        "FrameAnchor is the frame reference, not a transparent scalar"
     );
     assert_eq!(
         llbc.transparent_scalar_kind("eval::FrameAnchor"),
-        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
-        "interned class_root matches the harvested kind"
+        None,
+        "interned class_root is not a harvested scalar kind"
     );
     let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::live")
         .expect("lower eval::<Impl>::live");
@@ -12898,15 +12898,10 @@ fn frame_anchor_live_input_is_the_depth_word() {
             _ => None,
         })
         .expect("live has a self Input");
-    assert_eq!(
-        input.0,
-        crate::model::ValueType::Unsigned,
-        "live `&self` is the depth word"
-    );
-    assert_eq!(
-        input.1.as_deref(),
-        Some("eval::FrameAnchor"),
-        "live keeps the interned class_root so the annotator can match the harvest"
+    assert!(
+        matches!(input.0, crate::model::ValueType::Ref(_)),
+        "live `&self` is the frame reference, got {:?}",
+        input.0
     );
     assert!(
         graph.return_class_root.as_deref() != Some("eval::FrameAnchor"),

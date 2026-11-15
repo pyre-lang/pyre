@@ -846,8 +846,8 @@ pub(crate) fn raw_struct_ptr_from_layout(
         return None;
     }
     // A transparent scalar is the inner word, not a pointer to a C
-    // struct. Minting SomePtr unioned Integer ∪ Ptr at
-    // `FrameAnchor::live` (`mergeinputargs`).
+    // struct. Minting SomePtr unioned Integer ∪ Ptr at a call that
+    // takes the wrapper (`mergeinputargs`).
     if registry.transparent_scalar_kind(class_root).is_some() {
         return None;
     }
@@ -4943,10 +4943,11 @@ impl Bookkeeper {
                         )
                         .is_some_and(|shell| shell == attr.s_value);
                 // A transparent scalar is the inner word. Intern of the
-                // ADT leaf (`&FrameAnchor`) is `Instance(eval::FrameAnchor)`
-                // while `live`'s `&self` is unsigned. Replace that Instance
-                // the same way the fn-integer FORCE shell is replaced, so
-                // setattr of the depth word does not union Integer ∪ Instance.
+                // wrapper leaf (`&Wrapper`) is `Instance` of that wrapper
+                // while a borrowed wrapper local is the inner word. Replace
+                // that Instance the same way the fn-integer FORCE shell is
+                // replaced, so setattr of the inner word does not union
+                // Integer ∪ Instance.
                 let is_transparent_scalar_instance_shell =
                     self.transparent_scalar_annotation(&row.ty).is_some()
                         && matches!(&attr.s_value, SomeValue::Instance(_))
@@ -6024,9 +6025,14 @@ impl Bookkeeper {
         if fn_ptr_somevalue_for_spelling_in(t, Some(self)).is_some() {
             return SomeValue::Impossible;
         }
+        // A FrameAnchor field is the frame pointer (`rclass.py`
+        // `InstanceRepr` field reprs; `classdesc.py` `ClassDef.generalize_attr`).
+        if let Some(frame_ptr) = crate::front::mir::frame_anchor::field_spelling_frame_ptr(t) {
+            return self.project_struct_field_type(&frame_ptr);
+        }
         // A transparent scalar field is the inner word
         // (`discover_transparent_scalar_kinds`). SomePtr of the wrapper
-        // unioned Integer ∪ Ptr at `FrameAnchor::live`.
+        // unioned Integer ∪ Ptr at a call that takes the wrapper.
         if let Some(cell) = self.transparent_scalar_annotation(t) {
             return cell;
         }
@@ -16282,7 +16288,7 @@ mod tests {
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
-        let owner = "eval::FrameAnchor";
+        let owner = "eval::ScalarWrapper";
         let parent = "eval::Handler";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
         let _ids =
@@ -16329,14 +16335,14 @@ mod tests {
         );
         let projected = bk.project_struct_field_type(owner);
         let SomeValue::Integer(i) = projected else {
-            panic!("FrameAnchor field must project to the depth word, got {projected:?}");
+            panic!("ScalarWrapper field must project to the inner word, got {projected:?}");
         };
-        assert!(i.unsigned, "FrameAnchor.depth is usize");
-        for spelling in ["&eval::FrameAnchor", "FrameAnchor", "&FrameAnchor"] {
+        assert!(i.unsigned, "ScalarWrapper.depth is usize");
+        for spelling in ["&eval::ScalarWrapper", "ScalarWrapper", "&ScalarWrapper"] {
             let projected = bk.project_struct_field_type(spelling);
             assert!(
                 matches!(projected, SomeValue::Integer(ref i) if i.unsigned),
-                "Charon spells a capture as the ADT leaf; {spelling} is the depth word, got {projected:?}"
+                "Charon spells a capture as the ADT leaf; {spelling} is the inner word, got {projected:?}"
             );
         }
     }
@@ -16345,7 +16351,7 @@ mod tests {
     fn closure_capture_of_transparent_scalar_leaf_is_the_inner_word() {
         use crate::front::StructFieldRegistry;
 
-        let owner = "eval::FrameAnchor";
+        let owner = "eval::ScalarWrapper";
         let closure = "executioncontext::<Impl>::_trace::closure#2";
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
@@ -16355,7 +16361,7 @@ mod tests {
             closure.to_string(),
             vec![crate::front::semantic::FieldRow::positional(
                 "__pos_5",
-                "&FrameAnchor",
+                "&ScalarWrapper",
             )],
         );
         reg.transparent_scalar_kinds
@@ -16377,7 +16383,19 @@ mod tests {
             .clone();
         assert!(
             matches!(attr, SomeValue::Integer(ref i) if i.unsigned),
-            "closure capture of the FrameAnchor leaf is the depth word, got {attr:?}"
+            "closure capture of the ScalarWrapper leaf is the inner word, got {attr:?}"
+        );
+    }
+
+    #[test]
+    fn closure_capture_of_frame_anchor_is_the_frame_pointer() {
+        let bk = bk();
+        let from_capture = bk.project_struct_field_type("&FrameAnchor");
+        let from_frame_ptr = bk.project_struct_field_type("*mut pyframe::PyFrame");
+        assert_eq!(from_capture, from_frame_ptr);
+        assert!(
+            !matches!(from_capture, SomeValue::Integer(_)),
+            "closure capture of FrameAnchor is the frame pointer, got {from_capture:?}"
         );
     }
 

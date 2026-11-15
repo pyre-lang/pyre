@@ -1375,11 +1375,15 @@ fn intern_enqueue_fun_spec(
     if types.is_empty() && const_generics.is_empty() {
         return;
     }
-    let key = (id, serde_json::to_string(&types).unwrap_or_default());
+    let trait_refs = intern_call_trait_refs(generics);
+    // `description.py FunctionDesc.cachedgraph` is keyed by every specialization value.
+    let key = (
+        id,
+        serde_json::to_string(&(&types, &const_generics, &trait_refs)).unwrap_or_default(),
+    );
     if !seen.insert(key) {
         return;
     }
-    let trait_refs = intern_call_trait_refs(generics);
     queue.push((id, types, const_generics, trait_refs));
 }
 
@@ -9261,7 +9265,7 @@ pub use shadow_stack_erase::{
 mod owner_root_guard;
 
 #[path = "frame_anchor.rs"]
-mod frame_anchor;
+pub(crate) mod frame_anchor;
 
 #[path = "rbigint_gc_root.rs"]
 mod rbigint_gc_root;
