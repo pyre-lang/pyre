@@ -220,9 +220,6 @@ fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const Lo
     if w_code.is_null() {
         return None;
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let code_slot = roots.base();
-    let w_code = roots.pin_root(w_code);
     let pycode = unsafe { &*(w_code as *const crate::pycode::PyCode) };
     let code_ptr = pycode.code_ptr;
     let align_mask = std::mem::align_of::<CodeObject>() as i64 - 1;
@@ -258,9 +255,6 @@ fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const Lo
         header_pcs,
         handler_only_edges,
     }));
-    // The scan allocated; re-read the wrapper from its shadow slot before
-    // publishing onto `loop_header_info` (`gctransform/shadowstack.py`).
-    let pycode = unsafe { &*(roots.get(code_slot) as *const crate::pycode::PyCode) };
     match pycode.loop_header_info.compare_exchange(
         std::ptr::null_mut(),
         built,

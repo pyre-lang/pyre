@@ -251,7 +251,17 @@ pub(crate) fn build_call_graph(llbc: &Llbc) -> CallGraph {
     for fd in llbc.iter_fun_decls() {
         builder.install_generic(fd);
     }
-    let generic_ids: Vec<u64> = builder.graph.names.keys().copied().collect();
+    // `Joined::build` sorts `part.keys` by name then id so numbering does
+    // not follow `HashMap` order. Walk order here mints spec nodes
+    // (`spec_memo` identity-while-in-progress + `MAX_INSTANTIATION_DEPTH`),
+    // so the same comparator keeps `struct_error#0=…` from flickering in
+    // and out of the unjustified column.
+    let mut generic_ids: Vec<u64> = builder.graph.names.keys().copied().collect();
+    generic_ids.sort_unstable_by(|&a, &b| {
+        builder.graph.names[&a]
+            .cmp(&builder.graph.names[&b])
+            .then(a.cmp(&b))
+    });
     for id in generic_ids {
         builder.walk_generic(id);
     }
