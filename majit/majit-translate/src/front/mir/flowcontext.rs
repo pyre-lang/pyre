@@ -388,6 +388,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
         std::collections::HashMap<usize, FusedCopyStructGet>,
     /// ControlFlow dest of `Try::branch` of a fused get dest.
     pub(in crate::front::mir) fused_copy_struct_get_cf: std::collections::HashMap<usize, usize>,
+    /// Same-body MIR locals whose `ptr::add` dest is a first-class GcArray
+    /// element (`getitem`). Address-of `(*dest).field` consults this set.
+    /// Not a cross-call side table.
+    pub(in crate::front::mir) interior_elem_locals: std::collections::HashSet<usize>,
     /// MIR locals bound by `_i = &place` / `&raw place`, mapped to the place
     /// they borrowed, for the place-addressed consumers of a borrow (`*p = v`,
     /// `core::mem::{replace,swap,take}`, raw / scalar alias paths). The atomic
@@ -2426,6 +2430,7 @@ impl<'a> Lowering<'a> {
             interior_field_alias: std::collections::HashMap::new(),
             fused_copy_struct_get: std::collections::HashMap::new(),
             fused_copy_struct_get_cf: std::collections::HashMap::new(),
+            interior_elem_locals: std::collections::HashSet::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
             gc_mut_ref_option_params,
@@ -4248,6 +4253,11 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                let inherit_interior_src = if !self.multi_assigned_locals.contains(&dest_local) {
+                    interior_alias_source_local(&rvalue).filter(|&src| src != dest_local)
+                } else {
+                    None
+                };
                 let (op, result_var) =
                     self.build_rvalue(mir_bb, rvalue, &dest_ty, Some(dest_local))?;
                 if let Some(op) = op {
@@ -4273,6 +4283,9 @@ impl<'a> Lowering<'a> {
                         LocalValue::One(result_var.clone())
                     },
                 );
+                if let Some(src) = inherit_interior_src {
+                    self.inherit_interior_elem_alias(dest_local, src);
+                }
                 // Keep the aggregate-local map in sync with the
                 // last-write-wins slot: a non-aggregate rebind clears
                 // the marker so the slot's reads collapse again.

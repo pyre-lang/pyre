@@ -2252,11 +2252,13 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `(*p.add(i)).field` on a named struct pointee is
-                // `getinteriorfield` (`rewrite_op_getinteriorfield`). The
-                // add records the GcArray header and the index; the field
-                // use emits `InteriorFieldRead` / `InteriorFieldWrite`.
-                // `sub`, a constant index, and a pointer that escapes stay
-                // on the `direct_ptradd` path below.
+                // `getinteriorfield` (`rewrite_op_getinteriorfield`). Fusion
+                // records the GcArray header and index; an element use
+                // mallocs Interior `{ptr, index}`
+                // (`rtype_interior_getitem_malloc`). The field use emits
+                // `InteriorFieldRead` / `InteriorFieldWrite`. `sub`, a
+                // constant index, and a pointer that escapes stay on the
+                // `direct_ptradd` path below.
                 if self.try_lower_struct_field_ptr_add(
                     mir_bb,
                     &reg,
