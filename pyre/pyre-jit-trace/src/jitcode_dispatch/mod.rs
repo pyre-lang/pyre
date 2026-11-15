@@ -12734,7 +12734,13 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
-    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)
+    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)?;
+    // `record_guard` appends to `opencoder.py` `Trace._ops`; `_double_ops`
+    // can minor-collect. Tests rewrite minted `ConstPtr` slots here the
+    // way that minor would (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_fold_guard();
+    Ok(())
 }
 
 /// [`walker_emit_fold_guard_with_snapshot`] for a fold inside a Python opcode
@@ -13033,6 +13039,57 @@ pub(crate) mod mapdict_shape_collect_hook {
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {
             set(None);
+        }
+    }
+}
+
+/// Test-only writeback at collecting calls after the instance shape guard.
+///
+/// `mapdict_shape_collect_hook` fires at the end of
+/// `walker_guard_mapdict_instance_shape`. A later `GuardClass` /
+/// `walker_pin_terminator_allow_unboxing` / `walker_pin_cell_family_ever_mutated`
+/// can collect again (`opencoder.py` `Trace._double_ops`); tests that
+/// rewrite at the shape guard cannot see a stale use after those calls.
+/// Install only the site under test so an earlier fire cannot hide it.
+#[cfg(test)]
+pub(crate) mod later_collect_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER_FOLD_GUARD: Cell<Option<fn()>> = const { Cell::new(None) };
+        static AFTER_PIN: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    pub fn set_after_fold_guard(hook: Option<fn()>) {
+        AFTER_FOLD_GUARD.with(|slot| slot.set(hook));
+    }
+
+    pub fn set_after_pin(hook: Option<fn()>) {
+        AFTER_PIN.with(|slot| slot.set(hook));
+    }
+
+    pub fn run_after_fold_guard() {
+        AFTER_FOLD_GUARD.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub fn run_after_pin() {
+        AFTER_PIN.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub struct ClearOnDrop;
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_after_fold_guard(None);
+            set_after_pin(None);
         }
     }
 }
@@ -13695,7 +13752,14 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
         .expect("CellFamily.ever_mutated has mutate_ever_mutated");
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, descr, Some(&mutate));
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    // `record_quasiimmut_field` → `record_op` can minor-collect
+    // (`opencoder.py` `Trace._double_ops`; `pyjitpl.py`
+    // `opimpl_record_quasiimmut_field`). Tests rewrite minted `ConstPtr`
+    // slots here (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_pin();
+    Ok(())
 }
 
 /// Pin one `executioncontext.py` `?` field on a boxed EC.
@@ -13727,7 +13791,13 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
         op_pc,
         term as i64,
         crate::descr::terminator_allow_unboxing_descr(),
-    )
+    )?;
+    // The pin records `QUASIIMMUT_FIELD` and can minor-collect. Tests
+    // rewrite minted `ConstPtr` slots here so a later read of `attr` /
+    // the receiver sees the forwarded word (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_pin();
+    Ok(())
 }
 
 /// Pin `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']`, the read

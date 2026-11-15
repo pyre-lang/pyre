@@ -9224,7 +9224,7 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
 /// every one of the 9 declines reports `READ ever-mutated`.  So the row is
 /// covered now, and it is the constant arm that a `spec-folds=load_deref`
 /// directive would still not be covering.
-fn try_walker_specialize_load_deref<Sym: WalkSym>(
+pub(crate) fn try_walker_specialize_load_deref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
@@ -9278,18 +9278,17 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     if contents.is_null() {
         decline!("contents-unbound");
     }
-    // A cell holds an arbitrary object, and baking its address needs no
-    // movability test.  A RECORDED `ConstPtr` is forwarded at every later
-    // stage — the active-trace walk, the retrace and resume-data pools, and
-    // `remove_constptrs_in`, which turns each one into a `LoadFromGcTable`
-    // whose slot is a root — and the window before that, while the mint sits
-    // in the walker's own `registers_r` bank, is covered by
-    // `InlineRegisterBankGuard` (`miframe_registers`).  The family's start is
-    // interned the same way (`walker_pin_cell_family_ever_mutated` /
-    // `const_ref`); `quasiimmut.py get_current_qmut_instance` adds the
-    // mutate offset to that forwarded object.
+    // nestedscope.py `Cell.get` bakes `w_res` as a `history.py` `ConstPtr`.
+    // Mint it before the family pin: `walker_pin_cell_family_ever_mutated`
+    // records `QUASIIMMUT_FIELD` (`pyjitpl.py` `opimpl_record_quasiimmut_field`)
+    // and that append can minor-collect (`opencoder.py` `Trace._double_ops`).
+    // A raw copy taken before the pin is not forwarded; the interned slot is
+    // (`history.py` `ConstPtr.value`). The family's start is interned inside
+    // the pin the same way; `quasiimmut.py get_current_qmut_instance` adds
+    // the mutate offset to that forwarded object.
+    let contents_const = ctx.trace_ctx.const_ref(contents as i64);
     super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
-    Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
+    Ok(Some(contents_const))
 }
 
 /// [`try_walker_specialize_load_deref`]'s arm for a cell the trace holds RED —
@@ -9382,6 +9381,12 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
     {
         decline!("subwalk-guard-collapses");
     }
+    // CellFamily is a moving nursery object. Mint ConstPtr boxes before
+    // GuardClass / the family pin so later uses read the forwarded word
+    // (`history.py` `ConstPtr.value`). `record_guard` / `record_op` append
+    // to `opencoder.py` `Trace._ops`; `_double_ops` can minor-collect.
+    let family_const = ctx.trace_ctx.const_ref(family as i64);
+    let contents_const = ctx.trace_ctx.const_ref(contents as i64);
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(cell_op) {
         let type_const = ctx.trace_ctx.const_int(cell_type);
@@ -9393,12 +9398,16 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
         )?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(cell_op);
     }
+    let family = walker_concrete_ref_object(ctx, family_const)
+        .map(|p| p as *const pyre_object::nestedscope::CellFamily)
+        .unwrap_or(family);
     super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_op,
         crate::descr::cell_contents_descr(),
     );
+    let contents = walker_concrete_ref_object(ctx, contents_const).unwrap_or(contents);
     if !matches!(
         ctx.trace_ctx.box_value(value),
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE

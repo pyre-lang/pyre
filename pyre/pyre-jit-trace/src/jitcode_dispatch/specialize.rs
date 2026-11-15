@@ -2723,6 +2723,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         .unwrap_or(attr);
     let term = unsafe { pyre_object::mapdict::map_terminator(map) };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
+    // The terminator pin records `QUASIIMMUT_FIELD` and can minor-collect
+    // (`opencoder.py` `Trace._double_ops`). Re-read `attr` off the ConstPtr
+    // minted before the shape guard (`history.py` `ConstPtr.value`;
+    // `mapdict.py` `UnboxedPlainAttribute._pure_direct_read`).
+    let attr = walker_concrete_ref_object(ctx, attr_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(attr);
 
     // mapdict.py `UnboxedPlainAttribute._pure_direct_read`:
     // `self._box(self._pure_unboxed_read(obj))` — only the raw longlong read is
@@ -5236,10 +5243,19 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
             .unwrap_or(map);
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        // Intern the receiver before the terminator pin (`history.py`
+        // `ConstPtr`). A New-op box's recorder concrete is a raw snapshot;
+        // the interned slot is what a minor updates. `const_ref` only interns.
+        let obj_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
         if add.picked_unbox.is_some() {
             let term = unsafe { pyre_object::mapdict::map_terminator(map) };
             walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
         }
+        // The terminator pin can minor-collect. Re-read before descr
+        // selection (`mapdict.py` `_get_mapdict_map`; `history.py`
+        // `ConstPtr.value`).
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
         let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete_obj) };
         let unboxed_raw = match value_pin {
@@ -5277,7 +5293,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // the GETFIELD recording may trigger.
         let old_block = (add.storageindex > 0)
             .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
+        // Unbox / GETFIELD recording can collect again. Re-read before commit.
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         let concrete_value = live_box_ref(ctx, value, concrete_value);
         let committed = unsafe {
             pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
@@ -5293,6 +5311,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             drop(pyre_interpreter::runtime_ops::fetch_memory_error());
             return Ok(None);
         }
+        // Contended `instance_lock` in `store_attr_add_commit` can collect.
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         // `MetaInterp.execute_and_record` / `History.record` / `_make_op(..., value)`:
         // the recorded `NewArrayClear` is born with the block commit installed.
         let (new_block_value, new_block_ptr) = match ctx.trace_ctx.field_sanity_load(

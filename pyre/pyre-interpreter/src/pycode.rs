@@ -1546,8 +1546,11 @@ fn w_code_new_owned(
     // for name in cellvars]`, laid out by localsplus slot. Minted after the
     // wrapper is pinned so the array is a young child of an old-gen PyCode
     // (same order as `co_consts_w`). `new_cell_family` is
-    // `malloc_typed_managed` and does not collect; each family is stored
-    // into the array immediately. Empty cellvars leave the field null.
+    // `malloc_typed_managed` and does not collect; `allocated_or_raise`
+    // stores MemoryError and returns null. `w_code_new` has no error
+    // channel: abort the way `alloc_co_consts_array` does, so a refused
+    // family is not stored into a published table. Empty cellvars leave
+    // the field null.
     if code_ptr_aligned {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         if !code_ref.cellvars.is_empty() {
@@ -1560,6 +1563,11 @@ fn w_code_new_owned(
             for cellvar in code_ref.cellvars.iter() {
                 let cellname: &str = cellvar.as_ref();
                 let family = pyre_object::nestedscope::new_cell_family(cellname.to_string());
+                if family.is_null() {
+                    pyre_object::gc_hook::gc_alloc_failed(std::mem::size_of::<
+                        pyre_object::nestedscope::CellFamily,
+                    >());
+                }
                 let slot = match code_ref.varnames.iter().position(|varname| {
                     let varname: &str = varname.as_ref();
                     varname == cellname

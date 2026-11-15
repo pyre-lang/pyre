@@ -10893,6 +10893,53 @@ impl Drop for ClearMapdictShapeForward {
     }
 }
 
+thread_local! {
+    static PTR_FORWARD: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    static INSTANCE_POISON: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn rewrite_const_ptr(old: usize, new: usize) {
+    if old == 0 {
+        return;
+    }
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
+    majit_ir::const_ptr_table::walk(&mut |gcref| {
+        if gcref.0 == old {
+            gcref.0 = new;
+        }
+    });
+}
+
+fn run_ptr_forward() {
+    PTR_FORWARD.with(|slot| {
+        if let Some((old, new)) = slot.get() {
+            rewrite_const_ptr(old, new);
+        }
+    });
+}
+
+fn run_ptr_forward_and_poison_int() {
+    run_ptr_forward();
+    INSTANCE_POISON.with(|slot| {
+        let addr = slot.get();
+        if addr != 0 {
+            unsafe {
+                (*(addr as pyre_object::PyObjectRef)).ob_type = &pyre_object::pyobject::INT_TYPE;
+            }
+        }
+    });
+}
+
+struct ClearPtrForward;
+
+impl Drop for ClearPtrForward {
+    fn drop(&mut self) {
+        PTR_FORWARD.with(|slot| slot.set(None));
+        INSTANCE_POISON.with(|slot| slot.set(0));
+    }
+}
+
 unsafe fn copy_terminator(
     old: pyre_interpreter::objspace::std::mapdict::MapRef,
 ) -> pyre_interpreter::objspace::std::mapdict::MapRef {
@@ -11180,6 +11227,323 @@ fn store_attr_add_bakes_forwarded_new_map_after_shape_guard_collects() {
     assert!(
         !baked.contains(&(old_new_map as usize)),
         "baked new_map must not be the pre-guard address {old_new_map:?}"
+    );
+}
+
+#[test]
+fn load_deref_red_pins_forwarded_family_after_guard_class_collects() {
+    // `try_walker_read_deref_cell` interned `family` after GuardClass.
+    // CellFamily is a moving nursery object; GuardClass appends to
+    // `Trace._ops` and can minor-collect (`history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let old_family = pyre_object::nestedscope::new_cell_family("x".to_string());
+    let new_family = pyre_object::nestedscope::new_cell_family("x".to_string());
+    let contents = pyre_object::w_int_new(1);
+    let cell = pyre_object::w_cell_new(contents, old_family);
+    let _restore = [
+        RestoreConstPtr::intern(old_family as usize),
+        RestoreConstPtr::intern(new_family as usize),
+        RestoreConstPtr::intern(contents as usize),
+        RestoreConstPtr::intern(cell as usize),
+    ];
+    PTR_FORWARD.with(|slot| slot.set(Some((old_family as usize, new_family as usize))));
+    super::later_collect_hook::set_after_fold_guard(Some(run_ptr_forward));
+    let _clear_hook = super::later_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearPtrForward;
+
+    let mut tc = fresh_trace_ctx();
+    let cell_op = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.set_opref_concrete(
+        cell_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+    );
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        try_walker_read_deref_cell(wc, 0, cell_op, majit_ir::GcRef(cell as usize)).expect("fold")
+    });
+    assert!(
+        folded.is_some(),
+        "red LOAD_DEREF fold must accept this cell"
+    );
+
+    let recorder = tc.into_recorder();
+    let expected = crate::descr::cell_family_ever_mutated_descr();
+    let family_ptrs: Vec<u64> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .filter_map(|op| {
+            let descr = op.getdescr()?;
+            let qd = descr.as_quasi_immut_descr()?;
+            std::sync::Arc::ptr_eq(qd.fielddescr(), &expected).then_some(qd.struct_ptr())
+        })
+        .collect();
+    assert_eq!(
+        family_ptrs,
+        [new_family as u64],
+        "pinned family must be the forwarded object, not the pre-guard address {old_family:?}"
+    );
+}
+
+#[test]
+fn load_deref_constant_interns_forwarded_contents_after_family_pin_collects() {
+    // `try_walker_specialize_load_deref` interned `contents` after
+    // `walker_pin_cell_family_ever_mutated`. That pin records
+    // `QUASIIMMUT_FIELD` and can minor-collect; mint the contents
+    // ConstPtr before the pin (`nestedscope.py` `Cell.get`;
+    // `history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let family = pyre_object::nestedscope::new_cell_family("x".to_string());
+    let old_contents = pyre_object::w_int_new(1);
+    let new_contents = pyre_object::w_int_new(2);
+    let cell = pyre_object::w_cell_new(old_contents, family);
+    let _restore = [
+        RestoreConstPtr::intern(family as usize),
+        RestoreConstPtr::intern(old_contents as usize),
+        RestoreConstPtr::intern(new_contents as usize),
+        RestoreConstPtr::intern(cell as usize),
+    ];
+    PTR_FORWARD.with(|slot| slot.set(Some((old_contents as usize, new_contents as usize))));
+    super::later_collect_hook::set_after_pin(Some(run_ptr_forward));
+    let _clear_hook = super::later_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearPtrForward;
+
+    let mut tc = fresh_trace_ctx();
+    let cell_op = tc.const_ref(cell as i64);
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        try_walker_specialize_load_deref(wc, 0, &[cell_op]).expect("fold")
+    });
+    let Some(result) = folded else {
+        panic!("constant LOAD_DEREF fold must accept this cell");
+    };
+    let OpRef::ConstPtr(idx) = result else {
+        panic!("constant LOAD_DEREF arm returns a ConstPtr, got {result:?}");
+    };
+    assert_eq!(
+        majit_ir::const_ptr_table::resolve(idx).0,
+        new_contents as usize,
+        "baked contents must be the forwarded object, not the pre-pin address {old_contents:?}"
+    );
+}
+
+#[test]
+fn load_attr_unboxed_rereads_attr_after_terminator_pin_collects() {
+    // After the shape guard, `try_walker_specialize_load_attr` re-read
+    // `attr`, then `walker_pin_terminator_allow_unboxing` can collect
+    // before `pure_direct_read_attr(attr)` (`mapdict.py`
+    // `UnboxedPlainAttribute._pure_direct_read`; `history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    pyre_interpreter::typedef::init_typeobjects();
+    let w_type = pyre_object::typeobject::w_type_new(
+        "LaterCollectAttr",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+    }
+    let term = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        w_type,
+        pyre_object::mapdict::TerminatorKind::Dict,
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_terminator(w_type, term);
+    }
+    let inst = pyre_object::w_instance_new(w_type);
+    let value = pyre_object::w_int_new(1);
+    assert!(
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_node_setdictvalue(
+                inst,
+                rustpython_wtf8::Wtf8::new("obj"),
+                value,
+            )
+        },
+        "store an unboxable int onto the instance map"
+    );
+    let resolved = unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(inst, "obj")
+    };
+    let Some((_, _, old_map, _, _, _, _)) = resolved else {
+        panic!("unboxed LOAD_ATTR fast path must accept this instance");
+    };
+    let old_term = unsafe { pyre_object::mapdict::map_terminator(old_map) };
+    let new_term = unsafe { copy_terminator(old_term as _) };
+    let new_map = unsafe { copy_unboxed_attr(old_map, new_term) };
+    let _restore = [
+        RestoreConstPtr::intern(old_map as usize),
+        RestoreConstPtr::intern(old_term as usize),
+        RestoreConstPtr::intern(new_map as usize),
+        RestoreConstPtr::intern(new_term as usize),
+        RestoreConstPtr::intern(inst as usize),
+        RestoreConstPtr::intern(w_type as usize),
+    ];
+    PTR_FORWARD.with(|slot| slot.set(Some((old_map as usize, new_map as usize))));
+    super::later_collect_hook::set_after_pin(Some(run_ptr_forward));
+    let _clear_hook = super::later_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearPtrForward;
+
+    let mut tc = fresh_trace_ctx();
+    let obj = tc.const_ref(inst as i64);
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        super::specialize::try_walker_specialize_load_attr(wc, 0, obj, "obj", 0, 'r').expect("fold")
+    });
+    assert_eq!(
+        folded,
+        Some(()),
+        "unboxed LOAD_ATTR fold must accept this instance"
+    );
+
+    let recorder = tc.into_recorder();
+    let expected_attr = crate::descr::plain_attribute_ever_mutated_descr();
+    let attr_ptrs: Vec<u64> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .filter_map(|op| {
+            let descr = op.getdescr()?;
+            let qd = descr.as_quasi_immut_descr()?;
+            std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_attr).then_some(qd.struct_ptr())
+        })
+        .collect();
+    assert_eq!(
+        attr_ptrs,
+        [new_map as u64],
+        "pinned attribute node must be the forwarded map, not the pre-pin address {old_map:?}"
+    );
+}
+
+#[test]
+fn store_attr_add_rereads_receiver_after_terminator_pin_collects() {
+    // `try_walker_specialize_store_attr` store-add refreshed the
+    // receiver, then `walker_pin_terminator_allow_unboxing` can collect
+    // before `mapdict_map_descr` / `mapdict_storage_descr`. Re-read the
+    // interned receiver after the pin (`history.py` `ConstPtr`).
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::{compile_exec, w_code_new};
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    pyre_interpreter::typedef::init_typeobjects();
+    let w_type = pyre_object::typeobject::w_type_new(
+        "LaterCollectStoreAdd",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+    }
+    let term = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        w_type,
+        pyre_object::mapdict::TerminatorKind::Dict,
+    );
+    unsafe {
+        pyre_object::typeobject::w_type_set_terminator(w_type, term);
+    }
+    let inst = pyre_object::w_instance_new(w_type);
+    let value = pyre_object::w_int_new(1);
+    let add = unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_add_fast_path(inst, "obj", value)
+    };
+    let Some(add) = add else {
+        panic!("store_attr_add fast path must accept a fresh instance");
+    };
+    assert!(
+        add.picked_unbox.is_some(),
+        "fresh int store must pick unbox so the terminator pin runs"
+    );
+    drop(add);
+    let new_inst = pyre_object::w_instance_new(w_type);
+    unsafe {
+        let src = inst as *const pyre_object::W_ObjectObject;
+        let dst = new_inst as *mut pyre_object::W_ObjectObject;
+        (*dst).map = (*src).map;
+        (*dst).storage = (*src).storage;
+    }
+    let py_code = compile_exec("x.obj = y").expect("test code should compile");
+    let name_idx = py_code
+        .names
+        .iter()
+        .position(|n| n.as_str() == "obj")
+        .expect("STORE_ATTR name is in co_names");
+    let w_code = w_code_new(Box::into_raw(Box::new(py_code)) as *const ());
+    let int_probe = pyre_object::w_int_new(0);
+    let int_map_descr = unsafe { crate::descr::mapdict_map_descr(int_probe) };
+    let object_map_descr = crate::descr::object_map_descr();
+    assert!(
+        !std::sync::Arc::ptr_eq(&int_map_descr, &object_map_descr),
+        "poisoned-int and instance map descrs must differ"
+    );
+    let _restore = [
+        RestoreConstPtr::intern(inst as usize),
+        RestoreConstPtr::intern(new_inst as usize),
+        RestoreConstPtr::intern(w_type as usize),
+        RestoreConstPtr::intern(value as usize),
+        RestoreConstPtr::intern(int_probe as usize),
+    ];
+    PTR_FORWARD.with(|slot| slot.set(Some((inst as usize, new_inst as usize))));
+    INSTANCE_POISON.with(|slot| slot.set(inst as usize));
+    super::later_collect_hook::set_after_pin(Some(run_ptr_forward_and_poison_int));
+    let _clear_hook = super::later_collect_hook::ClearOnDrop;
+    let _clear_plan = ClearPtrForward;
+
+    let dummy_block: Box<[usize; 8]> = Box::new([0; 8]);
+    let cpu = AllocTestCpu {
+        block: dummy_block.as_ref().as_ptr() as i64,
+    };
+    let mut tc = fresh_trace_ctx();
+    tc.set_cpu(Some(&cpu));
+    let obj = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(obj);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef(inst as usize)));
+    let value_op = tc.const_ref(value as i64);
+    let mut regs_r = [OpRef::NONE];
+    let mut concrete_r = [ConcreteValue::Null];
+    let folded = with_authoritative_hint_walk(&mut tc, &mut regs_r, &mut concrete_r, |wc| {
+        super::specialize::try_walker_specialize_store_attr(
+            wc,
+            0,
+            obj,
+            value_op,
+            w_code as usize,
+            name_idx,
+        )
+        .expect("fold")
+    });
+    assert_eq!(
+        folded,
+        Some(()),
+        "store_attr_add fold must accept this instance"
+    );
+
+    let recorder = tc.into_recorder();
+    let descrs: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+        .filter_map(|op| op.getdescr())
+        .collect();
+    assert!(
+        descrs
+            .iter()
+            .any(|d| std::sync::Arc::ptr_eq(d, &object_map_descr)),
+        "map descr must be the forwarded instance descr, got {descrs:?}"
+    );
+    assert!(
+        descrs
+            .iter()
+            .all(|d| !std::sync::Arc::ptr_eq(d, &int_map_descr)),
+        "map descr must not be the poisoned receiver's int descr"
     );
 }
 
