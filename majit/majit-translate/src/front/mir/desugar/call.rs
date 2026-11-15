@@ -10667,6 +10667,21 @@ impl<'a> Lowering<'a> {
                     return None;
                 }
                 let td = self.llbc.type_by_id(adt_def_id)?;
+                // A compiler-generated closure env is a unique known
+                // function (`{closure#N}` → its `call` / `call_once` /
+                // `call_mut` body). RPython has no closures: a known
+                // callee is `simple_call` of a constant FunctionsPBC
+                // (`description.py` `FunctionDesc`, `rpbc.py`
+                // `FunctionReprBase.call`). Routing as Method spells
+                // `getattr(recv, leaf)` + `simple_call`; a captured
+                // closure field is a classdef-less `SomeInstance` and
+                // that getattr panics. Decline the Method hint so Fun
+                // of the closure body is FunctionPath with the env as
+                // arg[0] — the same form Trait-resolved Fn::call
+                // already takes (`specialized_trait_target`).
+                if type_decl_is_closure_env(td) {
+                    return None;
+                }
                 // An opaque owner from a dependency artefact has no extracted
                 // body in that LLBC, so the annotator never
                 // mints a `ClassDef` for it — the receiver lands as a
