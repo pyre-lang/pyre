@@ -9407,6 +9407,29 @@ impl<M: Clone> MetaInterp<M> {
             .or(self.active_jitdriver_sd)
     }
 
+    /// Key `compile_loop` would file a closed loop under, or `None` when
+    /// not tracing.
+    ///
+    /// `pyjitpl.py` `reached_loop_header` `get_procedure_token(greenboxes)`:
+    /// the greens are those of the merge point just reached.
+    pub fn reached_loop_header_key(&mut self) -> Option<u64> {
+        let (closed, cut_inner_green_key, outer_green_key) = {
+            let ctx = self.tracing.as_ref()?;
+            let outer = ctx.green_key;
+            let cut_inner = ctx.cut_inner_green_key.clone();
+            // `compile.py` `compile_loop` keys the JitCell by
+            // `original_boxes[:num_green_args]`, the greens of the merge
+            // point that closed the trace. A bridge may start from a guard
+            // in the origin loop and close at a different merge point, so
+            // the origin key is only the fallback for traces that did not
+            // close on a merge point. If older traces lack typed close
+            // greens, preserve the existing cross-loop-cut inner key path.
+            let closed = ctx.close_green_key();
+            (closed, cut_inner, outer)
+        };
+        Some(self.resolve_closing_green_key(closed, cut_inner_green_key.as_ref(), outer_green_key))
+    }
+
     /// Close the current trace, optimize, and compile.
     ///
     /// `jump_args` are the live boxes at the end of the loop
@@ -9607,33 +9630,19 @@ impl<M: Clone> MetaInterp<M> {
         // committing to a compile we mirror that by reading green_key
         // from the live trace ctx; only the "committed" exits below
         // take ownership of the ctx and drop the trace session.
-        let (closed, cut_inner_green_key, outer_green_key) = {
+        let green_key = self
+            .reached_loop_header_key()
+            .expect("compile_loop: no active trace ctx");
+        // Kept for the same_greenkey scan below (before optimize/backend).
+        // `cell_key_for_typed` consumes `closed`; the merge point was filed
+        // under the greens themselves, not under the resolved cell key.
+        let (closed_for_scan, cut_inner_green_key) = {
             let ctx = self
                 .tracing
                 .as_ref()
                 .expect("compile_loop: no active trace ctx");
-            let outer = ctx.green_key;
-            let cut_inner = ctx.cut_inner_green_key.clone();
-            // pyjitpl.py:3005 / :3183-3189: the key is
-            // `original_boxes[:num_green_args]`, i.e. the greens of the
-            // merge point that closed the trace.  A bridge may start from a
-            // guard in the origin loop and close at a different merge point,
-            // so the origin key is only the fallback for traces that did not
-            // close on a merge point.  If older traces lack typed close
-            // greens, preserve the existing cross-loop-cut inner key path.
-            let closed = ctx.close_green_key();
-            (closed, cut_inner, outer)
+            (ctx.close_green_key(), ctx.cut_inner_green_key.clone())
         };
-        // Kept for the same_greenkey scan below (before optimize/backend).
-        // `cell_key_for_typed` consumes `closed`; the merge point was filed
-        // under the greens themselves, not under the resolved cell key.
-        let closed_for_scan = closed.clone();
-        // File the loop on the cell `get_jitcell(*greenargs)` /
-        // `ensure_jit_cell_at_key` would own. `resolve_cell_key` walks
-        // that cell's greens; ensure the typed cell first so the token
-        // and the entry share it.
-        let green_key =
-            self.resolve_closing_green_key(closed, cut_inner_green_key.as_ref(), outer_green_key);
 
         // pyjitpl.py: has_compiled_targets(ptoken) →
         // raise SwitchToBlackhole(ABORT_BAD_LOOP).  The key is the one the
@@ -15842,25 +15851,62 @@ impl<M: Clone> MetaInterp<M> {
         // token on the interpreter greenkey. Resolve those greens to the
         // cell key before optimize/backend (`warmstate.py`
         // `make_unwrap_greenkey` / `attach_procedure_to_interp`).
+        // Do not retarget onto `green_key` (the JUMP target): that cell
+        // already holds the loop token, and replacing it with an entry
+        // token leaves `target_tokens` empty so `has_compiled_targets` is
+        // false and the next close compile_loops again
+        // (`pyjitpl.py` `reached_loop_header`).
         let original_green_key = {
-            let typed = self
+            let start_typed = self
                 .tracing
                 .as_ref()
                 .or(self.compile_tracing.as_ref())
                 .and_then(|ctx| ctx.green_key_values().cloned());
-            match typed.as_ref() {
+            let interp_key = self
+                .tracing
+                .as_ref()
+                .or(self.compile_tracing.as_ref())
+                .map(|ctx| ctx.root_green_key())
+                .unwrap_or(original_green_key);
+            let original_green_key = match start_typed.as_ref() {
                 Some(key) => {
                     let pin = crate::warmstate::GreenRefPin::pin(key);
                     let mut live = pin.live_clone(key);
-                    self.cell_key_for_typed_or_installed(
+                    let resolved = self.cell_key_for_typed_or_installed(
                         compiling_jd,
-                        original_green_key,
+                        interp_key,
                         &pin,
                         &mut live,
-                    )
+                    );
+                    if resolved == green_key && interp_key != green_key {
+                        interp_key
+                    } else {
+                        resolved
+                    }
                 }
-                None => original_green_key,
+                None => interp_key,
+            };
+            if self
+                .warm_state_ref_for_driver(compiling_jd)
+                .is_none_or(|warm| warm.cell_by_key(original_green_key).is_none())
+                && let Some(key) = start_typed.as_ref()
+            {
+                // The interp door hashed to a different number than the loop
+                // cell. File a cell under the interp key so
+                // `maybe_compile_and_run` can enter (`warmstate.py`
+                // `attach_procedure_to_interp` `ensure_jit_cell_at_key`).
+                let pin = crate::warmstate::GreenRefPin::pin(key);
+                let mut live = pin.live_clone(key);
+                let cell = crate::warmstate::BaseJitCell::new_for_driver_with_greens(
+                    compiling_jd,
+                    &pin,
+                    &mut live,
+                );
+                cell.cell_key.set(Some(original_green_key));
+                self.warm_state_for_driver(compiling_jd)
+                    .install_new_cell(original_green_key, Some(cell));
             }
+            original_green_key
         };
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
