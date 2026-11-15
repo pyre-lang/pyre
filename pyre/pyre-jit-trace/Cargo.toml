@@ -16,7 +16,7 @@ dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # compile-only placeholders and refuses unless `MAJIT_LLBC_EXTRACTION=1`, so
 # the only build that legitimately drops it is a Charon extraction pass of
 # `pyre-jit` — which is exactly where the host copy was dead weight.
-prepass = ["dep:pyre-interpreter", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
+prepass = ["dep:pyre-interpreter", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir", "dep:memmap2"]
 # Keep JIT-side module references in lockstep with the interpreter's sandbox
 # build, which drops the modules that reach the OS directly.
 sandbox = ["pyre-interpreter/sandbox", "pyre-module?/sandbox"]
@@ -59,6 +59,7 @@ majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2
 majit-ir = { workspace = true }
 majit-translate = { workspace = true, optional = true }
 mimalloc = { version = "0.1", optional = true }
+memmap2 = { version = "0.9", optional = true }
 pyre-interpreter = { workspace = true, features = ["host_env", "dynasm"], optional = true }
 # Same process as `jit_trace_fnaddrs()`: without this crate the
 # `#[pyre_methods]` wrappers that moved out of the interpreter never

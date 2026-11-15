@@ -3042,12 +3042,20 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
 
 fn hash_ullbc_file(h: &mut CacheHasher, repo_root: &std::path::Path, path: &std::path::Path) {
     h.write_str(&codegen_cache::repo_relative(repo_root, path));
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
+        h.write_str("missing");
+        return;
+    };
+    // SAFETY: the artefact is published by rename — llbc_extract.py
+    // (via extract-llbc.py) and the LLBC store both write a sibling
+    // temp file and `os.replace` it — so a mapped file is never
+    // truncated or rewritten while a reader holds it
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
         h.write_str("missing");
         return;
     };
     h.write_str("semantic");
-    ullbc_semantic::feed_semantic_ullbc(&bytes, &mut |chunk| h.write_bytes(chunk));
+    ullbc_semantic::feed_semantic_ullbc(&map[..], &mut |chunk| h.write_bytes(chunk));
 }
 
 fn hash_rs_dir_content(h: &mut CacheHasher, repo_root: &std::path::Path, dir: &std::path::Path) {

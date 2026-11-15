@@ -2939,6 +2939,7 @@ dependencies = [
  "majit-rlib",
  "majit-trace",
  "majit-translate",
+ "memmap2",
  "mimalloc",
  "parking_lot",
  "pyre-interpreter",
