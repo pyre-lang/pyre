@@ -143,12 +143,13 @@ pub mod host {
         #[cfg(any(not(unix), feature = "sandbox"))]
         pub use rustpython_host_env::os::*;
         // `replace` lives in the host layer's `posix`, which is only built for
-        // unix, wasi and windows. Targets without it have no replace-specific
-        // platform call, so the name degrades to `rename` exactly as the
-        // unix-like body does.
+        // unix, wasi and windows. Unix has no caller; `rposix.replace` serves
+        // posix there. Targets without it have no replace-specific platform
+        // call, so the name degrades to `rename` exactly as the unix-like body
+        // does.
         #[cfg(not(any(unix, windows, target_os = "wasi")))]
         pub use rustpython_host_env::os::rename as replace;
-        #[cfg(any(unix, windows, target_os = "wasi"))]
+        #[cfg(any(windows, target_os = "wasi"))]
         pub use rustpython_host_env::posix::replace;
     }
 }

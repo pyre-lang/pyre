@@ -1785,21 +1785,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
                         return Err(crate::PyError::type_error("siginfo must be None"));
                     }
-                    let pidfd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                    let flags = if args.len() >= 4 {
-                        (unsafe { pyre_object::w_int_get_value(args[3]) }) as u32
-                    } else {
-                        0
-                    };
-                    rustpython_host_env::signal::pidfd_send_signal(pidfd, sig, flags).map_err(
-                        |e| {
-                            crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("pidfd_send_signal: {e}"),
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let slot = pyre_object::gc_roots::pin_roots(args);
+                    let c_int = |k: usize| -> Result<i32, crate::PyError> {
+                        let v = crate::baseobjspace::index_int_w(
+                            pyre_object::gc_roots::shadow_stack_get(slot + k),
+                        )?;
+                        i32::try_from(v).map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C int",
                             )
-                        },
-                    )?;
+                        })
+                    };
+                    let pidfd = c_int(0)?;
+                    let sig = c_int(1)?;
+                    let flags = if args.len() >= 4 { c_int(3)? } else { 0 };
+                    let ret =
+                        unsafe { majit_rlib::rsignal::c_pidfd_send_signal(pidfd, sig, flags) };
+                    if ret < 0 {
+                        return Err(crate::PyError::os_error_with_errno(
+                            majit_rlib::rposix::get_saved_errno(),
+                            "pidfd_send_signal",
+                        ));
+                    }
                     return Ok(pyre_object::w_none());
                 }
                 #[cfg(not(feature = "host_env"))]

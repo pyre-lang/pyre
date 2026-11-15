@@ -511,7 +511,7 @@ crate::rffi::llexternal!(
 /// `rposix.handle_posix_error` — `widen` then `result < 0` reads
 /// `get_saved_errno`. The RPython `name` is the OSError message; callers
 /// here receive the errno.
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(unix)]
 fn handle_posix_error(result: i64) -> Result<i64, i32> {
     if result < 0 {
         Err(get_saved_errno())

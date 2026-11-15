@@ -204,6 +204,35 @@ crate::rffi::llexternal!(
     save_err = crate::rffi::RFFI_SAVE_ERRNO
 );
 
+// [3.15-spec] Not in rsignal.py. `signal_pidfd_send_signal_impl` calls
+// `syscall(__NR_pidfd_send_signal, pidfd, signalnum, NULL, flags)`.
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const PIDFD_ECI = {
+        includes: ["errno.h", "unistd.h", "sys/syscall.h"],
+        separate_module_sources: [
+            r#"RPY_EXTERN int rpy_pidfd_send_signal(int pidfd, int sig, int flags)
+{
+#ifdef __NR_pidfd_send_signal
+    return syscall(__NR_pidfd_send_signal, pidfd, sig, NULL, flags);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}"#,
+        ],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_pidfd_send_signal = "rpy_pidfd_send_signal",
+    [INT, INT, INT],
+    INT,
+    compilation_info = PIDFD_ECI,
+    save_err = crate::rffi::RFFI_SAVE_ERRNO
+);
+
 /// `rsignal.strsignal`.
 #[cfg(unix)]
 pub fn strsignal(signum: INT) -> Result<Option<Vec<u8>>, crate::rffi::MemoryError> {

@@ -1479,21 +1479,10 @@ static SYMLINK_SIG: WriteSig = WriteSig {
 
 /// Two of the four `access` mode bits, which the constant table publishes
 /// under the same names.
-#[cfg(feature = "host_env")]
-const X_OK: i64 = rustpython_host_env::os::X_OK as i64;
-#[cfg(not(feature = "host_env"))]
+/// These are the values every libc, wasi-libc included, gives the `access` mode bits.
 const X_OK: i64 = 1;
-#[cfg(feature = "host_env")]
-const W_OK: i64 = rustpython_host_env::os::W_OK as i64;
-#[cfg(not(feature = "host_env"))]
 const W_OK: i64 = 2;
-#[cfg(feature = "host_env")]
-const F_OK: i64 = rustpython_host_env::os::F_OK as i64;
-#[cfg(not(feature = "host_env"))]
 const F_OK: i64 = 0;
-#[cfg(feature = "host_env")]
-const R_OK: i64 = rustpython_host_env::os::R_OK as i64;
-#[cfg(not(feature = "host_env"))]
 const R_OK: i64 = 4;
 
 /// `posix.access(path, mode, ...)` — whether the name is there and the access
