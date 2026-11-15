@@ -2245,7 +2245,7 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> Option<(ValueType, usize, bool)> {
         if let Some(node) = tyref_node(ty, self.llbc)
-            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc, self.gc_struct_ids)
         {
             return Some(descr);
         }
@@ -2257,7 +2257,7 @@ impl<'a> Lowering<'a> {
             ));
         }
         if let Some(inner) = tyref_atomic_arg(ty, self.llbc)
-            && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc, self.gc_struct_ids)
         {
             return Some(descr);
         }
@@ -2375,7 +2375,7 @@ impl<'a> Lowering<'a> {
         if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return None;
         }
-        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc, self.gc_struct_ids)
     }
 
     pub(in crate::front::mir) fn read_mem_slot(
@@ -6930,7 +6930,7 @@ impl<'a> Lowering<'a> {
         if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return None;
         }
-        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc, self.gc_struct_ids)
     }
 
     pub(in crate::front::mir) fn emit_zero_constant_of_ty(

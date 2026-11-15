@@ -1599,6 +1599,27 @@ pub enum OpKind {
         /// `v_inst.concretetype.TO`). `array_type_id` is the dump spelling.
         array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
+    /// Address-of a field of a GcArray element InteriorPtr.
+    ///
+    /// `_interior_ptr._expose` wraps a nested container; a GCREF / primitive
+    /// field is returned as a value. Rust takes the address of a GCREF /
+    /// primitive field (`&(*elem).field` / `&mut (*elem).field`): offsets
+    /// carry `Field(name)` and `TO` is the field type. Distinct from
+    /// [`OpKind::FieldRead`] (getattr-as-load) and from `direct_ptradd`.
+    InteriorPtrExpose {
+        base: crate::flowspace::model::Variable,
+        field: FieldDescriptor,
+        ty: ValueType,
+    },
+    /// Store through a pointer-typed SSA that is not a same-body interior
+    /// alias and not a raw word (`*p = v` of a GCREF / `&mut` field).
+    /// Two operands: the pointer and the value. Flowspace setattr-shaped
+    /// store with no MIR field name; `InteriorPtrRepr` leaf-TO
+    /// store-through is the rtyper form. Never `raw_store` of a GCREF.
+    StoreThroughPtr {
+        ptr: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
+    },
     Call {
         target: CallTarget,
         /// Mixed Variable | Constant, matching

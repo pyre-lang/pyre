@@ -54,6 +54,9 @@ pub mod get_raw_address;
 // `ll_copy` (`rlist.py`) of a fixed GcArray into a raw `Vec` — mints
 // `ll_vec_copy_from_fixed_list`.
 pub mod list_to_raw;
+// `StoreThroughPtr` → `InteriorFieldWrite` from published `SomeInteriorPtr`
+// facts (`rewrite_fixed_newlist` / `do_fixed_newlist`).
+pub mod interior_ptr;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s

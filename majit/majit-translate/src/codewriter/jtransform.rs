@@ -6035,6 +6035,15 @@ impl<'a> Transformer<'a> {
             } if unop_name == "unichr" => {
                 self.rewrite_char_int_cast(op, operand, "cast_int_to_unichar", graph_name, graph)
             }
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached jtransform; the rtyper must lower \
+                 _interior_ptr._expose before codewriter emission (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached jtransform; the rtyper must lower \
+                 this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_store_through_ptr)"
+            ),
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -19330,6 +19339,15 @@ fn remap_op_renamings(
             array_type_id: array_type_id.clone(),
             array: array.clone(),
         },
+        OpKind::InteriorPtrExpose { base, field, ty } => OpKind::InteriorPtrExpose {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::StoreThroughPtr { ptr, value } => OpKind::StoreThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            value: remap_value(value, aliases),
+        },
         OpKind::Call {
             target,
             args,
@@ -21896,7 +21914,7 @@ mod tests {
     /// GC struct whose first field is another GC struct
     /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
     /// a subsequent field read is `getfield_gc_*` on the same object.
-    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC getsubstruct.
+    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC interior.
     #[test]
     fn gc_first_struct_downcast_field_read_is_same_object() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -22034,7 +22052,7 @@ mod tests {
                 &op.kind,
                 OpKind::BinOp { op, .. } if op == "add"
             )),
-            "downcast + field read must not emit a getsubstruct int_add; ops={ops:?}"
+            "downcast + field read must not emit an interior int_add; ops={ops:?}"
         );
         let w_cls = ops.iter().find(|op| {
             matches!(
