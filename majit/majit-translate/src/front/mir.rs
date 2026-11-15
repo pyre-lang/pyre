@@ -5424,6 +5424,7 @@ fn published_struct_field_layout(
     type_path: &str,
     field_name: &str,
     field_ty: &TyRef,
+    owner_is_closure_env: bool,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
@@ -5439,6 +5440,22 @@ fn published_struct_field_layout(
         // `rlist.py` `FixedSizeListRepr`: the tuple's `wrappeditems` is
         // `Ptr(GcArray(OBJECTPTR))`. `getitem` is `getarrayitem_gc`.
         "[*mut PyObject]".to_string()
+    } else if let Some(inner) =
+        closure_env_field_is_cell_address(owner_is_closure_env, field_ty, llbc)
+    {
+        // Raw cell address (`rdtoa.py` `strtod` `end_ptr`). `history.getkind`
+        // of a raw Ptr is `'int'`; `*mut T` is `raw_thin_pointer_spelling`
+        // so `get_type_flag` banks Int instead of tracing `&mut T` as
+        // FLAG_POINTER.
+        format!(
+            "*mut {}",
+            tyref_to_field_layout_string(
+                &TyRef::Other(inner.into()),
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        )
     } else {
         // `FloatArray.block` / `IntArray.block` stay `*mut TypedItemsBlock`.
         // That spelling projects as `SomePtr(GcArray(ITEM))` of the
@@ -6927,6 +6944,7 @@ fn derive_program_metadata(
                                 &name,
                                 &fname,
                                 &f.ty,
+                                type_decl_is_closure_env(td),
                                 llbc,
                                 gc_struct_ids,
                                 raw_alloc_flavor_structs,

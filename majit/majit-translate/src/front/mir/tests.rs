@@ -34874,6 +34874,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             list_of_str: false,
             raw_owned_root: None,
             owner_root: None,
+            cell_address: false,
         }],
     })
 }
@@ -34926,6 +34927,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             list_of_str: false,
             raw_owned_root: None,
             owner_root: None,
+            cell_address: false,
         }],
     })
 }
@@ -37220,6 +37222,272 @@ fn deref_store_through_mut_ref_field_of_bool_is_raw_store() {
             .any(|op| matches!(op.kind, OpKind::RawStore { .. })),
         "deref store of bool through &mut field must be RawStore; ops={ops:?}"
     );
+}
+
+/// Parent of `let mut flag = true; (|| { flag = false; })(); observe(flag)`:
+/// the captured local is a Char-varsize cell (`rdtoa.py` `strtod` `end_ptr`),
+/// the env stores that address, and the read after `call_mut` is `raw_load`.
+#[test]
+fn parent_mut_bool_captured_in_closure_env_is_raw_cell() {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let mut_bool = serde_json::json!({"Ref": [null, bool_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let flag_place = interior_place(1, &bool_ty);
+    let borrow_place = interior_place(2, &mut_bool);
+    let env_place = interior_place(3, &env_ty);
+    let recv_place = interior_place(4, &mut_env);
+    let caller = interior_caller(
+        "observe_flag",
+        0,
+        vec![],
+        bool_ty.clone(),
+        vec![
+            interior_local(0, None, &bool_ty),
+            interior_local(1, Some("flag"), &bool_ty),
+            interior_local(2, Some("borrow"), &mut_bool),
+            interior_local(3, Some("env"), &env_ty),
+            interior_local(4, Some("recv"), &mut_env),
+            interior_local(5, Some("call_ret"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        flag_place.clone(),
+                        serde_json::json!({
+                            "Use": [{"Const": [{"Bool": true}, bool_ty.clone()]}, "No"]
+                        }),
+                    ),
+                    interior_assign(
+                        borrow_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": flag_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        env_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": borrow_place.clone()}]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        recv_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": env_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![serde_json::json!({"Move": recv_place})],
+                    interior_place(5, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &bool_ty),
+                    serde_json::json!({
+                        "Use": [{"Read": flag_place}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let mut env_decl = interior_struct(
+        0,
+        &["fixture", "Env"],
+        &[("flag", mut_bool)],
+        8,
+        &[0],
+        false,
+    );
+    env_decl["src"] = serde_json::json!({"Closure": {"info": {
+        "kind": "FnMut",
+        "closure_body": {"id": 1, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }},
+        "fn_mut_impl": null,
+        "fn_once_impl": null,
+        "fn_impl": null
+    }}});
+    let call_mut = interior_opaque(1, &["fixture", "call_mut"], vec![mut_env], unit);
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller, call_mut]);
+    let graph = crate::test_support::lower_function(&llbc, "observe_flag")
+        .expect("lower parent that captures &mut bool into a closure env");
+    let ops = graph_ops(&graph);
+    let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let cell_ptr =
+        cell_ptr.unwrap_or_else(|| panic!("parent must allocate a Char-varsize cell; ops={ops:?}"));
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+                ..
+            } if *v == cell_ptr
+        )),
+        "closure env must store the cell address as an int word; ops={ops:?}"
+    );
+    let call_idx = ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::Call { .. }))
+        .unwrap_or_else(|| panic!("call_mut must be present; ops={ops:?}"));
+    let load_base = ops[call_idx + 1..].iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad {
+            base, itemsize: 1, ..
+        } => Some(base.clone()),
+        _ => None,
+    });
+    let load_base = load_base.unwrap_or_else(|| {
+        panic!("read of flag after call_mut must be RawLoad of the cell; ops={ops:?}")
+    });
+    // The cell pointer is the malloc result in the start block and an
+    // `inputarg` of later blocks (`Block.inputargs`).
+    assert!(
+        load_base == cell_ptr
+            || graph
+                .blocks
+                .iter()
+                .any(|block| block.inputargs.iter().any(|ia| *ia == load_base)),
+        "RawLoad after call_mut must use the cell pointer; ops={ops:?}"
+    );
+}
+
+/// `flag: &mut bool` parameter captured as `&mut *flag` into a Closure-src
+/// env. The operand is not a cell local (`id <= arg_count` is not bound
+/// as a cell), so the env must not store a scalar as the cell-address
+/// Int word (`rdtoa.py` `strtod` `end_ptr`).
+#[test]
+fn parent_mut_bool_param_reborrow_captured_in_closure_env_does_not_store_scalar() {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let mut_bool = serde_json::json!({"Ref": [null, bool_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let borrow_place = interior_place(2, &mut_bool);
+    let env_place = interior_place(3, &env_ty);
+    let caller = interior_caller(
+        "observe_flag",
+        1,
+        vec![mut_bool.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("flag"), &mut_bool),
+            interior_local(2, Some("borrow"), &mut_bool),
+            interior_local(3, Some("env"), &env_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    borrow_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(1, &mut_bool, &bool_ty),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place,
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, null, null]},
+                            [{"Move": borrow_place}]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let mut env_decl = interior_struct(
+        0,
+        &["fixture", "Env"],
+        &[("flag", mut_bool)],
+        8,
+        &[0],
+        false,
+    );
+    env_decl["src"] = serde_json::json!({"Closure": {"info": {
+        "kind": "FnMut",
+        "closure_body": {"id": 1, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }},
+        "fn_mut_impl": null,
+        "fn_once_impl": null,
+        "fn_impl": null
+    }}});
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller]);
+    match crate::test_support::lower_function(&llbc, "observe_flag") {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("raw cell address") && msg.contains("not the address of a cell local"),
+                "decline must name the cell-address operand hole; got {msg}"
+            );
+        }
+        Ok(graph) => {
+            let ops = graph_ops(&graph);
+            let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+                OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+                    op.result.clone()
+                }
+                _ => None,
+            });
+            let stores_scalar_int = ops.iter().any(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                    ..
+                } => cell_ptr.as_ref().is_none_or(|ptr| v != ptr),
+                _ => false,
+            });
+            assert!(
+                !stores_scalar_int,
+                "closure env must not store a scalar as the cell-address Int word; ops={ops:?}"
+            );
+            assert!(
+                cell_ptr.is_some()
+                    && ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite {
+                            value: LinkArg::Value(v),
+                            ty: ValueType::Int,
+                            ..
+                        } if cell_ptr.as_ref().is_some_and(|ptr| v == ptr)
+                    )),
+                "if lowering succeeds, the env must store a cell address; ops={ops:?}"
+            );
+        }
+    }
 }
 
 /// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through

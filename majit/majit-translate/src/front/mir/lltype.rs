@@ -3812,6 +3812,12 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             {
                 return peeled;
             }
+            if closure_env_field_is_cell_address(owner_is_closure_env, field_ty, llbc).is_some() {
+                // Declared field type is the cell-address source of truth;
+                // the place overlay is not a second exclusive-borrow test.
+                // `history.getkind` of a raw Ptr is `'int'`.
+                return ValueType::Int;
+            }
             // A by-value raw struct such as `Position` is not a GC
             // pointer. `getkind` of that word is int, so the load is
             // `getfield_raw_i`. A mutable `getfield_raw_r` is refused.
@@ -3995,6 +4001,34 @@ pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
         &TyRef::Other(pointee.clone().into()),
         llbc,
     ))
+}
+
+/// Pointee of an exclusive borrow of a primitive (`&mut bool`, `&mut u8`).
+///
+/// The env field holds the raw cell address (`rdtoa.py` `strtod`
+/// `end_ptr`); `history.getkind` of that raw Ptr is `'int'`. Shared `&P`
+/// stays [`tyref_shared_borrow_primitive_pointee`].
+pub(in crate::front::mir) fn tyref_exclusive_borrow_primitive_pointee(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let node = tyref_node(ty, llbc)?;
+    let pointee = type_node_mut_ref_pointee(node, llbc)?;
+    tyref_primitive_node(pointee, llbc).cloned()
+}
+
+/// Closure-env field whose declared type is an exclusive borrow of a
+/// primitive: the stored word is the raw cell address (`rdtoa.py`
+/// `strtod` `end_ptr`). `history.getkind` of a raw Ptr is `'int'`.
+pub(in crate::front::mir) fn closure_env_field_is_cell_address(
+    owner_is_closure_env: bool,
+    field_ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    if !owner_is_closure_env {
+        return None;
+    }
+    tyref_exclusive_borrow_primitive_pointee(field_ty, llbc)
 }
 
 /// Register-bank kind of an enum variant's payload — `Option<T>`,
@@ -5914,8 +5948,8 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
     if tyref_is_type_parameter(ty, llbc) {
         return ValueType::Unknown;
     }
-    if type_decl_is_closure_env(owner)
-        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc).or_else(|| {
+    if type_decl_is_closure_env(owner) {
+        if let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc).or_else(|| {
             tyref_is_borrowed_transparent_scalar(
                 ty,
                 llbc,
@@ -5933,9 +5967,13 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
                 )
             })
             .flatten()
-        })
-    {
-        return peeled;
+        }) {
+            return peeled;
+        }
+        if closure_env_field_is_cell_address(type_decl_is_closure_env(owner), ty, llbc).is_some() {
+            // Raw cell address. `history.getkind` of a raw Ptr is `'int'`.
+            return ValueType::Int;
+        }
     }
     tyref_to_attr_value_type_with(
         ty,

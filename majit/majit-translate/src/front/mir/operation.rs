@@ -1836,8 +1836,9 @@ impl<'a> Lowering<'a> {
 
     /// One-word `*p = v`: a raw pointer to a scalar, or a borrowed
     /// `&mut T` of a primitive scalar whose place `atomic_ref_place`
-    /// did not recover (a pointer field of a closure env). Multi-word
-    /// pointees use `move_plan` / `rffi.py` `_get_structcopy_fn`.
+    /// did not recover (the pointer is a closure-env field holding a
+    /// raw cell address). Multi-word pointees use `move_plan` /
+    /// `rffi.py` `_get_structcopy_fn`.
     fn one_word_deref_store_descr(
         &self,
         dest_ty: &TyRef,
@@ -1855,9 +1856,12 @@ impl<'a> Lowering<'a> {
         }
         // `&mut bool` (and other primitive scalars) behind a pointer
         // field: the Deref inner is a Field, not a Local, so
-        // `atomic_ref_place` does not fire. Same one-word store as a
-        // raw pointer. A transparent GCREF newtype (`PyError`) is not
-        // a primitive scalar and still declines rather than
+        // `atomic_ref_place` does not fire. The parent allocated a
+        // Char-varsize cell (`lltype.malloc` flavor='raw' / `rdtoa.py`
+        // `strtod` `end_ptr`); this store is `rewrite_op_raw_store`
+        // through that cell. A GC instance field of the env is
+        // `rewrite_op_setfield`. A transparent GCREF newtype (`PyError`)
+        // is not a primitive scalar and still declines rather than
         // `raw_store` of a GCREF.
         if !deref_base_is_raw_ptr
             && tyref_is_primitive_scalar(dest_ty, self.llbc)
@@ -2068,6 +2072,12 @@ impl<'a> Lowering<'a> {
                 .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
             (name == field_name).then_some(f)
         })?;
+        if closure_env_field_is_cell_address(type_decl_is_closure_env(td), &field.ty, self.llbc)
+            .is_some()
+        {
+            // Cell address. `history.getkind` of a raw Ptr is `'int'`.
+            return Some(ValueType::Int);
+        }
         Some(self.value_type_of(&field.ty))
     }
 
@@ -3952,6 +3962,17 @@ impl<'a> Lowering<'a> {
                             return Err(LowerError::Unsupported(format!(
                                 "bb{mir_bb}: pair slice item of an array aggregate"
                             )));
+                        }
+                        for (i, arg) in arg_vars.iter().enumerate() {
+                            let Some(field) = ctor.fields.get(i) else {
+                                continue;
+                            };
+                            if field.cell_address && !self.variable_is_cell_ptr(arg) {
+                                return Err(LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: closure env field {} stores a raw cell address (`rdtoa.py` `strtod` `end_ptr`) but the operand is not the address of a cell local",
+                                    field.name,
+                                )));
+                            }
                         }
                         let bb_id = self.emit_bb(mir_bb);
                         // A host `0` stored into a GCREF virtualizable field is
@@ -9281,6 +9302,14 @@ impl<'a> Lowering<'a> {
                         None
                     },
                     owner_root,
+                    cell_address: declared_ty.is_some_and(|ty| {
+                        closure_env_field_is_cell_address(
+                            tyref_is_closure_env(dest_ty, self.llbc),
+                            ty,
+                            self.llbc,
+                        )
+                        .is_some()
+                    }),
                 }
             })
             .collect();
