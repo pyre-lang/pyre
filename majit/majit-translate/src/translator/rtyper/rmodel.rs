@@ -1001,6 +1001,10 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("store_through_ptr"))
     }
 
+    fn rtype_load_through_ptr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("load_through_ptr"))
+    }
+
     fn rtype_len(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(self.missing_rtype_operation("len"))
     }
@@ -2675,6 +2679,22 @@ impl Repr for InteriorPtrRepr {
         let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
         vlist.push(v_value);
         Ok(hop.genop("setinteriorfield", vlist, GenopResult::Void))
+    }
+
+    fn rtype_load_through_ptr(&self, hop: &HighLevelOp) -> RTypeResult {
+        assert!(
+            !self.result_target().is_container_type(),
+            "load_through_ptr requires a leaf-TO interior pointer, got {:?}",
+            self.result_target()
+        );
+        let v_self = hop.inputarg(self, 0)?;
+        let vlist = self.getinteriorfieldargs(hop, v_self)?;
+        let r_result = hop_r_result(hop)?;
+        Ok(hop.genop(
+            "getinteriorfield",
+            vlist,
+            GenopResult::LLType(r_result.lowleveltype().clone()),
+        ))
     }
 }
 
@@ -4647,6 +4667,47 @@ mod tests {
             .find(|op| op.opname == "setinteriorfield")
             .expect("leaf-TO store-through must emit setinteriorfield");
         assert_eq!(set.args.len(), 4);
+    }
+
+    #[test]
+    fn interiorptr_rtype_load_through_ptr_emits_getinteriorfield() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, Struct,
+        };
+
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(array_type),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![
+                InteriorOffset::Index(0),
+                InteriorOffset::Field("value".into()),
+            ],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "load_through_ptr");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
+        hop.args_v.borrow_mut().extend([Hlvalue::Variable(v_self)]);
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr))]);
+        hop.args_r.borrow_mut().extend([Some(r_iptr_dyn)]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        assert!(r_iptr.rtype_load_through_ptr(&hop).unwrap().is_some());
+        let ops = hop.llops.borrow();
+        let get = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "getinteriorfield")
+            .expect("leaf-TO load-through must emit getinteriorfield");
+        assert_eq!(get.args.len(), 3);
     }
 
     #[test]

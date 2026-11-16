@@ -1651,6 +1651,16 @@ fn add_dest_struct_field_guard_classifies_uses() {
         !elem_accepts(&elem_escape_call),
         "a by-value call argument of dest escapes even with a Ref elem use"
     );
+
+    let raw_addr = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "RawPtr": {"place": field_place(1, 0), "kind": "Mut", "ptr_metadata": null}
+        }]
+    }))]);
+    assert!(
+        !elem_accepts(&raw_addr),
+        "&raw of an element field is not an elem use"
+    );
 }
 
 /// Distinctive `fn(bool) -> bool` so this fixture cannot collide with

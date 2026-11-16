@@ -603,6 +603,7 @@ mod tests {
             OpKind::StoreThroughPtr {
                 ptr: exposed,
                 value,
+                raw: None,
             },
             false,
         );

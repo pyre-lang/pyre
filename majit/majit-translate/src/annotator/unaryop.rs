@@ -80,6 +80,7 @@ pub static UNARY_OPERATIONS: &[OpKind] = &[
     OpKind::CallArgs,
     OpKind::InteriorPtrExpose,
     OpKind::StoreThroughPtr,
+    OpKind::LoadThroughPtr,
     // `Contains` is removed from UNARY_OPERATIONS upstream line 28 —
     // it's a binary op on the `in` operand semantically. The `@op.contains.register`
     // hooks below still live in unaryop.py, so they land here.
@@ -1202,6 +1203,38 @@ fn init_someinteger_overrides(
         Specialization {
             apply: pure(|_ann, _hl| panic!("AnnotatorError: 'int' has no length")),
             can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    register(
+        reg,
+        OpKind::StoreThroughPtr,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(|_ann, _hl| None),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    register(
+        reg,
+        OpKind::LoadThroughPtr,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_type = ann
+                    .annotation(&hl.args[1])
+                    .expect("integer.load_through_ptr: TYPE unbound");
+                match s_type.const_() {
+                    Some(ConstValue::LowLevelType(ll)) => Some(
+                        crate::translator::rtyper::llannotation::lltype_to_annotation(
+                            (**ll).clone(),
+                        ),
+                    ),
+                    other => panic!(
+                        "load_through_ptr TYPE is not a LowLevelType constant, got {other:?}"
+                    ),
+                }
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
 }
@@ -4487,6 +4520,31 @@ fn init_someptr_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+    register(
+        reg,
+        OpKind::LoadThroughPtr,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("ptr.load_through_ptr: self unbound");
+                Some(with_ptr_like(
+                    &s,
+                    |_| {
+                        std::panic::panic_any(AnnotatorError::new(
+                            "load_through_ptr on non-interior ptr",
+                        ))
+                    },
+                    |ptr| {
+                        ptr.load_through_ptr()
+                            .unwrap_or_else(|err| std::panic::panic_any(err))
+                    },
+                ))
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
 }
 
 // unaryop.py — class __extend__(SomeNone)
@@ -5495,6 +5553,7 @@ mod tests {
         assert!(UNARY_OPERATIONS.contains(&OpKind::Bool));
         assert!(UNARY_OPERATIONS.contains(&OpKind::InteriorPtrExpose));
         assert!(UNARY_OPERATIONS.contains(&OpKind::StoreThroughPtr));
+        assert!(UNARY_OPERATIONS.contains(&OpKind::LoadThroughPtr));
     }
 
     #[test]
@@ -6200,6 +6259,68 @@ mod tests {
         assert!(
             r.is_none(),
             "void store-through should return None, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn consider_load_through_ptr_on_leaf_to_returns_field_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let ann = mk_ann();
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(
+            &mut v_ptr,
+            SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(array_type),
+                TO: Box::new(LowLevelType::Signed),
+                offsets: vec![
+                    InteriorOffset::Index(0),
+                    InteriorOffset::Field("value".into()),
+                ],
+            })),
+        );
+        let hl = HLOperation::new(
+            OpKind::LoadThroughPtr,
+            vec![
+                Hlvalue::Variable(v_ptr),
+                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+                    LowLevelType::Signed,
+                )))),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(
+            matches!(r, SomeValue::Integer(_)),
+            "leaf-TO load-through should return the field annotation, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn consider_store_through_ptr_on_integer_address_returns_none() {
+        let ann = mk_ann();
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(
+            &mut v_ptr,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let mut v_value = Variable::named("v");
+        ann.setbinding(
+            &mut v_value,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::StoreThroughPtr,
+            vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_value)],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(
+            r.is_none(),
+            "integer-address store-through should return None, got {r:?}"
         );
     }
 

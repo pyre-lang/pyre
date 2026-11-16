@@ -2307,9 +2307,8 @@ impl<'a> Lowering<'a> {
             }
         }
         // A raw pointer word is `raw_store`. A `&mut` scalar from a
-        // same-body call is checked first below: that pointer addresses a
-        // GcArray element field, and `raw_store` into a GC object is not
-        // `setinteriorfield`.
+        // call result is checked first below: the rtyper picks
+        // `setinteriorfield` vs `raw_store` from the pointer's repr.
         let one_word = self.one_word_deref_store_descr(dest_ty, deref_base_is_raw_ptr);
         // A by-value nested struct keeps declining
         // (`deref_store_of_nested_struct_field_has_no_move_plan`).
@@ -2320,14 +2319,11 @@ impl<'a> Lowering<'a> {
         // `json_ty_is_niche_option_word`). A rust-heap `String`, `Vec`,
         // host enum, or fat pointer is not that leaf.
         //
-        // The pointer must also be a same-body Call result (a function
-        // returning `&mut (*elem).field`, or a field of a returned
-        // tuple/struct), possibly through Copy/Move or `&mut *x`.
-        // `Option`/`Result` unwrap/expect are peeled to the receiver;
-        // the remaining callee must not be `core`/`alloc`/`std`
-        // (`Enumerate::next` over a host `Vec` slot). A function
-        // argument or a Field of the closure-env argument is not that
-        // pointer.
+        // The pointer must also be a Call result (a function returning
+        // `&mut (*elem).field`, or a field of a returned tuple/struct),
+        // possibly through Copy/Move or `&mut *x`. `Option`/`Result`
+        // unwrap/expect are peeled to the receiver. A function argument
+        // or a Field of the closure-env argument is not that pointer.
         if tyref_by_value_struct_decl(
             dest_ty,
             self.llbc,
@@ -2342,9 +2338,17 @@ impl<'a> Lowering<'a> {
                 || tyref_node(dest_ty, self.llbc)
                     .is_some_and(|n| json_ty_is_niche_option_word(n, self.llbc)))
             && !(deref_base_is_raw_ptr && one_word.is_some())
-            && provenance_local.is_some_and(|local| self.deref_base_is_same_body_call_result(local))
+            && provenance_local.is_some_and(|local| self.deref_base_is_call_result(local))
         {
-            return Ok(Some(OpKind::StoreThroughPtr { ptr: base, value }));
+            return Ok(Some(OpKind::StoreThroughPtr {
+                ptr: base,
+                value,
+                raw: one_word.map(|(item_ty, itemsize, is_item_signed)| RawWordDescr {
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                }),
+            }));
         }
         if let Some((item_ty, itemsize, is_item_signed)) = one_word {
             let offset = self
@@ -2370,21 +2374,19 @@ impl<'a> Lowering<'a> {
     }
 
     /// Walk `local` through unique Copy/Move, Field projections, and
-    /// `&mut *x` reborrows to a same-body Call destination
-    /// (`defining_call` / `defining_assign`).
+    /// `&mut *x` reborrows to a Call destination (`defining_call` /
+    /// `defining_assign`).
     ///
     /// `Option`/`Result` `unwrap`/`expect` peel to the receiver
-    /// argument's origin under the same rules. The remaining callee is
-    /// translated code when its path is not a `core`/`alloc`/`std`
-    /// library function (the crate-root match in `call.rs` /
-    /// `lltype.rs`).
-    fn deref_base_is_same_body_call_result(&self, mut local: usize) -> bool {
+    /// argument's origin under the same rules. The remaining callee must
+    /// have a body the flow space lowers; the pointer's annotation then
+    /// decides interior vs raw lowering.
+    fn deref_base_is_call_result(&self, mut local: usize) -> bool {
         for _ in 0..32 {
             if let Some(call) = defining_call(self.llbc, self.body, local) {
-                let Some(path) = call_regular_name_path(&call, self.llbc) else {
-                    return false;
-                };
-                if path_is_option_or_result_unwrap_or_expect(&path) {
+                if let Some(path) = call_regular_name_path(&call, self.llbc)
+                    && path_is_option_or_result_unwrap_or_expect(&path)
+                {
                     let Some(recv) = call.args.first() else {
                         return false;
                     };
@@ -2400,8 +2402,20 @@ impl<'a> Lowering<'a> {
                     local = next;
                     continue;
                 }
-                let crate_root = path.split("::").next().unwrap_or(&path);
-                return !matches!(crate_root, "core" | "std" | "alloc");
+                // The callee must be a graph the flow space can build: a
+                // regular function with an unstructured body. A host
+                // function without one (`<[T; N]>::index_mut`) has no
+                // graph to return an interior pointer from.
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                    return false;
+                };
+                return self
+                    .llbc
+                    .fn_by_id(*id)
+                    .is_some_and(|fd| fd.has_unstructured_body());
             }
             match defining_assign(self.llbc, self.body, local) {
                 Some(Rvalue::Use(op, _)) => {
@@ -3992,31 +4006,13 @@ impl<'a> Lowering<'a> {
             // tracking lives outside the JIT).
             // `&raw const *p` is the address `p`. Resolving the deref
             // would `RawLoad` the pointee (`rewrite_op_raw_load`).
-            Rvalue::RawPtr { place, kind, .. } => {
+            Rvalue::RawPtr { place, .. } => {
                 if let Some(cell) = self.cell_local_of_address_place(&place) {
                     let v = self.defined_local(mir_bb, cell)?;
                     return Ok((None, v));
                 }
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
-                    return Ok((None, v));
-                }
-                if let Some(v) = self.try_reborrow_interior_elem(&place)? {
-                    return Ok((None, v));
-                }
-                if let Some(v) = self.try_emit_interior_field_use_of_ref_local(
-                    mir_bb,
-                    &place,
-                    borrow_kind_is_exclusive(&kind),
-                )? {
-                    return Ok((None, v));
-                }
-                if !borrow_kind_is_exclusive(&kind)
-                    && let Some(v) = self.try_emit_interior_field_read_from_place(mir_bb, &place)?
-                {
-                    return Ok((None, v));
-                }
-                if let Some(v) = self.try_emit_interior_ptr_expose(mir_bb, &place)? {
                     return Ok((None, v));
                 }
                 if !self.place_is_interior_struct_field(&place)
@@ -9272,13 +9268,6 @@ impl<'a> Lowering<'a> {
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
-                    let offset = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(offset.clone()),
-                        kind: OpKind::ConstInt(0),
-                    });
                     // Integer pointee (`u8` window byte, `CCHARP`) is `CHAR`.
                     // `Unknown` banks as `'r'` and `rewrite_op_raw_load`
                     // wraps the loaded word in `cast_int_to_ptr`.
@@ -9288,6 +9277,27 @@ impl<'a> Lowering<'a> {
                         crate::model::ConcreteType::Unknown
                     };
                     let loaded = self.graph.alloc_value_var_with_type(loaded_ct);
+                    if scalar_address {
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(loaded.clone()),
+                            kind: OpKind::LoadThroughPtr {
+                                ptr: base,
+                                raw: RawWordDescr {
+                                    item_ty,
+                                    itemsize,
+                                    is_item_signed,
+                                },
+                            },
+                        });
+                        return Ok(loaded);
+                    }
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(loaded.clone()),
                         kind: OpKind::RawLoad {

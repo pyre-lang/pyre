@@ -863,6 +863,20 @@ impl SomeInteriorPtr {
         interior_leaf_store_value_fits(&self.ll_ptrtype.TO, s_value)?;
         Ok(SomeValue::Impossible)
     }
+
+    /// Load through a leaf-TO interior pointer. The field type already
+    /// lives in `TO`.
+    pub fn load_through_ptr(&self) -> Result<SomeValue, AnnotatorError> {
+        if self.ll_ptrtype.TO.is_container_type() {
+            return Err(AnnotatorError::new(format!(
+                "load_through_ptr requires a leaf-TO interior pointer, got TO {:?}",
+                self.ll_ptrtype.TO
+            )));
+        }
+        Ok(highlevel_of_ptr_field_annotation(lltype_to_annotation(
+            (*self.ll_ptrtype.TO).clone(),
+        )))
+    }
 }
 
 fn interior_ptr_struct_field_type(

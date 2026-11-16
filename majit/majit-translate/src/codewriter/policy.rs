@@ -567,6 +567,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::VableArrayRead { item_ty, .. }
         | OpKind::VableArrayWrite { item_ty, .. }
         | OpKind::VableArrayLen { item_ty, .. } => out.push(item_ty),
+        OpKind::LoadThroughPtr { raw, .. } => out.push(&raw.item_ty),
 
         // The declared type of the op's result.
         OpKind::Call { result_ty, .. }

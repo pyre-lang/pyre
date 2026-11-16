@@ -806,6 +806,8 @@ impl CodeWriter {
                 &mut graph_owned,
                 value_to_var,
             );
+        } else {
+            crate::codewriter::interior_ptr::lower_through_ptr_without_annotation(&mut graph_owned);
         }
         // rstr.py `StringRepr.convert_const` resolves string literals into
         // prebuilt `Ptr(STR)` constants before the codewriter sees the

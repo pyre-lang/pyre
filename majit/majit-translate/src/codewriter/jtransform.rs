@@ -6044,6 +6044,11 @@ impl<'a> Transformer<'a> {
                  this store-through to setinteriorfield \
                  (InteriorPtrRepr.rtype_store_through_ptr)"
             ),
+            OpKind::LoadThroughPtr { .. } => panic!(
+                "OpKind::LoadThroughPtr reached jtransform; the rtyper must lower \
+                 this load-through to getinteriorfield \
+                 (InteriorPtrRepr.rtype_load_through_ptr)"
+            ),
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -19344,9 +19349,14 @@ fn remap_op_renamings(
             field: field.clone(),
             ty: ty.clone(),
         },
-        OpKind::StoreThroughPtr { ptr, value } => OpKind::StoreThroughPtr {
+        OpKind::StoreThroughPtr { ptr, value, raw } => OpKind::StoreThroughPtr {
             ptr: remap_value(ptr, aliases),
             value: remap_value(value, aliases),
+            raw: raw.clone(),
+        },
+        OpKind::LoadThroughPtr { ptr, raw } => OpKind::LoadThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            raw: raw.clone(),
         },
         OpKind::Call {
             target,

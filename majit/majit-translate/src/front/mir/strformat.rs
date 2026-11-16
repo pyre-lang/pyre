@@ -2478,7 +2478,8 @@ pub(in crate::front::mir) fn op_reads_var(
             base, index, value, ..
         } => is(base) || is(index) || is(value),
         OpKind::InteriorPtrExpose { base, .. } => is(base),
-        OpKind::StoreThroughPtr { ptr, value } => is(ptr) || is(value),
+        OpKind::StoreThroughPtr { ptr, value, .. } => is(ptr) || is(value),
+        OpKind::LoadThroughPtr { ptr, .. } => is(ptr),
         OpKind::Call { args, .. } => args.iter().any(|a| is(a)),
         OpKind::BinOp { lhs, rhs, .. } => is(lhs) || is(rhs),
         OpKind::UnaryOp { operand, .. } => is(operand),
