@@ -2919,6 +2919,22 @@ impl MiniMarkGC {
             .unwrap_or(GcRef(0))
     }
 
+    /// GIL-off first attempt for the untyped `alloc_varsize`: the same bump
+    /// `alloc_with_type(0, payload_size)` would take, with no length store —
+    /// type 0's layout says nothing about this allocation.
+    pub fn try_alloc_varsize_bump(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> GcRef {
+        let Some(payload_size) = Self::checked_varsize_payload_size(base_size, item_size, length)
+        else {
+            return GcRef(0);
+        };
+        self.try_alloc_nursery_bump_typed(0, payload_size)
+    }
+
     /// GIL-off first attempt for `alloc_varsize_typed`: bump/refill only.
     /// Null means the caller should collect under `gc_op_stw`.
     pub fn try_alloc_varsize_typed_bump(

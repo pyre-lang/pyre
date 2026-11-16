@@ -875,15 +875,20 @@ pub fn gc_op_alloc(
     no_collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
     collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
 ) -> crate::GcRef {
-    gc_op_alloc_slots(std::ptr::null_mut(), 0, no_collect, collect)
+    // SAFETY: zero slots, so the pointer is never read.
+    unsafe { gc_op_alloc_slots(std::ptr::null_mut(), 0, no_collect, collect) }
 }
 
 /// [`gc_op_alloc`] for a caller that holds live GC refs only in raw
 /// `*mut GcRef` slots. GIL-on leaves the slots untouched. GIL-off pins
 /// each slot across the STW wait and writes the reloaded value back
 /// before `collect` runs.
+///
+/// # Safety
+/// `slots` must point to `slot_count` initialized, writable `GcRef`s that
+/// stay valid for the call (any pointer when `slot_count == 0`).
 #[inline]
-pub fn gc_op_alloc_slots(
+pub unsafe fn gc_op_alloc_slots(
     slots: *mut crate::GcRef,
     slot_count: usize,
     no_collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
@@ -894,7 +899,8 @@ pub fn gc_op_alloc_slots(
         if !obj.is_null() {
             return obj;
         }
-        gc_op_stw_slots(slots, slot_count, collect)
+        // SAFETY: the caller's contract.
+        unsafe { gc_op_stw_slots(slots, slot_count, collect) }
     } else {
         gc_op(collect)
     }
@@ -908,8 +914,11 @@ pub fn gc_op_alloc_slots(
 /// refs are not on the shadow stack; the collector registers them
 /// (`roots.add`) only once it runs as owner. A foreign collection can
 /// move nursery objects while this thread waits.
+///
+/// # Safety
+/// Same contract as [`gc_op_alloc_slots`].
 #[inline]
-pub fn gc_op_stw_slots<R>(
+pub unsafe fn gc_op_stw_slots<R>(
     slots: *mut crate::GcRef,
     slot_count: usize,
     f: impl FnOnce(&mut MiniMarkGC) -> R,
@@ -921,10 +930,13 @@ pub fn gc_op_stw_slots<R>(
     if !crate::rgil::gil_disabled() {
         return gc_op(f);
     }
-    gc_op_stw_slots_nogil(slots, slot_count, f)
+    // SAFETY: the caller's contract.
+    unsafe { gc_op_stw_slots_nogil(slots, slot_count, f) }
 }
 
-fn gc_op_stw_slots_nogil<R>(
+/// # Safety
+/// Same contract as [`gc_op_alloc_slots`].
+unsafe fn gc_op_stw_slots_nogil<R>(
     slots: *mut crate::GcRef,
     slot_count: usize,
     f: impl FnOnce(&mut MiniMarkGC) -> R,
