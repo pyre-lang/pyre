@@ -1465,10 +1465,31 @@ mod context_methods {
             owner: Option<PyObjectRef>,
             session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let server_side = server_side
-                .map(pyre_interpreter::baseobjspace::is_true)
-                .transpose()?
-                .unwrap_or(false);
+            let mut owner = owner.unwrap_or(pyre_object::PY_NULL);
+            let mut session = session.unwrap_or(pyre_object::PY_NULL);
+            let mut server_hostname = server_hostname.unwrap_or(pyre_object::PY_NULL);
+            // `is_true` may run a user `__bool__` and collect.
+            let server_side = pyre_object::with_roots!(
+                incoming,
+                outgoing,
+                owner,
+                session,
+                server_hostname => server_side
+                    .map(pyre_interpreter::baseobjspace::is_true)
+                    .transpose()?
+                    .unwrap_or(false)
+            );
+            let owner = if owner.is_null() { None } else { Some(owner) };
+            let session = if session.is_null() {
+                None
+            } else {
+                Some(session)
+            };
+            let server_hostname = if server_hostname.is_null() {
+                None
+            } else {
+                Some(server_hostname)
+            };
             let mut owner = owner.unwrap_or_else(w_none);
             let hostname = server_hostname;
             if W_MemoryBIO::from_obj(incoming).is_none()
@@ -1525,16 +1546,36 @@ mod context_methods {
 
         fn _wrap_socket(
             &self,
-            sock: PyObjectRef,
+            mut sock: PyObjectRef,
             server_side: Option<PyObjectRef>,
             server_hostname: Option<PyObjectRef>,
             owner: Option<PyObjectRef>,
             session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let server_side = server_side
-                .map(pyre_interpreter::baseobjspace::is_true)
-                .transpose()?
-                .unwrap_or(false);
+            let mut owner = owner.unwrap_or(pyre_object::PY_NULL);
+            let mut session = session.unwrap_or(pyre_object::PY_NULL);
+            let mut server_hostname = server_hostname.unwrap_or(pyre_object::PY_NULL);
+            // `is_true` may run a user `__bool__` and collect.
+            let server_side = pyre_object::with_roots!(
+                sock,
+                owner,
+                session,
+                server_hostname => server_side
+                    .map(pyre_interpreter::baseobjspace::is_true)
+                    .transpose()?
+                    .unwrap_or(false)
+            );
+            let owner = if owner.is_null() { None } else { Some(owner) };
+            let session = if session.is_null() {
+                None
+            } else {
+                Some(session)
+            };
+            let server_hostname = if server_hostname.is_null() {
+                None
+            } else {
+                Some(server_hostname)
+            };
             let mut owner = owner.unwrap_or_else(w_none);
             let mut socket = sock;
             let hostname = server_hostname;
