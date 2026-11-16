@@ -229,15 +229,20 @@ pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
 
 // ── `_compat_pickle` fix_imports tables (space.fromcache(State)) ──────
 
-/// `pypy/module/_pickle/state.py State` — the four `_compat_pickle` mapping
-/// dicts, imported once and cached for the process instead of re-`getattr`'d on
-/// every `compat_map` call. Held off the GC object graph; the collector reaches
-/// the dicts through [`walk_pickle_state_gc`].
+/// `pypy/module/_pickle/state.py State` — the `_compat_pickle` mapping dicts
+/// and the `copyreg` dispatch/extension registries, imported once (`State.startup`
+/// order) instead of re-`getattr`'d on every `compat_map` / EXT lookup. Held off
+/// the GC object graph; the collector reaches the dicts through
+/// [`walk_pickle_state_gc`].
 struct PickleState {
     w_name_mapping: PyObjectRef,
     w_import_mapping: PyObjectRef,
     w_reverse_name_mapping: PyObjectRef,
     w_reverse_import_mapping: PyObjectRef,
+    w_dispatch_table: PyObjectRef,
+    w_extension_registry: PyObjectRef,
+    w_extension_cache: PyObjectRef,
+    w_inverted_registry: PyObjectRef,
 }
 
 /// Published once and never replaced (the `space.fromcache` singleton), so the
@@ -245,26 +250,27 @@ struct PickleState {
 /// `compat_map`.
 static PICKLE_STATE: AtomicPtr<PickleState> = AtomicPtr::new(std::ptr::null_mut());
 
-/// The cached `_compat_pickle` tables, built on first use. Returns `None` when
-/// `_compat_pickle` or one of its four tables is unavailable, so `compat_map`
-/// falls back to the identity mapping. Yields a raw `*const PickleState` (not a
+/// The cached `_compat_pickle` and `copyreg` tables, built on first use.
+/// Returns `None` when either module or one of its tables is unavailable, so
+/// `compat_map` falls back to the identity mapping and EXT / dispatch lookups
+/// treat the registries as missing. Yields a raw `*const PickleState` (not a
 /// shared reference): a reader may hold it across a collection that rewrites the
 /// slots through `walk_pickle_state_gc`'s raw pointers, which a `&PickleState`
 /// spanning that write would make undefined under Rust's aliasing model.
 ///
-/// `State.startup` (state.py) imports `_compat_pickle` eagerly at space startup
-/// and lets a failure propagate. This builds the same tables lazily on the first
-/// `compat_map` and degrades to the identity mapping when the module is absent
-/// rather than propagating: the eager-startup hook has no pyre counterpart, and
-/// the fallback keeps protocol-<3 pickling usable on a minimal stdlib that omits
-/// `_compat_pickle` (proto>=3 never reaches `compat_map`).
+/// `State.startup` imports `_compat_pickle` then `copyreg` eagerly at space
+/// startup and lets a failure propagate. This builds the same tables lazily on
+/// first use and degrades when a module is absent rather than propagating: the
+/// eager-startup hook has no pyre counterpart, and the fallback keeps
+/// protocol-<3 pickling usable on a minimal stdlib that omits `_compat_pickle`
+/// (proto>=3 never reaches `compat_map`).
 fn pickle_state() -> Option<*const PickleState> {
     let ptr = PICKLE_STATE.load(Ordering::Acquire);
     if !ptr.is_null() {
         return Some(ptr as *const PickleState);
     }
-    // Pin the module and each table across the reads: a plain module `getattr`
-    // stays native, but the defensive pin keeps the four dicts rooted even if a
+    // Pin each module and table across the reads: a plain module `getattr`
+    // stays native, but the defensive pin keeps the dicts rooted even if a
     // lookup ever runs Python and relocates them before publication.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
@@ -280,13 +286,33 @@ fn pickle_state() -> Option<*const PickleState> {
         let table = pyre_interpreter::baseobjspace::getattr_str(compat, attr).ok()?;
         let _ = pyre_object::gc_roots::pin_root(table);
     }
-    // Slots base+1..=base+4 hold the four tables (updated by any relocation
-    // during the reads). No GC-allocating step runs between here and publication.
+    // `State.startup` then imports `copyreg` and stores dispatch_table /
+    // _extension_registry / _extension_cache / _inverted_registry.
+    let copyreg_base = pyre_object::gc_roots::shadow_stack_len();
+    let copyreg = import_module("copyreg").ok()?;
+    let _ = pyre_object::gc_roots::pin_root(copyreg);
+    for attr in [
+        "dispatch_table",
+        "_extension_registry",
+        "_extension_cache",
+        "_inverted_registry",
+    ] {
+        let copyreg = pyre_object::gc_roots::shadow_stack_get(copyreg_base);
+        let table = pyre_interpreter::baseobjspace::getattr_str(copyreg, attr).ok()?;
+        let _ = pyre_object::gc_roots::pin_root(table);
+    }
+    // Slots base+1..=base+4 and copyreg_base+1..=copyreg_base+4 hold the tables
+    // (updated by any relocation during the reads). No GC-allocating step runs
+    // between here and publication.
     let created = Box::into_raw(Box::new(PickleState {
         w_name_mapping: pyre_object::gc_roots::shadow_stack_get(base + 1),
         w_import_mapping: pyre_object::gc_roots::shadow_stack_get(base + 2),
         w_reverse_name_mapping: pyre_object::gc_roots::shadow_stack_get(base + 3),
         w_reverse_import_mapping: pyre_object::gc_roots::shadow_stack_get(base + 4),
+        w_dispatch_table: pyre_object::gc_roots::shadow_stack_get(copyreg_base + 1),
+        w_extension_registry: pyre_object::gc_roots::shadow_stack_get(copyreg_base + 2),
+        w_extension_cache: pyre_object::gc_roots::shadow_stack_get(copyreg_base + 3),
+        w_inverted_registry: pyre_object::gc_roots::shadow_stack_get(copyreg_base + 4),
     }));
     let published = match PICKLE_STATE.compare_exchange(
         std::ptr::null_mut(),
@@ -303,7 +329,7 @@ fn pickle_state() -> Option<*const PickleState> {
     Some(published as *const PickleState)
 }
 
-/// Forward the four cached `_compat_pickle` mapping dicts. Called on every
+/// Forward the cached `_compat_pickle` and `copyreg` dicts. Called on every
 /// collection from `walk_global_prebuilt_roots`, so a minor move updates the
 /// off-GC cached pointers. Upstream reaches the same dicts through the space's
 /// object graph; pyre holds them off-heap and hands them to the collector.
@@ -312,9 +338,10 @@ pub(crate) fn walk_pickle_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if ptr.is_null() {
         return;
     }
-    // A collection can run mid-`compat_map`, which reads these same slots through
-    // raw pointers (never a live `&PickleState`); write them through raw pointers
-    // too so no `&`/`&mut` to the shared state is outstanding across the update.
+    // A collection can run mid-`compat_map` / EXT lookup, which reads these same
+    // slots through raw pointers (never a live `&PickleState`); write them
+    // through raw pointers too so no `&`/`&mut` to the shared state is
+    // outstanding across the update.
     unsafe {
         visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_name_mapping));
         visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_import_mapping));
@@ -322,6 +349,10 @@ pub(crate) fn walk_pickle_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         visitor(&mut *std::ptr::addr_of_mut!(
             (*ptr).w_reverse_import_mapping
         ));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_dispatch_table));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_extension_registry));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_extension_cache));
+        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_inverted_registry));
     }
 }
 

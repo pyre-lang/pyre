@@ -1029,12 +1029,12 @@ mod memo_proxy {
     }
 }
 
-/// `copyreg.dispatch_table`, or `PY_NULL` when `copyreg` is unavailable.
+/// `State.w_dispatch_table` (`copyreg.dispatch_table`), or `PY_NULL` when the
+/// cached state is unavailable.
 pub(crate) fn copyreg_dispatch_table() -> PyObjectRef {
-    match import_module("copyreg") {
-        Ok(copyreg) => pyre_interpreter::baseobjspace::getattr_str(copyreg, "dispatch_table")
-            .unwrap_or(pyre_object::PY_NULL),
-        Err(_) => pyre_object::PY_NULL,
+    match super::pickle_state() {
+        Some(state) => unsafe { std::ptr::addr_of!((*state).w_dispatch_table).read() },
+        None => pyre_object::PY_NULL,
     }
 }
 
@@ -3117,7 +3117,7 @@ fn save_global(
     // protocol >= 2: a `copyreg` extension code is emitted as EXT1/EXT2/EXT4
     // (and the object is not memoized — the reference is idempotent).
     if ctx.proto >= 2
-        && let Some(code) = extension_code(&module_name, &name)
+        && let Some(code) = extension_code(&module_name, &name)?
     {
         write_ext(buf, code)?;
         return Ok(());
@@ -3383,19 +3383,27 @@ fn save_toplevel_by_name(
     Ok(())
 }
 
-/// The `copyreg._extension_registry` code for `(module_name, name)`, if any.
-fn extension_code(module_name: &str, name: &str) -> Option<i64> {
-    let copyreg = import_module("copyreg").ok()?;
-    let registry =
-        pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_registry").ok()?;
+/// `save_global`: look up `(module_name, name)` in `State.w_extension_registry`.
+/// A missing key is `Ok(None)`; a present value is `space.int_w`'d (TypeError
+/// for `None`/`object()`, OverflowError for a bigint that does not fit).
+fn extension_code(module_name: &str, name: &str) -> Result<Option<i64>, PyError> {
+    let Some(state) = super::pickle_state() else {
+        return Ok(None);
+    };
+    // Build the (module, name) key before touching the cached slot, then pin
+    // it across `finditem` — the same bracketing `compat_map` uses for its
+    // mapping key (`save_global` `w_mod_and_name`).
     let mut key_items = pyre_object::gc_roots::RootedItems::new();
-    key_items.push(registry);
     key_items.push(pyre_object::w_str_new_managed(module_name));
     key_items.push(pyre_object::w_str_new_managed(name));
-    let key = pyre_object::tupleobject::w_tuple_new(vec![key_items.get(1), key_items.get(2)]);
-    let registry = key_items.get(0);
-    let code = unsafe { pyre_object::w_dict_lookup(registry, key) }?;
-    pyre_interpreter::baseobjspace::int_w(code).ok()
+    let key = pyre_object::tupleobject::w_tuple_new(key_items.take());
+    let _key_root = pyre_object::gc_roots::push_roots();
+    let key = pyre_object::gc_roots::pin_root(key);
+    let w_registry = unsafe { std::ptr::addr_of!((*state).w_extension_registry).read() };
+    match pyre_interpreter::baseobjspace::finditem(w_registry, key)? {
+        Some(w_code) => Ok(Some(pyre_interpreter::baseobjspace::int_w(w_code)?)),
+        None => Ok(None),
+    }
 }
 
 /// Emit the size-appropriate EXT opcode for an extension code. `save_global`
