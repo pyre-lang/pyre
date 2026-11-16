@@ -2122,6 +2122,10 @@ pub fn w_module_dict_new() -> PyObjectRef {
     // the unbounded lifetime of a raw-pointer deref expresses that GC
     // ownership without leaking a process-global strategy.
     let imp: &'static dyn DictStrategy = unsafe { &*strategy };
+    debug_assert_eq!(
+        imp as *const dyn DictStrategy as *const u8 as usize,
+        strategy as usize
+    );
     let strategy_ref = crate::gc_storage::gc_alloc_storage_box(
         DictStrategyRef {
             kind: StrategyKind::Module,
@@ -7345,6 +7349,9 @@ pub fn nullable_to_option(w: PyObjectRef) -> Option<PyObjectRef> {
 /// are MiniMark boxes allocated with the same typeid. Every
 /// `DictStrategyRef` therefore has a header, so `protect_speculative_field`
 /// takes the ordinary declared/derived descr path.
+///
+/// `imp`'s data word is the strategy instance: this holder for a prebuilt
+/// strategy, or `owner` for a per-dict one.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("kind", "imp", "owner")]
 pub struct DictStrategyRef {
@@ -7423,6 +7430,24 @@ pub static UNICODE_DICT_STRATEGY: UnicodeDictStrategy = UnicodeDictStrategy;
 /// singleton.
 pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 
+/// The trait object a prebuilt holder stores: its data word is the holder
+/// itself, so the word the JIT reads as `imp`'s data is the prebuilt
+/// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
+/// Every stateless strategy is zero-sized, so a reference to it is valid at
+/// the holder's address.
+pub fn prebuilt_strategy_imp<T: DictStrategy + 'static>(
+    _strategy: &'static T,
+    holder: usize,
+) -> &'static dyn DictStrategy {
+    assert_eq!(
+        std::mem::size_of::<T>(),
+        0,
+        "a prebuilt strategy is stateless"
+    );
+    assert_eq!(holder % std::mem::align_of::<usize>(), 0);
+    unsafe { &*(holder as *const T) }
+}
+
 /// Same-file `LOAD_GLOBAL` of the OnceLock plus `get_or_init`, matching
 /// [`crate::noneobject::w_none`]. The registered refs row is the GC object,
 /// not the lock. `get_or_init` lives in the accessor body so the translator
@@ -7433,14 +7458,21 @@ macro_rules! define_prebuilt_dict_strategy_ref {
         static $cell: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
         /// Process-wide `space.fromcache(StrategyCls)` holder. Prebuilt GC
         /// object (`malloc_typed_immortal`), matching `w_not_implemented`.
+        /// The holder's `imp` data word is the holder itself.
         #[inline]
         pub fn $accessor() -> &'static $crate::dictmultiobject::DictStrategyRef {
             let addr = *$cell.get_or_init(|| {
-                $crate::lltype::malloc_typed_immortal($crate::dictmultiobject::DictStrategyRef {
-                    kind: $kind,
-                    imp: $imp,
-                    owner: ::std::ptr::null_mut(),
-                }) as usize
+                let p = $crate::lltype::malloc_typed_immortal(
+                    $crate::dictmultiobject::DictStrategyRef {
+                        kind: $kind,
+                        imp: $imp,
+                        owner: ::std::ptr::null_mut(),
+                    },
+                );
+                unsafe {
+                    (*p).imp = $crate::dictmultiobject::prebuilt_strategy_imp($imp, p as usize);
+                }
+                p as usize
             });
             unsafe { &*(addr as *const $crate::dictmultiobject::DictStrategyRef) }
         }
@@ -9442,6 +9474,26 @@ mod tests {
             assert_eq!((*hdr).type_id(), T);
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+    }
+
+    #[test]
+    fn prebuilt_dict_strategy_holders_point_imp_at_themselves() {
+        let holders = [
+            object_dict_strategy_ref(),
+            empty_dict_strategy_ref(),
+            empty_kwargs_dict_strategy_ref(),
+            bytes_dict_strategy_ref(),
+            unicode_dict_strategy_ref(),
+            int_dict_strategy_ref(),
+            crate::identitydict::identity_dict_strategy_ref(),
+            crate::kwargsdict::kwargs_dict_strategy_ref(),
+        ];
+        for holder in holders {
+            assert_eq!(
+                holder.imp as *const dyn DictStrategy as *const u8 as usize,
+                holder as *const _ as usize
+            );
         }
     }
 
