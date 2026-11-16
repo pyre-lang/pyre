@@ -313,8 +313,14 @@ pub fn pypysig_reinstall(_signum: i32) {}
 pub mod test_support {
     static SIGNAL_EVAL_BREAKER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    /// Same contended wait as `pyre_object::gc_hook::hook_test_guard`: the
+    /// GIL is released while this thread waits, because tests take the lock
+    /// both before and after their first runtime entry.
     pub fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
-        SIGNAL_EVAL_BREAKER_TEST_LOCK.lock()
+        SIGNAL_EVAL_BREAKER_TEST_LOCK.try_lock().unwrap_or_else(|| {
+            let _blocked = majit_gc::gc_sync::before_external_block();
+            SIGNAL_EVAL_BREAKER_TEST_LOCK.lock()
+        })
     }
 }
 

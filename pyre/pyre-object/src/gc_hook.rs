@@ -159,8 +159,17 @@ mod hook_test_owner {
     /// Take [`HOOK_TEST_LOCK`] and hide hook effects from every other thread
     /// until the guard drops. Drop clears the nursery and stable alloc hooks
     /// so a panic cannot leave them installed.
+    ///
+    /// A test thread keeps the GIL from its first runtime entry until it
+    /// exits, and tests take this lock both before and after that entry. A
+    /// contended wait therefore releases the GIL (`before_external_block`),
+    /// as every blocking wait does, so the owner can take the GIL it is
+    /// waiting for.
     pub fn hook_test_guard() -> HookTestGuard {
-        let lock = HOOK_TEST_LOCK.lock();
+        let lock = HOOK_TEST_LOCK.try_lock().unwrap_or_else(|| {
+            let _blocked = majit_gc::gc_sync::before_external_block();
+            HOOK_TEST_LOCK.lock()
+        });
         HOOK_TEST_OWNER.store(hook_test_thread_tag(), std::sync::atomic::Ordering::Release);
         HookTestGuard { _lock: lock }
     }
