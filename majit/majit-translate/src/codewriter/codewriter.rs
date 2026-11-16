@@ -1032,9 +1032,10 @@ impl CodeWriter {
         super::type_state::force_int_bank_cells(rewritten_graph);
         super::type_state::rebucket_kind_lists(rewritten_graph);
         super::type_state::coerce_cross_bank_links(rewritten_graph);
-        // A fused `int_*` guard reads the int bank. An operand whose cell
-        // is now `GcRef` is cast before the guard (`cast_ptr_to_int`).
-        super::type_state::reint_fused_int_ref_operands(rewritten_graph);
+        // A fused `int_*` exit is int-bank only (`jtransform.py`
+        // `optimize_goto_if_not`; GC ptr compares stay `ptr_*` via
+        // `_rewrite_cmp_ptrs`).
+        super::type_state::assert_fused_int_operands_are_int(rewritten_graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(rewritten_graph);
 
         // Flatten the graph after register allocation.
