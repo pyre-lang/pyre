@@ -131,3 +131,61 @@ def collected():
 
 
 print("collect", collected())
+
+
+# A raising `__eq__` propagates as raised; only a raising hash takes the
+# container context (`dict_unhashable_type`).
+class EqTypeError:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        raise TypeError("boom")
+
+
+def eq_and_hash_errors():
+    seen = []
+    for container in ({EqTypeError(): 1}, {EqTypeError()}, frozenset([EqTypeError()])):
+        for _ in range(30):
+            try:
+                EqTypeError() in container
+            except TypeError as e:
+                seen.append(str(e))
+    for container in ({}, set()):
+        for _ in range(30):
+            try:
+                [] in container
+            except TypeError as e:
+                seen.append(str(e))
+    return seen
+
+
+errors = eq_and_hash_errors()
+assert errors[:90] == ["boom"] * 90, errors[:90]
+assert errors[90] == "cannot use 'list' as a dict key (unhashable type: 'list')", errors[90]
+assert errors[120] == "cannot use 'list' as a set element (unhashable type: 'list')", errors[120]
+print("eq/hash errors ok")
+
+
+def hash_error_message(f):
+    try:
+        f()
+    except TypeError as e:
+        return str(e)
+
+
+SET_ELEMENT = "cannot use 'list' as a set element (unhashable type: 'list')"
+DICT_KEY = "cannot use 'list' as a dict key (unhashable type: 'list')"
+for f, expected in (
+    (lambda: set().add([]), SET_ELEMENT),
+    (lambda: {[]}, SET_ELEMENT),
+    (lambda: frozenset([[]]), SET_ELEMENT),
+    (lambda: {}.get([]), DICT_KEY),
+    (lambda: {}.setdefault([], 1), DICT_KEY),
+    (lambda: dict.fromkeys([[]]), DICT_KEY),
+    (lambda: {[]: 1}, DICT_KEY),
+    (lambda: {1: 2}[[]], DICT_KEY),
+):
+    got = hash_error_message(f)
+    assert got == expected, (got, expected)
+print("container hash errors ok")
