@@ -7,9 +7,12 @@
 # past the zero-effect call_trace prologue walk. The wasm guest has Signed =
 # 8 bytes and isize/usize = 4, so `_int_to_int_cast` records `int_signext` /
 # `int_and` that are the identity on 64-bit native; traces are a few ops
-# longer on wasm and a tiny `trace_limit` cuts one frame earlier or later.
-# At 136 the wasm cut lands one frame earlier than native, so wasm keeps
-# its own baseline (`.wasm.jitstats`) for the adoption split.
+# longer on wasm and a tiny `trace_limit` can cut one frame earlier or later.
+# At 136 that extra length sits on a knife-edge (native 5 multi-frame blackhole
+# adoptions, wasm 4). Measured on dynasm, cranelift and wasm together, 111-126
+# is a 16-wide plateau of identical counters (multi=4, single=70) including
+# every ±2 neighbour, so 124 (closest to 136 with that window) is robust to
+# the wasm length difference. 142-147 is a narrower 6-wide plateau.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The
@@ -24,7 +27,7 @@ except ImportError:
 
 
 if pypyjit is not None:
-    pypyjit.set_param("trace_limit=136,threshold=1,function_threshold=1")
+    pypyjit.set_param("trace_limit=124,threshold=1,function_threshold=1")
 
 
 def leaf(box, mapping, values, x):
