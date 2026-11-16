@@ -499,14 +499,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
                 let PlaceKind::Local(id) = place.kind else {
                     continue;
                 };
-                bind_function_local_primitive_cell(
-                    &mut locals,
-                    &mut descr,
-                    body,
-                    arg_count,
-                    id as usize,
-                    llbc,
-                );
+                bind_closure_captured_cell_local(&mut locals, &mut descr, body, id as usize, llbc);
             }
         }
     }
@@ -537,22 +530,75 @@ fn bind_function_local_primitive_cell(
     id: usize,
     llbc: &Llbc,
 ) {
-    if id <= arg_count || locals.contains(id) {
+    // Residual `&T` of a parameter stays a function-scope spill
+    // (`collect_function_scope_spill_cells`). A closure capture of that
+    // same argument is [`bind_closure_captured_cell_local`].
+    if id <= arg_count {
+        return;
+    }
+    bind_cell_scalar_local(locals, descr, body, id, llbc, primitive_scalar_cell_descr);
+}
+
+/// Exclusive capture of a by-value primitive, or of a `repr(transparent)`
+/// wrapper of one, including a function argument (`rdtoa.py` `strtod`
+/// `end_ptr`). Local 0 is the return slot.
+fn bind_closure_captured_cell_local(
+    locals: &mut bit_set::BitSet,
+    descr: &mut [Option<(ValueType, usize, bool)>],
+    body: &Unstructured,
+    id: usize,
+    llbc: &Llbc,
+) {
+    if id == 0 {
+        return;
+    }
+    bind_cell_scalar_local(
+        locals,
+        descr,
+        body,
+        id,
+        llbc,
+        function_local_primitive_cell_descr,
+    );
+}
+
+fn bind_cell_scalar_local(
+    locals: &mut bit_set::BitSet,
+    descr: &mut [Option<(ValueType, usize, bool)>],
+    body: &Unstructured,
+    id: usize,
+    llbc: &Llbc,
+    cell_descr_of: impl FnOnce(&TyRef, &Llbc) -> Option<(ValueType, usize, bool)>,
+) {
+    if locals.contains(id) {
         return;
     }
     let Some(decl) = body.locals.locals.get(id) else {
         return;
     };
-    if !tyref_is_primitive_scalar(&decl.ty, llbc) {
-        return;
-    }
-    let Some(cell_descr) =
-        tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
-    else {
+    let Some(cell_descr) = cell_descr_of(&decl.ty, llbc) else {
         return;
     };
     locals.insert(id);
     descr[id] = Some(cell_descr);
+}
+
+fn primitive_scalar_cell_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+    if !tyref_is_primitive_scalar(ty, llbc) {
+        return None;
+    }
+    tyref_node(ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+}
+
+/// Char-varsize cell descr of a function-local primitive, or of a
+/// `repr(transparent)` wrapper whose unique field is that primitive.
+/// A transparent GCREF newtype is not a primitive and stays out.
+fn function_local_primitive_cell_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<(ValueType, usize, bool)> {
+    tyref_primitive_or_transparent_primitive_node(ty, llbc)
+        .and_then(|node| json_ty_raw_store_descr(node, llbc))
 }
 
 /// Residual `&T` of a parameter or field: one Char-varsize cell for the

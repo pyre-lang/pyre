@@ -2188,11 +2188,25 @@ impl<'a> Lowering<'a> {
             if cell_plan.has_storage_live.contains(local) {
                 continue;
             }
-            let Some((_, itemsize, _)) = cell_plan.descr.get(local).and_then(|d| d.as_ref()) else {
+            let Some((item_ty, itemsize, is_item_signed)) =
+                cell_plan.descr.get(local).and_then(|d| d.as_ref()).cloned()
+            else {
                 continue;
             };
             let start = graph.startblock;
-            let ptr = emit_raw_cell_malloc(&mut graph, start, *itemsize);
+            let incoming = local_var[local].as_ref().and_then(|value| value.one().ok());
+            let ptr = emit_raw_cell_malloc(&mut graph, start, itemsize);
+            if let Some(incoming) = incoming {
+                emit_raw_cell_store(
+                    &mut graph,
+                    start,
+                    ptr.clone(),
+                    incoming,
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                );
+            }
             local_var[local] = Some(LocalValue::One(ptr));
         }
         let mut function_scope_cells = Vec::with_capacity(function_scope_plan.len());

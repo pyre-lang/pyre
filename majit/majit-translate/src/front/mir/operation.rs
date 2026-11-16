@@ -1233,6 +1233,12 @@ impl<'a> Lowering<'a> {
         // `[variant, index]`). The read side resolves that index through
         // the base type; capture the type before `inner` is consumed.
         let field_base_ty = clone_tyref(&inner.ty);
+        let cell_address_deref = matches!(&elem, ProjectionElem::Atom(s) if s == "Deref")
+            && inner_local.is_some_and(|local| {
+                !self.index_elem_alias.contains_key(&local)
+                    && tyref_is_primitive_scalar(dest_ty, self.llbc)
+                    && self.place_is_cell_address_repr(&inner)
+            });
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.emit_bb(mir_bb);
         let op = match &elem {
@@ -1439,6 +1445,22 @@ impl<'a> Lowering<'a> {
                             array_type_id.as_str(),
                         )),
                     }
+                } else if cell_address_deref
+                    && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+                {
+                    // `let p = &mut *(*env).flag; *p = v;`: `p` is the
+                    // cell address. `rewrite_op_raw_store` stores the
+                    // pointee through that word.
+                    emit_raw_cell_store(
+                        &mut self.graph,
+                        bb_id,
+                        base.clone(),
+                        value_var(&value),
+                        item_ty,
+                        itemsize,
+                        is_item_signed,
+                    );
+                    return Ok(());
                 } else if let Some(local) = inner_local
                     && let Some(referent) = self.atomic_ref_place.get(&local).map(clone_place)
                 {
@@ -8310,6 +8332,29 @@ impl<'a> Lowering<'a> {
                             helper_ty.clone(),
                         );
                         return Ok(self.retype_word(mir_bb, item, &helper_ty, &item_ty));
+                    }
+                    // `let p = &mut *(*env).flag; let r = *p;`: `p` is the
+                    // cell address (`place_is_cell_address_repr` follows
+                    // `atomic_ref_place`). `rewrite_op_raw_load` loads the
+                    // pointee; the projection-cache arm below would return
+                    // the address. A GC mut-ref cell is `getfield` of
+                    // `value` above (`gc_mut_ref_param_root`).
+                    if !self.index_elem_alias.contains_key(&local)
+                        && tyref_is_primitive_scalar(&place_ty, self.llbc)
+                        && self.place_is_cell_address_repr(inner.as_ref())
+                        && let Some((item_ty, itemsize, is_item_signed)) =
+                            self.raw_word_descr(&place_ty)
+                    {
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        let bb = self.emit_bb(mir_bb);
+                        return Ok(emit_raw_cell_load(
+                            &mut self.graph,
+                            bb,
+                            base,
+                            item_ty,
+                            itemsize,
+                            is_item_signed,
+                        ));
                     }
                     if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
                         let followed = self.concrete_borrow_place(recorded);
