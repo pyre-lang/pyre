@@ -1,8 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot_d1
-# pyre-check: skip-backends=wasm
-# wasm still prints PASS but compiles `root:callee_d1` after five loop
-# aborts, so it cannot declare the native `hot_d1` loop.
 # Self-checking regression guard for a caller frame read from inside an inlined
 # callee while the caller's compiled loop is still running.
 #

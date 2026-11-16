@@ -1,5 +1,4 @@
 # pyre-check: skip-cpython
-# pyre-check: skip-backends=wasm
 # pyre-check: requires-modules=_cffi_backend
 # pyre-check: skip-platforms=win32
 # pyre-check: trace-shape=hot_lib_call:max=CallMayForceR:2
@@ -8,8 +7,8 @@
 # `_cffi_backend` is built into pypy but is not a CPython builtin, and this
 # host's python3 cannot import it, so pypy alone is the oracle here. The module
 # is absent on wasm32 altogether -- the fold arm itself is
-# `#[cfg(not(target_arch = "wasm32"))]` -- so that backend is skipped rather
-# than left to fail on the import.
+# `#[cfg(not(target_arch = "wasm32"))]` -- so `requires-modules=_cffi_backend`
+# skips that backend rather than leaving it to fail on the import.
 #
 # No `max-pypy-ratio`: absence exempts the fixture from the ratio gate, which
 # is what this file wants. Every leg's wall-clock is dominated by the libffi

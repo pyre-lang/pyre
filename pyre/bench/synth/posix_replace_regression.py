@@ -2,13 +2,12 @@
 # pyre-check: selfcheck-interpreted
 # The invariant is interpreter-level, so the run compiles no loop.
 # pyre-check: skip-backends=wasm
-# The wasm guest has no filesystem support used by this fixture.
+# The wasm guest filesystem is read-only, so the pid-named directory this
+# fixture creates cannot be made (`OSError: [Errno 30] Read-only file system`).
 # os.replace(src, dst) renames over an existing destination in one step and
 # leaves no source behind, where os.rename is the raw platform call.  It is
 # what importlib._bootstrap_external._write_atomic uses to publish a .pyc, so
 # the name has to exist before the write-atomic path can run at all.
-# Native-only: the wasm guest has no filesystem, so this guard skips that
-# backend. Behaviour verified against CPython/PyPy.
 #
 # The fixtures live in a pid-named directory this script creates in the cwd
 # rather than under tempfile, so the guard stays independent of the shutil
