@@ -700,8 +700,10 @@ pub const W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS: [usize; 34] = [
     EXC_W_DICT_OFFSET,
 ];
 
-/// Extended user layout: the extended pointers plus mapdict `storage`.
-pub const W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS: [usize; 35] = [
+/// Extended user layout: the extended pointers plus mapdict `map` /
+/// `storage`. `map` is the class terminator (`user_setup` /
+/// `_mapdict_init_empty(w_subtype.terminator)`), a traced reference.
+pub const W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS: [usize; 36] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -736,6 +738,7 @@ pub const W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS: [usize; 35] = [
     EXC_W_GROUP_EXCEPTIONS_OFFSET,
     EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
     EXC_W_DICT_OFFSET,
+    EXC_EXTENDED_USER_MAP_OFFSET,
     EXC_EXTENDED_USER_STORAGE_OFFSET,
 ];
 
@@ -3472,6 +3475,17 @@ mod tests {
             "immortal USER MemoryError map is the class terminator; the unmanaged walker must forward it"
         );
         assert!(W_BASE_EXCEPTION_USER_GC_PTR_OFFSETS.contains(&EXC_USER_STORAGE_OFFSET));
+    }
+
+    #[test]
+    fn extended_user_unmanaged_offsets_include_the_map_slot() {
+        assert!(
+            W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.contains(&EXC_EXTENDED_USER_MAP_OFFSET),
+            "immortal USER extended exception map is the class terminator; the unmanaged walker must forward it"
+        );
+        assert!(
+            W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.contains(&EXC_EXTENDED_USER_STORAGE_OFFSET)
+        );
     }
 
     #[test]

@@ -2903,7 +2903,10 @@ fn exit_frame_exception_ref(
 ) -> pyre_interpreter::PyError {
     let obj = exc_value as PyObjectRef;
     if unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_some() {
-        return unsafe { pyre_interpreter::PyError::from_exc_object(obj) };
+        // `pyopcode.py handle_asynchronous_error`: the low-level
+        // MemoryError singleton becomes `OperationError(w_MemoryError,
+        // w_None)`. Other exception objects keep `from_exc_object`.
+        return pyre_interpreter::pyerror_from_rpyexc_value(obj);
     }
     if obj.is_null() {
         return pyre_interpreter::PyError::new(
