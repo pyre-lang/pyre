@@ -178,7 +178,7 @@ fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
     let mut block_obj = deque.leftblock;
     let mut index = deque.leftindex;
     for _ in 0..deque.len {
-        result.push(block_get(block_obj, index));
+        result.push(pyre_object::with_roots!(block_obj => block_get(block_obj, index)));
         index += 1;
         if index >= BLOCKLEN {
             block_obj = block(block_obj).rightlink;
@@ -1061,8 +1061,8 @@ fn setitem_unlocked(
     Ok(())
 }
 
-fn rotate_unlocked(self_obj: PyObjectRef, n: i64) {
-    let mut items = snapshot(self_obj);
+fn rotate_unlocked(mut self_obj: PyObjectRef, n: i64) {
+    let mut items = pyre_object::with_roots!(self_obj => snapshot(self_obj));
     let len = items.len() as i64;
     if len > 1 {
         let shift = ((n % len) + len) % len;
@@ -1074,11 +1074,11 @@ fn rotate_unlocked(self_obj: PyObjectRef, n: i64) {
 }
 
 fn insert_unlocked(
-    self_obj: PyObjectRef,
+    mut self_obj: PyObjectRef,
     index: i64,
-    x: PyObjectRef,
+    mut x: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let mut items = snapshot(self_obj);
+    let mut items = pyre_object::with_roots!(self_obj, x => snapshot(self_obj));
     if maxlen_bound(self_obj).is_some_and(|m| items.len() >= m) {
         return Err(crate::PyError::index_error(
             "deque already at its maximum size",
@@ -1686,7 +1686,8 @@ impl W_Deque {
         let mut out = rustpython_wtf8::Wtf8Buf::new();
         out.push_str(name);
         out.push_str("([");
-        for (i, item) in snapshot(self_obj).into_iter().enumerate() {
+        let items = pyre_object::with_roots!(self_obj => snapshot(self_obj));
+        for (i, item) in items.into_iter().enumerate() {
             if i != 0 {
                 out.push_str(", ");
             }

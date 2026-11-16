@@ -16037,8 +16037,10 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                         value,
                     ))?;
                 } else {
-                    pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, name, value));
-                    mutated(obj, name);
+                    pyre_object::with_roots!(obj, value => {
+                        crate::type_dict_store(obj, name, value);
+                        mutated(obj, name);
+                    });
                 }
                 pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
                 if let Some(a) = abstract_flag {
@@ -20248,19 +20250,20 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         } else {
-            match (
-                pyre_object::w_list_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
-                    0,
-                ),
-                pyre_object::w_list_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
-                    1,
-                ),
-            ) {
-                (Some(it0), Some(it1)) => {
-                    let _ = pyre_object::gc_roots::pin_root(it0);
-                    let it0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let it0 = pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                0,
+            );
+            let it0_slot = it0.map(|it0| {
+                let _ = pyre_object::gc_roots::pin_root(it0);
+                pyre_object::gc_roots::shadow_stack_len() - 1
+            });
+            let it1 = pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                1,
+            );
+            match (it0_slot, it1) {
+                (Some(it0_slot), Some(it1)) => {
                     let _ = pyre_object::gc_roots::pin_root(it1);
                     let it1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     pyre_object::functional::w_zip_set_iteration_progress(
@@ -22189,13 +22192,15 @@ pub(crate) fn zip_next_w(obj: PyObjectRef) -> PyResult {
                 0,
             )
             .unwrap();
+            let _ = pyre_object::gc_roots::pin_root(iterator0);
+            let iterator0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let iterator1 = pyre_object::w_list_getitem(
                 pyre_object::gc_roots::shadow_stack_get(iterators_slot),
                 1,
             )
             .unwrap();
-            let iterator0_slot = pyre_object::gc_roots::pin_roots(&[iterator0, iterator1]);
-            let iterator1_slot = iterator0_slot + 1;
+            let _ = pyre_object::gc_roots::pin_root(iterator1);
+            let iterator1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             zo::w_zip_set_iteration_progress(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0);
 
             let item0 = match next(pyre_object::gc_roots::shadow_stack_get(iterator0_slot)) {
