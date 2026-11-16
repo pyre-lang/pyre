@@ -82,6 +82,12 @@ impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
 
+/// `RootScope` is one `usize` (`gc_roots.rs` `root_scope_payload_is_one_word`).
+/// The CALL_KW `_match_signature` walk residual-calls `push_roots`; without a
+/// runtime fnaddr the patcher disarms the build address to 0.
+impl ResidualSlot for pyre_object::gc_roots::RootScope {}
+impl ResidualRet for pyre_object::gc_roots::RootScope {}
+
 /// Word-ABI bridges for `majit_gc::shadow_stack::{push,get,try_pop_to}`.
 /// `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so each of
 /// the raw functions is `(usize) -> usize`, `(usize) -> usize` and
@@ -918,6 +924,19 @@ pub mod word_publish {
         }
         fn into_reg(self) -> i64 {
             self.as_raw() as usize as i64
+        }
+    }
+
+    /// One `usize` (`gc_roots.rs` `root_scope_payload_is_one_word`). Transmute
+    /// so `into_reg` does not run `Drop`, which would rewind the shadow stack.
+    impl WordAbi for pyre_object::gc_roots::RootScope {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            unsafe { std::mem::transmute::<usize, Self>(reg as usize) }
+        }
+        fn into_reg(self) -> i64 {
+            unsafe { std::mem::transmute::<Self, usize>(self) as i64 }
         }
     }
 
@@ -2174,21 +2193,15 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
         jit_trace_fnaddrs()
             .into_iter()
             .filter(|(path, _)| {
-                path.ends_with("::RootScope::pin_root")
-                    || path.ends_with("::RootScope::pin_roots")
-                    || path.ends_with("::RootScope::publish")
-                    || path.ends_with("::RootScope::normalize")
-                    || path.ends_with("::RootScope::set")
-                    || path.ends_with("::RootScope::get")
-                    || path.ends_with("::RootScope::base")
+                path.ends_with("::RootScope::base")
                     || path.ends_with("::gc_roots::shadow_stack_cell")
                     || *path == "pyre_object::shadow_stack_cell"
                     || path.ends_with("::gc_roots::shadow_stack_cell_len")
                     || *path == "pyre_object::shadow_stack_cell_len"
                     || path.ends_with("::gc_roots::shadow_stack_cell_truncate")
                     || *path == "pyre_object::shadow_stack_cell_truncate"
-                    || path.ends_with("::gc_roots::root_scope_close")
-                    || *path == "pyre_object::root_scope_close"
+                    || path.ends_with("::gc_roots::root_scope_close_word")
+                    || *path == "pyre_object::root_scope_close_word"
                     || path.ends_with("::gc_roots::shadow_stack_len")
                     || *path == "pyre_object::shadow_stack_len"
                     || path.ends_with("::gc_roots::shadow_stack_get")
@@ -2859,14 +2872,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
     // The bracket's close, which a lowered `Drop` of the guard calls with the
-    // guard itself: one word in, nothing out, and the truncate above behind
-    // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
+    // guard's one word: `save_point` in, nothing out, and the truncate above
+    // behind it.  A crate that carries no declaration of the guard's fields
+    // cannot spell the close as those two reads, so it names this instead.
     pa1!(
         &mut entries,
-        "pyre_object::gc_roots::root_scope_close",
-        "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        "pyre_object::gc_roots::root_scope_close_word",
+        "pyre_object::root_scope_close_word",
+        pyre_object::gc_roots::root_scope_close_word,
     );
     cpa2!(
         &mut entries,
@@ -2998,49 +3011,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::copy_object_slice_range_into_vec",
         "pyre_object::copy_object_slice_range_into_vec",
         pyre_object::gc_roots::copy_object_slice_range_into_vec_jit_abi,
-    );
-    // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
-    // `roots.get(slot)`: the same pin through the cached cell, and its
-    // read-back half.  The codewriter names an inherent method by its
-    // crate-stripped path, so that spelling is the alias.
-    pa2!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::pin_root",
-        "gc_roots::RootScope::pin_root",
-        pyre_object::gc_roots::RootScope::pin_root,
-    );
-    pa2!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::get",
-        "gc_roots::RootScope::get",
-        pyre_object::gc_roots::RootScope::get,
-    );
-    // The rest of the scope-local API a bracket body calls on its guard: the
-    // slice-taking pair through the one-word array ABI `publish_roots` uses,
-    // and the run normalize and slot write, whose arguments are words.
-    cpa2!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::publish",
-        "gc_roots::RootScope::publish",
-        pyre_object::gc_roots::RootScope::publish_jit_abi,
-    );
-    cpa2!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::pin_roots",
-        "gc_roots::RootScope::pin_roots",
-        pyre_object::gc_roots::RootScope::pin_roots_jit_abi,
-    );
-    pa3!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::normalize",
-        "gc_roots::RootScope::normalize",
-        pyre_object::gc_roots::RootScope::normalize,
-    );
-    pa3!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::set",
-        "gc_roots::RootScope::set",
-        pyre_object::gc_roots::RootScope::set,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -7576,6 +7546,10 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
             crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "objspace::std::classdict::CLASS_DICT_METHODS",
+            crate::objspace::std::classdict::class_dict_methods_addr(),
         ),
         // Prebuilt object singletons (`None` / `NotImplemented` /
         // `Ellipsis` / `True` / `False`).  The accessors `w_none`,
