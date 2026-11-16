@@ -4877,6 +4877,7 @@ impl<'a> Lowering<'a> {
                         inline_vec: false,
                         vec_part: None,
                         owner_declared_gc: disc_owner_gc,
+                        owner_typeptr_hint: false,
                         host_index: None,
                         scalar_word: None,
                     },
