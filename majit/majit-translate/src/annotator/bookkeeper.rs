@@ -4036,7 +4036,7 @@ impl Bookkeeper {
             if reg.is_enum_base(head) {
                 continue;
             }
-            hits.push(k.clone());
+            hits.push(k.to_string());
         }
         if hits.is_empty() {
             return None;
@@ -7993,9 +7993,9 @@ fn unique_path_suffix_identity(
             if !key.ends_with(&suffix) {
                 continue;
             }
-            let mapped = match reg.class_identity.get(key) {
+            let mapped = match reg.class_identity.get(&**key) {
                 Some(Some(ci)) => ci.spelling.clone(),
-                _ => key.clone(),
+                _ => key.to_string(),
             };
             if distinct.insert(mapped.clone()) {
                 if only.is_some() {

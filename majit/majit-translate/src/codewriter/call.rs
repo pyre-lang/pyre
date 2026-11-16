@@ -1565,6 +1565,13 @@ impl AnalyzerResult for ReadWriteEffects {
                 if set.is_empty() {
                     return Self::Set(other);
                 }
+                // A merge that adds no key keeps the shared set as it is;
+                // `Arc::make_mut` would copy it for nothing.
+                if std::sync::Arc::ptr_eq(&set, &other)
+                    || other.keys().all(|key| set.contains_key(key))
+                {
+                    return Self::Set(set);
+                }
                 let into = std::sync::Arc::make_mut(&mut set);
                 for (key, operand) in other.iter() {
                     into.entry(key.clone()).or_insert_with(|| operand.clone());

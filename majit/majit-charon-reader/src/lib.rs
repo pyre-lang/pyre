@@ -1433,6 +1433,13 @@ impl Llbc {
             .filter_map(Option::as_ref)
     }
 
+    /// Drop every body [`FunDecl::unstructured_shared`] parsed for this artefact.
+    pub fn release_body_cache(&self) {
+        for fd in self.iter_fun_decls() {
+            fd.release_unstructured_shared();
+        }
+    }
+
     /// Iterate over every present `GlobalDecl` (skipping opaque `null`
     /// entries).  Used by the hint harvester to read the macro-emitted
     /// `_elidable_function_<NAME>` / `_jit_*_<NAME>` marker consts.

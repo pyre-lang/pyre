@@ -586,6 +586,15 @@ jobs:
   cargo-test-linux:
     name: cargo test (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    # Fails the `pyre-jit-trace` build script when the translation prepass
+    # peaks above this resident set size. Run 43717442854 (ebb078cca83)
+    # reported `peak RSS 6149 MiB` for the analysis run in this job; the
+    # budget is that plus ~14%. Job-level, so every cargo step sees the same
+    # value and the build script is not re-run for an environment change.
+    # A rise is a prepass working-set regression to find, not a number to
+    # raise.
+    env:
+      PYRE_PREPASS_PEAK_RSS_BUDGET_MIB: "7000"
     # `actions: write` for the last step of `cargo-test-steps`, which cancels
     # the run when this job fails.
     permissions:

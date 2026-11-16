@@ -141,9 +141,10 @@ pub struct FunDecl {
     /// query.
     #[serde(skip)]
     splices_promoted: OnceLock<bool>,
-    /// [`FunDecl::unstructured_shared`], parsed on first query.
+    /// [`FunDecl::unstructured_shared`], parsed on first query and dropped by
+    /// [`FunDecl::release_unstructured_shared`]. `None`: not parsed (or released).
     #[serde(skip)]
-    unstructured_cache: OnceLock<Option<Arc<Unstructured>>>,
+    unstructured_cache: std::sync::Mutex<Option<Option<Arc<Unstructured>>>>,
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
@@ -446,11 +447,17 @@ impl FunDecl {
         Some(u)
     }
 
-    /// [`FunDecl::unstructured`], parsed once and shared by every later caller.
-    /// For readers that do not modify the body.
+    /// [`FunDecl::unstructured`], parsed on first query and shared until
+    /// [`FunDecl::release_unstructured_shared`]. For readers that do not modify the body.
     pub fn unstructured_shared(&self) -> Option<Arc<Unstructured>> {
+        if let Some(cached) = self.unstructured_cache.lock().unwrap().as_ref() {
+            return cached.clone();
+        }
+        let parsed = self.unstructured().map(Arc::new);
         self.unstructured_cache
-            .get_or_init(|| self.unstructured().map(Arc::new))
+            .lock()
+            .unwrap()
+            .get_or_insert(parsed)
             .clone()
     }
 
@@ -458,10 +465,16 @@ impl FunDecl {
     /// [`FunDecl::unstructured_shared`] body when that is already parsed, else a fresh parse
     /// that leaves the shared cache unset.
     pub fn unstructured_owned(&self) -> Option<Unstructured> {
-        match self.unstructured_cache.get() {
+        let cached = self.unstructured_cache.lock().unwrap().clone();
+        match cached {
             Some(shared) => shared.as_deref().cloned(),
             None => self.unstructured(),
         }
+    }
+
+    /// Drop the body [`FunDecl::unstructured_shared`] parsed. A later query parses again.
+    pub fn release_unstructured_shared(&self) {
+        self.unstructured_cache.lock().unwrap().take();
     }
 
     /// Rewrite each shared borrow of a string-literal global in `body` to an inline `const`,

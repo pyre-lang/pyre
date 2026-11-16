@@ -985,7 +985,7 @@ impl StructFieldRegistry {
                     majit_ir::descr::canonical_struct_name(parent) == canonical_owner
                         && self
                             .fields
-                            .get(key)
+                            .get(&**key)
                             .is_some_and(|rows| rows.iter().any(|row| row.name != "__discriminant"))
                 })
             })
@@ -1027,7 +1027,7 @@ impl StructFieldRegistry {
             if majit_ir::descr::canonical_struct_name(parent) != canonical_owner {
                 continue;
             }
-            if let Some(ty) = self.fields.get(key).and_then(|rows| {
+            if let Some(ty) = self.fields.get(&**key).and_then(|rows| {
                 rows.iter()
                     .find(|row| row.name == field_name)
                     .map(|row| row.ty.as_str())
@@ -1193,7 +1193,7 @@ impl StructFieldRegistry {
                 return false;
             };
             return bucket.iter().any(|key| {
-                let crate_root = key.split("::").next().unwrap_or(key.as_str());
+                let crate_root = key.split("::").next().unwrap_or(&**key);
                 self.foreign_body_roots.iter().any(|r| r == crate_root)
             });
         }
@@ -1207,7 +1207,7 @@ impl StructFieldRegistry {
             return false;
         };
         bucket.iter().any(|k| {
-            let ks = majit_ir::descr::strip_generic_args(k);
+            let ks = majit_ir::descr::strip_generic_args(&**k);
             let root = ks.split("::").next().unwrap_or(ks.as_ref());
             self.foreign_body_roots.iter().any(|r| r == root)
                 && crate_relative_struct_path(ks.as_ref(), &self.foreign_body_roots) == tail
@@ -1236,7 +1236,7 @@ impl StructFieldRegistry {
                         ambiguous = true;
                         break;
                     }
-                    found = Some(key.clone());
+                    found = Some(key.to_string());
                 }
             }
             if ambiguous { None } else { found }
@@ -1267,7 +1267,7 @@ impl StructFieldRegistry {
                         ambiguous = true;
                         break;
                     }
-                    found = Some(key.clone());
+                    found = Some(key.to_string());
                 }
             }
             if ambiguous { None } else { found }
@@ -1281,7 +1281,7 @@ impl StructFieldRegistry {
     pub(crate) fn with_keys_by_last_segment<R>(
         &self,
         leaf: &str,
-        f: impl FnOnce(&[String]) -> R,
+        f: impl FnOnce(&[std::sync::Arc<str>]) -> R,
     ) -> R {
         self.ensure_field_path_index();
         let index = self.field_path_index.borrow();
@@ -1318,46 +1318,48 @@ pub(crate) struct GcArrayItemIndex {
     pub(crate) keys: HashSet<String>,
 }
 
+/// Each key is allocated once and shared by the three bucket maps.
 #[derive(Clone, Debug)]
 pub(crate) struct FieldPathIndex {
     len: usize,
     /// [`FieldRows::key_fp`] at the time the buckets were built.
     key_fp: u64,
     /// Last `::` segment → keys ending with that segment.
-    by_last: rustc_hash::FxHashMap<String, Vec<String>>,
+    by_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>>,
     /// Last segment of the parent path → keys with that parent leaf.
-    by_parent_last: rustc_hash::FxHashMap<String, Vec<String>>,
+    by_parent_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>>,
     /// Last `::` segment of [`majit_ir::descr::strip_generic_args`] of the key → keys.
-    by_stripped_last: rustc_hash::FxHashMap<String, Vec<String>>,
+    by_stripped_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>>,
 }
 
 impl FieldPathIndex {
     fn build(fields: &HashMap<String, Vec<FieldRow>>, key_fp: u64) -> Self {
-        let mut by_last: rustc_hash::FxHashMap<String, Vec<String>> =
+        let mut by_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>> =
             rustc_hash::FxHashMap::default();
-        let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<String>> =
+        let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>> =
             rustc_hash::FxHashMap::default();
-        let mut by_stripped_last: rustc_hash::FxHashMap<String, Vec<String>> =
+        let mut by_stripped_last: rustc_hash::FxHashMap<String, Vec<std::sync::Arc<str>>> =
             rustc_hash::FxHashMap::default();
         for key in fields.keys() {
+            let shared: std::sync::Arc<str> = std::sync::Arc::from(key.as_str());
             let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
             by_last
                 .entry(leaf.to_string())
                 .or_default()
-                .push(key.clone());
+                .push(shared.clone());
             if let Some((parent, _variant)) = key.rsplit_once("::") {
                 let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
                 by_parent_last
                     .entry(parent_leaf.to_string())
                     .or_default()
-                    .push(key.clone());
+                    .push(shared.clone());
             }
             let stripped = majit_ir::descr::strip_generic_args(key);
             let stripped_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
             by_stripped_last
                 .entry(stripped_leaf.to_string())
                 .or_default()
-                .push(key.clone());
+                .push(shared.clone());
         }
         Self {
             len: fields.len(),
