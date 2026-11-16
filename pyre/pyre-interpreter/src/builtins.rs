@@ -22511,8 +22511,9 @@ pub unsafe fn tuple_hash_portal(
 /// `tupleobject.py _descr_hash_jitdriver`.
 ///
 /// Prologue: length, empty early return, `w_type` from the first item.
-/// The walk lives in [`tuple_hash_portal`], whose first loop statement is
-/// `hash_driver.jit_merge_point`.
+/// `warmspot.py` `rewrite_jit_merge_point` / `split_graph_and_record_jitdriver`
+/// leave this original graph as a stub that returns `portal_runner(*args)`
+/// (`ll_portal_runner`). The walk lives in [`tuple_hash_portal`].
 unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
     unsafe {
         let len = w_tuple_len(obj);
@@ -22521,10 +22522,10 @@ unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyErro
         }
         // `tuple_hash_w_type` reaches `w_tuple_getitem`, whose body boxes
         // an `_ii` / `_ff` payload. Reload `obj` before handing both words
-        // to the portal.
+        // to the runner.
         let mut obj = obj;
         let w_type = pyre_object::with_roots!(obj => tuple_hash_w_type(obj));
-        tuple_hash_portal(w_type, obj, len, XXPRIME_5, 0)
+        crate::call::tuple_hash_portal_runner(w_type, obj, len, XXPRIME_5, 0)
     }
 }
 
@@ -22532,7 +22533,7 @@ unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyErro
 /// `_descr_hash_jitdriver` for `hash_value`. Expanded into each arm so
 /// the unroll-safe graph contains the n-loop. `tuple_structural_hash`
 /// does not use this macro: its long arm is `_descr_hash_jitdriver_w`,
-/// which calls `tuple_hash_portal`.
+/// which calls `tuple_hash_portal_runner`.
 macro_rules! hash_tuple_xx_storage {
     ($obj:ident) => {{
         let len = w_tuple_len($obj);
