@@ -713,17 +713,19 @@ pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
 
 // ── W_Permutations — PyPy interp_itertools.py:W_Permutations ───────
 //
-// `pool_w`, `indices`, and `cycles` are the translated RPython list
-// attributes.  PyPy leaves indices/cycles unset when r > len(pool_w), which
-// is represented by null list pointers while `stopped` is true.
+// `pool_w` is the translated pool list.  `indices` and `cycles` are
+// `W_Permutations.__init__`'s `range(n)` and `range(n, n_minus_r, -1)`:
+// RPython lists of plain integers, stored as [`crate::IntArray`] so a read
+// or write never boxes.  Empty arrays are `__init__`'s unset indices/cycles
+// when `n_minus_r < 0` (`stopped`).
 #[pyre_class("itertools.permutations", static_name = "PERMUTATIONS", user_layout)]
 pub struct W_Permutations {
     pub pool_w: PyObjectRef,
     pub r: isize,
     pub stopped: bool,
     pub raised_stop_iteration: bool,
-    pub indices: PyObjectRef,
-    pub cycles: PyObjectRef,
+    pub indices: crate::IntArray,
+    pub cycles: crate::IntArray,
     pub started: bool,
 }
 
@@ -731,19 +733,45 @@ pub fn w_permutations_new(
     pool_w: PyObjectRef,
     r: isize,
     stopped: bool,
-    indices: PyObjectRef,
-    cycles: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let pool_w = crate::gc_roots::pin_root(pool_w);
-    if !indices.is_null() {
-        let _ = crate::gc_roots::pin_root(indices);
-    }
-    if !cycles.is_null() {
-        let _ = crate::gc_roots::pin_root(cycles);
-    }
-    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    let pool_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(w_subtype);
+    let subtype_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // `W_Permutations.__init__`: `n_minus_r < 0` leaves indices/cycles
+    // unset; otherwise `indices = range(n)` and
+    // `cycles = range(n, n_minus_r, -1)`.
+    let n = unsafe { crate::listobject::w_list_len(pool_w) };
+    let (indices, cycles) = if stopped {
+        (crate::IntArray::empty(), crate::IntArray::empty())
+    } else {
+        let mut indices = if n == 0 {
+            crate::IntArray::empty()
+        } else {
+            let fresh = crate::IntArray::from_vec((0..n).map(|i| i as i64).collect());
+            if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
+                return crate::PY_NULL;
+            }
+            fresh
+        };
+        let indices_slot = indices.pin_block();
+        let ru = r as usize;
+        let cycles = if ru == 0 {
+            crate::IntArray::empty()
+        } else {
+            let fresh = crate::IntArray::from_vec((0..ru).map(|i| (n - i) as i64).collect());
+            if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
+                return crate::PY_NULL;
+            }
+            fresh
+        };
+        indices.reload_block(indices_slot);
+        (indices, cycles)
+    };
+    let pool_w = crate::gc_roots::shadow_stack_get(pool_slot);
+    let w_subtype = crate::gc_roots::shadow_stack_get(subtype_slot);
     W_Permutations::allocate_instance(
         W_Permutations {
             ob: PyObject {
@@ -1531,14 +1559,14 @@ mod tests {
     }
 
     #[test]
-    fn w_permutations_gc_descriptor_traces_all_owned_lists() {
+    fn w_permutations_gc_descriptor_traces_owned_lists_and_index_blocks() {
         assert_eq!(
             W_PERMUTATIONS_GC_PTR_OFFSETS,
             [
                 std::mem::offset_of!(W_Permutations, ob.w_class),
                 std::mem::offset_of!(W_Permutations, pool_w),
-                std::mem::offset_of!(W_Permutations, indices),
-                std::mem::offset_of!(W_Permutations, cycles),
+                std::mem::offset_of!(W_Permutations, indices.block),
+                std::mem::offset_of!(W_Permutations, cycles.block),
             ]
         );
         assert_eq!(

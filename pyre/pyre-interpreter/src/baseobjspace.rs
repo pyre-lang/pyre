@@ -21529,32 +21529,24 @@ pub(crate) fn combinations_with_replacement_descr_next(obj: PyObjectRef) -> PyRe
 /// interp_itertools.py W_Permutations.descr_next.
 pub(crate) fn permutations_descr_next(obj: PyObjectRef) -> PyResult {
     unsafe {
-        // itertools.permutations — PyPy W_Permutations.descr_next.
-
+        type W_Permutations = pyre_object::interp_itertools::W_Permutations;
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-        if state.stopped {
-            (*(w_self as *mut pyre_object::interp_itertools::W_Permutations))
-                .raised_stop_iteration = true;
+        if (*(w_self as *const W_Permutations)).stopped {
+            (*(w_self as *mut W_Permutations)).raised_stop_iteration = true;
             return Err(PyError::stop_iteration());
         }
-        let r = state.r as usize;
-        let n = pyre_object::w_list_len(state.pool_w);
+        let r = (*(w_self as *const W_Permutations)).r as usize;
 
-        // Construct the result from the current indices before advancing
-        // the cycles, exactly as PyPy does.
+        // `w_result = space.newtuple([self.pool_w[indices[i]] for i in range(r)])`
         let mut result_item_slots = Vec::with_capacity(r);
         for i in 0..r {
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-            let index = pyre_object::w_int_get_value(
-                pyre_object::w_list_getitem(state.indices, i as i64)
-                    .expect("permutations index in range"),
-            );
-            let item = pyre_object::w_list_getitem(state.pool_w, index)
+            let index = (&(*(w_self as *const W_Permutations)).indices)[i];
+            let pool_w = (*(w_self as *const W_Permutations)).pool_w;
+            let item = pyre_object::w_list_getitem(pool_w, index)
                 .expect("permutations pool index in range");
             let _ = pyre_object::gc_roots::pin_root(item);
             result_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
@@ -21564,70 +21556,37 @@ pub(crate) fn permutations_descr_next(obj: PyObjectRef) -> PyResult {
         let _ = pyre_object::gc_roots::pin_root(result);
         let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-        let mut i = r;
-        while i > 0 {
-            i -= 1;
+        let mut i = r as isize - 1;
+        while i >= 0 {
+            let iu = i as usize;
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-            let j = pyre_object::w_int_get_value(
-                pyre_object::w_list_getitem(state.cycles, i as i64)
-                    .expect("permutations cycle in range"),
-            ) - 1;
+            let state = &mut *(w_self as *mut W_Permutations);
+            let j = state.cycles[iu] - 1;
             if j > 0 {
-                let w_j = pyre_object::w_int_new(j);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-                pyre_object::w_list_setitem(state.cycles, i as i64, w_j);
-
-                let swap_index = n - j as usize;
-                let left = pyre_object::w_list_getitem(state.indices, i as i64)
-                    .expect("permutations left swap index in range");
-                let right = pyre_object::w_list_getitem(state.indices, swap_index as i64)
-                    .expect("permutations right swap index in range");
-                let left_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(left);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-                pyre_object::w_list_setitem(state.indices, i as i64, right);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-                pyre_object::w_list_setitem(
-                    state.indices,
-                    swap_index as i64,
-                    pyre_object::gc_roots::shadow_stack_get(left_slot),
-                );
+                state.cycles[iu] = j;
+                let swap_index = state.indices.len() - j as usize;
+                let left = state.indices[iu];
+                let right = state.indices[swap_index];
+                state.indices[iu] = right;
+                state.indices[swap_index] = left;
                 return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
             }
-
-            let w_cycle = pyre_object::w_int_new((n - i) as i64);
-            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-            pyre_object::w_list_setitem(state.cycles, i as i64, w_cycle);
-
-            // Rotate indices[i:] one position to the left.
-            let first = pyre_object::w_list_getitem(state.indices, i as i64)
-                .expect("permutations rotation index in range");
-            let first_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(first);
-            let last = n - 1;
-            for k in i..last {
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-                let next = pyre_object::w_list_getitem(state.indices, (k + 1) as i64)
-                    .expect("permutations rotation source in range");
-                pyre_object::w_list_setitem(state.indices, k as i64, next);
+            let n = state.indices.len();
+            state.cycles[iu] = (n - iu) as i64;
+            let n1 = n as isize - 1;
+            debug_assert!(n1 >= 0);
+            let n1 = n1 as usize;
+            let num = state.indices[iu];
+            for k in iu..n1 {
+                let nxt = state.indices[k + 1];
+                state.indices[k] = nxt;
             }
-            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
-            pyre_object::w_list_setitem(
-                state.indices,
-                last as i64,
-                pyre_object::gc_roots::shadow_stack_get(first_slot),
-            );
+            state.indices[n1] = num;
+            i -= 1;
         }
 
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Permutations);
+        let state = &mut *(w_self as *mut W_Permutations);
         state.stopped = true;
         if state.started {
             return Err(PyError::stop_iteration());
