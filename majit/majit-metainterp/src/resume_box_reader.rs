@@ -1768,8 +1768,10 @@ pub fn replay_pending_fields(
             }
             continue;
         };
-        // `resume.py` `_prepare_pendingfields` decodes both operands the same way as frame
-        // boxes.
+        // resume.py `_prepare_pendingfields`: `struct = decode_ref(num)` then
+        // `setfield`/`setarrayitem` decode the value. Tagged decode and
+        // `rebuilt_value_to_opref` follow that order (target then value).
+        // This path has no value-first pre-decode.
         let rd_consts = storage.rd_consts().unwrap_or(&[]);
         let target = majit_ir::resumedata::decode_tagged_value(
             pending.target_tagged,

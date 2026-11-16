@@ -5950,6 +5950,14 @@ impl VirtualCache {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeDecodeCall {
+    Ref(i16),
+    Int(i16),
+    Float(i16),
+}
+
 /// registers directly from the deadframe's fail_args values.
 ///
 /// Combines AbstractResumeDataReader (resume.py) mixin with
@@ -6020,6 +6028,10 @@ pub struct ResumeDataDirectReader<'a> {
     /// Stored so the caller (blackhole_from_resumedata) can access it
     /// after consume_vref_and_vable completes.
     pub virtualizable_ptr: i64,
+
+    /// Test-only log of `decode_ref` / `decode_int` / `decode_float` calls.
+    #[cfg(test)]
+    decode_calls: Vec<ResumeDecodeCall>,
 }
 
 /// Holds `&mut ResumeDataDirectReader` while `self.deadframe` and
@@ -7220,6 +7232,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             allocator,
             all_liveness,
             virtualizable_ptr: 0,
+            #[cfg(test)]
+            decode_calls: Vec::new(),
         }
     }
 
@@ -7384,51 +7398,31 @@ impl<'a> ResumeDataDirectReader<'a> {
                 pf.value_tagged,
                 descr,
             );
-            // Decode the value first so materializing a virtual value can
-            // collect before we capture the target pointer. resume.py
-            // ResumeDataDirectReader._prepare_pendingfields does
-            // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
-            // every ref is GC-tracked so ordering does not matter. Re-read
-            // the target from its rooted slot (`virtuals_cache.get_ptr` /
-            // TAGBOX deadframe) after the value is resolved — the same
+            // resume.py `_prepare_pendingfields`:
+            //   struct = self.decode_ref(num)
+            //   if itemindex < 0: self.setfield(struct, fieldnum, descr)
+            //   else: self.setarrayitem(struct, itemindex, fieldnum, descr)
+            // `setfield`/`setarrayitem` decode the value. The `struct` local
+            // is a GC ref; RPython's transformer keeps it rooted across that
+            // decode. pyre's setfield/setarrayitem re-read via
+            // `decode_ref(target_tagged)` after the value decode (the same
             // re-read `abstract_virtual_struct_info_setfields` does after
-            // `decode_field_source`. `setfield`/`setarrayitem` then
-            // decode the value again from that rooted slot.
+            // `decode_field_source`).
+            let _ = field_info; // setfield dispatcher reads descr directly.
+            let _struct = self.decode_ref(pf.target_tagged);
             if pf.item_index < 0 {
-                let _ = field_info; // setfield dispatcher reads descr directly.
-                let fd = descr.as_field_descr().expect(
+                let _ = descr.as_field_descr().expect(
                     "resume.py `_prepare_pendingfields`: setfield pending field \
                      must carry a FieldDescr",
                 );
-                if fd.field_type() == majit_ir::Type::Ref {
-                    let _ = self.decode_ref(pf.value_tagged);
-                } else if fd.is_float_field() {
-                    let _ = self.decode_float(pf.value_tagged);
-                } else {
-                    let _ = self.decode_int(pf.value_tagged);
-                }
-                // resume.py: struct = self.decode_ref(num)
-                let struct_ptr = self.decode_ref(pf.target_tagged);
-                // resume.py: self.setfield(struct, fieldnum, descr)
-                self.setfield(struct_ptr, pf.value_tagged, descr);
+                self.setfield(pf.target_tagged, pf.value_tagged, descr);
             } else {
-                let ad = descr.as_array_descr().expect(
+                let _ = descr.as_array_descr().expect(
                     "resume.py `_prepare_pendingfields`: setarrayitem pending \
                      field must carry an ArrayDescr",
                 );
-                if ad.is_array_of_pointers() {
-                    let _ = self.decode_ref(pf.value_tagged);
-                } else if ad.is_array_of_floats() {
-                    let _ = self.decode_float(pf.value_tagged);
-                } else {
-                    let _ = self.decode_int(pf.value_tagged);
-                }
-                // resume.py: struct = self.decode_ref(num)
-                let struct_ptr = self.decode_ref(pf.target_tagged);
-                // resume.py: self.setarrayitem(struct, itemindex,
-                //                  fieldnum, descr).
                 let index = pf.item_index as usize;
-                self.setarrayitem(struct_ptr, index, pf.value_tagged, descr);
+                self.setarrayitem(pf.target_tagged, index, pf.value_tagged, descr);
             }
         }
     }
@@ -7437,7 +7431,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// forwards to `bh_setfield_gc_r` / `bh_setfield_gc_f` /
     /// `bh_setfield_gc_i` based on the field's value kind.  `fieldnum` is
     /// the resume.py-tagged value to decode (decode_ref / decode_float /
-    /// decode_int per kind).
+    /// decode_int per kind).  `struct_tagged` is the tagged `num`
+    /// `_prepare_pendingfields` already decoded into `struct`.
     ///
     /// Routes on `field_type()` (the value kind the optimizer numbered the
     /// stored box as) rather than `is_pointer_field()`.  In RPython these
@@ -7451,7 +7446,15 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// match how the value was numbered — by `field_type` — or a Ref value
     /// (here a virtual exception object) is mis-decoded via `decode_int`
     /// → `getvirtual_int` on a non-raw virtual.
-    pub fn setfield(&mut self, struct_ptr: i64, fieldnum: i16, descr: &majit_ir::DescrRef) {
+    ///
+    /// After decoding the value, re-read `struct` via
+    /// `decode_ref(struct_tagged)`. resume.py `_prepare_pendingfields`
+    /// keeps the `struct` local rooted across that decode; pyre's i64 is
+    /// not a GC root, so this is the same re-read
+    /// `abstract_virtual_struct_info_setfields` does after
+    /// `decode_field_source` (`virtuals_cache.get_ptr` / TAGBOX deadframe /
+    /// TAGCONST `rd_consts`).
+    pub fn setfield(&mut self, struct_tagged: i16, fieldnum: i16, descr: &majit_ir::DescrRef) {
         let fd = descr
             .as_field_descr()
             .expect("resume.py:1509 setfield requires FieldDescr");
@@ -7463,20 +7466,23 @@ impl<'a> ResumeDataDirectReader<'a> {
         };
         if fd.field_type() == majit_ir::Type::Ref {
             // resume.py newvalue = self.decode_ref(fieldnum)
-            // resume.py self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
             let value = self.decode_ref(fieldnum);
+            let struct_ptr = self.decode_ref(struct_tagged);
+            // resume.py self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
             self.allocator
                 .bh_setfield_gc_r(struct_ptr, value, &descr_info);
         } else if fd.is_float_field() {
             // resume.py newvalue = self.decode_float(fieldnum)
-            // resume.py self.cpu.bh_setfield_gc_f(struct, newvalue, descr)
             let value = self.decode_float(fieldnum);
+            let struct_ptr = self.decode_ref(struct_tagged);
+            // resume.py self.cpu.bh_setfield_gc_f(struct, newvalue, descr)
             self.allocator
                 .bh_setfield_gc_f(struct_ptr, value, &descr_info);
         } else {
             // resume.py newvalue = self.decode_int(fieldnum)
-            // resume.py self.cpu.bh_setfield_gc_i(struct, newvalue, descr)
             let value = self.decode_int(fieldnum);
+            let struct_ptr = self.decode_ref(struct_tagged);
+            // resume.py self.cpu.bh_setfield_gc_i(struct, newvalue, descr)
             self.allocator
                 .bh_setfield_gc_i(struct_ptr, value, &descr_info);
         }
@@ -7640,9 +7646,12 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `setarrayitem_float` / `setarrayitem_int` based on the live
     /// `arraydescr.is_array_of_pointers()` / `is_array_of_floats()`
     /// methods.  `fieldnum` is the resume.py-tagged value to decode.
+    /// `array_tagged` is the tagged `num` `_prepare_pendingfields`
+    /// already decoded into `array`; re-read after the value decode as
+    /// `setfield` does for `struct`.
     pub fn setarrayitem(
         &mut self,
-        array: i64,
+        array_tagged: i16,
         index: usize,
         fieldnum: i16,
         arraydescr: &majit_ir::DescrRef,
@@ -7651,18 +7660,21 @@ impl<'a> ResumeDataDirectReader<'a> {
             .as_array_descr()
             .expect("resume.py `setarrayitem` requires ArrayDescr");
         if ad.is_array_of_pointers() {
-            // resume.py:1011 self.bh_setarrayitem_gc_r(array, index, fieldnum, arraydescr)
+            // resume.py setarrayitem_ref: newvalue = self.decode_ref(fieldnum)
             let value = self.decode_ref(fieldnum);
+            let array = self.decode_ref(array_tagged);
             self.allocator
                 .bh_setarrayitem_gc_r(array, index, value, arraydescr);
         } else if ad.is_array_of_floats() {
-            // resume.py:1013 self.bh_setarrayitem_gc_f(array, index, fieldnum, arraydescr)
+            // resume.py setarrayitem_float: newvalue = self.decode_float(fieldnum)
             let value = self.decode_float(fieldnum);
+            let array = self.decode_ref(array_tagged);
             self.allocator
                 .bh_setarrayitem_gc_f(array, index, value, arraydescr);
         } else {
-            // resume.py:1015 self.bh_setarrayitem_gc_i(array, index, fieldnum, arraydescr)
+            // resume.py setarrayitem_int: newvalue = self.decode_int(fieldnum)
             let value = self.decode_int(fieldnum);
+            let array = self.decode_ref(array_tagged);
             self.allocator
                 .bh_setarrayitem_gc_i(array, index, value, arraydescr);
         }
@@ -8192,6 +8204,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py `ResumeDataDirectReader.decode_int`
     #[inline(always)]
     pub fn decode_int(&mut self, tagged: i16) -> i64 {
+        #[cfg(test)]
+        self.decode_calls.push(ResumeDecodeCall::Int(tagged));
         let mut cur = self.resume_cursor();
         let value = self.decode_int_tagged(tagged, &mut cur);
         cur.write_to_reader(&mut self.resumecodereader);
@@ -8227,6 +8241,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py `ResumeDataDirectReader.decode_ref`
     #[inline(always)]
     pub fn decode_ref(&mut self, tagged: i16) -> i64 {
+        #[cfg(test)]
+        self.decode_calls.push(ResumeDecodeCall::Ref(tagged));
         let mut cur = self.resume_cursor();
         let value = self.decode_ref_tagged(tagged, &mut cur);
         cur.write_to_reader(&mut self.resumecodereader);
@@ -8264,6 +8280,8 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py decode_float
     pub fn decode_float(&mut self, tagged: i16) -> i64 {
+        #[cfg(test)]
+        self.decode_calls.push(ResumeDecodeCall::Float(tagged));
         let cur = self.resume_cursor();
         self.decode_float_tagged(tagged, &cur)
     }
@@ -8803,6 +8821,7 @@ mod setfields_tests {
 
 #[cfg(test)]
 mod pendingfields_tests {
+    use super::ResumeDecodeCall;
     use super::*;
     use majit_backend::FailArgSource;
     use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
@@ -8955,6 +8974,49 @@ mod pendingfields_tests {
             *alloc.stores.borrow(),
             vec![(TO_SPACE, reader.virtuals_cache.get_ptr(0))],
             "store must use the forwarded TAGBOX deadframe slot"
+        );
+    }
+
+    /// resume.py `_prepare_pendingfields` decodes the target
+    /// (`struct = decode_ref(num)`) before `setfield` decodes the value.
+    #[test]
+    fn prepare_guard_pendingfields_decodes_target_before_value() {
+        let alloc = MovingAllocator::default();
+        let target_tagged = tag(0, TAGBOX).unwrap();
+        let value_tagged = tag(1, TAGBOX).unwrap();
+        let pending = [pending_entry(target_tagged, value_tagged)];
+        let deadframe = [0x1110, 0x2220];
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            FailArgSource::Slice(&deadframe),
+            None,
+            &alloc,
+        );
+        reader.prepare_guard_pendingfields(&pending);
+        assert_eq!(
+            reader.decode_calls.first().copied(),
+            Some(ResumeDecodeCall::Ref(target_tagged)),
+            "resume.py `_prepare_pendingfields`: struct = decode_ref(num) before the value"
+        );
+        let value_pos = reader
+            .decode_calls
+            .iter()
+            .position(|&c| c == ResumeDecodeCall::Ref(value_tagged));
+        let target_pos = reader
+            .decode_calls
+            .iter()
+            .position(|&c| c == ResumeDecodeCall::Ref(target_tagged));
+        assert!(
+            target_pos.is_some() && value_pos.is_some() && target_pos < value_pos,
+            "target decode must precede value decode, got {:?}",
+            reader.decode_calls
+        );
+        assert_eq!(
+            *alloc.stores.borrow(),
+            vec![(0x1110, 0x2220)],
+            "setfield must still store the TAGBOX target and value"
         );
     }
 }
