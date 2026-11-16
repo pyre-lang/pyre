@@ -5346,8 +5346,8 @@ fn live_follows_portal_merge(code: &[u8], marker: usize) -> bool {
 
 /// Whether a FunctionEntry sidecar offset is a valid walk start for `start_pc`.
 ///
-/// Truncation-carry of an unlowered py_pc through `first_op_offset` /
-/// `resume_entry_for` floors to an earlier opcode (`abort_permanent` block).
+/// Truncation-carry of an unlowered py_pc through `first_op_offset`
+/// floors to an earlier opcode (`abort_permanent` block).
 /// Walking from that offset rewinds the live frame. The round-trip
 /// `containing_py_pc_for_jitcode_pc` + `skip_python_trivia_forward` rejects
 /// that carry.
@@ -5407,13 +5407,10 @@ fn run_perfn_walk<Sym: WalkSym>(
     let is_plain_portal = !ctx.is_bridge_trace;
     let sidecar_entry = pjc.function_entry_for(start_pc);
     let uses_entry_sidecar = is_plain_portal && sidecar_entry.is_some();
-    let is_resume_sidecar = sidecar_entry.is_some_and(|off| pjc.is_resume_entry_offset(off));
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
-    } else if is_resume_sidecar {
-        sidecar_entry.filter(|&off| sidecar_offset_encodes_start_pc(&pjc, off, start_pc))
     } else if uses_entry_sidecar {
         // Truncation-carry of an unlowered py_pc through `first_op_offset`
         // is rejected by `sidecar_offset_encodes_start_pc`. A genuine
@@ -5468,7 +5465,6 @@ fn run_perfn_walk<Sym: WalkSym>(
         // entry sidecar names the instruction's first op, the
         // `get_is_being_profiled` diamond `interp_jit.py PyFrame.dispatch`
         // evaluates before its `while`; the walk starts past it.
-        None if pjc.is_resume_entry_offset(entry_coord) => entry_coord,
         None => {
             let merge = pjc
                 .loop_scan()
@@ -5668,15 +5664,20 @@ fn run_perfn_walk<Sym: WalkSym>(
         // virtualizable array before dispatching the header.  This is the
         // non-bridge counterpart of `setup_bridge_sym`'s color/slot inversion;
         // without it loop-carried collection operands remain `OpRef::NONE`.
-        if !is_bridge_trace && !pjc.is_resume_entry_offset(entry) {
+        if !is_bridge_trace {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-            // The shared `PyFrame.dispatch` loop head maps every green onto
-            // one jitcode offset, so `pcdep_trivia_at(entry)` floors head
-            // bytes to py 0. Seed the live Ref colors of the GREEN python
-            // pc (`first_op_offset`) so a FunctionEntry at a mid-function
-            // case (e.g. `returns_through_finally` at py 14) sees that
-            // instruction's stack/locals, not the function-entry live set.
-            let pcdep_at = pjc.first_op_offset(start_pc).unwrap_or(entry);
+            // An entry at the shared `PyFrame.dispatch` loop head seeds the
+            // head's own color->slot map (published over the head ranges,
+            // `pcdep_trivia_at`); the case colors behind the switch are
+            // reached through the head->case link copies
+            // (`pyjitpl.py MetaInterp.initialize_state_from_start`). Any
+            // other entry seeds the live Ref colors of the green python pc
+            // (`first_op_offset`).
+            let pcdep_at = if pjc.metadata.dispatch_head_contains(entry) {
+                entry
+            } else {
+                pjc.first_op_offset(start_pc).unwrap_or(entry)
+            };
             if let Some(pcdep) =
                 crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, pcdep_at as i32)
             {

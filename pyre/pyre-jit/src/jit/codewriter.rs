@@ -209,10 +209,6 @@ const PYTHON_PORTAL_JD_INDEX: usize = 0;
 /// `Nop` / `NotTaken` are dispatched opcodes: a function's first green
 /// is `RESUME` at pc 0, the same portal entry PyPy records at the
 /// prologue `NOP`.
-fn uses_dispatch_loop(code: &CodeObject) -> bool {
-    !pyre_interpreter::pyframe::code_flags_make_generator(code.flags)
-}
-
 fn is_python_instruction_start(code: &CodeObject, py_pc: usize) -> bool {
     if py_pc >= code.instructions.len() {
         return false;
@@ -400,7 +396,7 @@ impl FrameState {
         // `*_copy` opcode by the destination). Omitting the pad shifts a
         // later Ref portal extra onto this index and emits `ref_copy` of
         // an Int register. `getvariables()` still drops the constant, so
-        // a generator / opcode-case block does not grow an Int inputarg.
+        // an opcode-case block does not grow an Int inputarg.
         if let Some(next_instr) = &self.dispatch_next_instr {
             data.push(Some(next_instr.clone()));
         } else {
@@ -774,77 +770,6 @@ fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState
     }
 }
 
-/// Resume prelude for a yield continuation (`tweak_generator_body_graph`
-/// `_insert_reads`): reload live locals and `D` stack slots from the frame
-/// and join the body at `resume_py_pc`.
-fn emit_resume_entry_from_frame(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
-    pendingblocks: &mut VecDeque<SpamBlockRef>,
-    all_walker_blocks: &mut Vec<SpamBlockRef>,
-    frame_var: super::flow::Variable,
-    ec_var: super::flow::Variable,
-    stack_base_absolute: usize,
-    resume_py_pc: usize,
-    depth_at_yield: u16,
-) -> super::flow::BlockRef {
-    let prelude_block = graph.new_block(Vec::new());
-    let nlocals = code.varnames.len();
-    let lv = pyre_jit_trace::state::liveness_for(code as *const _);
-    let mut locals_w = vec![None; nlocals];
-    for i in 0..nlocals {
-        if lv.is_local_live(resume_py_pc, i) {
-            let v_local_idx: super::flow::FlowValue =
-                super::flow::Constant::signed(local_to_vable_slot(i) as i64).into();
-            let loaded = emit_graph_op_with_result(
-                graph,
-                &prelude_block,
-                "getarrayitem_vable_r",
-                vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
-                Kind::Ref,
-                resume_py_pc as i64,
-            );
-            locals_w[i] = Some(loaded.into());
-        }
-    }
-    let mut stack = Vec::with_capacity(depth_at_yield as usize);
-    for j in 0..depth_at_yield as usize {
-        let v_idx: super::flow::FlowValue =
-            super::flow::Constant::signed((stack_base_absolute + j) as i64).into();
-        let loaded = emit_graph_op_with_result(
-            graph,
-            &prelude_block,
-            "getarrayitem_vable_r",
-            vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
-            Kind::Ref,
-            resume_py_pc as i64,
-        );
-        stack.push(loaded.into());
-    }
-    let state = FrameState::new(
-        locals_w,
-        stack,
-        None,
-        frame_blocks_for_offset(code, resume_py_pc),
-        resume_py_pc,
-    )
-    .with_portal_extras((frame_var.into(), Some(ec_var.into())));
-    let prelude_spam = SpamBlockRef::new(prelude_block.clone(), Some(state.clone()));
-    all_walker_blocks.push(prelude_spam.clone());
-    let _ = mergeblock(
-        code,
-        graph,
-        joinpoints,
-        &prelude_spam,
-        &state,
-        resume_py_pc,
-        pendingblocks,
-        all_walker_blocks,
-    );
-    prelude_block
-}
-
 /// Follow a `mergeblock` supersede forwarder to the block flatten will emit.
 fn surviving_graph_block(block: &super::flow::BlockRef) -> super::flow::BlockRef {
     let mut cur = block.clone();
@@ -952,37 +877,6 @@ fn label_block_first_insn_index(ssarepr: &SSARepr, block: &super::flow::BlockRef
         .map(|off| label_idx + 1 + off)
 }
 
-/// First non-label, non-`-live-` insn of a resume prelude in `ssarepr`.
-fn resume_prelude_first_insn_index(
-    ssarepr: &SSARepr,
-    prelude: &super::flow::BlockRef,
-) -> Option<usize> {
-    let prelude_addr = prelude.as_ptr_addr();
-    let mut block_name: Option<&str> = None;
-    let mut link_name: Option<&str> = None;
-    for (name, block) in &ssarepr.label_blocks {
-        if block.as_ptr_addr() != prelude_addr {
-            continue;
-        }
-        if name.starts_with("block") {
-            if block_name.is_none() {
-                block_name = Some(name.as_str());
-            }
-        } else if link_name.is_none() {
-            link_name = Some(name.as_str());
-        }
-    }
-    let name = block_name.or(link_name)?;
-    let label_idx = ssarepr.insns.iter().position(|insn| match insn {
-        super::flatten::Insn::Label(label) => label.name == name,
-        _ => false,
-    })?;
-    ssarepr.insns[label_idx + 1..]
-        .iter()
-        .position(|insn| !matches!(insn, super::flatten::Insn::Label(_)) && !insn.is_live())
-        .map(|off| label_idx + 1 + off)
-}
-
 #[derive(Debug)]
 struct SpamBlock {
     /// `flowcontext.py:40` underlying `Block`.
@@ -995,10 +889,6 @@ struct SpamBlock {
     /// `EggBlock` has one incoming edge; pyre coalesces those eggs by handler
     /// PC, so widening the shared FrameState must rewrite every earlier edge.
     incoming_exception_links: Vec<super::flow::LinkRef>,
-    /// Whether this exception EggBlock receives a `raise value` edge.
-    /// Kept on the edge block so handler-entry policy follows link
-    /// provenance rather than scanning the surrounding code object.
-    explicit_raise_operand_edge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1011,7 +901,6 @@ impl SpamBlockRef {
             framestate,
             dead: false,
             incoming_exception_links: Vec::new(),
-            explicit_raise_operand_edge: false,
         })))
     }
 
@@ -1033,14 +922,6 @@ impl SpamBlockRef {
 
     fn incoming_exception_links(&self) -> Vec<super::flow::LinkRef> {
         self.0.borrow().incoming_exception_links.clone()
-    }
-
-    fn mark_explicit_raise_operand_edge(&self) {
-        self.0.borrow_mut().explicit_raise_operand_edge = true;
-    }
-
-    fn has_explicit_raise_operand_edge(&self) -> bool {
-        self.0.borrow().explicit_raise_operand_edge
     }
 
     fn mark_dead(&self) {
@@ -1131,16 +1012,10 @@ fn derive_pc_live_indices_from_sparse(
             pos_for_pc[py_pc as usize] = Some(pos);
         }
     }
-    // A true-portal PC opens with the portal merge (the `is_being_profiled`
-    // diamond, `promote_greens`' guards, op3 `-live-`, `jit_merge_point`,
-    // op2 `-live-`; `jtransform.py handle_jit_marker__jit_merge_point`).
-    // op2 is the marker "for do_recursive_call / guard resume": a guard
-    // resuming at the opcode start re-runs the opcode from its registers.
-    // Resuming before the merge instead makes `blackhole.py
-    // bhimpl_jit_merge_point` raise `ContinueRunningNormally` before the
-    // opcode, handing the interpreter an operand stack the snapshot kept only
-    // in registers.  The PC's merge is the first `jit_merge_point` before the
-    // next PC's first insn.
+    // `interp_jit.py PyFrame.dispatch` emits the portal merge once at the
+    // loop head (`jtransform.py handle_jit_marker__jit_merge_point`). If a
+    // merge sits in this PC's insn range, the op2 `-live-` after it is
+    // the guard-resume marker.
     let mut first_positions: Vec<usize> = pos_for_pc.iter().flatten().copied().collect();
     first_positions.sort_unstable();
     for pos in pos_for_pc.iter_mut().flatten() {
@@ -1690,15 +1565,14 @@ fn output_link(
 
 /// Dispatch-loop head (`interp_jit.py PyFrame.dispatch` `while True`).
 ///
-/// `get_is_being_profiled` runs once before the loop; continues of the
-/// `while True` re-enter at `jit_merge_point`, not at that read.
+/// `get_is_being_profiled` runs at the head, before `jit_merge_point`; the
+/// startblock and every continue of the `while True` enter the head.
 struct DispatchLoop {
-    /// Profiled diamond (`get_is_being_profiled`). The startblock enters
-    /// here; opcode continues do not.
+    /// Profiled diamond (`get_is_being_profiled`). The startblock and every
+    /// opcode continue enter here.
     head: SpamBlockRef,
     head_state: FrameState,
-    /// Loop-carried join: `int_guard_value` + `jit_merge_point`. Opcode
-    /// continues link here so they do not re-walk the profiled diamond.
+    /// Join of the profiled diamond: `int_guard_value` + `jit_merge_point`.
     merge_join: SpamBlockRef,
     merge_join_state: FrameState,
     /// Extra inputarg of `merge_join`: the loop-carried
@@ -1807,15 +1681,13 @@ fn dispatch_continue_to_loop_head(
     // the merge would not see the opcode pc.
     let mut source = current_state.clone();
     source.dispatch_next_instr = Some(super::flow::Constant::signed(case_pc as i64).into());
-    // Unprofiled continue: `get_is_being_profiled` ran before the
-    // `while True` (`interp_jit.py PyFrame.dispatch`) and the green is
-    // already 0. A profiled continue is a different green; the join's
-    // `int_guard_value` leaves the trace.
-    let mut args = dispatch_link_args(&source, &dispatch.merge_join_state);
-    args.push(super::flow::Constant::signed(0).into());
+    // `interp_jit.py PyFrame.dispatch` re-reads
+    // `is_being_profiled = self.get_is_being_profiled()` after every
+    // `handle_bytecode`; the continue re-enters the head's diamond.
+    let args = dispatch_link_args(&source, &dispatch.head_state);
     append_exit(
         &current_block.block(),
-        super::flow::Link::new(args, Some(dispatch.merge_join.block()), None).into_ref(),
+        super::flow::Link::new(args, Some(dispatch.head.block()), None).into_ref(),
     );
 }
 
@@ -1950,41 +1822,6 @@ fn setup_dispatch_loop(
         case_blocks,
         head_blocks: Vec::new(),
     }
-}
-
-fn goto_python_pc(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
-    current_block: &SpamBlockRef,
-    current_state: &FrameState,
-    target_py_pc: usize,
-    pendingblocks: &mut VecDeque<SpamBlockRef>,
-    all_walker_blocks: &mut Vec<SpamBlockRef>,
-    dispatch: Option<&DispatchLoop>,
-) {
-    if let Some(dispatch) = dispatch {
-        // CACHE after FOR_ITER / a jump landing is not an instruction
-        // start; `dispatch_case_pc` walks to the next green so the
-        // switch hits (`pyopcode.py dispatch_bytecode`).
-        dispatch_continue_to_loop_head(code, current_block, current_state, dispatch, target_py_pc);
-        return;
-    }
-    let _ = mergeblock(
-        code,
-        graph,
-        joinpoints,
-        current_block,
-        &{
-            let mut branch_state = current_state.clone();
-            branch_state.next_offset = target_py_pc;
-            branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
-            branch_state
-        },
-        target_py_pc,
-        pendingblocks,
-        all_walker_blocks,
-    );
 }
 
 /// Build the `[w_type, w_value]` argument list for a Link targeting
@@ -2264,49 +2101,6 @@ fn handler_entry_state_from_catch_site(
     state.next_offset = site.handler_py_pc;
     state.blocklist = frame_blocks_for_offset(code, site.handler_py_pc);
     state
-}
-
-fn handler_entry_state_from_catch_sites(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    catch_sites: &[ExceptionCatchSite],
-    handler_py_pc: usize,
-) -> Option<FrameState> {
-    let mut merged: Option<FrameState> = None;
-    for site in catch_sites {
-        if site.handler_py_pc != handler_py_pc {
-            continue;
-        }
-        let Some(landing_state) = site.landing.framestate() else {
-            continue;
-        };
-        let candidate = handler_entry_state_from_catch_site(code, graph, &landing_state, site);
-        merged = Some(match merged {
-            None => candidate,
-            Some(existing) => {
-                let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-                existing.union(&candidate, &mut fresh).unwrap_or(candidate)
-            }
-        });
-    }
-    merged
-}
-
-/// Whether an exception handler must retain values below the exception slot.
-///
-/// Exception-table `depth > 0` is CPython's protected operand-stack prefix
-/// (for example the saved outer-comprehension local restored by
-/// `SWAP; STORE_FAST; RERAISE`). Those values already arrive through the
-/// catch EggBlocks and `mergeblock` inputargs. Reconstructing the handler
-/// state creates fresh Variables for the prefix after the block inputargs have
-/// been fixed, leaving the cleanup ops with no producer.
-fn handler_entry_has_protected_prefix(
-    catch_sites: &[ExceptionCatchSite],
-    handler_py_pc: usize,
-) -> bool {
-    catch_sites
-        .iter()
-        .any(|site| site.handler_py_pc == handler_py_pc && site.stack_depth > 0)
 }
 
 /// True for a handler whose reconstructed entry stack carries an exception slot
@@ -2920,9 +2714,9 @@ const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 
 /// `pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`
-/// as a vable immediate store. Used on `jump_absolute` (`interp_jit.py`)
-/// and on a generator's per-instruction arm. A dispatch-loop body stores
-/// at the loop head from the live `next_instr` green instead.
+/// as a vable immediate store. Used on `jump_absolute` (`interp_jit.py`).
+/// A dispatch-loop body stores at the loop head from the live
+/// `next_instr` green instead.
 fn emit_setfield_last_instr(
     block: &super::flow::BlockRef,
     frame_var: super::flow::Variable,
@@ -3112,15 +2906,9 @@ fn emit_getcode(
 /// phi. `jtransform.py promote_greens` then `int_guard_value`s it
 /// before `jit_merge_point`.
 ///
-/// Emitted at walker-block start because the merge-point site itself
-/// must not append exits: `block_closed_by_terminator` is computed
-/// before merge emission and reused as the opcode-dispatch gate.
-/// The diamond closes its source block. The portal-header caller
-/// switches onto the join for `promote_greens`' `int_guard_value` of
-/// `is_being_profiled` and `jit_merge_point`. A `jump_absolute`
-/// back-edge emits `getcode` first, then this diamond, then
-/// `loop_header` on the join, and mergeblocks from the join to the
-/// loop header, which re-reads `debugdata`.
+/// The diamond closes its source block. `jump_absolute` (`interp_jit.py`)
+/// emits `getcode` first, then this diamond, then `loop_header` on the
+/// join, then continues the `while True` (`PyFrame.dispatch`).
 
 fn emit_portal_is_being_profiled_read(
     graph: &mut super::flow::FunctionGraph,
@@ -3211,9 +2999,8 @@ fn emit_portal_is_being_profiled_read(
 }
 
 /// Same diamond as [`emit_portal_is_being_profiled_read`], joining onto
-/// the dispatch-loop's pre-built `merge_join` so opcode continues can
-/// target that join (`interp_jit.py PyFrame.dispatch`:
-/// `is_being_profiled = self.get_is_being_profiled()` before `while True`).
+/// the dispatch-loop's pre-built `merge_join` (`interp_jit.py PyFrame.dispatch`:
+/// `is_being_profiled = self.get_is_being_profiled()` on every iteration).
 fn emit_portal_is_being_profiled_into(
     graph: &mut super::flow::FunctionGraph,
     current_block: &SpamBlockRef,
@@ -3356,9 +3143,9 @@ fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
 ///     next_instr = r_uint(self.last_instr)
 /// ```
 ///
-/// `ec.space.reverse_debugging` is constant false. A non-generator body
-/// emits this once at the dispatch-loop head; a generator body emits it
-/// at each instruction start (`frame_var` is that jitcode's own frame).
+/// `ec.space.reverse_debugging` is constant false. The dispatch-loop
+/// head emits this once (`frame_var` is that jitcode's own frame),
+/// generator bodies included (`interp_jit.py PyFrame.dispatch`).
 /// The three continue paths (null `debugdata`, null `w_f_trace`, inline_call)
 /// join and the opcode body continues.
 ///
@@ -3515,9 +3302,8 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     // EXTENDED_ARG; the switch green is the instruction start. Reloading
     // the vable into the green would miss the prefix case. The getfield
     // still records a tracer that writes last_instr (`run_trace_func`).
-    // A generator body leaves `dispatch_next_instr` unset; do not inject
-    // the Int there either (`flatten.py insert_renamings` would emit
-    // `ref_copy` of an Int).
+    // Do not inject the Int into `dispatch_next_instr` (`flatten.py
+    // insert_renamings` would emit `ref_copy` of an Int).
     let _ = next_instr;
     link_to_join(&next_block, &join);
 
@@ -4017,10 +3803,8 @@ fn emit_jump_absolute_tick(
     catch_sites: &[ExceptionCatchSite],
     unwind_memo: &mut Vec<SharedUnwindEntry>,
     depth_at_pc: &[u16],
-    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
-    pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
-    dispatch_loop: Option<&DispatchLoop>,
+    dispatch: &DispatchLoop,
 ) {
     let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
     let ticker_addr = majit_ir::eval_breaker_word::action_ticker_addr();
@@ -4161,10 +3945,9 @@ fn emit_jump_absolute_tick(
     // before `can_enter_jit`. `jtransform.py handle_jit_marker__can_enter_jit`
     // (`handle_jit_marker__loop_header`) drops those arguments; the
     // computations stay in the jitcode ahead of `loop_header`.
-    // The diamond closes `header_block`, so `loop_header` and the
-    // `mergeblock` live on the join. That is the same predecessor/join
-    // split the portal header uses, so `flatten_graph` emits the diamond
-    // before the marker.
+    // The diamond closes `header_block`, so `loop_header` lives on the
+    // join. That is the same predecessor/join split the portal header
+    // uses, so `flatten_graph` emits the diamond before the marker.
     let goto_block = if emit_header {
         let header_state = header_block
             .framestate()
@@ -4191,25 +3974,7 @@ fn emit_jump_absolute_tick(
     } else {
         current_state.clone()
     };
-    if let Some(dispatch) = dispatch_loop {
-        dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
-        return;
-    }
-    let _ = mergeblock(
-        code,
-        graph,
-        joinpoints,
-        &goto_block,
-        &{
-            let mut branch_state = goto_state;
-            branch_state.next_offset = target_py_pc;
-            branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
-            branch_state
-        },
-        target_py_pc,
-        pendingblocks,
-        all_walker_blocks,
-    );
+    dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
 }
 
 fn emit_frontend_neg(
@@ -7625,6 +7390,55 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
     }
 }
 
+/// `slot -> Variable.id` of the dispatch-loop head's locals and stack
+/// (`setup_dispatch_loop` builds them from frame slot indices). Same
+/// snapshot shape as the per-PC `pcdep_slot_var_resume` capture.
+fn frame_state_slot_vars(state: &FrameState) -> Vec<(u16, u32)> {
+    let mut snap = Vec::new();
+    let nloc = state.locals_w.len();
+    for (i, lv) in state.locals_w.iter().enumerate() {
+        if let Some(super::flow::FlowValue::Variable(v)) = lv {
+            snap.push((i as u16, v.id.0));
+        }
+    }
+    for (d, sv) in state.stack.iter().enumerate() {
+        if let super::flow::FlowValue::Variable(v) = sv {
+            snap.push(((nloc + d) as u16, v.id.0));
+        }
+    }
+    snap
+}
+
+/// Color a compact `[locals | stack]` slot→Variable snapshot. Head
+/// Variables are live by construction (`setup_dispatch_loop` union), so
+/// this does not gate on the graph live-oracle the per-PC map uses.
+fn color_slot_var_snapshot(
+    snap: &[(u16, u32)],
+    colorings: [&crate::jit::regalloc::Coloring; 3],
+    rename: &[Vec<u16>; 3],
+) -> Vec<(u8, u16, u16)> {
+    let mut slot_bank_color: std::collections::BTreeMap<u16, (u8, u16)> =
+        std::collections::BTreeMap::new();
+    for &(slot, var_id) in snap {
+        let vid = super::flow::VariableId(var_id);
+        for (bank_idx, kind) in [Kind::Int, Kind::Ref, Kind::Float].iter().enumerate() {
+            let Some(&pre) = colorings[bank_idx].get(&vid) else {
+                continue;
+            };
+            let color = super::regalloc::rename_lookup(rename, *kind, pre);
+            slot_bank_color.insert(slot, (bank_idx as u8, color));
+            break;
+        }
+    }
+    let mut entries: Vec<(u8, u16, u16)> = slot_bank_color
+        .into_iter()
+        .map(|(slot, (bank, color))| (bank, color, slot))
+        .collect();
+    entries.sort_unstable();
+    entries.dedup();
+    entries
+}
+
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
@@ -7859,13 +7673,6 @@ fn decode_exception_catch_sites(
         let landing_label = assembler.new_label();
         catch_for_pc[py_pc] = Some(landing_label);
         let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-        if matches!(
-            pyre_interpreter::decode_instruction_at(code, py_pc),
-            Some((Instruction::RaiseVarargs { argc }, op_arg))
-                if argc.get(op_arg) as i64 >= 1
-        ) {
-            landing.mark_explicit_raise_operand_edge();
-        }
         catch_sites.push(ExceptionCatchSite {
             landing_label,
             handler_py_pc,
@@ -8972,16 +8779,6 @@ impl CodeWriter {
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
         let mut unwind_memo: Vec<SharedUnwindEntry> = Vec::new();
-        // A graph with a caught `raise value` edge needs the EggBlock
-        // link-argument path throughout its exception handlers: cleanup
-        // reraises can carry that same operand across several exception-table
-        // components before POP_EXCEPT restores the previous exception.
-        // Graphs whose exception edges are all implicit/bare retain the
-        // established reconstruction; there is no explicit operand identity
-        // for it to discard.
-        let preserve_exception_edge_states = catch_sites
-            .iter()
-            .any(|site| site.landing.has_explicit_raise_operand_edge());
         // `flowcontext.py self.joinpoints = {}` — sparse-by-PC dict
         // keyed by `next_offset`, populated via `setdefault(...)` per
         // `flowcontext.py:426`.  Vec-of-Vec value preserves the candidate
@@ -8998,9 +8795,6 @@ impl CodeWriter {
         let mut trace_arm_blocks: Vec<super::flow::BlockRef> = Vec::new();
         let start_block = SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
         all_walker_blocks.push(start_block.clone());
-        if num_instrs > 0 && !uses_dispatch_loop(code) {
-            joinpoints.insert(0, vec![start_block.clone()]);
-        }
         // Catch landings live on `ExceptionCatchSite::landing` (decode-
         // time SpamBlockRef::new with framestate=None) and are NOT pushed
         // to `all_walker_blocks` at creation — they're queued at emission
@@ -9010,10 +8804,8 @@ impl CodeWriter {
         // `codewriter.rs::6907+`).
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
         // `emit_mark_label_catch_landing!` reassign it as the walker enters
-        // each block. Initialised to the first PC block so the
-        // `Label("pcN")` / live_placeholder / jit_merge_point
-        // emissions that precede the first `emit_mark_label_pc!`
-        // belong to it.
+        // each block. Initialised to the startblock; opcode cases are
+        // dequeued from `pendingblocks` (`interp_jit.py PyFrame.dispatch`).
         let mut current_block: SpamBlockRef = start_block.clone();
         // Per-block contiguous walker — `emit_mark_label_pc!` sets
         // `block_switch_pending = true` at block transitions instead
@@ -9054,12 +8846,11 @@ impl CodeWriter {
         // The deferred case-application across emit_mark_label_pc no
         // longer exists.
 
-        // rpython/flowspace/flowcontext.py `build_flow` parity:
-        // `pendingblocks = deque([startblock])` + `while pendingblocks:
-        // block = pendingblocks.popleft(); record_block(block)`.
-        // Queue element is the block itself (flowcontext.py); the
-        // framestate (`block.framestate.next_offset`) is read on pop
-        // (flowcontext.py).
+        // `flowcontext.py build_flow`: `while pendingblocks: block =
+        // pendingblocks.popleft(); record_block(block)`. Opcode cases are
+        // queued by `setup_dispatch_loop` (`interp_jit.py PyFrame.dispatch`).
+        // Queue element is the block itself; the framestate
+        // (`block.framestate.next_offset`) is read on pop.
         //
         // Declared here so `emit_mark_label_pc!`, `emit_goto!`,
         // `emit_goto_if_not!` (macro
@@ -9067,24 +8858,26 @@ impl CodeWriter {
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
-        let mut dispatch_loop: Option<DispatchLoop> = None;
-        if uses_dispatch_loop(code) && num_instrs > 0 {
-            dispatch_loop = Some(setup_dispatch_loop(
-                code,
-                &mut graph,
-                &start_block,
-                &start_state,
-                frame_var,
-                ec_var,
-                nlocals,
-                max_stackdepth,
-                &handler_depth_at,
-                &mut joinpoints,
-                &mut pendingblocks,
-                &mut all_walker_blocks,
-            ));
+        // Empty body: no switch cases. Seed the startblock the way
+        // `flowcontext.py build_flow` queued it, then still build the
+        // loop (`interp_jit.py PyFrame.dispatch`).
+        if num_instrs == 0 {
+            pendingblocks.push_back(current_block.clone());
         }
-        let mut resume_entries: Vec<(usize, super::flow::BlockRef)> = Vec::new();
+        let mut dispatch_loop = setup_dispatch_loop(
+            code,
+            &mut graph,
+            &start_block,
+            &start_state,
+            frame_var,
+            ec_var,
+            nlocals,
+            max_stackdepth,
+            &handler_depth_at,
+            &mut joinpoints,
+            &mut pendingblocks,
+            &mut all_walker_blocks,
+        );
         // Upstream `build_flow` relies on `block.dead` alone
         // (`flowcontext.py if not block.dead: record_block(block)`).
         // Pyre matches this: supersede may re-walk a PC under widened
@@ -9154,12 +8947,11 @@ impl CodeWriter {
         // it. Resolved per `flatten_constant_operand`'s Ref arms.
         let mut const_ref_slots_at_pc: Vec<Vec<(u16, i64)>> = vec![Vec::new(); num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
-        // jit_merge_point(). A non-generator body emits that merge once at
-        // the dispatch-loop head (`interp_jit.py PyFrame.dispatch`); a
-        // generator body keeps the unrolled per-instruction merge. Nested
-        // Python loops rely on the blackhole CRN at those inner headers to
-        // compile and target their own loops instead of growing giant
-        // bridges.
+        // jit_merge_point(). The dispatch-loop head emits that merge once
+        // (`interp_jit.py PyFrame.dispatch`), generator bodies included.
+        // Nested Python loops rely on the blackhole CRN at those inner
+        // headers to compile and target their own loops instead of growing
+        // giant bridges.
 
         // pyframe.py pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
@@ -9367,22 +9159,16 @@ impl CodeWriter {
         macro_rules! emit_goto {
             ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                // mergeblock establishes the target SpamBlock and the
-                // graph exit edge (`append_exit`).  Mirrors upstream
-                // `flatten.py self.emitline('goto',
-                // TLabel(link.target))` where `link.target` is a Block
-                // identity, not a PC.  A dispatch-loop body continues
-                // through `interp_jit.py PyFrame.dispatch` instead.
-                goto_python_pc(
+                // Continue the `while True` (`interp_jit.py PyFrame.dispatch`).
+                // CACHE after FOR_ITER / a jump landing is not an instruction
+                // start; `dispatch_case_pc` walks to the next green so the
+                // switch hits (`pyopcode.py dispatch_bytecode`).
+                dispatch_continue_to_loop_head(
                     code,
-                    &mut graph,
-                    &mut joinpoints,
                     &current_block,
                     &current_state,
+                    &dispatch_loop,
                     target_py_pc,
-                    &mut pendingblocks,
-                    &mut all_walker_blocks,
-                    dispatch_loop.as_ref(),
                 );
                 needs_fallthrough = false;
             }};
@@ -10216,22 +10002,17 @@ impl CodeWriter {
             ($cond:expr, $py_pc:expr) => {{
                 let _ = $cond;
                 let py_pc = $py_pc;
-                // mergeblock establishes the linkfalse edge (`append_exit`)
-                // and queues the target block.  `flatten.py:240-267`
-                // linkfalse mergeblock.  The bare `-live-` before the guard
-                // and the `goto_if_not` op itself are produced by the
-                // canonical splice (`flatten.rs`'s `insert_exits`) from the
-                // graph.
-                goto_python_pc(
+                // Continue the `while True` on the false edge
+                // (`interp_jit.py PyFrame.dispatch`). The bare `-live-`
+                // before the guard and the `goto_if_not` op itself are
+                // produced by the canonical splice (`flatten.rs`
+                // `insert_exits`) from the graph.
+                dispatch_continue_to_loop_head(
                     code,
-                    &mut graph,
-                    &mut joinpoints,
                     &current_block,
                     &current_state,
+                    &dispatch_loop,
                     py_pc,
-                    &mut pendingblocks,
-                    &mut all_walker_blocks,
-                    dispatch_loop.as_ref(),
                 );
             }};
         }
@@ -10637,16 +10418,12 @@ impl CodeWriter {
                 let bound_after_push_state = current_state.clone();
                 let bound_after_push_depth = current_depth;
                 if is_last {
-                    goto_python_pc(
+                    dispatch_continue_to_loop_head(
                         code,
-                        &mut graph,
-                        &mut joinpoints,
                         &current_block,
                         &current_state,
+                        &dispatch_loop,
                         fallthrough_py_pc,
-                        &mut pendingblocks,
-                        &mut all_walker_blocks,
-                        dispatch_loop.as_ref(),
                     );
                 }
 
@@ -10672,14 +10449,10 @@ impl CodeWriter {
             }};
         }
 
-        // Seed the outer walker queue.  Matches
-        // `flowcontext.py:401` `pendingblocks = deque([startblock])`.
-        // A dispatch-loop body walks the pre-queued opcode cases
-        // (`interp_jit.py PyFrame.dispatch`); the startblock only
-        // seeds `next_instr` and goes to the loop head.
-        if dispatch_loop.is_none() {
-            pendingblocks.push_back(current_block.clone());
-        }
+        // Opcode cases are already on `pendingblocks`
+        // (`setup_dispatch_loop`). The startblock only seeds
+        // `next_instr` and goes to the loop head
+        // (`interp_jit.py PyFrame.dispatch`).
 
         // flowcontext.py:402-405 `while self.pendingblocks: block =
         // self.pendingblocks.popleft(); if not block.dead: self.record_block(block)`.
@@ -10755,62 +10528,18 @@ impl CodeWriter {
                         if start_pc != py_pc {
                             break;
                         }
-                        if dispatch_loop.is_some() {
-                            // The switch already passed this case's
-                            // FrameState (`interp_jit.py PyFrame.dispatch`).
-                            current_depth = current_state.stack.len() as u16;
-                            needs_fallthrough = false;
-                        } else if preserve_exception_edge_states
-                            || handler_entry_has_protected_prefix(&catch_sites, py_pc)
-                        {
-                            // Each catch landing is the exception edge's
-                            // EggBlock: it constructs the handler stack from
-                            // its own link inputs, then `mergeblock` joins
-                            // those states through ordinary link arguments.
-                            // Keep that joined pending state while a caught
-                            // `raise value` or a protected stack prefix must
-                            // retain its identity through handler cleanup.
-                            current_depth = current_state.stack.len() as u16;
-                            needs_fallthrough = false;
-                        } else if let Some(handler_state) = handler_entry_state_from_catch_sites(
-                            code,
-                            &mut graph,
-                            &catch_sites,
-                            py_pc,
-                        ) {
-                            // Implicit edges with no protected prefix retain
-                            // the established cross-site reconstruction.
-                            current_depth = handler_state.stack.len() as u16;
-                            current_state = handler_state;
-                            needs_fallthrough = false;
-                        } else if let Some(handler_depth) =
-                            handler_depth_at.get(py_pc).copied().flatten()
-                        {
-                            current_depth = handler_depth;
-                            // Bare handler entry without a recorded
-                            // FrameState: only the depth is known, so
-                            // overwrite the whole symbolic stack with
-                            // null sentinels.  `resize` would preserve
-                            // any prefix carried over from the predecessor
-                            // block, leaking stale symbolic values into
-                            // the handler entry; a consumer reading
-                            // `current_state.stack[i]` here sees the
-                            // sentinel and falls back to the raw
-                            // `stack_base + i` register.
-                            current_state.stack =
-                                vec![null_stack_sentinel(); handler_depth as usize];
-                        }
+                        // The switch already passed this case's
+                        // FrameState (`interp_jit.py PyFrame.dispatch`).
+                        current_depth = current_state.stack.len() as u16;
+                        needs_fallthrough = false;
                     }
-                    if let Some(dispatch) = dispatch_loop.as_ref()
-                        && py_pc > start_pc
-                        && is_python_instruction_start(code, py_pc)
-                    {
+                    if py_pc > start_pc && is_python_instruction_start(code, py_pc) {
                         if current_block.block().borrow().exits.is_empty() {
                             dispatch_continue_to_loop_head(
                                 code,
                                 &current_block,
                                 &current_state,
-                                dispatch,
+                                &dispatch_loop,
                                 py_pc,
                             );
                         }
@@ -10831,10 +10560,8 @@ impl CodeWriter {
                         break;
                     }
                     if start_pc == py_pc && handler_entry_has_exception_slot(&catch_sites, py_pc) {
-                        // A sentinel top means the `handler_depth_at` fallback
-                        // above rebuilt the stack from the depth alone, so there
-                        // is no slot Variable to define; mint one for the
-                        // producer below to write.
+                        // If the case's stack top is not a Variable, mint one
+                        // for the producer below to write.
                         if !matches!(
                             current_state.stack.last(),
                             Some(super::flow::FlowValue::Variable(_))
@@ -10939,43 +10666,12 @@ impl CodeWriter {
                         }
                     }
 
-                    // jtransform.py:1708-1712 emits [op3, op1, op2]:
-                    //   op3 = -live- (for inlined short preambles)
-                    //   op1 = jit_merge_point
-                    //   op2 = -live- (for do_recursive_call / guard resume)
-                    // The per-PC emit_live_placeholder!() after this block
-                    // serves as op2; op3 is emitted inside the block below.
-                    //
-                    // The portal `jit_merge_point` belongs to the block that
-                    // legitimately STARTS at this PC — the one entered via its own
-                    // back-edge / pending-block pop (`flatten.py make_bytecode_block`
-                    // enters a block only via its own links).  Pyre's PC-sequential
-                    // walker can also reach a loop-header PC by sequentially
-                    // advancing off the PC-adjacent predecessor block AFTER that
-                    // predecessor was closed by an unconditional terminator
-                    // (`emit_goto!` / `emit_ref_return!` / `emit_raise!` cleared
-                    // `needs_fallthrough` so `emit_mark_label_pc!` could not switch
-                    // away, and no joinpoint is registered at the loop-header PC yet
-                    // because its back-edge lies at a higher, not-yet-walked PC).
-                    // In that case `current_block` is the terminator-closed
-                    // predecessor, NOT the loop-header block:
-                    //   - a JumpBackward block carrying `loop_header` + `goto`
-                    //     target whose PC-adjacent next PC is a DIFFERENT loop's
-                    //     header (the word-drop bug: the merge lands after the
-                    //     `goto`, so `insert_exits` serialises it BEFORE the goto
-                    //     target and a blackhole guard-resume reaches the
-                    //     `jit_merge_point` first, `ContinueRunningNormally`s at the
-                    //     loop-header PC without the predecessor's state reset →
-                    //     truncated / duplicated output);
-                    //   - an explicit `raise X` block whose fall-through PC is a
-                    //     loop header (merge serialised before the `raise`, dropping
-                    //     the handler).
-                    // In every terminator-closed case the merge belongs to the real
-                    // loop-header block, emitted when that PC is walked through its
-                    // own entry.  Suppress it here on any terminator-closed block —
-                    // the same guard the op-dispatch `block_closed_by_terminator`
-                    // gate applies below.  Computed once here and reused at that
-                    // gate.
+                    // `interp_jit.py PyFrame.dispatch` emits `[op3, op1, op2]`
+                    // (`jtransform.py handle_jit_marker__jit_merge_point`)
+                    // once at the loop head. The per-PC `-live-` below is
+                    // the opcode body's resume marker. Skip dispatch on a
+                    // block already closed by `emit_goto!` / return / raise
+                    // (`flowcontext.py` `StopFlowing`).
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
@@ -10993,177 +10689,9 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    // Logical start: first `ExtendedArg` of a prefix run, or
-                    // an unprefixed real opcode. `Cache` and the real opcode
-                    // after a prefix are not merge greens. `Resume` / `Nop` /
-                    // `NotTaken` are dispatched opcodes. The `last_instr`
-                    // store below still names the trivia-normalized opcode
-                    // pc (`skip_python_trivia_forward`).
-                    let at_instruction_start = is_python_instruction_start(code, py_pc);
-                    // `interp_jit.py PyFrame.dispatch` evaluates the portal
-                    // `jit_merge_point` before every `handle_bytecode`, so a
-                    // blackhole resumed from a guard (`blackhole.py
-                    // bhimpl_jit_merge_point`) raises `ContinueRunningNormally`
-                    // at the next opcode boundary (last-level) or runs
-                    // `ll_portal_runner` (inner recursive_call).  A generator
-                    // body unrolls that merge at every instruction start; a
-                    // non-generator body emits it once at the dispatch-loop
-                    // head. Tracing treats a merge no `loop_header` stamped as
-                    // inert (`pyjitpl.py opimpl_jit_merge_point`).
-                    // `loop_header` is `jump_absolute` / `can_enter_jit` on
-                    // that dispatch. Extra `trace_entry_pcs` (every
-                    // instruction) stay off generator bodies: a yield-resume
-                    // must not walk into the `abort_permanent` the yield
-                    // bakes (`should_unroll_one_iteration`).
-                    let emit_merge = at_instruction_start && dispatch_loop.is_none();
-                    if emit_merge && !block_closed_by_terminator {
-                        // Diamond at the merge-point start: the merge-point
-                        // site cannot carry a branch, so the null test
-                        // joins here before the merge-point `-live-`.
-                        // `goto_if_not` records a data guard;
-                        // `pyjitpl.py get_list_of_active_boxes` reads
-                        // the terminator's own `-live-`, so the header
-                        // carries one before the diamond.
-                        emit_live_placeholder!(py_pc);
-                        let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
-                            &mut graph,
-                            &current_block,
-                            &current_state,
-                            frame_var,
-                            py_pc as i64,
-                            &mut all_walker_blocks,
-                        );
-                        current_block = join_block;
-                        if let Some(state) = current_block.framestate() {
-                            current_state = state;
-                        }
-                        needs_fallthrough = true;
-                        let jdindex = PYTHON_PORTAL_JD_INDEX;
-                        // `interp_jit.py PyFrame.dispatch` passes the
-                        // `pycode` argument to `jit_merge_point`; that
-                        // argument is constant for the whole call. This
-                        // jitcode is built per CodeObject, so the green
-                        // is this body's `w_code` Constant.
-                        // `jtransform.py promote_greens` skips Constant
-                        // greens (`getcode()` is the back-edge's).
-                        let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
-                            super::flow::ConstantValue::Signed(roots.get(code_slot) as i64),
-                            Some(Kind::Ref),
-                        )
-                        .into();
-                        // `jtransform.py promote_greens`: `-live-` then
-                        // `{kind}_guard_value` on every Variable green
-                        // (`next_instr` and `pycode` are Constants), then
-                        // `handle_jit_marker__jit_merge_point`'s op3
-                        // `-live-` "for inlined short preambles".
-                        emit_live_placeholder!(py_pc);
-                        let _ = emit_graph_op_void(
-                            &current_block.block(),
-                            "int_guard_value",
-                            vec![profiled_var.into()],
-                            py_pc as i64,
-                        );
-                        emit_live_placeholder!(py_pc);
-                        let scratch_profiled_reg = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        // The `next_instr` green differs at every
-                        // instruction start.  As a list constant it would
-                        // take one `constants_i` slot per instruction and
-                        // overrun `assembler.py` `check_result`'s 256-wide
-                        // index space; held in a register it is filled by
-                        // the u16-immediate `int_copy/d>i`, the way
-                        // `last_instr` uses `setfield_vable_i_imm`.  Its
-                        // source is the constant, so `promote_greens`
-                        // still has nothing to guard for it.
-                        let scratch_next_instr_reg =
-                            ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        let next_instr_var = emit_graph_op_with_result(
-                            &mut graph,
-                            &current_block.block(),
-                            "int_copy",
-                            vec![super::flow::Constant::signed(py_pc as i64).into()],
-                            Kind::Int,
-                            -1,
-                        );
-                        let graph_args = portal_jit_merge_point_graph_args(
-                            &graph,
-                            next_instr_var,
-                            profiled_var,
-                            pycode_green,
-                            jdindex,
-                        );
-                        let graph_op = emit_graph_op_void(
-                            &current_block.block(),
-                            "jit_merge_point",
-                            graph_args,
-                            py_pc as i64,
-                        );
-                        // Ad hoc regallocs for the walk-time serialize of
-                        // `jit_merge_point`: Int `next_instr` and
-                        // `is_being_profiled` plus the two portal red Refs
-                        // (frame / ec). The pycode green is a Constant and
-                        // has no color.
-                        // Canonical `flatten_graph` recolors the same
-                        // Variables from the graph; this map exists
-                        // because the walker serializes the marker
-                        // outside that pass.
-                        let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
-                        portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
-                        portal_int_coloring.insert(next_instr_var.id, scratch_next_instr_reg);
-                        let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
-                        portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
-                        portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
-                        let mut portal_regallocs = [
-                            super::regalloc::GraphAllocationResult {
-                                coloring: portal_int_coloring,
-                                num_colors: scratch_profiled_reg.max(scratch_next_instr_reg) + 1,
-                            },
-                            super::regalloc::GraphAllocationResult {
-                                coloring: portal_ref_coloring,
-                                num_colors: 2,
-                            },
-                            super::regalloc::GraphAllocationResult {
-                                coloring: crate::jit::regalloc::Coloring::default(),
-                                num_colors: 0,
-                            },
-                        ];
-                        GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
-                            .serialize_op(&graph_op);
-                    }
 
                     if !block_closed_by_terminator {
                         emit_live_placeholder!(py_pc);
-                    }
-
-                    if emit_merge && !block_closed_by_terminator {
-                        // `interp_jit.py PyFrame.dispatch` promotes the live
-                        // valuestackdepth after jit_merge_point, before
-                        // handle_bytecode. Use the same getfield/hint lowering
-                        // as getcode; the static stack map cannot replace a
-                        // guard on this red-frame input.
-                        let depth = emit_vable_getfield_int(
-                            &mut graph,
-                            &current_block.block(),
-                            frame_var,
-                            VABLE_VALUESTACKDEPTH_FIELD_IDX,
-                            py_pc as i64,
-                        );
-                        emit_do_promote(
-                            &current_block.block(),
-                            "int_guard_value",
-                            depth,
-                            py_pc as i64,
-                        );
-                        record_graph_op(
-                            &current_block.block(),
-                            "setfield_vable_i",
-                            vable_setfield_int_graph_args(
-                                frame_var.into(),
-                                depth.into(),
-                                VABLE_VALUESTACKDEPTH_FIELD_IDX,
-                            ),
-                            None,
-                            py_pc as i64,
-                        );
                     }
 
                     // Dead-code dispatch gate: `current_block` has already
@@ -11193,13 +10721,6 @@ impl CodeWriter {
                     // the abort is the last instruction (nothing follows to
                     // dispatch).  `merge_entry_by_green` therefore keeps the
                     // loop headers behind an unsupported opcode.
-                    //
-                    // Reuses `block_closed_by_terminator` computed above the
-                    // loop-header `jit_merge_point` gate. The debugdata
-                    // diamond closes the header and switches
-                    // `current_block` to the join, which has no exits, so
-                    // the cached `false` still matches the block opcode
-                    // dispatch writes into.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
@@ -11210,96 +10731,6 @@ impl CodeWriter {
                     let code_unit = code.instructions[py_pc];
                     let (instruction, op_arg) = arg_state.get(code_unit);
                     exception_edge_handled = false;
-
-                    // `dispatch_bytecode` (pyopcode.py) writes
-                    // `self.last_instr = intmask(next_instr)` before every opcode.
-                    // That store is a `setfield_vable_i` of the standard virtualizable
-                    // (`_opimpl_setfield_vable`): compiled code only updates
-                    // `virtualizable_boxes`, and the blackhole replays it like any
-                    // other op. The value is the trivia-normalized opcode PC
-                    // (`skip_python_trivia_forward`): f_lasti / f_lineno name
-                    // the real opcode, not the EXTENDED_ARG prefix.
-                    // The immediate is inline (`setfield_vable_i_imm/rdd`) so a
-                    // per-instruction constant does not consume a `constants_i`
-                    // slot (`assembler.py` `check_result`).
-                    //
-                    // A non-generator body stores `last_instr` at the
-                    // dispatch-loop head from the `next_instr` green
-                    // (`pyopcode.py dispatch_bytecode`). A second store
-                    // in the case would record twice per opcode.
-                    {
-                        if at_instruction_start
-                            && current_block.block().borrow().exits.is_empty()
-                            && dispatch_loop.is_none()
-                        {
-                            let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
-                                code, py_pc,
-                            );
-                            // `emit_jump_absolute_tick` splits a fresh block
-                            // for the poll so JUMP_BACKWARD does not share a
-                            // CFG block with STORE_FAST. Same here: a
-                            // fall-through predecessor would otherwise keep
-                            // `last_instr` + the debugdata diamond on the
-                            // prior opcode's block. Flatten serializes until
-                            // `raise` and then `insert_exits` would see the
-                            // diamond's `ptr_iszero` exitswitch, dropping
-                            // `catch_exception`.
-                            let mut arm_state = {
-                                let mut fresh = |kind| fresh_variable_for_state(&mut graph, kind);
-                                current_state.copy(&mut fresh)
-                            };
-                            arm_state.next_offset = py_pc;
-                            arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let arm_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(arm_state.clone()),
-                            );
-                            all_walker_blocks.push(arm_block.clone());
-                            arm_block.block().borrow_mut().inputargs = arm_state.getvariables();
-                            append_exit(
-                                &current_block.block(),
-                                output_link(&current_state, &arm_state, arm_block.block()),
-                            );
-                            let v_li: super::flow::FlowValue =
-                                super::flow::Constant::signed(norm as i64).into();
-                            record_graph_op(
-                                &arm_block.block(),
-                                "setfield_vable_i",
-                                vable_setfield_int_graph_args(
-                                    frame_var.into(),
-                                    v_li.into(),
-                                    VABLE_LAST_INSTR_FIELD_IDX,
-                                ),
-                                None,
-                                py_pc as i64,
-                            );
-                            // `dispatch_bytecode` jitted arm (`pyopcode.py`):
-                            // `_d = self.debugdata`; if `_d.w_f_trace` then
-                            // `ec.bytecode_only_trace(self)` and
-                            // `next_instr = r_uint(self.last_instr)`.
-                            current_block = emit_dispatch_bytecode_jitted_trace_arm(
-                                code,
-                                &mut graph,
-                                &arm_block,
-                                &arm_state,
-                                frame_var,
-                                ec_var,
-                                py_pc,
-                                py_pc as i64,
-                                &catch_for_pc,
-                                &catch_sites,
-                                &mut unwind_memo,
-                                &depth_at_pc,
-                                &mut all_walker_blocks,
-                                &mut arm_blocks,
-                                &mut trace_arm_blocks,
-                            );
-                            if let Some(state) = current_block.framestate() {
-                                current_state = state;
-                            }
-                            needs_fallthrough = true;
-                        }
-                    }
 
                     // Snapshot the entry stack for `emit_abort_permanent!`.  The
                     // marker resumes the interpreter AT this opcode, so what it
@@ -11707,16 +11138,12 @@ impl CodeWriter {
                                 // `flatten.rs`'s `insert_exits`
                                 // normalises the [TRUE, FALSE] exits
                                 // ordering via the llexitcase swap.
-                                goto_python_pc(
+                                dispatch_continue_to_loop_head(
                                     code,
-                                    &mut graph,
-                                    &mut joinpoints,
                                     &current_block,
                                     &current_state,
+                                    &dispatch_loop,
                                     fallthrough_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                    dispatch_loop.as_ref(),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
                                 emit_goto_if_not!(scratch_truth, target_py_pc);
@@ -11795,16 +11222,12 @@ impl CodeWriter {
                                 // exits are already laid out via the two
                                 // mergeblocks above; no implicit fallthrough
                                 // link is needed.
-                                goto_python_pc(
+                                dispatch_continue_to_loop_head(
                                     code,
-                                    &mut graph,
-                                    &mut joinpoints,
                                     &current_block,
                                     &current_state,
+                                    &dispatch_loop,
                                     target_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                    dispatch_loop.as_ref(),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
                                 emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
@@ -11864,10 +11287,8 @@ impl CodeWriter {
                                         &catch_sites,
                                         &mut unwind_memo,
                                         &depth_at_pc,
-                                        &mut joinpoints,
-                                        &mut pendingblocks,
                                         &mut all_walker_blocks,
-                                        dispatch_loop.as_ref(),
+                                        &dispatch_loop,
                                     );
                                     needs_fallthrough = false;
                                 }
@@ -14085,16 +13506,12 @@ impl CodeWriter {
                             current_state = success_state;
                             push_and_bump!(next_result_in_success.into(), py_pc);
                             emit_goto!(py_pc + 1);
-                            goto_python_pc(
+                            dispatch_continue_to_loop_head(
                                 code,
-                                &mut graph,
-                                &mut joinpoints,
                                 &split_block,
                                 &split_state,
+                                &dispatch_loop,
                                 exhaust_target,
-                                &mut pendingblocks,
-                                &mut all_walker_blocks,
-                                dispatch_loop.as_ref(),
                             );
                             set_last_bool_exitcase(&split_block.block(), false);
                         }
@@ -14876,16 +14293,12 @@ impl CodeWriter {
                                 // (fallthrough) link.  `needs_fallthrough = false`
                                 // suppresses the PC-sequential walker's spurious
                                 // fallthrough injection (see PopJumpIfTrue).
-                                goto_python_pc(
+                                dispatch_continue_to_loop_head(
                                     code,
-                                    &mut graph,
-                                    &mut joinpoints,
                                     &current_block,
                                     &current_state,
+                                    &dispatch_loop,
                                     target_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                    dispatch_loop.as_ref(),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
                                 emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
@@ -16188,16 +15601,12 @@ impl CodeWriter {
                             // at the same PC when conditional control flow
                             // already reaches the continuation.
                             let next_py_pc = py_pc + 1;
-                            goto_python_pc(
+                            dispatch_continue_to_loop_head(
                                 code,
-                                &mut graph,
-                                &mut joinpoints,
                                 &current_block,
                                 &current_state,
+                                &dispatch_loop,
                                 next_py_pc,
-                                &mut pendingblocks,
-                                &mut all_walker_blocks,
-                                dispatch_loop.as_ref(),
                             );
                             needs_fallthrough = false;
                         }
@@ -16285,16 +15694,13 @@ impl CodeWriter {
                         // StoreName pops 1 value from the stack.
                         // (This is separate from the above because pyopcode.rs pops.)
 
-                        // `pyopcode.py` `YIELD_VALUE` raises `Yield` with the
-                        // value on the stack. `interp_jit.py` `PyFrame.dispatch`
-                        // `except Yield` pops it, hints `force_virtualizable`,
-                        // and returns it. The next send is a new dispatch at
-                        // `last_instr + 1` (`tweak_generator_body_graph`).
+                        // Yielded value is popped and returned with the frame
+                        // forced (`interp_jit.py PyFrame.dispatch` `except
+                        // Yield`); the next send re-enters the dispatch-loop
+                        // head at `last_instr + 1`.
                         Instruction::YieldValue { .. } => {
-                            let depth_at_yield = current_depth;
-                            let resume_py_pc = py_pc + 1;
                             let tos_index =
-                                stack_base_absolute + depth_at_yield.saturating_sub(1) as usize;
+                                stack_base_absolute + current_depth.saturating_sub(1) as usize;
                             let yielded = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -16316,23 +15722,6 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             emit_ref_return!(0, yielded.into());
-                            if resume_py_pc < num_instrs
-                                && !resume_entries.iter().any(|&(pc, _)| pc == resume_py_pc)
-                            {
-                                let prelude = emit_resume_entry_from_frame(
-                                    code,
-                                    &mut graph,
-                                    &mut joinpoints,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                    frame_var,
-                                    ec_var,
-                                    stack_base_absolute,
-                                    resume_py_pc,
-                                    depth_at_yield,
-                                );
-                                resume_entries.push((resume_py_pc, prelude));
-                            }
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
@@ -16355,9 +15744,8 @@ impl CodeWriter {
                             // Genuine trace boundary: SEND suspends the frame
                             // (StepResult::Yield) and resumes it in a different
                             // stack context, which a residual call cannot express.
-                            // YIELD_VALUE is a return plus a resume continuation
-                            // (`interp_jit.py` `dispatch` `except Yield`,
-                            // `tweak_generator_body_graph`); SEND stays an abort.
+                            // YIELD_VALUE is a return (`interp_jit.py`
+                            // `dispatch` `except Yield`); SEND stays an abort.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -16800,29 +16188,27 @@ impl CodeWriter {
                             current_block = next_block;
                         }
                     }
-                    if dispatch_loop.is_some() {
-                        let closed = {
-                            let block_rc = current_block.block();
-                            let block = block_rc.borrow();
-                            let has_explicit_raise =
-                                block.raising_op().is_some_and(|op| op.opname == "raise");
-                            !block.exits.is_empty()
-                                && (has_explicit_raise
-                                    || !matches!(
-                                        block.exitswitch,
-                                        Some(super::flow::ExitSwitch::Value(
-                                            super::flow::FlowValue::Constant(ref c),
-                                        )) if matches!(
-                                            c.value,
-                                            super::flow::ConstantValue::Atom(
-                                                super::flow::Atom::LastException
-                                            )
+                    let closed = {
+                        let block_rc = current_block.block();
+                        let block = block_rc.borrow();
+                        let has_explicit_raise =
+                            block.raising_op().is_some_and(|op| op.opname == "raise");
+                        !block.exits.is_empty()
+                            && (has_explicit_raise
+                                || !matches!(
+                                    block.exitswitch,
+                                    Some(super::flow::ExitSwitch::Value(
+                                        super::flow::FlowValue::Constant(ref c),
+                                    )) if matches!(
+                                        c.value,
+                                        super::flow::ConstantValue::Atom(
+                                            super::flow::Atom::LastException
                                         )
-                                    ))
-                        };
-                        if closed {
-                            break;
-                        }
+                                    )
+                                ))
+                    };
+                    if closed {
+                        break;
                     }
                 }
             } // end inner while-let pendingblocks
@@ -17066,35 +16452,33 @@ impl CodeWriter {
             }
         } // end outer drain loop
 
-        if let Some(ref mut dispatch) = dispatch_loop {
-            let first_head_walker_block = all_walker_blocks.len();
-            emit_dispatch_loop_head(
-                code,
-                &mut graph,
-                roots.get(code_slot) as *const (),
-                frame_var,
-                ec_var,
-                dispatch,
-                &catch_for_pc,
-                &catch_sites,
-                &mut unwind_memo,
-                &depth_at_pc,
-                &mut all_walker_blocks,
-                &mut arm_blocks,
-                &mut trace_arm_blocks,
-            );
-            // The head and merge join were created with the case blocks in
-            // `setup_dispatch_loop`; every walker block after them belongs to
-            // the head emission.
-            dispatch.head_blocks = [dispatch.head.block(), dispatch.merge_join.block()]
-                .into_iter()
-                .chain(
-                    all_walker_blocks[first_head_walker_block..]
-                        .iter()
-                        .map(|block| block.block()),
-                )
-                .collect();
-        }
+        let first_head_walker_block = all_walker_blocks.len();
+        emit_dispatch_loop_head(
+            code,
+            &mut graph,
+            roots.get(code_slot) as *const (),
+            frame_var,
+            ec_var,
+            &mut dispatch_loop,
+            &catch_for_pc,
+            &catch_sites,
+            &mut unwind_memo,
+            &depth_at_pc,
+            &mut all_walker_blocks,
+            &mut arm_blocks,
+            &mut trace_arm_blocks,
+        );
+        // The head and merge join were created with the case blocks in
+        // `setup_dispatch_loop`; every walker block after them belongs to
+        // the head emission.
+        dispatch_loop.head_blocks = [dispatch_loop.head.block(), dispatch_loop.merge_join.block()]
+            .into_iter()
+            .chain(
+                all_walker_blocks[first_head_walker_block..]
+                    .iter()
+                    .map(|block| block.block()),
+            )
+            .collect();
 
         // RPython flatten.py parity: every code path ends with an explicit
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
@@ -17155,51 +16539,6 @@ impl CodeWriter {
         // The other `all_passes` entries are structural no-ops on the walker's
         // empty-`operations` blocks (see their classification in
         // `simplify.rs`).
-        if !resume_entries.is_empty() {
-            let old_start = graph.startblock.clone();
-            let mut dispatch_inputs: Vec<super::flow::FlowValue> = (0..entry_arg_slots(code))
-                .map(|_| graph.fresh_variable(Kind::Ref).into())
-                .collect();
-            dispatch_inputs.push(frame_var.into());
-            dispatch_inputs.push(ec_var.into());
-            let dispatch = graph.new_block(dispatch_inputs.clone());
-            let li = emit_graph_op_with_result(
-                &mut graph,
-                &dispatch,
-                "getfield_vable_i",
-                vable_getfield_ref_graph_args(frame_var.into(), VABLE_LAST_INSTR_FIELD_IDX),
-                Kind::Int,
-                -1,
-            );
-            let sel = emit_graph_op_with_result(
-                &mut graph,
-                &dispatch,
-                "int_add",
-                vec![li.into(), super::flow::Constant::signed(1).into()],
-                Kind::Int,
-                -1,
-            );
-            dispatch.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(sel.into()));
-            for &(r, ref prelude) in &resume_entries {
-                let case: super::flow::FlowValue = super::flow::Constant::signed(r as i64).into();
-                let link =
-                    super::flow::Link::new(Vec::new(), Some(prelude.clone()), Some(case.clone()))
-                        .with_llexitcase(case)
-                        .into_ref();
-                append_exit(&dispatch, link);
-            }
-            let default_case: super::flow::FlowValue =
-                super::flow::Constant::string("default").into();
-            let default_link = super::flow::Link::new(
-                dispatch_inputs,
-                Some(old_start),
-                Some(default_case.clone()),
-            )
-            .with_llexitcase(default_case)
-            .into_ref();
-            append_exit(&dispatch, default_link);
-            graph.startblock = dispatch;
-        }
         eliminate_empty_blocks(&graph);
         super::simplify::constfold_exitswitch(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
@@ -17221,28 +16560,22 @@ impl CodeWriter {
         // remove_trivial_links merges single-entry/single-exit chains; the
         // canonical splice reads the simplified graph directly.
         super::simplify::remove_trivial_links(&graph);
-        for (_, prelude) in resume_entries.iter_mut() {
-            *prelude = surviving_graph_block(prelude);
-        }
-        let dispatch_head_block = dispatch_loop
+        let dispatch_head_block = surviving_graph_block(&dispatch_loop.merge_join.block());
+        let dispatch_switch_block = dispatch_loop
+            .switch_block
             .as_ref()
-            .map(|dispatch| surviving_graph_block(&dispatch.merge_join.block()));
-        let dispatch_switch_block = dispatch_loop.as_ref().and_then(|dispatch| {
-            dispatch
-                .switch_block
-                .as_ref()
-                .map(|block| surviving_graph_block(&block.block()))
-        });
+            .map(|block| surviving_graph_block(&block.block()));
         let dispatch_head_blocks: Vec<super::flow::BlockRef> = dispatch_loop
-            .as_ref()
-            .map(|dispatch| {
-                dispatch
-                    .head_blocks
-                    .iter()
-                    .map(surviving_graph_block)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .head_blocks
+            .iter()
+            .map(surviving_graph_block)
+            .collect();
+        // Head `-live-` is the union of instruction-start locals/stack
+        // (`setup_dispatch_loop`). Per-PC trivia floors those bytes to py 0,
+        // which has an empty color→slot map; publish the head's own map so a
+        // generator resume that enters at the `jit_merge_point` can seed
+        // every live Ref, null slots included (`PyFrame.dispatch`).
+        let head_slot_var: Vec<(u16, u32)> = frame_state_slot_vars(&dispatch_loop.merge_join_state);
 
         // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
         // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py`) into the
@@ -17819,6 +17152,24 @@ impl CodeWriter {
                     .collect()
             })
             .collect();
+        let head_pcdep: Vec<(u8, u16, u16)> = color_slot_var_snapshot(
+            &head_slot_var,
+            [
+                &splice_regallocs[Kind::Int.index()].coloring,
+                &splice_regallocs[Kind::Ref.index()].coloring,
+                &splice_regallocs[Kind::Float.index()].coloring,
+            ],
+            &alloc_result.rename,
+        )
+        .into_iter()
+        .map(|(bank, color, slot)| {
+            (
+                bank,
+                color,
+                frame_layout_slot(slot, nlocals, stack_base_absolute),
+            )
+        })
+        .collect();
         for entries in &mut const_ref_slots_at_pc {
             for (slot, _) in entries {
                 *slot = frame_layout_slot(*slot, nlocals, stack_base_absolute);
@@ -17866,10 +17217,10 @@ impl CodeWriter {
             num_regs,
             result_color_at_pc,
             pcdep_color_slots,
+            head_pcdep,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
-            &resume_entries,
-            dispatch_head_block.as_ref(),
+            &dispatch_head_block,
             dispatch_switch_block.as_ref(),
             &dispatch_head_blocks,
         )
@@ -17946,10 +17297,10 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
+        head_pcdep: Vec<(u8, u16, u16)>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
-        resume_entries: &[(usize, super::flow::BlockRef)],
-        dispatch_head: Option<&super::flow::BlockRef>,
+        dispatch_head: &super::flow::BlockRef,
         dispatch_switch: Option<&super::flow::BlockRef>,
         dispatch_head_blocks: &[super::flow::BlockRef],
     ) -> Option<PyJitCode> {
@@ -18004,14 +17355,7 @@ impl CodeWriter {
         // `interp_jit.py PyFrame.dispatch` head blocks, translated below into
         // `dispatch_head_by_jit_pc`.
         let dispatch_head_insn_ranges = labeled_block_insn_ranges(&ssarepr, dispatch_head_blocks);
-        let resume_insn_some: Vec<(usize, usize)> = resume_entries
-            .iter()
-            .filter_map(|&(py_pc, ref prelude)| {
-                resume_prelude_first_insn_index(&ssarepr, prelude).map(|idx| (py_pc, idx))
-            })
-            .collect();
-        let dispatch_head_insn =
-            dispatch_head.and_then(|block| label_block_first_insn_index(&ssarepr, block));
+        let dispatch_head_insn = label_block_first_insn_index(&ssarepr, dispatch_head);
         let dispatch_switch_insn =
             dispatch_switch.and_then(|block| switch_opcode_insn_index(&ssarepr, block));
         let mut combined_indices = pc_map.clone();
@@ -18026,8 +17370,6 @@ impl CodeWriter {
                 combined_indices.push(end_idx);
             }
         }
-        let resume_range_base = combined_indices.len();
-        combined_indices.extend(resume_insn_some.iter().map(|(_, idx)| *idx));
         let dispatch_head_index_slot = combined_indices.len();
         if let Some(idx) = dispatch_head_insn {
             combined_indices.push(idx);
@@ -18198,15 +17540,6 @@ impl CodeWriter {
                 "trace_arm_ranges must be sorted and disjoint"
             );
         }
-        let mut resume_entry_by_py_pc: Vec<(u32, u32)> = resume_insn_some
-            .iter()
-            .enumerate()
-            .filter_map(|(k, (py_pc, _))| {
-                let off = u32::try_from(combined_bytes[resume_range_base + k]).ok()?;
-                Some((u32::try_from(*py_pc).ok()?, off))
-            })
-            .collect();
-        resume_entry_by_py_pc.sort_unstable_by_key(|&(py, off)| (py, off));
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
@@ -18403,13 +17736,12 @@ impl CodeWriter {
         // still owns the marker tables: sparse carry-forward override first,
         // otherwise the derivable resume marker.
         //
-        // Every per-code jitcode emits `jit_merge_point` at every instruction
-        // start (`interp_jit.py PyFrame.dispatch`). PyPy's JitCell is keyed
-        // by greens including `next_instr`, and `ll_portal_runner`
-        // `maybe_compile_and_run` (`warmstate.py`) may start tracing at any
-        // of those greens. `compile_and_run_once` reads this sidecar for
-        // that start, so a body that already emitted those merges must
-        // publish a walk entry for each one that actually lowered.
+        // `interp_jit.py PyFrame.dispatch`: one loop-head `jit_merge_point`.
+        // PyPy's JitCell is keyed by greens including `next_instr`, and
+        // `ll_portal_runner` `maybe_compile_and_run` (`warmstate.py`) may
+        // start tracing at any instruction-start green. `compile_and_run_once`
+        // reads this sidecar for that start, so every green maps to that
+        // head.
         // Generator / coroutine bodies keep loop headers, and pc 0 only when
         // that is the real function entry. The first-resume pc after
         // RETURN_GENERATOR (`after_return_generator_index`, `PyFrame.next_instr`
@@ -18417,9 +17749,7 @@ impl CodeWriter {
         // `warmstate.py maybe_compile_and_run` would compile a separate entry
         // there. PyPy crosses the body through the caller and the generator's
         // own loop header (`should_unroll_one_iteration`,
-        // `opimpl_jit_merge_point`). A yield-resume coordinate here would walk
-        // into the `abort_permanent` the yield bakes
-        // (`generator_resume_marker_offset`).
+        // `opimpl_jit_merge_point`).
         //
         // A header this body never lowered does NOT qualify.  `abort_permanent`
         // closes its block, so every later PC is skipped as dead code and
@@ -18436,13 +17766,6 @@ impl CodeWriter {
         // entry makes `merge_entry_for` answer `None`, which both the walk and
         // `compile_and_run_once` read as "interpret this green".
         let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
-        // codewriter.py `jitdriver_sd_from_portal_graph`: true-portal iff
-        // this code is in `CallControl.jitdrivers_sd`. Same test as
-        // `transform_graph_to_jitcode`'s `is_true_portal`.
-        let is_true_portal = self
-            .callcontrol()
-            .jitdriver_sd_from_portal_graph(code as *const CodeObject)
-            .is_some();
         let mut trace_entry_pcs: Vec<usize> = loop_header_pcs
             .iter()
             .copied()
@@ -18459,34 +17782,16 @@ impl CodeWriter {
         if let Some(pc) = code_entry_pc {
             trace_entry_pcs.push(pc);
         }
-        // Yield PCs stay off the table for generator bodies even when the
-        // graph is later registered as a portal: `maybe_compile_and_run`
-        // would start a walk into the yield `abort_permanent`. Non-generator
-        // drained callees still need the dispatch greens — they are first
-        // drained as callees (`get_jitcode` does not rebuild) and
-        // `ll_portal_runner` then keys the cell by a mid-prologue
-        // `next_instr` (RESUME's CACHE, or the first real opcode).
-        let publish_instruction_greens =
-            is_true_portal || !pyre_interpreter::pyframe::code_flags_make_generator(code.flags);
-        if publish_instruction_greens {
-            for py_pc in 0..code.instructions.len() {
-                if !is_python_instruction_start(code, py_pc) {
-                    continue;
-                }
-                // `interp_jit.py PyFrame.dispatch`: every instruction-start
-                // `next_instr` reaches the one `jit_merge_point`, including
-                // instructions whose case body emits no ops.
-                if dispatch_head_off.is_none()
-                    && first_jit_pc_by_py_pc
-                        .get(py_pc)
-                        .copied()
-                        .unwrap_or(usize::MAX)
-                        == usize::MAX
-                {
-                    continue;
-                }
-                trace_entry_pcs.push(py_pc);
+        // Every instruction-start green maps to the dispatch-loop head,
+        // generator bodies included (`interp_jit.py PyFrame.dispatch`).
+        for py_pc in 0..code.instructions.len() {
+            if !is_python_instruction_start(code, py_pc) {
+                continue;
             }
+            // `interp_jit.py PyFrame.dispatch`: every instruction-start
+            // `next_instr` reaches the one `jit_merge_point`, including
+            // instructions whose case body emits no ops.
+            trace_entry_pcs.push(py_pc);
         }
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();
@@ -18503,75 +17808,25 @@ impl CodeWriter {
                     )
                 })
         };
-        let merge_entry_by_green: Vec<(u32, u32)> = if let Some(loop_head_off) = dispatch_head_off {
-            // `interp_jit.py PyFrame.dispatch`: one loop head. Every
-            // instruction-start green maps to that head; `pc_first_insn_pos`
-            // still names the case body.
-            trace_entry_pcs
-                .into_iter()
-                .filter_map(|py_pc| {
-                    let covered = first_jit_pc_by_py_pc
-                        .get(py_pc..)
-                        .is_some_and(|tail| tail.iter().any(|&v| v != usize::MAX));
-                    if !covered {
-                        return None;
-                    }
-                    Some((py_pc as u32, loop_head_off as u32))
-                })
-                .collect()
-        } else {
-            let merge_pcs: Vec<usize> =
-                pyre_jit_trace::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
-                    .filter(|op| op.opname == "jit_merge_point")
-                    .map(|op| op.pc)
-                    .collect();
-            trace_entry_pcs
-                .into_iter()
-                .filter_map(|py_pc| {
-                    // A truncated body (an untranslatable opcode bakes
-                    // `abort_permanent` mid-function) emits no ops at-or-after a
-                    // later trace entry, yet the dense pc_map still hands that
-                    // py_pc the LAST marker by carry-forward.  Walking from such
-                    // a bogus entry re-reaches the abort marker, and the abort
-                    // flush rewinds the live frame to the marker's own py_pc —
-                    // re-executing bytecode the frame already ran (duplicate
-                    // side effects).  Cover only entries the body reaches.
-                    let covered = first_jit_pc_by_py_pc
-                        .get(py_pc..)
-                        .is_some_and(|tail| tail.iter().any(|&v| v != usize::MAX));
-                    if !covered {
-                        return None;
-                    }
-                    // The guard-resume marker of a true-portal PC is the op2
-                    // `-live-` after its `jit_merge_point`.  A trace entry is the
-                    // portal reaching that merge point instead (`pyjitpl.py`
-                    // `initialize_state_from_start`), so it starts at the PC's own
-                    // first op, before the merge point and its greens.  The
-                    // `-live-` ahead of that op is shared with the previous PC's
-                    // tail and back-translates to it.
-                    let off = resolve_marker(py_pc)?;
-                    let start = first_jit_pc_by_py_pc[py_pc];
-                    let merge_before_off = start != usize::MAX && {
-                        let i = merge_pcs.partition_point(|&pc| pc < start);
-                        i < merge_pcs.len() && merge_pcs[i] < off
-                    };
-                    let off = if merge_before_off {
-                        start
-                    } else if code_entry_pc == Some(py_pc) || loop_header_pcs.contains(&py_pc) {
-                        // Function entry and loop headers still publish the
-                        // resume marker when the merge sandwich is not between
-                        // first op and op2 (older layout / suppressed merge).
-                        off
-                    } else {
-                        // A body instruction without a merge sandwich is a
-                        // guard-resume coordinate, not a walk entry
-                        // (`pyjitpl.py initialize_state_from_start`).
-                        return None;
-                    };
-                    Some((py_pc as u32, off as u32))
-                })
-                .collect()
-        };
+        // `interp_jit.py PyFrame.dispatch`: one loop head. Every
+        // instruction-start green maps to that head; `pc_first_insn_pos`
+        // still names the case body.
+        let merge_entry_by_green: Vec<(u32, u32)> = dispatch_head_off
+            .map(|loop_head_off| {
+                trace_entry_pcs
+                    .into_iter()
+                    .filter_map(|py_pc| {
+                        let covered = first_jit_pc_by_py_pc
+                            .get(py_pc..)
+                            .is_some_and(|tail| tail.iter().any(|&v| v != usize::MAX));
+                        if !covered {
+                            return None;
+                        }
+                        Some((py_pc as u32, loop_head_off as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let loop_header_by_green: Vec<(u32, u32)> = merge_entry_by_green
             .iter()
             .copied()
@@ -18953,6 +18208,29 @@ impl CodeWriter {
                     resolve_marker(skipped)
                 },
             );
+            // Instruction-start `-live-` trivia is keyed by opcode py_pc.
+            // Head bytes use offset -1 and would floor to py 0; record the
+            // head's locals/stack coloring the same way so
+            // `pcdep_trivia_at` at the `jit_merge_point` names every live
+            // Ref (`setup_dispatch_loop`).
+            if !head_pcdep.is_empty() {
+                let head_ranges: Vec<(usize, usize, usize)> = dispatch_head_by_jit_pc
+                    .iter()
+                    .map(|&(start, end)| (start as usize, end as usize, 0))
+                    .collect();
+                Self::override_predecessor_twin_ranges(
+                    &mut pcdep_trivia_pred_by_jit_pc,
+                    &head_ranges,
+                    |_| head_pcdep.clone(),
+                );
+                for &(start, _) in &dispatch_head_by_jit_pc {
+                    Self::upsert_predecessor_twin(
+                        &mut pcdep_trivia_marker_by_jit_pc,
+                        start as usize,
+                        head_pcdep.clone(),
+                    );
+                }
+            }
         }
 
         // call.py `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -18990,7 +18268,6 @@ impl CodeWriter {
             py_floor_by_jit_pc,
             py_exact_by_jit_pc,
             abort_permanent_py_pc_by_jit_pc,
-            resume_entry_by_py_pc,
             merge_entry_by_green,
             loop_header_by_green,
             dispatch_switch_pc,
@@ -19282,13 +18559,11 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 /// de-conflated from true-portal-ness, every drained graph carries the Portal
 /// input shape, graph-side frame-vable dual-writes, and
 /// `interp_jit.py PyFrame.dispatch` (`blackhole.py bhimpl_jit_merge_point`
-/// inner `ll_portal_runner`): one loop-head `jit_merge_point` on a
-/// non-generator body, the unrolled per-instruction merge on a generator.
-/// `loop_header` is `jump_absolute` / `can_enter_jit` on every drained
-/// graph that already carries dispatch `jit_merge_point`. Extra
-/// `trace_entry_pcs` (every instruction start) follow that dispatch for
-/// non-generator bodies; generator bodies keep their portal-status gate in
-/// the trace-entry table so a yield resume cannot enter its abort marker.
+/// inner `ll_portal_runner`): one loop-head `jit_merge_point` on every
+/// drained graph, generator bodies included. `loop_header` is
+/// `jump_absolute` / `can_enter_jit` on every drained graph that already
+/// carries dispatch `jit_merge_point`. Extra `trace_entry_pcs` (every
+/// instruction start) follow that dispatch.
 /// `LOAD_CONST` and `LOAD_GLOBAL` no longer split: portal and non-portal both
 /// use the per-code body and live frame respectively.
 /// Per-helper walker emit sites feed compile-time-known operands directly per
@@ -19847,13 +19122,16 @@ mod tests {
         let merge = pyjit
             .merge_entry_for(pjif_target)
             .expect("drain-prefix green maps to the dispatch-loop head");
-        let merge_at_head = follow_trampoline(merge);
-        assert_eq!(
-            resolved, merge_at_head,
+        // The continue re-enters the head's `get_is_being_profiled` diamond
+        // (`interp_jit.py PyFrame.dispatch`), which precedes the merge join
+        // that `merge_entry_for` names.
+        assert!(
+            pyjit.metadata.dispatch_head_contains(resolved) && resolved < merge,
             "if n > want: false-edge must dispatch-continue to the loop head \
              (pjif_target={pjif_target}..=join_store={join_store_pc}); \
              resolved trampoline jit_pc={resolved} py={resolved_py:?} pjif_pc={pjif_pc} merge={merge}"
         );
+        let merge_at_head = follow_trampoline(merge);
         assert_eq!(
             continue_next_instr,
             Some(dispatch_case_pc(&code, pjif_target)),
@@ -20567,23 +19845,6 @@ mod tests {
             lasti_py_pc: 0,
             landing: landing.clone(),
         }
-    }
-
-    #[test]
-    fn protected_handler_prefix_uses_joined_eggblock_state() {
-        let graph = FunctionGraph::new("handler-prefix", Block::shared(Vec::new()), None);
-        let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-        let mut protected = synthetic_catch_site(&landing);
-        protected.handler_py_pc = 12;
-        protected.stack_depth = 2;
-
-        let mut empty_prefix = synthetic_catch_site(&landing);
-        empty_prefix.handler_py_pc = 20;
-
-        let sites = vec![protected, empty_prefix];
-        assert!(handler_entry_has_protected_prefix(&sites, 12));
-        assert!(!handler_entry_has_protected_prefix(&sites, 20));
-        assert!(!handler_entry_has_protected_prefix(&sites, 99));
     }
 
     fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {
@@ -22490,9 +21751,9 @@ mod tests {
 
     #[test]
     fn true_portal_merge_entry_covers_instruction_start_greens() {
-        // interp_jit.py PyFrame.dispatch: jit_merge_point before every
-        // handle_bytecode. warmstate.py maybe_compile_and_run keys the cell
-        // by next_instr, so a mid-function portal entry is a real green.
+        // interp_jit.py PyFrame.dispatch: one loop-head jit_merge_point.
+        // warmstate.py maybe_compile_and_run keys the cell by next_instr,
+        // so a mid-function portal entry is a real green.
         let code = first_nested_function_code(
             "def rec(n):\n    if n <= 1:\n        return n\n    return rec(n - 1) + n\n",
         );
@@ -22596,13 +21857,13 @@ mod tests {
     }
 
     #[test]
-    fn generator_body_does_not_publish_first_resume_as_function_entry() {
-        // `warmstate.py maybe_compile_and_run` keys the cell on `next_instr`.
-        // An unstarted generator's `PyFrame.next_instr` is
+    fn generator_body_maps_first_resume_green_to_dispatch_head() {
+        // `interp_jit.py PyFrame.dispatch`: every instruction-start green
+        // maps to the dispatch-loop head, generator bodies included.
+        // `warmstate.py maybe_compile_and_run` keys the cell on
+        // `next_instr`. An unstarted generator's `PyFrame.next_instr` is
         // `after_return_generator_index` (the `POP_TOP` after
-        // `RETURN_GENERATOR`). That resume pc is not the portal function
-        // entry; the body is crossed through the caller and the generator's
-        // own loop header (`should_unroll_one_iteration`).
+        // `RETURN_GENERATOR`).
         let code = first_nested_function_code(
             "def gen(n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\n",
         );
@@ -22629,28 +21890,29 @@ mod tests {
         let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
-        // Callee graph, matching a generator body under `get_jitcode`:
-        // not a portal registration (`publish_instruction_greens` stays
-        // off). `warmstate.py maybe_compile_and_run` still needs
-        // `merge_entry_for` at the first-resume pc to open a cell.
         let pyjit = writer
             .transform_graph_to_jitcode(code)
             .expect("generator body must produce a jitcode");
         assert!(pyjit.jitcode.jitdriver_sd().is_none());
-        let greens: Vec<u32> = pyjit
-            .metadata
-            .merge_entry_by_green
-            .iter()
-            .map(|&(py, _)| py)
-            .collect();
-        assert!(
-            !greens.contains(&(first_resume as u32)),
-            "first-resume pc must not be a function-entry green, got {greens:?}"
-        );
+        let resume_entry = pyjit
+            .merge_entry_for(first_resume)
+            .expect("first-resume pc must map to the dispatch-loop head");
+        for py_pc in 0..code.instructions.len() {
+            if !is_python_instruction_start(code, py_pc) {
+                continue;
+            }
+            if let Some(entry) = pyjit.merge_entry_for(py_pc) {
+                assert_eq!(
+                    entry, resume_entry,
+                    "instruction-start green {py_pc} must map to the dispatch-loop head"
+                );
+            }
+        }
         for header in &headers {
-            assert!(
-                pyjit.merge_entry_for(*header).is_some(),
-                "loop header {header} must stay a merge green, got {greens:?}"
+            assert_eq!(
+                pyjit.merge_entry_for(*header),
+                Some(resume_entry),
+                "loop header {header} must map to the dispatch-loop head"
             );
         }
     }
@@ -22705,29 +21967,20 @@ mod tests {
                 pyjit.metadata.abort_permanent_py_pc_by_jit_pc
             );
         }
-        assert_eq!(
-            pyjit.metadata.resume_entry_by_py_pc.len(),
-            yield_pcs.len(),
-            "one resume prelude per yield, entries={:?} yield_pcs={yield_pcs:?}",
-            pyjit.metadata.resume_entry_by_py_pc
-        );
+        let Some(head) = (0..code.instructions.len()).find_map(|py_pc| {
+            if !is_python_instruction_start(code, py_pc) {
+                return None;
+            }
+            pyjit.merge_entry_for(py_pc)
+        }) else {
+            panic!("generator body must publish a dispatch-loop head");
+        };
         for &ypc in &yield_pcs {
             let resume_pc = ypc + 1;
-            let entry = pyjit
-                .metadata
-                .resume_entry_by_py_pc
-                .iter()
-                .find(|&&(py, _)| py as usize == resume_pc);
-            let Some(&(_, off)) = entry else {
-                panic!(
-                    "missing resume entry for yield pc {ypc} -> {resume_pc}, entries={:?}",
-                    pyjit.metadata.resume_entry_by_py_pc
-                );
-            };
             assert_eq!(
-                pyjit.first_op_offset(resume_pc),
-                Some(off as usize),
-                "first_op_offset({resume_pc}) must be the resume prelude"
+                pyjit.merge_entry_for(resume_pc),
+                Some(head),
+                "merge_entry_for({resume_pc}) must be the dispatch-loop head"
             );
         }
     }

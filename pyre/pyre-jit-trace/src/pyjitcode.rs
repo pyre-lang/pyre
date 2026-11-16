@@ -119,21 +119,15 @@ pub struct PyJitCodeMetadata {
     /// are decided on per frame by `loop_body_abort_permanent_pc`, so they get
     /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
-    /// Yield resume continuation: Python pc (`last_instr + 1`) → first
-    /// jitcode offset of the frame-reload prelude
-    /// (`interp_jit.py` `dispatch` `except Yield`,
-    /// `tweak_generator_body_graph`). Empty for skeleton / fixture metadata.
-    pub resume_entry_by_py_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. True-portal jitcode (`interp_jit.py PyFrame.dispatch`)
-    /// keys every instruction-start green; a non-generator body maps them
-    /// all to the one dispatch-loop head, and a generator body keeps the
-    /// unrolled per-instruction merge. PyPy's JitCell is keyed by greens
-    /// including `next_instr`. Non-portal jitcodes keep function entry plus
-    /// loop headers. Built at codewrite time; not a general py_pc → jitcode
-    /// inverse (an `abort_permanent` truncated body must not publish a
-    /// carry-forward marker as an entry). At portal entry `pyjitpl.py`
-    /// `opimpl_jit_merge_point` sets the live frame PC to the
+    /// keys every instruction-start green and maps them all to the one
+    /// dispatch-loop head, generator bodies included. PyPy's JitCell is keyed
+    /// by greens including `next_instr`. Non-portal jitcodes keep function
+    /// entry plus loop headers. Built at codewrite time; not a general
+    /// py_pc → jitcode inverse (an `abort_permanent` truncated body must not
+    /// publish a carry-forward marker as an entry). At portal entry
+    /// `pyjitpl.py` `opimpl_jit_merge_point` sets the live frame PC to the
     /// `jit_merge_point` origin before handling the opcode; pyre's
     /// whole-function JitCode has one corresponding entry per materialized
     /// trace-entry green. Sorted ascending by green py_pc for binary search;
@@ -143,17 +137,16 @@ pub struct PyJitCodeMetadata {
     /// py_pc is in `find_loop_header_pcs` (`interp_jit.py`
     /// `PyFrame.jump_absolute` / `can_enter_jit`). True-portal
     /// `merge_entry_by_green` also lists every instruction-start
-    /// (`PyFrame.dispatch`); a non-generator body maps those greens to
-    /// the one loop head, so consumers that want a loop header
-    /// (`first_loop_header_merge_point`, `loop_body_abort_permanent_pc`)
-    /// must not scan that dense table for distinct offsets. Empty for
-    /// skeleton / fixture metadata.
+    /// (`PyFrame.dispatch`) mapped to the one loop head, so consumers that
+    /// want a loop header (`first_loop_header_merge_point`,
+    /// `loop_body_abort_permanent_pc`) must not scan that dense table for
+    /// distinct offsets. Empty for skeleton / fixture metadata.
     pub loop_header_by_green: Vec<(u32, u32)>,
     /// Assembled jitcode pc of the dispatch-loop `switch` on the
     /// `next_instr` green (`interp_jit.py PyFrame.dispatch`,
-    /// `flatten.py insert_switch_exits`). `None` for a generator body
-    /// (unrolled per-instruction merges) and for a single-case dispatch
-    /// that links the head straight to its only opcode.
+    /// `flatten.py insert_switch_exits`). `None` for a single-case dispatch
+    /// that links the head straight to its only opcode, and for skeleton /
+    /// fixture metadata.
     pub dispatch_switch_pc: Option<usize>,
     /// Sorted, disjoint `[start, end)` JitCode byte ranges of the shared
     /// dispatch-loop head (`interp_jit.py PyFrame.dispatch`): the
@@ -161,8 +154,8 @@ pub struct PyJitCodeMetadata {
     /// `valuestackdepth` promote, the `last_instr` store, the
     /// `bytecode_only_trace` arm (`pyopcode.py dispatch_bytecode`) and the
     /// `switch`. These bytes belong to no single opcode: the instruction
-    /// they run for is the `next_instr` green the head carries. Empty for a
-    /// generator body and for skeleton / fixture metadata.
+    /// they run for is the `next_instr` green the head carries. Empty for
+    /// skeleton / fixture metadata.
     pub dispatch_head_by_jit_pc: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
@@ -578,11 +571,10 @@ impl PyJitCodePayload {
     /// The `jit_merge_point` of the first loop header in code order.
     ///
     /// True-portal `merge_entry_by_green` lists every instruction start
-    /// (`interp_jit.py PyFrame.dispatch`); a non-generator body maps them
-    /// all to the one loop head, so the first non-entry green is not a
-    /// distinct offset.  The header table is the `find_loop_header_pcs`
-    /// subset persisted next to it (`PyFrame.jump_absolute` /
-    /// `can_enter_jit`).
+    /// (`interp_jit.py PyFrame.dispatch`) mapped to the one loop head, so
+    /// the first non-entry green is not a distinct offset.  The header
+    /// table is the `find_loop_header_pcs` subset persisted next to it
+    /// (`PyFrame.jump_absolute` / `can_enter_jit`).
     pub fn first_loop_header_merge_point(&self) -> Option<usize> {
         self.metadata
             .loop_header_by_green
@@ -917,12 +909,10 @@ impl PyJitCode {
     /// JitCode `-live-` offset a walk of this body enters at to resume at
     /// `py_pc`.
     ///
-    /// `merge_entry_for` cannot answer a generator resume coordinate:
-    /// `merge_entry_by_green` is `find_loop_header_pcs` plus function entry.
-    /// A yield is a return plus a resume continuation (`interp_jit.py`
-    /// `dispatch` `except Yield`, `tweak_generator_body_graph`);
-    /// `first_op_offset` prefers that continuation when
-    /// `resume_entry_by_py_pc` has the pc.
+    /// `resume_execute_frame` starts at `next_instr()`, the first op of that
+    /// Python pc. `first_op_offset` is the instruction start `dispatch` would
+    /// enter. `derive_resume_marker` answers the block-head `-live-`
+    /// at-or-before that first op.
     pub fn resume_marker_offset(&self, py_pc: usize) -> Option<usize> {
         let metadata = &self.metadata;
         if metadata.block_head_py_by_jit_pc.is_empty() {
@@ -943,32 +933,11 @@ impl PyJitCode {
     /// bytecode that reads the exception from the frame
     /// (`PUSH_EXC_INFO` `getarrayitem_vable_r`).
     pub fn first_op_offset(&self, py_pc: usize) -> Option<usize> {
-        if let Some(off) = self.resume_entry_for(py_pc) {
-            return Some(off);
-        }
         let first_op_by_py_pc = self.first_op_by_py_pc()?;
         if py_pc >= first_op_by_py_pc.len() {
             return None;
         }
         derive_first_op(&first_op_by_py_pc, py_pc)
-    }
-
-    /// Jitcode offset of the yield-resume prelude at `py_pc`, if this body
-    /// published one (`resume_entry_by_py_pc`).
-    pub fn resume_entry_for(&self, py_pc: usize) -> Option<usize> {
-        self.metadata
-            .resume_entry_by_py_pc
-            .iter()
-            .find(|&&(py, _)| py as usize == py_pc)
-            .map(|&(_, off)| off as usize)
-    }
-
-    /// Whether `offset` is a published yield-resume prelude start.
-    pub fn is_resume_entry_offset(&self, offset: usize) -> bool {
-        self.metadata
-            .resume_entry_by_py_pc
-            .iter()
-            .any(|&(_, off)| off as usize == offset)
     }
 
     fn first_op_by_py_pc(&self) -> Option<Vec<usize>> {
@@ -1001,8 +970,7 @@ impl PyJitCode {
     /// generic `last_exc_value` landing (`flatten.py` `generate_last_exc`
     /// only appears on an exception link raised inside the same trace).
     pub fn function_entry_for(&self, py_pc: usize) -> Option<usize> {
-        self.resume_entry_for(py_pc)
-            .or_else(|| self.merge_entry_for(py_pc))
+        self.merge_entry_for(py_pc)
             .or_else(|| self.first_op_offset(py_pc))
     }
     /// Predecessor index into a jitcode-pc twin — the entry
@@ -1504,7 +1472,6 @@ impl PyJitCodeMetadata {
             py_floor_by_jit_pc: Vec::new(),
             py_exact_by_jit_pc: Vec::new(),
             abort_permanent_py_pc_by_jit_pc: Vec::new(),
-            resume_entry_by_py_pc: Vec::new(),
             merge_entry_by_green: Vec::new(),
             loop_header_by_green: Vec::new(),
             dispatch_switch_pc: None,
@@ -1553,8 +1520,7 @@ impl PyJitCodeMetadata {
     ///
     /// `dispatch_switch_pc` is the assembled `switch` on `next_instr`. A
     /// single-case body has no switch and still maps every green onto the
-    /// same head offset in `merge_entry_by_green`. Generator bodies keep
-    /// distinct per-instruction merge offsets, so they stay false.
+    /// same head offset in `merge_entry_by_green`.
     pub fn has_shared_dispatch_merge(&self) -> bool {
         if self.dispatch_switch_pc.is_some() {
             return true;
@@ -1618,7 +1584,7 @@ mod tests {
         assert_ne!(pjc.first_loop_header_merge_point(), first_insn);
         assert!(
             !pjc.metadata.has_shared_dispatch_merge(),
-            "distinct merge offsets are the unrolled generator / per-instruction shape"
+            "distinct merge offsets are not a shared dispatch-loop head"
         );
     }
 

@@ -15312,7 +15312,6 @@ mod tests {
                 py_floor_by_jit_pc: Vec::new(),
                 py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
-                resume_entry_by_py_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
                 dispatch_switch_pc: None,
