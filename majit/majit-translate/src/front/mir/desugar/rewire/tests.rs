@@ -755,10 +755,7 @@ fn option_ok_or_else_merged_return_has_no_undefined_link_args() {
 /// leave a deleted op result on `Link.args` (`FreshMallocs`).
 #[test]
 fn orig_parse_format_link_args_are_defined() {
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = majit_charon_reader::Llbc::load(path).unwrap_or_else(|err| {
-        panic!("{path} is missing or unreadable; run `python3 scripts/extract-llbc.py`: {err}")
-    });
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
     let spec = crate::ErrorCarrierSpec {
         carrier_path: "pyre_interpreter::error::PyError",
         carrier_class: "",
@@ -771,8 +768,8 @@ fn orig_parse_format_link_args_are_defined() {
     } else {
         "parse_format"
     };
-    let graph = crate::front::mir::lower_function_with_static_addrs(
-        &llbc,
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
         name,
         crate::HostStaticAddrs {
             error_carrier: spec,
@@ -1712,12 +1709,11 @@ fn producer_is_bare_fn_path(graph: &FunctionGraph, v: &Variable) -> bool {
 /// rebuilt `Err` (`annrpython.py` `mergeinputargs` / `unionof`).
 #[test]
 fn format_obj_name_and_then_join_is_a_result() {
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
         return;
-    }
-    let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    };
     let spec = crate::ErrorCarrierSpec {
         carrier_path: "pyre_interpreter::error::PyError",
         carrier_class: "",
@@ -1726,8 +1722,8 @@ fn format_obj_name_and_then_join_is_a_result() {
         from_exc_object: Some(("PyError", "from_exc_object")),
     };
     let name = "pyre_interpreter::error::format_obj_name";
-    let graph = crate::front::mir::lower_function_with_static_addrs(
-        &llbc,
+    let graph = crate::test_support::lower_function_with_static_addrs(
+        llbc,
         name,
         crate::HostStaticAddrs {
             error_carrier: spec,

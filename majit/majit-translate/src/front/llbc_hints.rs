@@ -1993,15 +1993,15 @@ mod tests {
 
     #[test]
     fn colliding_impl_new_marker_stays_on_the_decorated_owner() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/llbc/pyre-interpreter.ullbc"
-        );
-        if !std::path::Path::new(path).is_file() {
+        let Some(llbc) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+        ) else {
             return;
-        }
-        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
-        let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        };
+        crate::test_support::ensure_link_baseline(llbc);
+        let harvested = crate::test_support::with_llbc_link_read(std::iter::once(llbc), || {
+            super::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+        });
         let locals_root = harvested.get("pyframe::FrameLocalsRoot::new");
         assert!(
             locals_root.is_some_and(|hints| hints.iter().any(|h| h == "dont_look_inside")),
