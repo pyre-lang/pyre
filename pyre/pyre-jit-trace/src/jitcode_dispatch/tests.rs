@@ -34984,3 +34984,62 @@ fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
          virtualizable_boxes (`_opimpl_setfield_vable`)",
     );
 }
+
+/// Variable-exponent `int_pow_nomod` residualizes (`look_inside_iff` is
+/// false). The overflow `catch_exception` of `descr_pow` must stay a
+/// blackhole-runnable helper section so `GUARD_NO_EXCEPTION` numbers the
+/// helper (`capture_resumedata`) instead of collapsing to the portal CALL
+/// (`numbered_helper_guard_resume` CallerBoundary).
+#[test]
+fn int_pow_overflow_catch_does_not_collapse_guard_no_exception() {
+    let jc = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::objspace::descroperation::int_pow",
+    )
+    .expect("int_pow must be a discovered jitcode");
+    let idx = jc.try_index().expect("int_pow must have a jitcode index");
+    for reloc in &jc.reloc_consts_i {
+        if let majit_jitcode::jitcode::ConstIRelocKind::FnAddr { path, symbolic } = &reloc.kind {
+            assert!(
+                !(path.ends_with("::pow_ovf2long") && *symbolic),
+                "pow_ovf2long residual must be callable; got {path}"
+            );
+        }
+    }
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
+    let mut caught_calls = 0usize;
+    for (n, op) in ops.iter().enumerate() {
+        if !op.opname.starts_with("inline_call") && !op.opname.starts_with("residual_call") {
+            continue;
+        }
+        let live = ops
+            .iter()
+            .skip(n + 1)
+            .find(|o| o.opname == "live")
+            .map(|o| o.pc)
+            .unwrap_or(op.next_pc);
+        let Some(next) = ops.iter().skip(n + 1).find(|o| o.opname != "live") else {
+            continue;
+        };
+        if next.opname != "catch_exception" {
+            continue;
+        }
+        caught_calls += 1;
+        assert!(
+            !super::inline_call::helper_resume_reaches_blocker(idx, live, None),
+            "{}@{} live={} must not collapse GuardNoException to the CALL; ops={:?}",
+            op.opname,
+            op.pc,
+            live,
+            ops.iter()
+                .map(|o| format!("{}@{}", o.opname, o.pc))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(
+        caught_calls > 0,
+        "int_pow must catch a can-raise call (int_pow_nomod); ops={:?}",
+        ops.iter()
+            .map(|o| format!("{}@{}", o.opname, o.pc))
+            .collect::<Vec<_>>(),
+    );
+}

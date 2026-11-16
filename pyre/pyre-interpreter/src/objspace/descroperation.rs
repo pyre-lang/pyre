@@ -2074,6 +2074,8 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `descr_pow` with the original exponent object.
 /// `call.py CallControl.get_jitcode_calldescr` publishes the native
 /// function pointer the blackhole's `inline_call` invokes.
+/// `_pow_ovf2long` has no `@jit.dont_look_inside`; the body is looked
+/// inside so a variable-exponent overflow catch stays a helper section.
 #[majit_macros::getfunctionptr]
 unsafe fn pow_ovf2long(iv: i64, w_iw: PyObjectRef) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
