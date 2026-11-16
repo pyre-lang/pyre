@@ -4107,15 +4107,11 @@ impl IterOpcodeHandler for PyFrame {
         match pyre_object::with_roots!(iter, self_ref => crate::baseobjspace::next(iter)) {
             Ok(result) => Ok(Some(result)),
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(iter);
-                let (stop, mut e) = e.matches_stop_iteration_keep();
+                let (stop, mut e) =
+                    pyre_object::with_roots!(iter, self_ref => e.matches_stop_iteration_keep());
                 if stop {
-                    unsafe { &mut *(self_ref as *mut PyFrame) }._report_stopiteration_sometimes(
-                        pyre_object::gc_roots::shadow_stack_get(iter_slot),
-                        &mut e,
-                    )?;
+                    unsafe { &mut *(self_ref as *mut PyFrame) }
+                        ._report_stopiteration_sometimes(iter, &mut e)?;
                     Ok(None)
                 } else {
                     Err(e)

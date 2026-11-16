@@ -10818,7 +10818,8 @@ macro_rules! unicode_error_descr_new_gateway {
 
         #[inline(never)]
         unsafe fn $body(w_subtype: PyObjectRef, $($item: PyObjectRef),+) -> PyObjectRef {
-            let args_w = $args_w($($item),+);
+            let mut w_subtype = w_subtype;
+            let args_w = pyre_object::with_roots!(w_subtype => $args_w($($item),+));
             pyre_object::interp_exceptions::$allocate(w_subtype, args_w)
         }
 

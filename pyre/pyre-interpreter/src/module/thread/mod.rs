@@ -2009,18 +2009,19 @@ fn call_thread_target(
     if unsafe { crate::is_function(target) } {
         let mut mixed = args;
         let mut names = pyre_object::gc_roots::RootedItems::new();
+        names.push(target);
         for (name, value) in entries {
             mixed.push(value);
             names.push(w_str_new_managed(&name));
         }
-        let kwarg_names = w_tuple_new(names.take());
+        let kwarg_names = w_tuple_new((1..names.len()).map(|i| names.get(i)).collect());
         // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
         // can collect. `target` is passed to
         // `call_user_function_plain_with_ctx` afterwards, so publish it with
         // the mixed arguments and the kwnames tuple and read it back.
         let n_mixed = mixed.len();
         let roots = pyre_object::gc_roots::push_roots();
-        let head = roots.publish(&[target, kwarg_names]);
+        let head = roots.publish(&[names.get(0), kwarg_names]);
         let mixed_base = roots.publish(&mixed);
         roots.normalize(head, 2 + n_mixed);
         let mixed_now: Vec<PyObjectRef> = (0..n_mixed).map(|i| roots.get(mixed_base + i)).collect();
@@ -3066,9 +3067,14 @@ crate::py_module! {
             );
             crate::__pyre_store!(ns, "start_joinable_thread", function);
         }
+        // extra_init's `ns` is a copy of the outer pin; publish it into the
+        // same `_root_scope` so the collecting defaults helper cannot move it.
+        let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        ns = pyre_object::gc_roots::pin_root(ns);
         for name in ["start_new_thread", "start_new"] {
             if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
                 function = crate::gateway::function_set_null_positional_defaults(function, 1);
+                ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
                 crate::__pyre_store!(ns, name, function);
             }
         }

@@ -625,9 +625,14 @@ fn name_matches_hook_wrapper(name: &str, pat: &str) -> bool {
     name_matches_seed(name, pat) || name.contains(&format!("::{pat}::"))
 }
 
+/// Last `::` segment after dropping a `#…` specialization suffix.
+///
+/// Charon records a spec as `name#0=…`; that suffix can itself contain `::`.
+/// Strip the first `#` first so last-segment matchers still see the helper
+/// `CollectAnalyzer.analyze_simple_operation` would classify.
 fn name_last_segment(name: &str) -> &str {
-    let last = name.rsplit("::").next().unwrap_or(name);
-    last.split('#').next().unwrap_or(last)
+    let without_spec = name.split_once('#').map(|(base, _)| base).unwrap_or(name);
+    without_spec.rsplit("::").next().unwrap_or(without_spec)
 }
 
 /// `lltype.malloc` typed helpers that still call their allocation hook;
@@ -2925,6 +2930,10 @@ mod tests {
                         "alloc_nursery_typed#0=GcType<WIntObject>"
                     ]),
                     opaque(4, &["majit_gc", "alloc_nursery_typed_with_placement"]),
+                    opaque(5, &[
+                        "majit_gc",
+                        "alloc_nursery_typed#0=some_crate::GcType<some_crate::WIntObject>"
+                    ]),
                 ],
                 "global_decls": [],
                 "trait_decls": [],
@@ -2972,6 +2981,38 @@ mod tests {
             collecting.contains(&2),
             "collecting twin must remain a collecting seed: {collecting:?}"
         );
+        assert!(
+            host.contains(&5),
+            "nursery spec with `::` in the suffix must be a host-malloc id: {host:?}"
+        );
+        assert!(
+            !collecting.contains(&5),
+            "nursery spec with `::` in the suffix must not be a collecting seed: {collecting:?}"
+        );
+    }
+
+    /// `#…` instantiation suffixes can contain `::`; last-segment matchers
+    /// strip that suffix first so they still see the helper name
+    /// `CollectAnalyzer.analyze_simple_operation` would classify.
+    #[test]
+    fn name_last_segment_strips_spec_suffix_before_path() {
+        assert!(name_is_fixedsize_gc_malloc(
+            "majit_gc::alloc_nursery_typed#0=some_crate::GcType<some_crate::WIntObject>"
+        ));
+        assert!(name_is_fixedsize_gc_malloc(
+            "majit_gc::alloc_oldgen_typed#0=some_crate::GcType<some_crate::WIntObject>"
+        ));
+        assert!(!name_is_fixedsize_gc_malloc(
+            "majit_gc::alloc_nursery_collecting_typed#0=a::B"
+        ));
+        assert!(!name_is_fixedsize_gc_malloc(
+            "majit_gc::alloc_nursery_typed_with_placement#0=a::B"
+        ));
+        assert!(name_is_typed_malloc_helper(
+            "pyre_object::lltype::malloc_typed#0=a::b::C<d::E>"
+        ));
+        assert_eq!(name_last_segment("a::b::c"), "c");
+        assert_eq!(name_last_segment("a::f#0=x::y"), "f");
     }
 
     /// A `core::convert` `into` template whose body is a Trait call

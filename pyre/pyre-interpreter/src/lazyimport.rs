@@ -1778,7 +1778,7 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let mut globals = scope[1];
     let mut locals = scope[2];
     let mut fromlist = if scope[3].is_null() {
-        w_tuple_new(Vec::new())
+        pyre_object::with_roots!(name, globals, locals => w_tuple_new(Vec::new()))
     } else {
         scope[3]
     };

@@ -1794,11 +1794,16 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
         if data.is_empty() {
             let w_bytes =
                 pyre_interpreter::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
+            let bytes_type_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_bytes);
             let w_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
             return save_reduce(
                 ctx,
                 buf,
-                &[w_bytes, w_args],
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(bytes_type_slot),
+                    w_args,
+                ],
                 Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
             );
         }
@@ -2262,6 +2267,8 @@ fn save_bytearray(
         let _ = pyre_object::gc_roots::pin_root(w_obj);
         let w_bytearray_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_bytearray_type);
         let owned = copy_pinned_bytearray(obj_slot);
         let w_args = if owned.is_empty() {
             pyre_object::tupleobject::w_tuple_new(Vec::new())
@@ -2275,7 +2282,7 @@ fn save_bytearray(
         return save_reduce(
             ctx,
             buf,
-            &[w_bytearray_type, w_args],
+            &[pyre_object::gc_roots::shadow_stack_get(type_slot), w_args],
             Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
         );
     }
@@ -3382,9 +3389,11 @@ fn extension_code(module_name: &str, name: &str) -> Option<i64> {
     let registry =
         pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_registry").ok()?;
     let mut key_items = pyre_object::gc_roots::RootedItems::new();
+    key_items.push(registry);
     key_items.push(pyre_object::w_str_new_managed(module_name));
     key_items.push(pyre_object::w_str_new_managed(name));
-    let key = pyre_object::tupleobject::w_tuple_new(key_items.take());
+    let key = pyre_object::tupleobject::w_tuple_new(vec![key_items.get(1), key_items.get(2)]);
+    let registry = key_items.get(0);
     let code = unsafe { pyre_object::w_dict_lookup(registry, key) }?;
     pyre_interpreter::baseobjspace::int_w(code).ok()
 }

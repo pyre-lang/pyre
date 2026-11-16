@@ -6669,6 +6669,14 @@ pub fn new_exception_class(
     // this frame's copy of the pointer behind, the way `alloc_dict_object`
     // re-reads `dstorage` across its header malloc.
     let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = match w_dict {
+        Some(w_dict) => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _roots.pin_root(w_dict);
+            Some(slot)
+        }
+        None => None,
+    };
     let w_bases = match w_bases {
         None => pyre_object::w_tuple_new(vec![crate::typedef::gettypeobject(
             &pyre_object::interp_exceptions::EXC_EXCEPTION_TYPE,
@@ -6682,8 +6690,14 @@ pub fn new_exception_class(
     };
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_bases);
-    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = _roots.pin_root(w_dict.unwrap_or_else(pyre_object::w_dict_new));
+    let dict_slot = match dict_slot {
+        Some(slot) => slot,
+        None => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _roots.pin_root(pyre_object::w_dict_new());
+            slot
+        }
+    };
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(pyre_object::w_str_new_managed(name));
     let args = [

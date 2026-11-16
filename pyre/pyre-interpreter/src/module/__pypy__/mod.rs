@@ -351,12 +351,16 @@ crate::py_module! {
         "newmemoryview" / * = interp_buffer::newmemoryview; crate::Signature::new(vec!["buf", "itemsize", "format", "shape", "strides"], None, None, 0, 0),
     },
     extra_init: |ns| {
+        let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        ns = pyre_object::gc_roots::pin_root(ns);
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "move_to_end") } {
             function = crate::gateway::function_set_null_positional_defaults(function, 1);
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
             crate::__pyre_store!(ns, "move_to_end", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "newmemoryview") } {
             function = crate::gateway::function_set_null_positional_defaults(function, 2);
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
             crate::__pyre_store!(ns, "newmemoryview", function);
         }
         // Mark as a package so `from __pypy__.builders import ...`
