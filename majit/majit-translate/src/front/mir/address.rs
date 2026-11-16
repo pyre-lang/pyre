@@ -366,8 +366,9 @@ fn residual_scalar_ref_callee(
     fd: &FunDecl,
     dont_look_inside: &std::collections::HashSet<String>,
     oopspec_fns: &OopspecFns<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
-    fun_decl_is_residual(llbc, fd, dont_look_inside)
+    fun_decl_is_residual_callee(llbc, fd, dont_look_inside, struct_fields)
         && !fun_decl_has_oopspec(fd, oopspec_fns)
         && !is_inlined_mem_exchange_path(fd.item_meta.name_path_str())
 }
@@ -380,6 +381,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
     forward: &[bool],
     dont_look_inside: &std::collections::HashSet<String>,
     oopspec_fns: &OopspecFns<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> CellScalarPlan {
     let n_locals = body.locals.locals.len();
     let mut locals = bit_set::BitSet::with_capacity(n_locals);
@@ -405,7 +407,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
         let residual_ref_callee =
-            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns);
+            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns, struct_fields);
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref =
                 residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
@@ -632,6 +634,7 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
     forward: &[bool],
     dont_look_inside: &std::collections::HashSet<String>,
     oopspec_fns: &OopspecFns<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
     cell_locals: &bit_set::BitSet,
 ) -> Vec<FunctionScopeCellPlan> {
     let mut out = Vec::new();
@@ -656,7 +659,7 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
         let residual_ref_callee =
-            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns);
+            residual_scalar_ref_callee(llbc, fd, dont_look_inside, oopspec_fns, struct_fields);
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref =
                 residual_ref_callee && declared_residual_scalar_ref(declared, llbc, gc_struct_ids);
@@ -1908,8 +1911,13 @@ impl<'a> Lowering<'a> {
         let inputs = subst_inputs
             .as_deref()
             .unwrap_or(fd.signature.inputs.as_slice());
-        let residual_ref_callee =
-            residual_scalar_ref_callee(self.llbc, fd, self.dont_look_inside, &self.oopspec_fns);
+        let residual_ref_callee = residual_scalar_ref_callee(
+            self.llbc,
+            fd,
+            self.dont_look_inside,
+            &self.oopspec_fns,
+            self.struct_fields,
+        );
         let mut spills = Vec::new();
         for (index, declared) in inputs.iter().enumerate() {
             let residual_ref = residual_ref_callee

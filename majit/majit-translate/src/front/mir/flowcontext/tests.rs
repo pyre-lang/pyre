@@ -14174,20 +14174,23 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
     let mut dont_look_inside = std::collections::HashSet::new();
     dont_look_inside.insert("marked".to_string());
-    assert!(!super::fun_decl_is_residual(
+    assert!(!super::fun_decl_is_residual_callee(
         &llbc,
         llbc.fn_by_id(0).unwrap(),
-        &dont_look_inside
+        &dont_look_inside,
+        None
     ));
-    assert!(super::fun_decl_is_residual(
+    assert!(super::fun_decl_is_residual_callee(
         &llbc,
         llbc.fn_by_id(1).unwrap(),
-        &dont_look_inside
+        &dont_look_inside,
+        None
     ));
-    assert!(super::fun_decl_is_residual(
+    assert!(super::fun_decl_is_residual_callee(
         &llbc,
         llbc.fn_by_id(2).unwrap(),
-        &dont_look_inside
+        &dont_look_inside,
+        None
     ));
 
     let subject: super::Unstructured = serde_json::from_value(serde_json::json!({

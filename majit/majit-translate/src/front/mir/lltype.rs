@@ -13158,16 +13158,6 @@ pub(in crate::front::mir) fn fun_decl_is_dont_look_inside(
     crate::front::llbc_hints::fun_decl_has_harvested_hint(llbc, fd, dont_look_inside)
 }
 
-/// A callee reached through its real Rust ABI. It has no unstructured
-/// body to enter, or its path is in `dont_look_inside`.
-pub(in crate::front::mir) fn fun_decl_is_residual(
-    llbc: &Llbc,
-    fd: &FunDecl,
-    dont_look_inside: &std::collections::HashSet<String>,
-) -> bool {
-    !fd.has_unstructured_body() || fun_decl_is_dont_look_inside(llbc, fd, dont_look_inside)
-}
-
 pub(in crate::front::mir) fn gc_mut_ref_param_locals(
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,

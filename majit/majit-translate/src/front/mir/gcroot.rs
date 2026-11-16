@@ -1096,9 +1096,7 @@ impl<'a> Lowering<'a> {
         // local crate is an import of a graph that crate's artefact
         // carries; one of this artefact's own crate has no graph
         // (`extfunc.py`).
-        if !fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside)
-            && fun_decl_has_body_in_loaded_crate(fd, self.struct_fields, self.llbc)
-        {
+        if !fun_decl_is_residual_callee(self.llbc, fd, self.dont_look_inside, self.struct_fields) {
             return Ok(());
         }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
