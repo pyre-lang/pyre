@@ -25,11 +25,11 @@
 //! # GIL disabled
 //!
 //! [`crate::rgil::disable_gil`] turns on a second process mode. [`gc_op`]
-//! then takes a process-wide leaf lock ([`GcSync::gc_lock`]). A collector
-//! never waits for quiescence while holding that lock: [`quiesce_mutators`]
-//! releases it across the `quiesced` wait. Two concurrent collection
-//! requests: the loser parks as an ordinary mutator and the returned
-//! [`StwGuard`] reports [`StwGuard::superseded`].
+//! then takes a process-wide leaf lock ([`GcSync::gc_lock`]). Collecting
+//! operations take the stop-the-world before they borrow the collector
+//! ([`gc_op_stw`]); `gc_lock` is never held across a wait. A thread that
+//! asks for STW while another request is in flight parks as an ordinary
+//! mutator and then becomes the owner ([`quiesce_mutators_owned`]).
 //!
 //! # Design
 //!
@@ -103,8 +103,8 @@ pub struct GcSync {
     stw_generation: AtomicUsize,
     /// Leaf lock for [`gc_op`] when the GIL is disabled. Ordinary operations
     /// take it, run, and release. The stop-the-world owner already has
-    /// exclusive access and takes nothing. Released across the quiescence
-    /// wait: a thread blocked on this lock is not at a safepoint.
+    /// exclusive access and takes nothing. Never held across a wait:
+    /// collecting operations acquire STW first ([`gc_op_stw`]).
     gc_lock: RawMutex,
 }
 
@@ -178,6 +178,24 @@ pub(crate) fn singleton_finalizer_queues() -> Option<&'static FinalizerQueueTabl
 #[inline]
 pub fn is_initialized() -> bool {
     GC_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Whether `ptr` is the process singleton collector.
+///
+/// Address compare only: [`store_singleton`] publishes the Box once and
+/// never moves or replaces it. No TLS and no side table.
+#[inline]
+pub(crate) fn is_singleton(ptr: *const MiniMarkGC) -> bool {
+    if !GC_INITIALIZED.load(Ordering::Acquire) {
+        return false;
+    }
+    // SAFETY: `GC_INITIALIZED` is released only after the Box is stored,
+    // and the singleton lives for the process.
+    let stored = unsafe { (*GC_STORE.0.get()).as_ref() };
+    match stored {
+        Some(boxed) => std::ptr::eq(Box::as_ptr(boxed), ptr),
+        None => false,
+    }
 }
 
 /// Access the GC singleton mutably.
@@ -300,12 +318,13 @@ pub fn register_thread() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
+    // Counted under `quiesce`, which `rgil::disable_gil` holds across its
+    // census check and the mode switch.
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
     }
-
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
         .resumed
         .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
@@ -336,6 +355,8 @@ pub fn register_thread_parked() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
+    // Counted under `quiesce`; see [`register_thread`].
+    let _state = GC_SYNC.quiesce.lock().unwrap();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
@@ -713,9 +734,10 @@ pub fn stw_required() -> bool {
 /// Execute a closure with exclusive `&mut MiniMarkGC` access.
 ///
 /// With the GIL on this is a bare borrow of the singleton plus one Relaxed
-/// load of the mode word. With the GIL off it takes [`GcSync::gc_lock`], a
-/// leaf lock released across a quiescence wait. The stop-the-world owner
-/// already has exclusive access and takes nothing.
+/// load of the mode word. With the GIL off it takes [`GcSync::gc_lock`].
+/// The stop-the-world owner already has exclusive access and takes nothing.
+/// Collecting operations must use [`gc_op_stw`] so they never wait for
+/// other mutators while this `&mut` is live.
 ///
 /// There is deliberately no exit safepoint. A returned reference is rooted by
 /// the caller before its next entry-style safepoint.
@@ -744,18 +766,9 @@ fn gc_op_nogil<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
         );
         return f(unsafe { singleton_mut() });
     }
-    if mutators_quiesced() {
-        GC_THREAD.with(|t| t.in_gc_op.set(true));
-        struct StwReentry;
-        impl Drop for StwReentry {
-            fn drop(&mut self) {
-                GC_THREAD.with(|t| t.in_gc_op.set(false));
-            }
-        }
-        let _g = StwReentry;
-        return f(unsafe { singleton_mut() });
-    }
-    // Leaf lock; paired with `GcOpNogilGuard::drop`.
+    // Leaf lock; paired with `GcOpNogilGuard::drop`. The STW owner takes it
+    // too: an unregistered thread is not in the RUNNING census, so the drain
+    // does not stop it, and only `gc_lock` keeps its `gc_op` out.
     GC_SYNC.gc_lock.lock();
     GC_THREAD.with(|t| {
         t.holds_gc_lock.set(true);
@@ -830,6 +843,245 @@ pub fn gc_query<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     gc_op(|gc| f(gc))
 }
 
+/// GIL-on: [`gc_op`]. GIL-off: [`gc_op_stw`] with no extra roots.
+#[inline]
+pub fn gc_op_collecting<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
+    if crate::rgil::gil_disabled() {
+        gc_op_stw(&mut [], |gc, _| f(gc))
+    } else {
+        gc_op(f)
+    }
+}
+
+/// GIL-on: [`gc_op_with_root`]. GIL-off: [`gc_op_stw`] with `root` reloaded
+/// after STW so a moving minor cannot leave the caller a forwarding stub.
+#[inline]
+pub fn gc_op_stw_root<R>(
+    root: crate::GcRef,
+    f: impl FnOnce(&mut MiniMarkGC, crate::GcRef) -> R,
+) -> R {
+    if crate::rgil::gil_disabled() {
+        let mut roots = [root];
+        gc_op_stw(&mut roots, |gc, roots| f(gc, roots[0]))
+    } else {
+        gc_op_with_root(root, f)
+    }
+}
+
+/// GIL-off allocation: try `no_collect` under [`gc_op`]; on null, the
+/// collecting path under [`gc_op_stw`]. GIL-on is [`gc_op`] of `collect`.
+#[inline]
+pub fn gc_op_alloc(
+    no_collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
+    collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
+) -> crate::GcRef {
+    // SAFETY: zero slots, so the pointer is never read.
+    unsafe { gc_op_alloc_slots(std::ptr::null_mut(), 0, no_collect, collect) }
+}
+
+/// [`gc_op_alloc`] for a caller that holds live GC refs only in raw
+/// `*mut GcRef` slots. GIL-on leaves the slots untouched. GIL-off pins
+/// each slot across the STW wait and writes the reloaded value back
+/// before `collect` runs.
+///
+/// # Safety
+/// `slots` must point to `slot_count` initialized, writable `GcRef`s that
+/// stay valid for the call (any pointer when `slot_count == 0`).
+#[inline]
+pub unsafe fn gc_op_alloc_slots(
+    slots: *mut crate::GcRef,
+    slot_count: usize,
+    no_collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
+    collect: impl FnOnce(&mut MiniMarkGC) -> crate::GcRef,
+) -> crate::GcRef {
+    if crate::rgil::gil_disabled() {
+        let obj = gc_op(no_collect);
+        if !obj.is_null() {
+            return obj;
+        }
+        // SAFETY: the caller's contract.
+        unsafe { gc_op_stw_slots(slots, slot_count, collect) }
+    } else {
+        gc_op(collect)
+    }
+}
+
+/// GIL-on: [`gc_op`], slots untouched. GIL-off: pin each slot's current
+/// value on the shadow stack across [`quiesce_mutators_owned`] and write
+/// the reloaded value back into the slot before `f`.
+///
+/// Rooted collecting allocators take raw slots because the caller's GC
+/// refs are not on the shadow stack; the collector registers them
+/// (`roots.add`) only once it runs as owner. A foreign collection can
+/// move nursery objects while this thread waits.
+///
+/// # Safety
+/// Same contract as [`gc_op_alloc_slots`].
+#[inline]
+pub unsafe fn gc_op_stw_slots<R>(
+    slots: *mut crate::GcRef,
+    slot_count: usize,
+    f: impl FnOnce(&mut MiniMarkGC) -> R,
+) -> R {
+    debug_assert!(
+        crate::rgil::mutator_may_run(),
+        "a GC operation needs the GIL or GIL-disabled mode"
+    );
+    if !crate::rgil::gil_disabled() {
+        return gc_op(f);
+    }
+    // SAFETY: the caller's contract.
+    unsafe { gc_op_stw_slots_nogil(slots, slot_count, f) }
+}
+
+/// # Safety
+/// Same contract as [`gc_op_alloc_slots`].
+unsafe fn gc_op_stw_slots_nogil<R>(
+    slots: *mut crate::GcRef,
+    slot_count: usize,
+    f: impl FnOnce(&mut MiniMarkGC) -> R,
+) -> R {
+    if slot_count == 0 {
+        return gc_op_stw(&mut [], |gc, _| f(gc));
+    }
+    if slot_count == 1 {
+        let mut roots = [unsafe { *slots }];
+        return gc_op_stw(&mut roots, |gc, roots| {
+            unsafe { *slots = roots[0] };
+            f(gc)
+        });
+    }
+    let mut roots = Vec::with_capacity(slot_count);
+    for i in 0..slot_count {
+        roots.push(unsafe { *slots.add(i) });
+    }
+    gc_op_stw(&mut roots, |gc, roots| {
+        for (i, &root) in roots.iter().enumerate() {
+            unsafe { *slots.add(i) = root };
+        }
+        f(gc)
+    })
+}
+
+/// Exclusive GC operation that owns the stop-the-world before it borrows
+/// the collector.
+///
+/// GIL on: [`gc_op`] plus the caller's `roots` slice, unchanged cost.
+/// GIL off: `rgil.py` `acquire` analogue — owning STW (`mutators_quiesced`)
+/// is acquired first, then `&mut MiniMarkGC` is formed. `roots` are pinned
+/// on the shadow stack across the wait so a foreign collection forwards
+/// them; `f` receives the reloaded values.
+#[inline]
+pub fn gc_op_stw<R>(
+    roots: &mut [crate::GcRef],
+    f: impl FnOnce(&mut MiniMarkGC, &[crate::GcRef]) -> R,
+) -> R {
+    debug_assert!(
+        crate::rgil::mutator_may_run(),
+        "a GC operation needs the GIL or GIL-disabled mode"
+    );
+    if !crate::rgil::gil_disabled() {
+        return gc_op(|gc| f(gc, roots));
+    }
+    gc_op_stw_nogil(roots, f)
+}
+
+#[cold]
+fn gc_op_stw_nogil<R>(
+    roots: &mut [crate::GcRef],
+    f: impl FnOnce(&mut MiniMarkGC, &[crate::GcRef]) -> R,
+) -> R {
+    assert!(
+        !GC_THREAD.with(|t| t.holds_gc_lock.get()) || mutators_quiesced(),
+        "gc_op_stw must not run while gc_lock is held; acquire stop-the-world before &mut MiniMarkGC"
+    );
+    assert!(
+        !in_gc_op() || mutators_quiesced(),
+        "gc_op_stw must not nest inside gc_op"
+    );
+
+    struct StwOpGuard {
+        clear_in_gc_op: bool,
+    }
+    impl Drop for StwOpGuard {
+        fn drop(&mut self) {
+            if self.clear_in_gc_op {
+                GC_THREAD.with(|t| t.in_gc_op.set(false));
+            }
+        }
+    }
+
+    if mutators_quiesced() {
+        let already = GC_THREAD.with(|t| t.in_gc_op.get());
+        if !already {
+            GC_THREAD.with(|t| t.in_gc_op.set(true));
+        }
+        let _g = StwOpGuard {
+            clear_in_gc_op: !already,
+        };
+        let _lock = StwGcLock::take();
+        return f(unsafe { singleton_mut() }, roots);
+    }
+
+    struct RootGuard(usize);
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            crate::shadow_stack::try_pop_to(self.0);
+        }
+    }
+
+    let depth = crate::shadow_stack::depth();
+    for &root in roots.iter() {
+        crate::shadow_stack::push(root);
+    }
+    let _pinned = RootGuard(depth);
+    let _stw = quiesce_mutators_owned();
+    for (i, slot) in roots.iter_mut().enumerate() {
+        *slot = crate::shadow_stack::get(depth + i);
+    }
+
+    GC_THREAD.with(|t| t.in_gc_op.set(true));
+    let _g = StwOpGuard {
+        clear_in_gc_op: true,
+    };
+    let _lock = StwGcLock::take();
+    f(unsafe { singleton_mut() }, roots)
+}
+
+/// `gc_lock` held by the STW owner for the length of its `&mut MiniMarkGC`.
+///
+/// The drain parks registered mutators only. An unregistered thread runs
+/// [`gc_op_nogil`] under `gc_lock` alone, so the owner takes that lock after
+/// the drain, keeping the collector exclusive the way the GIL holder is in
+/// `rgil.py acquire`. No waiter holds `gc_lock` (see [`quiesce_mutators`]),
+/// so taking it after the drain cannot deadlock. Already held when this
+/// owner nests inside its own STW operation.
+struct StwGcLock(bool);
+
+impl StwGcLock {
+    fn take() -> Self {
+        if GC_THREAD.with(|t| t.holds_gc_lock.get()) {
+            return StwGcLock(false);
+        }
+        GC_SYNC.gc_lock.lock();
+        GC_THREAD.with(|t| t.holds_gc_lock.set(true));
+        StwGcLock(true)
+    }
+}
+
+impl Drop for StwGcLock {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let held = GC_THREAD.with(|t| t.holds_gc_lock.replace(false));
+        if held {
+            // SAFETY: `StwGcLock::take` took the lock on this thread.
+            unsafe { GC_SYNC.gc_lock.unlock() };
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // STW protocol
 // ──────────────────────────────────────────────────────────────
@@ -841,20 +1093,14 @@ pub fn gc_query<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
 pub struct StwGuard {
     active: bool,
     owner: bool,
-    superseded: bool,
-}
-
-impl StwGuard {
-    /// Another thread's collection ran while this thread asked for STW.
-    /// The caller must not collect; retry the triggering operation instead.
-    #[inline]
-    pub fn superseded(&self) -> bool {
-        self.superseded
-    }
 }
 
 /// Quiesce every other registered mutator when the process-global GC is shared.
 /// A registered collecting thread stays in RUNNING while collection executes.
+///
+/// Never releases [`GcSync::gc_lock`]. In GIL-disabled mode a caller that
+/// still holds that lock and is not already the STW owner is a routing bug:
+/// collecting operations must go through [`gc_op_stw`].
 pub fn quiesce_mutators() -> StwGuard {
     let ident = my_ident();
     if STW_OWNER.load(Ordering::Acquire) == ident {
@@ -862,7 +1108,6 @@ pub fn quiesce_mutators() -> StwGuard {
         return StwGuard {
             active: true,
             owner: false,
-            superseded: false,
         };
     }
 
@@ -874,21 +1119,24 @@ pub fn quiesce_mutators() -> StwGuard {
         return StwGuard {
             active: false,
             owner: false,
-            superseded: false,
         };
     }
 
-    let held_gc = crate::rgil::gil_disabled() && GC_THREAD.with(|t| t.holds_gc_lock.get());
+    if crate::rgil::gil_disabled() && GC_THREAD.with(|t| t.holds_gc_lock.get()) {
+        panic!(
+            "quiesce_mutators waited while gc_lock was held; GIL-disabled \
+             collections must go through gc_op_stw so stop-the-world is \
+             acquired before &mut MiniMarkGC exists"
+        );
+    }
+
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     if GC_SYNC.stw_requested.load(Ordering::Acquire) {
         drop(state);
-        release_gc_lock_across_wait(held_gc);
         park_as_mutator_for_foreign_stw();
-        reacquire_gc_lock_after_wait(held_gc);
         return StwGuard {
             active: false,
             owner: false,
-            superseded: true,
         };
     }
 
@@ -898,61 +1146,32 @@ pub fn quiesce_mutators() -> StwGuard {
     let collector_is_running =
         GC_THREAD.with(|t| t.registered.get()) && GC_THREAD.with(|t| t.running.get());
     let drain_target = usize::from(collector_is_running);
-    if held_gc {
-        // A thread blocked on the GC lock is not at a safepoint. Drop the
-        // leaf lock before waiting on RUNNING; retake it after the drain.
-        GC_THREAD.with(|t| t.holds_gc_lock.set(false));
-        // SAFETY: this thread holds `gc_lock` from `gc_op_nogil`.
-        unsafe { GC_SYNC.gc_lock.unlock() };
-    }
     state = GC_SYNC
         .quiesced
         .wait_while(state, |state| state.running != drain_target)
         .unwrap();
     drop(state);
-    if held_gc {
-        // Paired with the unlock above.
-        GC_SYNC.gc_lock.lock();
-        GC_THREAD.with(|t| t.holds_gc_lock.set(true));
-    }
     STW_OWNER.store(ident, Ordering::Release);
     STW_DEPTH.store(1, Ordering::Relaxed);
 
     StwGuard {
         active: true,
         owner: true,
-        superseded: false,
     }
 }
 
-/// Quiesce until this thread owns STW or no STW is required. Inspectors and
-/// other exclusive walks retry a superseded request; they are not a
-/// collection point that can skip the body.
+/// Quiesce until this thread owns STW or no STW is required. In GIL-off
+/// mode a non-owner parks as a mutator, then becomes owner.
 pub fn quiesce_mutators_owned() -> StwGuard {
     loop {
         let g = quiesce_mutators();
-        if !g.superseded() {
+        if mutators_quiesced() {
+            return g;
+        }
+        if !stw_required() && !crate::rgil::gil_disabled() {
             return g;
         }
     }
-}
-
-fn release_gc_lock_across_wait(held_gc: bool) {
-    if !held_gc {
-        return;
-    }
-    GC_THREAD.with(|t| t.holds_gc_lock.set(false));
-    // SAFETY: this thread holds `gc_lock` from `gc_op_nogil`.
-    unsafe { GC_SYNC.gc_lock.unlock() };
-}
-
-fn reacquire_gc_lock_after_wait(held_gc: bool) {
-    if !held_gc {
-        return;
-    }
-    // Paired with `release_gc_lock_across_wait`.
-    GC_SYNC.gc_lock.lock();
-    GC_THREAD.with(|t| t.holds_gc_lock.set(true));
 }
 
 fn park_as_mutator_for_foreign_stw() {
@@ -966,6 +1185,14 @@ fn park_as_mutator_for_foreign_stw() {
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire)),
     );
+}
+
+/// Run `f` with mutator registration held off: [`register_thread`] and
+/// [`register_thread_parked`] count a new mutator under the same lock, so
+/// the registered census `f` reads cannot change before `f` returns.
+pub(crate) fn with_registration_blocked<R>(f: impl FnOnce() -> R) -> R {
+    let _state = GC_SYNC.quiesce.lock().unwrap();
+    f()
 }
 
 /// Whether this thread currently owns or is nested inside collector-side STW.
@@ -1003,7 +1230,7 @@ impl Drop for StwGuard {
 /// `collect_fn` receives `&mut MiniMarkGC` — it can call
 /// `collect_nursery`, `collect_full`, etc.
 pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
-    gc_op(|gc| {
+    gc_op_stw(&mut [], |gc, _| {
         let _stw = quiesce_mutators_owned();
         collect_fn(gc);
     });
@@ -1034,7 +1261,7 @@ pub fn stop_the_world<R>(f: impl FnOnce() -> R) -> R {
 /// `pthread_atfork` exists for: the one thread that survives owns it on both
 /// sides of the fork and releases it on both sides.
 pub fn fork_under_stw<R>(fork_fn: impl FnOnce() -> R) -> R {
-    gc_op(|_| {
+    gc_op_stw(&mut [], |_, _| {
         let _stw = quiesce_mutators_owned();
         let held = GC_SYNC.quiesce.lock().unwrap();
         let result = fork_fn();

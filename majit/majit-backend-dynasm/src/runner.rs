@@ -289,6 +289,21 @@ pub(crate) fn with_dynasm_active_gc_mut<R>(
     None
 }
 
+/// Same box-then-singleton order as [`with_dynasm_active_gc_mut`]. The
+/// singleton arm is [`majit_gc::GcHandle`] so each method picks its own
+/// `gc_op` / `gc_op_alloc` / `gc_op_collecting` / `gc_op_stw_root` path.
+fn with_dynasm_active_gc_collecting<R>(
+    f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R,
+) -> Option<R> {
+    if gc_box::present() {
+        return gc_box::with_mut(f);
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(f(&mut majit_gc::GcHandle));
+    }
+    None
+}
+
 /// `cpu.gc_ll_descr`: the installed collector, or [`HostHeapGc`] —
 /// `get_ll_description(None)` (gc.py) picks the Boehm descr when no
 /// framework GC is configured, and this is that descr. Same three-way
@@ -877,7 +892,7 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
     if let Some(r) = gc_box::with_mut(|g| g.alloc_nursery_typed(type_id, size)) {
         return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_typed(type_id, size))
+    majit_gc::GcHandle.alloc_nursery_typed(type_id, size)
 }
 
 /// Rooted collecting allocation used when a residual helper has manufactured
@@ -968,7 +983,7 @@ fn dynasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
     if !majit_gc::gc_sync::is_initialized() {
         return GcRef(0);
     }
-    majit_gc::gc_sync::gc_op(|g| g.alloc_young_nonmoving_typed(type_id, size))
+    majit_gc::GcHandle.alloc_young_nonmoving_typed(type_id, size)
 }
 
 /// [`dynasm_alloc_young_nonmoving_typed`] without the collection in front of
@@ -1016,7 +1031,7 @@ fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_
         && majit_gc::gc_sync::is_initialized()
         && !majit_gc::gc_sync::in_gc_op()
     {
-        majit_gc::gc_sync::gc_op(|g| g.do_collect_nursery());
+        majit_gc::GcHandle.collect_nursery();
     }
     let size = sizedescr.as_size();
     let type_id = sizedescr.resolve_gc_tid();
@@ -1062,14 +1077,14 @@ fn dynasm_collect_generation(generation: i64) -> i64 {
     if let Some(freed) = gc_box::with_mut(|g| g.collect_generation(generation)) {
         return freed;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_generation(generation))
+    majit_gc::GcHandle.collect_generation(generation)
 }
 
 fn dynasm_freeze() {
     if gc_box::with_mut(|g| g.freeze()).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.freeze())
+    majit_gc::GcHandle.freeze()
 }
 
 fn dynasm_unfreeze() {
@@ -1090,7 +1105,7 @@ fn dynasm_collect_step() -> majit_gc::GcStepTransition {
     if let Some(transition) = gc_box::with_mut(|g| g.collect_step()) {
         return transition;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_step())
+    majit_gc::GcHandle.collect_step()
 }
 
 /// Takes `format_args!` rather than a built `String`: the callers sit on the
@@ -1135,7 +1150,7 @@ fn dynasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     if gc_box::with_mut(|g| g.get_objects(generation, &mut visit)).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.get_objects(generation, &mut visit));
+    majit_gc::GcHandle.get_objects(generation, &mut visit);
 }
 
 fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
@@ -1145,7 +1160,7 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     }
     // See `MajitGc::get_referents`: the fallback enters the collector, so the
     // argument is published and reloaded rather than passed as the raw local.
-    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
+    majit_gc::GcHandle.get_referents(obj, &mut visit);
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
@@ -1190,7 +1205,7 @@ fn dynasm_get_rpy_roots(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
     if let Some(supported) = gc_box::with_mut(|g| g.get_rpy_roots(&mut visit)) {
         return supported;
     }
-    majit_gc::gc_sync::gc_op(|g| g.get_rpy_roots(&mut visit))
+    majit_gc::GcHandle.get_rpy_roots(&mut visit)
 }
 
 fn dynasm_get_rpy_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisitorFn) -> bool {
@@ -1198,7 +1213,7 @@ fn dynasm_get_rpy_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsV
     if let Some(supported) = gc_box::with_mut(|g| g.get_rpy_referents(obj, &mut visit)) {
         return supported;
     }
-    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_rpy_referents(obj, &mut visit))
+    majit_gc::GcHandle.get_rpy_referents(obj, &mut visit)
 }
 
 fn dynasm_is_app_level_object(obj: majit_ir::GcRef) -> bool {
@@ -1212,7 +1227,7 @@ fn dynasm_dump_rpy_heap(fd: i32) -> Result<bool, i32> {
     if let Some(result) = gc_box::with_mut(|g| g.dump_rpy_heap(fd)) {
         return result;
     }
-    majit_gc::gc_sync::gc_op(|g| g.dump_rpy_heap(fd))
+    majit_gc::GcHandle.dump_rpy_heap(fd)
 }
 
 fn dynasm_get_typeids_text() -> Option<Vec<u8>> {
@@ -1227,25 +1242,21 @@ fn dynasm_add_memory_pressure(size: isize, object: GcRef) {
     if gc_box::with_mut(|g| g.add_memory_pressure(size, object)).is_some() {
         return;
     }
-    if object.is_null() {
-        majit_gc::gc_sync::gc_op(|g| g.add_memory_pressure(size, object));
-    } else {
-        majit_gc::gc_sync::gc_op_with_root(object, |g, object| g.add_memory_pressure(size, object));
-    }
+    majit_gc::GcHandle.add_memory_pressure(size, object);
 }
 
 fn dynasm_maybe_collect_for_external_malloc(totalsize: usize) -> bool {
     if let Some(result) = gc_box::with_mut(|g| g.maybe_collect_for_external_malloc(totalsize)) {
         return result;
     }
-    majit_gc::gc_sync::gc_op(|g| g.maybe_collect_for_external_malloc(totalsize))
+    majit_gc::GcHandle.maybe_collect_for_external_malloc(totalsize)
 }
 
 fn dynasm_total_memory_pressure() -> isize {
     if let Some(result) = gc_box::with_mut(|g| g.total_memory_pressure()) {
         return result;
     }
-    majit_gc::gc_sync::gc_op(|g| g.total_memory_pressure())
+    majit_gc::GcHandle.total_memory_pressure()
 }
 
 /// Non-moving old-gen-only major. Nursery addresses stay put. Used by the
@@ -1257,7 +1268,7 @@ fn dynasm_collect_oldgen_nonmoving() {
     if gc_box::with_mut(|g| g.collect_oldgen_nonmoving()).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_oldgen_nonmoving());
+    majit_gc::GcHandle.collect_oldgen_nonmoving();
 }
 
 /// Moving minor plus one bounded major step.
@@ -1267,7 +1278,7 @@ fn dynasm_collect_nursery() {
     if gc_box::with_mut(|g| g.collect_nursery()).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_nursery());
+    majit_gc::GcHandle.collect_nursery();
 }
 
 fn dynasm_register_finalizer(fq_index: usize, obj: GcRef) {
@@ -1513,8 +1524,9 @@ fn oom_signal_if_zero(result: u64) -> u64 {
 /// Returns payload pointer (after GcHeader), matching fast-path semantics.
 pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
     let gc_hdr = majit_gc::header::GcHeader::SIZE;
-    let result =
-        with_dynasm_active_gc_mut(|gc| gc.alloc_nursery(total_size as usize - gc_hdr).0 as u64);
+    let result = with_dynasm_active_gc_collecting(|gc| {
+        gc.alloc_nursery(total_size as usize - gc_hdr).0 as u64
+    });
     let ptr = result.unwrap_or_else(|| unsafe {
         // `libc::calloc` returns NULL on real host OOM; preserve that
         // NULL through to the trampoline's `TEST rax, rax; JZ propagate`
@@ -1572,8 +1584,9 @@ fn headerless_varsize_alloc_size(length: i64, itemsize: u64, base_size: u64) -> 
 /// matching the headerless fast path.  Headered collectors such as MiniMarkGC
 /// are not headerless-aware and must fail via `alloc_nursery_headerless`.
 pub extern "C" fn dynasm_nursery_slowpath_headerless(size: u64) -> u64 {
-    let ptr = with_dynasm_active_gc_mut(|gc| gc.alloc_nursery_headerless(size as usize).0 as u64)
-        .unwrap_or_else(|| unsafe { libc::calloc(1, size as usize) as u64 });
+    let ptr =
+        with_dynasm_active_gc_collecting(|gc| gc.alloc_nursery_headerless(size as usize).0 as u64)
+            .unwrap_or_else(|| unsafe { libc::calloc(1, size as usize) as u64 });
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
             "jit-backend",
@@ -1589,7 +1602,13 @@ pub extern "C" fn dynasm_nursery_slowpath_headerless(size: u64) -> u64 {
 /// through the trailing array, i.e. it excludes the GC header that the
 /// allocator prepends internally.
 pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
-    with_gc_ll_descr(|gc| malloc_jitframe(gc, frame_size as usize)) as u64
+    if gc_box::present() {
+        return with_gc_ll_descr(|gc| malloc_jitframe(gc, frame_size as usize)) as u64;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return malloc_jitframe(&mut majit_gc::GcHandle, frame_size as usize) as u64;
+    }
+    malloc_jitframe(&mut HostHeapGc, frame_size as usize) as u64
 }
 
 /// `_build_malloc_slowpath(kind='var')` parity: varsize nursery
@@ -1609,7 +1628,7 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     type_id: u64,
 ) -> u64 {
     let gc_hdr = majit_gc::header::GcHeader::SIZE;
-    let result = with_dynasm_active_gc_mut(|gc| {
+    let result = with_dynasm_active_gc_collecting(|gc| {
         gc.alloc_varsize_typed(
             type_id as u32,
             base_size as usize,
@@ -1714,7 +1733,7 @@ fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
     length: usize,
     clear: bool,
 ) -> u64 {
-    let result = with_dynasm_active_gc_mut(|gc| {
+    let result = with_dynasm_active_gc_collecting(|gc| {
         let obj = gc.alloc_varsize_typed(type_id, base_size, item_size, length);
         if obj.is_null() {
             0
@@ -1897,7 +1916,7 @@ fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
 }
 
 fn dynasm_alloc_fixedsize_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
-    let result = with_dynasm_active_gc_mut(|gc| {
+    let result = with_dynasm_active_gc_collecting(|gc| {
         let obj = gc.alloc_nursery_typed(type_id, payload_size);
         if obj.is_null() { 0 } else { obj.0 as u64 }
     });

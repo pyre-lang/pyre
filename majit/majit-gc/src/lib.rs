@@ -350,7 +350,13 @@ pub fn stress_trace_pool_alloc(roots: *mut GcRef, root_count: usize) {
     if !gc_sync::is_initialized() || gc_sync::in_gc_op() {
         return;
     }
-    gc_sync::gc_op(|gc| gc.stress_trace_alloc_minor(roots, root_count));
+    // SAFETY: `opencoder.py`'s callers pass their own live root slots, the
+    // same ones `stress_trace_alloc_minor` reads and rewrites.
+    unsafe {
+        gc_sync::gc_op_stw_slots(roots, root_count, |gc| {
+            gc.stress_trace_alloc_minor(roots, root_count)
+        })
+    };
 }
 
 /// Panic when `addr` is a nursery word that is not a live object start
@@ -1875,9 +1881,10 @@ pub fn ensure_type_registry_closed() {
 ///
 /// # Thread safety
 ///
-/// Exclusion comes from the GIL (`rgil`), which the caller holds for
-/// as long as it runs pyre code, so these methods take no lock of their own.
-/// Collection uses STW safepoint protocol (`gc_sync::request_stw`).
+/// Exclusion comes from the GIL (`rgil`) while it is on, so these methods
+/// take no lock of their own. With the GIL off, ordinary operations take
+/// `gc_lock`; collecting operations take the stop-the-world first
+/// (`gc_sync::gc_op_stw`, `rgil.py` `acquire`) before borrowing the collector.
 /// See gh#396 for the full free-threading GC design.
 pub struct GcHandle;
 
@@ -1894,10 +1901,16 @@ impl GcAllocator for GcHandle {
     }
 
     fn alloc_nursery(&mut self, size: usize) -> GcRef {
-        gc_sync::gc_op(|gc| gc.alloc_nursery(size))
+        gc_sync::gc_op_alloc(
+            |gc| gc.try_alloc_nursery_bump_typed(0, size),
+            |gc| gc.alloc_nursery(size),
+        )
     }
     fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
-        gc_sync::gc_op(|gc| gc.alloc_nursery_typed(type_id, size))
+        gc_sync::gc_op_alloc(
+            |gc| gc.try_alloc_nursery_bump_typed(type_id, size),
+            |gc| gc.alloc_nursery_typed(type_id, size),
+        )
     }
     unsafe fn alloc_nursery_collecting_typed_rooted(
         &mut self,
@@ -1906,9 +1919,18 @@ impl GcAllocator for GcHandle {
         root: *mut GcRef,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
-        gc_sync::gc_op(|gc| unsafe {
+        let no_collect = |gc: &mut collector::MiniMarkGC| {
+            let obj = gc.try_alloc_nursery_bump_typed(type_id, size);
+            if !obj.is_null() {
+                unsafe { *needs_write_barrier = false };
+            }
+            obj
+        };
+        let collect = |gc: &mut collector::MiniMarkGC| unsafe {
             gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
-        })
+        };
+        // SAFETY: this fn's contract covers the root slots.
+        unsafe { gc_sync::gc_op_alloc_slots(root, 1, no_collect, collect) }
     }
     unsafe fn alloc_fast_nursery_collecting_typed_rooted(
         &mut self,
@@ -1917,9 +1939,18 @@ impl GcAllocator for GcHandle {
         root: *mut GcRef,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
-        gc_sync::gc_op(|gc| unsafe {
+        let no_collect = |gc: &mut collector::MiniMarkGC| {
+            let obj = gc.try_alloc_nursery_bump_typed(type_id, size);
+            if !obj.is_null() {
+                unsafe { *needs_write_barrier = false };
+            }
+            obj
+        };
+        let collect = |gc: &mut collector::MiniMarkGC| unsafe {
             gc.alloc_fast_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
-        })
+        };
+        // SAFETY: this fn's contract covers the root slots.
+        unsafe { gc_sync::gc_op_alloc_slots(root, 1, no_collect, collect) }
     }
     unsafe fn alloc_fast_nursery_collecting_typed_roots(
         &mut self,
@@ -1929,7 +1960,14 @@ impl GcAllocator for GcHandle {
         root_count: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
-        gc_sync::gc_op(|gc| unsafe {
+        let no_collect = |gc: &mut collector::MiniMarkGC| {
+            let obj = gc.try_alloc_nursery_bump_typed(type_id, size);
+            if !obj.is_null() {
+                unsafe { *needs_write_barrier = false };
+            }
+            obj
+        };
+        let collect = |gc: &mut collector::MiniMarkGC| unsafe {
             gc.alloc_fast_nursery_collecting_typed_roots(
                 type_id,
                 size,
@@ -1937,13 +1975,18 @@ impl GcAllocator for GcHandle {
                 root_count,
                 needs_write_barrier,
             )
-        })
+        };
+        // SAFETY: this fn's contract covers the root slots.
+        unsafe { gc_sync::gc_op_alloc_slots(roots, root_count, no_collect, collect) }
     }
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect(size))
     }
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
-        gc_sync::gc_op(|gc| gc.alloc_varsize(base_size, item_size, length))
+        gc_sync::gc_op_alloc(
+            |gc| gc.try_alloc_varsize_bump(base_size, item_size, length),
+            |gc| gc.alloc_varsize(base_size, item_size, length),
+        )
     }
     fn alloc_varsize_typed(
         &mut self,
@@ -1952,7 +1995,16 @@ impl GcAllocator for GcHandle {
         item_size: usize,
         length: usize,
     ) -> GcRef {
-        gc_sync::gc_op(|gc| gc.alloc_varsize_typed(type_id, base_size, item_size, length))
+        gc_sync::gc_op_alloc(
+            |gc| {
+                if (type_id as usize) >= gc.type_count() {
+                    GcRef(0)
+                } else {
+                    gc.try_alloc_varsize_typed_bump(type_id, base_size, item_size, length)
+                }
+            },
+            |gc| gc.alloc_varsize_typed(type_id, base_size, item_size, length),
+        )
     }
     fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect_typed(type_id, size))
@@ -2003,7 +2055,10 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
     }
     fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
-        gc_sync::gc_op(|gc| gc.alloc_young_nonmoving_typed(type_id, size))
+        gc_sync::gc_op_alloc(
+            |gc| gc.try_alloc_young_nonmoving_typed(type_id, size),
+            |gc| gc.alloc_young_nonmoving_typed(type_id, size),
+        )
     }
     fn alloc_young_nonmoving_typed_no_collect(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_young_nonmoving_typed_no_collect(type_id, size))
@@ -2054,16 +2109,16 @@ impl GcAllocator for GcHandle {
         })
     }
     fn collect_nursery(&mut self) {
-        gc_sync::gc_op(|gc| gc.collect_nursery())
+        gc_sync::gc_op_collecting(|gc| gc.collect_nursery())
     }
     fn collect_full(&mut self) {
-        gc_sync::gc_op(|gc| gc.collect_full())
+        gc_sync::gc_op_collecting(|gc| gc.collect_full())
     }
     fn collect_generation(&mut self, generation: i64) -> i64 {
-        gc_sync::gc_op(|gc| gc.collect_generation(generation))
+        gc_sync::gc_op_collecting(|gc| gc.collect_generation(generation))
     }
     fn freeze(&mut self) {
-        gc_sync::gc_op(|gc| gc.freeze())
+        gc_sync::gc_op_collecting(|gc| gc.freeze())
     }
     fn unfreeze(&mut self) {
         gc_sync::gc_op(|gc| gc.unfreeze())
@@ -2079,10 +2134,10 @@ impl GcAllocator for GcHandle {
         }
     }
     fn collect_step(&mut self) -> GcStepTransition {
-        gc_sync::gc_op(|gc| gc.collect_step())
+        gc_sync::gc_op_collecting(|gc| gc.collect_step())
     }
     fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
-        gc_sync::gc_op(|gc| gc.get_objects(generation, visitor))
+        gc_sync::gc_op_collecting(|gc| gc.get_objects(generation, visitor))
     }
     fn get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
         // Rooted like `write_barrier`, for the reason `gc_op_with_root`
@@ -2090,7 +2145,7 @@ impl GcAllocator for GcHandle {
         // and the reload is what keeps the raw argument from reaching
         // `do_get_referents` as a forwarding stub, which it rejects — reporting
         // a live object as having no referents at all.
-        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, visitor))
+        gc_sync::gc_op_stw_root(obj, |gc, obj| gc.get_referents(obj, visitor))
     }
     fn is_tracked(&mut self, obj: GcRef) -> bool {
         // Same exposure as `get_referents`: a forwarded address is not a
@@ -2113,13 +2168,13 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_type_index(obj))
     }
     fn get_rpy_roots(&mut self, visitor: &mut dyn FnMut(GcRef)) -> bool {
-        gc_sync::gc_op(|gc| gc.get_rpy_roots(visitor))
+        gc_sync::gc_op_collecting(|gc| gc.get_rpy_roots(visitor))
     }
     fn get_rpy_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
-        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_referents(obj, visitor))
+        gc_sync::gc_op_stw_root(obj, |gc, obj| gc.get_rpy_referents(obj, visitor))
     }
     fn dump_rpy_heap(&mut self, fd: i32) -> Result<bool, i32> {
-        gc_sync::gc_op(|gc| gc.dump_rpy_heap(fd))
+        gc_sync::gc_op_collecting(|gc| gc.dump_rpy_heap(fd))
     }
     fn get_typeids_text(&self) -> Option<Vec<u8>> {
         gc_sync::gc_query_reentrant(|gc| gc.get_typeids_text())
@@ -2129,22 +2184,22 @@ impl GcAllocator for GcHandle {
     }
     fn add_memory_pressure(&mut self, size: isize, object: GcRef) {
         if object.is_null() {
-            gc_sync::gc_op(|gc| gc.add_memory_pressure(size, object));
+            gc_sync::gc_op_collecting(|gc| gc.add_memory_pressure(size, object));
         } else {
-            gc_sync::gc_op_with_root(object, |gc, object| gc.add_memory_pressure(size, object));
+            gc_sync::gc_op_stw_root(object, |gc, object| gc.add_memory_pressure(size, object));
         }
     }
     fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
-        gc_sync::gc_op(|gc| gc.maybe_collect_for_external_malloc(totalsize))
+        gc_sync::gc_op_collecting(|gc| gc.maybe_collect_for_external_malloc(totalsize))
     }
     fn total_memory_pressure(&mut self) -> isize {
-        gc_sync::gc_op(|gc| gc.total_memory_pressure())
+        gc_sync::gc_op_collecting(|gc| gc.total_memory_pressure())
     }
     fn is_app_level_object(&mut self, obj: GcRef) -> bool {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_app_level_object(obj))
     }
     fn collect_oldgen_nonmoving(&mut self) {
-        gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
+        gc_sync::gc_op_collecting(|gc| gc.collect_oldgen_nonmoving())
     }
     fn enable(&mut self) {
         gc_sync::gc_op(|gc| gc.enable())
@@ -2217,7 +2272,7 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_query_reentrant(|gc| gc.can_optimize_clean_setarrayitems())
     }
     fn gc_step(&mut self) -> bool {
-        gc_sync::gc_op(|gc| gc.gc_step())
+        gc_sync::gc_op_collecting(|gc| gc.gc_step())
     }
     fn pin(&mut self, obj: GcRef) -> bool {
         gc_sync::gc_op(|gc| gc.pin(obj))
@@ -2979,9 +3034,18 @@ pub unsafe fn standalone_alloc_nursery_collecting_typed_rooted(
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    gc_sync::gc_op(|g| unsafe {
+    let no_collect = |g: &mut collector::MiniMarkGC| {
+        let obj = g.try_alloc_nursery_bump_typed(type_id, payload_size);
+        if !obj.is_null() {
+            unsafe { *needs_write_barrier = false };
+        }
+        obj
+    };
+    let collect = |g: &mut collector::MiniMarkGC| unsafe {
         g.alloc_nursery_collecting_typed_rooted(type_id, payload_size, root, needs_write_barrier)
-    })
+    };
+    // SAFETY: this fn's contract covers the root slots.
+    unsafe { gc_sync::gc_op_alloc_slots(root, 1, no_collect, collect) }
 }
 
 /// [`standalone_alloc_nursery_collecting_typed_rooted`] for a type that carries
@@ -3120,15 +3184,20 @@ unsafe fn malloc_fast_slow(
     let free_addr = PUBLISHED_BUMP
         .free_addr
         .load(std::sync::atomic::Ordering::Relaxed);
+    // `MAJIT_GC_STRESS_TRACE_ALLOC` routes every allocation here so it
+    // reaches `stress_trace_alloc_minor` below; the per-thread chunk bump
+    // must not answer it first.
     if free_addr == PUBLISHED_BUMP_GIL_DISABLED
         && !gc_sync::stw_requested()
+        && !gc_stress_trace_alloc_enabled()
         && let Some(obj) = unsafe { malloc_fast_bump_threadlocal(type_id, payload_size) }
     {
         return obj;
     }
-    let _live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
+    let live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
     if rgil::gil_disabled() {
         gc_sync::safepoint_poll();
+        live.reload_slots();
     }
     if gc_box_installed() {
         if let Some(f) = ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
@@ -3173,7 +3242,17 @@ unsafe fn malloc_fast_via_gc_sync(
         unsafe { *needs_write_barrier = true };
         return GcRef(0);
     }
-    gc_sync::gc_op(|g| unsafe {
+    let no_collect = |g: &mut collector::MiniMarkGC| {
+        if gc_stress_trace_alloc_enabled() {
+            return GcRef(0);
+        }
+        let obj = g.try_alloc_nursery_bump_typed(type_id, payload_size);
+        if !obj.is_null() {
+            unsafe { *needs_write_barrier = false };
+        }
+        obj
+    };
+    let collect = |g: &mut collector::MiniMarkGC| unsafe {
         if gc_stress_trace_alloc_enabled() {
             g.stress_trace_alloc_minor(roots, root_count);
         }
@@ -3184,7 +3263,9 @@ unsafe fn malloc_fast_via_gc_sync(
             root_count,
             needs_write_barrier,
         )
-    })
+    };
+    // SAFETY: this fn's contract covers the root slots.
+    unsafe { gc_sync::gc_op_alloc_slots(roots, root_count, no_collect, collect) }
 }
 
 /// [`standalone_alloc_fast_nursery_collecting_typed_rooted`] with the complete

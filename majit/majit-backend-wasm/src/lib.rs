@@ -1361,6 +1361,19 @@ fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Opti
     None
 }
 
+/// Same box-then-singleton order as [`with_wasm_active_gc_mut`]. The
+/// singleton arm is [`majit_gc::GcHandle`] so each method picks its own
+/// `gc_op` / `gc_op_alloc` / `gc_op_collecting` / `gc_op_stw_root` path.
+fn with_wasm_active_gc_collecting<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+    if gc_box::present() {
+        return gc_box::with_mut(f);
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(f(&mut majit_gc::GcHandle));
+    }
+    None
+}
+
 /// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
 /// prebuilt MemoryError singleton, then the allocator returns NULL.
 /// A zero singleton means the runtime cannot raise (`debug.py fatalerror`).
@@ -1731,11 +1744,11 @@ fn body_reload_fn_ptr() -> i64 {
 /// `gc.collect()`. Mirrors dynasm's `dynasm_collect_generation` and cranelift's
 /// `collect_generation_via_active_runtime`.
 fn wasm_collect_generation(generation: i64) -> i64 {
-    with_wasm_active_gc_mut(|gc| gc.collect_generation(generation)).unwrap_or(0)
+    with_wasm_active_gc_collecting(|gc| gc.collect_generation(generation)).unwrap_or(0)
 }
 
 fn wasm_freeze() {
-    with_wasm_active_gc_mut(|gc| gc.freeze());
+    with_wasm_active_gc_collecting(|gc| gc.freeze());
 }
 
 fn wasm_unfreeze() {
@@ -1747,7 +1760,7 @@ fn wasm_freeze_count() -> i64 {
 }
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {
-    with_wasm_active_gc_mut(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
+    with_wasm_active_gc_collecting(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
         // `rgc.py collect_step`: SCANNING on both sides would never report completion.
         old_state: majit_gc::GcStepTransition::STATE_MARKING,
         new_state: majit_gc::GcStepTransition::STATE_SCANNING,
@@ -1762,24 +1775,24 @@ fn wasm_collect_step() -> majit_gc::GcStepTransition {
 /// by gcmap. Routes via `with_wasm_active_gc_mut` (test box → box;
 /// production → the `gc_sync` singleton).
 fn wasm_collect_oldgen_nonmoving() {
-    with_wasm_active_gc_mut(|gc| gc.collect_oldgen_nonmoving());
+    with_wasm_active_gc_collecting(|gc| gc.collect_oldgen_nonmoving());
 }
 
 /// Moving minor plus one bounded major step.
 /// `incminimark.py` `minor_collection_with_major_progress` with
 /// `force_enabled=False`.
 fn wasm_collect_nursery() {
-    with_wasm_active_gc_mut(|gc| gc.collect_nursery());
+    with_wasm_active_gc_collecting(|gc| gc.collect_nursery());
 }
 
 fn wasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    with_wasm_active_gc_mut(|gc| gc.get_objects(generation, &mut visit));
+    with_wasm_active_gc_collecting(|gc| gc.get_objects(generation, &mut visit));
 }
 
 fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    with_wasm_active_gc_mut(|gc| gc.get_referents(obj, &mut visit));
+    with_wasm_active_gc_collecting(|gc| gc.get_referents(obj, &mut visit));
 }
 
 fn wasm_is_tracked(obj: GcRef) -> bool {
@@ -1808,12 +1821,12 @@ fn wasm_get_rpy_type_index(obj: GcRef) -> Option<usize> {
 
 fn wasm_get_rpy_roots(visitor: majit_gc::GetObjectsVisitorFn) -> bool {
     let mut visit = visitor;
-    with_wasm_active_gc_mut(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
+    with_wasm_active_gc_collecting(|gc| gc.get_rpy_roots(&mut visit)).unwrap_or(false)
 }
 
 fn wasm_get_rpy_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) -> bool {
     let mut visit = visitor;
-    with_wasm_active_gc_mut(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
+    with_wasm_active_gc_collecting(|gc| gc.get_rpy_referents(obj, &mut visit)).unwrap_or(false)
 }
 
 fn wasm_is_app_level_object(obj: GcRef) -> bool {
@@ -1821,7 +1834,7 @@ fn wasm_is_app_level_object(obj: GcRef) -> bool {
 }
 
 fn wasm_dump_rpy_heap(fd: i32) -> Result<bool, i32> {
-    with_wasm_active_gc_mut(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false))
+    with_wasm_active_gc_collecting(|gc| gc.dump_rpy_heap(fd)).unwrap_or(Ok(false))
 }
 
 fn wasm_get_typeids_text() -> Option<Vec<u8>> {
@@ -1833,15 +1846,16 @@ fn wasm_get_typeids_list() -> Option<Vec<usize>> {
 }
 
 fn wasm_add_memory_pressure(size: isize, object: GcRef) {
-    with_wasm_active_gc_mut(|gc| gc.add_memory_pressure(size, object));
+    with_wasm_active_gc_collecting(|gc| gc.add_memory_pressure(size, object));
 }
 
 fn wasm_maybe_collect_for_external_malloc(totalsize: usize) -> bool {
-    with_wasm_active_gc_mut(|gc| gc.maybe_collect_for_external_malloc(totalsize)).unwrap_or(false)
+    with_wasm_active_gc_collecting(|gc| gc.maybe_collect_for_external_malloc(totalsize))
+        .unwrap_or(false)
 }
 
 fn wasm_total_memory_pressure() -> isize {
-    with_wasm_active_gc_mut(|gc| gc.total_memory_pressure()).unwrap_or(0)
+    with_wasm_active_gc_collecting(|gc| gc.total_memory_pressure()).unwrap_or(0)
 }
 
 /// `minimark.py id_or_identityhash` trampoline. The collector
@@ -1965,7 +1979,7 @@ unsafe fn wasm_alloc_nursery_typed_with_placement(
 /// backend must replace every process-global allocation hook as one unit so a
 /// previously-installed native backend cannot receive wasm allocations.
 fn wasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
-    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
+    with_wasm_active_gc_collecting(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// Rooted collecting companion for a result whose GC child exists only in a
@@ -1980,10 +1994,23 @@ unsafe fn wasm_alloc_nursery_collecting_typed_rooted(
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    with_wasm_active_gc_mut(|gc| unsafe {
+    if let Some(r) = gc_box::with_mut(|gc| unsafe {
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
-    })
-    .unwrap_or(GcRef(0))
+    }) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        unsafe { *needs_write_barrier = true };
+        return GcRef(0);
+    }
+    unsafe {
+        majit_gc::standalone_alloc_nursery_collecting_typed_rooted(
+            type_id,
+            size,
+            root,
+            needs_write_barrier,
+        )
+    }
 }
 
 unsafe fn wasm_alloc_nursery_collecting_typed_roots(
@@ -1993,7 +2020,7 @@ unsafe fn wasm_alloc_nursery_collecting_typed_roots(
     root_count: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    with_wasm_active_gc_mut(|gc| unsafe {
+    if let Some(r) = gc_box::with_mut(|gc| unsafe {
         gc.alloc_fast_nursery_collecting_typed_roots(
             type_id,
             size,
@@ -2001,8 +2028,22 @@ unsafe fn wasm_alloc_nursery_collecting_typed_roots(
             root_count,
             needs_write_barrier,
         )
-    })
-    .unwrap_or(GcRef(0))
+    }) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        unsafe { *needs_write_barrier = true };
+        return GcRef(0);
+    }
+    unsafe {
+        majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    }
 }
 
 /// Host-side old-gen allocation trampoline. Stable
@@ -2016,7 +2057,8 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// run that minor (`threshold_reached` then
 /// `minor_collection_with_major_progress`).
 fn wasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
-    with_wasm_active_gc_mut(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
+    with_wasm_active_gc_collecting(|gc| gc.alloc_young_nonmoving_typed(type_id, size))
+        .unwrap_or(GcRef(0))
 }
 
 /// [`wasm_alloc_young_nonmoving_typed`] without the collection in front of
@@ -2129,7 +2171,7 @@ fn oom_signal_if_zero(result: i64) -> i64 {
 /// allocation. So it uses the *collecting* `alloc_nursery_typed`, which
 /// triggers a minor collection on nursery-full instead of leaking to old-gen.
 pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
-    let obj = with_wasm_active_gc_mut(|gc| {
+    let obj = with_wasm_active_gc_collecting(|gc| {
         gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64
     })
     .unwrap_or(0);
@@ -2149,7 +2191,7 @@ pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
         return oom_signal_if_zero(0);
     }
     let size = size.saturating_add(7) & !7;
-    let obj = with_wasm_active_gc_mut(|gc| {
+    let obj = with_wasm_active_gc_collecting(|gc| {
         if let Some(base) = try_headerless_nursery_bump(gc, size) {
             return base as i64;
         }
@@ -2186,7 +2228,7 @@ pub extern "C" fn wasm_jit_alloc_array(
     let Ok(length) = usize::try_from(length) else {
         return oom_signal_if_zero(0);
     };
-    let obj = with_wasm_active_gc_mut(|gc| {
+    let obj = with_wasm_active_gc_collecting(|gc| {
         let obj = gc.alloc_varsize_typed(
             type_id as u32,
             base_size as usize,

@@ -239,8 +239,9 @@ what supplies its exclusive-heap-access requirement has changed once.
   cycles through a cached block pointer, which is why Rust code keeps the
   published address pair while the GIL exists. GIL-disabled mode is off by
   default (`rgil::disable_gil`, one-way): `gc_op` then takes a process-wide
-  leaf lock and releases it across the STW quiescence wait so a blocked
-  mutator is not a safepoint; each mutator bumps a 32 KiB chunk carved from
+  leaf lock; collecting operations take the stop-the-world before they
+  borrow the collector, and `gc_lock` is never held across a wait; each
+  mutator bumps a 32 KiB chunk carved from
   the arena fallback cursor, and a minor (or wholesale cursor rewrite) zeros
   every registered pair. `malloc_fast` keeps the published-address load and
   a `free_addr <= 1` branch; the sentinel `1` is the cold per-thread bump.
