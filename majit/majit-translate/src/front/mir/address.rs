@@ -595,7 +595,9 @@ fn primitive_scalar_cell_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, us
 /// Char-varsize cell descr of a function-local primitive, or of a
 /// `repr(transparent)` wrapper whose unique field is that primitive.
 /// A transparent GCREF newtype is not a primitive and stays out.
-fn function_local_primitive_cell_descr(
+/// The same descr `rewrite_op_raw_load` / `rewrite_op_raw_store` use
+/// for a cell-address pointee (`tyref_primitive_or_transparent_primitive_node`).
+pub(in crate::front::mir) fn function_local_primitive_cell_descr(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<(ValueType, usize, bool)> {
@@ -1148,9 +1150,16 @@ impl<'a> Lowering<'a> {
         };
         let i = *i as usize;
         if follow_recorded_borrow && let Some(recorded) = self.atomic_ref_place.get(&i) {
-            let followed = self.concrete_borrow_place(recorded.clone());
-            if self.place_is_cell_address_repr_at(&followed, false) {
-                return true;
+            // `Rvalue::Ref` keeps the cell address only for an exclusive
+            // reborrow (`exclusive_reborrow_cell_address_inner`). A shared
+            // `&P` already holds the loaded word; following its referent
+            // would `RawLoad` that integer as a pointer
+            // (`rewrite_op_raw_load`).
+            if tyref_exclusive_borrow_primitive_pointee(&place.ty, self.llbc).is_some() {
+                let followed = self.concrete_borrow_place(recorded.clone());
+                if self.place_is_cell_address_repr_at(&followed, false) {
+                    return true;
+                }
             }
         }
         if !follow_recorded_borrow {
