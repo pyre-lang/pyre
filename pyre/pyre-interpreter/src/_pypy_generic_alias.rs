@@ -946,8 +946,7 @@ pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
     Ok(res)
 }
 
-/// `GenericAlias.__reduce__` (CPython 3.14
-/// `Objects/genericaliasobject.c:ga_reduce`).
+/// `GenericAlias.__reduce__` (`_pypy_generic_alias.py`).
 fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -982,8 +981,10 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
             pyre_object::gc_roots::shadow_stack_get(args_slot),
         ]));
     }
-    // `(type(self), (origin, args))`.
-    let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
+    // `(type(self), (self.__origin__, self.__args__))`.
+    let ga_type = crate::typedef::r#type(self_())
+        .map(|p| p.as_ptr())
+        .unwrap_or(pyre_object::PY_NULL);
     let ga_type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ga_type);
     let args = w_tuple_new(vec![
