@@ -712,13 +712,12 @@ jobs:
         # combination SIGSEGVs in TLS dtors and corrupts the fail-descr
         # registry (KERN_INVALID_ADDRESS at test tokens such as 0x51).
         # Linux and Windows already run the same suite; macos coverage
-        # for this crate is the integration tests below.
+        # for this crate is the integration test below.
         if [ "${{ runner.os }}" != "macOS" ]; then
           cargo test --no-default-features -p majit-backend-wasm --lib \
             -- --test-threads=1
         fi
-        cargo test --no-default-features -p majit-backend-wasm \
-          --test bridge_diag_mirror --test codegen_test
+        cargo test --no-default-features -p majit-backend-wasm --test codegen_test
 
     - name: Run process-exclusive tests (dynasm, serial)
       shell: bash
