@@ -1,3 +1,11 @@
+# pyre-check: jitstats-band=guard_failures=64
+# The `<module>` GUARD_VALUE on `FrameDebugData.w_locals` has one counter per
+# failing value (`compile.py` `AbstractResumeGuardDescr.make_a_counter_per_value`
+# / `must_compile` hash the failing Ref), and every repeat execs a fresh
+# namespace. Its failures are the cold count of one namespace address plus 200
+# for the next: 0+200, 8+200 or 64+200 with the GC schedule (412, 420 and 476
+# in total at the same 8 loops / 2 bridges; cranelift read 509 on CI).
+# `decay=0` does not change the reading.
 # A class body and an `exec(code, ns)` body are the two frames that receive
 # their namespace through `setdictscope`, and both route a hot loop through the
 # JIT portal.

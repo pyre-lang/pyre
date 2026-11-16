@@ -14036,7 +14036,8 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for pair in items.as_chunks::<2>().0 {
+                                let pairs = items.as_chunks::<2>().0;
+                                for (i, pair) in pairs.iter().enumerate() {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "dict_display_setitem",
@@ -14047,6 +14048,22 @@ impl CodeWriter {
                                         ],
                                         py_pc as i64,
                                     );
+                                    // Same cut as BUILD_SET.
+                                    if i + 1 < pairs.len()
+                                        && let Some(catch_label) = catch_for_pc[py_pc]
+                                    {
+                                        let mut threaded: Vec<super::flow::FlowValue> =
+                                            vec![super::flow::FlowValue::Variable(dict_value)];
+                                        for remaining in pairs.iter().skip(i + 1) {
+                                            threaded.push(remaining[0].clone());
+                                            threaded.push(remaining[1].clone());
+                                        }
+                                        emit_catch_exception_and_split!(
+                                            catch_label,
+                                            py_pc,
+                                            threaded
+                                        );
+                                    }
                                 }
                                 dict_value
                             } else {
@@ -14235,16 +14252,30 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for item in items {
+                                // flowcontext.py `guessexception`: each can-raise
+                                // `set_add` inside a `try` ends its own block.
+                                for (i, item) in items.iter().enumerate() {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "set_add",
                                         vec![
                                             super::flow::FlowValue::Variable(set_value).into(),
-                                            item.into(),
+                                            item.clone().into(),
                                         ],
                                         py_pc as i64,
                                     );
+                                    if i + 1 < items.len()
+                                        && let Some(catch_label) = catch_for_pc[py_pc]
+                                    {
+                                        let mut threaded: Vec<super::flow::FlowValue> =
+                                            vec![super::flow::FlowValue::Variable(set_value)];
+                                        threaded.extend(items.iter().skip(i + 1).cloned());
+                                        emit_catch_exception_and_split!(
+                                            catch_label,
+                                            py_pc,
+                                            threaded
+                                        );
+                                    }
                                 }
                                 set_value
                             } else {

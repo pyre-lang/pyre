@@ -552,15 +552,28 @@ impl<'a> Lowering<'a> {
         Some((field, ty))
     }
 
+    /// Concrete `GcArray(DICTENTRY)` for `alias.array_type_id`
+    /// (`get_ll_dict` one DICTENTRYARRAY per instantiation).
+    fn interior_alias_array(
+        &self,
+        alias: &InteriorFieldAlias,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+        let item = crate::codewriter::call::extract_element_type_from_str(&alias.array_type_id)?;
+        super::lltype::gcarray_of_bound_struct_item(self.struct_fields?, &item)
+    }
+
     /// The GcArray object a recorded struct-field `ptr::add` addresses.
     ///
     /// `Local` re-resolves the header MIR local. `Entries` emits
     /// `FieldRead entries` (`pure: false`) and returns that result, which
-    /// is the base the following interior op must use.
+    /// is the base the following interior op must use. When the bound
+    /// ARRAY is available it is the FieldRead result's concretetype
+    /// (`rewrite_op_getinteriorfield` `op.args[0].concretetype.TO`).
     pub(in crate::front::mir) fn interior_header_base(
         &mut self,
         bb_id: BlockId,
         alias: &InteriorFieldAlias,
+        entries_array: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
     ) -> Result<Variable, LowerError> {
         match &alias.header {
             InteriorHeader::Local { local, var } => {
@@ -576,6 +589,14 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                if let Some(arr) = entries_array {
+                    use crate::translator::rtyper::lltypesystem::lltype::{
+                        LowLevelType, Ptr, PtrTarget,
+                    };
+                    res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+                        TO: PtrTarget::Array(arr.clone()),
+                    }))));
+                }
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),
                     kind: OpKind::FieldRead {
@@ -622,7 +643,8 @@ impl<'a> Lowering<'a> {
             return Ok(None);
         };
         let bb_id = self.emit_bb(mir_bb);
-        let base = self.interior_header_base(bb_id, &alias)?;
+        let array = self.interior_alias_array(&alias);
+        let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
         let owner_declared_gc = container_declared_gc(
             &inner.ty,
@@ -676,7 +698,7 @@ impl<'a> Lowering<'a> {
                     ),
                 item_ty,
                 array_type_id: Some(alias.array_type_id.clone()),
-                array: None,
+                array,
             },
         });
         if enum_tag_unsigned {
@@ -710,7 +732,8 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: interior field write lost its ptr::add alias"
             )));
         };
-        let base = self.interior_header_base(bb_id, &alias)?;
+        let array = self.interior_alias_array(&alias);
+        let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
         let value_var = match &value {
             LinkArg::Value(var) => var.clone(),
@@ -740,7 +763,7 @@ impl<'a> Lowering<'a> {
                 value: value_var,
                 item_ty,
                 array_type_id: Some(alias.array_type_id.clone()),
-                array: None,
+                array,
             },
         });
         Ok(())

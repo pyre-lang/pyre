@@ -16720,6 +16720,19 @@ pub(crate) fn struct_item_flexible_gcarray_block_annotation(
     }))
 }
 
+/// `GcArray(DICTENTRY)` of a bound item spelling (`get_ll_dict`
+/// `DICTENTRYARRAY`). `raw_struct_array_item_lltype_inner` keeps the
+/// `<K,V>` interned name when the span has no `??`.
+pub(crate) fn gcarray_of_bound_struct_item(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::Array;
+    let mut visited = std::collections::HashSet::new();
+    let entry = raw_struct_array_item_lltype_inner(reg, item, &mut visited, true)?;
+    Some(Array::gc(entry))
+}
+
 fn spelling_type_args(spelling: &str) -> Vec<&str> {
     let Some(start) = spelling.find('<') else {
         return Vec::new();
