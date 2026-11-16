@@ -121,6 +121,9 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 pub const FRAME_SLOT_BASE: u64 = 8;
 pub(crate) const SLOT_SIZE: u64 = 8;
 
+/// Unused `WasmFailDescr.force_locs` entry: a logical hole owns no force word.
+pub const FORCE_LOC_HOLE: u32 = u32::MAX;
+
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
@@ -461,11 +464,16 @@ pub const MIN_FRAME_BYTES: usize = CALL_SRET_OFS as usize + MAX_SRET_BYTES;
 /// Per-token layout of a wasm execution frame. Residual calls use the
 /// module-static scratch at [`crate::jit_call_area_addr`]; the historical
 /// trampoline offsets stay on the struct for [`Self::fixed`]. Host entry and
-/// CALL_ASSEMBLER allocate `frame_bytes` (`jfi_frame_depth`).
+/// CALL_ASSEMBLER allocate `frame_bytes` (`jfi_frame_depth`), the depth
+/// `assembler.py` `assemble_loop` publishes through `update_frame_depth`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
     /// Number of value slots before the dispatch key (including frame[0]).
     pub value_slots: usize,
+    /// Force slots this geometry can address, prefix plus tail. Compact
+    /// geometries set this to the trace's GUARD_NOT_FORCED(_2) live fail-arg
+    /// count; [`Self::extend`] grows it when a later bridge writes more.
+    pub force_slots: usize,
     /// Byte offset of the call trampoline result word.
     pub call_result_ofs: u64,
     pub call_func_ofs: u64,
@@ -485,14 +493,15 @@ pub struct FrameGeometry {
     /// the tail. The published `jf_gcmap` marks the used ordinary homes plus
     /// these captures.
     pub label_ref_slots: usize,
-    /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
-    /// i64 slot per prefix value slot and is disjoint from exits, dispatch,
-    /// and homes. Residual calls use the module-static scratch
-    /// (`jit_call_area_addr`), not this object.
+    /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. Compact
+    /// geometries reserve [`Self::prefix_force_slots`] i64 words here
+    /// (zero when the trace has no force guard). Extra force args from
+    /// `extend` sit in the tail. Residual calls use the module-static
+    /// scratch (`jit_call_area_addr`), not this object.
     pub force_slot_base: u64,
-    /// Bytes through the end of the force region. Equals [`Self::frame_bytes`]
-    /// on a compact geometry (no in-object call area). An extend tail sits
-    /// past this prefix; `jfi_frame_depth` covers it.
+    /// Bytes through the end of the prefix force region. Equals
+    /// [`Self::frame_bytes`] on a compact geometry (no in-object call area).
+    /// An extend tail sits past this prefix; `jfi_frame_depth` covers it.
     pub ca_frame_bytes: u32,
     /// Full bytes in the frame layout. Host entry, CALL_ASSEMBLER, and
     /// chained bridges allocate this many item bytes (`ca_frame_depth` /
@@ -502,6 +511,10 @@ pub struct FrameGeometry {
     /// Value slots addressed at [`FRAME_SLOT_BASE`]. Equals [`Self::value_slots`]
     /// until [`Self::extend`] appends the overflow past [`Self::tail_base`].
     pub prefix_value_slots: usize,
+    /// Force slots addressed at [`Self::force_slot_base`]. Equals the compact
+    /// `force_slots` argument until [`Self::extend`] appends overflow past
+    /// [`Self::tail_base`].
+    pub prefix_force_slots: usize,
     /// Ordinary Ref homes addressed at [`Self::home_slot_base`]. Label captures
     /// stay at the end of this prefix; extra ordinary homes go to the tail.
     pub prefix_ordinary_homes: usize,
@@ -522,6 +535,7 @@ impl FrameGeometry {
     pub const fn fixed() -> Self {
         Self {
             value_slots: MIN_FRAME_BYTES / 8,
+            force_slots: MIN_FRAME_BYTES / 8,
             call_result_ofs: CALL_RESULT_OFS,
             call_func_ofs: CALL_FUNC_OFS,
             call_nargs_ofs: CALL_NARGS_OFS,
@@ -534,6 +548,7 @@ impl FrameGeometry {
             ca_frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
             frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
             prefix_value_slots: MIN_FRAME_BYTES / 8,
+            prefix_force_slots: MIN_FRAME_BYTES / 8,
             prefix_ordinary_homes: 0,
             extra_ordinary_homes: 0,
             tail_base: 0,
@@ -542,22 +557,27 @@ impl FrameGeometry {
 
     /// Compact geometry for one token:
     /// `[value slots | dispatch key | Ref homes | force slots]`.
-    /// `value_slots` includes frame[0]. Force prefix length equals
-    /// `value_slots` because `emit_force_arm` / `force_arg_word` share the
-    /// compact fail-loc index space; a later `GUARD_NOT_FORCED` that writes
-    /// more fail args also raises `frame_value_slots`, and `extend` tails the
-    /// overflow. Residual calls use the module-static scratch, so this object
-    /// does not reserve a call area. A later bridge that needs more slots
-    /// keeps these offsets and appends a tail (`extend`);
+    /// `value_slots` includes frame[0]. `force_slots` is the maximum live
+    /// fail-arg count any `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2` writes
+    /// through [`Self::force_slot_ofs`] (`emit_force_arm`); zero when the
+    /// trace has none. Residual calls use the module-static scratch, so this
+    /// object does not reserve a call area. A later bridge that needs more
+    /// slots keeps these offsets and appends a tail (`extend`);
     /// `_check_frame_depth` / `wasm_realloc_frame` grow the live frame
-    /// (`assembler.py` `_check_frame_depth`, `llmodel.py` `realloc_frame`).
-    pub fn compact(value_slots: usize, home_slots: usize, label_ref_slots: usize) -> Self {
+    /// (`assembler.py` `assemble_loop` `update_frame_depth`,
+    /// `llmodel.py` `realloc_frame`).
+    pub fn compact(
+        value_slots: usize,
+        home_slots: usize,
+        label_ref_slots: usize,
+        force_slots: usize,
+    ) -> Self {
         debug_assert!(label_ref_slots <= home_slots);
         let value_slots = value_slots.max(1);
         let dispatch_key_ofs = (value_slots as u64) * SLOT_SIZE;
         let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
         let force_slot_base = home_slot_base + home_slots as u64 * SLOT_SIZE;
-        let ca_frame_bytes = force_slot_base + value_slots as u64 * SLOT_SIZE;
+        let ca_frame_bytes = force_slot_base + force_slots as u64 * SLOT_SIZE;
         let call_result_ofs = ca_frame_bytes;
         let call_func_ofs = call_result_ofs + SLOT_SIZE;
         let call_nargs_ofs = call_func_ofs + SLOT_SIZE;
@@ -565,6 +585,7 @@ impl FrameGeometry {
         let frame_bytes = ca_frame_bytes;
         Self {
             value_slots,
+            force_slots,
             call_result_ofs,
             call_func_ofs,
             call_nargs_ofs,
@@ -577,22 +598,27 @@ impl FrameGeometry {
             ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
             prefix_value_slots: value_slots,
+            prefix_force_slots: force_slots,
             prefix_ordinary_homes: home_slots - label_ref_slots,
             extra_ordinary_homes: 0,
             tail_base: 0,
         }
     }
 
-    /// `assembler.py _check_frame_depth`: keep every offset of `self`.
+    /// `assembler.py` `_check_frame_depth`: keep every offset of `self`.
     /// Overflow value slots, force args, and ordinary Ref homes share a
     /// tail of fixed-stride rows at [`Self::tail_base`]. Row `j` is
     /// `[value_j, force_j, home_j]`. A second extend keeps `tail_base` and
     /// the prefix counts, so an index already published does not move.
     /// A trace that already fits is returned unchanged.
-    pub fn extend(self, value_slots: usize, ordinary_homes: usize) -> Self {
+    pub fn extend(self, value_slots: usize, ordinary_homes: usize, force_slots: usize) -> Self {
         let values = value_slots.max(self.value_slots);
         let homes = ordinary_homes.max(self.addressable_ordinary_homes());
-        if values == self.value_slots && homes == self.addressable_ordinary_homes() {
+        let forces = force_slots.max(self.force_slots);
+        if values == self.value_slots
+            && homes == self.addressable_ordinary_homes()
+            && forces == self.force_slots
+        {
             return self;
         }
         let mut ext = self;
@@ -600,9 +626,11 @@ impl FrameGeometry {
             ext.tail_base = self.frame_bytes as u64;
         }
         ext.value_slots = values;
+        ext.force_slots = forces;
         ext.extra_ordinary_homes = homes - self.prefix_ordinary_homes;
         let extra_values = values - self.prefix_value_slots;
-        let rows = extra_values.max(ext.extra_ordinary_homes) as u64;
+        let extra_force = forces - self.prefix_force_slots;
+        let rows = extra_values.max(extra_force).max(ext.extra_ordinary_homes) as u64;
         let growth = 3 * rows * SLOT_SIZE;
         ext.frame_bytes = u32::try_from(ext.tail_base)
             .expect("tail_base")
@@ -658,16 +686,45 @@ impl FrameGeometry {
         (self.tail_base - FRAME_SLOT_BASE) / SLOT_SIZE
     }
 
-    /// GUARD_NOT_FORCED(_2) failarg `slot`. The source reserves
-    /// `prefix_value_slots` words at [`Self::force_slot_base`]; the rest are
-    /// the force word of tail row `slot - prefix_value_slots`.
+    /// GUARD_NOT_FORCED(_2) failarg `slot`. In-prefix iff
+    /// `slot < prefix_force_slots`; a slot at or past that count is the
+    /// force word of tail row `slot - prefix_force_slots`.
     pub fn force_slot_ofs(self, slot: u64) -> u64 {
-        let prefix = self.prefix_value_slots as u64;
-        if slot < prefix || !self.has_tail() {
+        let prefix = self.prefix_force_slots as u64;
+        if slot < prefix {
             self.force_slot_base + slot * SLOT_SIZE
         } else {
+            debug_assert!(
+                self.has_tail(),
+                "force slot {slot} needs a tail past prefix {prefix}"
+            );
             self.tail_base + (3 * (slot - prefix) + 1) * SLOT_SIZE
         }
+    }
+
+    /// Byte offsets `emit_force_arm` stores to, parallel to `fail_locs`.
+    /// Live entries are [`Self::force_slot_ofs`] at compact rank; holes are
+    /// [`FORCE_LOC_HOLE`]. [`Self::force_slot_ofs`] needs a tail when
+    /// `rank >= prefix_force_slots`; a no-tail geometry keeps
+    /// `force_slot_base + rank * SLOT_SIZE` for those ranks.
+    pub fn force_locs_for(self, fail_locs: &[Option<usize>]) -> Vec<u32> {
+        let mut rank = 0u64;
+        fail_locs
+            .iter()
+            .map(|slot| {
+                if slot.is_some() {
+                    let ofs = if rank < self.prefix_force_slots as u64 || self.has_tail() {
+                        self.force_slot_ofs(rank) as u32
+                    } else {
+                        (self.force_slot_base + rank * SLOT_SIZE) as u32
+                    };
+                    rank += 1;
+                    ofs
+                } else {
+                    FORCE_LOC_HOLE
+                }
+            })
+            .collect()
     }
 
     /// Byte offset of the first tail force word. Zero when [`Self::has_tail`]
@@ -709,6 +766,11 @@ impl FrameGeometry {
     /// Ordinary homes this geometry can address, prefix plus tail.
     pub const fn addressable_ordinary_homes(self) -> usize {
         self.ordinary_home_slots() + self.extra_ordinary_homes
+    }
+
+    /// Force slots this geometry can address, prefix plus tail.
+    pub const fn addressable_force_slots(self) -> usize {
+        self.force_slots
     }
 
     /// Host entry writes `nargs` values at [`Self::spill_slot_ofs`] and the
@@ -2473,6 +2535,16 @@ fn counter_slot(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
 
 pub fn frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots(inputargs, ops) + LabelResumeData::collect(inputargs, ops).scalar_slots
+}
+
+/// Live fail-arg count `emit_force_arm` writes through [`FrameGeometry::force_slot_ofs`].
+/// Zero when the trace has no `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`.
+pub fn frame_force_slots(_inputargs: &[InputArgRc], ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
+        .map(|op| live_exit_fail_args(op).len())
+        .max()
+        .unwrap_or(0)
 }
 
 /// `CondCallGcWb` / `CondCallGcWbArray` are the rewriter's already-decided
@@ -5315,8 +5387,9 @@ pub(crate) fn build_wasm_module_reporting_shortage(
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
     // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
-    // Ref homes, and the force region; a chained bridge that needs more keeps
-    // those offsets and appends a tail (`FrameGeometry::extend`).
+    // Ref homes, and the force region (sized to GUARD_NOT_FORCED live fail args);
+    // a chained bridge that needs more keeps those offsets and appends a tail
+    // (`FrameGeometry::extend`).
     let label_resume = LabelResumeData::collect_with_regions(
         &analysis_inputargs,
         &analysis_ops,
@@ -5338,6 +5411,22 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         *shortage_out = Some(shortage);
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {} frame value slots exceed compiled frame layout ({})",
+            shortage.needed, shortage.available,
+        )));
+    }
+    let needed_force_slots = frame_force_slots(&analysis_inputargs, &analysis_ops);
+    if needed_force_slots > frame.force_slots {
+        let shortage = super::FrameShortage::new(
+            super::FrameShortageKind::ForceSlots,
+            needed_force_slots,
+            frame.force_slots,
+        );
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
+        }
+        *shortage_out = Some(shortage);
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: {} force slots exceed compiled frame layout ({})",
             shortage.needed, shortage.available,
         )));
     }
@@ -5459,6 +5548,9 @@ pub(crate) fn build_wasm_module_reporting_shortage(
             ),
             super::FrameShortageKind::FrameValueSlots => {
                 unreachable!("value-slot shortage was checked above")
+            }
+            super::FrameShortageKind::ForceSlots => {
+                unreachable!("force-slot shortage was checked above")
             }
         };
         return Err(BackendError::Unsupported(reason));
@@ -13846,7 +13938,7 @@ mod tests {
             closed_body_regions: 0,
             closed_outside_regions: 0,
             ref_homes: &ref_homes,
-            frame: FrameGeometry::compact(1, 0, 0),
+            frame: FrameGeometry::compact(1, 0, 0, 0),
             counter_slot: None,
             spill_helpers: &spill_helpers,
             exit_table_base: 0,
@@ -13872,9 +13964,9 @@ mod tests {
 
     #[test]
     fn extended_geometry_keeps_source_offsets_and_tails_the_overflow() {
-        let source = FrameGeometry::compact(8, 4, 1);
-        assert_eq!(source.extend(8, source.ordinary_home_slots()), source);
-        let ext = source.extend(11, source.ordinary_home_slots() + 2);
+        let source = FrameGeometry::compact(8, 4, 1, 3);
+        assert_eq!(source.extend(8, source.ordinary_home_slots(), 3), source);
+        let ext = source.extend(11, source.ordinary_home_slots() + 2, 5);
         assert!(ext.has_tail());
         assert_eq!(ext.dispatch_key_ofs, source.dispatch_key_ofs);
         assert_eq!(ext.home_slot_base, source.home_slot_base);
@@ -13893,7 +13985,13 @@ mod tests {
         assert_eq!(ext.spill_slot_ofs(8), tail_base);
         assert_eq!(ext.spill_slot_ofs(9), tail_base + 3 * SLOT_SIZE);
         assert_eq!(ext.spill_slot_ofs(10), tail_base + 6 * SLOT_SIZE);
-        assert_eq!(ext.force_slot_ofs(8), tail_base + SLOT_SIZE);
+        assert_eq!(ext.force_slot_ofs(0), source.force_slot_base);
+        assert_eq!(
+            ext.force_slot_ofs(2),
+            source.force_slot_base + 2 * SLOT_SIZE
+        );
+        assert_eq!(ext.force_slot_ofs(3), tail_base + SLOT_SIZE);
+        assert_eq!(ext.force_slot_ofs(4), tail_base + 4 * SLOT_SIZE);
         assert_eq!(ext.home_ofs(prefix_homes), tail_base + 2 * SLOT_SIZE);
         assert_eq!(ext.home_ofs(prefix_homes + 1), tail_base + 5 * SLOT_SIZE);
         let tail_home = ext.home_ofs(prefix_homes);
@@ -13914,9 +14012,9 @@ mod tests {
     /// value, force, and home words of the grown geometry do not alias.
     #[test]
     fn ca_frame_depth_covers_tail_initial_locs() {
-        let source = FrameGeometry::compact(8, 4, 1);
+        let source = FrameGeometry::compact(8, 4, 1, 0);
         assert_eq!(source.ca_frame_depth(), source.signed_item_count());
-        let tailed = source.extend(11, source.ordinary_home_slots());
+        let tailed = source.extend(11, source.ordinary_home_slots(), 0);
         assert!(tailed.has_tail());
         assert_eq!(tailed.ca_frame_depth(), tailed.signed_item_count());
         let items_bytes = (tailed.ca_frame_depth() * std::mem::size_of::<isize>()) as u64;
@@ -13943,7 +14041,7 @@ mod tests {
 
     #[test]
     fn ca_frame_depth_covers_compact_home_gcmap() {
-        let frame = FrameGeometry::compact(32, 18, 2);
+        let frame = FrameGeometry::compact(32, 18, 2, 0);
         assert_eq!(frame.ca_frame_depth(), frame.signed_item_count());
         assert_eq!(
             frame.ca_frame_depth(),
@@ -13966,11 +14064,12 @@ mod tests {
 
     #[test]
     fn second_extend_keeps_published_tail_offsets() {
-        let source = FrameGeometry::compact(8, 4, 1);
-        let first = source.extend(11, source.ordinary_home_slots() + 2);
-        let second = first.extend(14, source.ordinary_home_slots() + 5);
+        let source = FrameGeometry::compact(8, 4, 1, 3);
+        let first = source.extend(11, source.ordinary_home_slots() + 2, 5);
+        let second = first.extend(14, source.ordinary_home_slots() + 5, 8);
         assert_eq!(second.tail_base, first.tail_base);
         assert_eq!(second.prefix_value_slots, first.prefix_value_slots);
+        assert_eq!(second.prefix_force_slots, first.prefix_force_slots);
         assert_eq!(second.prefix_ordinary_homes, first.prefix_ordinary_homes);
         for k in 0..first.value_slots as u64 {
             assert_eq!(
@@ -13978,6 +14077,8 @@ mod tests {
                 first.spill_slot_ofs(k),
                 "value {k}"
             );
+        }
+        for k in 0..first.force_slots as u64 {
             assert_eq!(
                 second.force_slot_ofs(k),
                 first.force_slot_ofs(k),
@@ -13993,16 +14094,21 @@ mod tests {
             offs.push(ofs);
         };
         let prefix_v = second.prefix_value_slots as u64;
+        let prefix_f = second.prefix_force_slots as u64;
         let prefix_h = second.prefix_ordinary_homes as u64;
         for k in prefix_v..second.value_slots as u64 {
             push(second.spill_slot_ofs(k));
+        }
+        for k in prefix_f..second.force_slots as u64 {
             push(second.force_slot_ofs(k));
         }
         for h in prefix_h..second.addressable_ordinary_homes() as u64 {
             push(second.home_ofs(h));
         }
-        let rows = (second.value_slots - second.prefix_value_slots).max(second.extra_ordinary_homes)
-            as u64;
+        let extra_force = second.force_slots - second.prefix_force_slots;
+        let rows = (second.value_slots - second.prefix_value_slots)
+            .max(extra_force)
+            .max(second.extra_ordinary_homes) as u64;
         assert_eq!(
             second.frame_bytes as u64,
             second.tail_base + 3 * rows * SLOT_SIZE
@@ -14012,17 +14118,40 @@ mod tests {
     #[test]
     fn compact_geometry_omits_the_residual_call_area() {
         let _cpu = cpu();
-        let frame = FrameGeometry::compact(32, 16, 0);
+        let frame = FrameGeometry::compact(32, 16, 0, 0);
         assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
         assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
         assert_eq!(frame.force_slot_base, 49 * SLOT_SIZE);
-        assert_eq!(frame.ca_frame_bytes, 648);
+        assert_eq!(frame.ca_frame_bytes as u64, frame.force_slot_base);
         assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
         assert_eq!(frame.frame_bytes, frame.ca_frame_bytes);
-        assert_eq!(
-            frame.frame_bytes as u64,
-            frame.force_slot_ofs(31) + SLOT_SIZE
-        );
+    }
+
+    #[test]
+    fn zero_force_slots_end_at_force_slot_base_and_extend_tails_them() {
+        let source = FrameGeometry::compact(8, 4, 1, 0);
+        assert_eq!(source.force_slots, 0);
+        assert_eq!(source.prefix_force_slots, 0);
+        assert_eq!(source.ca_frame_bytes as u64, source.force_slot_base);
+        let dispatch = source.dispatch_key_ofs;
+        let homes = source.home_slot_base;
+        let force_base = source.force_slot_base;
+        let prefix_bytes = source.ca_frame_bytes;
+        let ext = source.extend(8, source.ordinary_home_slots(), 3);
+        assert!(ext.has_tail());
+        assert_eq!(ext.dispatch_key_ofs, dispatch);
+        assert_eq!(ext.home_slot_base, homes);
+        assert_eq!(ext.force_slot_base, force_base);
+        assert_eq!(ext.ca_frame_bytes, prefix_bytes);
+        assert_eq!(ext.spill_slot_ofs(0), FRAME_SLOT_BASE);
+        assert_eq!(ext.spill_slot_ofs(7), FRAME_SLOT_BASE + 7 * SLOT_SIZE);
+        assert_eq!(ext.home_ofs(0), source.home_slot_base);
+        assert_eq!(ext.prefix_force_slots, 0);
+        assert_eq!(ext.force_slots, 3);
+        assert_eq!(ext.force_slot_ofs(0), ext.tail_base + SLOT_SIZE);
+        assert_eq!(ext.force_slot_ofs(1), ext.tail_base + 4 * SLOT_SIZE);
+        assert_eq!(ext.force_slot_ofs(2), ext.tail_base + 7 * SLOT_SIZE);
+        assert_eq!(ext.frame_bytes as u64, ext.tail_base + 3 * 3 * SLOT_SIZE);
     }
 
     /// The constant-operand bound must answer exactly what the wrapping
