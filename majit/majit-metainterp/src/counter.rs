@@ -472,23 +472,22 @@ impl JitCounterInner {
     /// drivers may file a cell under the same raw hash; a minted key is
     /// unique across drivers ([`Self::mint_cell_key`]).
     fn cell_by_key(&self, jitdriver_sd: usize, cell_key: u64) -> Option<Rc<BaseJitCell>> {
-        fn walk(
-            cell: Option<&Rc<BaseJitCell>>,
-            jitdriver_sd: usize,
-            cell_key: u64,
-        ) -> Option<Rc<BaseJitCell>> {
-            let c = cell?;
+        let head = self.lookup_chain(self.bucket_of(cell_key));
+        let mut cell: Option<&Rc<BaseJitCell>> = head.as_ref();
+        while let Some(c) = cell {
             if c.jitdriver_sd == jitdriver_sd && c.cell_key.get() == Some(cell_key) {
                 return Some(Rc::clone(c));
             }
-            let next = c.next.borrow();
-            walk(next.as_ref(), jitdriver_sd, cell_key)
+            // SAFETY: `BaseJitCell.next` is only mutably borrowed in
+            // `install_new_cell` and `gc_cells` (`next.take` / `next.borrow_mut`);
+            // both take `&mut JitCounterInner`. This walk holds `&self` and
+            // has no callback, so those writers cannot run. The table is a
+            // `RefCell` (`!Sync`).
+            cell = unsafe { c.next.try_borrow_unguarded() }
+                .expect("jitcell chain relinked during lookup")
+                .as_ref();
         }
-        walk(
-            self.lookup_chain(self.bucket_of(cell_key)).as_ref(),
-            jitdriver_sd,
-            cell_key,
-        )
+        None
     }
 
     /// Whether any driver's cell holds `cell_key`.

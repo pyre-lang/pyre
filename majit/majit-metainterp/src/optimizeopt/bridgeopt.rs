@@ -133,16 +133,18 @@ pub fn serialize_optimizer_knowledge(
         numb_state.append_int(0); // loopinvariant count
         return Ok(());
     };
-    // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
+    // bridgeopt.py serialize_optheap(available_boxes): membership is after
+    // `AbstractValue.get_box_replacement`. Walk the box, then test
+    // Const / available_boxes (`ResumeDataVirtualAdder._gettagged`).
     let field_ok = |obj: &Operand, val: &Operand| {
-        // bridgeopt.py serialize_optheap membership is after
-        // `AbstractValue.get_box_replacement`. Walk the box, then test
-        // Const / available_boxes (`ResumeDataVirtualAdder._gettagged`).
-        let obj = obj.get_box_replacement(false);
-        let val = val.get_box_replacement(false);
-        (obj.is_constant() || env.is_const(&obj) || available_boxes.contains_key(&obj))
-            && (val.is_constant() || env.is_const(&val) || available_boxes.contains_key(&val))
+        obj.with_box_replacement(|obj| {
+            val.with_box_replacement(|val| {
+                (obj.is_constant() || env.is_const(obj) || available_boxes.contains_key(obj))
+                    && (val.is_constant() || env.is_const(val) || available_boxes.contains_key(val))
+            })
+        })
     };
+    // bridgeopt.py serialize_optheap(available_boxes)
     let triples_struct: Vec<&(Operand, i32, Operand)> = knowledge
         .heap_fields
         .iter()
@@ -181,8 +183,9 @@ pub fn serialize_optimizer_knowledge(
         .loopinvariant_results
         .iter()
         .filter(|(_, result)| {
-            let result = result.get_box_replacement(false);
-            result.is_constant() || env.is_const(&result) || available_boxes.contains_key(&result)
+            result.with_box_replacement(|result| {
+                result.is_constant() || env.is_const(result) || available_boxes.contains_key(result)
+            })
         })
         .collect();
     numb_state.append_int(tuples_loopinvariant.len() as i64);

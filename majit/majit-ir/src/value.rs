@@ -188,6 +188,9 @@ impl Value {
 /// A constant value known at trace time.
 ///
 /// Mirrors rpython/jit/metainterp/resoperation.py Const* classes.
+/// `#[repr(u64)]` is a data-carrying primitive-repr enum: u64 tag then
+/// the 8-byte payload in every arm, which [`Const::payload_word`] loads.
+#[repr(u64)]
 #[derive(Clone, Copy, Debug)]
 pub enum Const {
     Int(i64),
@@ -196,6 +199,8 @@ pub enum Const {
     /// Const across a collection are walked and the walk writes this field.
     Ref(GcRef),
 }
+
+const _: () = assert!(std::mem::size_of::<Const>() == 16);
 
 impl PartialEq for Const {
     fn eq(&self, other: &Self) -> bool {
@@ -490,6 +495,28 @@ impl Const {
             Value::Float(v) => Const::Float(v),
             Value::Ref(v) => Const::from_gcref(v),
             Value::Void => panic!("Const::from_value: Void has no Const counterpart"),
+        }
+    }
+
+    /// Payload word at offset 8. `history.py` `ConstInt.getint` /
+    /// `ConstPtr.getref_base` / `ConstFloat.getfloatstorage` are typed
+    /// field loads of `self.value`; on 64-bit targets every `Const` arm
+    /// stores that word here, and other targets take the typed load.
+    /// TAGCONST decode uses this after a `debug_assert!` on the
+    /// bank's variant (`resume.py` numbering).
+    #[inline(always)]
+    pub fn payload_word(&self) -> i64 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            debug_assert_eq!(std::mem::size_of::<Const>(), 16);
+            // SAFETY: `#[repr(u64)]` stores the discriminant as a u64 then an
+            // 8-byte payload in every arm on a 64-bit target (`GcRef` is a
+            // `usize`), so offset 8 is the field load `as_raw_i64` performs.
+            unsafe { *(self as *const Const as *const i64).add(1) }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            self.as_raw_i64()
         }
     }
 
@@ -2204,6 +2231,21 @@ mod tests {
     fn test_gcref_null() {
         assert!(GcRef::NULL.is_null());
         assert!(!GcRef(0x1234).is_null());
+    }
+
+    #[test]
+    fn const_payload_word_matches_as_raw_i64() {
+        assert_eq!(std::mem::size_of::<Const>(), 16);
+        let cases = [
+            Const::Int(0x1111_2222_3333_4444),
+            Const::Int(-1),
+            Const::Float(2.5),
+            Const::Ref(GcRef(0x5555)),
+            Const::Ref(GcRef(0)),
+        ];
+        for c in cases {
+            assert_eq!(c.payload_word(), c.as_raw_i64());
+        }
     }
 
     #[test]

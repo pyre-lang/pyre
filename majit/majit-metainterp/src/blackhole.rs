@@ -1457,20 +1457,9 @@ impl BlackholeInterpreter {
         // resumed at a position that is not a merge point, or a `setarg_i` wrote
         // past `num_regs_i` and overwrote the constant slot the operand reads.
         // Report both coordinates instead of an anonymous bounds panic.
-        assert!(
-            jdindex < self.jitdrivers_sd.len(),
-            "blackhole jit_merge_point decoded jdindex={jdindex} but only {} jitdriver(s) exist \
-             (jitcode={} c_form={} jdindex_byte={jdindex_byte} num_regs_i={} registers_i.len={} \
-             position={} last_opcode_position={} entry_position={})",
-            self.jitdrivers_sd.len(),
-            self.jitcode.name(),
-            opcode == jitcode::insns::BC_JIT_MERGE_POINT_C,
-            self.jitcode.num_regs_i(),
-            self.registers_i.len(),
-            self.position,
-            self.last_opcode_position,
-            self.entry_position,
-        );
+        if jdindex >= self.jitdrivers_sd.len() {
+            jit_merge_point_jdindex_out_of_range(self, jdindex, opcode, jdindex_byte);
+        }
         let result_type = self.jitdrivers_sd[jdindex].result_type;
         // The portal runner is published behind an `extern "C"` boundary and
         // cannot unwind, so a raise inside it arrives in `BH_LAST_EXC_VALUE`
@@ -1745,6 +1734,7 @@ impl BlackholeInterpreter {
     }
 
     /// blackhole.py handle_rvmprof_enter.
+    #[inline]
     pub fn handle_rvmprof_enter(&mut self) {
         let code: &[u8] = self.jitcode.code.as_slice();
         let mut position = self.position;
@@ -1894,6 +1884,11 @@ impl BlackholeInterpreter {
         self.run_inner()
     }
 
+    /// The loop body is one function that its callers do not inline, as
+    /// `blackhole.py BlackholeInterpBuilder.setup_insns` sets
+    /// `dispatch_loop._dont_inline_ = True`. The `const UNTRANSLATED`
+    /// instances are the translated loop and the untranslated diagnostic loop.
+    #[inline(never)]
     fn run_inner(&mut self) -> BhRunOutcome {
         let trace = crate::majit_log_enabled() || crate::bh_debug_enabled();
         // blackhole.py:86-91:
@@ -2179,10 +2174,76 @@ impl BlackholeInterpreter {
                         self.position = position + 1;
                         return BhRunOutcome::LeaveFrame;
                     }
-                    jitcode::insns::BC_INLINE_CALL => {
-                        self.position = pos_before;
+                    jitcode::insns::BC_GOTO_IF_NOT_INT_LT => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            let target = bh_code_label(code, position + 2);
+                            position = if a < b {
+                                position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE
+                            } else {
+                                target
+                            };
+                        }
+                        continue;
+                    }
+                    // `bhimpl_loop_header` / `bhimpl_int_guard_value` /
+                    // `bhimpl_ref_guard_value` are `pass`; one register operand.
+                    jitcode::insns::BC_LOOP_HEADER
+                    | jitcode::insns::BC_INT_GUARD_VALUE
+                    | jitcode::insns::BC_REF_GUARD_VALUE => {
+                        position += 1;
+                        continue;
+                    }
+                    jitcode::insns::BC_LOAD_STATE_FIELD
+                    | jitcode::insns::BC_STORE_STATE_FIELD
+                    | jitcode::insns::BC_LOAD_STATE_FIELD_REF
+                    | jitcode::insns::BC_STRLEN => {
+                        let stepped = match opcode {
+                            jitcode::insns::BC_LOAD_STATE_FIELD => {
+                                handler_load_state_field_di(self, code, position)
+                            }
+                            jitcode::insns::BC_STORE_STATE_FIELD => {
+                                handler_store_state_field_di(self, code, position)
+                            }
+                            jitcode::insns::BC_LOAD_STATE_FIELD_REF => {
+                                handler_load_state_field_ref_dr(self, code, position)
+                            }
+                            _ => handler_strlen(self, code, position),
+                        };
+                        let Ok(new_pos) = stepped else {
+                            unreachable!("state-field and strlen handlers do not raise")
+                        };
+                        position = new_pos;
+                        regs_i = self.registers_i.as_mut_ptr();
+                        regs_r = self.registers_r.as_mut_ptr();
+                        continue;
+                    }
+                    jitcode::insns::BC_INLINE_CALL
+                    | jitcode::insns::BC_INLINE_CALL_IR_I
+                    | jitcode::insns::BC_JIT_MERGE_POINT_C => {
                         self.last_opcode_position = pos_before;
-                        match handler_inline_call_nested_ext(self, code, position) {
+                        // `_get_method` handlers decode from the byte after the
+                        // opcode. `inline_call_nested_ext` keeps the opcode's
+                        // own position in `self.position`; the other two are
+                        // entered with it past the opcode, as `dispatch_step`
+                        // enters them (`bhimpl_jit_merge_point` reads its
+                        // operands through `self.position`).
+                        let stepped = match opcode {
+                            jitcode::insns::BC_INLINE_CALL => {
+                                self.position = pos_before;
+                                handler_inline_call_nested_ext(self, code, position)
+                            }
+                            jitcode::insns::BC_INLINE_CALL_IR_I => {
+                                self.position = position;
+                                handler_inline_call_ir_i(self, code, position)
+                            }
+                            _ => {
+                                self.position = position;
+                                handler_jit_merge_point_c(self, code, position)
+                            }
+                        };
+                        match stepped {
                             Ok(new_pos) => {
                                 position = new_pos;
                                 regs_i = self.registers_i.as_mut_ptr();
@@ -2300,6 +2361,7 @@ impl BlackholeInterpreter {
     /// byte (handler signature `(bh, code, position) -> Result<usize>`)
     /// and return the post-operand position; we then store it back into
     /// `self.position`.
+    #[inline(always)]
     fn dispatch_step(&mut self, opcode: u8, code: &[u8]) -> Result<(), DispatchError> {
         // `blackhole.py dispatch_loop`: `self.dispatch_table[opcode_byte](...)`.
         // The table is 256 slots (`setup_insns`), so a u8 index cannot miss.
@@ -4122,6 +4184,47 @@ mod tests {
         let next = handler_store_state_field_di(&mut bh, &[0, 0, 2], 0).unwrap();
         assert_eq!(next, 3);
         assert_eq!(bh.registers_i[0], 99);
+    }
+
+    #[test]
+    fn goto_if_not_int_lt_arm_matches_table_handler() {
+        // `goto_if_not_int_lt r0 r1 L; int_return r2; L: int_return r3`.
+        // Fall-through when `r0 < r1` (`bhimpl_goto_if_not_int_lt`).
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        let l = b.new_label();
+        b.goto_if_not_int_lt(0, 1, l);
+        b.int_return(2);
+        b.mark_label(l);
+        b.int_return(3);
+        let jitcode = std::sync::Arc::new(b.finish());
+
+        let run = |r0: i64, r1: i64| {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert(
+                "goto_if_not_int_lt/iiL".to_string(),
+                majit_jitcode::insns::BC_GOTO_IF_NOT_INT_LT,
+            );
+            entries.insert(
+                "int_return/i".to_string(),
+                majit_jitcode::insns::BC_INT_RETURN,
+            );
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+            let mut bh = builder.acquire_interp();
+            bh.setposition(jitcode.clone(), 0);
+            bh.registers_i[0] = r0;
+            bh.registers_i[1] = r1;
+            bh.registers_i[2] = 11;
+            bh.registers_i[3] = 22;
+            match bh.run() {
+                BhRunOutcome::LeaveFrame => {}
+                other => panic!("expected LeaveFrame, got {other:?}"),
+            }
+            bh.tmpreg_i
+        };
+        assert_eq!(run(1, 2), 11);
+        assert_eq!(run(2, 1), 22);
     }
 
     #[test]
@@ -8738,31 +8841,56 @@ impl StateFieldLayout {
 /// Encoding: 1× u16 `field_idx` + 1× u8 dest register = 3 bytes.
 /// Only the portal JitCode emits this opcode (`blackhole.py`
 /// `bhimpl_inline_call_*` never inherits caller registers).
+#[inline(always)]
 fn handler_load_state_field_di(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let dest = code[position + 2] as usize;
+    debug_assert!(position + 2 < code.len());
+    // SAFETY: `assembler.py` `Assembler.assemble` emits a well-formed
+    // stream: this opcode is followed by a u16 field index and a u8 dest
+    // register, and those operands name slots in the seated banks.
+    let field_idx = unsafe {
+        *code.get_unchecked(position) as usize | ((*code.get_unchecked(position + 1) as usize) << 8)
+    };
+    let dest = unsafe { *code.get_unchecked(position + 2) } as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    let value = bh.registers_i[slot];
-    bh.registers_i[dest] = value;
+    debug_assert!(slot < bh.registers_i.len());
+    debug_assert!(dest < bh.registers_i.len());
+    // SAFETY: dest and slot are seated-bank indices from the same layout
+    // the assembler used for this opcode.
+    let value = unsafe { *bh.registers_i.get_unchecked(slot) };
+    unsafe {
+        *bh.registers_i.get_unchecked_mut(dest) = value;
+    }
     Ok(position + 3)
 }
 
 /// `store_state_field/di` — `registers_i[slot(field_idx)] = registers_i[src]`.
 /// Encoding: 1× u16 `field_idx` + 1× u8 src register = 3 bytes.
+#[inline(always)]
 fn handler_store_state_field_di(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let src = code[position + 2] as usize;
+    debug_assert!(position + 2 < code.len());
+    // SAFETY: `assembler.py` `Assembler.assemble` well-formed stream:
+    // u16 field index then u8 src register, naming seated-bank slots.
+    let field_idx = unsafe {
+        *code.get_unchecked(position) as usize | ((*code.get_unchecked(position + 1) as usize) << 8)
+    };
+    let src = unsafe { *code.get_unchecked(position + 2) } as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    let value = bh.registers_i[src];
-    bh.registers_i[slot] = value;
+    debug_assert!(src < bh.registers_i.len());
+    debug_assert!(slot < bh.registers_i.len());
+    // SAFETY: src and slot are seated-bank indices from the same layout
+    // the assembler used for this opcode.
+    let value = unsafe { *bh.registers_i.get_unchecked(src) };
+    unsafe {
+        *bh.registers_i.get_unchecked_mut(slot) = value;
+    }
     Ok(position + 3)
 }
 
@@ -8771,16 +8899,28 @@ fn handler_store_state_field_di(
 /// resume reader seeded it from the ref fail-args. Mirror of
 /// `handler_load_state_field_di` on the ref bank.
 /// Encoding: 1× u16 `field_idx` + 1× u8 dest ref register = 3 bytes.
+#[inline(always)]
 fn handler_load_state_field_ref_dr(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let dest = code[position + 2] as usize;
+    debug_assert!(position + 2 < code.len());
+    // SAFETY: `assembler.py` `Assembler.assemble` well-formed stream:
+    // u16 field index then u8 dest ref register, naming seated-bank slots.
+    let field_idx = unsafe {
+        *code.get_unchecked(position) as usize | ((*code.get_unchecked(position + 1) as usize) << 8)
+    };
+    let dest = unsafe { *code.get_unchecked(position + 2) } as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
-    let value = bh.registers_r[slot];
-    bh.registers_r[dest] = value;
+    debug_assert!(slot < bh.registers_r.len());
+    debug_assert!(dest < bh.registers_r.len());
+    // SAFETY: dest and slot are seated ref-bank indices from the same
+    // layout the assembler used for this opcode.
+    let value = unsafe { *bh.registers_r.get_unchecked(slot) };
+    unsafe {
+        *bh.registers_r.get_unchecked_mut(dest) = value;
+    }
     Ok(position + 3)
 }
 
@@ -8844,6 +8984,7 @@ fn handler_jit_merge_point_i(
 
 /// Handler for `jit_merge_point/cIRFIRF` — `BC_JIT_MERGE_POINT_C`
 /// (assembler.py `USE_C_FORM`: jdindex inlined as a signed byte).
+#[inline(always)]
 fn handler_jit_merge_point_c(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -10678,6 +10819,7 @@ fn handler_new_array_clear_c(
 }
 
 // String operations (`blackhole.py bhimpl_getlistitem_gc_r`)
+#[inline(always)]
 fn handler_strlen(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10871,6 +11013,31 @@ fn handler_setinteriorfield_gc_i(
 type BhArgList = crate::opencoder::FixedSignedList;
 type ListRootGuard = crate::opencoder::ListRootGuard;
 
+/// `blackhole.py` `bhimpl_jit_merge_point` indexes
+/// `sd.jitdrivers_sd[jdindex]` only on the recursive-portal arm.
+#[cold]
+#[inline(never)]
+fn jit_merge_point_jdindex_out_of_range(
+    bh: &BlackholeInterpreter,
+    jdindex: usize,
+    opcode: u8,
+    jdindex_byte: u8,
+) -> ! {
+    panic!(
+        "blackhole jit_merge_point decoded jdindex={jdindex} but only {} jitdriver(s) exist \
+         (jitcode={} c_form={} jdindex_byte={jdindex_byte} num_regs_i={} registers_i.len={} \
+         position={} last_opcode_position={} entry_position={})",
+        bh.jitdrivers_sd.len(),
+        bh.jitcode.name(),
+        opcode == jitcode::insns::BC_JIT_MERGE_POINT_C,
+        bh.jitcode.num_regs_i(),
+        bh.registers_i.len(),
+        bh.position,
+        bh.last_opcode_position,
+        bh.entry_position,
+    );
+}
+
 /// blackhole.py `@arguments` decode of an `'I'` / `'R'` / `'F'` operand:
 /// `length = ord(code[position])`, then `registers[ord(code[position + i])]`
 /// for each `i`, then `position += length`.
@@ -10881,15 +11048,19 @@ fn get_list_of_values_into(
     registers: &[i64],
     values: &mut Vec<i64>,
 ) {
-    let start = *position + 1;
-    let end = start + code[*position] as usize;
+    let length = code[*position] as usize;
+    *position += 1;
     values.clear();
-    values.extend(
-        code[start..end]
-            .iter()
-            .map(|&index| registers[index as usize]),
-    );
-    *position = end;
+    values.reserve(length);
+    for i in 0..length {
+        // SAFETY: an `'I'`/`'R'`/`'F'` argcode length byte names that many
+        // following register-index bytes, each `< num_regs + nconsts`
+        // (`blackhole.py` `_get_method` / `_get_list_of_values`).
+        let index = unsafe { *code.get_unchecked(*position + i) } as usize;
+        debug_assert!(index < registers.len());
+        values.push(unsafe { *registers.get_unchecked(index) });
+    }
+    *position += length;
 }
 
 #[cfg(test)]
@@ -10905,7 +11076,10 @@ fn read_list_from(
     gc_ptrs: bool,
     live: &mut [GcRef],
 ) -> (BhArgList, usize) {
-    let count = code[pos] as usize;
+    debug_assert!(pos < code.len());
+    // SAFETY: an `'I'`/`'R'`/`'F'` argcode length byte names that many
+    // following register-index bytes (`blackhole.py` `_get_method`).
+    let count = unsafe { *code.get_unchecked(pos) } as usize;
     let (mut values, needs) = BhArgList::alloc_with_roots(count, gc_ptrs, live);
     values.fill_from_code(regs, code, pos + 1);
     // incminimark.py `write_barrier` is the `TRACK_YOUNG_PTRS` test; a
@@ -14891,6 +15065,7 @@ fn handler_inline_call_irf_v(
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
+#[inline(always)]
 fn handler_inline_call_ir_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

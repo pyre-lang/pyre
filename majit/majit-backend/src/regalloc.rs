@@ -235,12 +235,12 @@ impl<R: Copy + Eq + Hash> LifetimeManager<R> {
         let longevity_var = get_lifetime(v).unwrap();
         // check whether there is a fixed register and whether it's free
         if let Some(idx) = longevity_var.find_fixed_register(position) {
-            let idx = idx as usize;
-            if idx < all_regs.len() {
-                let reg = all_regs[idx];
-                if free_regs.contains(&reg) {
-                    return Some(reg);
-                }
+            // `regalloc.py Lifetime.find_fixed_register` stores the register's
+            // index in `all_regs`; the non-generic `Lifetime` in `majit-ir`
+            // cannot name the backend register type.
+            let reg = all_regs[idx as usize];
+            if free_regs.contains(&reg) {
+                return Some(reg);
             }
         }
         // try to find a register that's free for the whole lifetime of v

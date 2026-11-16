@@ -958,9 +958,15 @@ impl FixedSignedList {
     #[inline]
     pub fn fill_from_code(&mut self, regs: &[i64], code: &[u8], start: usize) {
         let len = self.header_len();
+        debug_assert!(start + len <= code.len());
         let p = self.item_ptr();
         for i in 0..len {
-            unsafe { *p.add(i) = regs[code[start + i] as usize] };
+            // SAFETY: an `'I'`/`'R'`/`'F'` argcode length byte names that
+            // many following register-index bytes, each
+            // `< num_regs + nconsts` (`blackhole.py` `_get_method`).
+            let index = unsafe { *code.get_unchecked(start + i) } as usize;
+            debug_assert!(index < regs.len());
+            unsafe { *p.add(i) = *regs.get_unchecked(index) };
         }
     }
 }

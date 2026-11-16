@@ -3562,62 +3562,63 @@ impl ResumeDataLoopMemo {
         // box in `cached`; ResumeDataLoopMemo._number_boxes walks that
         // object. A miss is a bind-at-alloc / iterator-cache bug.
         let held = cached.or(snapshot_box.cached.as_ref());
-        let b = match held {
-            Some(cached) => cached.get_box_replacement(false),
-            None => panic!(
+        let Some(held) = held else {
+            panic!(
                 "_number_one: snapshot slot {raw_opref:?} has no iterator-cache box \
                  (TraceIterator._get)"
-            ),
+            );
         };
-        let opref = b.to_opref();
-        if opref.is_none() {
-            numb_state.append_short(NULLREF);
-            return Ok(());
-        }
-        // resume.py: isinstance(box, Const) → getconst
-        if env.is_const(&b) {
-            let (val, tp) = env.get_const(&b);
-            let tagged = self.getconst(val, tp)?;
-            numb_state.append_short(tagged);
-            return Ok(());
-        }
-        // ResumeDataLoopMemo._number_boxes: liveboxes
-        if let Some(tagged) = numb_state.liveboxes.get(&b) {
-            numb_state.append_short(tagged);
-            return Ok(());
-        }
-        // ResumeDataLoopMemo._number_boxes:
-        //
+        // resume.py ResumeDataLoopMemo._number_boxes:
         //     box = iter.get(...)
         //     box = box.get_box_replacement()
-        //     ...
-        //     if box.type == 'r':
-        //
-        // The type used for virtual classification is the replacement
-        // box's type (`AbstractValue.type`), not the original snapshot
-        // slot's fallback type. A snapshot slot can carry an Int fallback
-        // from tracing but forward to a Ref virtual after optimization;
-        // keeping the stale fallback would number that virtual as a TAGBOX
-        // and the subsequent fail-arg force would materialize it.
-        let box_type = b.type_();
-        let is_virtual = match box_type {
-            majit_ir::Type::Ref => env.is_virtual_ref(&b),
-            majit_ir::Type::Int => env.is_virtual_raw(&b),
-            _ => false,
-        };
-        let tagged = if is_virtual {
-            let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
-            numb_state.num_virtuals += 1;
-            t
-        } else {
-            // resume.py `_number_boxes` reads `box.type` off the box.
-            let t = tag(numb_state.num_boxes, TAGBOX)?;
-            numb_state.num_boxes += 1;
-            t
-        };
-        numb_state.liveboxes.insert(b, tagged);
-        numb_state.append_short(tagged);
-        Ok(())
+        // Walk the held box; clone only when liveboxes stores the terminal.
+        held.with_box_replacement(|b| {
+            if b.to_opref().is_none() {
+                numb_state.append_short(NULLREF);
+                return Ok(());
+            }
+            // resume.py: isinstance(box, Const) → getconst
+            if env.is_const(b) {
+                let (val, tp) = env.get_const(b);
+                let tagged = self.getconst(val, tp)?;
+                numb_state.append_short(tagged);
+                return Ok(());
+            }
+            // ResumeDataLoopMemo._number_boxes: liveboxes
+            if let Some(tagged) = numb_state.liveboxes.get(b) {
+                numb_state.append_short(tagged);
+                return Ok(());
+            }
+            // ResumeDataLoopMemo._number_boxes:
+            //
+            //     if box.type == 'r':
+            //
+            // The type used for virtual classification is the replacement
+            // box's type (`AbstractValue.type`), not the original snapshot
+            // slot's fallback type. A snapshot slot can carry an Int fallback
+            // from tracing but forward to a Ref virtual after optimization;
+            // keeping the stale fallback would number that virtual as a TAGBOX
+            // and the subsequent fail-arg force would materialize it.
+            let box_type = b.type_();
+            let is_virtual = match box_type {
+                majit_ir::Type::Ref => env.is_virtual_ref(b),
+                majit_ir::Type::Int => env.is_virtual_raw(b),
+                _ => false,
+            };
+            let tagged = if is_virtual {
+                let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
+                numb_state.num_virtuals += 1;
+                t
+            } else {
+                // resume.py `_number_boxes` reads `box.type` off the box.
+                let t = tag(numb_state.num_boxes, TAGBOX)?;
+                numb_state.num_boxes += 1;
+                t
+            };
+            numb_state.liveboxes.insert(b.clone(), tagged);
+            numb_state.append_short(tagged);
+            Ok(())
+        })
     }
 
     /// `resume.py ResumeDataLoopMemo._number_boxes(self, iter, iterator, numb_state)`.
@@ -7015,6 +7016,52 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
     }
 }
 
+/// Locals for one resume-section walk: `Reader.cur_pos` / `items_read` /
+/// numbering payload pointer (`resumecode.py` `numb_next_item`) and the
+/// TAGBOX `deadframe` / `rd_locs` / `count` (`llmodel.py` `_decode_pos`).
+struct ResumeCursor<'a> {
+    numb_ptr: *const u8,
+    numb_len: usize,
+    cur_pos: usize,
+    items_read: usize,
+    deadframe: i64,
+    locs: &'a [u16],
+    count: i32,
+    locs_empty: bool,
+}
+
+impl ResumeCursor<'_> {
+    #[inline(always)]
+    fn next_item(&mut self) -> i32 {
+        debug_assert!(!self.numb_ptr.is_null());
+        Reader::take_item_from(
+            self.numb_ptr,
+            self.numb_len,
+            &mut self.cur_pos,
+            &mut self.items_read,
+        )
+    }
+
+    #[inline(always)]
+    fn write_to_reader(&self, reader: &mut Reader<'_>) {
+        reader.cur_pos = self.cur_pos;
+        reader.items_read = self.items_read;
+    }
+
+    #[inline(always)]
+    fn reload_bases(&mut self, reader: &Reader<'_>, deadframe: i64) {
+        self.cur_pos = reader.cur_pos;
+        self.items_read = reader.items_read;
+        self.deadframe = deadframe;
+        let code = reader.code_addr();
+        if code != 0 {
+            let (ptr, len) = Reader::bound_payload(code);
+            self.numb_ptr = ptr;
+            self.numb_len = len;
+        }
+    }
+}
+
 impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py __init__
     pub fn new(
@@ -7111,13 +7158,42 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `get_*_value_direct` on `self.deadframe`.
     #[inline(always)]
     fn cpu_get_value(&self, index: usize) -> i64 {
-        let gcref = self.deadframe;
-        if gcref != 0 {
-            return unsafe {
-                majit_backend::get_int_value_at(gcref, self.deadframe_rd_locs, index)
-            };
+        let locs = self.deadframe_rd_locs;
+        self.cpu_get_value_at(self.deadframe, locs, locs.is_empty(), index)
+    }
+
+    #[inline(always)]
+    fn cpu_get_value_at(
+        &self,
+        deadframe: i64,
+        locs: &[u16],
+        locs_empty: bool,
+        index: usize,
+    ) -> i64 {
+        if deadframe != 0 {
+            return unsafe { majit_backend::get_int_value_at(deadframe, locs, index, locs_empty) };
         }
         self.cpu_get_value_slice(index)
+    }
+
+    #[inline(always)]
+    fn resume_cursor(&self) -> ResumeCursor<'a> {
+        let code = self.resumecodereader.code_addr();
+        let (numb_ptr, numb_len) = if code != 0 {
+            Reader::bound_payload(code)
+        } else {
+            (std::ptr::null(), 0)
+        };
+        ResumeCursor {
+            numb_ptr,
+            numb_len,
+            cur_pos: self.resumecodereader.cur_pos,
+            items_read: self.resumecodereader.items_read,
+            deadframe: self.deadframe,
+            locs: self.deadframe_rd_locs,
+            count: self.count,
+            locs_empty: self.deadframe_rd_locs.is_empty(),
+        }
     }
 
     #[cold]
@@ -7500,8 +7576,13 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py `read_jitcode_pos_pc`.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
-        let jitcode_pos = self.resumecodereader.next_item_bound();
-        let pc = self.resumecodereader.next_item_bound();
+        let mut cur_pos = self.resumecodereader.cur_pos;
+        let mut items_read = self.resumecodereader.items_read;
+        let code = self.resumecodereader.code_addr();
+        let jitcode_pos = Reader::next_item_from(code, &mut cur_pos, &mut items_read);
+        let pc = Reader::next_item_from(code, &mut cur_pos, &mut items_read);
+        self.resumecodereader.cur_pos = cur_pos;
+        self.resumecodereader.items_read = items_read;
         (jitcode_pos, pc)
     }
 
@@ -7714,11 +7795,16 @@ impl<'a> ResumeDataDirectReader<'a> {
 
         // jitcode.py `enumerate_vars` — three length bytes.
         // `ord(all_liveness[offset])` after translation is an `rffi` load.
-        // Validate the header once at section start; bank walks are then
-        // unchecked under `LivenessIterator::new`.
-        let length_i = all_liveness[info] as u32;
-        let length_r = all_liveness[info + 1] as u32;
-        let length_f = all_liveness[info + 2] as u32;
+        debug_assert!(
+            info + 2 < all_liveness.len(),
+            "enumerate_vars header past all_liveness"
+        );
+        // SAFETY: `get_live_vars_info` returns an offset of a complete
+        // `encode_liveness` record (3 length bytes + banks). A short
+        // buffer is a producer bug (`liveness.py` `encode_liveness`).
+        let length_i = unsafe { *all_liveness.get_unchecked(info) } as u32;
+        let length_r = unsafe { *all_liveness.get_unchecked(info + 1) } as u32;
+        let length_f = unsafe { *all_liveness.get_unchecked(info + 2) } as u32;
         // jitcode.py:152
         let mut offset = info + 3;
 
@@ -7727,6 +7813,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // store plus a `jit_strict_mode` bound check; the regex leaf
         // pays that call once per live slot per frame per character.
         let vinfo_heap = vinfo.filter(|v| v.has_vable_token());
+        let mut cur = self.resume_cursor();
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             // SAFETY: `all_liveness` bank at `offset` is a complete
@@ -7738,9 +7825,11 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // (`liveness.py` `LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 // resume.py `_callback_i`: `write_an_int(index, next_int())`.
-                bh.registers_i[reg_idx as usize] = self.next_int();
+                let tagged = cur.next_item() as i16;
+                bh.registers_i[reg_idx as usize] = self.decode_int_tagged(tagged, &mut cur);
             }
             offset = it.offset();
+            cur.write_to_reader(&mut self.resumecodereader);
         }
         // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
@@ -7750,13 +7839,15 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 // resume.py `_callback_r`: `write_a_ref(index, next_ref())`.
-                let value = self.next_ref();
+                let tagged = cur.next_item() as i16;
+                let value = self.decode_ref_tagged(tagged, &mut cur);
                 bh.registers_r[reg_idx as usize] = value;
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
             }
             offset = it.offset();
+            cur.write_to_reader(&mut self.resumecodereader);
         }
         // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
@@ -7766,10 +7857,12 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 // resume.py `_callback_f`: `write_a_float(index, next_float())`.
-                bh.registers_f[reg_idx as usize] = self.next_float();
+                let tagged = cur.next_item() as i16;
+                bh.registers_f[reg_idx as usize] = self.decode_float_tagged(tagged, &cur);
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
+            cur.write_to_reader(&mut self.resumecodereader);
         }
     }
 
@@ -7998,52 +8091,84 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py `ResumeDataDirectReader.decode_int`
     #[inline(always)]
     pub fn decode_int(&mut self, tagged: i16) -> i64 {
+        let mut cur = self.resume_cursor();
+        let value = self.decode_int_tagged(tagged, &mut cur);
+        cur.write_to_reader(&mut self.resumecodereader);
+        value
+    }
+
+    #[inline(always)]
+    fn decode_int_tagged(&mut self, tagged: i16, cur: &mut ResumeCursor<'_>) -> i64 {
         let (num, tag) = untag(tagged);
         if tag == TAGCONST {
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            self.consts[idx].getint()
+            let c = &self.consts[idx];
+            debug_assert!(matches!(c, Const::Int(_)));
+            c.payload_word()
         } else if tag == TAGINT {
             num as i64
         } else if tag == TAGVIRTUAL {
+            cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
-            self.getvirtual_int(idx)
+            let value = self.getvirtual_int(idx);
+            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            value
         } else {
             debug_assert_eq!(tag, TAGBOX);
             let mut idx = num;
             if idx < 0 {
-                idx += self.count;
+                idx += cur.count;
             }
-            self.cpu_get_value(idx as usize)
+            self.cpu_get_value_at(cur.deadframe, cur.locs, cur.locs_empty, idx as usize)
         }
     }
 
     /// resume.py `ResumeDataDirectReader.decode_ref`
     #[inline(always)]
     pub fn decode_ref(&mut self, tagged: i16) -> i64 {
+        let mut cur = self.resume_cursor();
+        let value = self.decode_ref_tagged(tagged, &mut cur);
+        cur.write_to_reader(&mut self.resumecodereader);
+        value
+    }
+
+    #[inline(always)]
+    fn decode_ref_tagged(&mut self, tagged: i16, cur: &mut ResumeCursor<'_>) -> i64 {
         let (num, tag) = untag(tagged);
         if tag == TAGCONST {
             if tagged_eq(tagged, NULLREF) {
                 return 0;
             }
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            self.consts[idx].getref_base().as_usize() as i64
+            let c = &self.consts[idx];
+            debug_assert!(matches!(c, Const::Ref(_)));
+            c.payload_word()
         } else if tag == TAGVIRTUAL {
+            cur.write_to_reader(&mut self.resumecodereader);
             let idx = self.virtual_index(num);
-            self.getvirtual_ptr(idx)
+            let value = self.getvirtual_ptr(idx);
+            cur.reload_bases(&self.resumecodereader, self.deadframe);
+            value
         } else {
             if tag != TAGBOX {
                 panic!("decode_ref: unexpected tag {tag}");
             }
             let mut idx = num;
             if idx < 0 {
-                idx += self.count;
+                idx += cur.count;
             }
-            self.cpu_get_value(idx as usize)
+            self.cpu_get_value_at(cur.deadframe, cur.locs, cur.locs_empty, idx as usize)
         }
     }
 
     /// resume.py decode_float
     pub fn decode_float(&mut self, tagged: i16) -> i64 {
+        let cur = self.resume_cursor();
+        self.decode_float_tagged(tagged, &cur)
+    }
+
+    #[inline(always)]
+    fn decode_float_tagged(&self, tagged: i16, cur: &ResumeCursor<'_>) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
@@ -8055,9 +8180,9 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // resume.py:1585-1588
                 let mut idx = num;
                 if idx < 0 {
-                    idx += self.count;
+                    idx += cur.count;
                 }
-                self.cpu_get_value(idx as usize)
+                self.cpu_get_value_at(cur.deadframe, cur.locs, cur.locs_empty, idx as usize)
             }
             _ => {
                 // resume.py — only TAGCONST and TAGBOX valid for floats

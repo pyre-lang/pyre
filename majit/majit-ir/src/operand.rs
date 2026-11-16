@@ -193,6 +193,71 @@ const OP_SMALLWIDE: u64 = 4;
 const OP_NULLREF: u64 = 5;
 const OP_TEMPVAR: u64 = 6;
 
+/// `SmallWide` packed word (`history.py` Const carries its type on the object):
+/// bits 0–2 tag `OP_SMALLWIDE`, bits 3–61 slab index (59 bits), bits 62–63
+/// `Type`. The index field is 59 bits; `wide_slot` asserts
+/// `id / WIDE_CHUNK < WIDE_MAX_CHUNKS`, so the maximum index is
+/// `WIDE_MAX_CHUNKS * WIDE_CHUNK - 1` (4_194_303). `Operand` is always a
+/// `u64` and SmallWide is a slab index, not a stolen pointer, so bits 62–63
+/// are free on every pointer width. Type bits are a function of the slab
+/// entry: two operands naming the same index pack the same bits, so
+/// `PartialEq` / `Hash` of the packed word still identify by index.
+const SMALLWIDE_INDEX_SHIFT: u32 = 3;
+const SMALLWIDE_INDEX_BITS: u32 = 59;
+const SMALLWIDE_INDEX_MASK: u64 = (1u64 << 59) - 1;
+const SMALLWIDE_TYPE_SHIFT: u32 = 62;
+
+#[inline]
+fn type_to_small_wide_bits(tp: Type) -> u64 {
+    match tp {
+        Type::Int => 0,
+        Type::Ref => 1,
+        Type::Float => 2,
+        Type::Void => 3,
+    }
+}
+
+#[inline]
+fn small_wide_bits_to_type(bits: u64) -> Type {
+    match bits & 0b11 {
+        0 => Type::Int,
+        1 => Type::Ref,
+        2 => Type::Float,
+        _ => Type::Void,
+    }
+}
+
+#[inline]
+fn wide_stored_type(stored: WideStored) -> Type {
+    match stored {
+        WideStored::Int(_) => Type::Int,
+        WideStored::Float(_) => Type::Float,
+        WideStored::Ref(_) => Type::Ref,
+        WideStored::Void => Type::Void,
+    }
+}
+
+#[inline]
+fn pack_small_wide(id: u64, tp: Type) -> u64 {
+    debug_assert!(
+        id < (1u64 << SMALLWIDE_INDEX_BITS),
+        "SmallWide index exceeds 59 bits"
+    );
+    OP_SMALLWIDE
+        | (id << SMALLWIDE_INDEX_SHIFT)
+        | (type_to_small_wide_bits(tp) << SMALLWIDE_TYPE_SHIFT)
+}
+
+#[inline]
+fn small_wide_index(packed: u64) -> u64 {
+    (packed >> SMALLWIDE_INDEX_SHIFT) & SMALLWIDE_INDEX_MASK
+}
+
+#[inline]
+fn small_wide_type(packed: u64) -> Type {
+    small_wide_bits_to_type(packed >> SMALLWIDE_TYPE_SHIFT)
+}
+
 /// Decoded view. Pointer variants borrow the operand's own reference without
 /// taking a count; the view must not outlive the operand it was read from.
 enum Opnd {
@@ -216,12 +281,13 @@ pub struct OperandView<'a> {
 
 impl OperandView<'_> {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
+    /// SmallWide reads the packed 2-bit type and does not load the slab.
     pub fn type_(&self) -> Type {
         match &self.inner {
             Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
             Opnd::InputArg(ia) => ia.tp.get(),
             Opnd::SmallInt(_) => Type::Int,
-            Opnd::SmallWide(id) => wide_value(*id).get_type(),
+            Opnd::SmallWide(packed) => small_wide_type(*packed),
             Opnd::NullRef => Type::Ref,
             Opnd::Const(cell) => cell.get().get_type(),
             Opnd::None => Type::Void,
@@ -234,7 +300,7 @@ impl OperandView<'_> {
     pub fn const_value(&self) -> Option<Value> {
         match &self.inner {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
-            Opnd::SmallWide(id) => Some(wide_value(*id)),
+            Opnd::SmallWide(packed) => Some(wide_value(small_wide_index(*packed))),
             Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
             Opnd::Const(cell) => Some(cell.get()),
             Opnd::Op(_) | Opnd::InputArg(_) | Opnd::TempVar(_) | Opnd::None => None,
@@ -287,9 +353,9 @@ impl Operand {
 
     #[allow(non_snake_case)]
     pub fn SmallWide(id: u64) -> Operand {
-        debug_assert!(id < (1 << 61));
+        let tp = wide_stored_type(wide_slot(id as u32).get());
         Operand {
-            packed: OP_SMALLWIDE | (id << 3),
+            packed: pack_small_wide(id, tp),
         }
     }
 
@@ -330,7 +396,7 @@ impl Operand {
                 let id = self.packed >> 35;
                 Opnd::SmallInt((id << 32) | val)
             }
-            OP_SMALLWIDE => Opnd::SmallWide(self.packed >> 3),
+            OP_SMALLWIDE => Opnd::SmallWide(self.packed),
             OP_NULLREF => Opnd::NullRef,
             OP_TEMPVAR => Opnd::TempVar(ManuallyDrop::new(unsafe {
                 Rc::from_raw((self.packed & !OP_TAG) as *const TempVar)
@@ -449,7 +515,10 @@ impl std::fmt::Debug for Operand {
                 .debug_tuple("SmallInt")
                 .field(&small_int_value(enc))
                 .finish(),
-            Opnd::SmallWide(id) => f.debug_tuple("SmallWide").field(&wide_value(id)).finish(),
+            Opnd::SmallWide(packed) => f
+                .debug_tuple("SmallWide")
+                .field(&wide_value(small_wide_index(packed)))
+                .finish(),
             Opnd::NullRef => f.write_str("NullRef"),
             Opnd::Const(c) => f.debug_tuple("Const").field(&c.get()).finish(),
             Opnd::TempVar(tv) => f.debug_tuple("TempVar").field(&tv.id).finish(),
@@ -468,7 +537,11 @@ impl Operand {
         {
             return Operand::SmallInt(encoded);
         }
-        Operand::SmallWide(fresh_wide(value))
+        let stored = store_wide(value);
+        let id = fresh_wide_stored(stored);
+        Operand {
+            packed: pack_small_wide(id, wide_stored_type(stored)),
+        }
     }
 
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
@@ -522,7 +595,12 @@ impl Operand {
             // Resolving it and interning the word again would hash that
             // word through `id_or_identityhash`, which takes only a live
             // address.
-            OpRef::ConstPtr(v) => Operand::SmallWide(fresh_wide_stored(WideStored::Ref(v))),
+            OpRef::ConstPtr(v) => {
+                let id = fresh_wide_stored(WideStored::Ref(v));
+                Operand {
+                    packed: pack_small_wide(id, Type::Ref),
+                }
+            }
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
                  every operand source must carry a bound producer or a const (#9)"
@@ -582,7 +660,7 @@ impl Operand {
             Opnd::Op(op) => op.pos().get(),
             Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp.get()),
             Opnd::SmallInt(encoded) => OpRef::const_int(small_int_value(encoded)),
-            Opnd::SmallWide(id) => match wide_slot(id as u32).get() {
+            Opnd::SmallWide(packed) => match wide_slot(small_wide_index(packed) as u32).get() {
                 WideStored::Int(v) => OpRef::const_int(v),
                 WideStored::Float(v) => OpRef::const_float(v),
                 WideStored::Ref(index) => OpRef::ConstPtr(index),
@@ -611,12 +689,17 @@ impl Operand {
     }
 
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
+    /// SmallWide reads the 2-bit type packed at mint (`history.py` Const type
+    /// on the object) and does not load the slab.
     pub fn type_(&self) -> Type {
+        if self.packed & OP_TAG == OP_SMALLWIDE {
+            return small_wide_type(self.packed);
+        }
         match self.view() {
             Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
             Opnd::InputArg(ia) => ia.tp.get(),
             Opnd::SmallInt(_) => Type::Int,
-            Opnd::SmallWide(id) => wide_value(id).get_type(),
+            Opnd::SmallWide(packed) => small_wide_type(packed),
             Opnd::NullRef => Type::Ref,
             Opnd::Const(cell) => cell.get().get_type(),
             Opnd::None => Type::Void,
@@ -629,7 +712,7 @@ impl Operand {
     pub fn const_value(&self) -> Option<Value> {
         match self.view() {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
-            Opnd::SmallWide(id) => Some(wide_value(id)),
+            Opnd::SmallWide(packed) => Some(wide_value(small_wide_index(packed))),
             Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
             Opnd::Const(cell) => Some(cell.get()),
             Opnd::Op(_) | Opnd::InputArg(_) | Opnd::TempVar(_) | Opnd::None => None,
@@ -644,7 +727,7 @@ impl Operand {
     pub fn get_value(&self) -> Option<Value> {
         match self.view() {
             Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
-            Opnd::SmallWide(id) => Some(wide_value(id)),
+            Opnd::SmallWide(packed) => Some(wide_value(small_wide_index(packed))),
             Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
             Opnd::Const(cell) => Some(cell.get()),
             Opnd::Op(op) => op.get_value(),
@@ -658,7 +741,7 @@ impl Operand {
     pub fn const_int(&self) -> Option<i64> {
         match self.view() {
             Opnd::SmallInt(encoded) => Some(small_int_value(encoded)),
-            Opnd::SmallWide(id) => match wide_value(id) {
+            Opnd::SmallWide(packed) => match wide_value(small_wide_index(packed)) {
                 Value::Int(v) => Some(v),
                 _ => None,
             },
@@ -1053,7 +1136,7 @@ impl Operand {
     /// cell still carries a `Value::Ref` address and is forwarded here.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         if self.packed != 0 && self.packed & OP_TAG == OP_SMALLWIDE {
-            let id = self.packed >> 3;
+            let id = small_wide_index(self.packed);
             if let Some(index) = wide_ref_index(id) {
                 crate::const_ptr_table::trace_index(index, visitor);
             }
@@ -1549,6 +1632,32 @@ mod tests {
 
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 8);
+    }
+
+    #[test]
+    fn small_wide_type_bits_follow_slab_index_identity() {
+        let f = Operand::const_(Const::Float(1.5));
+        assert!(f.is_small_wide());
+        assert_eq!(f.type_(), Type::Float);
+        f.with_view(|v| assert_eq!(v.type_(), Type::Float));
+        assert_eq!(f, f.clone());
+        let rebuilt = Operand::SmallWide(small_wide_index(f.packed));
+        assert_eq!(rebuilt, f);
+        assert_eq!(rebuilt.type_(), Type::Float);
+        let f2 = Operand::const_(Const::Float(1.5));
+        assert_ne!(f, f2);
+
+        let r = Operand::const_(Const::from_gcref(GcRef(0x1000)));
+        assert_eq!(r.type_(), Type::Ref);
+        r.with_view(|v| assert_eq!(v.type_(), Type::Ref));
+        assert_eq!(Operand::SmallWide(small_wide_index(r.packed)), r);
+
+        let n = Operand::const_(Const::Int(i32::MAX as i64 + 1));
+        assert!(n.is_small_wide());
+        assert_eq!(n.type_(), Type::Int);
+        n.with_view(|v| assert_eq!(v.type_(), Type::Int));
+        assert_eq!(Operand::SmallWide(small_wide_index(n.packed)), n);
+        assert_eq!(n.const_value(), Some(Value::Int(i32::MAX as i64 + 1)));
     }
 
     #[test]

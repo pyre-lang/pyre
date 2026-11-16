@@ -7567,9 +7567,10 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// One class dispatch (`FailDescr::handle_fail_is_plain_resume_guard`),
     /// matching the virtual `handle_fail`. Plain `ResumeGuardDescr` /
-    /// `ResumeAtPositionDescr` on a driver with no virtualizable take the
-    /// straight-line function; Forced / Exc / Copied / Finish / Propagate
-    /// keep `consume_executed_frame` + [`Self::consume_compiled_entry_result`].
+    /// `ResumeAtPositionDescr` with no heap virtualizable (none, or one
+    /// without a `vable_token`) take the straight-line function; Forced /
+    /// Exc / Copied / Finish / Propagate keep `consume_executed_frame` +
+    /// [`Self::consume_compiled_entry_result`].
     fn dispatch_handle_fail(
         &mut self,
         green_key: u64,
@@ -7592,8 +7593,23 @@ impl<S: JitState> JitDriver<S> {
             .backend()
             .get_latest_descr(&frame)
             .handle_fail_is_plain_resume_guard();
-        if is_plain && self.meta.virtualizable_info().is_none() {
-            return self.handle_fail(frame, green_key, target_pc, state, env, compiled_meta);
+        if is_plain {
+            // `compile.py ResumeGuardDescr.handle_fail` has one body. A
+            // driver whose virtualizable carries no `vable_token` (a
+            // state-field machine) has no heap virtualizable to force, so it
+            // takes the same straight-line function once the recording
+            // context's saved pointer is put back.
+            let restore = match self.meta.virtualizable_info() {
+                None => Some(false),
+                Some(info) if !info.has_vable_token() => Some(true),
+                Some(_) => None,
+            };
+            if let Some(restore) = restore {
+                if restore {
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
+                }
+                return self.handle_fail(frame, green_key, target_pc, state, env, compiled_meta);
+            }
         }
         let mut result = self.meta.consume_executed_frame(green_key, frame);
         self.consume_compiled_entry_result(
@@ -7648,7 +7664,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// `compile.py` `AbstractResumeGuardDescr.handle_fail` for the plain
-    /// `ResumeGuardDescr` / `ResumeAtPositionDescr` with no virtualizable.
+    /// `ResumeGuardDescr` / `ResumeAtPositionDescr` with no heap virtualizable
+    /// (none, or one without a `vable_token`).
     fn handle_fail(
         &mut self,
         deadframe: majit_backend::DeadFrame,
@@ -7742,8 +7759,8 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// `compile.py AbstractResumeGuardDescr.handle_fail(self, deadframe, ...)`
     /// for Forced / Exc / Copied / Finish / Propagate. Plain
-    /// `ResumeGuardDescr` / `ResumeAtPositionDescr` without a virtualizable
-    /// run [`Self::handle_fail`].
+    /// `ResumeGuardDescr` / `ResumeAtPositionDescr` with no heap virtualizable
+    /// (none, or one without a `vable_token`) run [`Self::handle_fail`].
     fn consume_compiled_entry_result(
         &mut self,
         green_key: u64,

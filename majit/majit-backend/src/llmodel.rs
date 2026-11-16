@@ -53,12 +53,12 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
 }
 
 #[inline]
-fn decode_rd_loc_slot_from_locs(locs: &[u16], index: usize) -> Option<usize> {
+fn decode_rd_loc_slot_from_locs(locs: &[u16], index: usize, locs_empty: bool) -> Option<usize> {
     // Empty table is identity: FINISH outputs, external JUMP inputs, and
     // execute_token input stores (`_ll_initial_locs` / LABEL loader).
     // Guards always stamp `rd_locs` (`store_info_on_descr`); `0xFFFF` is a
     // numbering hole and has no jitframe word.
-    if locs.is_empty() {
+    if locs_empty {
         return Some(index);
     }
     match locs.get(index).copied() {
@@ -79,7 +79,8 @@ fn decode_rd_loc_slot_from_locs(locs: &[u16], index: usize) -> Option<usize> {
 /// passed in, because the deadframe types that hold one are the callers.
 #[inline]
 pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
-    decode_rd_loc_slot_from_locs(descr.rd_locs(), index)
+    let locs = descr.rd_locs();
+    decode_rd_loc_slot_from_locs(locs, index, locs.is_empty())
 }
 
 /// llmodel.py — `get_int_value_direct(deadframe, pos)`.
@@ -114,13 +115,18 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
 /// deadframe GCREF. The reader stores that GCREF plus `rd_locs` and
 /// hits this instead of matching [`FailArgSource`] per TAGBOX slot.
 #[inline(always)]
-pub unsafe fn get_int_value_at(deadframe: i64, locs: &[u16], index: usize) -> i64 {
+pub unsafe fn get_int_value_at(
+    deadframe: i64,
+    locs: &[u16],
+    index: usize,
+    locs_empty: bool,
+) -> i64 {
     let ptr = deadframe as *mut JitFrame;
     // `ResumeDataDirectReader::bind_deadframe_root` registers the reader's
     // `deadframe` field, so a collection rewrites it in place; the frame a
     // guard failure returned carries no `jf_forward` link.
     debug_assert_eq!(unsafe { JitFrame::resolve(ptr) }, ptr);
-    match decode_rd_loc_slot_from_locs(locs, index) {
+    match decode_rd_loc_slot_from_locs(locs, index, locs_empty) {
         Some(slot) => unsafe { get_int_value_direct(ptr as *const JitFrame, slot) as i64 },
         None => 0,
     }
@@ -234,7 +240,7 @@ impl<'a> FailArgSource<'a> {
             } => {
                 debug_assert!(index < *n);
                 let ptr = root.get().0 as *const JitFrame;
-                match decode_rd_loc_slot_from_locs(rd_locs, index) {
+                match decode_rd_loc_slot_from_locs(rd_locs, index, rd_locs.is_empty()) {
                     Some(slot) => {
                         let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
                         unsafe { get_int_value_direct(ptr, slot) as i64 }
@@ -244,7 +250,7 @@ impl<'a> FailArgSource<'a> {
             }
             Self::LibcJitFrame { ptr, rd_locs, n } => {
                 debug_assert!(index < *n);
-                match decode_rd_loc_slot_from_locs(rd_locs, index) {
+                match decode_rd_loc_slot_from_locs(rd_locs, index, rd_locs.is_empty()) {
                     Some(slot) => {
                         let ptr = unsafe { JitFrame::resolve(*ptr as *mut JitFrame) };
                         unsafe { get_int_value_direct(ptr, slot) as i64 }

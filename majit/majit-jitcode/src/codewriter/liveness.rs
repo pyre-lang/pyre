@@ -226,8 +226,8 @@ impl<'a> LivenessIterator<'a> {
     /// `LivenessIterator.next` does `ord(all_liveness[self.offset])`.
     /// A truncated buffer is a producer bug.
     pub unsafe fn new(offset: usize, length: u32, all_liveness: &'a [u8]) -> Self {
-        assert!(length != 0);
-        assert!(
+        debug_assert!(length != 0);
+        debug_assert!(
             offset < all_liveness.len(),
             "liveness bank offset past all_liveness"
         );

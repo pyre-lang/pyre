@@ -319,6 +319,13 @@ impl<'a> Reader<'a> {
         self.from_gc && self.code.0 != 0
     }
 
+    /// `resumecode.py` `Reader.code` payload address (length word, then
+    /// `numb.code` bytes). Zero until `bind_numbering`.
+    #[inline(always)]
+    pub fn code_addr(&self) -> usize {
+        self.code.0
+    }
+
     /// The `Reader.code` field `push_resume_ref_root` rewrites.
     #[inline]
     pub fn gc_code_mut(&mut self) -> Option<&mut crate::GcRef> {
@@ -340,39 +347,61 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// `numb.code` pointer and length from a bound `Reader.code` address.
+    /// `resumecode.py` `numb_next_item` indexes `numb.code` from that
+    /// pointer. An empty numbering never reaches this path.
     #[inline(always)]
-    fn take_item(&mut self, ptr: *const u8, len: usize) -> i32 {
-        let index = self.cur_pos;
+    pub fn bound_payload(code: usize) -> (*const u8, usize) {
+        debug_assert!(code != 0);
+        // SAFETY: `bind_numbering` stored a live `NUMBERING` payload;
+        // the length word sits at `code`, bytes at `code + WORD`.
+        let ptr = unsafe { (code as *const u8).add(numb_len_word()) };
+        #[cfg(debug_assertions)]
+        let len = unsafe { *(code as *const usize) };
+        #[cfg(not(debug_assertions))]
+        let len = 0usize;
+        (ptr, len)
+    }
+
+    /// One varint consume: `resumecode.py` `Reader.next_item` /
+    /// `numb_next_item` after inlining, with `cur_pos` / `items_read`
+    /// as ordinary locals.
+    #[inline(always)]
+    pub fn take_item_from(
+        ptr: *const u8,
+        len: usize,
+        cur_pos: &mut usize,
+        items_read: &mut usize,
+    ) -> i32 {
         // SAFETY: `payload` is a complete `NUMBERING.code`
         // (`resumecode.py` `Writer.create_numbering`; `numb_next_item`).
-        let (result, new_pos) = unsafe { decode_varint_at(ptr, len, index) };
-        self.cur_pos = new_pos;
-        self.items_read += 1;
+        let (result, new_pos) = unsafe { decode_varint_at(ptr, len, *cur_pos) };
+        *cur_pos = new_pos;
+        *items_read += 1;
         result
+    }
+
+    /// Bound `numb_next_item` with the numbering address and cursor in
+    /// caller locals (`resumecode.py` `Reader.next_item`).
+    #[inline(always)]
+    pub fn next_item_from(code: usize, cur_pos: &mut usize, items_read: &mut usize) -> i32 {
+        let (ptr, len) = Self::bound_payload(code);
+        Self::take_item_from(ptr, len, cur_pos, items_read)
     }
 
     /// resumecode.py: next_item / `numb_next_item` (always inline).
     #[inline(always)]
     pub fn next_item(&mut self) -> i32 {
         let (ptr, len) = self.payload();
-        self.take_item(ptr, len)
+        Self::take_item_from(ptr, len, &mut self.cur_pos, &mut self.items_read)
     }
 
     /// `numb_next_item` after `bind_numbering` / `from_numbering`.
     /// An empty numbering never reaches this path.
     #[inline(always)]
     pub fn next_item_bound(&mut self) -> i32 {
-        let addr = self.code.0;
-        debug_assert!(self.bound && addr != 0);
-        // SAFETY: `bind_numbering` stored a live `NUMBERING` payload;
-        // `resumecode.py` `numb_next_item` indexes `numb.code` from that
-        // pointer. An empty numbering never reaches this path.
-        let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
-        #[cfg(debug_assertions)]
-        let len = unsafe { *(addr as *const usize) };
-        #[cfg(not(debug_assertions))]
-        let len = 0usize;
-        self.take_item(ptr, len)
+        debug_assert!(self.bound && self.code.0 != 0);
+        Self::next_item_from(self.code.0, &mut self.cur_pos, &mut self.items_read)
     }
 
     /// resumecode.py: peek
