@@ -7269,83 +7269,6 @@ fn pygraph_from_adapter_graph(graph: crate::flowspace::model::GraphRef) -> Rc<Py
     })
 }
 
-/// Dual-gate slot on always-raise wrappers is an unfollowed Ok-arm phi
-/// (a colored block inputarg), not `getreturnvar()`. `normalizecalls.py`
-/// `normalize_calltable_row_annotation` only unions graph args and
-/// `getreturnvar()`. Phase A leaves the Ok-arm twin unbound; Phase B
-/// stamps Impossible→Void; `flatten.py` `getcolor` still colors it.
-/// Bind only those colored unbound phi twins to the family Instance
-/// return so dual-gate compares GcRef.
-fn widen_impossible_value_to_var_twins(
-    annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    call_registry: &CallRegistry,
-    builtin_wrapper_graphs: &[crate::parse::CallPath],
-    function_graphs: &crate::codewriter::call::GraphStore,
-) {
-    use crate::annotator::model::SomeValue;
-    let work: Vec<(Vec<Variable>, SomeValue)> = {
-        let tp = call_registry.two_phase();
-        builtin_wrapper_graphs
-            .iter()
-            .filter_map(|path| {
-                let subject = tp.subjects.get(path)?;
-                let ret = subject.graph.borrow().getreturnvar();
-                let s_payload = annotator.annotation(&ret)?;
-                if !matches!(s_payload, SomeValue::Instance(_)) {
-                    return None;
-                }
-                let twins = function_graphs.get(path).map_or_else(Vec::new, |legacy| {
-                    phi_unbound_twins(legacy.as_ref(), subject, annotator)
-                });
-                Some((twins, s_payload))
-            })
-            .collect()
-    };
-    for (twins, s_payload) in work {
-        for mut v in twins {
-            match annotator.annotation(&Hlvalue::Variable(v.clone())) {
-                None | Some(SomeValue::Impossible) => {
-                    annotator.setbinding(&mut v, s_payload.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Colored, unbound block inputarg twins. Dual-gate `getcolor` still
-/// emits these Ok-arm phis on always-raise wrappers.
-fn phi_unbound_twins(
-    legacy: &LegacyGraph,
-    subject: &crate::translator::rtyper::call_registry::TwoPhaseSubject,
-    annotator: &crate::annotator::annrpython::RPythonAnnotator,
-) -> Vec<Variable> {
-    use crate::annotator::model::SomeValue;
-    let colored = colored_operand_vars(legacy);
-    let mut out = Vec::new();
-    let mut push = |typed: &Variable| match annotator.annotation(&Hlvalue::Variable(typed.clone()))
-    {
-        None | Some(SomeValue::Impossible) => out.push(typed.clone()),
-        _ => {}
-    };
-    for block in &legacy.blocks {
-        for ia in &block.inputargs {
-            if !colored.contains(ia) {
-                continue;
-            }
-            if let Some(typed) = subject.value_to_var.get(ia) {
-                push(typed);
-            }
-            if let Some(typeds) = subject.value_to_var_candidates.get(ia) {
-                for typed in typeds {
-                    push(typed);
-                }
-            }
-        }
-    }
-    out
-}
-
 fn rtype_skip_wrapper_subjects(
     call_registry: &CallRegistry,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
@@ -7382,7 +7305,6 @@ fn consider_builtin_wrapper_call_site(
     call_registry: &CallRegistry,
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
-    function_graphs: &crate::codewriter::call::GraphStore,
 ) -> Result<(), crate::annotator::model::AnnotatorError> {
     use crate::annotator::argument::simple_args;
     use crate::annotator::description::{FunctionDesc, GraphCacheKey};
@@ -7453,17 +7375,6 @@ fn consider_builtin_wrapper_call_site(
             normalize_calltable_row_annotation(annotator, graphs)?;
         }
     }
-    // Always-raising wrappers already bind `getreturnvar()` as the
-    // `PyResult` `SomeInstance` (signature / reachable except-path).
-    // Dual-gate slot is the unfollowed Ok-arm phi, still Impossible →
-    // Void. `unionof(s_ImpossibleValue, X) == X`: give that extract the
-    // family return so Phase B rtypes GcRef.
-    widen_impossible_value_to_var_twins(
-        annotator,
-        call_registry,
-        builtin_wrapper_graphs,
-        function_graphs,
-    );
     if descs.is_empty() {
         return Ok(());
     }
@@ -7939,12 +7850,7 @@ fn run_phase_b_rtype_isolated(
     // skip `FunctionDesc.pycall`, so the generated wrappers need their
     // PBC call-family row before the whole-program driver.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        consider_builtin_wrapper_call_site(
-            call_registry,
-            &annotator,
-            builtin_wrapper_graphs,
-            function_graphs,
-        )
+        consider_builtin_wrapper_call_site(call_registry, &annotator, builtin_wrapper_graphs)
     })) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
