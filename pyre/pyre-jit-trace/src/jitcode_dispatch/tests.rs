@@ -3997,16 +3997,17 @@ fn call_trace_callee_prologue_walk_does_not_leave_helper_as_call_result() {
     });
 }
 
-/// `HelperReturn::CalleePrologue` on a transparent helper (`call_trace`):
-/// `blackhole_if_trace_too_long` (`pyjitpl.py`) uses the ordinary
-/// [`helper_too_long_decision`] table. The helper is not latched as
-/// innermost (dest-write); a 0-effect declined latch Aborts so the
-/// enclosing Python CALL latches the CALL-entry image
-/// (`blackhole.py convert_and_run_from_pyjitpl`). A `Converted` helper's
-/// child starts from `CallResult` and still latches; an unrelated
-/// Collapsed helper (`HelperResume::Unresumable`) still latches.
+/// A transparent helper whose return is not the CALL's result
+/// (`HelperReturn::CalleePrologue`, or a `'v'` boxed descent and every
+/// helper below it: `FbwWalkMode::call_entry_helper_chain`) is not latched
+/// as innermost: `blackhole.py convert_and_run_from_pyjitpl` would
+/// dest-write its return into the CALL. `blackhole_if_trace_too_long`
+/// (`pyjitpl.py`) uses the ordinary [`helper_too_long_decision`] table, so a
+/// 0-effect declined latch Aborts and the enclosing Python CALL latches the
+/// CALL-entry image. `CallResult` and `Converted` helpers outside such a
+/// chain still latch, with or without a Collapsed helper level on the stack.
 #[test]
-fn callee_prologue_helper_does_not_latch_abort_blackhole() {
+fn call_entry_helper_does_not_latch_abort_blackhole() {
     #[derive(Clone, Copy)]
     enum HelperOnStack {
         None,
@@ -4016,6 +4017,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
     fn try_latch(
         helper_return: HelperReturn,
         on_stack: HelperOnStack,
+        call_entry_helper_chain: bool,
     ) -> (bool, HelperTooLongDecision) {
         fbw_store_journal_reset();
         reset_single_frame_blackhole();
@@ -4050,6 +4052,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
                 // Skip keys off CalleePrologue, not this index.
                 transparent_helper_jitcode_index: Some(test_outer_resume_jitcode_index() as usize),
                 helper_return,
+                call_entry_helper_chain,
                 ..test_fbw_mode()
             },
             session: &session,
@@ -4081,7 +4084,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
     }
 
     let (call_result_latched, call_result_too_long) =
-        try_latch(HelperReturn::CallResult, HelperOnStack::None);
+        try_latch(HelperReturn::CallResult, HelperOnStack::None, false);
     assert!(
         call_result_latched,
         "CallResult helper still latches via the test-helper convert path"
@@ -4097,23 +4100,35 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         "a Converted helper's child starts from CallResult"
     );
     let (converted_latched, converted_too_long) =
-        try_latch(HelperReturn::Converted, HelperOnStack::None);
+        try_latch(HelperReturn::Converted, HelperOnStack::None, false);
     assert!(
         converted_latched,
-        "Converted helper still latches as innermost"
+        "Converted helper that writes the CALL's dest still latches as innermost"
     );
     assert_eq!(
         converted_too_long,
         HelperTooLongDecision::Abort,
         "Converted 0-effect still aborts"
     );
+    let (boxed_latched, boxed_too_long) =
+        try_latch(HelperReturn::Converted, HelperOnStack::None, true);
+    assert!(
+        !boxed_latched,
+        "boxed descent whose return the walk takes back must not latch"
+    );
+    assert_eq!(
+        boxed_too_long,
+        HelperTooLongDecision::Abort,
+        "boxed descent 0-effect declined latch Aborts"
+    );
     let (converted_child_latched, converted_child_too_long) = try_latch(
         HelperReturn::Converted.child_helper_return(),
         HelperOnStack::None,
+        true,
     );
     assert!(
-        converted_child_latched,
-        "Converted helper's CallResult child still latches"
+        !converted_child_latched,
+        "a CallResult child under a boxed descent must not latch"
     );
     assert_eq!(
         converted_child_too_long,
@@ -4121,7 +4136,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         "Converted helper's CallResult child 0-effect still aborts"
     );
     let (prologue_latched, prologue_too_long) =
-        try_latch(HelperReturn::CalleePrologue, HelperOnStack::None);
+        try_latch(HelperReturn::CalleePrologue, HelperOnStack::None, false);
     assert!(
         !prologue_latched,
         "CalleePrologue helper must not latch as innermost"
@@ -4132,10 +4147,10 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         "CalleePrologue 0-effect declined latch Aborts so the enclosing CALL can latch"
     );
     let (call_entry_latched, call_entry_too_long) =
-        try_latch(HelperReturn::CallResult, HelperOnStack::CallEntry);
+        try_latch(HelperReturn::CallResult, HelperOnStack::CallEntry, false);
     assert!(
         call_entry_latched,
-        "CallResult under HelperResume::CallEntry still latches when the walk is not CalleePrologue"
+        "CallResult under HelperResume::CallEntry still latches outside a call-entry helper chain"
     );
     assert_eq!(
         call_entry_too_long,
@@ -4143,7 +4158,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         "CallResult 0-effect under CallEntry still aborts"
     );
     let (converted_call_entry_latched, converted_call_entry_too_long) =
-        try_latch(HelperReturn::Converted, HelperOnStack::CallEntry);
+        try_latch(HelperReturn::Converted, HelperOnStack::CallEntry, false);
     assert!(
         converted_call_entry_latched,
         "Converted walk still latches with CallEntry on the stack"
@@ -4153,8 +4168,11 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         HelperTooLongDecision::Abort,
         "Converted 0-effect under CallEntry still aborts"
     );
-    let (prologue_call_entry_latched, prologue_call_entry_too_long) =
-        try_latch(HelperReturn::CalleePrologue, HelperOnStack::CallEntry);
+    let (prologue_call_entry_latched, prologue_call_entry_too_long) = try_latch(
+        HelperReturn::CalleePrologue,
+        HelperOnStack::CallEntry,
+        false,
+    );
     assert!(
         !prologue_call_entry_latched,
         "CalleePrologue walk skips latch even with CallEntry on the stack"
@@ -4165,7 +4183,7 @@ fn callee_prologue_helper_does_not_latch_abort_blackhole() {
         "CalleePrologue 0-effect under CallEntry still Aborts at the CALL entry"
     );
     let (unrelated_latched, unrelated_too_long) =
-        try_latch(HelperReturn::CallResult, HelperOnStack::Unresumable);
+        try_latch(HelperReturn::CallResult, HelperOnStack::Unresumable, false);
     assert!(
         unrelated_latched,
         "unrelated Collapsed Unresumable helper still latches"
