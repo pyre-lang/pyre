@@ -16753,10 +16753,11 @@ fn core_alloc_layout_does_not_share_typeobject_layout_leaf() {
     );
 }
 
-/// A pointer field whose pointee leaf is ambiguous spells the qualified
-/// identity `adt_ast_head` paints. `bookkeeper.py` `getuniqueclassdef`
-/// is one ClassDef per class, so the row has to name that class. An
-/// unambiguous pointee keeps the TypeDecl leaf.
+/// Raw-pointer field rows carry the declaration identity (#348 rule):
+/// one ClassDef per declaration (`bookkeeper.py` `getuniqueclassdef`),
+/// and the row spelling names that declaration whether or not its leaf
+/// is ambiguous. The ambiguous `Layout` leaf is the case that needs the
+/// identity to project.
 #[test]
 fn ambiguous_layout_pointer_field_row_projects_classdef() {
     let llbc = llbc_with_types(
@@ -16797,11 +16798,7 @@ fn ambiguous_layout_pointer_field_row_projects_classdef() {
     super::harden_duplicate_leaf_metadata(&mut fields, &mut origins, &mut enums, Some(&ids));
     assert_eq!(
         fields.field_type("typeobject::Holder", "plain"),
-        Some(unpainted_plain.as_str())
-    );
-    assert_eq!(
-        fields.field_type("typeobject::Holder", "plain"),
-        Some("*const PlainWord")
+        Some("*const typeobject::PlainWord")
     );
     let layout_row = fields
         .field_type("typeobject::Holder", "layout")
