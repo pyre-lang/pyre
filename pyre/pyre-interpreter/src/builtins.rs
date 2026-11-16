@@ -4527,9 +4527,15 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
         crate::__pyre_store!(ns, "MemoryError", exc_type);
     });
-    // compile.py `memory_error = MemoryError()`: the singleton is a
-    // translation-time prebuilt. Materialize it now so a later MiniMark
-    // max-heap breach does not `malloc_typed` + `handle_alloc_error`.
+    // compile.py `memory_error = MemoryError()` / exceptiondata.py
+    // `get_standard_ll_exc_instance`: translation-time prebuilt. This is
+    // the earliest point the Python class and its map terminator exist
+    // (`register_exc_class` just ran; `install_type_terminator` stored
+    // `w_subtype.terminator`). `memory_error_singleton` is still
+    // `get_or_init`; calling it here is what makes the init closure
+    // unreachable at OOM. The instance map is that terminator — a GC
+    // node after #2567 — kept alive from the type and from the singleton's
+    // unmanaged map slot.
     let _ = pyre_object::interp_exceptions::memory_error_singleton();
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
