@@ -1070,10 +1070,16 @@ fn normalize_unary_op_name(source_name: &str) -> Result<String, TyperError> {
         // pyfunc=int)`).  The front emits it for
         // `f64::to_int_unchecked::<i64>` and the float-to-int scalar cast.
         "cast_float_to_int" => Ok("int".to_string()),
+        // `ord` — `operation.py add_operator('ord', 1, …)`, dispatched at
+        // `rtyper.rs "ord"` into `AbstractUniCharRepr.rtype_ord` /
+        // `BaseCharReprMixin.rtype_ord` (`rstr.py` `cast_unichar_to_int`
+        // / `cast_char_to_int`). The front emits it for a char-source
+        // integer `as` (`c as u32`).
+        "ord" => Ok("ord".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py registers \
-             `pos` / `neg` / `invert` / `bool` / `abs` and the ported \
+             `pos` / `neg` / `invert` / `bool` / `abs` / `ord` and the ported \
              `str` as unary ops, and `cast_float_to_int` stands for `int`; \
              `same_as` is rtyper's internal renaming op per \
              rtyper.py:478-481; all 13 typed cast names retired \

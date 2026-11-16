@@ -7457,6 +7457,192 @@ fn field_row_struct_identity_keeps_slice_of_gc_pointer_struct() {
 }
 
 #[test]
+fn field_row_struct_identity_qualifies_raw_ptr_pointee() {
+    // `charon_adt_to_ast_string` renders the ADT leaf, so a harvested
+    // `*const Layout` would miss `mod_a::Layout` when that leaf is
+    // withdrawn (`harden_duplicate_leaf_metadata` of
+    // `alloc::layout::Layout` beside `mod_a::Layout`). A raw-pointer
+    // field is `lltype.py` `Ptr` of the pointee; the row carries the
+    // TypeDecl identity (`class_identity_spelling` /
+    // `intern_adt_type_decl_identity`) the same way a by-value ADT field
+    // does.
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "mod_a", "Layout"],
+                vec![named_copy_field("typedef", u64_ty.clone())],
+            ),
+            opaque_type_decl(1, &["alloc", "layout", "Layout"]),
+            type_decl_struct(
+                2,
+                &["host", "mod_b", "Code"],
+                vec![named_copy_field("n", u64_ty)],
+            ),
+        ],
+        vec![],
+    );
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    let const_ty = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [adt_node(0), "Shared"]
+        })
+        .into(),
+    );
+    let const_layout = super::tyref_to_field_layout_string(&const_ty, &llbc, &gc, &raw);
+    assert_eq!(const_layout, "*const Layout");
+    assert_eq!(
+        super::field_row_struct_identity(&const_ty, &llbc, &const_layout).as_deref(),
+        Some("*const mod_a::Layout")
+    );
+
+    let mut_ty = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [adt_node(0), "Mut"]
+        })
+        .into(),
+    );
+    let mut_layout = super::tyref_to_field_layout_string(&mut_ty, &llbc, &gc, &raw);
+    assert_eq!(mut_layout, "*mut Layout");
+    assert_eq!(
+        super::field_row_struct_identity(&mut_ty, &llbc, &mut_layout).as_deref(),
+        Some("*mut mod_a::Layout")
+    );
+
+    let unique_ty = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [adt_node(2), "Shared"]
+        })
+        .into(),
+    );
+    let unique_layout = super::tyref_to_field_layout_string(&unique_ty, &llbc, &gc, &raw);
+    assert_eq!(unique_layout, "*const Code");
+    assert_eq!(
+        super::field_row_struct_identity(&unique_ty, &llbc, &unique_layout).as_deref(),
+        Some("*const mod_b::Code")
+    );
+
+    let nested_ty = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [{"RawPtr": [adt_node(0), "Shared"]}, "Shared"]
+        })
+        .into(),
+    );
+    let nested_layout = super::tyref_to_field_layout_string(&nested_ty, &llbc, &gc, &raw);
+    assert_eq!(nested_layout, "*const *const Layout");
+    assert_eq!(
+        super::field_row_struct_identity(&nested_ty, &llbc, &nested_layout).as_deref(),
+        Some("*const *const mod_a::Layout")
+    );
+
+    let opaque_ty = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [adt_node(1), "Mut"]
+        })
+        .into(),
+    );
+    let opaque_layout = super::tyref_to_field_layout_string(&opaque_ty, &llbc, &gc, &raw);
+    assert_eq!(opaque_layout, "*mut Layout");
+    assert_eq!(
+        super::field_row_struct_identity(&opaque_ty, &llbc, &opaque_layout),
+        None,
+        "Opaque pointee keeps the layout spelling"
+    );
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let primitive = TyRef::Other(
+        serde_json::json!({
+            "RawPtr": [i64_ty, "Shared"]
+        })
+        .into(),
+    );
+    let primitive_layout = super::tyref_to_field_layout_string(&primitive, &llbc, &gc, &raw);
+    assert_eq!(primitive_layout, "*const i64");
+    assert_eq!(
+        super::field_row_struct_identity(&primitive, &llbc, &primitive_layout),
+        None
+    );
+}
+
+#[test]
+fn harvested_raw_ptr_field_interns_pointee_classdef_after_duplicate_leaf_withdrawn() {
+    // Two TypeDecls share the leaf `Layout`. Harvest of a `*const Layout`
+    // field must carry `mod_a::Layout` so harden's withdrawn leaf does
+    // not mint a classdef-less instance (`unaryop.py` `SomeInstance.getattr`,
+    // `bookkeeper.py` `getuniqueclassdef`).
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let llbc = llbc_with_types(
+        "host",
+        vec![
+            type_decl_struct(
+                0,
+                &["host", "mod_a", "Layout"],
+                vec![named_copy_field("typedef", u64_ty)],
+            ),
+            opaque_type_decl(1, &["alloc", "layout", "Layout"]),
+            type_decl_struct(
+                2,
+                &["host", "mod_a", "Owner"],
+                vec![named_copy_field(
+                    "ptr",
+                    serde_json::json!({"RawPtr": [adt_node(0), "Shared"]}),
+                )],
+            ),
+        ],
+        vec![],
+    );
+    let (_, _, mut fields, mut by_discr, mut origins, _, _, ids) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let ptr_ty = fields
+        .field_type("mod_a::Owner", "ptr")
+        .expect("Owner.ptr harvested")
+        .to_string();
+    assert_eq!(ptr_ty, "*const mod_a::Layout");
+
+    crate::front::mir::harden_duplicate_leaf_metadata(
+        &mut fields,
+        &mut origins,
+        &mut by_discr,
+        Some(&ids),
+    );
+    assert!(
+        !fields.fields.contains_key("Layout"),
+        "duplicate Layout leaf must be withdrawn"
+    );
+    assert!(
+        fields.fields.contains_key("mod_a::Layout"),
+        "pointee declaration must remain a struct_fields key"
+    );
+
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(fields));
+    match bk.project_struct_field_type(&ptr_ty) {
+        SomeValue::Instance(inst) => {
+            let name = inst.classdef.as_ref().map(|cd| cd.borrow().name.clone());
+            assert_eq!(
+                name.as_deref(),
+                Some("mod_a::Layout"),
+                "raw-pointer field must intern the pointee ClassDef, got {name:?}"
+            );
+            assert!(inst.can_be_none, "a stored raw pointer can be null");
+        }
+        other => panic!("expected nullable Layout instance, got {other:?}"),
+    }
+}
+
+#[test]
 fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
     let llbc = llbc_with_trait_impls(serde_json::json!([]));
     let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});

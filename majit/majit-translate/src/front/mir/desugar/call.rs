@@ -1,6 +1,9 @@
 //! Hand lowering of individual call sites (`lower_call` … `impl_method_owner`).
 
-use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_index_slots};
+use super::std_call::{
+    AtomicClass, interior_deref_root_local, is_char_from_u32_unchecked,
+    rewrite_interior_index_slots,
+};
 use super::*;
 
 /// `core::cell::...` or Charon dropping the `core::` crate prefix
@@ -4818,6 +4821,23 @@ impl<'a> Lowering<'a> {
                     if host_rthread_threadlocalref_llop(&path) == Some(ThreadLocalRefLlop::Addr) {
                         return self.emit_threadlocalref_addr(mir_bb, dest_local, target);
                     }
+                }
+                // Inherent `char::from_u32_unchecked(i)` is `unichr(i)`
+                // (`rint.py` `rtype_unichr`). Matched by the full core
+                // path (`specialcase.py` `register_flow_sc`). Resolved
+                // here so a residual host result does not annotate
+                // SomeInteger.
+                if args.len() == 1
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && is_char_from_u32_unchecked(fd.item_meta.name_path_str())
+                {
+                    let res = push_unichr(&mut self.graph, bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
                 }
                 // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
                 // Truncation toward zero, undefined outside the signed
@@ -10832,9 +10852,9 @@ impl Lowering<'_> {
     /// Dest `Option<T>` payload shape. Inner `T` is [`Self::tyref_adt_type_arg`]
     /// (serde through [`TyRef`], so a `Deduplicated` generic peels the same
     /// way [`Self::tyref_option_payload_value_type`] already does).
-    /// `None` declines: a `Ref` payload whose TypeDecl cannot be resolved
-    /// must not store the helper word (`ClassDef.generalize_attr` /
-    /// `unionof`).
+    /// `None` declines: a `Ref` payload whose TypeDecl is Opaque (or Alias
+    /// of Opaque), or otherwise cannot carry a field, must not intern an
+    /// empty shell (`ClassDef.generalize_attr` / `unionof`).
     fn nth_payload_shape(
         &self,
         dest_ty: &TyRef,
@@ -10878,19 +10898,11 @@ impl Lowering<'_> {
                 field: found,
             });
         }
-        match &td.kind {
-            TypeDeclKind::Opaque => {
-                Some(crate::front::wtf8_nth::NthPayload::Instance { owner, field: None })
-            }
-            TypeDeclKind::Alias(body) => {
-                let node = body.get("aliased_ty").unwrap_or(body);
-                let peeled = type_node_peel_aliases(node, self.llbc).unwrap_or(node);
-                let inner = self.llbc.type_by_id(adt_node_def_id(peeled)?)?;
-                matches!(inner.kind, TypeDeclKind::Opaque)
-                    .then_some(crate::front::wtf8_nth::NthPayload::Instance { owner, field: None })
-            }
-            _ => None,
-        }
+        // Opaque TypeDecl (and Alias of Opaque, which
+        // `type_decl_struct_fields` does not peel) has no published
+        // field. An empty instance would drop the code point. Decline
+        // (`try_lower_wtf8_code_points_nth` → `Ok(false)`).
+        None
     }
 
     /// `vec![e0, …, eN-1]` → `ll_vec_newlist_{kind}(N)` +

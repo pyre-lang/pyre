@@ -16102,6 +16102,14 @@ pub(in crate::front::mir) fn item_meta_json(
     })
 }
 
+pub(in crate::front::mir) fn u8_ty() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+}
+
+pub(in crate::front::mir) fn i8_ty() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Signed": "I8"}}})
+}
+
 pub(in crate::front::mir) fn u32_ty() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}})
 }
@@ -16361,6 +16369,289 @@ fn named_char_const_and_char_literal_emit_unichr() {
         "named char const is code point 0x3e: {named:#?}"
     );
     assert!(has_code(&lit), "char literal is code point 0x3e: {lit:#?}");
+}
+
+fn char_as_int_cast_fixture(name: &str, dest_ty: serde_json::Value) -> Llbc {
+    let span = span_json();
+    let src_ty = char_scalar_ty();
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", name], "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [src_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "value", "span": span, "ty": src_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &dest_ty),
+                        {"UnaryOp": [
+                            {"Cast": {"Scalar": [src_ty.clone(), dest_ty.clone()]}},
+                            {"Read": place(1, &src_ty)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("char-as-int fixture Llbc parses")
+}
+
+fn graph_has_unary_ord(graph: &crate::model::FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "ord" && *result_ty == ValueType::Int
+            )
+        })
+}
+
+fn graph_has_r_uint(graph: &crate::model::FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("r_uint")
+            )
+        })
+}
+
+fn graph_ord_result(graph: &crate::model::FunctionGraph) -> Option<Variable> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::UnaryOp {
+                op: name,
+                result_ty,
+                ..
+            } if name == "ord" && *result_ty == ValueType::Int => op.result.clone(),
+            _ => None,
+        })
+}
+
+fn graph_has_and_of(graph: &crate::model::FunctionGraph, lhs: &Variable, mask: u64) -> bool {
+    let ops = graph_ops(graph);
+    ops.iter().any(|op| match &op.kind {
+        OpKind::BinOp {
+            op,
+            lhs: op_lhs,
+            rhs,
+            ..
+        } if op == "and" && op_lhs == lhs => rhs_defined_by(
+            &ops,
+            rhs,
+            |kind| matches!(kind, OpKind::ConstUInt(n) if *n == mask),
+        ),
+        _ => false,
+    })
+}
+
+fn graph_has_signext_of(graph: &crate::model::FunctionGraph, lhs: &Variable, nbytes: i64) -> bool {
+    let ops = graph_ops(graph);
+    ops.iter().any(|op| match &op.kind {
+        OpKind::BinOp {
+            op,
+            lhs: op_lhs,
+            rhs,
+            ..
+        } if op == "signext" && op_lhs == lhs => rhs_defined_by(
+            &ops,
+            rhs,
+            |kind| matches!(kind, OpKind::ConstInt(n) if *n == nbytes),
+        ),
+        _ => false,
+    })
+}
+
+fn graph_has_int_and(graph: &crate::model::FunctionGraph) -> bool {
+    graph_ops(graph)
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "and"))
+}
+
+fn graph_has_int_signext(graph: &crate::model::FunctionGraph) -> bool {
+    graph_ops(graph)
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "signext"))
+}
+
+/// `c as u8` is `ord(c)` then `int_and` with 0xFF (`jtransform.py`
+/// `_int_to_int_cast`; `rstr.py` `AbstractUniCharRepr.rtype_ord`).
+#[test]
+fn char_as_u8_emits_ord_then_int_and() {
+    let llbc = char_as_int_cast_fixture("char_as_u8", u8_ty());
+    let graph = crate::test_support::lower_function(&llbc, "char_as_u8").expect("lower char as u8");
+    let ord = graph_ord_result(&graph).expect("char as u8 must emit ord");
+    assert!(
+        graph_has_and_of(&graph, &ord, 0xFF),
+        "char as u8 must int_and the ord result with 0xFF; ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `c as i8` is `ord(c)` then `int_signext` of 1 byte (`jtransform.py`
+/// `_int_to_int_cast`; `rstr.py` `AbstractUniCharRepr.rtype_ord`).
+#[test]
+fn char_as_i8_emits_ord_then_int_signext() {
+    let llbc = char_as_int_cast_fixture("char_as_i8", i8_ty());
+    let graph = crate::test_support::lower_function(&llbc, "char_as_i8").expect("lower char as i8");
+    let ord = graph_ord_result(&graph).expect("char as i8 must emit ord");
+    assert!(
+        graph_has_signext_of(&graph, &ord, 1),
+        "char as i8 must int_signext the ord result by 1 byte; ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `c as u32` is `ord(c)` then `r_uint` (`rstr.py`
+/// `AbstractUniCharRepr.rtype_ord`, then `rarithmetic.r_uint`).
+#[test]
+fn char_as_u32_emits_ord_then_r_uint() {
+    let llbc = char_as_int_cast_fixture("char_as_u32", u32_ty());
+    let graph =
+        crate::test_support::lower_function(&llbc, "char_as_u32").expect("lower char as u32");
+    assert!(
+        graph_has_unary_ord(&graph),
+        "char as u32 must emit ord; ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        graph_has_r_uint(&graph),
+        "char as u32 must retype through r_uint; ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !graph_has_int_and(&graph),
+        "char as u32 must not int_and; ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !graph_has_int_signext(&graph),
+        "char as u32 must not int_signext; ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `c as i64` keeps the `ord` result; the dest already holds every code
+/// point (`jtransform.py` `_int_to_int_cast`).
+#[test]
+fn char_as_i64_emits_ord_without_narrowing() {
+    let llbc = char_as_int_cast_fixture("char_as_i64", i64_ty());
+    let graph =
+        crate::test_support::lower_function(&llbc, "char_as_i64").expect("lower char as i64");
+    assert!(
+        graph_has_unary_ord(&graph),
+        "char as i64 must emit ord; ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !graph_has_int_and(&graph),
+        "char as i64 must not int_and; ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !graph_has_int_signext(&graph),
+        "char as i64 must not int_signext; ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `char::from_u32_unchecked(i)` is `unichr(i)` (`builtin.py`
+/// `builtin_unichr`; `rint.py` `rtype_unichr`). A residual host result
+/// annotates SomeInteger. The callee path is the extracted LLBC item
+/// (`core::char::methods::<Impl>::from_u32_unchecked`).
+#[test]
+fn char_from_u32_unchecked_emits_unichr() {
+    let llbc = scalar_method_call_fixture(
+        "from_u32_unchecked",
+        &["core", "char", "methods", "<Impl>", "from_u32_unchecked"],
+        u32_ty(),
+        char_scalar_ty(),
+    );
+    let graph = crate::test_support::lower_function(&llbc, "from_u32_unchecked")
+        .expect("lower char::from_u32_unchecked");
+    let ops = graph_ops(&graph);
+    assert_eq!(
+        unichr_ops(&graph).len(),
+        1,
+        "char::from_u32_unchecked must become __majit_unichr; ops={ops:?}"
+    );
+    let calls = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Call { .. }))
+        .count();
+    assert_eq!(
+        calls, 1,
+        "char::from_u32_unchecked must not residualize a host call; ops={ops:?}"
+    );
+}
+
+/// A user function whose path has a `char` segment and leaf
+/// `from_u32_unchecked` / `from_u32` is not the core constructor
+/// (`specialcase.py` `register_flow_sc`).
+#[test]
+fn user_char_from_u32_lookalike_is_not_unichr() {
+    for leaf in ["from_u32_unchecked", "from_u32"] {
+        let caller = format!("call_user_{leaf}");
+        let llbc = scalar_method_call_fixture(
+            &caller,
+            &["fixture", "char", leaf],
+            u32_ty(),
+            char_scalar_ty(),
+        );
+        let graph = crate::test_support::lower_function(&llbc, &caller)
+            .unwrap_or_else(|e| panic!("lower fixture::char::{leaf}: {e}"));
+        let ops = graph_ops(&graph);
+        assert!(
+            unichr_ops(&graph).is_empty(),
+            "user fixture::char::{leaf} must not become __majit_unichr; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some(leaf)
+            )),
+            "user fixture::char::{leaf} must stay a call; ops={ops:?}"
+        );
+    }
 }
 
 pub(in crate::front::mir) fn nullary_calls_ending(
@@ -32052,11 +32343,11 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
 
 /// `Wtf8CodePoints::nth(s, n)` is `rutf8.py` `next_codepoint_pos` /
 /// `codepoint_at_pos` via the minted `ll_wtf8_nth` helper, not a residual
-/// 2-segment FunctionPath.
+/// 2-segment FunctionPath. A Struct payload writes the unique non-ZST
+/// field (`value`).
 #[test]
 fn wtf8_code_points_nth_lowers_to_minted_helper() {
     use crate::front::wtf8_nth::LL_WTF8_NTH;
-    use crate::model::{CallTarget, OpKind};
     let s_ty = interior_adt(1);
     let n_ty = interior_usize();
     let cp_ty = interior_adt(1);
@@ -32105,43 +32396,92 @@ fn wtf8_code_points_nth_lowers_to_minted_helper() {
     );
     let llbc = llbc_with_types("fixture", vec![option_enum(0), wtf8], vec![caller, nth]);
     let graph = lower_interior(&llbc, "nth_site");
-    let paths: Vec<Vec<&str>> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => Some(segments.iter().map(String::as_str).collect()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !paths
-            .iter()
-            .any(|segments| segments.as_slice() == ["Wtf8CodePoints", "nth"]
-                || segments.last() == Some(&"nth")
-                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))),
-        "nth must not survive as a FunctionPath: {paths:#?}"
-    );
-    assert!(
-        paths
-            .iter()
-            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
-        "call site calls the minted helper: {paths:#?}"
-    );
+    assert_nth_struct_payload_writes_value(&graph, LL_WTF8_NTH);
 }
 
-/// Dest `Option` is a `Deduplicated` local whose payload TypeDecl is
-/// Opaque — the `unicode_translate_error_str` nth site. Intern of that
-/// payload is a named instance (`intern_opaque_payload_spelling`); the
-/// lowering must store that instance in `Some.__pos_0`, not the helper
-/// word (`ClassDef.generalize_attr` / `unionof`).
+/// Dest `Option` is a `Deduplicated` local whose payload TypeDecl is a
+/// Struct with `value: u32` — the `unicode_translate_error_str` nth site
+/// after Charon includes `rustpython_wtf8::CodePoint`. The lowering
+/// writes that field and stores the instance in `Some.__pos_0`
+/// (`ClassDef.generalize_attr` / `unionof`).
 #[test]
-fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
+fn wtf8_code_points_nth_dedup_struct_payload_writes_value() {
     use crate::front::wtf8_nth::LL_WTF8_NTH;
-    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    let s_ty = interior_adt(1);
+    let n_ty = interior_usize();
+    let dest_ty = serde_json::json!({"Deduplicated": 10});
+    let cp_body = interior_adt(1);
+    let opt_body = option_adt_node(0, serde_json::json!({"Deduplicated": 11}));
+    let struct_cp = interior_struct(
+        1,
+        &["rustpython_wtf8", "CodePoint"],
+        &[("value", interior_u32())],
+        4,
+        &[0],
+        false,
+    );
+    let nth = interior_opaque(
+        1,
+        &["rustpython_wtf8", "Wtf8CodePoints", "nth"],
+        vec![s_ty.clone(), n_ty.clone()],
+        dest_ty.clone(),
+    );
+    let caller = interior_caller(
+        "nth_site",
+        2,
+        vec![s_ty.clone(), n_ty.clone()],
+        dest_ty.clone(),
+        vec![
+            interior_local(0, None, &dest_ty),
+            interior_local(1, Some("s"), &s_ty),
+            interior_local(2, Some("n"), &n_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &s_ty)),
+                        interior_copy(interior_place(2, &n_ty)),
+                    ],
+                    interior_place(0, &dest_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [option_enum(0), struct_cp],
+            "fun_decls": [caller, nth],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            {"Value": [10, opt_body]},
+            {"Value": [11, cp_body]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = lower_interior(&llbc, "nth_site");
+    assert_nth_struct_payload_writes_value(&graph, LL_WTF8_NTH);
+}
+
+/// Dest `Option` payload TypeDecl is Opaque: no published field can
+/// carry the code point, so `nth_payload_shape` declines and residual
+/// `nth` stays.
+#[test]
+fn wtf8_code_points_nth_opaque_payload_declines() {
+    use crate::front::wtf8_nth::LL_WTF8_NTH;
+    use crate::model::{CallTarget, OpKind};
     let s_ty = interior_adt(1);
     let n_ty = interior_usize();
     let dest_ty = serde_json::json!({"Deduplicated": 10});
@@ -32205,7 +32545,139 @@ fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
     let graph = lower_interior(&llbc, "nth_site");
-    let ops = graph_ops(&graph);
+    let paths: Vec<Vec<&str>> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.iter().map(String::as_str).collect()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|segments| segments.as_slice() == ["Wtf8CodePoints", "nth"]
+                || segments.last() == Some(&"nth")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))),
+        "opaque payload declines: residual nth stays: {paths:#?}"
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
+        "opaque payload must not mint ll_wtf8_nth: {paths:#?}"
+    );
+}
+
+/// Unsigned unique field is `rarithmetic.py` `r_uint` of the signed helper
+/// word (`signedness_retype_op`); a signed field stores the helper as-is.
+#[test]
+fn emit_nth_payload_retypes_unsigned_field_and_skips_signed() {
+    use crate::front::wtf8_nth::{NthPayload, emit_nth_payload};
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+
+    fn payload_ops(
+        field_ty: ValueType,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("nth_payload");
+        let block = graph.startblock;
+        let helper = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(helper.clone()),
+            kind: OpKind::ConstInt(65),
+        });
+        emit_nth_payload(
+            &mut graph,
+            block,
+            helper.clone(),
+            &NthPayload::Instance {
+                owner: "Holder".to_string(),
+                field: Some(("n".to_string(), field_ty)),
+            },
+        );
+        (graph.block(block).operations.clone(), helper)
+    }
+
+    let (unsigned_ops, unsigned_helper) = payload_ops(ValueType::Unsigned);
+    let mut r_uint_result = None;
+    let mut unsigned_write = None;
+    for (i, op) in unsigned_ops.iter().enumerate() {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty,
+            } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "r_uint"] => {
+                assert_eq!(*result_ty, ValueType::Unsigned);
+                assert_eq!(
+                    args.first().and_then(LinkArg::as_variable),
+                    Some(&unsigned_helper)
+                );
+                r_uint_result = Some((i, op.result.clone().expect("r_uint result")));
+            }
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ty,
+                ..
+            } if field.name == "n" => {
+                unsigned_write = Some((i, v.clone(), ty.clone()));
+            }
+            _ => {}
+        }
+    }
+    let (r_uint_idx, retyped) = r_uint_result.expect("Unsigned field emits r_uint");
+    let (write_idx, written, written_ty) = unsigned_write.expect("Unsigned field FieldWrite n");
+    assert!(
+        r_uint_idx < write_idx,
+        "r_uint must sit between the helper and FieldWrite: r_uint={r_uint_idx} write={write_idx}"
+    );
+    assert_eq!(written, retyped);
+    assert_eq!(written_ty, ValueType::Unsigned);
+    assert_ne!(written, unsigned_helper);
+
+    let (signed_ops, signed_helper) = payload_ops(ValueType::Int);
+    assert!(
+        signed_ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "r_uint"]
+                    || segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        }),
+        "Signed field must not retype the helper word: {signed_ops:#?}"
+    );
+    let signed_write = signed_ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(v),
+            ty,
+            ..
+        } if field.name == "n" => Some((v.clone(), ty.clone())),
+        _ => None,
+    });
+    let (written, written_ty) = signed_write.expect("Signed field FieldWrite n");
+    assert_eq!(written, signed_helper);
+    assert_eq!(written_ty, ValueType::Int);
+}
+
+fn assert_nth_struct_payload_writes_value(graph: &crate::model::FunctionGraph, helper: &str) {
+    use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    let identity = super::class_identity_spelling(
+        "rustpython_wtf8::CodePoint",
+        &std::collections::HashSet::new(),
+    );
+    let payload_owner = |owner: &str| {
+        owner == identity.as_str() || owner.rsplit("::").next() == Some(identity.as_str())
+    };
+    let ops = graph_ops(graph);
     let paths: Vec<Vec<&str>> = ops
         .iter()
         .filter_map(|op| match &op.kind {
@@ -32225,20 +32697,19 @@ fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
         "nth must not survive as a FunctionPath: {paths:#?}"
     );
     assert!(
-        paths
-            .iter()
-            .any(|segments| segments.as_slice() == [LL_WTF8_NTH]),
+        paths.iter().any(|segments| segments.as_slice() == [helper]),
         "call site calls the minted helper: {paths:#?}"
     );
     let mut nth_results = Vec::new();
     let mut ctor_results = Vec::new();
     let mut pos0 = Vec::new();
+    let mut value_writes = Vec::new();
     for op in &ops {
         match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } if segments.as_slice() == [LL_WTF8_NTH] => {
+            } if segments.as_slice() == [helper] => {
                 if let Some(result) = &op.result {
                     nth_results.push(result.clone());
                 }
@@ -32257,15 +32728,19 @@ fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
                     owner_path.is_empty(),
                     "payload ctor intern's under class_identity_spelling, not a crate-prefixed path: {owner_path:?}"
                 );
-                let identity = super::class_identity_spelling(
-                    "rustpython_wtf8::CodePoint",
-                    &std::collections::HashSet::new(),
-                );
                 assert_eq!(
                     name.as_str(),
                     identity.as_str(),
                     "payload ctor name is intern_adt_type_decl_identity"
                 );
+                if let Some(result) = &op.result {
+                    ctor_results.push(result.clone());
+                }
+            }
+            // `simplify_lowered_graph` (`scalar_replace_named_struct_aggregates`,
+            // `malloc.py` `rewrite_op_malloc`) rewrites the payload ctor to
+            // `New` + `setfield` at the `Some.__pos_0` escape.
+            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } if payload_owner(owner) => {
                 if let Some(result) = &op.result {
                     ctor_results.push(result.clone());
                 }
@@ -32278,12 +32753,70 @@ fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
             } if field.name == "__pos_0" => {
                 pos0.push((v.clone(), ty.clone()));
             }
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ty,
+                ..
+            } if field.name == "value" => {
+                value_writes.push((v.clone(), ty.clone()));
+            }
             _ => {}
         }
     }
+    let new_owners: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => Some(owner.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(
         !ctor_results.is_empty(),
-        "Opaque dest payload must be a struct instance ctor"
+        "Struct dest payload must be a struct instance ctor; identity={identity} new_owners={new_owners:?} value_writes={value_writes:?} pos0={pos0:?}"
+    );
+    // `close_call_diamond` threads the helper word as a Some-arm
+    // inputarg (`true_extras` → mapped[0]). The field is Unsigned, so
+    // `signedness_retype_op` / `rarithmetic.py` `r_uint` retypes that
+    // alias before the FieldWrite.
+    let helper_words = diamond_threaded_words(graph, &nth_results);
+    let mut r_uint_of_helper = Vec::new();
+    for op in &ops {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.as_slice() != ["rpython", "rlib", "rarithmetic", "r_uint"] {
+            continue;
+        }
+        let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+            continue;
+        };
+        if helper_words.iter().any(|h| h == arg)
+            && let Some(result) = op.result.as_ref()
+        {
+            r_uint_of_helper.push(result.clone());
+        }
+    }
+    assert!(
+        !r_uint_of_helper.is_empty(),
+        "Unsigned field must r_uint the helper word: helper_words={helper_words:#?} ops={ops:#?}"
+    );
+    assert!(
+        value_writes.iter().any(|(v, ty)| {
+            r_uint_of_helper.iter().any(|retyped| retyped == v) && matches!(ty, ValueType::Unsigned)
+        }),
+        "Struct payload must FieldWrite value from r_uint(helper): value_writes={value_writes:#?} r_uint_of_helper={r_uint_of_helper:#?}"
+    );
+    assert!(
+        value_writes
+            .iter()
+            .all(|(v, _)| helper_words.iter().all(|nth| nth != v)),
+        "Unsigned field must not store the signed helper word: value_writes={value_writes:#?} helper_words={helper_words:#?}"
     );
     assert!(
         pos0.iter().any(|(v, ty)| {
@@ -32293,9 +32826,42 @@ fn wtf8_code_points_nth_dedup_opaque_payload_is_struct_instance() {
     );
     assert!(
         pos0.iter()
-            .all(|(v, _)| nth_results.iter().all(|nth| nth != v)),
+            .all(|(v, _)| helper_words.iter().all(|nth| nth != v)),
         "Some.__pos_0 must not store the raw nth word"
     );
+}
+
+/// Variables reached from `seeds` by `Link.args` → target `inputargs`.
+/// `close_call_diamond` maps `true_extras` onto the Some-arm that way.
+fn diamond_threaded_words(
+    graph: &crate::model::FunctionGraph,
+    seeds: &[crate::flowspace::model::Variable],
+) -> Vec<crate::flowspace::model::Variable> {
+    let mut words = seeds.to_vec();
+    loop {
+        let before = words.len();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target = graph.block(link.target);
+                for (i, arg) in link.args.iter().enumerate() {
+                    let Some(v) = arg.as_variable() else {
+                        continue;
+                    };
+                    if !words.iter().any(|h| h == v) {
+                        continue;
+                    }
+                    if let Some(input) = target.inputargs.get(i) {
+                        if !words.iter().any(|h| h == input) {
+                            words.push(input.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if words.len() == before {
+            return words;
+        }
+    }
 }
 
 /// `PyError(ptr)` is the payload pointer. Construction peels to that

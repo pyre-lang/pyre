@@ -16261,9 +16261,13 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
 /// (`json_ty_is_by_value_copy_aggregate`, the FLAG_STRUCT item
 /// `adt_node_class_root_identity` names) and keeps the wrapper
 /// spelling; a slice of any other ADT keeps the spelling
-/// `tyref_to_field_layout_string` produced. Pointer, reference,
-/// and builtin layouts keep the spelling `tyref_to_field_layout_string`
-/// already produced.
+/// `tyref_to_field_layout_string` produced. A raw-pointer field is
+/// `lltype.py` `Ptr` of that pointee (`Ptr.TO`): qualify the pointee
+/// the same way (`intern_adt_type_decl_identity`) and keep the
+/// `*const` / `*mut` constructor, so `Bookkeeper.project_struct_field_type`
+/// intern's `getuniqueclassdef` of the declaration rather than a
+/// withdrawn leaf. References and builtins keep the spelling
+/// `tyref_to_field_layout_string` already produced.
 pub(in crate::front::mir) fn field_row_struct_identity(
     ty: &TyRef,
     llbc: &Llbc,
@@ -16274,6 +16278,13 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     // class identity would mint a ClassDef.
     if crate::front::semantic::is_list_family_spelling(layout) {
         return None;
+    }
+    if let Some((prefix, pointee_layout)) = raw_ptr_field_layout_parts(layout) {
+        let node = type_node_peel_aliases(tyref_node(ty, llbc)?, llbc)?;
+        let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
+        let pointee_ty = TyRef::Other(pointee.clone().into());
+        let qualified = field_row_struct_identity(&pointee_ty, llbc, pointee_layout.trim())?;
+        return Some(format!("{prefix}{qualified}"));
     }
     if let Some((item, len)) = shaped_array_parts(layout) {
         let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
@@ -16348,6 +16359,19 @@ pub(in crate::front::mir) fn field_row_struct_identity(
     Some(majit_ir::descr::canonical_struct_name(&format!(
         "{identity}{suffix}"
     )))
+}
+
+/// `*const T` / `*mut T` constructor and pointee spelling of a field
+/// layout. One peel: a nested pointer is the pointee of this word
+/// (`lltype.py` `Ptr`).
+fn raw_ptr_field_layout_parts(layout: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = layout.strip_prefix("*const ") {
+        Some(("*const ", rest))
+    } else if let Some(rest) = layout.strip_prefix("*mut ") {
+        Some(("*mut ", rest))
+    } else {
+        None
+    }
 }
 
 /// `SomePtr(GcArray(STRUCT))` for a declared two-field `{integer, [STRUCT; 0]}`

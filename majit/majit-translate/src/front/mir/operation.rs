@@ -2949,11 +2949,65 @@ impl<'a> Lowering<'a> {
                     // byte-char (`SomeChar`) path.  Reserved `__majit_unichr`
                     // like `__majit_range`: a bare `["unichr"]` binds the
                     // leaf-keyed `ctypeprim::unichr` host.
+                    // The reverse, `c as u32`, is `ord(c)` then `r_uint`
+                    // (`rstr.py` `AbstractUniCharRepr.rtype_ord` →
+                    // `cast_unichar_to_int`). `ord` is Signed holding the
+                    // code point; the scalar is 32-bit unsigned (`char` as
+                    // `u32`). A narrower dest is `jtransform.py`
+                    // `_int_to_int_cast` (`int_and` / `int_signext`).
+                    // Same-width / wider unsigned dests still `r_uint`.
+                    // Char is Int-banked (`scalar_value_type` of Char), so
+                    // an unsigned dest would otherwise `r_uint` a UniChar
+                    // (`IntegerRepr.convert_from`). Same-type `c as char`
+                    // is the identity.
+                    let src_is_char = operand_tyref(&operand)
+                        .is_some_and(|ty| tyref_is_char(ty, self.llbc))
+                        || const_operand_tyref(&operand, self.llbc)
+                            .as_ref()
+                            .is_some_and(|ty| tyref_is_char(ty, self.llbc));
                     if tyref_is_char(dest_ty, self.llbc) {
+                        if src_is_char {
+                            return Ok((None, arg));
+                        }
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         return Ok((Some(unichr_call(arg)), res));
+                    }
+                    if src_is_char {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let ord = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(ord.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "ord".to_string(),
+                                operand: arg,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                        let dest_unsigned = matches!(
+                            tyref_to_attr_value_type_with(
+                                dest_ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs
+                            ),
+                            ValueType::Unsigned
+                        );
+                        let (kind, value) = self
+                            .literal_int_width(dest_ty)
+                            .and_then(|dst| {
+                                self.materialize_int_cast(mir_bb, (32, true), dst, ord.clone())
+                            })
+                            .unwrap_or((None, ord));
+                        if dest_unsigned && kind.is_none() {
+                            let (kind, res) = signedness_retype_op(&mut self.graph, value, false);
+                            return Ok((Some(kind), res));
+                        }
+                        return Ok((kind, value));
                     }
                     // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
                     // Overlay `as *const T` must not alias or fold back to
@@ -12295,7 +12349,7 @@ pub(in crate::front::mir) fn rarithmetic_mask(
 
 /// `rarithmetic.intmask` (`result_ty: Int`) or `r_uint` (`result_ty: Unsigned`).
 /// `rarithmetic.py` `intmask` / `r_uint`; `rffi.cast` annotates from the target.
-pub(in crate::front::mir) fn signedness_retype_op(
+pub(crate) fn signedness_retype_op(
     graph: &mut FunctionGraph,
     arg: Variable,
     dest_signed: bool,

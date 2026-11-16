@@ -261,6 +261,41 @@ CHARON_ARGS = [
     # reads.
     "--include",
     "rustpython_compiler_core::bytecode::_",
+    # `rustpython_wtf8::CodePoint` items a crate reaches otherwise stay
+    # `opacity: Foreign` / `kind: Opaque` / `body: "Opaque"`, so the
+    # translator cannot read `value: u32` or the inherent methods
+    # (`to_u32`, `from_u32`, `to_char`). Include the type itself (private
+    # field, like `core::cell::Cell`) and each reached inherent method.
+    # `item::_` is subitems only; inherent-impl methods live under an
+    # Impl segment Charon cannot match (`PatElem::Impl` vs `ImplElem::Ty`
+    # is TODO), so `crate::_::method` matches `CodePoint::to_u32`
+    # (`core::num::_::div_ceil`). Do not include `rustpython_wtf8::_`
+    # (`Wtf8` / `Wtf8Buf` / `Wtf8CodePoints` stay identity-lowered).
+    "--include",
+    "rustpython_wtf8::CodePoint",
+    "--include",
+    "rustpython_wtf8::_::to_u32",
+    "--include",
+    "rustpython_wtf8::_::from_u32",
+    "--include",
+    "rustpython_wtf8::_::from_u32_unchecked",
+    "--include",
+    "rustpython_wtf8::_::from_char",
+    "--include",
+    "rustpython_wtf8::_::to_char",
+    "--include",
+    "rustpython_wtf8::_::to_char_lossy",
+    "--include",
+    "rustpython_wtf8::_::encode_wtf8",
+    "--include",
+    "rustpython_wtf8::_::len_wtf8",
+    # `len_wtf8` / `encode_wtf8` call these `core_char` free functions.
+    # They stay Foreign unless included. Do not include `Wtf8` /
+    # `Wtf8Buf` / `Wtf8CodePoints`.
+    "--include",
+    "rustpython_wtf8::core_char::len_utf8",
+    "--include",
+    "rustpython_wtf8::core_char::encode_utf8_raw",
     *CHARON_CORE_INCLUDE,
 ]
 

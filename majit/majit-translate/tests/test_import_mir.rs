@@ -312,9 +312,16 @@ fn pycode_code_ptr_is_raw_int_kind() {
         .struct_fields
         .field_type("PyCode", "code_ptr")
         .expect("PyCode.code_ptr harvested");
+    // `field_row_struct_identity` intern's a raw-pointer field as
+    // `lltype.py` `Ptr` of the TypeDecl identity (`class_identity_spelling`
+    // / `intern_adt_type_decl_identity`), so a unique-leaf `CodeObject`
+    // harvest is `*const bytecode::CodeObject<…>` when the pointee carries
+    // type args.
+    let pointee = spelling.strip_prefix("*const ").unwrap_or(spelling);
+    let leaf = pointee.split('<').next().unwrap_or(pointee);
     assert!(
-        spelling == "*const CodeObject" || spelling.starts_with("*const CodeObject<"),
-        "PyCode.code_ptr spelling must be *const CodeObject, got {spelling}"
+        leaf == "CodeObject" || leaf.ends_with("::CodeObject"),
+        "PyCode.code_ptr spelling must intern CodeObject, got {spelling}"
     );
     let w_code = program
         .functions

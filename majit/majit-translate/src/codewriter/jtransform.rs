@@ -1127,7 +1127,10 @@ fn is_list_write_barrier_path(segments: &[String]) -> bool {
 /// `jtransform.py rewrite_op_same_as`, `rewrite_op_cast_pointer` →
 /// `rewrite_op_same_as`, `rewrite_op_cast_bool_to_*` /
 /// `cast_int_to_uint` / `cast_uint_to_int` (explicit no-ops),
-/// `rewrite_op_cast_opaque_ptr`, and the `deref` reborrow (`&mut *p`).
+/// `rewrite_op_cast_char_to_int` / `rewrite_op_cast_unichar_to_int` /
+/// `rewrite_op_cast_int_to_char` / `rewrite_op_cast_int_to_unichar`
+/// (`pass`), `rewrite_op_cast_opaque_ptr`, and the `deref` reborrow
+/// (`&mut *p`).
 pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
     matches!(
         name,
@@ -1139,6 +1142,10 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
             | "cast_bool_to_uint"
             | "cast_int_to_uint"
             | "cast_uint_to_int"
+            | "cast_char_to_int"
+            | "cast_unichar_to_int"
+            | "cast_int_to_char"
+            | "cast_int_to_unichar"
     )
 }
 
@@ -5451,6 +5458,30 @@ impl<'a> Transformer<'a> {
         fn_const_target_for_var(graph, &resolved, 0)
     }
 
+    /// Skip-arm `ord` / `unichr` become the llop `rtype_ord` /
+    /// `rtype_unichr` would have emitted, then re-enter so
+    /// `rewrite_op_cast_unichar_to_int` / `rewrite_op_cast_char_to_int` /
+    /// `rewrite_op_cast_int_to_unichar` (`jtransform.py`, `pass`) drop
+    /// it as identity.
+    fn rewrite_char_int_cast(
+        &mut self,
+        op: &SpaceOperation,
+        operand: &crate::flowspace::model::Variable,
+        cast_op: &'static str,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let cast = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::UnaryOp {
+                op: cast_op.to_string(),
+                operand: operand.clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        self.rewrite_operation(&cast, graph_name, graph)
+    }
+
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
     fn rewrite_operation(
         &mut self,
@@ -5670,6 +5701,16 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::Live { forced },
                 }])
             }
+            // `front::mir unichr_call` / `IntegerRepr.rtype_unichr`: the
+            // skip arm still carries `Call(__majit_unichr)`. Classify-calls
+            // would residualize it; project to `cast_int_to_unichar` first
+            // so `rewrite_op_cast_int_to_unichar` (`jtransform.py`, `pass`)
+            // drops it the same way the rtyped graph does.
+            OpKind::Call { target, args, .. }
+                if let Some(operand) = unichr_shim_operand(target, args) =>
+            {
+                self.rewrite_char_int_cast(op, operand, "cast_int_to_unichar", graph_name, graph)
+            }
             // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
             // drop the op and alias the result to the operand. `deref` is
             // the `&mut *p` reborrow of the same pointer.
@@ -5690,6 +5731,37 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            // Skip-arm `ord` is still the high-level hop
+            // (`operation.py add_operator('ord')`; `front::mir` char-source
+            // integer `as`). `AbstractUniCharRepr.rtype_ord` /
+            // `BaseCharReprMixin.rtype_ord` (`rstr.py`) emit
+            // `cast_unichar_to_int` / `cast_char_to_int`; the identity arm
+            // above then `pass`es them. Same un-rtyped projection as the
+            // `bool` arm (`IntegerRepr.rtype_bool` / `BoolRepr`).
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "ord" => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                let cast_op = if operand.concretetype() == Some(LowLevelType::Char) {
+                    "cast_char_to_int"
+                } else {
+                    "cast_unichar_to_int"
+                };
+                self.rewrite_char_int_cast(op, operand, cast_op, graph_name, graph)
+            }
+            // `IntegerRepr.rtype_unichr` (`rint.py`) emits
+            // `cast_int_to_unichar`. A leftover UnaryOp `unichr` is the
+            // same skip-arm hole (`int_unichr`); the Call spelling is
+            // handled above.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "unichr" => {
+                self.rewrite_char_int_cast(op, operand, "cast_int_to_unichar", graph_name, graph)
+            }
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -19470,6 +19542,25 @@ fn is_record_exact_value_helper(target: &CallTarget) -> bool {
         if segments.as_slice() == ["majit_rlib", "jit", "record_exact_value"])
 }
 
+/// `front::mir unichr_call` — reserved `__majit_unichr` with one
+/// Variable code-point argument (`IntegerRepr.rtype_unichr`).
+fn unichr_shim_operand<'a>(
+    target: &CallTarget,
+    args: &'a [LinkArg],
+) -> Option<&'a crate::flowspace::model::Variable> {
+    match target {
+        CallTarget::FunctionPath { segments, .. }
+            if segments.as_slice() == [crate::runtime_names::shims::UNICHR] =>
+        {
+            if args.len() != 1 {
+                return None;
+            }
+            args[0].as_variable()
+        }
+        _ => None,
+    }
+}
+
 /// `objectmodel.keepalive_until_here` / `rtype_keepalive_until_here`.
 fn call_is_keepalive_until_here(target: &CallTarget) -> bool {
     match target {
@@ -20893,6 +20984,17 @@ mod tests {
             );
         }
         assert!(is_same_as_identity_unary("same_as"));
+        for name in [
+            "cast_char_to_int",
+            "cast_unichar_to_int",
+            "cast_int_to_char",
+            "cast_int_to_unichar",
+        ] {
+            assert!(
+                is_same_as_identity_unary(name),
+                "{name} is rewrite_op_cast_* pass"
+            );
+        }
     }
 
     #[test]
@@ -24391,6 +24493,135 @@ mod tests {
         );
         assert_eq!(block.exits.len(), 1);
         assert_eq!(block.exits[0].target, transformed.graph.returnblock);
+        assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
+    }
+
+    fn skip_arm_unary_graph(
+        name: &str,
+        op: &str,
+    ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new(name);
+        let input_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "c".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: op.into(),
+                    operand: input_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        (graph, input_var)
+    }
+
+    #[test]
+    fn transform_graph_drops_skip_arm_ord_as_unichar_identity() {
+        let (graph, input_var) = skip_arm_unary_graph("skip_ord", "ord");
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+        assert!(
+            !block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. }
+                    if op == "ord"
+                        || op == "cast_unichar_to_int"
+                        || op == "cast_char_to_int"
+            )),
+            "skip-arm ord must become the dropped cast: {:?}",
+            block.operations
+        );
+        assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
+    }
+
+    #[test]
+    fn transform_graph_drops_skip_arm_char_ord_as_char_identity() {
+        let (graph, input_var) = skip_arm_unary_graph("skip_char_ord", "ord");
+        input_var.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+        ));
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+        assert!(
+            !block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. }
+                    if op == "ord" || op == "cast_char_to_int"
+            )),
+            "Char-stamped ord must become the dropped cast: {:?}",
+            block.operations
+        );
+        assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
+    }
+
+    #[test]
+    fn transform_graph_drops_skip_arm_unichr_as_identity() {
+        let (graph, input_var) = skip_arm_unary_graph("skip_unichr", "unichr");
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+        assert!(
+            !block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. }
+                    if op == "unichr" || op == "cast_int_to_unichar"
+            )),
+            "skip-arm unichr must become the dropped cast: {:?}",
+            block.operations
+        );
+        assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
+    }
+
+    #[test]
+    fn transform_graph_drops_skip_arm_unichr_call_as_identity() {
+        let mut graph = FunctionGraph::new("skip_unichr_call");
+        let input_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                crate::front::mir::unichr_call(input_var.clone()),
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+        assert!(
+            !block.operations.iter().any(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_unichar" || op == "unichr" => {
+                    true
+                }
+                OpKind::Call { target, .. } => matches!(
+                    target,
+                    CallTarget::FunctionPath { segments, .. }
+                        if segments.as_slice() == [crate::runtime_names::shims::UNICHR]
+                ),
+                _ => false,
+            }),
+            "skip-arm __majit_unichr must become the dropped cast: {:?}",
+            block.operations
+        );
         assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
     }
 

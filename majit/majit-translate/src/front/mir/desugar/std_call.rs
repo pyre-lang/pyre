@@ -97,6 +97,17 @@ pub(in crate::front::mir) fn is_inlined_mem_exchange_path(name: &str) -> bool {
 /// Matched in full. `std::array::from_fn` is this `core::` item in LLBC.
 const ARRAY_FROM_FN_PATH: &str = "core::array::from_fn";
 
+/// Inherent `char::from_u32_unchecked` in extracted LLBC. Matched in
+/// full: `specialcase.py` `register_flow_sc` keys special cases by
+/// callable identity. `rint.py` `rtype_unichr` lowers it to
+/// `cast_int_to_unichar`.
+const CHAR_FROM_U32_UNCHECKED_PATH: &str = "core::char::methods::<Impl>::from_u32_unchecked";
+
+/// [`CHAR_FROM_U32_UNCHECKED_PATH`], compared to `name_path_str()`.
+pub(in crate::front::mir) fn is_char_from_u32_unchecked(name: &str) -> bool {
+    name == CHAR_FROM_U32_UNCHECKED_PATH
+}
+
 /// `from_fn::<T, N, F>(f)` as `[f(0), …, f(N-1)]` when `N` is concrete and
 /// `F`'s `FnMut::call_mut` (or the closure body when `F` is `Fn` / `FnMut`)
 /// is a local unstructured body. `from_fn` requires `F: FnMut`; a
