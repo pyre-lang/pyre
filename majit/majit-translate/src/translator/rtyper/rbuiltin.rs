@@ -4987,7 +4987,7 @@ fn dst_as_store_address(
 /// Harvest-skip plus HOST_ENV keep one ARRAY per caller (`@specialize.ll()`).
 /// When source or dest is an ARRAY, the rtyper mints the same `ll_arraycopy`
 /// helper `rlist.py` extend/getslice mint
-/// (`build_ll_arraycopy_general_helper_graph`); `CallControl.mark_oopspec`
+/// (`build_ll_arraycopy_helper_graph`); `CallControl.mark_oopspec`
 /// on `["ll_arraycopy"]` rewrites it to `OS_ARRAYCOPY`
 /// (`jtransform.py` `do_fixed_list_ll_arraycopy`), matching
 /// `rtype_ll_arraymove_intrinsic`. `_canraise` is False (`call.py`).
@@ -5051,7 +5051,7 @@ fn rtype_jit_ll_arraycopy_specialized(
     item_lltype: LowLevelType,
     items_ptr: LowLevelType,
 ) -> RTypeResult {
-    use crate::translator::rtyper::rlist::build_ll_arraycopy_general_helper_graph;
+    use crate::translator::rtyper::rlist::build_ll_arraycopy_helper_graph;
 
     let vlist_args = hop.inputargs(vec![
         ConvertedTo::Repr(r_source),
@@ -5071,7 +5071,7 @@ fn rtype_jit_ll_arraycopy_specialized(
         ],
         LowLevelType::Void,
         move |_rtyper, _args, _result| {
-            build_ll_arraycopy_general_helper_graph("ll_arraycopy", item_lltype, items_ptr)
+            build_ll_arraycopy_helper_graph("ll_arraycopy", item_lltype, items_ptr)
         },
     )?;
     hop.exception_cannot_occur()?;

@@ -33489,6 +33489,75 @@ mod tests {
         assert_eq!(ei._write_descrs_arrays.as_ref().map(|v| v.len()), Some(1));
     }
 
+    /// Minted 5-arg `rgc.ll_arraycopy`: writeanalyze of `copy_item`
+    /// (`getarrayitem` + `setarrayitem`) names dest's ARRAY; the write
+    /// subsumes the read. `OS_ARRAYCOPY` / `CannotRaise` match
+    /// `jtransform.py` `do_fixed_list_ll_arraycopy`. Same descrs as HEAD's
+    /// loop-only 5-arg helper (the `length <= 1` head is the same TYPE).
+    #[test]
+    fn minted_ll_arraycopy_effectinfo_is_array_descr_os_arraycopy() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rlist::{
+            build_ll_arraycopy_helper_graph, items_array_ptr_lltype,
+        };
+        use majit_ir::value::Type;
+
+        for (label, item, ir_ty) in [
+            ("int", LowLevelType::Signed, Type::Int),
+            ("ref", GCREF.clone(), Type::Ref),
+            ("float", LowLevelType::Float, Type::Float),
+        ] {
+            let items_ptr = items_array_ptr_lltype(&item);
+            let py = build_ll_arraycopy_helper_graph("ll_arraycopy", item, items_ptr)
+                .unwrap_or_else(|err| panic!("{label}: {err:?}"));
+            let converted = effect_graph_from_rtyped_helper(&py.graph.borrow());
+            let mut cc = CallControl::new();
+            let path = CallPath::from_segments(["ll_arraycopy"]);
+            cc.register_function_graph(path.clone(), converted);
+            let effects = cc.analyze_readwrite(
+                &path,
+                &mut ReadWriteTracker::new(),
+                &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+            );
+            assert!(
+                !ReadWriteEffects::is_top_result(&effects),
+                "{label}: writeanalyze must not be top, got {effects:?}"
+            );
+            let ei = effectinfo_from_writeanalyze(
+                &effects,
+                ExtraEffect::CannotRaise,
+                OopSpecIndex::Arraycopy,
+                false,
+                true,
+                None,
+                "ll_arraycopy",
+                &cc,
+                EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+            );
+            assert_eq!(ei.oopspecindex, OopSpecIndex::Arraycopy, "{label}");
+            assert_eq!(ei.extraeffect, ExtraEffect::CannotRaise, "{label}");
+            let writes = ei
+                ._write_descrs_arrays
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: write_descrs_arrays"));
+            assert_eq!(writes.len(), 1, "{label}: write_descrs_arrays={writes:?}");
+            let ad = writes[0]
+                .as_array_descr()
+                .unwrap_or_else(|| panic!("{label}: write descr is an ARRAY"));
+            assert_eq!(ad.item_type(), ir_ty, "{label}");
+            assert_eq!(
+                ei._readonly_descrs_arrays.as_ref().map(|v| v.len()),
+                Some(0),
+                "{label}: write subsumes read"
+            );
+            assert_eq!(
+                ei._write_descrs_fields.as_ref().map(|v| v.len()),
+                Some(0),
+                "{label}: no field writes"
+            );
+        }
+    }
+
     /// `writeanalyze.py` `_get_effect_for_offset` keys an ArrayItemsOffset
     /// by `Ptr(ARRAY)`; `effectinfo_from_writeanalyze` extraef keys the extra
     /// array effect of an interiorfield the same way. A GcArray of inline

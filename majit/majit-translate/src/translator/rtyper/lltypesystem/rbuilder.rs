@@ -5649,8 +5649,9 @@ fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
 /// `raw_memclear` fast path (the `must_split_gc_address_space()` `else`
 /// branch) is deferred as a translation-time concern, mirroring
 /// [`build_ll_arraycopy_helper_graph`](../../rlist.rs) which lowers the
-/// sibling `rgc.ll_arraycopy` to the same bare element loop and defers its
-/// `raw_memcopy` fast path (`rgc.py`); the `itemoffsetof` / `sizeof`
+/// sibling `rgc.ll_arraycopy` to the `length <= 1` `copy_item` head plus
+/// the slowpath element loop and defers its `raw_memcopy` fast path
+/// (`rgc.py`); the `itemoffsetof` / `sizeof`
 /// / `cast_ptr_to_adr` / `raw_memclear` address machinery has no
 /// construction-side surface here.
 pub fn build_ll_arrayclear_helper_graph(

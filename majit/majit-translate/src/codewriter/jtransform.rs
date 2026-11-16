@@ -14298,39 +14298,19 @@ impl<'a> Transformer<'a> {
         // only the function address is retargeted to the native
         // barrier+memcpy body (`jit_ll_arraycopy`).
         //
-        // rgc.py `ll_arraycopy` is always five arguments. The rtyper
-        // still mints a specialized three-argument helper
-        // (`source_start == dest_start == 0`) for append/resize;
-        // expand that call to the five-argument ABI rather than
-        // feeding three residuals into `jit_ll_arraycopy`.
+        // rgc.py `ll_arraycopy` is always five arguments
+        // (`source, dest, source_start, dest_start, length`). The rtyper
+        // mints that helper (`build_ll_arraycopy_helper_graph`); a
+        // start=0 copy passes two Signed 0 constants. A 3-arg call is
+        // a leftover specialised helper and is rejected.
         if oopspec_name == "list.ll_arraycopy" {
+            assert_eq!(
+                args.len(),
+                5,
+                "list.ll_arraycopy is rgc.ll_arraycopy(source, dest, source_start, dest_start, length)"
+            );
             let copy_target = CallTarget::function_path(["jit_ll_arraycopy"]);
-            let (copy_args, prefix) = if args.len() == 3 {
-                let source_start = graph.alloc_value_var_with_type(ConcreteType::Signed);
-                let dest_start = graph.alloc_value_var_with_type(ConcreteType::Signed);
-                let prefix = vec![
-                    SpaceOperation {
-                        result: Some(source_start.clone()),
-                        kind: OpKind::ConstInt(0),
-                    },
-                    SpaceOperation {
-                        result: Some(dest_start.clone()),
-                        kind: OpKind::ConstInt(0),
-                    },
-                ];
-                (
-                    vec![
-                        args[0].clone(),
-                        args[1].clone(),
-                        source_start,
-                        dest_start,
-                        args[2].clone(),
-                    ],
-                    prefix,
-                )
-            } else {
-                (args.to_vec(), Vec::new())
-            };
+            let copy_args = args.to_vec();
             // `do_fixed_list_ll_arraycopy` (`jtransform.py`) rewrites to
             // `OS_ARRAYCOPY`; `effectinfo.py` then sets
             // `single_write_descr_array` from writeanalyze of
@@ -14384,14 +14364,7 @@ impl<'a> Transformer<'a> {
                 Some(majit_ir::descr::ExtraEffect::CannotRaise),
                 array_descrs,
             );
-            return Some(match rewritten {
-                RewriteResult::Replace(ops) if !prefix.is_empty() => {
-                    let mut all = prefix;
-                    all.extend(ops);
-                    RewriteResult::Replace(all)
-                }
-                other => other,
-            });
+            return Some(rewritten);
         }
         // `do_fixed_list_len` / `do_fixed_list_getitem` /
         // `do_fixed_list_getitem_foldable` / `do_fixed_list_setitem`
@@ -45497,11 +45470,13 @@ mod tests {
         );
     }
 
-    /// The rtyper's specialized `ll_arraycopy(source, dest, length)` must
-    /// still emit the five-argument `jit_ll_arraycopy` ABI, with the two
-    /// missing starts rewritten as constant zero.
+    /// A 3-arg `list.ll_arraycopy` is the old start=0 specialised helper
+    /// and is rejected; `rgc.ll_arraycopy` is always five arguments.
     #[test]
-    fn list_ll_arraycopy_three_arg_expands_to_five_arg_abi() {
+    #[should_panic(
+        expected = "list.ll_arraycopy is rgc.ll_arraycopy(source, dest, source_start, dest_start, length)"
+    )]
+    fn list_ll_arraycopy_three_arg_is_rejected() {
         use crate::call::CallControl;
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, LowLevelType, Ptr, PtrTarget,
@@ -45528,58 +45503,8 @@ mod tests {
                 result_ty: ValueType::Void,
             },
         };
-        let rewritten = transformer
-            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
-            .expect("list.ll_arraycopy must be handled");
-        let RewriteResult::Replace(ops) = rewritten else {
-            panic!("expected Replace");
-        };
-        let zeros: Vec<_> = ops
-            .iter()
-            .filter(|op| matches!(op.kind, OpKind::ConstInt(0)))
-            .collect();
-        assert_eq!(
-            zeros.len(),
-            2,
-            "specialized call inserts two start=0 consts"
-        );
-        let residual = ops.iter().find_map(|op| match &op.kind {
-            OpKind::CallResidual {
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
-                ..
-            } => Some((args_i, args_r, args_f, result_kind)),
-            _ => None,
-        });
-        let Some((args_i, args_r, args_f, result_kind)) = residual else {
-            panic!("expected a CallResidual, got {ops:?}");
-        };
-        assert_eq!(args_r, &args[0..2], "source then dest");
-        let source_start = zeros[0]
-            .result
-            .as_ref()
-            .expect("source_start const has a result");
-        let dest_start = zeros[1]
-            .result
-            .as_ref()
-            .expect("dest_start const has a result");
-        assert_eq!(
-            args_i,
-            &[source_start.clone(), dest_start.clone(), args[2].clone()],
-            "starts then length"
-        );
-        assert!(args_f.is_empty());
-        assert_eq!(*result_kind, 'v');
-        let callinfo = &transformer
-            .callcontrol
-            .as_deref()
-            .unwrap()
-            .callinfocollection;
-        assert!(callinfo.has_oopspec(OopSpecIndex::Arraycopy));
-        let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraycopy);
-        assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraycopy"));
+        let _ =
+            transformer._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy");
     }
 
     /// Other `rgc.*` spellings are not ported and fall through to the
