@@ -3190,6 +3190,42 @@ impl RPythonAnnotator {
                                 &s_exitcase,
                             )
                         });
+                        // `annrpython.py` `flowin` keeps
+                        // `link.exitcase == s_exitswitch.const` only.
+                        // Upstream never annotates a multi-case switch
+                        // with a default arm: `checkgraph` admits
+                        // `'default'` only as the last exit of a
+                        // non-boolean switch, and `merge_if_blocks`
+                        // writes that arm after annotation. MIR
+                        // `SwitchInt` lowering emits that same
+                        // last-exit `'default'` before annotation, so
+                        // a constant that matches no case still takes
+                        // it.
+                        if exits.is_empty() {
+                            let all = block.borrow().exits.clone();
+                            let exitcase_is_bool = |link: &LinkRef, expected: bool| {
+                                matches!(
+                                    &link.borrow().exitcase,
+                                    Some(Hlvalue::Constant(c))
+                                        if c.value
+                                            == super::super::flowspace::model::ConstValue::Bool(
+                                                expected,
+                                            )
+                                )
+                            };
+                            let is_boolean_switch = all.len() == 2
+                                && exitcase_is_bool(&all[0], false)
+                                && exitcase_is_bool(&all[1], true);
+                            if !is_boolean_switch
+                                && let Some(last) = all.last()
+                                && matches!(
+                                    &last.borrow().exitcase,
+                                    Some(Hlvalue::Constant(c)) if c.value.string_eq("default")
+                                )
+                            {
+                                exits.push(last.clone());
+                            }
+                        }
                     }
                 }
                 exits
@@ -3951,6 +3987,177 @@ mod tests {
                 .contains_key(&LinkKey::of(&drop_link)),
             "UInt(1) discriminant must drop Int(2) exit"
         );
+    }
+
+    fn flowin_switchint_with_default(
+        name: &str,
+        disc: i64,
+    ) -> (
+        Rc<RPythonAnnotator>,
+        GraphRef,
+        BlockRef,
+        LinkRef,
+        LinkRef,
+        LinkRef,
+        BlockRef,
+    ) {
+        use super::super::super::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, Link,
+        };
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph(name, 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                let mut s = SomeInteger::new(true, false);
+                s.base.const_box = Some(Constant::new(ConstValue::Int(disc)));
+                ann.setbinding(v, SomeValue::Integer(s));
+            }
+            blk.exitswitch = Some(blk.inputargs[0].clone());
+        }
+
+        let case4_target = Block::shared(vec![]);
+        let case5_target = Block::shared(vec![]);
+        let default_target = Block::shared(vec![]);
+        let case4_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(case4_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Int(4)))),
+        )));
+        let case5_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(case5_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Int(5)))),
+        )));
+        // MIR `SwitchInt` lowering: last exit is `UniStr("default")`.
+        let default_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(default_target.clone()),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::UniStr(
+                "default".into(),
+            )))),
+        )));
+        startblock.closeblock(vec![
+            case4_link.clone(),
+            case5_link.clone(),
+            default_link.clone(),
+        ]);
+        (
+            ann,
+            graph,
+            startblock,
+            case4_link,
+            case5_link,
+            default_link,
+            default_target,
+        )
+    }
+
+    #[test]
+    fn flowin_constant_switch_unmatched_follows_default() {
+        // Shape B (`descroperation::compare`): SwitchInt cases 4, 5,
+        // `'default'`; const 0 matches none, so `flowin` follows the
+        // last-exit default arm `checkgraph` requires.
+        let (ann, graph, startblock, case4_link, case5_link, default_link, default_target) =
+            flowin_switchint_with_default("switch_default", 0);
+        let case4_target = case4_link.borrow().target.clone().unwrap();
+        let case5_target = case5_link.borrow().target.clone().unwrap();
+
+        ann.processblock(&graph, &startblock).unwrap();
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&default_link)),
+            "unmatched constant must follow the default exit"
+        );
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&case4_link)),
+            "unmatched constant must drop Int(4)"
+        );
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&case5_link)),
+            "unmatched constant must drop Int(5)"
+        );
+        assert!(
+            ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&default_target)),
+            "default target must be scheduled"
+        );
+        assert!(
+            !ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&case4_target)),
+            "Int(4) target must not be scheduled"
+        );
+        assert!(
+            !ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&case5_target)),
+            "Int(5) target must not be scheduled"
+        );
+        ann.complete_pending_blocks().unwrap();
+        assert!(
+            matches!(
+                ann.annotated.borrow().get(&BlockKey::of(&default_target)),
+                Some(Some(_))
+            ),
+            "default target must be annotated after complete_pending_blocks"
+        );
+    }
+
+    #[test]
+    fn flowin_constant_switch_matching_case_ignores_default() {
+        let (ann, graph, startblock, case4_link, case5_link, default_link, default_target) =
+            flowin_switchint_with_default("switch_match_case", 4);
+        let case4_target = case4_link.borrow().target.clone().unwrap();
+        let case5_target = case5_link.borrow().target.clone().unwrap();
+
+        ann.processblock(&graph, &startblock).unwrap();
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&case4_link)),
+            "Int(4) discriminant must keep the Int(4) exit"
+        );
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&case5_link)),
+            "Int(4) discriminant must drop Int(5)"
+        );
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&default_link)),
+            "Int(4) discriminant must drop the default exit"
+        );
+        assert!(
+            ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&case4_target)),
+            "matched-case target must be scheduled"
+        );
+        assert!(
+            !ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&case5_target))
+        );
+        assert!(
+            !ann.annotated
+                .borrow()
+                .contains_key(&BlockKey::of(&default_target))
+        );
+        ann.complete_pending_blocks().unwrap();
+        assert!(matches!(
+            ann.annotated.borrow().get(&BlockKey::of(&case4_target)),
+            Some(Some(_))
+        ));
     }
 
     #[test]
