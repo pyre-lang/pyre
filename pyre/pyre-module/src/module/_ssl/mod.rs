@@ -194,14 +194,17 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     err
 }
 
-/// `SSLError.__str__`: a non-empty `strerror` is the message, otherwise
-/// `str(self.args)`. `os_error_fill_slots` stores that text on the OSError
-/// `w_strerror` slot. Keep the policy on this class rather than the
-/// process-wide exception formatter.
+/// `SSLError.__str__`: if the `strerror` slot is set and an instance of `str`
+/// (subclasses and the empty string included), return that value; otherwise
+/// `str()` of the `args` slot. Slots are read directly, with no attribute
+/// lookup and no truth test.
 fn ssl_error_str(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let mut exc = args[0];
+    // [3.15-spec] strerror/args slots read directly, str check without truth test (measured python3.15); SSLError.__str__ uses getattr and truth.
     let w_strerror = unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(exc) };
-    if !w_strerror.is_null() && unsafe { is_str(w_strerror) && w_str_len(w_strerror) > 0 } {
+    if !w_strerror.is_null()
+        && unsafe { pyre_interpreter::baseobjspace::isinstance_str_w(w_strerror) }
+    {
         return Ok(w_strerror);
     }
     let mut w_args = pyre_object::with_roots!(exc => unsafe {
