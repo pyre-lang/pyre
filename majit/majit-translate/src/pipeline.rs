@@ -76,6 +76,9 @@ pub struct JitDriverSpec {
     /// (`interp_jit.py` `class __extend__(PyFrame): def dispatch`). Every
     /// spelling of it shares the rewritten origportal graph, so its callers
     /// see `return portal_runner(*args)`. The runtime function keeps its body.
+    /// Autoreds split portals use the same alias after
+    /// `warmspot.py rewrite_jit_merge_point` has filled in the autodetected
+    /// reds (`support.py autodetect_jit_markers_redvars`).
     #[serde(default)]
     pub extends: Option<CallPath>,
 }

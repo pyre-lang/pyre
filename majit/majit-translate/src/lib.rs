@@ -3590,6 +3590,9 @@ fn register_configured_jitdrivers(
     // leaves the origportal as `return portal_runner(*args)`, and every
     // caller of the extended function must see that stub so
     // `pyjitpl.py do_recursive_call` inlines or records CALL_ASSEMBLER.
+    // Autoreds drivers already ran `autodetect_jit_markers_redvars` and
+    // the rewrite above, so the stub's `portal_runner` call carries
+    // greens plus those reds; the alias is the same graph share.
     // Specs whose graphs are absent no-op.
     alias_extended_functions_to_origportal(call_control, specs);
 }
@@ -4893,6 +4896,269 @@ mod portal_driver_tests {
                     .expect("dispatch aliases origportal"),
             ),
             "dispatch_frame and eval_loop_jit must be the same graph object"
+        );
+    }
+
+    /// Autoreds split portal whose interpreter entry is an OnceLock hook
+    /// dispatcher (`tuple_hash_portal_runner`). `JitDriverSpec.extends`
+    /// must share that dispatcher with the rewritten origportal so
+    /// `_descr_hash_jitdriver_w` sees `return portal_runner(*args)` and
+    /// `guess_call_kind` classifies the call `'recursive'`.
+    #[test]
+    fn autoreds_oncelock_dispatcher_aliases_onto_rewritten_origportal() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::Link;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["builtins", "tuple_hash_portal"]);
+        let dispatcher = CallPath::from_segments(["call", "tuple_hash_portal_runner"]);
+        let dispatcher_alias =
+            CallPath::from_segments(["pyre_interpreter", "call", "tuple_hash_portal_runner"]);
+        let caller = CallPath::from_segments(["builtins", "_descr_hash_jitdriver_w"]);
+        let runner = CallPath::from_segments(["eval", "ll_tuple_hash_portal_runner_shim"]);
+
+        let mut graph = FunctionGraph::new("builtins::tuple_hash_portal");
+        let receiver = Variable::named("driver");
+        let w_type = Variable::named("w_type");
+        let w_tuple = Variable::named("w_tuple");
+        let len = Variable::named("len");
+        FunctionGraph::set_concretetype_of_inline(&receiver, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&w_type, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&w_tuple, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&len, ConcreteType::Signed);
+        graph.block_mut(graph.startblock).inputargs =
+            vec![w_type.clone(), w_tuple.clone(), len.clone()];
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(receiver.clone()),
+                kind: OpKind::ConstRefNull,
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("TupleHashJitDriver".into()),
+                    ),
+                    args: crate::model::call_args(vec![receiver, w_type.clone()]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.block_mut(graph.startblock).exits = vec![Link::from_variables(
+            &graph,
+            vec![w_type, w_tuple, len],
+            graph.startblock,
+            None,
+        )];
+        call_control.register_function_graph(portal.clone(), graph);
+        call_control.register_function_graph(
+            runner.clone(),
+            return_graph("ll_tuple_hash_portal_runner_shim"),
+        );
+
+        let mut dispatcher_graph = FunctionGraph::new("call::tuple_hash_portal_runner");
+        let d_w_type = dispatcher_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let d_w_tuple = dispatcher_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let d_len = dispatcher_graph.alloc_value_var_with_type(ConcreteType::Signed);
+        dispatcher_graph
+            .block_mut(dispatcher_graph.startblock)
+            .inputargs = vec![d_w_type.clone(), d_w_tuple.clone(), d_len.clone()];
+        let cell = dispatcher_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        dispatcher_graph
+            .block_mut(dispatcher_graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(cell.clone()),
+                kind: OpKind::ConstRefNull,
+            });
+        let offset = dispatcher_graph.alloc_value_var_with_type(ConcreteType::Signed);
+        dispatcher_graph
+            .block_mut(dispatcher_graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(8),
+            });
+        let fnptr = dispatcher_graph.alloc_value_var_with_type(ConcreteType::Signed);
+        dispatcher_graph
+            .block_mut(dispatcher_graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(fnptr.clone()),
+                kind: OpKind::RawLoad {
+                    base: cell,
+                    offset,
+                    item_ty: ValueType::Int,
+                    itemsize: 8,
+                    is_item_signed: true,
+                },
+            });
+        dispatcher_graph
+            .block_mut(dispatcher_graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr: fnptr,
+                    args: vec![d_w_type, d_w_tuple, d_len],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Void,
+                },
+            });
+        dispatcher_graph.set_return(dispatcher_graph.startblock, None);
+        call_control.register_function_graph(dispatcher.clone(), dispatcher_graph);
+        call_control
+            .function_graphs_mut()
+            .share_path(dispatcher_alias.clone(), &dispatcher);
+
+        let mut caller_graph = FunctionGraph::new("builtins::_descr_hash_jitdriver_w");
+        let obj = caller_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let c_w_type = caller_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let c_len = caller_graph.alloc_value_var_with_type(ConcreteType::Signed);
+        caller_graph.block_mut(caller_graph.startblock).inputargs = vec![obj.clone()];
+        caller_graph
+            .block_mut(caller_graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(dispatcher.segments.clone()),
+                    args: crate::model::call_args(vec![c_w_type, obj, c_len]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        caller_graph.set_return(caller_graph.startblock, None);
+        call_control.register_function_graph(caller.clone(), caller_graph);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(runner.clone()),
+                greens: vec!["w_type".into()],
+                reds: vec![],
+                green_kinds: vec![majit_ir::Type::Ref],
+                red_kinds: vec![],
+                autoreds: true,
+                virtualizables: vec![],
+                red_types: vec![],
+                split_portal: true,
+                extends: Some(dispatcher.clone()),
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+
+        let calls_runner = |path: &CallPath| {
+            call_control
+                .function_graphs()
+                .get(path)
+                .expect("dispatcher alias must resolve")
+                .blocks
+                .iter()
+                .any(|block| {
+                    block.operations.iter().any(|op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } => segments.as_slice() == runner.segments.as_slice(),
+                        _ => false,
+                    })
+                })
+        };
+        let has_indirect = |path: &CallPath| {
+            call_control
+                .function_graphs()
+                .get(path)
+                .expect("dispatcher alias must resolve")
+                .blocks
+                .iter()
+                .any(|block| {
+                    block
+                        .operations
+                        .iter()
+                        .any(|op| matches!(op.kind, OpKind::IndirectCall { .. }))
+                })
+        };
+        assert!(
+            calls_runner(&dispatcher),
+            "tuple_hash_portal_runner must share the rewritten origportal stub"
+        );
+        assert!(
+            calls_runner(&dispatcher_alias),
+            "every tuple_hash_portal_runner spelling must share the origportal stub"
+        );
+        assert!(
+            !has_indirect(&dispatcher) && !has_indirect(&dispatcher_alias),
+            "the OnceLock-hook IndirectCall must not remain on the tracing graph"
+        );
+
+        let runner_call = call_control
+            .function_graphs()
+            .get(&dispatcher)
+            .expect("dispatcher aliases origportal")
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.as_slice() == runner.segments.as_slice(),
+                _ => false,
+            })
+            .cloned()
+            .expect("origportal stub must call portal_runner");
+        assert_eq!(
+            call_control.guess_call_kind(&runner_call),
+            call::CallKind::Recursive,
+            "direct call to portal_runner_ptr is recursive"
+        );
+
+        let caller_still_names_dispatcher = call_control
+            .function_graphs()
+            .get(&caller)
+            .expect("caller remains")
+            .blocks
+            .iter()
+            .any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => segments.as_slice() == dispatcher.segments.as_slice(),
+                    _ => false,
+                })
+            });
+        assert!(
+            caller_still_names_dispatcher,
+            "_descr_hash_jitdriver_w must keep calling the dispatcher path"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &call_control
+                    .function_graphs()
+                    .get(&portal)
+                    .expect("origportal remains"),
+                &call_control
+                    .function_graphs()
+                    .get(&dispatcher)
+                    .expect("dispatcher aliases origportal"),
+            ),
+            "tuple_hash_portal_runner and tuple_hash_portal must be the same graph object"
         );
     }
 

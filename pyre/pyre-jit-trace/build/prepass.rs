@@ -1437,7 +1437,8 @@ fn real_main() {
                     // greens=['w_type'], reds='auto')`. The portal is the
                     // source-level cut at `split_before_jit_merge_point`:
                     // `tuple_hash_portal` starts the loop at the marker;
-                    // `_descr_hash_jitdriver_w` is the prologue that calls it.
+                    // `_descr_hash_jitdriver_w` is the prologue that calls
+                    // `tuple_hash_portal_runner`.
                     portal: majit_translate::CallPath::from_segments([
                         "builtins",
                         "tuple_hash_portal",
@@ -1454,7 +1455,17 @@ fn real_main() {
                     virtualizables: vec![],
                     red_types: vec![],
                     split_portal: true,
-                    extends: None,
+                    // `interp_jit.py class __extend__(PyFrame)` analog:
+                    // `_descr_hash_jitdriver_w` calls `tuple_hash_portal_runner`.
+                    // Alias that dispatcher onto the rewritten origportal so
+                    // tracing sees `return portal_runner(*args)`
+                    // (`warmspot.py rewrite_jit_merge_point`). The runtime
+                    // function keeps the OnceLock hook that ticks
+                    // `increment_function_threshold`.
+                    extends: Some(majit_translate::CallPath::from_segments([
+                        "call",
+                        "tuple_hash_portal_runner",
+                    ])),
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

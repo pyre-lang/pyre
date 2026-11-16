@@ -612,9 +612,12 @@ pub fn tuple_hash_merge_point(
 }
 
 /// `warmspot.py rewrite_jit_merge_point`: the original `_descr_hash_jitdriver`
-/// graph ends in `return portal_runner(*args)`. The merge hook above is the
-/// in-portal `increment_threshold` door and cannot carry this runner: the two
-/// doors tick different counters (`increment_function_threshold` here).
+/// graph ends in `return portal_runner(*args)`. `JitDriverSpec.extends` aliases
+/// this function's tracing graph onto that origportal stub; the runtime body
+/// below stays the OnceLock hook so every entry ticks
+/// `increment_function_threshold`. The merge hook above is the in-portal
+/// `increment_threshold` door and cannot carry this runner: the two doors
+/// tick different counters.
 type TupleHashPortalRunnerFn = fn(
     w_type: PyObjectRef,
     w_tuple: PyObjectRef,
