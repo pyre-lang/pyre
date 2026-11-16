@@ -6775,6 +6775,7 @@ pub(in crate::front::mir) struct StructElemCensus {
     pub(in crate::front::mir) defs: usize,
     pub(in crate::front::mir) elems: usize,
     pub(in crate::front::mir) other: usize,
+    pub(in crate::front::mir) copies: Vec<usize>,
 }
 
 pub(in crate::front::mir) fn struct_elem_census(
@@ -6786,6 +6787,7 @@ pub(in crate::front::mir) fn struct_elem_census(
         defs: 0,
         elems: 0,
         other: 0,
+        copies: Vec::new(),
     };
     let mut unused_fields = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
@@ -6796,7 +6798,19 @@ pub(in crate::front::mir) fn struct_elem_census(
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_struct_elem(&rvalue, dest, &mut census.elems, &mut census.other);
+                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _) = &rvalue
+                        && matches!(p.kind, PlaceKind::Local(local) if local as usize == dest)
+                        && let PlaceKind::Local(x) = &place.kind
+                    {
+                        census.copies.push(*x as usize);
+                    } else {
+                        scan_rvalue_struct_elem(
+                            &rvalue,
+                            dest,
+                            &mut census.elems,
+                            &mut census.other,
+                        );
+                    }
                     classify_struct_field_write(
                         &place,
                         dest,
@@ -6855,15 +6869,50 @@ pub(in crate::front::mir) fn struct_elem_census(
 }
 
 /// `ptr::add` dest used as a GcArray element: address-of a field or a
-/// reborrow of the dest. Fusion still requires `other == 0`; getitem SSA
-/// does not. A value copy of the pointer is not a reason to skip getitem.
+/// reborrow of the dest. The dest and every value-copy of it must have
+/// one definition and no escaping use, and some node in that tree must
+/// be an element use.
 pub(in crate::front::mir) fn add_dest_used_as_struct_elem(
     llbc: &Llbc,
     body: &Unstructured,
     dest: usize,
 ) -> bool {
     let census = struct_elem_census(llbc, body, dest);
-    census.defs == 1 && census.elems >= 1
+    if !(census.defs == 1 && census.other == 0 && (census.elems >= 1 || !census.copies.is_empty()))
+    {
+        return false;
+    }
+    if !census
+        .copies
+        .iter()
+        .all(|&x| copy_used_as_struct_elem(llbc, body, x, 1))
+    {
+        return false;
+    }
+    census.elems >= 1 || copies_tree_has_elem(llbc, body, &census.copies, 1)
+}
+
+fn copy_used_as_struct_elem(llbc: &Llbc, body: &Unstructured, dest: usize, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let census = struct_elem_census(llbc, body, dest);
+    census.defs == 1
+        && census.other == 0
+        && census
+            .copies
+            .iter()
+            .all(|&x| copy_used_as_struct_elem(llbc, body, x, depth + 1))
+}
+
+fn copies_tree_has_elem(llbc: &Llbc, body: &Unstructured, copies: &[usize], depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    copies.iter().any(|&x| {
+        let census = struct_elem_census(llbc, body, x);
+        census.elems >= 1 || copies_tree_has_elem(llbc, body, &census.copies, depth + 1)
+    })
 }
 
 /// Header recovered from the add's base before any flowspace Variable exists.

@@ -2798,6 +2798,10 @@ fn add_dest_struct_field_guard_classifies_uses() {
         "Assign": [place_local(2), {"Use": [{"Read": place_local(1)}, "No"]}]
     }))]);
     assert!(!accepts(&escape), "the pointer escapes by value");
+    assert!(
+        !elem_accepts(&escape),
+        "a pointer copied into an unused local has no elem"
+    );
 
     let bare = body_of(vec![stmt(serde_json::json!({
         "Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]
@@ -2932,6 +2936,54 @@ fn add_dest_struct_field_guard_classifies_uses() {
         serde_json::from_value::<Unstructured>(body_json).expect("call fixture parses")
     };
     assert!(accepts(&call_body), "a call argument is a value field use");
+
+    let elem_escape_call = {
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 0, "locals": [local(0), local(1), local(2)]},
+            "body": [{
+                "statements": [
+                    stmt(serde_json::json!({
+                        "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
+                    })),
+                    stmt(serde_json::json!({
+                        "Assign": [place_local(2), {
+                            "Ref": {"place": field_place(1, 0), "kind": "Shared", "ptr_metadata": null}
+                        }]
+                    })),
+                ],
+                "kind": "Regular",
+                "terminator": {
+                    "kind": {
+                        "Call": {
+                            "call": {
+                                "func": {
+                                    "Regular": {
+                                        "kind": {"Fun": 1},
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    }
+                                },
+                                "args": [{"Read": place_local(1)}]
+                            },
+                            "dest": place_local(2),
+                            "target": 0,
+                            "on_unwind": 0
+                        }
+                    }
+                }
+            }]
+        });
+        serde_json::from_value::<Unstructured>(body_json).expect("elem+escape call fixture parses")
+    };
+    assert!(
+        !elem_accepts(&elem_escape_call),
+        "a by-value call argument of dest escapes even with a Ref elem use"
+    );
 }
 
 /// Distinctive `fn(bool) -> bool` so this fixture cannot collide with
