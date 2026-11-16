@@ -37799,7 +37799,10 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             for &item in &items {
                 let _ = pyre_object::gc_roots::pin_root(item);
             }
-            let pool = pyre_object::w_list_new(items);
+            // `W_Product.__init__` `space.fixedview` is a `list[W_Root]`;
+            // Object strategy keeps each wrapped item by identity.
+            let pool =
+                crate::runtime_ops::obj_or_memory_error(pyre_object::w_list_new_object(items))?;
             let _ = pyre_object::gc_roots::pin_root(pool);
             pool_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
         }
@@ -37823,7 +37826,7 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     } else {
         cls
     };
-    Ok(pyre_object::interp_itertools::w_product_new(
+    crate::runtime_ops::obj_or_memory_error(pyre_object::interp_itertools::w_product_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(gears_slot) },
         stopped,
         w_subtype,
@@ -38186,7 +38189,9 @@ fn permutations_descr_new_from(
         let _ = pyre_object::gc_roots::pin_root(item);
     }
     let n = items.len();
-    let pool_w = pyre_object::w_list_new(items);
+    // `W_Permutations.__init__` `self.pool_w = space.fixedview(w_iterable)`
+    // is a `list[W_Root]`; Object strategy keeps each wrapped item by identity.
+    let pool_w = crate::runtime_ops::obj_or_memory_error(pyre_object::w_list_new_object(items))?;
     let _ = pyre_object::gc_roots::pin_root(pool_w);
     let pool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
@@ -38227,7 +38232,7 @@ fn permutations_descr_new_from(
     } else {
         cls
     };
-    Ok(pyre_object::interp_itertools::w_permutations_new(
+    crate::runtime_ops::obj_or_memory_error(pyre_object::interp_itertools::w_permutations_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
         r,
         stopped,

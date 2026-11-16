@@ -176,6 +176,22 @@ impl IntArray {
         }
     }
 
+    /// `rlist.py ll_newlist` for a Signed `GcArray` of live length `len`.
+    ///
+    /// Allocates the items block directly (`try_alloc_typed_items_block`);
+    /// failure is `None`, the same edge that allocation already publishes as
+    /// MemoryError. The block is zero-filled. Empty `len` is [`Self::empty`].
+    pub fn try_with_len(len: usize) -> Option<Self> {
+        if len == 0 {
+            return Some(Self::empty());
+        }
+        let block = unsafe { try_alloc_typed_items_block(len, gc_int_array_gc_type_id())? };
+        Some(Self {
+            block,
+            len: crate::object_array::length_cell(len),
+        })
+    }
+
     /// Adopt an already-allocated Signed items block. The block is the
     /// `ll_newlist` result; `ll_arraycopy` fills it before the list header
     /// takes the edge.
@@ -472,5 +488,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn try_with_len_is_zero_filled() {
+        let empty = IntArray::try_with_len(0).unwrap();
+        assert!(empty.is_empty());
+        assert!(empty.block.is_null());
+        let arr = IntArray::try_with_len(5).unwrap();
+        assert_eq!(arr.as_slice(), &[0, 0, 0, 0, 0]);
     }
 }
