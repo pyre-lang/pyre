@@ -163,7 +163,7 @@ fn pop_n_ok_payload_field_is_int() {
 /// close, and the word-ABI bridge whose argument is the guard's save_point
 /// word.
 fn is_close_leaf(s: &str) -> bool {
-    s == "root_scope_close_word" || s == "root_scope_close" || s == "root_scope_close_jit_abi"
+    s == "root_scope_close_word" || s == "root_scope_close"
 }
 
 /// A lowered `RootScope` drop closes the scope by value
@@ -3107,7 +3107,7 @@ fn object_setattr_erases_with_roots_pin_run() {
             ),
         ));
         dump.push_str("--- object_setattr stack/root calls ---\n");
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
@@ -3136,7 +3136,7 @@ fn object_setattr_erases_with_roots_pin_run() {
             && let Some(force_body) = force_fd.unstructured()
         {
             dump.push_str("--- force callees ---\n");
-            for (bb_idx, bb) in force_body.body.iter().enumerate() {
+            for (bb_idx, bb) in force_body.body().iter().enumerate() {
                 let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                     continue;
                 };
@@ -3170,7 +3170,7 @@ fn object_setattr_erases_with_roots_pin_run() {
                 .find(|fd| fd.item_meta.name_path() == helper)
                 && let Some(helper_body) = helper_fd.unstructured()
             {
-                for (bb_idx, bb) in helper_body.body.iter().enumerate() {
+                for (bb_idx, bb) in helper_body.body().iter().enumerate() {
                     let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                         continue;
                     };
@@ -3201,7 +3201,7 @@ fn object_setattr_erases_with_roots_pin_run() {
         ));
         dump.push_str("--- bb0-bb10 terminators ---\n");
         for bb_idx in 0..11 {
-            let Some(bb) = body.body.get(bb_idx) else {
+            let Some(bb) = body.body().get(bb_idx) else {
                 break;
             };
             match bb.term_ref(llbc) {
@@ -3291,7 +3291,7 @@ fn object_setattr_erases_with_roots_pin_run() {
         use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, StmtKind, TermKind};
         let mut dump = format!("residual promoted_const: {}\n", promoted.join("\n"));
         dump.push_str("--- object_setattr calls to promoted_const ---\n");
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
@@ -3331,7 +3331,7 @@ fn object_setattr_erases_with_roots_pin_run() {
                 dump.push_str("no body\n");
                 continue;
             };
-            for (bb_idx, bb) in body.body.iter().enumerate() {
+            for (bb_idx, bb) in body.body().iter().enumerate() {
                 for (si, stmt) in bb.statements.iter().enumerate() {
                     let kind = match stmt.stmt_kind_ref() {
                         Ok(
@@ -3373,10 +3373,10 @@ fn object_setattr_erases_with_roots_pin_run() {
             }
             dump.push_str(&format!(
                 "term_kind_value={} const_meta={:?}\n",
-                body.body[0].terminator.kind_value(),
+                body.body()[0].terminator.kind_value(),
                 {
                     let mut found = None;
-                    for stmt in &body.body[0].statements {
+                    for stmt in &body.body()[0].statements {
                         if let Ok(StmtKind::Assign(
                             _,
                             majit_charon_reader::ullbc::Rvalue::Use(

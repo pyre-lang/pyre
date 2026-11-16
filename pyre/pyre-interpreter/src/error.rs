@@ -300,7 +300,7 @@ pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObje
 /// Floyd cycle-detection over the `__context__` chain, breaking the
 /// loop by writing `None` into the offending link before the new
 /// `w_context` is attached.
-fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<(), PyError> {
+pub fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<(), PyError> {
     let mut w_rabbit = w_context;
     let mut w_tortoise = w_context;
     let mut update_tortoise_toggle = false;

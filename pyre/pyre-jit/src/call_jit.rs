@@ -2453,6 +2453,9 @@ pub fn publish_pyre_host_hooks() {
         ),
         assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
         make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
+        jitcode_pc_raise_keeps_existing_traceback: Some(
+            pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback,
+        ),
     });
 }
 
@@ -4799,10 +4802,17 @@ fn trace_and_compile_from_bridge_body(
                     bridge_frame_root.frame(),
                 );
             }
-            let done_with_this_frame = driver.take_done_with_this_frame_ref();
+            // pyjitpl.py finishframe raises DoneWithThisFrameRef(resultbox)
+            // after compile_done_with_this_frame; warmspot.py
+            // handle_jitexception returns e.result. Take the resultbox
+            // only when this shortcut actually returns Finished. A take
+            // before the `allow_finish_direct_return` gate (CA passes
+            // false) clears single_pass_finish_values so
+            // bridge_resolution_from_abort_blackhole DoneWithThisFrame
+            // publishes ConcreteValue::Null.
             if pc == usize::MAX
                 && allow_finish_direct_return
-                && let Some(result) = done_with_this_frame
+                && let Some(result) = driver.take_done_with_this_frame_ref()
             {
                 return BridgeResolution::Finished(pyre_jit_trace::state::ConcreteValue::Ref(
                     result.as_usize() as pyre_object::PyObjectRef,

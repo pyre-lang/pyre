@@ -1005,19 +1005,32 @@ pub fn generate_residual_shim_source(targets: &[&ResidualShimTarget]) -> String 
     out.push_str("pub static GENERATED_RESIDUAL_SHIMS: &[(&str, ResidualShimAddr)] = &[\n");
     for (index, target) in targets.iter().enumerate() {
         let ident = shim_ident(index, &target.path);
-        out.push_str(&format!(
-            "    (\"{}\", ResidualShimAddr({ident} as *const ())),\n",
-            escape_path(&target.path)
-        ));
-        if target.path != target.rust_path {
+        for key in shim_table_keys(target) {
             out.push_str(&format!(
                 "    (\"{}\", ResidualShimAddr({ident} as *const ())),\n",
-                escape_path(&target.rust_path)
+                escape_path(&key)
             ));
         }
     }
     out.push_str("];\n");
     out
+}
+
+/// Reloc paths the runtime patcher looks up. Keep the catalog spelling,
+/// the callable spelling, and the crate-stripped alias `canonical_key`
+/// uses when the CallPath has no crate segment.
+fn shim_table_keys(target: &ResidualShimTarget) -> Vec<String> {
+    let mut keys = vec![target.path.clone()];
+    if target.rust_path != target.path {
+        keys.push(target.rust_path.clone());
+    }
+    if let Some((_, rest)) = target.path.split_once("::")
+        && !rest.is_empty()
+        && !keys.iter().any(|key| key == rest)
+    {
+        keys.push(rest.to_string());
+    }
+    keys
 }
 
 fn escape_path(path: &str) -> String {
@@ -1862,6 +1875,10 @@ mod tests {
         assert!(src.contains("extern \"C\""));
         assert!(src.contains("pyre_object::function::w_method_new"));
         assert!(src.contains("GENERATED_RESIDUAL_SHIMS"));
+        assert!(
+            src.contains("\"function::w_method_new\""),
+            "crate-stripped reloc alias: {src}"
+        );
         assert!(src.contains("residual_word_to_value"));
         assert!(src.contains("residual_value_to_word"));
         assert!(src.contains("__a0: i64, __a1: i64, __a2: i64"));

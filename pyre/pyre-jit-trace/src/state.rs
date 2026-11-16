@@ -5227,11 +5227,14 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 /// by recorded `setfield_gc`/`setarrayitem_gc` (`pyjitpl.py
 /// _opimpl_setfield_vable` / `_nonstandard_virtualizable`) or materialized
 /// on resume with every field, None included (`resume.py
-/// AbstractVirtualStructInfo.setfields`, `VArrayInfoClear.setfields`;
-/// `virtualizable.py write_from_resume_data_partial` writes every item
-/// `0..len`). Operand slots `0..stack_only` are therefore written in full
-/// — a live NULL register and an unrecovered slot both store NULL.
-/// `stack_only` is `maps.stack_depth_at_pc` capped at the frame's stored
+/// AbstractVirtualStructInfo.setfields`, `VArrayInfoClear.setfields`).
+/// Locals stay in that array. `consume_one_section` / `consume_boxes`
+/// restore the MIFrame / blackhole registers only (`resume.py`); a pcdep
+/// fan-out of those live boxes onto `slot < nlocals` would store a
+/// `Const(Ref(0))` hole over a local the virtual already materialized.
+/// Operand slots `0..stack_only` are written in full — a live NULL
+/// register and an unrecovered slot both store NULL. `stack_only` is
+/// `maps.stack_depth_at_pc` capped at the frame's stored
 /// `valuestackdepth` (the last recorded `setfield_vable`); the overlay
 /// never writes `valuestackdepth`.
 pub fn sync_inlined_section_heap_frame(
@@ -5285,13 +5288,14 @@ pub fn sync_inlined_section_heap_frame(
             &maps.pcdep_entries,
             color as usize,
         ) {
+            // Locals: `AbstractVirtualStructInfo.setfields`. Only the
+            // operand stack is missing from the heap (`pyframe.py popvalue`).
             if slot < nlocals {
-                store_live_frame_array_slot(frame_ptr, slot, value);
-            } else {
-                let i = slot - nlocals;
-                if i < operand.len() && operand[i].is_none() {
-                    operand[i] = Some(value);
-                }
+                continue;
+            }
+            let i = slot - nlocals;
+            if i < operand.len() && operand[i].is_none() {
+                operand[i] = Some(value);
             }
         }
     }
@@ -5300,14 +5304,13 @@ pub fn sync_inlined_section_heap_frame(
     let const_slots = const_ref_slots_from_pc(jitcode_index, jitcode_pc);
     for &(slot, raw) in &const_slots {
         let slot = slot as usize;
-        let value = majit_ir::Value::Ref(majit_ir::GcRef(raw as usize));
         if slot < nlocals {
-            store_live_frame_array_slot(frame_ptr, slot, value);
-        } else {
-            let i = slot - nlocals;
-            if i < operand.len() && operand[i].is_none() {
-                operand[i] = Some(value);
-            }
+            continue;
+        }
+        let value = majit_ir::Value::Ref(majit_ir::GcRef(raw as usize));
+        let i = slot - nlocals;
+        if i < operand.len() && operand[i].is_none() {
+            operand[i] = Some(value);
         }
     }
     for i in 0..stack_only {

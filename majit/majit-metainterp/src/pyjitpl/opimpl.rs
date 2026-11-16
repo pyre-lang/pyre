@@ -4529,30 +4529,44 @@ where
                     });
                     redboxes.push((opref, ty));
                 }
-                if slot == 0
-                    && let Some(majit_ir::OpRef::ConstInt(v)) =
-                        frame.int_regs.get(reg_idx).copied().flatten()
-                {
-                    if mp_green_pc.is_none() {
-                        mp_green_pc = Some(v);
+                // `opimpl_jit_merge_point` `greenboxes`: every listed green
+                // at this opcode. `box_bits` covers Const and a stamped
+                // InputArg. An unset slot is the merge-point panic
+                // (`verify_green_args` / `bhimpl_jit_merge_point`).
+                if is_green_slot {
+                    let opref = match slot {
+                        0 => frame.int_regs.get(reg_idx).copied().flatten(),
+                        1 => frame.ref_regs.get(reg_idx).copied().flatten(),
+                        2 => frame.float_regs.get(reg_idx).copied().flatten(),
+                        _ => None,
+                    };
+                    let bits = opref.and_then(|op| ctx.box_bits(op)).unwrap_or_else(|| {
+                        panic!(
+                            "merge-point green {} register {reg} must be live \
+                             (blackhole.py bhimpl_jit_merge_point)",
+                            ["int", "ref", "float"][slot]
+                        )
+                    });
+                    debug_assert!(
+                        opref.is_some_and(|op| op.is_constant()),
+                        "BC_JIT_MERGE_POINT: green register \
+                         {reg} (slot {slot}) holds non-Const \
+                         OpRef {opref:?} — emit_promote_greens \
+                         (`jtransform.py` `promote_greens`) must run before \
+                         the merge point so all greens are \
+                         constants (pyjitpl.py verify_green_args)",
+                    );
+                    match slot {
+                        0 => {
+                            if mp_green_pc.is_none() {
+                                mp_green_pc = Some(bits);
+                            }
+                            mp_green_ints.push(bits);
+                        }
+                        1 => mp_green_refs.push(bits),
+                        2 => mp_green_floats.push(bits),
+                        _ => {}
                     }
-                    mp_green_ints.push(v);
-                }
-                // pyjitpl.py same_greenkey: ref (slot 1) and float
-                // (slot 2) green constants for the full-green header
-                // compare.  `equal_whatever(Float, ..)` compares f64 bits,
-                // so store the float green's `to_bits`.
-                if slot == 1
-                    && let Some(majit_ir::OpRef::ConstPtr(v)) =
-                        frame.ref_regs.get(reg_idx).copied().flatten()
-                {
-                    mp_green_refs.push(majit_ir::const_ptr_table::resolve(v).0 as i64);
-                }
-                if slot == 2
-                    && let Some(majit_ir::OpRef::ConstFloat(v)) =
-                        frame.float_regs.get(reg_idx).copied().flatten()
-                {
-                    mp_green_floats.push(v.to_bits() as i64);
                 }
                 debug_assert!(
                     reg_idx < max,
@@ -4560,37 +4574,6 @@ where
                      out of range for slot {slot} \
                      (kind bank size {max})",
                 );
-                if is_green_slot && cfg!(debug_assertions) {
-                    // Look up the OpRef in the matching
-                    // typed register bank.  A None slot
-                    // means the register has not been
-                    // populated yet — also a macro emission
-                    // bug.
-                    let opref_opt = match slot {
-                        0 => frame.int_regs.get(reg_idx).copied().flatten(),
-                        1 => frame.ref_regs.get(reg_idx).copied().flatten(),
-                        2 => frame.float_regs.get(reg_idx).copied().flatten(),
-                        _ => unreachable!(),
-                    };
-                    let Some(opref) = opref_opt else {
-                        panic!(
-                            "BC_JIT_MERGE_POINT: green register \
-                             {reg} (slot {slot}) is unset at \
-                             trace time (pyjitpl.py:1530 \
-                             verify_green_args)",
-                        );
-                    };
-                    assert!(
-                        opref.is_constant(),
-                        "BC_JIT_MERGE_POINT: green register \
-                         {reg} (slot {slot}) holds non-Const \
-                         OpRef {opref:?} — emit_promote_greens \
-                         (`jtransform.py` `promote_greens`) must run before \
-                         the merge point so all greens are \
-                         constants (pyjitpl.py:1530-1535 \
-                         verify_green_args)",
-                    );
-                }
             }
         }
         // pyjitpl.py MIFrame.opimpl_jit_merge_point: `redboxes` reach
@@ -4934,7 +4917,7 @@ where
                 }
                 // pyjitpl.py `popframe(leave_portal_frame=False)` still
                 // decrements `portal_call_depth` when `jitcode.jitdriver_sd`.
-                if popped.portal_entered {
+                if popped.jitcode.jitdriver_sd().is_some() {
                     ctx.adjust_portal_call_depth(-1);
                 }
                 // popframe still appends the log close when greenkey

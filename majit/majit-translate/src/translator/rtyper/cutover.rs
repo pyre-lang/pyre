@@ -5153,6 +5153,28 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &[],
         LowLevelType::Address,
     ),
+    // Compiled-loop CRN park helpers (`pyjitpl.py` `_establish_nullity`).
+    // They live in `pyre-jit-trace`, outside the interpreter minting
+    // closure, so `eval_loop_jit` residualizes them
+    // (`extfunc.py` `register_external` / `rlib/jit.py` `dont_look_inside`).
+    (
+        &[
+            "pyre_jit_trace",
+            "jitcode_dispatch",
+            "rewind_foriter_cache_park",
+        ],
+        &["frame"],
+        LowLevelType::Bool,
+    ),
+    (
+        &[
+            "pyre_jit_trace",
+            "jitcode_dispatch",
+            "push_resume_send_none_if_parked",
+        ],
+        &["frame"],
+        LowLevelType::Bool,
+    ),
 ];
 
 /// True when `segments` is a [`NO_EFFECT_EXTERNALS`] path.
@@ -5242,6 +5264,34 @@ fn register_residual_signature_external(
 /// Register one opaque external through the annotator-only stub carrier.
 /// The caller retains ownership of which table or synthetic path declares
 /// the external; this helper keeps their registration semantics identical.
+fn register_opaque_external_ref_result(
+    registry: &CallRegistry,
+    segments: &[&str],
+    argnames: &[&str],
+) {
+    let signature = Signature::new(
+        argnames.iter().map(|n| (*n).to_string()).collect(),
+        None,
+        None,
+    );
+    let s_result = crate::codewriter::annotation_state::valuetype_to_someshell(
+        &crate::model::ValueType::Ref(None),
+    )
+    .expect("Ref(None) shells to a definite SomeInstance");
+    let stub_pygraph = build_stub_pygraph_with_result_shell(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        s_result.clone(),
+    );
+    let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+    if alias_existing_lookup(registry, &key) {
+        return;
+    }
+    registry
+        .get_or_register(key, signature)
+        .install_external_stub(stub_pygraph, s_result);
+}
+
 fn register_opaque_external(
     registry: &CallRegistry,
     segments: &[&str],
@@ -5452,6 +5502,18 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, argtype_index) in ATOMIC_PTR_ARGTYPE_EXTERNALS {
         register_opaque_external_argtype(registry, segments, argnames, *argtype_index);
     }
+    // `AtomicPtr::compare_exchange` returns `Result<*mut T, *mut T>`,
+    // a real ADT the caller matches on (`dont_look_inside_return_token`
+    // of a non-carrier Result). The residual shell is classdef-less
+    // `SomeInstance` (`residual_return_shell` `"ref"`), which unions
+    // with the dest Result via the classdef-less widen arm
+    // (`binaryop.py`). `specialize:argtype` of `new` would annotate
+    // `*mut T` and fail the Result dest.
+    register_opaque_external_ref_result(
+        registry,
+        &["sync", "atomic", "AtomicPtr", "compare_exchange"],
+        &["self", "current", "new", "success", "failure"],
+    );
     register_saturating_arith_externals(registry);
     // `<[T]>::to_vec` leftover the pair-slice rewrite did not retarget
     // (`front::mir` `is_slice_to_vec` only fires on an enabled pair
@@ -17125,6 +17187,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["w_code_get_ptr".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
@@ -17156,6 +17219,7 @@ mod tests {
         let (graph, result, value_to_var) = backfill_call_result_fixture(
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["w_code_get_ptr".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
@@ -22488,7 +22552,7 @@ mod tests {
 
         use crate::annotator::model::{SomeString, SomeValue};
         use crate::flowspace::model::{ConstValue, Constant};
-        use crate::model::OpKind;
+        use crate::model::{CallTarget, OpKind};
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
         let Some(object) = crate::test_support::load_ullbc_if_present(
@@ -22584,6 +22648,148 @@ mod tests {
         assert!(
             !matches!(&s_key, SomeValue::Instance(inst) if inst.classdef.is_none()),
             "getattr key must not be classdef-less, got {s_key:?}"
+        );
+
+        // `ll2ctypes.py` `ForceCastEntry`: Raw `DICTENTRY` dest after
+        // `direct_ptradd` is `rffi.cast`, not `cast_int_to_ptr` of the
+        // CArrayPtr blob (`lltype.py` `ann_cast_int_to_ptr` expects Integer).
+        let recast_int_to_entry = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            if segments.last().map(String::as_str) != Some("cast_int_to_ptr") {
+                return false;
+            }
+            match args.first() {
+                Some(crate::model::LinkArg::Const(c)) => match &c.value {
+                    ConstValue::LowLevelType(ty) => matches!(
+                        ty.as_ref(),
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(p)
+                            if matches!(&p.TO, PtrTarget::Struct(st) if st._name.contains("Entry"))
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            }
+        });
+        assert!(
+            !recast_int_to_entry,
+            "Raw DICTENTRY dest is rffi.cast, ops {:?}",
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .map(|op| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `rordereddict.py` `DICTENTRY` inlines `ObjectKey` at offset 0
+    /// (`lltype.py` `_first_struct`). `mark_deleted` stores
+    /// `e.key = K::dummy()` as leaf FieldWrites; missing Charon layout
+    /// of field 0 still uses the inner name `hash`, not `key.hash`
+    /// (`lltype.py` `_nofield`).
+    #[test]
+    fn objectkey_mark_deleted_fieldwrite_hash_not_key_hash() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+
+        let Some(object) = crate::test_support::load_ullbc_if_present(
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
+        ) else {
+            return;
+        };
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object],
+            crate::HostStaticAddrs::default(),
+            &["dictmultiobject", "rordereddict", "rordereddict_entries"],
+            &[
+                "w_module_dict_delitem_str_no_proxy",
+                "w_dict_delitem_wtf8_no_proxy",
+                "nth_item",
+            ],
+        )
+        .expect("lower ObjectKey dict delete");
+
+        let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        let mark_deleted = program
+            .functions
+            .iter()
+            .find(|f| f.name.contains("mark_deleted") && f.name.contains("ObjectKey"))
+            .unwrap_or_else(|| panic!("expected ObjectKey mark_deleted spec, got {names:?}"));
+        let writes: Vec<&str> = mark_deleted
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            writes.iter().any(|name| *name == "hash"),
+            "ObjectKey mark_deleted FieldWrite hash, got {writes:?}"
+        );
+        assert!(
+            writes.iter().all(|name| *name != "key.hash"),
+            "ObjectKey mark_deleted must not FieldWrite key.hash, got {writes:?}"
+        );
+
+        let mut gcref_cast_results = Vec::new();
+        for op in mark_deleted
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+        {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("__cast_instance_intrinsic") {
+                continue;
+            }
+            let Some(LinkArg::Const(c)) = args.get(1) else {
+                continue;
+            };
+            if c.value.as_text() != Some("GCREF") {
+                continue;
+            }
+            if let Some(res) = &op.result {
+                gcref_cast_results.push(res.clone());
+            }
+        }
+        let obj_writes: Vec<_> = mark_deleted
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. } if field.name == "obj" => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            obj_writes.iter().any(|value| {
+                matches!(
+                    value,
+                    LinkArg::Value(var) if gcref_cast_results.iter().any(|g| g == var)
+                )
+            }),
+            "ObjectKey mark_deleted FieldWrite obj recasts to GCREF \
+             (`annlowlevel.cast_instance_to_gcref`), casts {gcref_cast_results:?} \
+             writes {obj_writes:?}"
         );
     }
 
@@ -23471,6 +23677,18 @@ mod tests {
             ["majit_gc", "shadow_stack", "slot_from_cached"].as_slice(),
             ["majit_gc", "shadow_stack", "cache_root_stack_slot"].as_slice(),
             ["majit_gc", "shadow_stack", "shadow_stack_slot"].as_slice(),
+            [
+                "pyre_jit_trace",
+                "jitcode_dispatch",
+                "rewind_foriter_cache_park",
+            ]
+            .as_slice(),
+            [
+                "pyre_jit_trace",
+                "jitcode_dispatch",
+                "push_resume_send_none_if_parked",
+            ]
+            .as_slice(),
         ] {
             assert!(
                 registry

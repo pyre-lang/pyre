@@ -101,6 +101,33 @@ pub fn active_backend_jit_exc_value_forward(old: i64, new: i64) {
     majit_backend_dynasm::jit_exc_value_forward(old, new)
 }
 
+/// `llmodel.py` `_store_exception` counterpart used by the unique walk's
+/// `execute_raised` analogue. Residual helpers publish into both
+/// `BH_LAST_EXC_VALUE` and the backend cells
+/// (`publish_residual_call_exception`); `executor.py` `_do_call` hands the
+/// exception only to `metainterp.execute_raised` and never touches those
+/// cells. Drain them after the walk copies the raise into
+/// `last_exception_value`, matching `executor.rs` `do_call` and the FBW
+/// residual raise arm.
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn active_backend_clear_stored_exception() {
+    majit_backend_cranelift::jit_exc_clear();
+}
+
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+pub fn active_backend_clear_stored_exception() {
+    majit_backend_dynasm::jit_exc_clear();
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn active_backend_clear_stored_exception() {
+    majit_backend_wasm::jit_exc_clear();
+}
+
 static RD_CONSTS_WALK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
@@ -3101,6 +3128,11 @@ pub type SymbolicFnaddrPathResolver = fn(i64) -> Option<&'static str>;
 /// `jitexc._get_standard_error` (untranslated). majit cannot import the
 /// host exception type, so the host publishes the integer here.
 pub type AssertionErrorTypeptr = fn() -> i64;
+/// Host: `jitcode_pc_raise_keeps_existing_traceback` /
+/// `raise_at_py_pc_keeps_existing_traceback`.
+/// `pyopcode.py FOR_ITER` keeps the iterator's traceback;
+/// `RaiseWithExplicitTraceback` (`RAISE_VARARGS 0`, `RERAISE`) does too.
+pub type JitcodePcRaiseKeepsExistingTraceback = fn(i32, i32) -> bool;
 
 /// Interpreter-owned callbacks `warmspot.py` would put on
 /// `MetaInterpStaticData` at setup. Folded from the process-global
@@ -3122,6 +3154,7 @@ pub struct HostHooks {
     /// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
     /// `None` skips the op: the following getfield stays a real load.
     pub make_quasi_immut_descr: Option<MakeQuasiImmutDescr>,
+    pub jitcode_pc_raise_keeps_existing_traceback: Option<JitcodePcRaiseKeepsExistingTraceback>,
 }
 
 /// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
@@ -3142,6 +3175,7 @@ static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(Host
     symbolic_fnaddr_path_resolver: None,
     assertion_error_typeptr: None,
     make_quasi_immut_descr: None,
+    jitcode_pc_raise_keeps_existing_traceback: None,
 });
 
 /// Published copy of [`MetaInterpStaticData::host`]. Readers that do
@@ -7918,10 +7952,12 @@ impl<M: Clone> MetaInterp<M> {
     /// would read at this merge point, and build `live_arg_boxes` the way
     /// `opimpl_jit_merge_point` → `reached_loop_header` does.
     ///
-    /// Re-reads declaration-order slots off the live portal frame when
-    /// `framestack` still holds one. A `#[jit_interp]` Continue walk has
-    /// already dropped its standalone frames; that path snapshotted the
-    /// same slots before the last pop (`snapshot_live_portal_greens`).
+    /// Uses `live_portal_greens` captured at the last depth-0 merge point,
+    /// replacing a still-live register (a write after that opcode). Reds
+    /// re-read only while every listed slot is still live. A
+    /// `#[jit_interp]` Continue walk has already dropped its standalone
+    /// frames; that path refreshed the same banks before the last pop
+    /// (`snapshot_live_portal_greens`).
     pub fn close_header_revisit(&mut self, pc: usize) {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
@@ -8290,6 +8326,12 @@ impl<M: Clone> MetaInterp<M> {
         // A refused residual (`symbolic_residual_abort`) never ran, so the
         // blackhole resumes at that instruction's `orgpc` rather than after
         // it; see `stage_interpret_abort_blackhole`, which consumes the flag.
+        // Leave the latch set: `stage_switch_to_blackhole` must not convert
+        // a framestack whose top instruction is a symbolic residual the
+        // blackhole would `LeaveFrame` (`reject_unresolved_call`). That
+        // skip of the call CRNs the caller past the STORE (`UnboundLocalError`
+        // on `v`). `resume_in_blackhole` from the guard deadframe routes
+        // the pending exception instead (`compile.py` `handle_fail` else-arm).
         let refused = self
             .tracing
             .as_ref()
@@ -17755,6 +17797,12 @@ impl<M: Clone> MetaInterp<M> {
             header_pc: portal_pc,
             redboxes: Vec::new(),
         };
+        // `make_result_of_lastop` recovers the caller dest from bytecode.
+        // The walker writes that slot through the callee's `return_*`;
+        // copy the leftover `BC_INLINE_CALL` onto the rebuilt chain.
+        // A portal residual-call parent (`NoInlineCallSite`) keeps an
+        // empty dest, matching `bridge_from_guard_resume_position`.
+        let _ = self.wire_rebuilt_inline_framestack();
         self._handle_guard_failure(&mut portal_sym, portal_pc)
     }
 
@@ -18783,11 +18831,20 @@ impl<M: Clone> MetaInterp<M> {
             {
                 let frame = self.framestack.current_mut();
                 let code = &frame.jitcode.code;
-                let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
-                    frame.pc
-                } else {
-                    frame.code_cursor
-                };
+                // Unique walk splits RPython's single `MIFrame.pc` into a
+                // resume snapshot (`pc`, `setup_resume_at_op`) and a live
+                // decode cursor (`code_cursor`). `finishframe_exception`
+                // (`pyjitpl.py`) reads `position = frame.pc` which already
+                // sits just after the insn that raised. After a residual
+                // call the cursor is at the trailing `-live-`; `pc` is still
+                // the guard-fail resume snapshot, so a search at `pc` misses
+                // `catch_exception` and compiles `ExitFrameWithException`.
+                // `opimpl_raise` / `opimpl_reraise` already pin
+                // `pc = code_cursor` before this search.
+                if frame.code_cursor != 0 {
+                    frame.pc = frame.code_cursor;
+                }
+                let mut position = frame.pc;
 
                 if position < code.len() {
                     let mut opcode = code[position];
@@ -19071,9 +19128,15 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
                 // resume.py `MIFrame.setup_resume_at_op`: `self.pc = pc`.
                 // The walker reads `code_cursor`; `pc` is what a snapshot
-                // reports (`dispatch.rs` seats both).
+                // reports (`setup_resume_at_op` seats both).
                 frame.setup_resume_at_op(pc);
-                frame.code_cursor = pc;
+                // Same pairing as `rebuild_portal_framestack_from_resumedata`:
+                // `newframe` greenkey is None, so ENTER is not recorded,
+                // but `jitdriver_sd` already incremented depth.
+                if let Some(jd) = frame.jitcode.jitdriver_sd() {
+                    frame.portal_entered = true;
+                    frame.portal_jd = jd;
+                }
             }
         }
     }
@@ -19278,8 +19341,19 @@ impl<M: Clone> MetaInterp<M> {
             // borrow `self.tracing` for `setup`.
             let frame_index = self.newframe(jitcode, None);
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
-                // resume.py `MIFrame.setup_resume_at_op`.
+                // resume.py `MIFrame.setup_resume_at_op` (`self.pc = pc`).
+                // Seats `code_cursor` with `pc` so `interpret` / `run_one_step`
+                // resume at the encoded section, not jitcode entry.
                 frame.setup_resume_at_op(pc);
+                // `newframe(jitcode)` increments `portal_call_depth` when
+                // `jitcode.jitdriver_sd` and does not record ENTER
+                // (`greenkey is None`). `portal_entered` still pairs
+                // walker popframe's depth decrement
+                // (`trace_from_guard_resume_position`).
+                if let Some(jd) = frame.jitcode.jitdriver_sd() {
+                    frame.portal_entered = true;
+                    frame.portal_jd = jd;
+                }
             }
             let ok = Self::consume_portal_resume_section(
                 &mut self.framestack,
@@ -19315,8 +19389,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `BC_INLINE_CALL` is copied onto the rebuilt frames before
     /// `interpret` (`trace_bridge_via_interpret`).
     ///
-    /// `setup_resume_at_op` stores `pc` and leaves `code_cursor` at 0
-    /// (`MIFrame::new`). `interpret` walks `code_cursor`.
+    /// `setup_resume_at_op` stores `pc` and `code_cursor`. This helper
+    /// reseats `code_cursor` from `pc` so a rebuild that skipped
+    /// `setup_resume_at_op` still walks from the encoded section.
     ///
     /// Resume sections are the inlined MIFrame chain
     /// (`resume.py rebuild_from_resumedata`). A pair that is not a
@@ -19335,17 +19410,36 @@ impl<M: Clone> MetaInterp<M> {
             let caller_pc = self.framestack.frames[depth - 1].pc;
             let caller_jc = std::sync::Arc::clone(&self.framestack.frames[depth - 1].jitcode);
             let callee_jc = std::sync::Arc::clone(&self.framestack.frames[depth].jitcode);
-            let Ok(site) = caller_jc.inline_resume_site_for(caller_pc, &callee_jc) else {
-                return false;
+            let site = match caller_jc.inline_resume_site_for(caller_pc, &callee_jc) {
+                Ok(site) => Some(site),
+                // Portal residual-call / eval-loop parent: dest is in
+                // `resulttypes`, not a leftover `BC_INLINE_CALL`
+                // (`JitCode::result_slot_at_pc`). Keep the section.
+                Err(crate::jitcode::InlineResumeSiteError::NoInlineCallSite) => None,
+                Err(_) => return false,
             };
             let (caller, rest) = self.framestack.frames.split_at_mut(depth);
             let caller = &mut caller[depth - 1];
             let callee = &mut rest[0];
-            callee.inline_frame = true;
-            callee.return_i = site.return_i;
-            callee.return_r = site.return_r;
-            callee.return_f = site.return_f;
-            let (argcode, dst) = match site.result_slot() {
+            let slot = site
+                .as_ref()
+                .and_then(|site| site.result_slot())
+                .or_else(|| caller.jitcode.result_slot_at_pc(caller_pc));
+            if site.is_some() || slot.is_some() {
+                callee.inline_frame = true;
+            }
+            if let Some(site) = site {
+                callee.return_i = site.return_i;
+                callee.return_r = site.return_r;
+                callee.return_f = site.return_f;
+            } else if let Some((kind, dst)) = slot {
+                match kind {
+                    crate::jitcode::JitArgKind::Int => callee.return_i = Some(dst),
+                    crate::jitcode::JitArgKind::Ref => callee.return_r = Some(dst),
+                    crate::jitcode::JitArgKind::Float => callee.return_f = Some(dst),
+                }
+            }
+            let (argcode, dst) = match slot {
                 Some((crate::jitcode::JitArgKind::Int, dst)) => (b'i', Some(dst)),
                 Some((crate::jitcode::JitArgKind::Ref, dst)) => (b'r', Some(dst)),
                 Some((crate::jitcode::JitArgKind::Float, dst)) => (b'f', Some(dst)),
@@ -24040,7 +24134,9 @@ mod portal_resume_rebuild_tests {
             &mut crate::BridgeVirtualCache::new(4, crate::default_bridge_array_descr),
         ));
         assert_eq!(meta.framestack.frames[0].pc, 0);
+        assert_eq!(meta.framestack.frames[0].code_cursor, 0);
         meta.framestack.frames[0].pc = 99;
+        meta.framestack.frames[0].code_cursor = 99;
         assert!(meta.rebuild_portal_framestack_from_resumedata(
             &frames,
             &[],
@@ -24077,7 +24173,9 @@ mod portal_resume_rebuild_tests {
         assert!(ok);
         assert_eq!(meta.framestack.frames.len(), 2);
         assert_eq!(meta.framestack.frames[0].pc, 0);
+        assert_eq!(meta.framestack.frames[0].code_cursor, 0);
         assert_eq!(meta.framestack.frames[1].pc, 3);
+        assert_eq!(meta.framestack.frames[1].code_cursor, 3);
     }
 
     #[test]
@@ -29898,6 +29996,42 @@ mod metainterp_static_data_tests {
         ));
         assert_eq!(meta.framestack.current_mut().pc, 6);
         assert_eq!(meta.framestack.current_mut().code_cursor, 6);
+    }
+
+    #[test]
+    fn finishframe_exception_uses_code_cursor_when_pc_is_stale_resume_snapshot() {
+        // Unique walk leaves `pc` at `setup_resume_at_op` and advances
+        // `code_cursor`. `finishframe_exception` (`pyjitpl.py`) reads the
+        // single `frame.pc` that already sits just after the raising insn.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        jitcode.body_mut().code = vec![
+            crate::jitcode::insns::BC_LIVE,
+            0,
+            0,
+            0xff,
+            crate::jitcode::insns::BC_LIVE,
+            0,
+            0,
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
+            10,
+            0,
+            0,
+        ];
+        let jitcode = std::sync::Arc::new(jitcode);
+        let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
+        frame.pc = 3;
+        frame.code_cursor = 4;
+        meta.framestack.push(frame);
+
+        let result = meta.finishframe_exception();
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
+        assert_eq!(meta.framestack.current_mut().pc, 10);
+        assert_eq!(meta.framestack.current_mut().code_cursor, 10);
     }
 
     #[test]

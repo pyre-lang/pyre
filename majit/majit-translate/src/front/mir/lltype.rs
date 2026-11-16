@@ -2208,6 +2208,41 @@ pub(in crate::front::mir) fn opaque_struct_field_name(
         .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx))
 }
 
+/// Charon `Scalar` of a `rffi.CFixedArray` slot: bytes, 16/32-bit ints,
+/// and IEEE floats. Pointer-width `usize` / `isize` / `i64` / `u64` stay
+/// out so a Repeat of the OnceLock word (`[None] * N`) is
+/// `__array_repeat` (`rlist.py` `ll_alloc_and_set`).
+pub(in crate::front::mir) fn cfixedarray_scalar_value_type(
+    scalar: &serde_json::Value,
+) -> Option<ValueType> {
+    if scalar.as_str() == Some("Char") {
+        return Some(ValueType::Int);
+    }
+    let obj = scalar.as_object()?;
+    if let Some(int) = obj.get("Integer").and_then(serde_json::Value::as_object) {
+        let width = int
+            .get("Unsigned")
+            .or_else(|| int.get("Signed"))
+            .and_then(serde_json::Value::as_str)?;
+        let unsigned = int.contains_key("Unsigned");
+        return match width {
+            "U8" | "U16" | "U32" if unsigned => Some(ValueType::Unsigned),
+            "I8" | "I16" | "I32" if !unsigned => Some(ValueType::Int),
+            _ => None,
+        };
+    }
+    if let Some(f) = obj.get("Float").and_then(serde_json::Value::as_str) {
+        return Some(if f == "F32" {
+            ValueType::SingleFloat
+        } else if f == "F64" {
+            ValueType::Float
+        } else {
+            return None;
+        });
+    }
+    None
+}
+
 pub(in crate::front::mir) fn scalar_value_type(scalar: &serde_json::Value) -> Option<ValueType> {
     if let Some(atom) = scalar.as_str() {
         return match atom {
@@ -4216,6 +4251,13 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         gc_struct_ids,
         raw_alloc_flavor_structs,
     ) {
+        return ValueType::Ref(Some(root));
+    }
+    // Shaped `[T; N]` / non-empty tuple: `rffi.CFixedArray` /
+    // `CConfig.in6_addr.s6_addr`. `tyref_to_value_type` otherwise reports
+    // the common `Ref` bank; keep the positional owner so a Repeat of
+    // `[0u8; 16]` and a by-value `sockaddr_in6_get_addr` join.
+    if let Some(root) = tyref_positional_aggregate_root(ty, llbc) {
         return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
@@ -6658,10 +6700,11 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     {
         return ValueType::Ref(None);
     }
-    // Inlined `[T; N]` of a scalar: Repeat's fill is that item
-    // (`lltype.FixedSizeArray` has no `getkind` as a value).
-    if let Some(item_ty) = scalar_fixed_array_item(ty, llbc) {
-        return item_ty;
+    // Shaped `[T; N]` is `rffi.CFixedArray` (`CConfig.in6_addr.s6_addr`):
+    // the array value, not the fill item. A field read of `s6_addr` and
+    // a Repeat of `[0u8; 16]` share this owner.
+    if let Some(root) = tyref_positional_aggregate_root(ty, llbc) {
+        return ValueType::Ref(Some(root));
     }
     // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
     // attribute: seed it `SomeStringBuilder`, matching the value site.
@@ -8374,6 +8417,28 @@ pub(in crate::front::mir) fn type_decl_struct_field_offset(
         .and_then(|layout| layout.struct_field_offset(field_idx))
 }
 
+/// Whether field `field_idx` of `td` sits at offset 0 of the object.
+///
+/// Charon `Some(0)` is the recorded layout (`lltype.py` `_first_struct`:
+/// the first inlined Struct shares the outer object's address). A
+/// recorded nonzero offset is a hop. An unknown Charon offset of
+/// declaration-order field 0 is still offset 0: a Rust struct's first
+/// field is at the object's address (`_note_inlined_into` of the first
+/// field). Later fields with unknown offset stay a nonzero hop. OnceLock
+/// payload offset still uses [`type_decl_struct_field_offset`] alone
+/// (`oncelock_fn_payload_offset`): that field is not field 0.
+pub(in crate::front::mir) fn type_decl_field_at_offset_zero(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    field_idx: usize,
+) -> bool {
+    match type_decl_struct_field_offset(td, llbc, field_idx) {
+        Some(0) => true,
+        Some(_) => false,
+        None => field_idx == 0,
+    }
+}
+
 /// Leaves of by-value struct `td`, relative to `td`.
 ///
 /// `instantiated` is the use-site type of `td` (generic arguments
@@ -8398,9 +8463,11 @@ pub(in crate::front::mir) fn type_decl_struct_field_offset(
 /// composed with `nest_inline_leaf`: at offset 0 the hop joins the `super`
 /// chain and the inner descr stays (`heaptracker.all_fielddescrs` /
 /// `Transformer.zero_contents` use the inner struct's descr on the outer
-/// object); a nonzero hop, or an unknown Charon offset, spells the remaining
-/// path on `td`. Pair-field (`pair_len_field_name`) leaves of a nested
-/// struct go through the same composition.
+/// object); a nonzero hop spells the remaining path on `td`. An unknown
+/// Charon offset of declaration-order field 0 is offset 0
+/// (`type_decl_field_at_offset_zero` / `lltype.py` `_first_struct`).
+/// Pair-field (`pair_len_field_name`) leaves of a nested struct go
+/// through the same composition.
 pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     td: &TypeDecl,
     instantiated: &TyRef,
@@ -8465,7 +8532,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
                 leaves.extend(nested_leaves);
                 continue;
             }
-            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
+            let at_offset_zero = type_decl_field_at_offset_zero(td, llbc, i);
             let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
                 .with_owner_id(Some(owner_id))
                 .with_base_is_deref(false);
@@ -8524,7 +8591,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
         raw_alloc_flavor_structs,
     )?;
     Some(crate::model::InlineStructExpansion {
-        at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
+        at_offset_zero: type_decl_field_at_offset_zero(td, llbc, field_idx),
         leaves: collect_by_value_struct_leaves(
             nested,
             &field.ty,
@@ -11195,9 +11262,9 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     let sid = declared_adt_struct_id(pointee, llbc)?;
     let name = adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
-        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
-        .unwrap_or_default();
-    if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+        .map(|td| td.item_meta.name_path_stripped())
+        .unwrap_or("");
+    if !struct_id_is_declared_gc(gc_struct_ids, sid, name) {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -16528,12 +16595,10 @@ pub(in crate::front::mir) enum IntoDevirt {
     /// The reflexive `impl<T> From<T> for T` was selected — the call
     /// is a `T -> T` identity conversion.
     Identity,
-    /// A concrete `impl From<T> for U` was selected; the segments are
-    /// its `from` function's path and `fun_decl_id` is that FunDecl.
-    Target {
-        segments: Vec<String>,
-        fun_decl_id: u64,
-    },
+    /// A concrete `impl From<T> for U` was selected. `segments` are that
+    /// `from` function's harvest path (`spec_segments`); `fn_id` is the
+    /// FunDecl stamp uses (`Bookkeeper.getdesc` of this `from`).
+    Target { segments: Vec<String>, fn_id: u64 },
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
@@ -18551,6 +18616,17 @@ fn field_row_lltype(
     }
     if is_str_family_class_root(t) || is_rstr_str_layout_declaration(t) {
         return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
+    }
+    // `identitydict.py` `IdentityKey`: `repr(transparent)` over
+    // `PyObjectRef`. Overlay storage in `DICTENTRY` is GCREF
+    // (`annlowlevel.py` `cast_instance_to_gcref`). Dummy recast
+    // onto GCREF (`FieldWrite` of a gcarray-item GC pointer) so
+    // setattr is Ptr, not Instance (`annotation_to_lltype`). Nested
+    // Struct intern of the wrapper made setattr expect
+    // `Struct IdentityKey`. `project_struct_field_type` already
+    // peels the same spelling to `PyObjectRef`.
+    if crate::annotator::bookkeeper::is_identity_key_spelling(t) {
+        return Some((*GCREF).clone());
     }
     if spelling_is_declared_gc(&reg.gc_struct_ids, t) {
         return Some((*GCREF).clone());

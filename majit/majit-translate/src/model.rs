@@ -2832,7 +2832,7 @@ pub fn cast_pointer_root(kind: &OpKind) -> Option<&str> {
 /// `compute_lifetimes` unions that operand with the result; the op is
 /// not a use. `__cast_pointer` is the Call spelling; `CAST_INSTANCE` is
 /// pyre's fuse-time `cast_pointer` (`is_identity_cast_path`).
-fn identity_operand(kind: &OpKind) -> Option<&crate::flowspace::model::Variable> {
+pub(crate) fn identity_operand(kind: &OpKind) -> Option<&crate::flowspace::model::Variable> {
     match kind {
         OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
             Some(operand)
@@ -26229,6 +26229,7 @@ mod tests {
             segments: vec!["celldict".into(), "Owner".into(), "setitem".into()],
             resolved_path: Some(path),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let json = serde_json::to_string(&t).expect("encode");

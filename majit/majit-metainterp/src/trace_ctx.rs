@@ -479,12 +479,15 @@ pub struct TraceCtx {
     /// from.  Set by both close paths; `None` when the trace did not close on
     /// a merge point.
     pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
-    /// Current portal green banks, re-read from the merge-point registers
-    /// at Finish so a Halt after a green write still has the live values.
+    /// `pyjitpl.py MIFrame.opimpl_jit_merge_point` `greenboxes` at the last
+    /// depth-0 merge point, in `(ints, refs, floats)` banks.
+    /// `bhimpl_jit_merge_point` / `reached_loop_header` /
+    /// `current_merge_points` keep those boxes; a later `-live-` may drop
+    /// the registers. Finish still prefers a live write into the same slot.
     pub(crate) live_portal_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
     /// Merge-point green register bytes, declaration order per bank.
-    /// Abort / SegmentedLoop re-read those slots off the live frame the
-    /// way `snapshot_live_portal_greens` does at Finish.
+    /// Late snapshots index `live_portal_greens` with these; a still-live
+    /// slot (a write after the merge point) replaces that word.
     pub(crate) portal_green_regs_i: Vec<u8>,
     pub(crate) portal_green_regs_r: Vec<u8>,
     pub(crate) portal_green_regs_f: Vec<u8>,
@@ -3572,10 +3575,11 @@ impl TraceCtx {
 
     /// Green banks `warmspot.py handle_jitexception` assigns after a
     /// close. Prefer the merge-point snapshot (`close_greens`), then the
-    /// live registers re-read after a later green write, then the
-    /// trace-start header. A missing bank is a missing snapshot:
-    /// `warmspot.py` `getattr(e, attrname)[count]` fails on a short list
-    /// rather than inventing a pc-only `ContinueRunningNormally`.
+    /// last depth-0 `greenboxes` (`live_portal_greens` /
+    /// `opimpl_jit_merge_point`), then the trace-start header. A missing
+    /// bank is a missing snapshot: `warmspot.py`
+    /// `getattr(e, attrname)[count]` fails on a short list rather than
+    /// inventing a pc-only `ContinueRunningNormally`.
     pub fn portal_resume_args(&self) -> crate::jitexc::ContinueRunningNormallyArgs {
         if let Some((ints, refs, floats, _)) = self.close_greens.clone() {
             return crate::jitexc::ContinueRunningNormallyArgs::from_green_banks(
@@ -3599,12 +3603,16 @@ impl TraceCtx {
         )
     }
 
-    /// Re-read declaration-order greens off a live frame's registers.
+    /// Snapshot declaration-order greens for `ContinueRunningNormally`.
     ///
-    /// `warmspot.py handle_jitexception` takes those values from
-    /// `jitexc.py ContinueRunningNormally`. A green write after the last
-    /// merge point lives in the merge-point's register (the `join_merge`
-    /// header slot for a loop-carried green).
+    /// `opimpl_jit_merge_point` already stored `greenboxes` in
+    /// `live_portal_greens`. A still-live register (a write after that
+    /// opcode, `kind` / `is_being_profiled`) replaces the matching word.
+    /// A later `-live-` (catch-handler liveness or a residual CALL's
+    /// trailing marker) may have dropped the slot: keep the stored
+    /// merge-point word. Panic only when both the register and that
+    /// snapshot are missing — `bhimpl_jit_merge_point` reads the greens
+    /// at the opcode itself.
     pub fn snapshot_portal_greens_from_frame(
         &mut self,
         ints: &[Option<OpRef>],
@@ -3617,13 +3625,22 @@ impl TraceCtx {
         {
             return;
         }
-        fn read(ctx: &TraceCtx, bank: &[Option<OpRef>], regs: &[u8], what: &str) -> Vec<i64> {
+        let stored = self.live_portal_greens.clone();
+        fn read(
+            ctx: &TraceCtx,
+            bank: &[Option<OpRef>],
+            regs: &[u8],
+            stored: Option<&[i64]>,
+            what: &str,
+        ) -> Vec<i64> {
             regs.iter()
-                .map(|&reg| {
+                .enumerate()
+                .map(|(i, &reg)| {
                     bank.get(reg as usize)
                         .copied()
                         .flatten()
                         .and_then(|op| ctx.box_bits(op))
+                        .or_else(|| stored.and_then(|s| s.get(i).copied()))
                         .unwrap_or_else(|| {
                             panic!(
                                 "merge-point green {what} register {reg} must be live \
@@ -3635,15 +3652,32 @@ impl TraceCtx {
         }
         // The merge point that set `portal_green_regs_*` wrote
         // `live_portal_greens` with its driver's spec in the same step.
-        let spec = self
-            .live_portal_greens
+        let spec = stored
             .as_ref()
             .map(|(_, _, _, spec)| spec.clone())
             .unwrap_or_default();
         self.live_portal_greens = Some((
-            read(self, ints, &self.portal_green_regs_i, "int"),
-            read(self, refs, &self.portal_green_regs_r, "ref"),
-            read(self, floats, &self.portal_green_regs_f, "float"),
+            read(
+                self,
+                ints,
+                &self.portal_green_regs_i,
+                stored.as_ref().map(|(i, _, _, _)| i.as_slice()),
+                "int",
+            ),
+            read(
+                self,
+                refs,
+                &self.portal_green_regs_r,
+                stored.as_ref().map(|(_, r, _, _)| r.as_slice()),
+                "ref",
+            ),
+            read(
+                self,
+                floats,
+                &self.portal_green_regs_f,
+                stored.as_ref().map(|(_, _, f, _)| f.as_slice()),
+                "float",
+            ),
             spec,
         ));
     }
@@ -3675,12 +3709,32 @@ impl TraceCtx {
     }
 
     /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).
+    ///
+    /// A later `-live-` may have dropped a listed slot. Drop the
+    /// previous snapshot rather than panicking or feeding stale boxes
+    /// to `reached_loop_header`. Panic only when a listed register is
+    /// empty at the merge point itself.
     pub fn snapshot_portal_reds_from_frame(
         &mut self,
         ints: &[Option<OpRef>],
         refs: &[Option<OpRef>],
         floats: &[Option<OpRef>],
     ) {
+        fn slot_live(bank: &[Option<OpRef>], regs: &[u8]) -> bool {
+            regs.iter()
+                .all(|&reg| bank.get(reg as usize).copied().flatten().is_some())
+        }
+        if !slot_live(ints, &self.portal_red_regs_i)
+            || !slot_live(refs, &self.portal_red_regs_r)
+            || !slot_live(floats, &self.portal_red_regs_f)
+        {
+            // A later `-live-` dropped a listed red. Drop the previous
+            // snapshot rather than feeding stale boxes to
+            // `reached_loop_header` (`prepare_list_of_boxes` copies
+            // only at the merge point itself).
+            self.live_portal_reds = None;
+            return;
+        }
         fn read(bank: &[Option<OpRef>], regs: &[u8], what: &str, ty: Type) -> Vec<(OpRef, Type)> {
             regs.iter()
                 .map(|&reg| {
@@ -3707,9 +3761,10 @@ impl TraceCtx {
     /// Header-revisit close: copy the live portal greens into
     /// `close_greens` when the merge point did not write its own.
     ///
-    /// Callers re-read `last_mp_green_*` first (`snapshot_live_portal_greens`
+    /// Callers refresh `live_portal_greens` first (`snapshot_live_portal_greens`
     /// on Finish / Abort / SegmentedLoop / too-long / last-portal-pop, or
-    /// `MetaInterp::close_header_revisit` on the generated fast path).
+    /// `MetaInterp::close_header_revisit` on the generated fast path). A
+    /// dead register keeps the merge-point `greenboxes`.
     pub fn adopt_live_greens_as_close(&mut self) {
         if self.close_greens.is_none() {
             self.close_greens = self.live_portal_greens.clone();

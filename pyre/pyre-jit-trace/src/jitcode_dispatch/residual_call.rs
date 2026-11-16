@@ -13299,6 +13299,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                 &[],
                                 dst,
                                 dst_bank,
+                                ei,
                             )?
                         {
                             return Ok(outcome);

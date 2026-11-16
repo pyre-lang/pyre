@@ -1428,7 +1428,7 @@ pub mod frame_locals_proxy {
 /// length, which is red, while the slot loop that precedes it is bounded by
 /// the green `locals_plus_names` and is what lets the caller carry
 /// `@jit.unroll_safe`.
-fn merge_extra_locals(snapshot: PyObjectRef, extra: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn merge_extra_locals(snapshot: PyObjectRef, extra: PyObjectRef) -> Result<(), crate::PyError> {
     // `setitem` allocates and can run the key's `__hash__`, so the pairs still
     // queued in this native snapshot are published first and read back per
     // store.
@@ -2428,7 +2428,7 @@ impl FrameBox {
 /// Creation therefore walks the live ExecutionContext from its current top
 /// frame, using the PyPy no-hidden-frame traversal, and records summaries in
 /// most-recent-first order.
-fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
+pub fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
     if ec.is_null() {
         return w_none();
     }

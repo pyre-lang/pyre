@@ -1854,6 +1854,10 @@ fn execute_store_name_names_index_is_raw_item_address() {
 /// `nolength` ArrayRead of `[ConstantData]` (headerless slice spelling)
 /// with `taken_by_address`. jtransform rewrites it as `getarraysubstruct`
 /// (`int_mul` sizeof(ConstantData) + `int_add`, kind `'i'`).
+///
+/// `co_consts_w` is a `FixedObjectArray`; `load_atomic` is
+/// `ll_getitem_fast` (`rlist.py`) of that length-prefixed list and stays
+/// `getarrayitem_gc` after rewrite.
 #[test]
 fn w_code_const_constants_index_is_raw_item_address() {
     let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
@@ -2079,15 +2083,43 @@ fn w_code_const_constants_index_is_raw_item_address() {
         saw_int_add,
         "getarraysubstruct is int_add kind 'i'. dump={rewrite_dump:?}"
     );
-    let leftover_gc_item = rewritten.graph.blocks.iter().any(|block| {
+    let leftover_constants_gc_item = rewritten.graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| match &op.kind {
-            OpKind::ArrayRead { nolength, .. } => !nolength,
+            OpKind::ArrayRead {
+                nolength,
+                array_type_id,
+                ..
+            } => {
+                !*nolength
+                    && array_type_id.as_deref()
+                        != Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+            }
             _ => false,
         })
     });
     assert!(
-        !leftover_gc_item,
-        "no getarrayitem_gc after rewrite. dump={rewrite_dump:?}"
+        !leftover_constants_gc_item,
+        "constants index is not leftover getarrayitem_gc. dump={rewrite_dump:?}"
+    );
+    let saw_consts_w_getitem = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                taken_by_address,
+                ..
+            } => {
+                array_type_id.as_deref()
+                    == Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                    && !*nolength
+                    && !*taken_by_address
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        saw_consts_w_getitem,
+        "co_consts_w load_atomic is ll_getitem_fast. dump={rewrite_dump:?}"
     );
     let leftover_raw_r = rewritten.graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| match &op.kind {

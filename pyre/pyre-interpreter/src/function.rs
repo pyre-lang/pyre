@@ -2868,7 +2868,7 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
 /// existing `_utf8`; non-surrogate runs are `&str` views of that payload
 /// (`from_utf8_unchecked` / `utf8_payload_bytes`). The UTF-8 setter path
 /// never reaches here.
-unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
+pub unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
     let storage = unsafe { w_str_storage(w_name) };
     let wtf8 = unsafe { utf8_payload_wtf8(storage) };
     let bytes = unsafe { utf8_payload_bytes(storage) };

@@ -32,6 +32,19 @@ type CallValues = SmallVec<[Value; CALL_INLINE]>;
 type OpImplFn<'mi, S, R> =
     fn(&mut JitCodeMachine<'mi, S, R>, &mut TraceCtx, &mut S, &R, u8) -> TraceAction;
 
+fn portal_frame_op(frame: &MIFrame) -> Option<OpRef> {
+    let portal_reg = frame.jitcode.exec.portal_frame_reg;
+    if portal_reg == u16::MAX {
+        return None;
+    }
+    frame
+        .ref_regs
+        .get(portal_reg as usize)
+        .copied()
+        .flatten()
+        .filter(|op| !op.is_none())
+}
+
 fn intern_dispatch_array_descr(
     cache: &parking_lot::Mutex<
         crate::FxIndexMap<crate::pyjitpl::DispatchArrayDescrKey, majit_ir::DescrRef>,
@@ -1721,8 +1734,9 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
     /// Green register bytes from the last `BC_JIT_MERGE_POINT` decode.
-    /// Finish re-reads those slots so a green write after the header is
-    /// still in the resume banks.
+    /// Finish may re-read a still-live slot (a write after the header);
+    /// a later `-live-` that dropped the register keeps the merge-point
+    /// `greenboxes` already in `TraceCtx::live_portal_greens`.
     last_mp_green_i: Vec<u8>,
     last_mp_green_r: Vec<u8>,
     last_mp_green_f: Vec<u8>,
@@ -3186,14 +3200,15 @@ where
         ctx.walk_finish_values.extend(value);
     }
 
-    /// Read the last merge-point green registers off the live portal frame.
+    /// Refresh portal greens after Finish / Abort / SegmentedLoop /
+    /// too-long / last-portal-pop.
     ///
-    /// `handle_jitexception` takes those values from
-    /// `ContinueRunningNormally`. A Halt after a green write is not at a
-    /// merge point, so this is the header-register snapshot. Abort,
-    /// SegmentedLoop, too-long, and the last-portal-frame pop (Continue)
-    /// re-read the same slots: the previous merge-point *values* would
-    /// otherwise overwrite a later write.
+    /// `opimpl_jit_merge_point` already stored `greenboxes` in
+    /// `live_portal_greens` (`bhimpl_jit_merge_point` / `current_merge_points`).
+    /// A still-live slot (a write after that opcode) replaces the matching
+    /// word; a later `-live-` that dropped the register keeps the stored
+    /// merge-point value. `handle_jitexception` reads the banks from
+    /// `ContinueRunningNormally`.
     fn snapshot_live_portal_greens(&mut self, ctx: &mut TraceCtx) {
         if !(self.last_mp_green_i.is_empty()
             && self.last_mp_green_r.is_empty()
@@ -3213,14 +3228,18 @@ where
         self.snapshot_live_portal_reds(ctx);
     }
 
-    /// Re-read merge-point red registers off the live portal frame.
+    /// Refresh merge-point redboxes after Finish / Abort / SegmentedLoop /
+    /// too-long / last-portal-pop.
     ///
     /// `opimpl_jit_merge_point` feeds `redboxes` into `reached_loop_header`
-    /// (`prepare_list_of_boxes`) only at a merge point. Abort / too-long /
-    /// Continue before that first merge point still have empty
-    /// `last_mp_red_*`, and copying them would replace a valid earlier
-    /// snapshot with an empty one. Skip the re-read until a merge point
-    /// has listed reds, matching `snapshot_live_portal_greens`.
+    /// (`prepare_list_of_boxes`) only at a merge point. A still-live set
+    /// replaces the last snapshot; a later `-live-` that dropped a
+    /// register drops that snapshot rather than mixing stale `OpRef`s
+    /// into `reached_loop_header`. Abort / too-long / Continue before
+    /// that first merge point still have empty `last_mp_red_*`, and
+    /// copying them would replace a valid earlier snapshot with an
+    /// empty one. Skip until a merge point has listed reds, matching
+    /// `snapshot_live_portal_greens`.
     fn snapshot_live_portal_reds(&mut self, ctx: &mut TraceCtx) {
         if !(self.last_mp_red_i.is_empty()
             && self.last_mp_red_r.is_empty()
@@ -3384,13 +3403,15 @@ where
                 ctx.pop_inline_frame();
             }
             // pyjitpl.py finishframe_exception -> popframe(
-            // leave_portal_frame=True): a portal frame whose push recorded
-            // ENTER_PORTAL_FRAME unwinds through here, so record the matching
-            // LEAVE_PORTAL_FRAME just as the normal-return pop does.
-            if frame.portal_entered {
-                // pyjitpl.py `popframe`: `portal_call_depth -= 1` then
-                // `leave_portal_frame` when `jitcode.jitdriver_sd`.
+            // leave_portal_frame=True): `portal_call_depth -= 1` when
+            // `jitcode.jitdriver_sd`, then `leave_portal_frame` when this
+            // push recorded ENTER (`portal_entered`). Resume rebuild
+            // increments depth without ENTER and still pairs the
+            // decrement; it sets `portal_entered` so leave also records.
+            if frame.jitcode.jitdriver_sd().is_some() {
                 ctx.adjust_portal_call_depth(-1);
+            }
+            if frame.portal_entered {
                 let jd_box = ctx.const_int(frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
                 if frame.portal_trace_logged {
@@ -3405,6 +3426,117 @@ where
         }
     }
 
+    /// Walk-time attach plus the residual FBW records at
+    /// `record_top_level_application_traceback` / `record_inline_application_traceback`
+    /// (`emit_runtime`).
+    ///
+    /// `pyopcode.py handle_operation_error` calls
+    /// `pytraceback.record_application_traceback` before
+    /// `lookup_exceptiontable`. Upstream traces that interpreter body, so
+    /// `pyjitpl.py finishframe_exception` only searches `catch_exception`.
+    /// Unique walk of a per-code jitcode is walking `raise/r` after
+    /// `bh_normalize_raise_varargs_with_frame`, not that interpreter
+    /// function; without this residual the compiled handler reads a None
+    /// `__traceback__`.
+    fn record_unwind_application_traceback(&mut self, ctx: &mut TraceCtx) {
+        let exc_value = self.last_exception_value;
+        let exc_box = self.last_exception_box;
+        let (inline_frame, jitcode_index, opcode_position, frame_op) = {
+            let frame = self.frames.current_mut();
+            let frame_op = portal_frame_op(frame);
+            let jitcode_index = frame.jitcode.try_index().map_or(-1, |index| index as i32);
+            let opcode_position = frame.last_opcode_position as i32;
+            (frame.inline_frame, jitcode_index, opcode_position, frame_op)
+        };
+        let frame_bits = frame_op.and_then(|op| ctx.box_bits(op)).filter(|&b| b != 0);
+        {
+            let frame = self.frames.current_mut();
+            // FBW `record_inline_application_traceback` attaches with
+            // `concrete_portal_frame` (this level's `portal_frame_reg`
+            // PyFrame). The inline 0/0 stub is a no-op
+            // (`record_inline_traceback_for_recording` returns on
+            // `w_globals == 0`).
+            if let Some(bits) = frame_bits {
+                super::record_application_traceback_for_recording(
+                    exc_value,
+                    bits,
+                    jitcode_index,
+                    opcode_position,
+                );
+            } else {
+                let vable_ptr = ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null());
+                super::record_application_traceback(exc_value, vable_ptr, frame);
+            }
+        }
+        let Some(exc_box) = exc_box else {
+            return;
+        };
+        if exc_box.is_none() {
+            return;
+        }
+        // FBW `recording_raise_keeps_existing_traceback` /
+        // `raise_at_py_pc_keeps_existing_traceback`: FOR_ITER,
+        // `RAISE_VARARGS 0`, `RERAISE` keep the existing chain.
+        // `pyopcode.py FOR_ITER` swallows StopIteration without
+        // `handle_operation_error`. FBW `SubRaise` still walk-time
+        // attaches when `containing_py_pc` is Some, but sets
+        // `emit_runtime = false` once a node exists — no residual
+        // `CallVoid` with `EffectInfo::MOST_GENERAL` on the live
+        // portal frame. Unique walk has no IR node, so that residual
+        // would force the virtualizable for the whole trace.
+        if super::host_hooks()
+            .jitcode_pc_raise_keeps_existing_traceback
+            .is_some_and(|f| f(jitcode_index, opcode_position))
+        {
+            return;
+        }
+        let jitcode = ctx.const_int(i64::from(jitcode_index));
+        let opcode = ctx.const_int(i64::from(opcode_position));
+        // FBW residual: `registers_r[metadata.portal_frame_reg]` into
+        // `record_application_traceback_hook` (`record_inline_application_traceback`).
+        // Fall back to the non-inline vable box, then the inline stub,
+        // only when this level has no frame register.
+        if let Some(frame_op) = frame_op {
+            let hook = super::record_application_traceback_hook_address();
+            if hook.is_null() {
+                return;
+            }
+            ctx.call_void_typed_with_effect(
+                hook,
+                &[exc_box, frame_op, jitcode, opcode],
+                &[Type::Ref, Type::Ref, Type::Int, Type::Int],
+                crate::call_descr::default_effect_info(),
+            );
+        } else if inline_frame {
+            let hook = super::record_inline_application_traceback_hook_address();
+            if hook.is_null() {
+                return;
+            }
+            let w_code = ctx.const_ref(0);
+            let w_globals = ctx.const_ref(0);
+            ctx.call_void_typed_with_effect(
+                hook,
+                &[exc_box, w_code, w_globals, jitcode, opcode],
+                &[Type::Ref, Type::Ref, Type::Ref, Type::Int, Type::Int],
+                crate::call_descr::default_effect_info(),
+            );
+        } else {
+            let hook = super::record_application_traceback_hook_address();
+            let Some(frame_op) = ctx.standard_virtualizable_box() else {
+                return;
+            };
+            if hook.is_null() || frame_op.is_none() {
+                return;
+            }
+            ctx.call_void_typed_with_effect(
+                hook,
+                &[exc_box, frame_op, jitcode, opcode],
+                &[Type::Ref, Type::Ref, Type::Int, Type::Int],
+                crate::call_descr::default_effect_info(),
+            );
+        }
+    }
+
     fn unwind_to_exception_handler(&mut self, ctx: &mut TraceCtx) -> TraceAction {
         const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
 
@@ -3413,11 +3545,20 @@ where
             {
                 let frame = self.frames.current_mut();
                 let code = &frame.jitcode.code;
-                let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
-                    frame.pc
-                } else {
-                    frame.code_cursor
-                };
+                // Unique walk splits RPython's single `MIFrame.pc` into a
+                // resume snapshot (`pc`, `setup_resume_at_op`) and a live
+                // decode cursor (`code_cursor`). `finishframe_exception`
+                // (`pyjitpl.py`) reads `position = frame.pc` which already
+                // sits just after the insn that raised. After a residual
+                // call the cursor is at the trailing `-live-`; `pc` is still
+                // the guard-fail resume snapshot, so a search at `pc` misses
+                // `catch_exception` and compiles `ExitFrameWithException`.
+                // `opimpl_raise` / `opimpl_reraise` already pin
+                // `pc = code_cursor` before this search.
+                if frame.code_cursor != 0 {
+                    frame.pc = frame.code_cursor;
+                }
+                let mut position = frame.pc;
 
                 if position < code.len() {
                     let mut opcode = code[position];
@@ -3445,24 +3586,17 @@ where
                 }
             }
             if handled {
-                let frame = self.frames.current_mut();
-                if frame.jitcode.code[frame.last_opcode_position] != jitcode::insns::BC_RERAISE {
-                    super::record_application_traceback(
-                        self.last_exception_value,
-                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                        frame,
-                    );
+                let last_is_reraise = {
+                    let frame = self.frames.current_mut();
+                    frame.jitcode.code.get(frame.last_opcode_position)
+                        == Some(&jitcode::insns::BC_RERAISE)
+                };
+                if !last_is_reraise {
+                    self.record_unwind_application_traceback(ctx);
                 }
                 return TraceAction::Continue;
             }
-            {
-                let frame = self.frames.current_mut();
-                super::record_application_traceback(
-                    self.last_exception_value,
-                    ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                    frame,
-                );
-            }
+            self.record_unwind_application_traceback(ctx);
             self.pop_exception_frame(ctx);
         }
         // RPython parity for `pyjitpl.py:2533-2538`: framestack drained
@@ -3559,6 +3693,21 @@ where
         // by residual calls, then handle_possible_exception() records
         // GUARD_EXCEPTION and finishframe_exception() unwinds from the current
         // frame.
+        //
+        // executor.py `_do_call` `except Exception as e:
+        // metainterp.execute_raised(e)` takes the raise out of the helper
+        // into `last_exc_value` only. Unique walk reads the same raise from
+        // `BH_LAST_EXC_VALUE` (the C-boundary stand-in). Consume both
+        // halves here: the shared `bh_*` helper also published into the
+        // backend `_store_exception` cells
+        // (`publish_residual_call_exception`). `executor.rs` `do_call`
+        // and the FBW residual raise arm drain those cells after
+        // `execute_raised`. Unique walk does not go through `do_call`,
+        // so drain here or a raise this GUARD_EXCEPTION consumed leaks
+        // into the next compiled trace's `must_save_exception` guard
+        // (`_call_with_frames_removed` on range_ctor_in_loop).
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        super::active_backend_clear_stored_exception();
         self.last_exception_value = exc;
         self.class_of_last_exc_is_const = false;
         let class_is_const = self.class_of_last_exc_is_const;
@@ -3604,6 +3753,11 @@ where
             return TraceAction::Continue;
         }
 
+        // Same `execute_raised` analogue as
+        // `finish_residual_call_exception_path`: take BH, drain backend
+        // `_store_exception` (`executor.rs` `do_call` / FBW raise arm).
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        super::active_backend_clear_stored_exception();
         self.last_exception_value = exc;
         self.class_of_last_exc_is_const = false;
         let class_is_const = self.class_of_last_exc_is_const;
@@ -3928,9 +4082,10 @@ where
     /// `JitArgKind` selects the register bank it is read from (a ref
     /// `program` green from the ref bank, an int `pc` green from the int
     /// bank), so the concrete green value hashes against
-    /// `green_args_spec`.  `green_pc` (the concrete of the first green,
-    /// or 0) keys the per-depth `recursive_depth` count and seeds the
-    /// portal frame's entry pc — the first green is the int portal pc.
+    /// `green_args_spec`.  `green_pc` (the concrete of the first int
+    /// green, or 0) keys the per-depth `recursive_depth` count. It is a
+    /// portal argument (`warmspot.py` portal args = greens + reds), not a
+    /// jitcode offset: `MIFrame.setup_call` sets `self.pc = 0`.
     ///
     /// This mirrors the `BC_INLINE_CALL` machinery (frame push, argument
     /// marshalling, return-slot wiring), but resolves both the callee and
@@ -3993,7 +4148,8 @@ where
         let jd_index = self.read_int_reg(ctx, jd_index).1 as usize;
 
         // `pyjitpl.py` `boxes3` concatenates the three kind lists (I then R
-        // then F).  `green_pc` is the first int green — the portal entry pc.
+        // then F).  `green_pc` is the first int green — a guest pc box that
+        // `setup_call` seats as an argument, not the callee jitcode offset.
         let mut green_values = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
         for &src in &greens_i {
             green_values.push(self.read_int_reg(ctx, src).1);
@@ -4068,13 +4224,16 @@ where
                 None,
             );
         }
-        // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
-        // `portal_jitcode`; enter their portal at `green_pc` as before.
-        // Otherwise `pyjitpl.py _opimpl_recursive_call`
-        // `perform_call(portal_code)` with `portal_code =
-        // targetjitdriver_sd.mainjitcode`: production carries the extracted
-        // portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
-        // grab_initial_jitcodes`), and `MIFrame.setup_call` starts it at pc 0.
+        // pyjitpl.py `_opimpl_recursive_call` `perform_call(portal_code)`
+        // with `portal_code = targetjitdriver_sd.mainjitcode`. Production
+        // wires that jitcode through `portal_jitcode` (`.with_portals`)
+        // and also keeps it on `jitdrivers_sd[jd].mainjitcode` (`call.py
+        // grab_initial_jitcodes`). `MetaInterp.perform_call` then
+        // `newframe` + `MIFrame.setup_call(allboxes)` with `self.pc = 0`:
+        // the guest pc is a green argument of the portal, not an offset
+        // into its bytecode (`assembler.py assemble` writes the startblock
+        // at byte 0; `flatten.py enforce_input_args` colors those
+        // inputargs `0..N` per kind).
         //
         // `#[jit_interp]` `recursive_portal_call!` emits greens only
         // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
@@ -4086,10 +4245,10 @@ where
         // (jtransform `handle_recursive_call` `make_three_lists` of the
         // portal reds).
         let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
-        let (portal, start_pc) = match runtime.portal_jitcode(jd_index) {
-            Some(portal) => (Some(portal), green_pc),
-            None if opcode_has_reds => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
-            None => (None, 0),
+        let portal = match runtime.portal_jitcode(jd_index) {
+            Some(portal) => Some(portal),
+            None if opcode_has_reds => ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(),
+            None => None,
         };
         if let Some(portal) = portal {
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
@@ -4104,8 +4263,7 @@ where
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =
                 self.frames
-                    .take_frame(portal, start_pc, Some(greenkey.clone()), Some(ctx));
-            portal_frame.code_cursor = start_pc;
+                    .take_frame(portal, 0, Some(greenkey.clone()), Some(ctx));
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
             // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
             // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
@@ -4132,29 +4290,51 @@ where
             // auto-LEAVE pops.
             portal_frame.portal_entered = true;
             portal_frame.portal_jd = jd_index;
-            // Portal args are greens+reds per kind, the same concatenation
-            // `bhimpl_recursive_call_*` passes to `cpu.bh_call_*`.
-            for (dst, &src) in greens_i.iter().chain(reds_i.iter()).enumerate() {
+            // pyjitpl.py `_opimpl_recursive_call`: `allboxes = greenboxes +
+            // redboxes`; `perform_call` → `setup_call(allboxes)`. `boxes3`
+            // is I then R then F; `setup_call` then packs one register bank
+            // per kind in that argument order. The walker reads
+            // `code_cursor`; `setup_call` only writes `pc`.
+            let mut argboxes = Vec::with_capacity(
+                greens_i.len()
+                    + greens_r.len()
+                    + greens_f.len()
+                    + reds_i.len()
+                    + reds_r.len()
+                    + reds_f.len(),
+            );
+            for &src in &greens_i {
                 let (value, concrete) = self.read_int_reg(ctx, src);
-                #[cfg(feature = "jit-audits")]
-                majit_ir::reg_write_audit::note_int_write(
-                    portal_frame.int_regs.as_ptr() as usize,
-                    dst,
-                    Some(value),
-                );
-                portal_frame.int_regs[dst] = Some(value);
                 debug_assert_box_holds(ctx, value, Value::Int(concrete));
+                argboxes.push((JitArgKind::Int, value, concrete));
             }
-            for (dst, &src) in greens_r.iter().chain(reds_r.iter()).enumerate() {
+            for &src in &greens_r {
                 let (value, concrete) = self.read_ref_reg(ctx, src);
-                portal_frame.ref_regs[dst] = Some(value);
                 debug_assert_box_holds(ctx, value, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                argboxes.push((JitArgKind::Ref, value, concrete));
             }
-            for (dst, &src) in greens_f.iter().chain(reds_f.iter()).enumerate() {
+            for &src in &greens_f {
                 let (value, concrete) = self.read_float_reg(ctx, src);
-                portal_frame.float_regs[dst] = Some(value);
                 debug_assert_box_holds(ctx, value, Value::Float(f64::from_bits(concrete as u64)));
+                argboxes.push((JitArgKind::Float, value, concrete));
             }
+            for &src in &reds_i {
+                let (value, concrete) = self.read_int_reg(ctx, src);
+                debug_assert_box_holds(ctx, value, Value::Int(concrete));
+                argboxes.push((JitArgKind::Int, value, concrete));
+            }
+            for &src in &reds_r {
+                let (value, concrete) = self.read_ref_reg(ctx, src);
+                debug_assert_box_holds(ctx, value, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                argboxes.push((JitArgKind::Ref, value, concrete));
+            }
+            for &src in &reds_f {
+                let (value, concrete) = self.read_float_reg(ctx, src);
+                debug_assert_box_holds(ctx, value, Value::Float(f64::from_bits(concrete as u64)));
+                argboxes.push((JitArgKind::Float, value, concrete));
+            }
+            portal_frame.setup_call(&argboxes);
+            portal_frame.code_cursor = 0;
             match result_kind {
                 Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
                 Some(JitArgKind::Ref) => portal_frame.return_r = result_dst,
@@ -4697,10 +4877,11 @@ where
         if finished {
             if self.frames.len() == 1 {
                 // The walk is about to return Continue with an empty
-                // framestack. Re-read `last_mp_green_*` off this last
+                // framestack. Refresh portal greens off this last
                 // portal frame so a later header-revisit CloseLoop
-                // publishes values written after the merge-point stamp
-                // (`bhimpl_jit_merge_point`).
+                // sees a write after the merge-point stamp, and keeps
+                // `live_portal_greens` when a later `-live-` dropped the
+                // register (`bhimpl_jit_merge_point`).
                 self.snapshot_live_portal_greens(ctx);
             }
             let mut finished_frame = self.frames.pop().expect("finished frame stack was empty");
@@ -4708,14 +4889,15 @@ where
                 ctx.pop_inline_frame();
             }
             // pyjitpl.py finishframe -> popframe(leave_portal_frame=True):
-            // a portal frame whose push recorded ENTER_PORTAL_FRAME returns
-            // normally here, so record the matching LEAVE_PORTAL_FRAME. Ordinary
-            // BC_INLINE_CALL frames (inline_frame=true, portal_entered=false)
-            // recorded no ENTER and record no LEAVE.
-            if finished_frame.portal_entered {
-                // pyjitpl.py `popframe`: `portal_call_depth -= 1` then
-                // `leave_portal_frame` when `jitcode.jitdriver_sd`.
+            // `portal_call_depth -= 1` when `jitcode.jitdriver_sd`. LEAVE
+            // only when this push recorded ENTER (`portal_entered`).
+            // Ordinary BC_INLINE_CALL frames (inline_frame=true,
+            // portal_entered=false, no jitdriver_sd) recorded no ENTER
+            // and record no LEAVE.
+            if finished_frame.jitcode.jitdriver_sd().is_some() {
                 ctx.adjust_portal_call_depth(-1);
+            }
+            if finished_frame.portal_entered {
                 let jd_box = ctx.const_int(finished_frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
                 if finished_frame.portal_trace_logged {
@@ -4735,25 +4917,26 @@ where
                 && let Some((return_kind, callee_src)) =
                     finished_frame.jitcode.trailing_return_info()
             {
+                // A portal residual-call parent leaves `return_*` empty
+                // (`bridge_from_guard_resume_position` `NoInlineCallSite`).
                 match return_kind {
                     JitArgKind::Int => {
-                        let caller_dst = finished_frame
-                            .return_i
-                            .expect("inline int return missing caller destination");
-                        parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src as usize];
+                        if let Some(caller_dst) = finished_frame.return_i {
+                            parent.int_regs[caller_dst] =
+                                finished_frame.int_regs[callee_src as usize];
+                        }
                     }
                     JitArgKind::Ref => {
-                        let caller_dst = finished_frame
-                            .return_r
-                            .expect("inline ref return missing caller destination");
-                        parent.ref_regs[caller_dst] = finished_frame.ref_regs[callee_src as usize];
+                        if let Some(caller_dst) = finished_frame.return_r {
+                            parent.ref_regs[caller_dst] =
+                                finished_frame.ref_regs[callee_src as usize];
+                        }
                     }
                     JitArgKind::Float => {
-                        let caller_dst = finished_frame
-                            .return_f
-                            .expect("inline float return missing caller destination");
-                        parent.float_regs[caller_dst] =
-                            finished_frame.float_regs[callee_src as usize];
+                        if let Some(caller_dst) = finished_frame.return_f {
+                            parent.float_regs[caller_dst] =
+                                finished_frame.float_regs[callee_src as usize];
+                        }
                     }
                 }
             }
@@ -5836,51 +6019,55 @@ pub fn publish_walk_abort_handoff(
         // That replay is only sound when no residual has committed. A bound
         // helper such as `iter_next_store` may already have popped the
         // iterator; re-running the merge-point opcode then raises
-        // `no iterator to advance`. Compiled code can have made that
-        // call before the guard failed, so a bridge walk that then
-        // refuses an unbound residual (`__len`, `scope_rewind`) must
-        // not fall back to the loop header either — `pyjitpl.py
-        // run_blackhole_interp_to_cancel_tracing` converts the live
-        // framestack instead. Keep i0 and the framestack when the host
-        // marked a committed residual or this walk is already a
-        // guard-resume bridge.
+        // `no iterator to advance`. Keep i0 and the framestack when the
+        // host marked a committed residual — `pyjitpl.py
+        // run_blackhole_interp_to_cancel_tracing` converts that live
+        // framestack (`abort_after_residual_push`).
         //
         // A refused residual never ran (`do_residual_call` always
-        // executes before `SwitchToBlackhole`). `snap_pc_to_instruction_start`
-        // prefers `code_cursor` when that is already a startpoint, which
-        // after operand decode is the *next* instruction, so the blackhole
-        // would skip the call. Resume at `last_opcode_position` (`orgpc`)
+        // executes before `SwitchToBlackhole`). Converting the walk's
+        // framestack would `setposition` on that unresolved call;
+        // `blackhole.py` `reject_unresolved_call` then `LeaveFrame`s
+        // without writing the result, and the caller CRNs past the
+        // STORE (`UnboundLocalError` on `v`). `compile.py`
+        // `ResumeGuardDescr.handle_fail` else-arm
+        // `resume_in_blackhole`s the guard deadframe instead — a
+        // unique-interpret / bridge walk included. The deadframe is
+        // the membership `goto_if_not`, which the blackhole can run.
+        //
+        // `snap_pc_to_instruction_start` prefers `code_cursor` when
+        // that is already a startpoint, which after operand decode is
+        // the *next* instruction, so a converted blackhole would skip
+        // the call. Resume at `last_opcode_position` (`orgpc`)
         // instead, matching `MetaInterp::interpret` /
         // `stage_interpret_abort_blackhole`.
-        let refused = std::mem::replace(&mut ctx.symbolic_residual_abort, false);
-        if refused
-            && !crate::take_residual_committed()
-            && !crate::is_bridge_walking()
-            && !ctx.is_bridge_trace
-        {
+        // Leave `symbolic_residual_abort` set when declining conversion:
+        // `stage_switch_to_blackhole` must not convert a leftover
+        // `MetaInterp.framestack` (`reject_unresolved_call` LeaveFrame).
+        if ctx.symbolic_residual_abort && !crate::take_residual_committed() {
             return;
         }
+        let refused = std::mem::replace(&mut ctx.symbolic_residual_abort, false);
         // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` CRNs from
-        // the merge the blackhole reaches, not the aborted walk's root i0.
-        // A bridge whose portal frame is still sitting on the failing
-        // opcode (POP_JUMP extra already 0) would publish that opcode as
-        // next_instr. Prefer the last depth-0 merge; leave the field empty
-        // on a bridge with none so `stage_cancel` converts the framestack
-        // instead of ContinueRunningNormally.
-        if ctx.walk_final_pc.is_none() {
-            if let Some(pc) = ctx.last_mp_green_pc {
-                ctx.walk_final_pc = Some(pc);
-            } else if !ctx.is_bridge_trace
-                && let Some(pc) = standalone.frames.frames[0]
-                    .int_regs
-                    .first()
-                    .copied()
-                    .flatten()
-                    .and_then(|op| ctx.box_bits(op))
-                    .and_then(|pc| usize::try_from(pc).ok())
-            {
-                ctx.walk_final_pc = Some(pc);
-            }
+        // the merge the blackhole reaches, not the aborted walk's start
+        // `greenboxes` (`last_mp_green_pc` / `current_merge_points[0]`).
+        // Filling `walk_final_pc` from that merge rewinds past residual
+        // mutations the walk already committed. Leave it empty so
+        // `stage_cancel` converts the framestack
+        // (`bhimpl_jit_merge_point` is the merge the blackhole reaches).
+        // A non-bridge walk with a still-live root i0 keeps that pc as
+        // the fallback for a consumer that declines conversion.
+        if ctx.walk_final_pc.is_none()
+            && !ctx.is_bridge_trace
+            && let Some(pc) = standalone.frames.frames[0]
+                .int_regs
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
+                .and_then(|pc| usize::try_from(pc).ok())
+        {
+            ctx.walk_final_pc = Some(pc);
         }
         // An arm that failed to lower is emitted as a degraded stub: a
         // sub-JitCode whose entire body is the single `abort` byte, pushed by
@@ -5920,6 +6107,9 @@ pub fn publish_walk_abort_handoff(
         if stub_resume_pc.is_none()
             && let Some(root) = standalone.frames.frames.first()
         {
+            // `opimpl_jit_merge_point` already stored `greenboxes`. A
+            // still-live slot replaces that word; a later `-live-` keeps
+            // the stored merge-point value.
             ctx.snapshot_portal_greens_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
         }
         // `run_to_end` already re-read live greens on Abort. The shared
@@ -7006,11 +7196,15 @@ mod tests {
 
     #[test]
     fn refused_residual_on_a_bridge_resumes_at_the_unrun_opcode() {
-        // `do_residual_call` has not run. After operand decode `code_cursor`
-        // is the next startpoint, so `snap_pc_to_instruction_start` would
-        // skip the call. A bridge must convert the live framestack
-        // (`run_blackhole_interp_to_cancel_tracing`) at the refused
-        // instruction's `orgpc`.
+        // `do_residual_call` has not run. Converting the live framestack
+        // would `setposition` on that unresolved call; `blackhole.py`
+        // `reject_unresolved_call` then `LeaveFrame`s without writing the
+        // result, and the caller CRNs past the STORE. `compile.py`
+        // `ResumeGuardDescr.handle_fail` else-arm `resume_in_blackhole`s
+        // the guard deadframe instead — a unique-interpret / bridge walk
+        // included. Leave `symbolic_residual_abort` set so
+        // `stage_switch_to_blackhole` does not convert a leftover
+        // `MetaInterp.framestack`.
         let mut builder = JitCodeBuilder::new();
         builder.set_name("refused_residual_bridge_pc");
         builder.load_const_i_value(1, 0);
@@ -7046,13 +7240,25 @@ mod tests {
         standalone.frames.push(frame);
 
         publish_walk_abort_handoff(&mut ctx, &TraceAction::Abort, &mut standalone);
-        let resumed = ctx
-            .aborted_framestack
-            .expect("a bridge refused residual publishes the framestack");
-        let top = resumed.frames.last().expect("top frame");
-        assert_eq!(top.pc, start);
-        assert!(top.jitcode.is_valid_startpoint(top.pc));
-        assert_eq!(top.code_cursor, next);
+        assert!(
+            ctx.aborted_framestack.is_none(),
+            "a refused residual must not convert the live framestack",
+        );
+        assert!(
+            ctx.symbolic_residual_abort,
+            "leave the refusal flag so leftover MetaInterp frames stay unconverted",
+        );
+        assert_eq!(ctx.walk_final_pc, None);
+        assert_eq!(standalone.frames.frames.last().unwrap().pc, 0);
+        assert_eq!(
+            standalone
+                .frames
+                .frames
+                .last()
+                .unwrap()
+                .last_opcode_position,
+            start
+        );
     }
 
     #[test]
@@ -7972,6 +8178,57 @@ mod tests {
         assert_eq!(ctx.live_portal_reds, Some(vec![(live, Type::Int)]));
     }
 
+    /// `opimpl_jit_merge_point` stored `greenboxes`; a later `-live-` cleared
+    /// i0. Abort / Finish must keep the merge-point word rather than panic.
+    #[test]
+    fn snapshot_portal_greens_keeps_merge_point_value_when_later_live_drops_the_slot() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = None;
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(frame);
+
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.portal_green_regs_i = vec![0];
+        ctx.live_portal_greens = Some((vec![41], vec![], vec![], vec![majit_ir::GreenType::Int]));
+
+        let mut machine = portal_red_snapshot_machine(&mut stack);
+        machine.last_mp_green_i = vec![0];
+        machine.snapshot_live_portal_greens(&mut ctx);
+
+        assert_eq!(
+            ctx.live_portal_greens
+                .as_ref()
+                .map(|(i, _, _, _)| i.as_slice()),
+            Some([41].as_slice()),
+        );
+    }
+
+    /// A later `-live-` cleared i0. Abort / Finish drop the previous
+    /// snapshot rather than panicking or feeding stale boxes forward.
+    #[test]
+    fn snapshot_portal_reds_drops_snapshot_when_later_live_drops_the_slot() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = None;
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(frame);
+
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.portal_red_regs_i = vec![0];
+        ctx.live_portal_reds = Some(vec![(OpRef::int_op(7), Type::Int)]);
+
+        let mut machine = portal_red_snapshot_machine(&mut stack);
+        machine.last_mp_red_i = vec![0];
+        machine.snapshot_live_portal_reds(&mut ctx);
+
+        assert_eq!(ctx.live_portal_reds, None);
+    }
+
     /// pyjitpl.py `MIFrame.opimpl_jit_merge_point`: `redboxes` become the
     /// loop-header live state only at `portal_call_depth == 0`. A merge point
     /// reached inside an inlined portal must leave `last_mp_red_*` /
@@ -8190,6 +8447,51 @@ mod tests {
         );
     }
 
+    /// pyjitpl.py `MIFrame.setup_call`: `self.pc = 0`. A nonzero guest pc
+    /// is a green argument of the portal jitcode, not an offset into it
+    /// (`_opimpl_recursive_call` `allboxes = greenboxes + redboxes`).
+    #[test]
+    fn recursive_call_starts_portal_at_pc_0_when_green_pc_is_nonzero() {
+        let mut portal_builder = JitCodeBuilder::new();
+        portal_builder.int_return(0);
+        let portal = std::sync::Arc::new(portal_builder.finish());
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(0, 99);
+        caller_builder.load_const_i_value(1, 42);
+        caller_builder.recursive_call_int(0, 2, &[(JitArgKind::Int, 0)], &[(JitArgKind::Int, 1)]);
+        let caller = std::sync::Arc::new(caller_builder.finish());
+
+        let runtime = RecursivePortalRuntime {
+            portal: portal.clone(),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut standalone = StandaloneFrameStack::new();
+        let frame = standalone
+            .frames
+            .take_frame(caller, 0, None, Some(&mut ctx));
+        standalone.frames.push(frame);
+        let mut sym = DummySym;
+        let mut machine = JitCodeMachine::with_framestack(&mut standalone.frames, &[], &[]);
+        let action = machine.run_one_step(&mut ctx, &mut sym, &runtime);
+        assert!(
+            matches!(action, TraceAction::Continue),
+            "recursive call must push the portal frame, got {action:?}"
+        );
+        assert_eq!(machine.frames.frames.len(), 2);
+        let portal_frame = machine.frames.frames.last().expect("pushed portal");
+        assert!(
+            std::sync::Arc::ptr_eq(&portal_frame.jitcode, &portal),
+            "pushed frame must be the portal jitcode"
+        );
+        assert_eq!(portal_frame.pc, 0);
+        assert_eq!(portal_frame.code_cursor, 0);
+        let green = portal_frame.int_regs[0].expect("green pc seated at i0");
+        let red = portal_frame.int_regs[1].expect("red arg seated at i1");
+        assert_eq!(ctx.box_bits(green), Some(99));
+        assert_eq!(ctx.box_bits(red), Some(42));
+    }
+
     /// [`RecursivePortalRuntime`] without a portal jitcode: the inline
     /// decision has no frame to push.
     struct RecursivePortalWithoutJitcodeRuntime;
@@ -8240,8 +8542,8 @@ mod tests {
         );
         assert_eq!(ctx.walk_final_pc, None);
         assert!(
-            !ctx.symbolic_residual_abort,
-            "the one-shot refusal flag must be consumed by the publisher",
+            ctx.symbolic_residual_abort,
+            "leave the refusal flag so leftover MetaInterp frames stay unconverted",
         );
     }
 
@@ -10617,8 +10919,8 @@ mod tests {
             "no post-decode blackhole handoff is sound",
         );
         assert!(
-            !ctx.symbolic_residual_abort,
-            "the one-shot refusal flag must be consumed by the publisher",
+            ctx.symbolic_residual_abort,
+            "leave the refusal flag so leftover MetaInterp frames stay unconverted",
         );
     }
 

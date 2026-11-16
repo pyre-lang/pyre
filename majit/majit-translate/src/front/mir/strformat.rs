@@ -247,8 +247,8 @@ pub(in crate::front::mir) fn read_array_literal_elements(
             let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
             // A `setfield_gc` inline `Const` element carries no SSA
             // Variable; the recognizer needs a register operand per slot.
-            let write_var = value.as_variable()?;
-            by_index.push((idx, write_var.clone()));
+            let write_var = peel_identity_casts(graph, value.as_variable()?);
+            by_index.push((idx, write_var));
         }
     }
     by_index.sort_by_key(|(i, _)| *i);
@@ -258,6 +258,39 @@ pub(in crate::front::mir) fn read_array_literal_elements(
         }
     }
     Some(by_index.into_iter().map(|(_, v)| v).collect())
+}
+
+/// `rclass.py` `InstanceRepr.rtype_setattr` / `HighLevelOp.convertvar`:
+/// `ctor_ccharp_field_store` emits `__cast_instance_intrinsic` when a
+/// positional Tuple/Array field has a classed `declared_ty`
+/// (`positional_aggregate_field_rows`). The convertvar is identity for
+/// a non-null interpolant / `new_display` result (`IDENTITY_OPS`); the
+/// collapser's producer walk is that source, not the recast.
+fn peel_identity_casts(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let mut current = var.clone();
+    let mut visited: Vec<u64> = Vec::new();
+    loop {
+        if visited.contains(&current.id()) {
+            return current;
+        }
+        visited.push(current.id());
+        let Some((block_id, idx)) = resolve_to_producer_op(graph, &current) else {
+            return current;
+        };
+        let Some(block) = graph.blocks.iter().find(|b| b.id == block_id) else {
+            return current;
+        };
+        let Some(op) = block.operations.get(idx) else {
+            return current;
+        };
+        let Some(operand) = crate::model::identity_operand(&op.kind) else {
+            return current;
+        };
+        current = operand.clone();
+    }
 }
 
 /// Resolve a Variable to the `i64` value of the integer constant op that
@@ -741,11 +774,11 @@ pub(in crate::front::mir) fn unwrap_fmt_arg_tuple_ref(
                 if base_matches && field.name == field_name {
                     // A `setfield_gc` inline `Const` carries no SSA Variable;
                     // the back-trace needs a register operand to follow.
-                    let write_var = value.as_variable()?;
+                    let write_var = peel_identity_casts(graph, value.as_variable()?);
                     if found.as_ref().is_some_and(|f| f.id() != write_var.id()) {
                         return None; // ambiguous: distinct values written
                     }
-                    found = Some(write_var.clone());
+                    found = Some(write_var);
                 }
             }
         }
@@ -762,7 +795,8 @@ pub(in crate::front::mir) fn extract_fmt_arg(
     arg_elem: &crate::flowspace::model::Variable,
 ) -> Option<FmtArg> {
     use crate::model::{CallTarget, OpKind};
-    let (block_id, idx) = resolve_to_producer_op(graph, arg_elem)?;
+    let arg_elem = peel_identity_casts(graph, arg_elem);
+    let (block_id, idx) = resolve_to_producer_op(graph, &arg_elem)?;
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     let (kind, inner) = match &block.operations.get(idx)?.kind {
         OpKind::Call {
@@ -794,7 +828,8 @@ pub(in crate::front::mir) fn extract_fmt_chain(
 ) -> Option<FmtChain> {
     use crate::model::{CallTarget, OpKind};
     // The format(args) argument is the result of `Arguments::new(pieces, args)`.
-    let (block_id, idx) = resolve_to_producer_op(graph, fmt_args_var)?;
+    let fmt_args_var = peel_identity_casts(graph, fmt_args_var);
+    let (block_id, idx) = resolve_to_producer_op(graph, &fmt_args_var)?;
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     let (pieces_var, args_var) = match &block.operations.get(idx)?.kind {
         OpKind::Call {
@@ -1917,7 +1952,8 @@ pub(in crate::front::mir) fn fmt_value_renders_via_rstr(
     var: &crate::flowspace::model::Variable,
 ) -> bool {
     use crate::model::{OpKind, ValueType};
-    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+    let var = peel_identity_casts(graph, var);
+    let Some((bid, idx)) = resolve_to_producer_op(graph, &var) else {
         return true;
     };
     let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
@@ -2835,7 +2871,8 @@ pub(in crate::front::mir) fn collect_fmt_collapse_multi(
     // fold is emitted (all rendered values are live there as the args-array
     // elements).  Require it distinct from the format block so a forwarding
     // link exists to re-thread the folded String onto.
-    let (args_block, args_idx) = resolve_to_producer_op(graph, &fmt_args)?;
+    let (args_block, args_idx) =
+        resolve_to_producer_op(graph, &peel_identity_casts(graph, &fmt_args))?;
     if args_block == bf {
         return None;
     }
@@ -2863,7 +2900,8 @@ pub(in crate::front::mir) fn collect_fmt_collapse_multi(
     let mut new_display_ops = Vec::with_capacity(arg_elem_vars.len());
     let mut spill_dead = Vec::new();
     for elem in &arg_elem_vars {
-        let (b_i, idx_i) = resolve_to_producer_op(graph, elem)?;
+        let elem = peel_identity_casts(graph, elem);
+        let (b_i, idx_i) = resolve_to_producer_op(graph, &elem)?;
         let blk = graph.blocks.iter().find(|b| b.id == b_i)?;
         let inner = match &blk.operations.get(idx_i)?.kind {
             OpKind::Call {

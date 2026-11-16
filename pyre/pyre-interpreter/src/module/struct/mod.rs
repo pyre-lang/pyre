@@ -334,7 +334,7 @@ fn struct_init_apply(self_obj: PyObjectRef, w_format: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-fn struct_new_impl(
+pub fn struct_new_impl(
     cls: PyObjectRef,
     pos: &[PyObjectRef],
     kw_names: &[PyObjectRef],

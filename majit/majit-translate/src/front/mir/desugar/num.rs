@@ -523,6 +523,31 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         let dest_vt = self.value_type_of(&call.dest.ty);
+        // `*mut ItemsBlock` is `GcArray(OBJECTPTR)` (`rlist.py` `ll_items`).
+        // `push_null_gc_ptr_with_spelling` intern's classdef-less
+        // (`ptr_null_constant`: a GcArray has no ClassDef). Recast onto
+        // the ItemsBlock list spelling `malloc_varsize_clear_alloc`
+        // already shares (`ITEMS_BLOCK_CAST_ROOT` / `project_cast_root`)
+        // so the live SomeList arm unions (`binaryop.py` pairtype
+        // SomeList/SomeList). Bytes/unicode arrays share
+        // `items_block_items_base`; a `[PyObject]` dest would union
+        // Instance(PyObject) with String at `ll_setitem_fast`.
+        if matches!(dest_vt, ValueType::Ref(_))
+            && majit_ir::descr::is_object_gcarray_items_block(&root)
+            && !graph_is_string_items_owner(&self.graph.name)
+        {
+            let recast_root = "object_array::ItemsBlock".to_string();
+            let recast_ty = ValueType::Ref(Some(recast_root.clone()));
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self
+                .graph
+                .push_niche_null(bb_id, Some(&(recast_root, recast_ty)));
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         if dest_vt != ValueType::Ref(Some(root.clone())) {
             return Ok(false);
         }
@@ -605,6 +630,10 @@ impl<'a> Lowering<'a> {
     /// and `pairtype(SomePtr, SomeObject).union` is UnionError
     /// (`llannotation.py`).
     ///
+    /// The object-list items-base accessor (`rlist.py` `ll_items`) is
+    /// the same residual, with dest `*mut PyObjectRef`: recast onto
+    /// `object_array::ItemsBlock` so the return merge is List ∪ List.
+    ///
     /// RPython: `lltype.nullptr(GcArray(ITEM))` is
     /// `cast_int_to_ptr(Ptr(GcArray(ITEM)), 0)` when `oddint == 0`
     /// (`lltype.py` `ann_cast_int_to_ptr` → `SomePtr(PTRTYPE)`).
@@ -626,6 +655,30 @@ impl<'a> Lowering<'a> {
         };
         if !is_core_ptr_null_fun_path(&path) {
             return Ok(false);
+        }
+        // `items_block_items_base` (`rlist.py` `ll_items`) collapses the
+        // offset arm onto the `*mut ItemsBlock` receiver (`SomeList`).
+        // Residual `ptr_null_constant` is classdef-less; dest of this
+        // `null_mut` is `*mut PyObjectRef`, so dest recast intern's
+        // Instance(PyObject) or stays classdef-less.
+        // `binaryop.py` pairtype(SomeList, SomeObject) has no arm for
+        // List ∪ Instance. Recast onto the ItemsBlock list spelling
+        // `malloc_varsize_clear_alloc` already shares
+        // (`ITEMS_BLOCK_CAST_ROOT` / `project_cast_root`).
+        // Bytes/unicode arrays share this helper; a `[PyObject]` dest
+        // would union Instance(PyObject) with String at `ll_setitem_fast`.
+        if is_object_items_block_base_accessor(&self.graph.name)
+            && !graph_is_string_items_owner(&self.graph.name)
+        {
+            let root = "object_array::ItemsBlock".to_string();
+            let recast_ty = ValueType::Ref(Some(root.clone()));
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self.graph.push_niche_null(bb_id, Some(&(root, recast_ty)));
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
         }
         let Some(item) = self.tyref_scalar_flexible_gcarray_item(&call.dest.ty) else {
             return Ok(false);

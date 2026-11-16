@@ -2036,7 +2036,7 @@ unsafe fn set_compilation_unit_filename_bytes_oldname(
 /// `importing.py update_code_filenames` stores `code_w.co_filename = pathname`
 /// then `code_w.w_filename = space.newfilename(pathname)`; this is that pair.
 /// Realization allocates, so `obj` is rooted across it and reloaded.
-unsafe fn set_filename_bytes(mut obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+pub unsafe fn set_filename_bytes(mut obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.pin_roots(&[obj]);
     obj = roots.get(obj_slot);
@@ -5209,7 +5209,7 @@ fn detach_code_unit_wrapper(code_ptr: *const ()) {
 
 /// The `box_code_object` allocation `code_ptr`'s body belongs to, or zero when
 /// no graph claims it.
-fn code_unit_owner(code_ptr: *const ()) -> usize {
+pub fn code_unit_owner(code_ptr: *const ()) -> usize {
     if code_ptr.is_null() {
         return 0;
     }

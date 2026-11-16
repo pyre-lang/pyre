@@ -2350,7 +2350,6 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
                     || *path == "pyre_object::shadow_stack_cell_truncate"
                     || path.ends_with("::gc_roots::root_scope_close_word")
                     || *path == "pyre_object::root_scope_close_word"
-                    || path.ends_with("::root_scope_close_jit_abi")
                     || path.ends_with("::gc_roots::shadow_stack_len")
                     || *path == "pyre_object::shadow_stack_len"
                     || path.ends_with("::gc_roots::shadow_stack_get")
@@ -4867,12 +4866,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_small_int_const",
         pyre_object::intobject::jit_w_small_int_const,
     );
-    upa3!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
-        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
-        crate::objspace::descroperation::call_descr_obj_arg,
-    );
     upa1!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
@@ -6749,12 +6742,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::call_one_arg_in_frame",
         crate::call::call_one_arg_in_frame,
     );
-    upa3!(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::get_and_call_function0",
-        "pyre_interpreter::get_and_call_function0",
-        crate::baseobjspace::get_and_call_function0,
-    );
     cpa1!(
         &mut entries,
         "pyre_interpreter::eval::raise_prepared_exc",
@@ -8485,12 +8472,13 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
-        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
-        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
-        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
-        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
-        ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
+        finditem_str_named_word, handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word,
+        interned_residual_inst_path, is_abi_unsound_argument_residual, is_exact_type_word,
+        is_list_write_barrier, is_plain_int1_word, is_pyframe_operand_stack_accessor,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs, ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word,
+        ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
         pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs,
@@ -8609,8 +8597,8 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
-    /// `baseobjspace.py call_function` has no JIT hint; look-inside is an
-    /// `inline_call`, not a residual address.
+    /// `get_and_call_function` is `unroll_safe` (looked inside); look-inside
+    /// is an `inline_call`, not a residual address.
     #[test]
     fn jit_trace_fnaddrs_does_not_publish_look_inside_call_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
@@ -8618,9 +8606,29 @@ mod tests {
             !bindings.contains_key("pyre_interpreter::baseobjspace::get_and_call_function"),
             "look-inside graph is an inline_call, not a residual address"
         );
-        assert!(
-            !bindings.contains_key("pyre_interpreter::call::call_function_impl_result"),
-            "look-inside graph is an inline_call, not a residual address"
+    }
+
+    /// `call_function_impl_result` is `#[getfunctionptr]`; the table publishes
+    /// the word-ABI trampoline, not the raw `&[PyObjectRef]` / `Result` item
+    /// (`get_jitcode_calldescr` / `getfunctionptr`).
+    #[test]
+    fn jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let call_impl: extern "C" fn(i64, i64) -> i64 =
+            crate::call::__majit_call_target_call_function_impl_result;
+        let call_impl = call_impl as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::call_function_impl_result"],
+            call_impl
+        );
+        let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
+        assert_ne!(
+            call_impl, raw_call,
+            "must not publish the raw slice/Result item"
         );
     }
 
@@ -9734,10 +9742,12 @@ mod tests {
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
-        let a_norm = elidable_body_spelling(a);
-        let b_norm = elidable_body_spelling(b);
-        let a_norm = look_inside_iff_trampoline_spelling(a_norm.as_ref());
-        let b_norm = look_inside_iff_trampoline_spelling(b_norm.as_ref());
+        let a_elidable = elidable_body_spelling(a);
+        let b_elidable = elidable_body_spelling(b);
+        let a_residual = residual_inst_spelling(a_elidable.as_ref());
+        let b_residual = residual_inst_spelling(b_elidable.as_ref());
+        let a_norm = look_inside_iff_trampoline_spelling(a_residual.as_ref());
+        let b_norm = look_inside_iff_trampoline_spelling(b_residual.as_ref());
         let a = a_norm.as_ref();
         let b = b_norm.as_ref();
         if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
@@ -10531,8 +10541,8 @@ mod tests {
                 pyre_object::gc_roots::push_roots_jit_abi as *const (),
             ),
             (
-                "pyre_object::gc_roots::root_scope_close_jit_abi",
-                pyre_object::gc_roots::root_scope_close_jit_abi as *const (),
+                "pyre_object::gc_roots::root_scope_close_word",
+                pyre_object::gc_roots::root_scope_close_word as *const (),
             ),
             (
                 "pyre_object::gc_roots::root_scope_pin_root_jit_abi",

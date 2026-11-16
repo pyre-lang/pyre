@@ -113,7 +113,7 @@ pub fn make_generic_alias(
 
 /// `_collect_parameters(args)` (`_pypy_generic_alias.py`) — gather the
 /// free type variables in order of first appearance.
-pub(crate) fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
+pub fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
     // Every turn of this walk runs Python — the `__typing_subst__` and
     // `__parameters__` lookups, and the `__eq__` behind the uniqueness test —
     // and `args`, the tuples and lists nested inside it, and the parameters
@@ -1309,7 +1309,7 @@ impl UnionBuilder {
     }
 }
 
-fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResult {
+pub fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(parameters);
     let parameters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

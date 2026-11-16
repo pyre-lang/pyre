@@ -872,9 +872,11 @@ impl ListRootGuard {
     /// (`try_pop_to` / `FrameAnchor` Drop / `root_scope_close`).
     #[inline]
     pub fn release(&mut self) {
-        while let Some(root) = self.roots.pop() {
-            drop(root);
+        if self.len == 0 {
+            return;
         }
+        majit_gc::shadow_stack::try_pop_to(self.base);
+        self.len = 0;
     }
 }
 

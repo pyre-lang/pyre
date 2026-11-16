@@ -309,7 +309,7 @@ fn classify_call(
     }
     let kind = match leaf {
         "push_roots" | "push_roots_jit_abi" => Leaf::Open,
-        "root_scope_close" | "root_scope_close_word" | "root_scope_close_jit_abi" => return Some((Leaf::Close, true)),
+        "root_scope_close" | "root_scope_close_word" => return Some((Leaf::Close, true)),
         "pin_root" | "root_scope_pin_root_jit_abi" => Leaf::Pin,
         "pin_roots"
         | "publish_roots"
@@ -1542,7 +1542,7 @@ fn look_through(
     let mut found_index_local: Option<usize> = None;
     let mut many = false;
     let mut opaque = false;
-    for block in &body.body {
+    for block in body.body() {
         if block.is_cleanup {
             continue;
         }
@@ -1607,7 +1607,7 @@ fn look_through(
         {
             if plan.had_reload {
                 let mut leaf = Leaf::ReloadTop;
-                for block in &body.body {
+                for block in body.body() {
                     if block.is_cleanup {
                         continue;
                     }
@@ -2266,22 +2266,19 @@ impl<'a> EraseWalk<'a> {
         if !self.emit() {
             return Ok(());
         }
-        if relative || lo == depth {
-            if k >= depth {
-                return Err(if set {
-                    "set-above-depth".into()
-                } else {
-                    "get-above-depth".into()
-                });
-            }
-        } else if k >= lo && k < self.join_band_hi(lo) {
-            return Err("absolute-get-above-join-floor".into());
-        } else if k >= depth {
+        if k >= depth {
             return Err(if set {
                 "set-above-depth".into()
             } else {
                 "get-above-depth".into()
             });
+        }
+        if relative {
+            if k < floor {
+                return Err("relative-get-below-join".into());
+            }
+        } else if lo != depth && k >= lo && k < self.join_band_hi(lo) {
+            return Err("absolute-get-above-join-floor".into());
         }
         Ok(())
     }
@@ -2348,6 +2345,14 @@ impl<'a> EraseWalk<'a> {
                         frozen_lo.is_some_and(|l| lo >= l),
                         "emit incoming lo is below phase-1 lattice"
                     );
+                    debug_assert!(
+                        frozen_rel.is_some_and(|r| rel <= r),
+                        "emit incoming rel exceeds phase-1 lattice"
+                    );
+                    debug_assert!(
+                        frozen_open.is_some_and(|o| open >= o),
+                        "emit incoming open is below phase-1 lattice"
+                    );
                     return Err("depth-disagrees-at-merge".into());
                 }
                 if !self.visited[target] {
@@ -2385,65 +2390,44 @@ impl<'a> EraseWalk<'a> {
                         }
                     }
                 }
-                match (self.depth_in[target], self.lo_in[target]) {
-                    (Some(d), Some(l)) if d == depth && l == lo => self.join_pins_at(target),
-                    (None, _) => {
-                        self.depth_in[target] = Some(depth);
-                        self.lo_in[target] = Some(lo);
-                        self.open_in[target] = Some(open);
-                        self.pin_count_in[target] = Some(self.pin_count.clone());
-                        self.split_key_in[target] = Some(self.split_key);
-                        self.queue.push_back(target);
-                        Ok(())
-                    }
-                    (Some(d), Some(l)) => {
-                        // Incoming depths disagree at a CFG join, including a
-                        // Drop/Close: that block postdominates itself, so the
-                        // join is accepted and `slot_count` takes max.
-                        // `stack_walk` `Depth::join` takes a min lower bound for
-                        // neutrality; this walk takes max for `slot_count`.
-                        // `gctransform/shadowstack.py`
-                        // `ShadowStackFrameworkGCTransformer.push_roots` /
-                        // `gctransform/framework.py` `get_livevars_for_roots` is
-                        // one livevar set around the collecting op, not a
-                        // per-arm stack pointer. Extra-pin Gets stay on the
-                        // writing arm (SSA slot locals). A back edge that grows
-                        // depth is pins accumulating around a loop: refuse
-                        // rather than let the lattice climb.
-                        // `gctransform/framework.py` computes livevars per block
-                        // from the finished graph before `push_roots` inserts the
-                        // stores; the analysis never rewrites while it is still
-                        // iterating.
-                        if d != depth && dominates(self.succs, self.n_blocks, target, from) {
-                            return Err("depth-disagrees-at-merge".into());
-                        }
-                        if d != depth
-                            && !join_postdominated_by_this_guard_rewind(
-                                self.body,
-                                self.llbc,
-                                self.classified,
-                                self.specials,
-                                self.succs,
-                                self.n_blocks,
-                                target,
-                            )
-                        {
-                            return Err("depth-disagrees-at-merge".into());
-                        }
-                        let joined_hi = d.max(depth);
-                        let joined_lo = l.min(lo);
-                        if joined_hi != d || joined_lo != l {
-                            self.depth_in[target] = Some(joined_hi);
-                            self.lo_in[target] = Some(joined_lo);
-                            if depth == joined_hi {
-                                self.open_in[target] = Some(open);
-                            }
-                            self.visited[target] = false;
-                            self.queue.push_back(target);
-                        }
-                        self.join_pins_at(target)
-                    }
-                    _ => Ok(()),
+                // Incoming depths disagree at a CFG join, including a
+                // Drop/Close: that block postdominates itself, so the
+                // join is accepted and `slot_count` takes max.
+                // `stack_walk` `Depth::join` takes a min lower bound for
+                // neutrality; this walk takes max for `slot_count`.
+                // `gctransform/shadowstack.py`
+                // `ShadowStackFrameworkGCTransformer.push_roots` /
+                // `gctransform/framework.py` `get_livevars_for_roots` is
+                // one livevar set around the collecting op, not a
+                // per-arm stack pointer. Extra-pin Gets stay on the
+                // writing arm (SSA slot locals). A back edge that grows
+                // depth is pins accumulating around a loop: refuse
+                // rather than let the lattice climb.
+                // `gctransform/framework.py` computes livevars per block
+                // from the finished graph before `push_roots` inserts the
+                // stores; the analysis never rewrites while it is still
+                // iterating.
+                let incoming = EdgeOut::from_outgoing(depth, lo, rel, open);
+                let old_same_edge = self.edge_out[from][edge];
+                self.edge_out[from][edge] = Some(incoming);
+                let mut others: Option<EdgeOut> = None;
+                let mut joined: Option<EdgeOut> = None;
+                let mut min_d = usize::MAX;
+                let mut max_d = 0usize;
+                // Block 0 has no CFG predecessor for the function entry.
+                // Keep that (0,0,0,0) contribution so a back-edge cannot
+                // replace the start IN with only the loop OUT.
+                if target == 0 {
+                    let entry = EdgeOut {
+                        depth: 0,
+                        lo: 0,
+                        rel: 0,
+                        open: 0,
+                    };
+                    joined = Some(entry);
+                    others = Some(entry);
+                    min_d = 0;
+                    max_d = 0;
                 }
                 for &(pred, ei) in &self.incoming[target] {
                     let Some(e) = self.edge_out[pred][ei] else {
@@ -2475,7 +2459,7 @@ impl<'a> EraseWalk<'a> {
                         .or_else(|| old_same_edge.map(|o| o.depth))
                         .or(self.depth_in[target]);
                     if back_hi.is_some_and(|d| d != incoming.depth) {
-                        return Err("depth-disagrees-at-merge");
+                        return Err("depth-disagrees-at-merge".into());
                     }
                 }
                 if min_d != max_d
@@ -2490,7 +2474,7 @@ impl<'a> EraseWalk<'a> {
                         joined.lo,
                     )
                 {
-                    return Err("depth-disagrees-at-merge");
+                    return Err("depth-disagrees-at-merge".into());
                 }
                 if Some(joined.depth) != self.depth_in[target]
                     || Some(joined.lo) != self.lo_in[target]
@@ -2675,6 +2659,8 @@ impl<'a> EraseWalk<'a> {
         {
             return Ok((k, relative, floor));
         }
+        // A literal const index names a caller slot (`RootScope::get`,
+        // `shadow_stack_get`: `stack.slot(index)`), not this body's.
         Err("index-not-static".into())
     }
 
@@ -3015,8 +3001,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 Rvalue::UnaryOp(op, operand) if op.get("Cast").is_some() => {
                     match operand_local(operand).and_then(|l| cx.specials.get(&l).copied()) {
                         Some(Special::ReloadedRoot) => Some(Special::ReloadedRoot),
-                        Some(Special::Index { k, relative }) => {
-                            Some(Special::Index { k, relative })
+                        Some(Special::Index { k, relative, floor }) => {
+                            Some(Special::Index { k, relative, floor })
                         }
                         _ => None,
                     }
@@ -3024,8 +3010,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 Rvalue::Cast(_, operand, _) => {
                     match operand_local(operand).and_then(|l| cx.specials.get(&l).copied()) {
                         Some(Special::ReloadedRoot) => Some(Special::ReloadedRoot),
-                        Some(Special::Index { k, relative }) => {
-                            Some(Special::Index { k, relative })
+                        Some(Special::Index { k, relative, floor }) => {
+                            Some(Special::Index { k, relative, floor })
                         }
                         _ => None,
                     }
@@ -3179,7 +3165,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     Special::SliceRuntimeIndex { index, .. }
                     | Special::SliceRuntimeIndexPair { index, .. } => {
                         if cx.index_assign_counts.get(index).copied().unwrap_or(0) > 1 {
-                            return Err("slice-index-reassigned");
+                            return Err("slice-index-reassigned".into());
                         }
                     }
                     _ => {}
@@ -3250,10 +3236,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 ) {
                     let dest_json = &term_json["Call"]["dest"];
                     let stmts = match answer {
-                        GetterAnswer::Scalar { k, relative } => {
-                            cx.check_slot_read(k, relative, depth, lo, false)?;
+                        GetterAnswer::Scalar { k, relative, floor } => {
+                            cx.check_slot_read(k, relative, floor, depth, lo, false)?;
                             if !cx.emit() {
-                                cx.reach(bb, *target, depth, lo, open)?;
+                                cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                                 continue;
                             }
                             let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
@@ -3267,7 +3253,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 return Err("get-above-depth".into());
                             }
                             if !cx.emit() {
-                                cx.reach(bb, *target, depth, lo, open)?;
+                                cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                                 continue;
                             }
                             vec![assign_json(
@@ -3281,7 +3267,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     for local in carriers {
                         cx.capture_temps.insert(local);
                     }
-                    cx.reach(bb, *target, depth, lo, open)?;
+                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                     continue;
                 }
                 let Some(&(leaf, method)) = classified.get(&bb) else {
@@ -3690,10 +3676,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     cx.call_dests,
                                     cx.const_locals,
                                 ) {
-                                    return Err("index-not-static");
+                                    return Err("index-not-static".into());
                                 }
                                 if cx.emit() && open == 0 {
-                                    return Err("get-above-depth");
+                                    return Err("get-above-depth".into());
                                 }
                                 if cx.emit() {
                                     stmts.push(assign_json(
@@ -3704,17 +3690,6 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                             dest_json,
                                             index,
                                         )?,
-                                    ));
-                                }
-                            }
-                            _ if const_k.is_some() => {
-                                let k = const_k.unwrap();
-                                cx.check_slot_read(k, false, depth, lo, false)?;
-                                if cx.emit() {
-                                    let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
-                                    stmts.push(assign_json(
-                                        dest_json.clone(),
-                                        json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
                                     ));
                                 }
                             }
@@ -3790,7 +3765,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 )
                             {
                                 if cx.index_assign_counts.get(index).copied().unwrap_or(0) > 1 {
-                                    return Err("slice-index-reassigned");
+                                    return Err("slice-index-reassigned".into());
                                 }
                                 src.offset = SliceOff::Local(index);
                             }
@@ -3827,7 +3802,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     }
                     Leaf::CopyRange => {
                         let Some(src) = slice_src(&cx.specials, call.args.get(arg0)) else {
-                            return Err("unmodeled-stack-op");
+                            return Err("unmodeled-stack-op".into());
                         };
                         // Identity only when dest aliases that published
                         // incoming slice at offset 0. `copy_range(base,
@@ -3846,7 +3821,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 },
                             );
                         if !dest_is_published {
-                            return Err("copy-range-dest-not-published-slice");
+                            return Err("copy-range-dest-not-published-slice".into());
                         }
                         if !cx.copy_range_slices.contains(&src.slice) {
                             cx.copy_range_slices.push(src.slice);
@@ -3858,6 +3833,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         }
                         let dest_ty = dest_json["ty"].clone();
                         if depth > 0 {
+                            cx.check_slot_read(depth - 1, true, rel, depth, lo, false)?;
                             if cx.emit() {
                                 let ty = cx.slot_ty_at(depth - 1).ok_or("reload-before-any-pin")?;
                                 stmts.push(assign_json(
@@ -3908,7 +3884,6 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         if let Some(dest) = dest {
                             cx.bind(dest, Special::SlotHandle)?;
                         }
-                        cx.check_slot_read(depth - 1, true, rel, depth, lo, false)?;
                         if cx.emit() {
                             stmts.push(assign_json(dest_json.clone(), zero_use(&dest_json["ty"])));
                         }
@@ -3935,6 +3910,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             Special::Index {
                                 k: depth,
                                 relative: false,
+                                floor: 0,
                             },
                         )?;
                         pin_depth(&mut depth, &mut lo, 1);
@@ -3998,7 +3974,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     lo = k;
                     open = open.saturating_sub(1);
                     cx.record_term(bb, *target, Vec::new());
-                    cx.reach(bb, *target, depth, lo, open)?;
+                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                 } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
                     return Err("drop-of-unopened-guard".into());
                 } else {
@@ -4053,7 +4029,7 @@ fn analyze_in(
     in_flight: &[u64],
     allow_cached: bool,
 ) -> Result<Option<Plan>, Refusal> {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
     let forward_blocks = super::forward_reachable_mask(llbc, body);
@@ -4096,7 +4072,7 @@ fn analyze_in(
     // read, so a body that only has that family is not gated here.
     let publishes = classified.values().any(|(leaf, _)| leaf_is_bracket(*leaf));
     if publishes {
-        for (bb, block) in body.body.iter().enumerate() {
+        for (bb, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb] {
                 continue;
             }
@@ -4384,7 +4360,7 @@ fn analyze_in(
             )
             .is_none()
             {
-                return Err("set-slice-unmirrored");
+                return Err("set-slice-unmirrored".into());
             }
         }
     }
@@ -4426,7 +4402,7 @@ fn analyze_in(
                     .iter()
                     .any(|published| *published == slice || Some(*published) == root);
                 if published && !mirrors.contains(&(bb, si)) {
-                    return Err("copy-range-after-unmirrored-store");
+                    return Err("copy-range-after-unmirrored-store".into());
                 }
             }
         }
@@ -5611,7 +5587,7 @@ fn independent_leaf_plan(body: &Unstructured, llbc: &Llbc, in_flight: &[u64]) ->
         had_reload: false,
         reload_src: None,
     };
-    for (bb, block) in body.body.iter().enumerate() {
+    for (bb, block) in body.body().iter().enumerate() {
         let Ok(TermKind::Call { call, target, .. }) = block.term_ref(llbc) else {
             continue;
         };
@@ -8131,7 +8107,7 @@ mod tests {
         let fd = llbc.fn_by_id(4).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         match erase_shadow_stack(fd, &body, &llbc) {
-            Err("copy-range-dest-not-published-slice") => {}
+            Err(reason) if reason == "copy-range-dest-not-published-slice" => {}
             other => panic!("expected copy-range-dest-not-published-slice, got {other:?}"),
         }
     }
@@ -8743,7 +8719,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("returns-with-published-slots") => {}
+            Err(reason) if reason == "returns-with-published-slots" => {}
             Ok(Some(_)) => panic!("expected returns-with-published-slots, got accepted"),
             Ok(None) => panic!("expected returns-with-published-slots, got no bracket"),
             Err(reason) => panic!("expected returns-with-published-slots, got {reason}"),
@@ -9573,25 +9549,25 @@ mod tests {
             walk.effect()
         );
         let caller = llbc.fn_by_id(7).expect("caller").unstructured().unwrap();
-        let reload_call = match caller.body[3].term_ref(&llbc) {
+        let reload_call = match caller.body()[3].term_ref(&llbc) {
             Ok(TermKind::Call { call, .. }) => call,
             other => panic!("expected wrapper Call, got {other:?}"),
         };
         assert!(
-            classify_or_look_through(reload_call, &llbc, &[], false).is_none(),
+            classify_or_look_through(&reload_call, &llbc, &[], false).is_none(),
             "Get of argument 2 must not look through as Get of the receiver"
         );
         let arg0_caller = body_of(
             2,
             vec![bb(call_fun(6, vec![copy(0)], 1, 1)), bb(json!("Return"))],
         );
-        let arg0_call = match arg0_caller.body[0].term_ref(&llbc) {
+        let arg0_call = match arg0_caller.body()[0].term_ref(&llbc) {
             Ok(TermKind::Call { call, .. }) => call,
             other => panic!("expected arg0 wrapper Call, got {other:?}"),
         };
         assert!(
             matches!(
-                classify_or_look_through(arg0_call, &llbc, &[], false),
+                classify_or_look_through(&arg0_call, &llbc, &[], false),
                 Some((Leaf::Get, false))
             ),
             "Get of argument 0 still looks through as Get"
@@ -10556,9 +10532,8 @@ mod tests {
         );
     }
 
-    /// A slot assigned only on one arm and read after the join is not
-    /// definitely assigned; bb0 gets its null-init. A pin that dominates
-    /// its get does not.
+    /// A dominating pin gets no bb0 null-init. An extra pin on one arm
+    /// and a `len - 1` read at the join is refused.
     #[test]
     fn erase_inits_slot_read_without_dominating_assign() {
         let llbc = stack_ops_llbc();
@@ -10570,7 +10545,7 @@ mod tests {
                 super::local_place_json(slot_local, &ty()),
                 super::null_ptr_rvalue(&ty()),
             );
-            erased.body[0]
+            erased.body()[0]
                 .statements
                 .iter()
                 .any(|stmt| stmt.kind_value() == &expected)
@@ -10614,20 +10589,12 @@ mod tests {
                 bb(json!("Return")),
             ],
         );
-        let erased = match erase_shadow_stack(&fd, &correlated, &llbc) {
-            Ok(Some(erased)) => erased,
-            Ok(None) => panic!("expected accepted erase, got no bracket"),
-            Err(reason) => panic!("expected accepted erase, got {reason}"),
-        };
-        let base = n_locals as usize;
-        assert!(
-            bb0_inits_slot(&erased, base + 1),
-            "a correlated extra-pin read after the join must null-init that slot at bb0"
-        );
-        assert!(
-            !bb0_inits_slot(&erased, base),
-            "the dominating first pin must not null-init at bb0"
-        );
+        match erase_shadow_stack(&fd, &correlated, &llbc) {
+            Err(reason) if reason == "relative-get-below-join" => {}
+            Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
+            Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
+            Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
+        }
     }
 
     /// Two-phase walk: the short arm reaches the join first. After the join
@@ -11064,7 +11031,7 @@ mod tests {
             ],
         );
         match analyze(&get_body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("expected index-not-static on literal Get, got accepted"),
             Ok(None) => panic!("expected index-not-static on literal Get, got no bracket"),
             Err(reason) => panic!("expected index-not-static on literal Get, got {reason}"),
@@ -11085,7 +11052,7 @@ mod tests {
             ],
         );
         match analyze(&set_body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("expected index-not-static on literal Set, got accepted"),
             Ok(None) => panic!("expected index-not-static on literal Set, got no bracket"),
             Err(reason) => panic!("expected index-not-static on literal Set, got {reason}"),
@@ -11122,7 +11089,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("relative-get-below-join") => {}
+            Err(reason) if reason == "relative-get-below-join" => {}
             Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
             Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
             Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
@@ -11152,7 +11119,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("relative-get-below-join") => {}
+            Err(reason) if reason == "relative-get-below-join" => {}
             Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
             Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
             Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
@@ -11220,7 +11187,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("relative-get-below-join") => {}
+            Err(reason) if reason == "relative-get-below-join" => {}
             Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
             Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
             Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
@@ -11298,7 +11265,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("depth-disagrees-at-merge") => {}
+            Err(reason) if reason == "depth-disagrees-at-merge" => {}
             Ok(Some(_)) => panic!("expected depth-disagrees-at-merge, got accepted"),
             Ok(None) => panic!("expected depth-disagrees-at-merge, got no bracket"),
             Err(reason) => panic!("expected depth-disagrees-at-merge, got {reason}"),
@@ -11329,7 +11296,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("pin-count-disagrees-at-merge") => {}
+            Err(reason) if reason == "pin-count-disagrees-at-merge" => {}
             Ok(Some(_)) => panic!("expected pin-count-disagrees-at-merge, got accepted"),
             Ok(None) => panic!("expected pin-count-disagrees-at-merge, got no bracket"),
             Err(reason) => panic!("expected pin-count-disagrees-at-merge, got {reason}"),
@@ -11368,7 +11335,7 @@ mod tests {
             let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) else {
                 continue;
             };
-            if callee_path(call, &llbc)
+            if callee_path(&call, &llbc)
                 .as_deref()
                 .is_some_and(|p| p.rsplit("::").next() == Some("push_roots"))
             {
@@ -11519,7 +11486,7 @@ mod tests {
             .iter()
             .filter_map(|bb| match bb.term_ref(llbc) {
                 Ok(TermKind::Call { call, .. }) => {
-                    super::callee_path(call, llbc).filter(|path| path.contains("RootedItems"))
+                    super::callee_path(&call, llbc).filter(|path| path.contains("RootedItems"))
                 }
                 _ => None,
             })
@@ -12232,7 +12199,7 @@ mod tests {
             vec![bb(call_fun(2, vec![copy(1)], 0, 1)), bb(json!("Return"))],
         );
         match analyze(&body, &llbc) {
-            Err("returns-slot-index") => {}
+            Err(reason) if reason == "returns-slot-index" => {}
             Ok(Some(_)) => panic!("expected returns-slot-index, got accepted"),
             Ok(None) => panic!("expected returns-slot-index, got no bracket"),
             Err(reason) => panic!("expected returns-slot-index, got {reason}"),
@@ -12272,13 +12239,13 @@ mod tests {
     fn erase_refuses_unmirrored_set_through_slice() {
         let llbc = slice_ops_llbc();
         match analyze(&slice_set_body(true), &llbc) {
-            Err("set-slice-unmirrored") => {}
+            Err(reason) if reason == "set-slice-unmirrored" => {}
             Ok(Some(_)) => panic!("expected set-slice-unmirrored, got accepted"),
             Ok(None) => panic!("expected set-slice-unmirrored, got no bracket"),
             Err(reason) => panic!("expected set-slice-unmirrored, got {reason}"),
         }
         match analyze(&slice_set_body(false), &llbc) {
-            Err("set-slice-unmirrored") => {}
+            Err(reason) if reason == "set-slice-unmirrored" => {}
             Ok(Some(_)) => panic!("expected set-slice-unmirrored, got accepted"),
             Ok(None) => panic!("expected set-slice-unmirrored, got no bracket"),
             Err(reason) => panic!("expected set-slice-unmirrored, got {reason}"),
@@ -12460,7 +12427,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("set-slice-unmirrored") => {}
+            Err(reason) if reason == "set-slice-unmirrored" => {}
             Ok(Some(_)) => panic!("expected set-slice-unmirrored, got accepted"),
             Ok(None) => panic!("expected set-slice-unmirrored, got no bracket"),
             Err(reason) => panic!("expected set-slice-unmirrored, got {reason}"),
@@ -12537,22 +12504,22 @@ mod tests {
             Ok(None) => panic!("expected cached-slot erase, got no bracket"),
             Err(reason) => panic!("expected cached-slot erase, got {reason}"),
         };
-        for block in &erased.body {
+        for block in erased.body() {
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) {
-                let path = callee_path(call, llbc).unwrap_or_default();
+                let path = callee_path(&call, llbc).unwrap_or_default();
                 assert!(
                     !path.contains("slot_from_cached") && !path.contains("slot_top_ref"),
                     "cached-slot resolve/reload must leave the jitcode: {path}"
                 );
             }
         }
-        let copies_frame = erased.body.iter().any(|block| {
+        let copies_frame = erased.body().iter().any(|block| {
             block.statements.iter().any(|stmt| {
                 matches!(
                     stmt.stmt_kind_ref(),
                     Ok(StmtKind::Assign(place, Rvalue::Use(op, _)))
-                        if place_local(place) == Some(0)
-                            && operand_local(op) == Some(frame_local)
+                        if place_local(&place) == Some(0)
+                            && operand_local(&op) == Some(frame_local)
                 )
             })
         });
@@ -12648,9 +12615,9 @@ mod tests {
         let fd = llbc.fn_by_id(4).expect("subject");
         let body = fd.unstructured().expect("stripped body");
         let erased = assert_reload_answers_frame(fd, &body, &llbc, 1);
-        for block in &erased.body {
+        for block in erased.body() {
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) {
-                let path = callee_path(call, &llbc).unwrap_or_default();
+                let path = callee_path(&call, &llbc).unwrap_or_default();
                 assert!(
                     !path.contains("through_slot"),
                     "erased wrapper call must leave the jitcode: {path}"
@@ -12698,9 +12665,9 @@ mod tests {
             Ok(None) => panic!("expected cached-slot erase, got no bracket"),
             Err(reason) => panic!("expected cached-slot erase, got {reason}"),
         };
-        let leftover = erased.body.iter().any(|block| {
+        let leftover = erased.body().iter().any(|block| {
             matches!(block.term_ref(&llbc), Ok(TermKind::Call { call, .. })
-                if callee_path(call, &llbc).is_some_and(|p| p.contains("slot_from_cached") || p.contains("slot_top_ref")))
+                if callee_path(&call, &llbc).is_some_and(|p| p.contains("slot_from_cached") || p.contains("slot_top_ref")))
         });
         assert!(!leftover, "cached-slot leaves must leave the jitcode");
     }
@@ -12734,14 +12701,14 @@ mod tests {
             Ok(None) => panic!("expected cached-slot erase, got no bracket"),
             Err(reason) => panic!("expected cached-slot erase, got {reason}"),
         };
-        let leftover = erased.body.iter().any(|block| {
+        let leftover = erased.body().iter().any(|block| {
             matches!(block.term_ref(&llbc), Ok(TermKind::Call { call, .. })
-                if callee_path(call, &llbc).is_some_and(|p| p.contains("slot_from_cached") || p.contains("slot_top_ref")))
+                if callee_path(&call, &llbc).is_some_and(|p| p.contains("slot_from_cached") || p.contains("slot_top_ref")))
         });
         assert!(!leftover, "cached-slot leaves must leave the jitcode");
-        let keeps_callee = erased.body.iter().any(|block| {
+        let keeps_callee = erased.body().iter().any(|block| {
             matches!(block.term_ref(&llbc), Ok(TermKind::Call { call, .. })
-                if callee_path(call, &llbc).is_some_and(|p| p.contains("touch_frame")))
+                if callee_path(&call, &llbc).is_some_and(|p| p.contains("touch_frame")))
         });
         assert!(keeps_callee, "the reloaded frame flows to the callee");
     }
@@ -12843,9 +12810,9 @@ mod tests {
             Ok(None) => panic!("expected cached-slot erase, got no bracket"),
             Err(reason) => panic!("expected cached-slot erase, got {reason}"),
         };
-        for block in &erased.body {
+        for block in erased.body() {
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) {
-                let path = callee_path(call, &llbc).unwrap_or_default();
+                let path = callee_path(&call, &llbc).unwrap_or_default();
                 assert!(
                     !path.contains("slot_from_cached")
                         && !path.contains("slot_top_ref")
@@ -12937,11 +12904,11 @@ mod tests {
     }
 
     fn no_call_path_contains(body: &Unstructured, llbc: &Llbc, needle: &str) -> bool {
-        body.body.iter().all(|block| {
+        body.body().iter().all(|block| {
             !matches!(
                 block.term_ref(llbc),
                 Ok(TermKind::Call { call, .. })
-                    if callee_path(call, llbc).is_some_and(|p| p.contains(needle))
+                    if callee_path(&call, llbc).is_some_and(|p| p.contains(needle))
             )
         })
     }
@@ -13152,13 +13119,13 @@ mod tests {
             "gc_current_object_address"
         ));
         assert!(no_call_path_contains(&erased, &llbc, "try_gc"));
-        let copies_arg = erased.body.iter().any(|block| {
+        let copies_arg = erased.body().iter().any(|block| {
             block.statements.iter().any(|stmt| {
                 matches!(
                     stmt.stmt_kind_ref(),
                     Ok(StmtKind::Assign(place, Rvalue::Use(op, _)))
-                        if place_local(place) == Some(0)
-                            && operand_local(op) == Some(1)
+                        if place_local(&place) == Some(0)
+                            && operand_local(&op) == Some(1)
                 )
             })
         });

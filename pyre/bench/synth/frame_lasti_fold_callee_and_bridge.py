@@ -1,8 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: skip-backends=wasm
-# wasm still prints PASS but compiles `root:leaf` and `root:caller_view`
-# after five loop aborts, so it cannot declare the native `main` loop.
 # Self-checking guard for the `f_lasti` coordinate on the two frames a walk
 # owns that are NOT the loop's own portal: the frame of an inlined callee, and
 # the caller's frame read from inside one.

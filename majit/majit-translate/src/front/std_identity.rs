@@ -405,12 +405,16 @@ pub(crate) fn lower_std_primitive_op(
             }
             return op_kind;
         }
-        // Opaque `Ref` / `RefMut` / `RefCell` have no field list
-        // (`TypeDeclKind::Opaque`). They type as T, so `banks_agree`
-        // is the identity verdict; do not bypass it.
+        // Opaque `Ref` / `RefMut` / `RefCell` / `MutexGuard` have no
+        // field list (`TypeDeclKind::Opaque`). They type as T, so
+        // `banks_agree` is the identity verdict; do not bypass it.
+        // `lock_api::mutex::MutexGuard` is that Opaque foreign guard
+        // (`parking_lot`); RPython has no lock cell, so deref is
+        // `same_as` of the payload (`jtransform.py` `rewrite_op_same_as`).
         if banks_agree
             && (is_std_cell_ref_deref_target(target, receiver_path)
-                || is_std_cell_refcell_borrow_target(target, receiver_path))
+                || is_std_cell_refcell_borrow_target(target, receiver_path)
+                || is_mutex_guard_deref_target(target, receiver_path))
         {
             return same_as(operand, result_ty.clone());
         }
@@ -539,6 +543,26 @@ fn is_peeled_ref_or_guard_deref_path(segments: &[String]) -> bool {
     matches!(function_leaf(segments), Some("deref" | "deref_mut"))
         && (path_has(segments, "MutexGuard")
             || (path_has(segments, "Ref") && !path_has(segments, "RefCell")))
+}
+
+/// `MutexGuard::deref` / `deref_mut`, including the peeled
+/// `mutex::MutexGuard::<impl DerefMut<lock_api::mutex::MutexGuard<v0,v1>>>`
+/// path Charon emits for `parking_lot`.
+fn is_mutex_guard_deref_target(target: &CallTarget, receiver_path: Option<&str>) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            is_peeled_ref_or_guard_deref_path(segments) && path_has(segments, "MutexGuard")
+        }
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            matches!(name.as_str(), "deref" | "deref_mut")
+                && path_leaf(receiver_root.as_deref().or(receiver_path)) == Some("MutexGuard")
+        }
+        _ => false,
+    }
 }
 
 /// `cell::RefCell::borrow` after `core` is peeled. The body is
@@ -1610,6 +1634,56 @@ mod tests {
         assert!(
             matches!(disagree, OpKind::Call { .. }),
             "opaque Ref::deref keeps the residual Call when banks disagree, got {disagree:?}"
+        );
+
+        let lock_api = lower_std_primitive_op(
+            call(
+                path(&[
+                    "mutex",
+                    "MutexGuard",
+                    "<impl core::ops::deref::DerefMut<lock_api::mutex::MutexGuard<v0,v1>>>",
+                    "deref_mut",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("HashSet".into())),
+            ),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+        );
+        assert!(
+            matches!(lock_api, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "opaque lock_api MutexGuard::deref_mut is the inner value, got {lock_api:?}"
+        );
+
+        let lock_disagree = lower_std_primitive_op(
+            call(
+                path(&[
+                    "mutex",
+                    "MutexGuard",
+                    "<impl core::ops::deref::DerefMut<lock_api::mutex::MutexGuard<v0,v1>>>",
+                    "deref_mut",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("HashSet".into())),
+            ),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            false,
+        );
+        assert!(
+            matches!(lock_disagree, OpKind::Call { .. }),
+            "opaque MutexGuard::deref_mut keeps the residual Call when banks disagree, got {lock_disagree:?}"
         );
     }
 

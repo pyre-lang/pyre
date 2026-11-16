@@ -981,6 +981,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: object_vec_rangefrom_marker_segments(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
@@ -4222,6 +4223,7 @@ impl<'a> Lowering<'a> {
                 if let Some(id) = self.call_target_fun_decl_id(reg) {
                     target = target.with_fun_decl_id(id);
                     if let Some(fd) = self.llbc.fn_by_id(id) {
+                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
                         target = self.attach_call_generics(target, fd, &reg.generics, None);
                     }
                 }
@@ -7781,7 +7783,7 @@ pub(in crate::front::mir) fn raw_vec_pair_view_locals(
 ) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut view = vec![false; n];
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
@@ -7821,7 +7823,7 @@ pub(in crate::front::mir) fn raw_vec_pair_view_locals(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -7860,7 +7862,7 @@ pub(in crate::front::mir) fn raw_vec_pair_view_locals(
             let mut grew = true;
             while grew {
                 grew = false;
-                for bb in &body.body {
+                for bb in body.body() {
                     for stmt in &bb.statements {
                         let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                             continue;
@@ -8095,14 +8097,20 @@ pub(in crate::front::mir) fn tyref_raw_array_parts<'l>(
 /// `[T; N]` whose item is an int/uint/float register. `history.py getkind`
 /// has no kind for a `FixedSizeArray` value; the items are the registers.
 /// Length may be a const-generic, so this does not parse `N`.
+///
+/// The item must be a Charon `Scalar` of a non-pointer-width integer or
+/// float (`rffi.CFixedArray` of `u8` / `i32` / `f64`). `usize` / `isize`
+/// / `i64` / `u64` are pointer-width: `vec![w_none(); N]` inlines to
+/// `[usize; N]` of the OnceLock word, and unrolling that Array intern's
+/// a classdef-less instance that `mergeinputargs` cannot join with List
+/// (`binaryop.py` has `pairtype(SomeList, SomeList)` and `obj.noneify()`,
+/// not List ∪ Instance). `rlist.py` `ll_alloc_and_set` is `__array_repeat`.
 pub(in crate::front::mir) fn scalar_fixed_array_item(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     let item = tyref_array_item(ty, llbc)?;
-    let item_ty = tyref_to_value_type(&item, llbc);
-    matches!(
-        item_ty,
-        ValueType::Int | ValueType::Unsigned | ValueType::Float
-    )
-    .then_some(item_ty)
+    let node = tyref_node(&item, llbc)?;
+    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
+    let scalar = node.as_object()?.get("Scalar")?;
+    cfixedarray_scalar_value_type(scalar)
 }
 
 /// Whether the JSON `place` is `a` or `*b` for a raw-array storage local `a`
@@ -8818,7 +8826,7 @@ pub(in crate::front::mir) fn local_is_rust_vec_deref(
         if !seen.insert(cur) {
             return None;
         }
-        let from_call = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+        let from_call = body.body().iter().enumerate().find_map(|(bb_idx, bb)| {
             if !forward_blocks[bb_idx] {
                 return None;
             }
@@ -8839,7 +8847,7 @@ pub(in crate::front::mir) fn local_is_rust_vec_deref(
         if from_call.is_some() {
             return from_call;
         }
-        cur = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+        cur = body.body().iter().enumerate().find_map(|(bb_idx, bb)| {
             if !forward_blocks[bb_idx] {
                 return None;
             }
@@ -8876,7 +8884,7 @@ pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(
     let mut grew = true;
     while grew {
         grew = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -9013,7 +9021,7 @@ pub(in crate::front::mir) fn raw_vec_pair_view_used_as_whole_arg(
     let mut grew = true;
     while grew {
         grew = false;
-        for bb in &body.body {
+        for bb in body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -9032,7 +9040,7 @@ pub(in crate::front::mir) fn raw_vec_pair_view_used_as_whole_arg(
         }
     }
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

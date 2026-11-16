@@ -128,7 +128,7 @@ fn lower_named_with_pytypes(
 /// close, and the word-ABI bridge whose argument is the guard's save_point
 /// word.
 fn is_close_leaf(s: &str) -> bool {
-    s == "root_scope_close_word" || s == "root_scope_close" || s == "root_scope_close_jit_abi"
+    s == "root_scope_close_word" || s == "root_scope_close"
 }
 
 /// Count calls whose path ends with `leaf`, over every block of the graph.
@@ -1526,7 +1526,7 @@ fn residual_dict_operation_guard_ctor(kind: &OpKind) -> bool {
 
 /// ULLBC terminator whose callee is `Vec::index` of a `RangeFrom`.
 fn body_calls_vec_rangefrom_index(llbc: &Llbc, body: &Unstructured) -> bool {
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };

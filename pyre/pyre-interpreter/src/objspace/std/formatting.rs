@@ -563,7 +563,7 @@ pub unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyRes
     bytes_format_percent_inner(pyre_object::gc_roots::shadow_stack_get(fmt_slot), args)
 }
 
-unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+pub unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // As `str_format_percent`: the conversions run Python and `BINARY_OP %`
     // popped both operands, so nothing else roots them.  A nursery bytearray
     // `fmt` moves across a conversion, so the result kind is read from the

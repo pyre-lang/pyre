@@ -9009,7 +9009,16 @@ fn portal_metatrace_maybe(
             >= portal_metatrace_skip()
         && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        drive_portal_metatrace(driver, info, env, green_key, next_instr, frame, ec)
+        drive_portal_metatrace(
+            driver,
+            info,
+            env,
+            green_key,
+            matched_cell,
+            next_instr,
+            frame,
+            ec,
+        )
     } else {
         false
     }
@@ -9031,10 +9040,36 @@ fn drive_portal_metatrace(
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A live session on another key or driver may still
-    // `bound_reached` a nested MetaInterp.
-    if driver.cell_is_tracing(green_key) {
+    // `warmstate.py maybe_compile_and_run` reads `JC_TRACING` only on the
+    // cell `comparekey` matched. A miss does not consult a foreign occupant
+    // whose `cell_key` equals the bucket hash. This door has no prior
+    // decision, so it tests the matched cell the same way
+    // `drive_tuple_hash_trace` does.
+    if matched_cell
+        .as_ref()
+        .and_then(|r| r.cell.as_ref())
+        .is_some_and(|cell| cell.is_tracing())
+    {
+        return false;
+    }
+    // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
+    // in its own slot before `PortalPycodeRoot` pushes `W_Code` above it.
+    let mut frame_root = FrameRoot::new(unsafe { &mut *frame });
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter. confirm_enter_jit(*args) is greens then reds.
+    let reds = pypyjit_confirm_reds(driver, frame_root.frame());
+    let greenargs = majit_ir::pypyjit_greenargs(
+        loop_header_pc,
+        frame_root.frame().get_is_being_profiled(),
+        pycode_root.get() as u64,
+    );
+    if !driver.meta_interp_mut().bound_reached_prelude(
+        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+        &greenargs,
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+        &reds,
+    ) {
         return false;
     }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer

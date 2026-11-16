@@ -432,9 +432,17 @@ impl<'a> Lowering<'a> {
     /// `Cell` / `UnsafeCell` / atomic bindings. The value is not a
     /// prebuilt constant (`immutable_static_is_prebuilt_table`); the
     /// address is still the place to load or store through.
+    ///
+    /// `FnPtrCell<F>` stays off this lane: it has a dedicated
+    /// `static_addr_op` arm. `OnceLock<T>` uses this sentinel when no
+    /// refs row matches (`cache.py Cache.getorbuild` of a fromcache
+    /// singleton that the host table does not register).
     pub(in crate::front::mir) fn immutable_static_addr_op(&self, def_id: u64) -> Option<OpKind> {
         let g = self.llbc.global_by_id(def_id)?;
         if !global_is_immutable_static(g) {
+            return None;
+        }
+        if global_tyref(g).is_some_and(|ty| tyref_is_fnptrcell(&ty, self.llbc)) {
             return None;
         }
         Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
@@ -985,7 +993,7 @@ pub(in crate::front::mir) fn immutable_static_init_tables(
     let mut local_funs: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     let mut struct_fields: Option<Vec<Option<OpKind>>> = None;
     let mut struct_funs: Option<Vec<Option<u64>>> = None;
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -1229,7 +1237,7 @@ pub(in crate::front::mir) fn local_assigned_operand(
     body: &Unstructured,
     local: u64,
 ) -> Option<Operand> {
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -2382,6 +2390,7 @@ pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKin
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
+                    resolved_path: None,
                     fun_decl_id: None,
                     generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
@@ -2401,6 +2410,7 @@ pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKin
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: synthetic,
+                    resolved_path: None,
                     fun_decl_id: None,
                     generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
@@ -4307,6 +4317,19 @@ pub(in crate::front::mir) fn traitref_clause_bound0_index(
         return None;
     }
     Some(bound.get(1)?.as_u64()? as usize)
+}
+
+pub(in crate::front::mir) fn tyexpr_body<'a>(
+    llbc: &'a Llbc,
+    ty: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
+        return arr.get(1);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_body(id);
+    }
+    Some(ty)
 }
 
 pub(in crate::front::mir) fn align_up(offset: u64, align: u64) -> Option<u64> {

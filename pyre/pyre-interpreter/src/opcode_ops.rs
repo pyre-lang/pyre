@@ -204,32 +204,6 @@ pub fn binary_value(
     // passes its own spelling — `&` for `a & b`, `&=` for `a &= b`.
     let symbol = operator_symbol(op);
     use crate::objspace::descroperation as desc;
-    let dunder = match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(desc::BinopDunder::Add),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(desc::BinopDunder::Sub),
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(desc::BinopDunder::Mul),
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-            Some(desc::BinopDunder::FloorDiv)
-        }
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-            Some(desc::BinopDunder::Mod)
-        }
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
-            Some(desc::BinopDunder::TrueDiv)
-        }
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => Some(desc::BinopDunder::LShift),
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => Some(desc::BinopDunder::RShift),
-        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(desc::BinopDunder::And),
-        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(desc::BinopDunder::Or),
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(desc::BinopDunder::Xor),
-        _ => None,
-    };
-    if let Some(dunder) = dunder
-        && let Some(w_res) =
-            pyre_object::with_roots!(a, b => desc::try_binop_shortcut(a, b, dunder))?
-    {
-        return Ok(w_res);
-    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
@@ -510,7 +484,10 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
-            return Ok(w_tuple_from_shadow(base, items.len()));
+            let live: Vec<PyObjectRef> = (0..items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                .collect();
+            return Ok(pyre_object::w_tuple_new(live));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
@@ -1342,7 +1319,7 @@ fn _dict_merge_loop(
 /// `f(x=1, **D(a=1))` with D overriding __getitem__/keys and inheriting dict.__iter__ yields the
 /// backing value and never calls keys()). Engineered as dictmultiobject.py rev_update1_dict_dict's
 /// live storage walk plus _dict_merge_loop's contains_w check.
-fn _dict_merge_dict(
+pub fn _dict_merge_dict(
     w_dict: PyObjectRef,
     w_item: PyObjectRef,
     w_function: PyObjectRef,

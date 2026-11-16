@@ -2956,7 +2956,7 @@ impl<'a> Lowering<'a> {
             if !seen.insert(cur) {
                 return None;
             }
-            let from_call = self.body.body.iter().find_map(|bb| {
+            let from_call = self.body.body().iter().find_map(|bb| {
                 let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
                     return None;
                 };
@@ -2982,7 +2982,7 @@ impl<'a> Lowering<'a> {
             if from_call.is_some() {
                 return from_call;
             }
-            cur = self.body.body.iter().find_map(|bb| {
+            cur = self.body.body().iter().find_map(|bb| {
                 bb.statements.iter().find_map(|stmt| {
                     let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                         return None;

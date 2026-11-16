@@ -10349,6 +10349,12 @@ pub fn py_unit_is_cache(frame: usize, pc: usize) -> bool {
 ///
 /// The success-path push of that dest sits above GET_ITER's two slots; pop
 /// it so the rewound `FOR_ITER` still peeks the iterator.
+///
+/// Residual (`rlib/jit.py` `dont_look_inside`): compiled-loop CRN park
+/// (`pyjitpl.py` `_establish_nullity`) is JIT-dispatch, and the helper
+/// lives outside the interpreter minting closure.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn rewind_foriter_cache_park(frame: &mut pyre_interpreter::pyframe::PyFrame) -> bool {
     let next = frame.next_instr();
     let extra = frame.valuestackdepth.saturating_sub(frame.stack_base());
@@ -10420,6 +10426,11 @@ fn foriter_header_for_null_tos_park(
 /// `YIELD_VALUE` has a one-unit CACHE pad. Compiled-loop CRN parks on
 /// that CACHE (`next` is not `RESUME`); `owning_instruction` walks it
 /// back to the yield. A specialised `RESUME_CHECK` is the same park.
+///
+/// Residual (`rlib/jit.py` `dont_look_inside`): same JIT-dispatch
+/// boundary as [`rewind_foriter_cache_park`].
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn push_resume_send_none_if_parked(frame: &mut pyre_interpreter::pyframe::PyFrame) -> bool {
     let next = frame.next_instr();
     let extra = frame.valuestackdepth.saturating_sub(frame.stack_base());

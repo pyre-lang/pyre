@@ -85,11 +85,13 @@
 //!     no-op alias. Enum variants, tuples, and arrays still emit
 //!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
-//!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
-//!     / __len / __nullary_*)`. `new_array_clear` is produced later by
-//!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
-//!     repeat stays the `__array_repeat(fill, count)` call here. The
-//!     result type is the dest's `Array<T;N>` so
+//!   - `Repeat` / `Len` / `NullaryOp` — a small literal scalar `[T; N]` Repeat
+//!     is `rffi.CFixedArray` initialisation (`CConfig.in6_addr.s6_addr`):
+//!     the same Array ctor plus per-slot `__pos_i` writes as `Aggregate`
+//!     of N copies of the fill. A large, non-literal, object, or resizable
+//!     repeat stays `__array_repeat` (`rlist.py` `ll_alloc_and_set`).
+//!     `new_array_clear` is produced later by `do_fixed_newlist_clear`.
+//!     The call's result type is the dest's `Array<T;N>` so
 //!     `fixed_repeat_identity` can redirect without a later
 //!     `ArrayRead` / `ArrayWrite` of the same SSA.
 //!
@@ -5759,7 +5761,12 @@ pub(in crate::front::mir) fn rust_vec_header_ptr_spelling(
                 tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
             Some(format!("*mut Vec<{item}>"))
         }
-        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<*mut u8>".to_string()),
+        // `llmemory.GCREF` / `lltype.Ptr(GcOpaqueType)`. `*mut u8` is
+        // `rffi.CCHARP` (`vec_item_kind_for_spelling` Int); intern of
+        // that spelling is `SomeRustVec` of Integer items and cannot
+        // setbind `for_kind(Ref)` (`rlist.py` `ll_alloc_and_set` of a
+        // pointer item).
+        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<GCREF>".to_string()),
         Some(majit_ir::rvec::VecItemKind::Float) => Some("*mut Vec<f64>".to_string()),
         None => None,
     }
@@ -5785,7 +5792,9 @@ fn annotation_struct_field_type(
                 tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
             format!("*mut Vec<{item}>")
         }
-        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
+        // Same GCREF header as `rust_vec_header_ptr_spelling`. `*mut u8`
+        // is CCHARP / Address (`vec_item_kind_for_spelling` Int).
+        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => {
             // `bookkeeper.py` `getuniqueclassdef` is one ClassDef per class,
@@ -8597,7 +8606,7 @@ pub(crate) fn declared_gckind_by_name(
             if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
                 continue;
             }
-            let canon = strip_crate_prefix(td.item_meta.name_path_str());
+            let canon = td.item_meta.name_path_stripped().to_string();
             let kind = declared_gckind(struct_id_for_type_decl(td), &canon, &gc);
             out.insert(canon, kind);
         }
@@ -9644,7 +9653,13 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         Some(gc_root_effects),
         func_hints,
         None,
-    )
+    )?;
+    // Whole-program lowering stamps the header (`graph_stamp`) after the
+    // body. This single-decl entry is the same funcobj; GraphKey occupancy
+    // is `scope_owner_identity`.
+    Ok(graph
+        .with_funcobj_identity(scope_owner_identity(llbc, fd))
+        .with_fun_decl_id(fd.def_id))
 }
 
 /// Lower a same-crate callee whose return is a fat `&dyn` / `Box<dyn>`,
@@ -9827,8 +9842,8 @@ pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, discover_eval_override_graphs, discover_profilefunc_graphs,
     discover_profilefunc_spellings, fnptr_field_family_member_fn_ids, fnptr_field_under_use,
-    fnptr_struct_field_target, inherent_callable_rust_path, registered_path_for_fun_decl,
-    release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
+    fnptr_struct_field_target, inherent_callable_rust_path, release_declared_vable_array_address,
+    vtable_slot_under_fn_ptr_cast,
 };
 pub use self::desugar::callee::{harvest_path_for_fun_decl, registered_path_for_fun_decl};
 pub(crate) use self::desugar::rewire::{
@@ -9836,7 +9851,7 @@ pub(crate) use self::desugar::rewire::{
     is_core_default_path,
 };
 pub(crate) use self::gcroot::{
-    OWNER_ROOT_DECLARED_PATH, ROOT_SCOPE_CLOSE, ROOT_SCOPE_CLOSE_JIT_ABI, RootStackAnalyzer,
+    OWNER_ROOT_DECLARED_PATH, ROOT_SCOPE_CLOSE, RootStackAnalyzer,
     harvest_root_stack_touching_paths_with, harvest_scope_owning_identities_with,
     is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
     is_slice_buffer_free_call, owner_root_type_path,

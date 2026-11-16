@@ -1251,12 +1251,27 @@ fn is_array_aggregate_ctor(kind: &OpKind) -> bool {
     )
 }
 
-fn array_aggregate_elements(
+/// An array aggregate rebuilt as `newlist`: its items in position order,
+/// and the index of the block operation the `newlist` replaces.
+struct ArrayAggregate {
+    items: Vec<Variable>,
+    at: usize,
+}
+
+/// The items of the array built by the ctor at `ctor_at`, whose result
+/// is `array`.  The front may compute an item after the ctor and before
+/// its `__pos_i` write (`ctor_ccharp_field_store` `narrow_root` emits
+/// `cast_instance` there; `rclass.py` `InstanceRepr.rtype_setattr`
+/// `convertvar`), so `newlist` takes the place of the last write.  A
+/// missing or repeated position declines.
+fn array_aggregate_items(
     operations: &[SpaceOperation],
+    ctor_at: usize,
     array: &Variable,
-) -> Option<Vec<Variable>> {
+) -> Option<ArrayAggregate> {
     let mut by_index = Vec::new();
-    for op in operations {
+    let mut at = ctor_at;
+    for (op_index, op) in operations.iter().enumerate() {
         if let OpKind::FieldWrite {
             base, field, value, ..
         } = &op.kind
@@ -1264,6 +1279,7 @@ fn array_aggregate_elements(
         {
             let index = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
             by_index.push((index, value.as_variable()?.clone()));
+            at = at.max(op_index);
         }
     }
     by_index.sort_by_key(|(index, _)| *index);
@@ -1272,7 +1288,10 @@ fn array_aggregate_elements(
             return None;
         }
     }
-    Some(by_index.into_iter().map(|(_, value)| value).collect())
+    Some(ArrayAggregate {
+        items: by_index.into_iter().map(|(_, value)| value).collect(),
+        at,
+    })
 }
 
 /// A shaped Rust tuple aggregate emitted by `front::mir`: the
@@ -7763,16 +7782,17 @@ fn function_graph_to_flowspace_inner(
                 Some((result, aggregate))
             })
             .collect();
-        let array_list_elements: HashMap<Variable, Vec<Variable>> = legacy_block
+        let array_list_elements: HashMap<Variable, ArrayAggregate> = legacy_block
             .operations
             .iter()
-            .filter_map(|op| {
+            .enumerate()
+            .filter_map(|(index, op)| {
                 if !is_array_aggregate_ctor(&op.kind) {
                     return None;
                 }
                 let result = op.result.as_ref()?.clone();
-                let elements = array_aggregate_elements(&legacy_block.operations, &result)?;
-                Some((result, elements))
+                let aggregate = array_aggregate_items(&legacy_block.operations, index, &result)?;
+                Some((result, aggregate))
             })
             .collect();
         let is_window_field = |field: &crate::model::FieldDescriptor| -> bool {
@@ -7914,27 +7934,33 @@ fn function_graph_to_flowspace_inner(
             // RPython has one list model for Rust fixed arrays, slices, and
             // Vec values.  Rebuild the front-end's exact Array ctor +
             // positional writes as `newlist(items...)` only in this
-            // flowspace view; the semantic graph stays intact for legacy
-            // fallback/code generation.
-            if let Some(result_var) = legacy_op.result.as_ref()
-                && let Some(elements) = array_list_elements.get(result_var)
-            {
-                let mut args = Vec::with_capacity(elements.len());
-                for (index, element) in elements.iter().enumerate() {
-                    args.push(lookup_operand(
-                        &value_map,
-                        element,
-                        legacy_op,
-                        &format!("array_item_{index}"),
-                    )?);
+            // flowspace view, placed where its last item is written; the
+            // semantic graph stays intact for legacy fallback/code
+            // generation.
+            let array_var = match &legacy_op.kind {
+                OpKind::FieldWrite { base, .. } if array_list_elements.contains_key(base) => {
+                    Some(base)
                 }
-                let result = resolve_result_hlvalue(legacy_op, &value_map)?;
-                translated_ops.push(FlowspaceOp::new("newlist", args, result));
-                continue;
-            }
-            if let OpKind::FieldWrite { base, .. } = &legacy_op.kind
-                && array_list_elements.contains_key(base)
-            {
+                _ => legacy_op
+                    .result
+                    .as_ref()
+                    .filter(|result| array_list_elements.contains_key(*result)),
+            };
+            if let Some(array_var) = array_var {
+                let aggregate = &array_list_elements[array_var];
+                if aggregate.at == op_index {
+                    let mut args = Vec::with_capacity(aggregate.items.len());
+                    for (index, element) in aggregate.items.iter().enumerate() {
+                        args.push(lookup_operand(
+                            &value_map,
+                            element,
+                            legacy_op,
+                            &format!("array_item_{index}"),
+                        )?);
+                    }
+                    let result = lookup_operand(&value_map, array_var, legacy_op, "array")?;
+                    translated_ops.push(FlowspaceOp::new("newlist", args, result));
+                }
                 continue;
             }
             // A Rust tuple aggregate is `newtuple(items...)` in this view,
@@ -12427,9 +12453,10 @@ mod tests {
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
                         generic_rust_args: Vec::new(),
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -12463,9 +12490,10 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__delslice_range".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
                     generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![
                     vars[0].clone(),
@@ -13968,6 +13996,7 @@ mod tests {
                     ],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -14005,6 +14034,7 @@ mod tests {
                     segments: vec!["vec".into(), "Vec".into(), "deref".into()],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
@@ -17537,6 +17567,9 @@ mod tests {
         ));
     }
 
+    /// A shaped array ctor whose item is computed after the ctor becomes one
+    /// `newlist` at its last item write (`ctor_ccharp_field_store` may
+    /// emit `cast_instance` between the ctor and `__pos_i`).
     #[test]
     fn function_graph_to_flowspace_rebuilds_array_aggregate_as_rpython_list() {
         let mut graph = LegacyGraph::new("array_to_list");
@@ -17548,10 +17581,6 @@ mod tests {
                 SpaceOperation {
                     result: Some(vars[2].clone()),
                     kind: OpKind::ConstInt(10),
-                },
-                SpaceOperation {
-                    result: Some(vars[3].clone()),
-                    kind: OpKind::ConstInt(20),
                 },
                 SpaceOperation {
                     result: Some(vars[4].clone()),
@@ -17572,6 +17601,10 @@ mod tests {
                         value: LinkArg::Value(vars[2].clone()),
                         ty: ValueType::Int,
                     },
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
                 },
                 SpaceOperation {
                     result: None,

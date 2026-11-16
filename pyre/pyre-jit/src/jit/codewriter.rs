@@ -17810,7 +17810,7 @@ impl CodeWriter {
                 head_block_range_meta.push((k, has_end));
             }
         }
-        let (jitcode, combined_bytes) = {
+        let (mut jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
         }?;
@@ -18771,6 +18771,11 @@ impl CodeWriter {
             const_ref_slots_by_jit_pc,
             is_drained: true,
         };
+
+        // Unique walk's MIFrame reads this the way FBW
+        // `record_inline_application_traceback` reads
+        // `PyJitCodeMetadata.portal_frame_reg` off `registers_r`.
+        jitcode.exec.portal_frame_reg = portal_frame_reg;
 
         Some(PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),

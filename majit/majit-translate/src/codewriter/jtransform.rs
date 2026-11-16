@@ -11694,7 +11694,13 @@ impl<'a> Transformer<'a> {
             }
             other => other,
         };
-        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+        if let Some(VableArrayVar {
+            vable_base,
+            array_index: arr_idx,
+            itemsize,
+            is_signed,
+            owner,
+        }) = self
             .vable_array_vars
             .get(&resolve_alias(base, &self.aliases))
             .cloned()
@@ -18948,6 +18954,30 @@ fn fixed_list_clears(item: &str) -> bool {
         || item.starts_with("Rc<")
         || item.starts_with("Vec<")
         || item.starts_with("Option<")
+}
+
+/// ARRAY of a skip-spine fixed list, keyed by the identity
+/// [`crate::front::mir::fixed_list_reader`] already published (`slice_array_type_id`, then
+/// `canonical_array_type_id`). `rstr.py CHAR_ARRAY` is `[u8]`;
+/// `rlist.py` list items are `GcArray(Signed)` / `GcArray(Float)`;
+/// `rmodel.py externalvsinternal(..., gcref=True)` stores object items
+/// as `GcArray(GCREF)`.
+fn gc_array_for_fixed_list_id(
+    array_type_id: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+    let mut inner = array_type_id.trim();
+    while let Some(rest) = crate::front::typestr::peel_pointer_prefix(inner) {
+        inner = rest;
+    }
+    let id = crate::front::typestr::canonical_array_type_id(inner);
+    match id.as_ref() {
+        LIST_INT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Signed)),
+        LIST_FLOAT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Float)),
+        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID => Some(Array::gc((*GCREF).clone())),
+        "[u8]" | "GcArray<u8>" => Some(crate::codewriter::call::gcarray_char()),
+        _ => None,
+    }
 }
 
 /// ARRAY identity of a rich `__array_repeat`.
@@ -30004,6 +30034,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )

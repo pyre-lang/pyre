@@ -389,7 +389,8 @@ impl SomePtr {
         match example.getattr(attr) {
             Ok(v) => {
                 if v != lltype::LowLevelValue::Void {
-                    let v_lltype = annotation_to_lltype(s_value, None)?;
+                    let field_t = lltype::typeOf_value(&v);
+                    let v_lltype = annotation_to_stored_field_lltype(s_value, &field_t)?;
                     example
                         .setattr(attr, v_lltype._defl())
                         .map_err(AnnotatorError::new)?;
@@ -432,6 +433,23 @@ fn strptr_as_somestring(s: &SomeValue) -> Option<SomeValue> {
         return None;
     }
     s_str0().noneify().ok()
+}
+
+/// lltype of `s_value` stored into a field whose declared type is `field_t`.
+///
+/// `annotation_to_lltype` has no SomeString witness (`llannotation.py`).
+/// Niche-null intern of a STR key cell (`BytesKey` / `StrKey` dummy
+/// `null_mut()`, `rstr.py` `STRPTR`) is SomeString (`s_str0`). Store of
+/// that word into STRPTR is the same pointer (`lltype.py`
+/// `SomePtr.setattr` of a matching Ptr).
+fn annotation_to_stored_field_lltype(
+    s_value: &SomeValue,
+    field_t: &lltype::LowLevelType,
+) -> Result<lltype::LowLevelType, AnnotatorError> {
+    if matches!(s_value, SomeValue::String(_)) && lltype_is_strptr(field_t) {
+        return Ok(field_t.clone());
+    }
+    annotation_to_lltype(s_value, None)
 }
 
 fn lltype_is_strptr(ty: &lltype::LowLevelType) -> bool {
@@ -543,6 +561,7 @@ fn carray_item_struct_field_accepts(field_t: &lltype::LowLevelType, s_value: &So
         Err(_) if matches!(s_value, SomeValue::Instance(_)) && is_pointer_word_lltype(field_t) => {
             true
         }
+        Err(_) if matches!(s_value, SomeValue::String(_)) && lltype_is_strptr(field_t) => true,
         _ => false,
     }
 }
@@ -754,8 +773,10 @@ impl SomeInteriorPtr {
             );
         };
         let mut example = self.ll_ptrtype._example();
-        if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
-            let v_lltype = annotation_to_lltype(s_value, None)?;
+        let v = example.getattr(attr).map_err(AnnotatorError::new)?;
+        if v != lltype::LowLevelValue::Void {
+            let field_t = lltype::typeOf_value(&v);
+            let v_lltype = annotation_to_stored_field_lltype(s_value, &field_t)?;
             example
                 .setattr(attr, v_lltype._defl())
                 .map_err(AnnotatorError::new)?;

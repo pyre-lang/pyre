@@ -7380,7 +7380,7 @@ fn iterable_uses_base_iter(obj: PyObjectRef, base_type: &pyre_object::PyType) ->
     }
 }
 
-fn set_init_from_iterable_impl(
+pub fn set_init_from_iterable_impl(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
     wrap_hash_error: bool,
@@ -25462,7 +25462,7 @@ fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 /// Keeping the decomposition on pyre's translated `RBigInt` surface matches
 /// PyPy's `W_FloatObject.descr_as_integer_ratio` and avoids crossing into
 /// RustPython's opaque malachite `Rational` implementation.
-fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError> {
+pub fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError> {
     if value.is_infinite() {
         return Err(crate::PyError::overflow_error(
             "cannot convert Infinity to integer ratio",
@@ -33016,7 +33016,7 @@ fn set_op_xor(
 /// `setobject.py W_BaseSetObject.descr_union` — the result starts as a copy
 /// of self and every operand is merged in: a set operand through its storage
 /// (`:366`), any other iterable element by element (`:368-369`).
-pub(crate) fn set_method_union(
+pub fn set_method_union(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33243,7 +33243,7 @@ fn set_intersection_len_absorbed(err: &mut crate::PyError) -> bool {
 /// with duplicates is measured longer than the set it becomes. That measure
 /// disagreeing with the set lengths is what leaves work for the swap in
 /// `set_intersect_update`.
-pub(crate) fn set_method_intersection(
+pub fn set_method_intersection(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33331,7 +33331,7 @@ pub(crate) fn set_method_intersection(
 
 /// `setobject.py W_BaseSetObject.descr_difference` — a copy of self with
 /// `descr_difference_update` run over it.
-pub(crate) fn set_method_difference(
+pub fn set_method_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33802,7 +33802,7 @@ fn set_setitem_with_hash_result(rc: i64) -> Result<(), crate::PyError> {
 /// One `iterkeys_with_hash` pass of
 /// `ObjectSetStrategy._symmetric_difference_unwrapped`: keys of `walk` that
 /// `contains_with_hash` misses in `probe` are placed in `d_new`.
-fn symmetric_difference_one_side(
+pub fn symmetric_difference_one_side(
     walk_slot: usize,
     probe_slot: usize,
     d_new_slot: usize,

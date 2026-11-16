@@ -7,14 +7,15 @@ use super::{
     is_rustc_pointer_niche_spelling, is_str_family_class_root, json_ty_is_by_value_copy_aggregate,
     json_ty_is_thin_pointer_element, json_ty_packed_copy_struct_byte_size,
     json_ty_scalar_element_spelling, no_immutable_fields, no_raw_alloc_flavor,
-    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
-    raw_ptr_pointee_is_non_adt_spelling, repeat_array_result_ty, shaped_array_parts,
-    ty_is_raw_address, type_decl_is_closure_env, tyref_array_suffix, tyref_enum_payload_value_type,
+    no_tombstoned_leaves, payload_tuple_suffix, positional_aggregate_field_rows,
+    raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling, repeat_array_result_ty,
+    shaped_array_parts, ty_is_raw_address, type_decl_is_closure_env,
+    tyref_aggregate_field_value_type, tyref_array_suffix, tyref_enum_payload_value_type,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling,
     tyref_is_niche_option, tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family,
-    tyref_is_void_zst, tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
-    positional_aggregate_field_rows, tyref_aggregate_field_value_type, tyref_is_raw_struct_value,
+    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr,
+    tyref_is_raw_struct_value, tyref_is_string_family, tyref_is_void_zst,
+    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
     tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
@@ -1639,6 +1640,10 @@ mod slice_or_vec_container_root_spelling_tests {
         assert_eq!(
             slice_or_vec_container_root_spelling("*mut Vec<*mut u8>"),
             Some("*mut Vec<*mut u8>")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("*mut Vec<GCREF>"),
+            Some("*mut Vec<GCREF>")
         );
         assert_eq!(
             slice_or_vec_container_root_spelling("Vec<*mut u8>"),
@@ -22222,6 +22227,95 @@ fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
     assert_eq!(dotted, expected);
 }
 
+/// `rordereddict.py` `DICTENTRY` inlines `ObjectKey` as field 0
+/// (`lltype.py` `_first_struct`). Missing Charon layout of that field
+/// is still offset 0 (`type_decl_field_at_offset_zero`): the inner
+/// leaf keeps `hash` on `ObjectKey`, not a dotted `key.hash` on Entry
+/// (`lltype.py` `_nofield` of `"key.hash"`).
+#[test]
+fn collect_by_value_struct_leaves_unknown_offset_field0_keeps_inner_names() {
+    let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+    let decls = vec![
+        type_decl_struct(
+            0,
+            &["dictmultiobject", "ObjectKey"],
+            vec![field("hash", i64_ty()), field("obj", i64_ty())],
+        ),
+        type_decl_struct(
+            1,
+            &["rordereddict_entries", "Entry"],
+            vec![
+                field("key", named_adt(0, vec![])),
+                field("f_valid", i64_ty()),
+                field("value", i64_ty()),
+                field("f_hash", i64_ty()),
+            ],
+        ),
+    ];
+    let llbc = window_llbc(decls, vec![]);
+    let entry = llbc.type_by_id(1).expect("Entry decl");
+    let entry_ty = TyRef::Other(named_adt(1, vec![]).into());
+    let leaves = super::collect_by_value_struct_leaves(
+        entry,
+        &entry_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    let hash = leaves
+        .iter()
+        .find(|leaf| leaf.field.name == "hash")
+        .unwrap_or_else(|| panic!("inner hash leaf, got {leaves:?}"));
+    assert_eq!(
+        hash.field.owner_root.as_deref(),
+        Some("ObjectKey"),
+        "offset-0 hop keeps ObjectKey as owner"
+    );
+    assert!(
+        leaves.iter().all(|leaf| leaf.field.name != "key.hash"),
+        "unknown field-0 offset must not spell key.hash, got {leaves:?}"
+    );
+}
+
+/// A nested by-value field that is not declaration-order field 0 stays a
+/// hop when Charon layout is missing (`type_decl_field_at_offset_zero`).
+#[test]
+fn collect_by_value_struct_leaves_unknown_offset_later_field_stays_dotted() {
+    let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+    let decls = vec![
+        type_decl_struct(
+            0,
+            &["dictmultiobject", "ObjectKey"],
+            vec![field("hash", i64_ty())],
+        ),
+        type_decl_struct(
+            1,
+            &["fixture", "Holder"],
+            vec![
+                field("prefix", i64_ty()),
+                field("key", named_adt(0, vec![])),
+            ],
+        ),
+    ];
+    let llbc = window_llbc(decls, vec![]);
+    let holder = llbc.type_by_id(1).expect("Holder decl");
+    let holder_ty = TyRef::Other(named_adt(1, vec![]).into());
+    let leaves = super::collect_by_value_struct_leaves(
+        holder,
+        &holder_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        leaves.iter().any(|leaf| leaf.field.name == "key.hash"
+            && leaf.field.owner_root.as_deref() == Some("Holder")),
+        "nonzero hop spells key.hash on Holder, got {leaves:?}"
+    );
+}
+
 #[test]
 fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
     let mut funs = Vec::new();
@@ -22382,6 +22476,22 @@ fn field_row_declared_gc_pointer_is_gcref() {
     reg.note_declared_gc_name("owner::GcAdt");
     let got = super::field_row_lltype(&reg, "*mut owner::GcAdt", &mut field_row_visited())
         .expect("declared-GC pointer field");
+    assert_eq!(got, (*GCREF).clone());
+}
+
+#[test]
+fn field_row_identity_key_is_gcref() {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    let mut reg = crate::front::StructFieldRegistry::default();
+    reg.fields.insert(
+        "identitydict::IdentityKey".to_string(),
+        vec![("__pos_0".to_string(), "*mut pyobject::PyObject".to_string())],
+    );
+    let got = super::field_row_lltype(&reg, "identitydict::IdentityKey", &mut field_row_visited())
+        .expect("IdentityKey field intern");
+    assert_eq!(got, (*GCREF).clone());
+    let got = super::field_row_lltype(&reg, "IdentityKey", &mut field_row_visited())
+        .expect("IdentityKey leaf intern");
     assert_eq!(got, (*GCREF).clone());
 }
 

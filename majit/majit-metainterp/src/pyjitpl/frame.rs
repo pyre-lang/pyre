@@ -802,6 +802,10 @@ impl MIFrame {
 
     /// pyjitpl.py `MIFrame.setup_resume_at_op(pc)`.
     ///
+    /// Upstream is `self.pc = pc`. The walker (`run_one_step`) reads
+    /// `code_cursor`; a snapshot reports `pc`. `newframe` / `setup` leave
+    /// `code_cursor` at 0, so resume must seat both or unique interpret
+    /// restarts the jitcode at entry (`bump()` before a later residual).
     /// `last_opcode_position` follows `pc`, the way `setup` seats both and
     /// `BlackholeInterpreter::reset_position_state` does for a resumed
     /// blackhole frame. `prepare_resume_from_failure` runs
@@ -809,6 +813,7 @@ impl MIFrame {
     /// dispatched, and the traceback node it attaches reads this cursor.
     pub fn setup_resume_at_op(&mut self, pc: usize) {
         self.pc = pc;
+        self.code_cursor = pc;
         self.last_opcode_position = pc;
     }
 
@@ -2250,6 +2255,8 @@ mod tests {
         let mut frame = MIFrame::new(jitcode.clone(), 0);
         frame.setup_resume_at_op(123);
         assert_eq!(frame.pc, 123);
+        assert_eq!(frame.code_cursor, 123);
+        assert_eq!(frame.last_opcode_position, 123);
     }
 
     #[test]

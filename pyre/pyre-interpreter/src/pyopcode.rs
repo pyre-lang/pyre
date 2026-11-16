@@ -2323,14 +2323,14 @@ pub fn make_function_flag_arg(
 /// `oefmt` is likewise not looked inside.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn call_intrinsic_1_err_not_implemented(func: IntrinsicFunction1) -> crate::PyError {
+pub fn call_intrinsic_1_err_not_implemented(func: IntrinsicFunction1) -> crate::PyError {
     crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
 }
 
 /// Residual TypeError for an unimplemented `CALL_INTRINSIC_2` variant.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn call_intrinsic_2_err_not_implemented(func: IntrinsicFunction2) -> crate::PyError {
+pub fn call_intrinsic_2_err_not_implemented(func: IntrinsicFunction2) -> crate::PyError {
     crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
 }
 
@@ -3411,23 +3411,8 @@ where
     let Instruction::Reraise { depth } = instruction else {
         unreachable!()
     };
-    // Same stub problem as `raise_varargs` / `check_exc_match`.
-    let oparg = depth.get(op_arg);
-    let reraise_lasti: i32 = if oparg != 0 {
-        crate::baseobjspace::int_w(executor.peek_at(oparg as usize)?)? as i32
-    } else {
-        -1
-    };
-    let w_exc = executor.pop_value()?;
-    if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
-        return Err(PyError::type_error(
-            "exception must derive from BaseException",
-        ));
-    }
-    let mut err = unsafe { PyError::from_exc_object(w_exc) };
-    err.set_attach_tb(false);
-    err.set_reraise_lasti(reraise_lasti);
-    Err(err)
+    executor.reraise(depth.get(op_arg))?;
+    Ok(StepResult::Continue)
 }
 
 pub fn execute_list_extend<E: OpcodeStepExecutor>(

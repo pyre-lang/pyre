@@ -1183,9 +1183,6 @@ pub(in crate::front::mir) const ROOTED_ITEMS_TYPE: &str = "RootedItems";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard's save_point word.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close_word";
-/// Word-ABI residual of [`ROOT_SCOPE_CLOSE`]. Jitcode holds the guard as its
-/// save_point word, so the emitted close names this leaf.
-pub(crate) const ROOT_SCOPE_CLOSE_JIT_ABI: &str = "root_scope_close_jit_abi";
 
 /// True for the root-bracket guard's own type path.
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
@@ -1324,7 +1321,6 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let in_gc_roots = segments.iter().any(|s| s == "gc_roots");
     (leaf == Some("drop_in_place") && in_gc_roots && segments.iter().any(|s| s == "RootScope"))
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
-        || (leaf == Some(ROOT_SCOPE_CLOSE_JIT_ABI) && in_gc_roots)
 }
 
 /// Guard releases that an exceptional Result rewrite must replay on the
@@ -2645,7 +2641,7 @@ pub(in crate::front::mir) fn block_successors_kind(
     bb: usize,
     include_unwind: bool,
 ) -> Vec<usize> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut out = Vec::new();
     let mut push = |target: u64| {
         let target = target as usize;
@@ -5380,7 +5376,7 @@ pub fn pin_roots_published_locals(
 ) -> Option<Vec<usize>> {
     let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

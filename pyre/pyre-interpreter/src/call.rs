@@ -185,7 +185,7 @@ type RecursionHome = *mut crate::PyExecutionContext;
 /// execution context; this Rust TLS is only the pre-context fallback and has
 /// no source-translatable object graph.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
+pub fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.get())
 }
 
@@ -462,11 +462,12 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
 
 /// Direct call the codewriter classifies as the jd0 portal runner.
 ///
-/// The traced form is `recursive_call`, not this body. The body is the
-/// interpreter entry: the registered eval function, same as the indirect
-/// hook this call replaced. `frame` is `&mut PyFrame` so the red is
-/// GCREF, matching `jit_merge_point` and `PYPYJIT_RED_VARS`.
+/// The traced form is `recursive_call`, not this body
+/// (`warmspot.py` `rewrite_jit_merge_point`). Residual
+/// (`rlib/jit.py` `dont_look_inside`): looking inside types
+/// `get_eval_fn()` as Integer and fails `simple_call`.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn recursive_portal_enter(
     _next_instr: i64,
     _is_being_profiled: i64,
@@ -1255,7 +1256,7 @@ fn format_unknown_kwds_err(fname: &Wtf8, unmatched: &[Wtf8Buf]) -> Wtf8Buf {
 #[cold]
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn resolve_kwargs_binding_error(
+pub fn resolve_kwargs_binding_error(
     callable: PyObjectRef,
     args: &[PyObjectRef],
     kwarg_names: PyObjectRef,
@@ -1644,8 +1645,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
     builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
-#[majit_macros::unroll_safe]
-fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+pub fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
     // collection between the outer `space.call_function` reload and this
@@ -2405,7 +2405,7 @@ fn call_kw_in_ctx_impl(
 /// The bound scope has the `Arguments.parse_into_scope` layout
 /// (`co_argcount + kwonly + *args + **kwargs`, defaults filled) and is what
 /// `call_user_function_resolved` copies into the new frame.
-fn call_user_function_from_call_kw(
+pub fn call_user_function_from_call_kw(
     execution_context: *const crate::PyExecutionContext,
     target_func: PyObjectRef,
     call_args: &[PyObjectRef],
@@ -2554,6 +2554,17 @@ fn read_root_run(
         out.push(roots.get(base + index));
     }
     out
+}
+
+/// True when `type(callable) is type`. This is the first test
+/// `metaclass_call_override` makes, and it cannot collect: `r#type` and
+/// `w_type` are pointer reads. It is a subset of "no override" — a class
+/// whose metaclass is exactly `type` uses `type.__call__`, the default
+/// constructor.
+#[inline]
+fn metaclass_is_type(callable: PyObjectRef) -> bool {
+    crate::typedef::r#type(callable)
+        .is_some_and(|m| std::ptr::eq(m.as_ptr(), crate::typedef::w_type()))
 }
 
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
@@ -2751,12 +2762,14 @@ fn call_callable_with_mode(
     // One-arg type call (`ValueError("v")`) is a word residual so the
     // exception-bridge walk can construct the instance instead of
     // residualising the slice-ABI generic dispatcher.
-    // `descroperation.py call` looks up `type(w_obj).__call__`; take this
-    // residual only when that lookup is the default constructor.
-    if unsafe { pyre_object::is_type(callable) }
-        && args.len() == 1
-        && metaclass_call_override(callable).is_none()
-    {
+    // `descroperation.py call` looks up `type(w_obj).__call__`; when
+    // `type(w_obj) is type` that lookup is `type.__call__`, the default
+    // constructor.  The predicate is a pointer-identity test and cannot
+    // collect, so `callable` and `args` may stay unrooted here.  Any other
+    // metaclass (ABCMeta, EnumType, a metaclass with `__call__`) falls
+    // through to `call_non_function_callable_with_mode`, which performs
+    // the override check with roots.
+    if unsafe { pyre_object::is_type(callable) } && args.len() == 1 && metaclass_is_type(callable) {
         let value = call_type_one_arg(execution_context, callable, args[0]);
         if value.is_null() {
             return Err(
@@ -4126,7 +4139,7 @@ fn call_with_minted_keyword_names(
 /// `methodcall` is `Arguments.methodcall`; `_match_signature` raises
 /// `ArgErrTooManyMethod` when it is set. Callers that hold an `Arguments`
 /// pass `args.methodcall`; star-arg and minted-name paths pass `false`.
-fn call_with_kwargs_in_ctx_impl(
+pub fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
@@ -4985,10 +4998,9 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
 /// wraps it for callers that expect a bare `PyObjectRef` and stash the
 /// error in `PENDING_CALL_ERROR` instead.
 ///
-/// `*args_w` has a length fixed per call site, so the loops over `args`
-/// (root reload, receiver-prepended argument list) unroll like
-/// `list(args_w)` does.
-#[majit_macros::unroll_safe]
+/// Residual (`look_inside_graph` sees the `args` loop). The word-ABI
+/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
+#[majit_macros::getfunctionptr]
 pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],
@@ -5005,17 +5017,9 @@ pub fn call_function_impl_result(
     // re-reads the nursery window and the foreign-mutator flag that the whole
     // set shares.  This is the `publish_roots` + `normalize_roots` shape
     // `pin_roots` documents for a set that does not sit in one slice.
-    // `publish(&[callable])` materializes a one-word buffer and stores the
-    // callable as an integer before that buffer is allocated. The allocation
-    // can collect, and the integer is not a root, so the slot then holds the
-    // pre-move address. `pin_root` takes the reference itself.
-    let _ = _roots.pin_root(callable);
-    let arg_len = args.len();
-    let args_at = _roots.publish(args);
-    let root_base = args_at - 1;
-    // `normalize_moved`'s bool is true whenever the nursery forwarded a
-    // slot. The callable is reloaded from its published slot on both arms.
-    let roots_moved = _roots.normalize_moved(root_base, 1 + arg_len);
+    let root_base = _roots.publish(&[callable]);
+    let _ = _roots.publish(args);
+    let roots_moved = _roots.normalize_moved(root_base, 1 + args.len());
 
     // A JIT prologue may have published an overflow before entering this
     // residual dispatcher, so preserve that pending exception.  Do not run a
@@ -6002,79 +6006,19 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     // The callee frame is pinned and the caller is not, for the reason
     // `call_user_function_with_ctx` records: no caller `PyFrame` exists here.
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
-    // Generators already returned through `frame_into_generator_for_function`.
-    // `PyFrame::run` is `execute_frame` here: the portal, not a second snapshot.
-    eval_current_frame_raw(&mut frame)
-}
-
-/// Invoke a user function with an already-resolved argument scope,
-/// frameless (exec ctx pulled from the thread-local set by
-/// __build_class__).  Mirrors [`call_user_function_with_args`] but skips
-/// `fill_user_function_args` because `args` is the final frame-local
-/// layout produced by [`resolve_kwargs`] — re-matching it would treat the
-/// packed `*args` / `**kwargs` slots as extra positionals.
-fn call_user_function_resolved_frameless(
-    mut func: PyObjectRef,
-    args: &[PyObjectRef],
-) -> PyObjectRef {
-    let w_code = unsafe { crate::getcode(func) };
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let closure = unsafe { function_get_closure(func) };
-    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-    let exec_ctx = take_last_exec_ctx();
-    let code_ref = unsafe { &*func_code };
-
-    // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-    let mut frame = match pyre_object::with_roots!(func => {
-        let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        };
-        crate::pyframe::FrameBox::new(inner)
-    }) {
-        Ok(f) => f,
+    let result = frame.run_with_jit();
+    match result {
+        Ok(v) => v,
         Err(e) => {
             set_call_error(e);
-            return PY_NULL;
+            PY_NULL
         }
-    };
-    frame.fix_array_ptrs();
-    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        return match frame_into_generator_for_function(frame, func) {
-            Ok(v) => v,
-            Err(e) => {
-                set_call_error(e);
-                PY_NULL
-            }
-        };
     }
-    // Argument matching has already happened, but the activation is the same
-    // `PyCode.funcrun` -> `PyFrame.run` one, so this takes the portal on the
-    // terms the ordinary spelling above records.
-    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
-    // Same portal as above: this function already returned when the code
-    // object is a generator or coroutine.
-    eval_current_frame_raw(&mut frame)
 }
 
-/// Call a metaclass with extra keyword arguments.
-///
-/// PyPy: metaclass(name, bases, namespace, **kwds).
-/// Resolves kwargs to the metaclass __new__'s kwonly / **kwds parameters.
-/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod);
-/// unwrap it to the underlying function so the signature-based dispatch and
-/// `is_function` fast-paths below see the real callable rather than the
-/// descriptor wrapper. Builtin `__new__` (not a staticmethod) passes through.
+/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod).
+/// Return the wrapped function so `resolve_kwargs` can match keywords against
+/// its signature; a builtin `__new__` (not a staticmethod) is returned as is.
 unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::function::is_staticmethod(f) } {
         unsafe { pyre_object::function::w_staticmethod_get_func(f) }
@@ -6110,205 +6054,20 @@ fn call_metaclass_with_kwargs(
     let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
     let name = || pyre_object::gc_roots::shadow_stack_get(name_slot);
     let bases = || pyre_object::gc_roots::shadow_stack_get(bases_slot);
-    if unsafe { !pyre_object::is_type(w_metaclass()) } {
-        // compiling.py:215-221 — `space.call_args(w_meta, Arguments(name,
-        // bases, ns, **kwds))`; a non-type metaclass receives the
-        // class-definition keywords too, and `call_args`
-        // (descroperation.py) takes no frame.
-        let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) } {
-            unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs()) }
-        } else {
-            Vec::new()
-        };
-        if !kwds.is_empty() {
-            return match call_with_kwargs_in_ctx(
-                take_last_exec_ctx(),
-                w_metaclass(),
-                &[name(), bases(), w_namespace_dict()],
-                &kwds,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            };
-        }
-        return crate::call_function(w_metaclass(), &[name(), bases(), w_namespace_dict()]);
-    }
-    let kw_base = pyre_object::gc_roots::shadow_stack_len();
-    let n_kw = {
-        let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) }
-        {
-            unsafe {
-                pyre_object::w_dict_items(kwargs())
-                    .into_iter()
-                    .filter(|(k, _)| pyre_object::is_str(*k))
-                    .collect()
-            }
-        } else {
-            Vec::new()
-        };
-        let flat: Vec<PyObjectRef> = kw_items.iter().flat_map(|&(k, v)| [k, v]).collect();
-        let _ = _roots.pin_roots(&flat);
-        kw_items.len()
-    };
-    let kw_key = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i);
-    let kw_value = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i + 1);
-    // Find the metaclass __new__ method
-    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass(), "__new__") };
-
-    let instance = if let Some(new_fn) = new_fn {
-        let new_fn = unsafe { unwrap_static_new(new_fn) };
-        // Resolve only against a user-defined __new__ with a real code
-        // object; the builtin type.__new__ has none, so fall through.
-        let is_user_fn = unsafe { crate::is_function(new_fn) }
-            && unsafe {
-                !crate::is_builtin_code(crate::getcode(new_fn) as pyre_object::PyObjectRef)
-            };
-        if is_user_fn {
-            // [mcs, name, bases, ns] positional + the class-definition
-            // kwargs as keywords; resolve_kwargs matches them against the
-            // __new__ signature, filling keyword-only params and packing
-            // the remainder into a `**kwds` parameter when present.
-            // `resolve_kwargs` reaches `store_collected_keyword`. The slots
-            // are the live words; these pins' arguments are not read again.
-            let new_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(new_fn);
-            let names_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-                (0..n_kw).map(kw_key).collect(),
-            ));
-            let mut call_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            call_args.extend((0..n_kw).map(kw_value));
-            match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
-                &call_args,
-                pyre_object::gc_roots::shadow_stack_get(names_slot),
-                false,
-            ) {
-                Ok(resolved) => call_user_function_resolved_frameless(
-                    pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
-                    &resolved,
-                ),
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            }
-        } else {
-            // Builtin type.__new__: the same Arguments shape as
-            // `space.call_obj_args(w_newfunc, self, __args__)`.
-            let mut new_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            let result = if n_kw == 0 {
-                call_function_impl_result(new_fn, &new_args)
-            } else {
-                let mut names = Vec::with_capacity(n_kw);
-                let mut values = Vec::with_capacity(n_kw);
-                for i in 0..n_kw {
-                    names.push(kw_key(i));
-                    values.push(kw_value(i));
-                }
-                call_with_kwargs_in_ctx_impl(
-                    take_last_exec_ctx(),
-                    new_fn,
-                    &new_args,
-                    &names,
-                    &values,
-                    true,
-                    std::ptr::null_mut(),
-                    false,
-                )
-            };
-            match result {
-                Ok(obj) => obj,
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            }
-        }
+    let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) } {
+        unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs()) }
     } else {
         Vec::new()
     };
-
-    if instance.is_null() {
-        return PY_NULL;
-    }
-    // Heap types are born nursery (`w_type_new` /
-    // `try_gc_alloc_collecting_rooted`). `__init__` is arbitrary Python and
-    // can collect, so the slot is the
-    // live word after those calls.
-    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(instance);
-    if let Some(w_insttype) = type_call_init_type(
-        pyre_object::gc_roots::shadow_stack_get(instance_slot),
-        w_metaclass(),
-    ) && let Some(init_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
-        let is_user_fn = unsafe { crate::is_function(init_fn) }
-            && unsafe {
-                !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
-            };
-        if is_user_fn && n_kw != 0 {
-            // The metaclass `__new__` ran between the pin and here.
-            // Same slot discipline as `__new__`: `init_fn` is not read again
-            // after the pin.
-            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(init_fn);
-            let names_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-                (0..n_kw).map(kw_key).collect(),
-            ));
-            let mut call_args = vec![
-                pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                name(),
-                bases(),
-                pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            ];
-            call_args.extend((0..n_kw).map(kw_value));
-            match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
-                &call_args,
-                pyre_object::gc_roots::shadow_stack_get(names_slot),
-                false,
-            ) {
-                Ok(resolved) => {
-                    let res = call_user_function_resolved_frameless(
-                        pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
-                        &resolved,
-                    );
-                    if res.is_null() {
-                        return PY_NULL;
-                    }
-                    if let Err(e) = check_init_returned_none(res) {
-                        set_call_error(e);
-                        return PY_NULL;
-                    }
-                }
-                Err(e) => {
-                    set_call_error(e);
-                    return PY_NULL;
-                }
-            }
-        } else {
-            // Builtin __init__ (e.g. type.__init__) ignores the
-            // class-definition keywords during 3-arg class creation, and a
-            // user __init__ with no kwargs takes only the positional triple.
-            // Either way call positionally; the class-definition kwargs flow
-            // to the __init_subclass__ forwarding path instead of being
-            // rejected here (typeobject.py descr_call passes __args__ to a
-            // builtin __init__, which tolerates them).
-            if let Err(e) = call_function_impl_result(
-                init_fn,
-                &[
-                    pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                    name(),
-                    bases(),
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                ],
-            ) {
+    if !kwds.is_empty() {
+        return match call_with_kwargs_in_ctx(
+            take_last_exec_ctx(),
+            w_metaclass(),
+            &[name(), bases(), w_namespace_dict()],
+            &kwds,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
                 set_call_error(e);
                 PY_NULL
             }

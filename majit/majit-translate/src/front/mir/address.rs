@@ -1901,8 +1901,21 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
             return;
         }
+        // `CallTarget::Method` getattr's the leaf off args[0]
+        // (`unaryop.py` `SomeInstance.getattr`). Recasting that
+        // receiver to int makes `SomeInteger.getattr` fail
+        // (`allocated_or_raise` on `GcAllocOutcome`). Keep the classed
+        // instance; a `dont_look_inside` method is already FunctionPath
+        // (`unspecialized_fun_segments`) and still recasts. Other
+        // residual multi-word args stay addresses
+        // (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+        let skip_receiver = self.impl_method_owner(fd).is_some()
+            && !fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside);
         let bb_id = self.block_id[mir_bb];
         for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            if skip_receiver && index == 0 {
+                continue;
+            }
             let Some(kind) = pass_by_value_multiword_kind(ty, self.llbc) else {
                 continue;
             };

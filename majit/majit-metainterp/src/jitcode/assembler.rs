@@ -6782,6 +6782,7 @@ impl JitCodeBuilder {
             // (blackhole.py handler argcode-based decode parity).
             jit_merge_point_offset: self.jit_merge_point_offset,
             reads_identity_slots: self.reads_identity_slots,
+            portal_frame_reg: u16::MAX,
         };
         // codewriter.py `jitcode.index = index` — back-stamped by
         // `state::jitcode_for` at registration time. JitCode::new

@@ -5055,7 +5055,7 @@ fn oncelock_usize_global_llbc() -> majit_charon_reader::Llbc {
         serde_json::json!({
             "def_id": 1,
             "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
-            "global_kind": "Static",
+            "global_kind": immutable_static_kind(),
             "ty": cell_ty
         }),
     ];
@@ -5090,6 +5090,26 @@ fn oncelock_usize_struct_global_does_not_cast_instance() {
             segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
         }),
         "OnceLock<usize> must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+/// A Struct `OnceLock<usize>` Global with no refs row is the immutable
+/// static's sentinel address, not a residual `FunctionPath` of the
+/// static (`bookkeeper.py immutablevalue`).
+#[test]
+fn oncelock_usize_struct_global_without_refs_does_not_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let graph = super::lower_function(&oncelock_usize_global_llbc(), "read_cell")
+        .expect("Struct OnceLock<usize> Global lowers without refs");
+    assert!(
+        !const_ref_addrs(&graph).is_empty(),
+        "OnceLock Global without refs is ConstRefAddr: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph).iter().all(|segments| {
+            segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        }),
+        "OnceLock<usize> without refs must not wrap ConstRefAddr: {graph:?}"
     );
 }
 
@@ -5295,7 +5315,7 @@ fn oncelock_usize_get_or_init_llbc() -> majit_charon_reader::Llbc {
         serde_json::json!({
             "def_id": 1,
             "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
-            "global_kind": "Static",
+            "global_kind": immutable_static_kind(),
             "ty": cell_ty
         }),
     ];
@@ -5336,6 +5356,27 @@ fn oncelock_usize_get_or_init_folds_to_prebuilt() {
             segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
         }),
         "get_or_init receiver must stay a bare ConstRefAddr: {graph:?}"
+    );
+}
+
+/// `ONCE.get_or_init(f)` of a ConstRefAddr cell with no refs row is
+/// still `Bookkeeper.immutablevalue`: dest is `&T`, not a residual
+/// `OnceLock::get_or_init` (`cache.py Cache.getorbuild`).
+#[test]
+fn oncelock_usize_get_or_init_without_refs_folds_to_const_ref_addr() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_usize_get_or_init_llbc();
+    let graph = super::lower_function(&llbc, "read_cell")
+        .expect("OnceLock<usize>::get_or_init without refs lowers");
+    assert!(
+        !const_ref_addrs(&graph).is_empty(),
+        "OnceLock Global without refs is ConstRefAddr: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| !segments.iter().any(|s| s == "get_or_init")),
+        "get_or_init must fold to the ConstRefAddr cell: {graph:?}"
     );
 }
 

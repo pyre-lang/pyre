@@ -6662,11 +6662,25 @@ impl Bookkeeper {
             // as `SomeInstance` so a later `__cast_instance_intrinsic`
             // onto `[PyObject]` / `[i64]` can install the real item.
             if !flexible_gcarray_erased_byte_tail(&items_ty) {
-                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(gcarray_root)
-                    && let Some(s_items) =
+                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(gcarray_root) {
+                    if let Some(s_items) =
                         super::classdesc::ClassDef::about_attribute(&classdef, &items_field)
-                    && matches!(s_items, SomeValue::List(_))
-                {
+                        && matches!(s_items, SomeValue::List(_))
+                    {
+                        return s_items;
+                    }
+                    let s_items = self.project_struct_field_type(&items_ty);
+                    if matches!(s_items, SomeValue::List(_)) {
+                        // `classdesc.py` `ClassDef.generalize_attr` stores
+                        // `Attribute.s_value`. A later projection of the
+                        // same `GcArray` must reuse this `ListDef`
+                        // (`listdef.py` `ListDef.same_as` is identity).
+                        let _ = super::classdesc::ClassDef::generalize_attr(
+                            &classdef,
+                            &items_field,
+                            Some(s_items.clone()),
+                        );
+                    }
                     return s_items;
                 }
                 return self.project_struct_field_type(&items_ty);
@@ -8629,13 +8643,17 @@ pub(crate) fn struct_root_refuses_classdef_intern(
 /// *template* has no instance ClassDef (`ensure_session` would otherwise
 /// mint one payload for every `T`); a monomorph intern's on first use
 /// so `Option<i64>::Some.__pos_0` getattr is that instantiation's
-/// ClassDef. A `GcArray` wrapper has no instance ClassDef on New either.
-/// A non-GC `GcArray` ITEM template (`rordereddict.py` `DICTENTRY`) is
-/// the same: `ensure_session` must not mint `SomeInstance` beside dest's
-/// `SomePtr`. A monomorph `Entry<K, V>` intern's (`struct_root_is_gcarray_item`
-/// is false when the intern key carries `<…>`). A raw-word owner with
-/// fields (`RootedSlotStore`, `PinnedResult`) intern's as a prebuilt
-/// instance on New; dest/harvest still skip it.
+/// ClassDef. A primitive `GcArray` wrapper has no instance ClassDef on
+/// New (`lltype.py` `GcArray` is `SomePtr`). An object-item `ListRepr`
+/// (`rlist.py` `ListRepr.items`) intern's so `ClassDef.attrs[_items]`
+/// holds the `ListDef` (`listdef.py` `ListDef.same_as`). A non-GC
+/// `GcArray` ITEM template (`rordereddict.py` `DICTENTRY`) is the same
+/// refuse as a primitive wrapper: `ensure_session` must not mint
+/// `SomeInstance` beside dest's `SomePtr`. A monomorph `Entry<K, V>`
+/// intern's (`struct_root_is_gcarray_item` is false when the intern key
+/// carries `<…>`). A raw-word owner with fields (`RootedSlotStore`,
+/// `PinnedResult`) intern's as a prebuilt instance on New; dest/harvest
+/// still skip it.
 fn struct_root_refuses_classdef_new(
     root: &str,
     registry: Option<&crate::front::StructFieldRegistry>,
@@ -8643,7 +8661,8 @@ fn struct_root_refuses_classdef_new(
     is_gcref_type_spelling(root)
         || struct_root_is_string_family(root)
         || struct_root_is_core_option_or_result_template(root, registry)
-        || struct_root_is_gcarray_ptr_wrapper(root, registry)
+        || (struct_root_is_gcarray_ptr_wrapper(root, registry)
+            && !registry.is_some_and(|reg| reg.is_list_items_gcarray_owner(root)))
         || registry.is_some_and(|reg| struct_root_is_gcarray_item(reg, root))
 }
 
@@ -13952,6 +13971,45 @@ mod tests {
         assert!(
             item.classdef.is_some(),
             "PyObject item must keep its ClassDef"
+        );
+        let second =
+            bk.project_struct_field_type("*mut pyre_object::object_array::FixedObjectArray");
+        assert!(
+            SomeValue::List(array).contains(&second),
+            "two projections of the same FixedObjectArray share one ListDef"
+        );
+    }
+
+    #[test]
+    fn declared_gc_fixed_object_array_interns_listrepr_items() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("_items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        note_declared_gc(&mut reg, &["object_array::FixedObjectArray"]);
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("object_array::FixedObjectArray")
+                .is_none(),
+            "return-stamp harvest must still refuse FixedObjectArray"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("object_array::FixedObjectArray")
+            .expect("ListRepr items intern a ClassDef so attrs[_items] holds the ListDef");
+        assert!(
+            matches!(
+                cd.borrow().attrs.get("_items").map(|a| &a.s_value),
+                Some(SomeValue::List(_))
+            ),
+            "declared-Gc FixedObjectArray._items is the ListRepr ListDef"
         );
     }
 

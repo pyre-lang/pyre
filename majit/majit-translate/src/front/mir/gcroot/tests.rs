@@ -594,6 +594,7 @@ fn root_scope_drop_is_classified_and_live() {
             ],
             resolved_path: None,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: Vec::new(),
@@ -1537,7 +1538,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
         serde_json::from_value(value).expect("statement JSON")
     };
     let mut cast_unsize = body_of(vec![mv(19), mv(20)]);
-    cast_unsize.body[1].statements[5] = stmt_of(assign(
+    cast_unsize.body_mut()[1].statements[5] = stmt_of(assign(
         9,
         serde_json::json!({"Cast": [
             {"Unsize": [ty(), ty(), {"Length": usize_lit(2)}]},
@@ -1545,11 +1546,11 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
             ty()
         ]}),
     ));
-    cast_unsize.body[1].statements.push(stmt_of(assign(
+    cast_unsize.body_mut()[1].statements.push(stmt_of(assign(
         18,
         serde_json::json!({"Use": [copy(9), "No"]}),
     )));
-    cast_unsize.body[1].set_terminator_kind(call(3, vec![copy(4), mv(18)], 5, 2));
+    cast_unsize.body_mut()[1].set_terminator_kind(call(3, vec![copy(4), mv(18)], 5, 2));
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &cast_unsize,

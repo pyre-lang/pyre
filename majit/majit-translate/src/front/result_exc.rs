@@ -14505,7 +14505,7 @@ pub(crate) fn retarget_gc_erasure_identity_args(graph: &mut FunctionGraph) {
 fn is_root_bracket_close(kind: &OpKind) -> bool {
     matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
     if segments.last().is_some_and(|s| {
-        s == super::mir::ROOT_SCOPE_CLOSE || s == super::mir::ROOT_SCOPE_CLOSE_JIT_ABI
+        s == super::mir::ROOT_SCOPE_CLOSE
     }))
 }
 

@@ -36554,6 +36554,61 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
     );
 }
 
+/// `fromcache` of a `OnceLock` static with no refs row (`mapdict.py`
+/// `get_terminator_for_dicts`). Unique-graph is ConstRefAddr of the
+/// immutable-static sentinel recast onto `T` so FieldRead of `.0`
+/// annotates (`llmemory.py` `SomeAddress.getattr` rejects `__pos_0`).
+/// Residual `FunctionPath` of the static or `OnceLock::get_or_init`
+/// would fail source-lift (`CallRegistry`).
+#[test]
+#[ignore = "requires the extracted pyre-interpreter LLBC"]
+fn get_terminator_for_dicts_get_or_init_folds_without_refs() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let graph = crate::test_support::lower_function(
+        llbc,
+        "pyre_interpreter::objspace::std::mapdict::get_terminator_for_dicts",
+    )
+    .expect("lower get_terminator_for_dicts");
+    let residual: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments
+                .iter()
+                .any(|s| s == "get_or_init" || s == "TERMINATOR_FOR_DICTS") =>
+            {
+                Some(segments.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "get_or_init / TERMINATOR_FOR_DICTS survived lowering: {residual:?}"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
+        "OnceLock Global without refs is ConstRefAddr"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| root.contains("TerminatorForDicts"))),
+        "get_or_init dest is Instance(TerminatorForDicts): {graph:?}"
+    );
+}
+
 /// `space.fromcache(ClassDictStrategy)` holder (`classdict.py`). The
 /// accessor is the same OnceLock+immortal malloc as `w_none`; the refs
 /// row is the GC object, so `get_or_init` is `Bookkeeper.immutablevalue`.
@@ -50244,6 +50299,54 @@ fn items_block_items_base_on_a_fixed_list_is_the_operand() {
     assert!(
         link_carries(&graph, field),
         "the fixed list itself must flow onward; ops={ops:?}"
+    );
+}
+
+/// `FixedObjectArray::compare_exchange_ref` calls `item_atomic_ptr`;
+/// that call is `ll_getitem_fast` (`rlist.py`) so the unique graph
+/// never getattr's `item_atomic_ptr` on the SomeList intern. CAS stays
+/// `AtomicPtr::compare_exchange` (`extfunc.py`).
+#[test]
+fn compare_exchange_ref_does_not_getattr_item_atomic_ptr() {
+    use crate::model::OpKind;
+
+    let graph = lower_object_fn("pyre_object::object_array::<Impl>::compare_exchange_ref");
+    let ops = graph_ops(&graph);
+    let has_arrayread = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::ArrayRead {
+                array_type_id: Some(id),
+                ..
+            } if id == super::OBJECT_REF_GCARRAY_TYPE_ID
+        )
+    });
+    assert!(
+        has_arrayread,
+        "compare_exchange_ref must getarrayitem the slot; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "item_atomic_ptr"),
+        "compare_exchange_ref must not getattr item_atomic_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "items_ptr"),
+        "compare_exchange_ref must not getattr items_ptr; graph={}",
+        graph.dump()
+    );
+}
+
+/// `FixedObjectArray::items_ptr` is `ll_fixed_items(l) = l` (`rlist.py`).
+/// Unique-graph of `item_atomic_ptr` must not getattr `items_ptr`.
+#[test]
+fn item_atomic_ptr_does_not_getattr_items_ptr() {
+    let graph = lower_object_fn("pyre_object::object_array::<Impl>::item_atomic_ptr");
+    assert!(
+        !calls_leaf(&graph, "items_ptr"),
+        "item_atomic_ptr must not getattr items_ptr; graph={}",
+        graph.dump()
     );
 }
 

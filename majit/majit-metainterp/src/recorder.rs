@@ -2015,8 +2015,7 @@ impl Trace {
             let nops = pos._count.saturating_sub(n) as usize;
             self.slots.truncate(nops);
             let nvalues = pos._index.saturating_sub(n) as usize;
-            self.value_slots.truncate(nvalues);
-            self.unpublished_resrefs.borrow_mut().truncate(nvalues);
+            self.truncate_value_slots(nvalues);
             self.op_count = pos._count;
             self.box_count = pos._index;
             self.ops.clear();
@@ -2024,9 +2023,7 @@ impl Trace {
         }
         self.ops.truncate(pos._pos);
         let n = self.max_num_inputargs;
-        let nvalues = pos._index.saturating_sub(n) as usize;
-        self.value_slots.truncate(nvalues);
-        self.unpublished_resrefs.borrow_mut().truncate(nvalues);
+        self.truncate_value_slots(pos._index.saturating_sub(n) as usize);
         self.op_count = pos._count;
         self.box_count = pos._index;
     }
@@ -2037,6 +2034,7 @@ impl Trace {
     /// at that position next, and list it a second time.
     fn truncate_value_slots(&mut self, len: usize) {
         self.value_slots.truncate(len);
+        self.unpublished_resrefs.borrow_mut().truncate(len);
         self.young_ref_slots
             .get_mut()
             .retain(|&slot| (slot as usize) < len);
@@ -2409,9 +2407,6 @@ impl Trace {
         }
         let is_gc = majit_gc::gc_owns_object(gcref.0);
         vs.gc_referent.set(is_gc);
-        if !is_gc {
-            return;
-        }
         if !vs.young_listed.replace(true) {
             self.young_ref_slots.borrow_mut().push(slot as u32);
         }
@@ -2450,8 +2445,13 @@ impl Trace {
     }
 
     /// Settle one slot's `Value::Ref` against a collection: moved to where
-    /// its referent went, cleared if the referent died.
+    /// its referent went, cleared if the referent died. A non-GC referent
+    /// (raw / interior / stack pointer) stays put: `classify == None` is
+    /// not "the object died".
     fn settle_concrete_ref(vs: &ValueSlot, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        if !vs.gc_referent.get() {
+            return;
+        }
         Self::settle_resref_cell(&vs.concrete, classify);
     }
 

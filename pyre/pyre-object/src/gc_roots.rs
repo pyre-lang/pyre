@@ -598,16 +598,8 @@ pub extern "C" fn push_roots_jit_abi() -> usize {
     shadow_stack_len()
 }
 
-/// [`root_scope_close`] over the guard word.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn root_scope_close_jit_abi(save_point: usize) {
-    #[cfg(debug_assertions)]
-    assert_shadow_stack_not_walking();
-    shadow_stack_cell_truncate(shadow_stack_cell(), save_point);
-}
-
 /// Charon's `RootScope::drop_in_place` glue over the guard word; the same
-/// rewind as [`root_scope_close_jit_abi`].
+/// rewind as [`root_scope_close_word`].
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn root_scope_drop_in_place_jit_abi(save_point: usize) {
     #[cfg(debug_assertions)]
@@ -1790,7 +1782,7 @@ mod tests {
         let _ = root_scope_pin_root_jit_abi(word, dummy(0x1234));
         assert_eq!(root_scope_get_jit_abi(word, slot), dummy(0x1234));
         assert_eq!(shadow_stack_len(), before + 1);
-        root_scope_close_jit_abi(word);
+        root_scope_close_word(word);
         assert_eq!(shadow_stack_len(), before);
         let word = push_roots_jit_abi();
         let _ = root_scope_pin_root_jit_abi(word, dummy(0x5678));
@@ -1814,7 +1806,7 @@ mod tests {
         let base = root_scope_publish_jit_abi(word, items.as_ptr(), items.len());
         assert_eq!(base, before + 2);
         assert_eq!(shadow_stack_len(), before + 4);
-        root_scope_close_jit_abi(word);
+        root_scope_close_word(word);
         assert_eq!(shadow_stack_len(), before);
     }
 

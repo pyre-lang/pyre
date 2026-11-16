@@ -2589,6 +2589,31 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::ptr::from_ref` / `from_mut` is rustc `return r`
+                // (`ptr/mod.rs`). RPython has no reference type separate
+                // from `Ptr`; `rptr.py` / `annlowlevel.py specialize_call`
+                // emit `cast_pointer` and `jtransform.py
+                // rewrite_op_cast_pointer` aliases via `same_as`. Alias
+                // here so unique-graph annotate never residualises a host
+                // Call the registry does not own.
+                if args.len() == 1
+                    && regular_call_name_path(&reg, self.llbc)
+                        .as_deref()
+                        .is_some_and(|name| {
+                            let segs: Vec<String> = name
+                                .split("::")
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            crate::codewriter::jtransform::is_ptr_from_ref_path(&segs)
+                        })
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
                 // `lltype.direct_ptradd(ptr, unscaled_count)`.  `sub`
                 // negates the count.  The pointer's concretetype carries
@@ -2648,7 +2673,58 @@ impl<'a> Lowering<'a> {
                             count = neg;
                         }
                         let item = item_lltype_for_size(pointee_size);
-                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
+                        // `item_lltype_for_size` of a 40-byte `DICTENTRY`
+                        // is `FixedSizeArray(Char, n)` and `direct_ptradd`
+                        // stamps `CArrayPtr` of that blob (`lltype.py`
+                        // `_nofield`). A harvested GcArray ITEM is
+                        // `Ptr(Struct)` (`getarraysubstruct`). A GC item
+                        // recasts the address word with `cast_ptr_to_int`
+                        // then `cast_int_to_ptr`, the same way
+                        // `direct_arrayitems` dest is typed. A Raw item
+                        // (`rordereddict.py` `DICTENTRY` / `lltype.py`
+                        // `Struct`) goes through
+                        // `restore_offset_pointer_type` (`ll2ctypes.py`
+                        // `ForceCastEntry`): `ann_cast_int_to_ptr` expects
+                        // Integer, and the ptradd result is still a Ptr.
+                        let gc_item_ptr =
+                            self.ptr_add_gcarray_item_result_lltype(first_arg_ty.as_ref());
+                        let raw_entry = args[0].concretetype();
+                        let added = push_direct_ptradd(
+                            &mut self.graph,
+                            bb_id,
+                            args[0].clone(),
+                            count,
+                            &item,
+                        );
+                        match gc_item_ptr {
+                            Some(item_ptr)
+                                if matches!(
+                                    &item_ptr,
+                                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(p)
+                                        if p._needsgc()
+                                ) =>
+                            {
+                                let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, added);
+                                emit_dest_typed_cast_int_to_ptr(
+                                    &mut self.graph,
+                                    bb_id,
+                                    addr,
+                                    item_ptr,
+                                )
+                            }
+                            Some(item_ptr) => restore_offset_pointer_type(
+                                &mut self.graph,
+                                bb_id,
+                                Some(item_ptr),
+                                added,
+                            ),
+                            None => restore_offset_pointer_type(
+                                &mut self.graph,
+                                bb_id,
+                                raw_entry,
+                                added,
+                            ),
+                        }
                     };
                     self.local_var[dest_local] = Some(LocalValue::One(offset));
                     let target_bb = self.block_id[target];
@@ -2898,12 +2974,7 @@ impl<'a> Lowering<'a> {
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),
                             kind: OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec!["__string_byte_getitem".to_string()],
-                                    fun_decl_id: None,
-                                    generic_rust_args: Vec::new(),
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                },
+                                target: CallTarget::function_path(["__string_byte_getitem"]),
                                 args: crate::model::call_args(vec![src, args[1].clone()]),
                                 // `ord` returns RPython Signed. The byte-copy
                                 // helper stores `u8`, so that graph's read is
@@ -3899,6 +3970,96 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `FixedObjectArray::load_atomic(self, index, order)` is
+                // `ll_getitem_fast` (`rlist.py`) on the same
+                // `FixedSizeListRepr` `set_ref` writes. The method body
+                // is `item_atomic_ptr(index).load(order)`; collapsing
+                // the call keeps `getattr("item_atomic_ptr")` off the
+                // SomeList intern. Ordering is the array descr's load.
+                if args.len() == 3 && self.is_object_array_load_atomic_call(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
+                            nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
+                            pure: false,
+                            taken_by_address: false,
+                        },
+                    });
+                    let narrowed =
+                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(res), "PyObject");
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        narrowed
+                            .as_variable()
+                            .expect("a FixedObjectArray getitem stays a Variable")
+                            .clone(),
+                    ));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `FixedObjectArray::item_atomic_ptr(self, index)` is the
+                // interior of `l.items[index]` (`rlist.py` `ll_getitem_fast`).
+                // Bind dest to that getarrayitem and record
+                // `index_elem_alias` so a following `Atomic::load` is
+                // the element already read. Do not collapse
+                // `compare_exchange_ref` here: CAS stays
+                // `AtomicPtr::compare_exchange` (`extfunc.py`).
+                if args.len() == 2 && self.is_object_array_item_atomic_ptr_call(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
+                            nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
+                            pure: false,
+                            taken_by_address: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            rust_vec: None,
+                            list_root: None,
+                            items_owner: None,
+                            no_element: false,
+                        },
+                    );
+                    let narrowed =
+                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(res), "PyObject");
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        narrowed
+                            .as_variable()
+                            .expect("a FixedObjectArray item_atomic_ptr stays a Variable")
+                            .clone(),
+                    ));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `items_block_set_ref(block, index, value)` is
                 // `ll_setitem_fast` (`rlist.py`) on the object-strategy
                 // items list. `W_ListObject.items` is the erased
@@ -4650,11 +4811,23 @@ impl<'a> Lowering<'a> {
                 // row carries the built object is `Bookkeeper.immutablevalue`
                 // of that object: the host initialized it before the row was
                 // captured, so the call is the constant and `f` never runs.
+                // dest is `&T`. Alias keeps the Address word of the cell;
+                // FieldRead of T's fields is getattr of a named field, which
+                // `SomeAddress.getattr` rejects (`llmemory.py`). Recast onto
+                // T (`annlowlevel.py` `cast_opaque_ptr`) so `.0.get()` of a
+                // `Cell` wrapper annotates.
                 if args.len() == 2
                     && !self.multi_assigned_locals.contains(&dest_local)
                     && self.is_prebuilt_once_lock_get_or_init(&reg, &args[0])
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    if let Some(v) = self.local_var[dest_local]
+                        .as_ref()
+                        .and_then(|lv| lv.one().ok())
+                    {
+                        let recast = self.recast_onto_dest_class_root(bb_id, v, &call.dest.ty);
+                        self.local_var[dest_local] = Some(LocalValue::One(recast));
+                    }
                     self.prebuilt_once_value_locals.push(dest_local);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -4715,8 +4888,17 @@ impl<'a> Lowering<'a> {
                         // (`rtype_getattr` getinteriorfield of a
                         // non-container FIELD_TYPE), not the static object
                         // (`bookkeeper.py immutablevalue`).
+                        // Integer Atomic* statics stay a word `raw_load`.
+                        // `AtomicPtr` dest is a GCREF (`sys_exc_info_code`);
+                        // `raw_load` of Unsigned from that Ptr fails
+                        // `rtype_raw_load`. Fold the field instead
+                        // (`rptr.py InteriorPtrRepr`).
                         if parent.is_none()
                             && matches!(template.kind, PlaceKind::Global { .. })
+                            && matches!(
+                                self.value_type_of(&call.dest.ty),
+                                ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                            )
                             && let Some((item_ty, itemsize, is_item_signed)) =
                                 self.atomic_load_word_descr(&call.dest.ty, first_arg_ty.as_ref())
                         {
@@ -4791,6 +4973,22 @@ impl<'a> Lowering<'a> {
                             self.graph.set_goto(bb_id, target_bb, link_args);
                             return Ok(());
                         }
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    // `item_atomic_ptr` already bound dest to
+                    // `ll_getitem_fast`. Unique-graph of `load_atomic`
+                    // takes `Ordering` as an argument, so the slot is
+                    // `unknown`; the getarrayitem is still the element.
+                    // A write-only `index_mut` alias has no element.
+                    if recv.is_some_and(|local| {
+                        self.index_elem_alias
+                            .get(&local)
+                            .is_some_and(|alias| !alias.no_element)
+                    }) {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -6419,6 +6617,37 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
+                    // Field-address `Cell::get` is that field's `getfield`
+                    // (`jtransform.py` `rewrite_op_getfield`). The borrow
+                    // is `taken_by_address` on the preceding FieldRead.
+                    if let Some(OpKind::FieldRead {
+                        base,
+                        mut field,
+                        pure,
+                        ..
+                    }) = self.address_field_read_of(bb_id, &args[0])
+                    {
+                        field.taken_by_address = false;
+                        let ty = self.value_type_of(&call.dest.ty);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(concretetype_for_field(&ty));
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::FieldRead {
+                                base,
+                                field,
+                                ty,
+                                pure,
+                            },
+                        });
+                        let res = self.recast_onto_dest_class_root(bb_id, res, &call.dest.ty);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                     // No containing field place: the call stays
                     // (`jtransform.py rewrite_op_getfield` has no field to read).
                 }
@@ -6827,6 +7056,7 @@ impl<'a> Lowering<'a> {
                             .is_some_and(|ty| tyref_is_u8_list(ty, self.llbc)))
                 {
                     let ptr = self.emit_list_items_ccharp(mir_bb, args[0].clone());
+                    self.list_view_locals.retain(|&local| local != dest_local);
                     self.local_var[dest_local] = Some(LocalValue::One(ptr));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6981,8 +7211,8 @@ impl<'a> Lowering<'a> {
                 // pointer-receiver trampoline. Methods that use the
                 // thread cell drop the receiver and name the free
                 // helper, the `pin_roots` / `publish` rewrite above.
-                // Close still needs the save_point word; name that
-                // bridge under the bridge's own path.
+                // Close still needs the save_point word; name the
+                // lowered close (`root_scope_close_word`).
                 let (segments, method_hint) = if original_segments.last().map(String::as_str)
                     == Some("root_scope_close")
                     && original_segments.iter().any(|s| s == "gc_roots")
@@ -6991,7 +7221,7 @@ impl<'a> Lowering<'a> {
                         vec![
                             "pyre_object".to_string(),
                             "gc_roots".to_string(),
-                            "root_scope_close_jit_abi".to_string(),
+                            "root_scope_close_word".to_string(),
                         ],
                         None,
                     )
@@ -8043,10 +8273,8 @@ impl<'a> Lowering<'a> {
                         // inside `call_target_segments`.
                         let path_fun_decl_id = if !same_callee {
                             None
-                        } else if let Some(IntoDevirt::Target {
-                            fun_decl_id: from_id,
-                            ..
-                        }) = self.blanket_into_devirt(&reg)
+                        } else if let Some(IntoDevirt::Target { fn_id: from_id, .. }) =
+                            self.blanket_into_devirt(&reg)
                         {
                             Some(from_id)
                         } else {
@@ -8122,7 +8350,8 @@ impl<'a> Lowering<'a> {
                                     generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 };
-                                if let Some(id) = path_fun_decl_id {
+                                if same_callee && let Some(id) = self.call_target_fun_decl_id(&reg)
+                                {
                                     target = target.with_fun_decl_id(id);
                                     if let Some(fd) = self.llbc.fn_by_id(id) {
                                         target = stamp_call_target_fun_decl(target, self.llbc, fd);
@@ -11168,7 +11397,9 @@ impl<'a> Lowering<'a> {
         &self,
         payload: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)
+        let impl_method = crate::front::clause_spec::trait_impl_method(payload, self.llbc);
+        let from_default = impl_method.is_none();
+        let (fn_id, generics) = impl_method
             .or_else(|| crate::front::clause_spec::trait_default_method(payload, self.llbc))?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
@@ -11199,6 +11430,15 @@ impl<'a> Lowering<'a> {
         }
         if let Some(segments) = self.enqueue_spec(fd, &generics) {
             return Some((segments, None));
+        }
+        // A provided default whose `cachedgraph` copy was not minted
+        // stays the original FunDecl (`description.py` `ClassDesc.lookup`
+        // of the trait method). Naming `spec_segments` residualizes
+        // `Iterator::take` as an unregistered `IntoIter::take` path;
+        // main's `specialized_trait_target` only consults
+        // `trait_impl_method`, so that default is looked inside.
+        if from_default {
+            return None;
         }
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
@@ -12351,6 +12591,27 @@ impl Lowering<'_> {
                     | StmtKind::PlaceMention(_))
             )
         })
+    }
+
+    /// Recast `value` onto the class root of `dest_ty` when that type
+    /// names an instance (`lltype.py` `ann_cast_opaque_ptr`).
+    fn recast_onto_dest_class_root(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        value: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) else {
+            return value;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call(&root, value),
+        });
+        narrowed
     }
 
     /// Signed-word `raw_load` of a fn-pointer niche (`FnPtrCell::get` at

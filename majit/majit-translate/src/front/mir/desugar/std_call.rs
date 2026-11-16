@@ -619,6 +619,37 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `FixedObjectArray::load_atomic(self, index, order)` — `ll_getitem_fast`
+    /// (`rlist.py`) of the same length-prefixed array `set_ref` writes.
+    /// The body is `item_atomic_ptr(index).load(order)`; collapsing the
+    /// call keeps `item_atomic_ptr` off the SomeList intern.
+    pub(in crate::front::mir) fn is_object_array_load_atomic_call(
+        &self,
+        reg: &RegularCall,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str() == "pyre_object::object_array::<Impl>::load_atomic"
+        })
+    }
+
+    /// `FixedObjectArray::item_atomic_ptr(self, index)` — address of
+    /// `l.items[index]` (`rlist.py` `ll_getitem_fast` interior). Callers
+    /// `Atomic::load` that slot or `AtomicPtr::compare_exchange` it.
+    pub(in crate::front::mir) fn is_object_array_item_atomic_ptr_call(
+        &self,
+        reg: &RegularCall,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path_str() == "pyre_object::object_array::<Impl>::item_atomic_ptr"
+        })
+    }
+
     /// `object_array::items_block_set_ref(block, index, value)`, the
     /// `ItemsBlock` element store whose body hand-rolls the write barrier.
     pub(in crate::front::mir) fn is_items_block_set_ref_call(&self, reg: &RegularCall) -> bool {
@@ -989,6 +1020,23 @@ impl<'a> Lowering<'a> {
             kind: crate::model::cast_instance_call(root, raw),
         });
         res
+    }
+
+    /// `Ptr(DICTENTRY)` of a `*mut Entry<K,V>` / `&Entry` ptr::add dest
+    /// (`rordereddict.py` `DICTENTRY` inlined in `GcArray`; `lltype.py`
+    /// `Struct`). `item_lltype_for_size` of that layout is
+    /// `FixedSizeArray(Char, n)` and `direct_ptradd` stamps
+    /// `CArrayPtr` of that blob; getattr of `key` then fails
+    /// (`Ptr._nofield`). Restore the item Struct so the interior
+    /// pointer is `SomePtr(Ptr(DICTENTRY))` (`lltype.py`
+    /// `getarraysubstruct`).
+    pub(in crate::front::mir) fn ptr_add_gcarray_item_result_lltype(
+        &self,
+        first_arg_ty: Option<&TyRef>,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        let ty = first_arg_ty?;
+        let spelling = instantiated_struct_item_spelling(ty, self.llbc, self.tombstoned_leaves)?;
+        self.array_tail_gcarray_item_ptr_lltype(&spelling, ty).1
     }
 
     /// `Ptr(ITEM)` for a gcarray item dest, or `None` when `root` is not
@@ -1918,6 +1966,24 @@ impl<'a> Lowering<'a> {
         type_decl_struct_field_offset(td, self.llbc, field_idx)
     }
 
+    /// Whether `payload` names an inlined struct field at offset 0 of
+    /// `base_ty` (`lltype.py` `_first_struct`). Unknown Charon offset of
+    /// declaration-order field 0 is offset 0
+    /// (`type_decl_field_at_offset_zero`).
+    pub(in crate::front::mir) fn struct_field_at_offset_zero(
+        &self,
+        base_ty: &TyRef,
+        payload: &serde_json::Value,
+    ) -> bool {
+        let Some((None, field_idx)) = indexed_field_parts(payload) else {
+            return false;
+        };
+        self.field_base_adt(base_ty)
+            .and_then(type_decl_ref_adt_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| type_decl_field_at_offset_zero(td, self.llbc, field_idx))
+    }
+
     /// Whole-enum move: switch on `__discriminant`, then copy that
     /// variant's fields. `new_value` stores into `place`; `None` reads
     /// `place` and returns the join phi.
@@ -2303,7 +2369,32 @@ impl<'a> Lowering<'a> {
                     pure: false,
                 },
             });
-            let value = field_store_value(read, &leaf.ty);
+            let stored = field_store_value(read, &leaf.ty);
+            // `DICTENTRY` intern's SomePtr (`llannotation.py`
+            // `lltype_to_annotation` of `Ptr(DICTENTRY)`); a GC pointer
+            // leaf overlays GCREF (`overlay_field_lltype`). After
+            // `_first_struct` peel the write owner is ObjectKey, so the
+            // Assign overlay keyed on the gcarray-item owner does not
+            // fire. Store through `cast_instance_to_gcref`
+            // (`annlowlevel.py`) so setattr is Ptr, not Instance
+            // (`annotation_to_lltype`).
+            let value = if self.struct_fields.is_some_and(|reg| {
+                container_field.owner_root.as_deref().is_some_and(|owner| {
+                    crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, owner)
+                })
+            }) && matches!(
+                &leaf.ty,
+                ValueType::Ref(Some(root))
+                    if !root.is_empty()
+                        && !crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                        && !crate::front::mir::is_str_family_class_root(root)
+                        && !majit_ir::descr::is_list_container_spelling(root)
+                        && !majit_ir::descr::is_shaped_tuple_name(root)
+            ) {
+                self.narrow_value_to_instance_root(bb_id, LinkArg::Value(stored), "GCREF")
+            } else {
+                LinkArg::Value(stored)
+            };
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
@@ -2313,7 +2404,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         container_leaf_descriptor(container_field, at_offset_zero, &leaf)
                     },
-                    value: LinkArg::Value(value),
+                    value,
                     ty: leaf.ty,
                 },
             });
@@ -3022,9 +3113,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// `std::sync::OnceLock::get_or_init` whose receiver is a
-    /// [`OpKind::ConstRefAddr`] taken from a `refs` row. Those rows register
-    /// the initialized object, not the `OnceLock` container, so the only
-    /// receivers that qualify are statics the host already initialized.
+    /// [`OpKind::ConstRefAddr`]. dest is `&T` (`cache.py Cache.getorbuild` /
+    /// `bookkeeper.py immutablevalue`): a refs row is the initialized
+    /// object, and an immutable-static sentinel is the cell address
+    /// unique-graph treats as that prebuilt when the host table has no
+    /// row. Aliasing dest typed as `&T` makes a subsequent `.0.get()` a
+    /// FieldRead of `T`.
     pub(in crate::front::mir) fn is_prebuilt_once_lock_get_or_init(
         &self,
         reg: &RegularCall,
@@ -3044,9 +3138,7 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .flat_map(|block| &block.operations)
                 .any(|op| {
-                    op.result.as_ref() == Some(recv)
-                        && matches!(op.kind, OpKind::ConstRefAddr(addr)
-                            if self.static_addrs.refs.iter().any(|(_, a)| *a == addr))
+                    op.result.as_ref() == Some(recv) && matches!(op.kind, OpKind::ConstRefAddr(_))
                 })
     }
 
@@ -3774,6 +3866,12 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         list: Variable,
     ) -> Variable {
+        if list.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            // Already the items address (`rffi.py` `CCHARP`). A second
+            // `nonmoving_raw_ptr_for_resizable_list` would annotate the
+            // CCHARP as a list (`rgc.py` `_check_resizable_list_of_chars`).
+            return self.ensure_window_ccharp(mir_bb, list);
+        }
         let bb_id = self.emit_bb(mir_bb);
         let data = self
             .graph
@@ -5227,7 +5325,7 @@ impl<'a> Lowering<'a> {
         result_ty: ValueType,
     ) -> Variable {
         let result = self.alloc_legacy_result(&result_ty);
-        let target = CallTarget::FunctionPath {
+        let mut target = CallTarget::FunctionPath {
             segments,
             resolved_path: None,
             fun_decl_id: None,
@@ -8973,7 +9071,12 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path_str(),
-                "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
+                "core::slice::<Impl>::as_ptr"
+                    | "core::slice::<Impl>::as_mut_ptr"
+                    // `FixedObjectArray::items_ptr` is `ll_fixed_items(l) = l`
+                    // (`rlist.py`): the receiver is already the object list.
+                    | "pyre_object::object_array::<Impl>::items_ptr"
+                    | "pyre_object::object_array::<Impl>::items_mut_ptr"
             )
         })
     }
@@ -10047,7 +10150,7 @@ impl<'a> Lowering<'a> {
             let leaf = path.rsplit("::").next().unwrap_or("from");
             return Some(IntoDevirt::Target {
                 segments: spec_segments(self.llbc, fd, leaf),
-                fun_decl_id: fn_id,
+                fn_id,
             });
         }
         None

@@ -1866,27 +1866,10 @@ pub unsafe fn raise_cause_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir
 }
 
 fn alloc_raise_cause(w_cause: PyObjectRef, invalid: Option<PyError>) -> RaiseCauseRef {
-    let invalid_word = invalid
-        .as_ref()
-        .map(|err| err.0.as_ptr())
-        .unwrap_or(pyre_object::PY_NULL);
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_cause);
-    let invalid_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(invalid_word);
-    let ptr = pyre_object::lltype::malloc_typed_managed(RaiseCause {
-        w_cause: pyre_object::PY_NULL,
-        invalid: None,
-    });
-    unsafe {
-        (*ptr).w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
-        let inv = pyre_object::gc_roots::shadow_stack_get(invalid_slot);
-        if !inv.is_null() {
-            (*ptr).invalid = Some(PyError::from_raw(inv));
-        }
-        pyre_object::gc_hook::try_gc_write_barrier_managed(ptr as pyre_object::gc_hook::GCREF);
-    }
+    // `malloc_typed_managed` is the host `try_gc_alloc` path and does not
+    // collect, so the payload can be written at birth. The allocator's own
+    // write barrier sees the nursery fields.
+    let ptr = pyre_object::lltype::malloc_typed_managed(RaiseCause { w_cause, invalid });
     RaiseCauseRef(unsafe { std::ptr::NonNull::new_unchecked(ptr) })
 }
 
@@ -1964,16 +1947,10 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCauseRef>) -> Res
     // chain.  It must still become the context of a new exception raised by
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cause_slot = cause.map(|c| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(c.as_pyobject_ref());
-        slot
-    });
+    // `get_sys_exception` and `chain_context` only read the handled exception
+    // and write `__context__` slots; they do not collect, so the `RaiseCause`
+    // handle can stay a raw local.
     crate::error::chain_context(exc, get_sys_exception());
-    let cause = cause_slot.map(|slot| unsafe {
-        RaiseCauseRef::from_pyobject_ref(pyre_object::gc_roots::shadow_stack_get(slot))
-    });
     if let Some(cause) = cause
         && !cause.w_cause.is_null()
     {
@@ -2901,7 +2878,11 @@ pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
 /// move, so the loop re-reads it from its `FrameAnchor` slot after every
 /// collecting call (`shadowstack.py` `pop_roots`), matching `eval_loop_jit`.
 /// A JIT nursery frame is resumed through `eval_loop_jit`.
-fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
+pub fn eval_loop(
+    frame: &mut PyFrame,
+    ec: *mut crate::PyExecutionContext,
+    relink: bool,
+) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
     // this around a residual call to detect a body effect that ran through

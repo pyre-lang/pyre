@@ -5334,6 +5334,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(runner.clone()),
+                portal_enter: None,
                 greens: vec!["w_type".into()],
                 reds: vec![],
                 green_kinds: vec![majit_ir::Type::Ref],

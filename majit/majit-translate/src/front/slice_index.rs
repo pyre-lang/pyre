@@ -2980,6 +2980,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,

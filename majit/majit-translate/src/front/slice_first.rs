@@ -404,6 +404,7 @@ fn rewire_one_slice_first_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments,
+                        resolved_path: None,
                         fun_decl_id: None,
                         generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
@@ -1324,6 +1325,7 @@ mod tests {
                             "<Impl>".into(),
                             "get".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,

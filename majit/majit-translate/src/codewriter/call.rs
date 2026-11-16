@@ -4033,11 +4033,20 @@ impl StoreCore {
     /// `funcobj.graph` for a direct-call target (`call.py graphs_from`).
     fn registered_direct_callee(&self, target: &CallTarget) -> Option<CallPath> {
         let path = match target {
-            CallTarget::FunctionPath { .. } => {
+            CallTarget::FunctionPath { resolved_path, .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
                 }
-                target.function_call_path()?
+                // Prefer the FunDecl identity stamped on `resolved_path`
+                // when that spelling names a graph (`target_to_path`).
+                // Harvest `segments` stay the fallback for a residual.
+                if let Some(path) = resolved_path
+                    && self.contains_key(path)
+                {
+                    path.clone()
+                } else {
+                    target.function_call_path()?
+                }
             }
             CallTarget::Method {
                 name,
@@ -10084,11 +10093,15 @@ impl CallControl {
                     resolved_path,
                     ..
                 } => {
-                    if function_path_matches {
+                    // Harvest spelling (`function_path_matches`) or the
+                    // FunDecl identity stamped on `resolved_path` both
+                    // name this funcobj. Rewrite segments, spec, and
+                    // `resolved_path` together so `function_call_path`
+                    // and `target_to_path` follow the same copy
+                    // (`FunctionDesc.cachedgraph`).
+                    if function_path_matches || resolved_matches {
                         *segments = to.segments.clone();
                         *specialization = to.specialization;
-                    }
-                    if function_path_matches || resolved_matches {
                         *resolved_path = Some(to.clone());
                     }
                 }
@@ -12556,7 +12569,15 @@ impl CallControl {
     pub fn fnaddr_binding_for_path(&self, path: &CallPath) -> FnAddrBinding {
         match self.concrete_fnaddr_binding(path) {
             Some((resolved, addr)) => self.bind_fnaddr(resolved, addr, false),
-            None => self.bind_fnaddr(path.clone(), symbolic_fnaddr_for_path(path), true),
+            None => {
+                // Concrete keeps today's priority: exact hit, then sorted alias
+                // walk of the requested spelling (`concrete_fnaddr_binding`).
+                // Symbolic miss hashes the funcobj's one GraphStore
+                // representative (`call.py CallControl.get_jitcode` /
+                // `lltype.py getfunctionptr`).
+                let path = self.function_graphs.canonical_path(path);
+                self.bind_fnaddr(path.clone(), symbolic_fnaddr_for_path(&path), true)
+            }
         }
     }
 
