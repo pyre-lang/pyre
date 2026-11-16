@@ -3133,6 +3133,201 @@ fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
     );
 }
 
+/// True when any instruction-start pc is covered by the exception table.
+fn dispatch_head_has_catch_sites(code: &CodeObject, catch_for_pc: &[Option<u16>]) -> bool {
+    (0..code.instructions.len()).any(|py_pc| {
+        is_python_instruction_start(code, py_pc) && {
+            let lasti = dispatch_last_instr_pc(code, py_pc);
+            catch_for_pc.get(lasti).copied().flatten().is_some()
+                || catch_for_pc.get(py_pc).copied().flatten().is_some()
+        }
+    })
+}
+
+/// Catch label for a dispatch green `py_pc`. Prefer
+/// `dispatch_last_instr_pc` so the lookup matches
+/// `PyFrame.handle_operation_error`'s `lookup_exceptiontable(self.last_instr)`.
+fn catch_label_for_dispatch_pc(
+    code: &CodeObject,
+    catch_for_pc: &[Option<u16>],
+    py_pc: usize,
+) -> Option<u16> {
+    let lasti = dispatch_last_instr_pc(code, py_pc);
+    catch_for_pc
+        .get(lasti)
+        .copied()
+        .flatten()
+        .or_else(|| catch_for_pc.get(py_pc).copied().flatten())
+}
+
+/// `PyFrame.handle_operation_error` unrolls `lookup_exceptiontable` as a
+/// switch on the head's `next_instr` green. `tr_armed` stays the canraise
+/// block; `dispatch_x` is a Value switch (not canraise).
+///
+/// `PyFrame.handle_bytecode` wraps `dispatch_bytecode` in try/except
+/// `OperationError`. `dispatch_bytecode` stores `last_instr` before
+/// `bytecode_only_trace`, so a raising trace hook is looked up against
+/// the current instruction.
+fn emit_trace_arm_exception_dispatch(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    tr_armed: &SpamBlockRef,
+    armed_state: &FrameState,
+    catch_for_pc: &[Option<u16>],
+    catch_sites: &[ExceptionCatchSite],
+    unwind_memo: &mut Vec<SharedUnwindEntry>,
+    depth_at_pc: &[u16],
+    offset: i64,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+    arm_blocks: &mut Vec<super::flow::BlockRef>,
+    trace_arm_blocks: &mut Vec<super::flow::BlockRef>,
+) {
+    if !dispatch_head_has_catch_sites(code, catch_for_pc) {
+        return;
+    }
+    let seeded = exception_landing_state(graph, armed_state);
+    // Seeded state must already carry the switch green and the
+    // guessexception pair (`flowcontext.py guessexception`). Check both
+    // before creating `dispatch_x`: an early return after
+    // `attach_materialized_exception_edge` would leave that block with
+    // no exits.
+    let Some(super::flow::FlowValue::Variable(switch_next)) = seeded.dispatch_next_instr.clone()
+    else {
+        return;
+    };
+    if seeded.last_exception.is_none() {
+        return;
+    }
+
+    let dispatch_x = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+    all_walker_blocks.push(dispatch_x.clone());
+    arm_blocks.push(dispatch_x.block());
+    trace_arm_blocks.push(dispatch_x.block());
+    attach_materialized_exception_edge(graph, &tr_armed.block(), &dispatch_x, &seeded, &[]);
+    let x_state = match dispatch_x.framestate() {
+        Some(state) => state,
+        None => {
+            // The attach already marked `tr_armed` canraise and linked
+            // here. Close `dispatch_x` with the function-level raise
+            // (`flatten.py make_return` of the exceptblock pair) rather
+            // than leaving it with no exits.
+            let default_case: super::flow::FlowValue =
+                super::flow::Constant::string("default").into();
+            append_exit(
+                &dispatch_x.block(),
+                super::flow::Link::new(
+                    exceptblock_link_args(&seeded),
+                    Some(graph.exceptblock.clone()),
+                    Some(default_case.clone()),
+                )
+                .with_llexitcase(default_case)
+                .into_ref(),
+            );
+            return;
+        }
+    };
+    dispatch_x.block().borrow_mut().exitswitch =
+        Some(super::flow::ExitSwitch::Value(switch_next.into()));
+
+    for py_pc in 0..code.instructions.len() {
+        if !is_python_instruction_start(code, py_pc) {
+            continue;
+        }
+        let Some(catch_label) = catch_label_for_dispatch_pc(code, catch_for_pc, py_pc) else {
+            continue;
+        };
+        let Some(site) = catch_sites
+            .iter()
+            .find(|site| site.landing_label == catch_label)
+            .cloned()
+        else {
+            continue;
+        };
+        let (b_p, b_p_state) =
+            copy_spam_block_at_pc(code, graph, &x_state, py_pc, all_walker_blocks);
+        // `copy` keeps X's last-exception pair. Check before emitting
+        // switch cases: a `continue` after `append_exit` would leave
+        // `B_P` as a switch target with no raise/catch.
+        let Some(evalue) = b_p_state
+            .last_exception
+            .as_ref()
+            .map(|(_, value)| value.clone())
+        else {
+            continue;
+        };
+        arm_blocks.push(b_p.block());
+        trace_arm_blocks.push(b_p.block());
+        let args = x_state.getoutputargs(&b_p_state);
+        let emit_case = |key_pc: usize| {
+            let case_key: super::flow::FlowValue =
+                super::flow::Constant::signed(key_pc as i64).into();
+            append_exit(
+                &dispatch_x.block(),
+                super::flow::Link::new(args.clone(), Some(b_p.block()), Some(case_key.clone()))
+                    .with_llexitcase(case_key)
+                    .into_ref(),
+            );
+        };
+        emit_case(py_pc);
+        let skipped = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py_pc);
+        if skipped != py_pc && !is_python_instruction_start(code, skipped) {
+            emit_case(skipped);
+        }
+        record_graph_op(&b_p.block(), "raise", vec![evalue.into()], None, offset);
+        let mut catch_source = b_p_state.clone();
+        // Handler entry is reached by `goto`, not through the `next_instr`
+        // switch, so the catch edge carries no `next_instr` green
+        // (opcode-case catch edges carry none either, and
+        // `FrameState::union` would not merge Some with None).
+        catch_source.dispatch_next_instr = None;
+        let depth_p = depth_at_pc
+            .get(site.lasti_py_pc)
+            .copied()
+            .unwrap_or(site.stack_depth);
+        sync_stack_state(graph, &mut catch_source, depth_p);
+        attach_catch_exception_edge(
+            code,
+            graph,
+            &b_p.block(),
+            &site.landing,
+            &catch_source,
+            &site,
+            unwind_memo,
+            depth_at_pc,
+        );
+    }
+
+    if dispatch_x.block().borrow().exits.is_empty() {
+        // No reusable catch case. A Value switch whose only exit is
+        // `Str("default")` is a single-exit block, and `flatten.py
+        // insert_exits` rejects that exitcase. Close with a direct
+        // exceptblock link (`Raise.nomoreblocks`).
+        dispatch_x.block().borrow_mut().exitswitch = None;
+        append_exit(
+            &dispatch_x.block(),
+            super::flow::Link::new(
+                exceptblock_link_args(&x_state),
+                Some(graph.exceptblock.clone()),
+                None,
+            )
+            .into_ref(),
+        );
+        return;
+    }
+
+    let default_case: super::flow::FlowValue = super::flow::Constant::string("default").into();
+    append_exit(
+        &dispatch_x.block(),
+        super::flow::Link::new(
+            exceptblock_link_args(&x_state),
+            Some(graph.exceptblock.clone()),
+            Some(default_case.clone()),
+        )
+        .with_llexitcase(default_case)
+        .into_ref(),
+    );
+}
+
 /// `pyopcode.py dispatch_bytecode` jitted arm, after
 /// `self.last_instr = intmask(next_instr)`:
 ///
@@ -3269,22 +3464,24 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     arm_blocks.push(next_block.block());
     trace_arm_blocks.push(next_block.block());
     next_block.block().borrow_mut().inputargs = next_state.getvariables();
-    if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
-        && let Some(site) = catch_sites
-            .iter()
-            .find(|site| site.landing_label == catch_label)
-    {
-        attach_catch_exception_edge(
-            code,
-            graph,
-            &tr_armed.block(),
-            &site.landing,
-            &armed_state,
-            site,
-            unwind_memo,
-            depth_at_pc,
-        );
-    }
+    // `handle_bytecode` / `handle_operation_error`: a raising
+    // `bytecode_only_trace` looks up `lookup_exceptiontable(self.last_instr)`.
+    // Do not key the catch off this reload block's `py_pc` (the head
+    // passes 0). The exception successor switches on `next_instr`.
+    emit_trace_arm_exception_dispatch(
+        code,
+        graph,
+        &tr_armed,
+        &armed_state,
+        catch_for_pc,
+        catch_sites,
+        unwind_memo,
+        depth_at_pc,
+        offset,
+        all_walker_blocks,
+        arm_blocks,
+        trace_arm_blocks,
+    );
     append_exit(
         &tr_armed.block(),
         output_link(&armed_state, &next_state, next_block.block()),
@@ -3317,7 +3514,7 @@ fn emit_dispatch_loop_head(
     frame_var: super::flow::Variable,
     ec_var: super::flow::Variable,
     dispatch: &mut DispatchLoop,
-    _catch_for_pc: &[Option<u16>],
+    catch_for_pc: &[Option<u16>],
     catch_sites: &[ExceptionCatchSite],
     unwind_memo: &mut Vec<SharedUnwindEntry>,
     depth_at_pc: &[u16],
@@ -3428,7 +3625,7 @@ fn emit_dispatch_loop_head(
         ec_var,
         0,
         LOOP_HEAD_OFFSET,
-        &[],
+        catch_for_pc,
         catch_sites,
         unwind_memo,
         depth_at_pc,
@@ -7390,9 +7587,10 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
     }
 }
 
-/// `slot -> Variable.id` of the dispatch-loop head's locals and stack
-/// (`setup_dispatch_loop` builds them from frame slot indices). Same
-/// snapshot shape as the per-PC `pcdep_slot_var_resume` capture.
+/// `slot -> Variable.id` of one dispatch-head block's locals and stack
+/// (`setup_dispatch_loop` builds the head and merge-join states from
+/// frame slot indices; later head blocks copy into fresh Variables).
+/// Same snapshot shape as the per-PC `pcdep_slot_var_resume` capture.
 fn frame_state_slot_vars(state: &FrameState) -> Vec<(u16, u32)> {
     let mut snap = Vec::new();
     let nloc = state.locals_w.len();
@@ -7409,9 +7607,10 @@ fn frame_state_slot_vars(state: &FrameState) -> Vec<(u16, u32)> {
     snap
 }
 
-/// Color a compact `[locals | stack]` slot→Variable snapshot. Head
-/// Variables are live by construction (`setup_dispatch_loop` union), so
-/// this does not gate on the graph live-oracle the per-PC map uses.
+/// Color a compact `[locals | stack]` slot→Variable snapshot. Each
+/// head block's Variables are live by construction (`setup_dispatch_loop`
+/// union, then copies), so this does not gate on the graph live-oracle
+/// the per-PC map uses.
 fn color_slot_var_snapshot(
     snap: &[(u16, u32)],
     colorings: [&crate::jit::regalloc::Coloring; 3],
@@ -10468,6 +10667,10 @@ impl CodeWriter {
         // A handler block drained after the first landing pass can itself
         // expose a nested cleanup landing; a one-shot pass leaves that
         // regular block live with inputargs but no exits.
+        // Head walker blocks: `emit_dispatch_loop_head` runs once, after the case
+        // walk has filled `depth_at_pc`; landings its trace-arm catch edges reach
+        // are emitted by the next pass of this fixed point.
+        let mut head_walker_range: Option<std::ops::Range<usize>> = None;
         loop {
             while let Some(pending_block) = pendingblocks.pop_front() {
                 if pending_block.dead() {
@@ -16361,6 +16564,10 @@ impl CodeWriter {
                             -1,
                         );
                         if let Some(boxed_var) = boxed_lasti {
+                            // The lasti slot carries the boxed value, not the
+                            // producerless Ref `push_fresh_ref` reserved, so the
+                            // handler link argument has a defining op.
+                            current_state.stack[depth as usize] = boxed_var.into();
                             let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
                             let v_lasti_idx: super::flow::FlowValue =
                                 super::flow::Constant::signed(lasti_depth_value).into();
@@ -16449,33 +16656,39 @@ impl CodeWriter {
                 emit_goto!(handler_py_pc);
             }
             if !emitted_catch_landing {
-                break;
+                if head_walker_range.is_some() {
+                    break;
+                }
+                let first_head_walker_block = all_walker_blocks.len();
+                emit_dispatch_loop_head(
+                    code,
+                    &mut graph,
+                    roots.get(code_slot) as *const (),
+                    frame_var,
+                    ec_var,
+                    &mut dispatch_loop,
+                    &catch_for_pc,
+                    &catch_sites,
+                    &mut unwind_memo,
+                    &depth_at_pc,
+                    &mut all_walker_blocks,
+                    &mut arm_blocks,
+                    &mut trace_arm_blocks,
+                );
+                head_walker_range = Some(first_head_walker_block..all_walker_blocks.len());
             }
         } // end outer drain loop
 
-        let first_head_walker_block = all_walker_blocks.len();
-        emit_dispatch_loop_head(
-            code,
-            &mut graph,
-            roots.get(code_slot) as *const (),
-            frame_var,
-            ec_var,
-            &mut dispatch_loop,
-            &catch_for_pc,
-            &catch_sites,
-            &mut unwind_memo,
-            &depth_at_pc,
-            &mut all_walker_blocks,
-            &mut arm_blocks,
-            &mut trace_arm_blocks,
-        );
+        let Some(head_walker_range) = head_walker_range else {
+            return None;
+        };
         // The head and merge join were created with the case blocks in
         // `setup_dispatch_loop`; every walker block after them belongs to
         // the head emission.
         dispatch_loop.head_blocks = [dispatch_loop.head.block(), dispatch_loop.merge_join.block()]
             .into_iter()
             .chain(
-                all_walker_blocks[first_head_walker_block..]
+                all_walker_blocks[head_walker_range.clone()]
                     .iter()
                     .map(|block| block.block()),
             )
@@ -16571,12 +16784,26 @@ impl CodeWriter {
             .iter()
             .map(surviving_graph_block)
             .collect();
-        // Head `-live-` is the union of instruction-start locals/stack
-        // (`setup_dispatch_loop`). Per-PC trivia floors those bytes to py 0,
-        // which has an empty color→slot map; publish the head's own map so a
-        // generator resume that enters at the `jit_merge_point` can seed
-        // every live Ref, null slots included (`PyFrame.dispatch`).
-        let head_slot_var: Vec<(u16, u32)> = frame_state_slot_vars(&dispatch_loop.merge_join_state);
+        // Each head block carries its own FrameState: `setup_dispatch_loop`
+        // builds the head and merge-join states, and the profiled diamond /
+        // `bytecode_only_trace` arm copy theirs into fresh Variables.
+        // `flatten.py insert_renamings` may color a link's source and target
+        // differently, so the color→slot map is per block. A block that
+        // `remove_trivial_links` folded into its predecessor no longer owns
+        // a label and is skipped.
+        let head_block_slot_vars: Vec<(super::flow::BlockRef, Vec<(u16, u32)>)> =
+            [dispatch_loop.head.clone(), dispatch_loop.merge_join.clone()]
+                .into_iter()
+                .chain(all_walker_blocks[head_walker_range.clone()].iter().cloned())
+                .filter_map(|spam| {
+                    let block = spam.block();
+                    if surviving_graph_block(&block).as_ptr_addr() != block.as_ptr_addr() {
+                        return None;
+                    }
+                    let state = spam.framestate()?;
+                    Some((block, frame_state_slot_vars(&state)))
+                })
+                .collect();
 
         // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
         // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py`) into the
@@ -17153,24 +17380,31 @@ impl CodeWriter {
                     .collect()
             })
             .collect();
-        let head_pcdep: Vec<(u8, u16, u16)> = color_slot_var_snapshot(
-            &head_slot_var,
-            [
-                &splice_regallocs[Kind::Int.index()].coloring,
-                &splice_regallocs[Kind::Ref.index()].coloring,
-                &splice_regallocs[Kind::Float.index()].coloring,
-            ],
-            &alloc_result.rename,
-        )
-        .into_iter()
-        .map(|(bank, color, slot)| {
-            (
-                bank,
-                color,
-                frame_layout_slot(slot, nlocals, stack_base_absolute),
-            )
-        })
-        .collect();
+        let head_block_pcdep: Vec<(super::flow::BlockRef, Vec<(u8, u16, u16)>)> =
+            head_block_slot_vars
+                .iter()
+                .map(|(block, snap)| {
+                    let entries = color_slot_var_snapshot(
+                        snap,
+                        [
+                            &splice_regallocs[Kind::Int.index()].coloring,
+                            &splice_regallocs[Kind::Ref.index()].coloring,
+                            &splice_regallocs[Kind::Float.index()].coloring,
+                        ],
+                        &alloc_result.rename,
+                    )
+                    .into_iter()
+                    .map(|(bank, color, slot)| {
+                        (
+                            bank,
+                            color,
+                            frame_layout_slot(slot, nlocals, stack_base_absolute),
+                        )
+                    })
+                    .collect();
+                    (block.clone(), entries)
+                })
+                .collect();
         for entries in &mut const_ref_slots_at_pc {
             for (slot, _) in entries {
                 *slot = frame_layout_slot(*slot, nlocals, stack_base_absolute);
@@ -17218,7 +17452,7 @@ impl CodeWriter {
             num_regs,
             result_color_at_pc,
             pcdep_color_slots,
-            head_pcdep,
+            head_block_pcdep,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
             &dispatch_head_block,
@@ -17298,7 +17532,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
-        head_pcdep: Vec<(u8, u16, u16)>,
+        head_block_pcdep: Vec<(super::flow::BlockRef, Vec<(u8, u16, u16)>)>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
         dispatch_head: &super::flow::BlockRef,
@@ -17386,6 +17620,20 @@ impl CodeWriter {
                 combined_indices.push(end_idx);
             }
         }
+        let head_block_range_base = combined_indices.len();
+        let mut head_block_range_meta: Vec<(usize, bool)> = Vec::new();
+        for (k, (block, _)) in head_block_pcdep.iter().enumerate() {
+            for (start_idx, end_idx) in
+                labeled_block_insn_ranges(&ssarepr, std::slice::from_ref(block))
+            {
+                combined_indices.push(start_idx);
+                let has_end = end_idx.is_some();
+                if let Some(end_idx) = end_idx {
+                    combined_indices.push(end_idx);
+                }
+                head_block_range_meta.push((k, has_end));
+            }
+        }
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -17420,6 +17668,25 @@ impl CodeWriter {
             }
             merged
         };
+        let mut head_block_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        {
+            let mut cursor = head_block_range_base;
+            for &(owner, has_end) in &head_block_range_meta {
+                let start = combined_bytes[cursor];
+                cursor += 1;
+                let end = if has_end {
+                    let end = combined_bytes[cursor];
+                    cursor += 1;
+                    end
+                } else {
+                    jitcode.code.len()
+                };
+                if start < end {
+                    head_block_ranges.push((start, end, owner));
+                }
+            }
+            head_block_ranges.sort_unstable_by_key(|&(start, _, _)| start);
+        }
         let dispatch_head_off =
             dispatch_head_insn.map(|_| combined_bytes[dispatch_head_index_slot]);
         let dispatch_switch_pc =
@@ -18194,25 +18461,21 @@ impl CodeWriter {
                 },
             );
             // Instruction-start `-live-` trivia is keyed by opcode py_pc.
-            // Head bytes use offset -1 and would floor to py 0; record the
-            // head's locals/stack coloring the same way so
+            // Head bytes use offset -1 and would floor to py 0; each head
+            // block publishes its own locals/stack coloring so
             // `pcdep_trivia_at` at the `jit_merge_point` names every live
             // Ref (`setup_dispatch_loop`).
-            if !head_pcdep.is_empty() {
-                let head_ranges: Vec<(usize, usize, usize)> = dispatch_head_by_jit_pc
-                    .iter()
-                    .map(|&(start, end)| (start as usize, end as usize, 0))
-                    .collect();
+            if !head_block_ranges.is_empty() {
                 Self::override_predecessor_twin_ranges(
                     &mut pcdep_trivia_pred_by_jit_pc,
-                    &head_ranges,
-                    |_| head_pcdep.clone(),
+                    &head_block_ranges,
+                    |owner| head_block_pcdep[owner].1.clone(),
                 );
-                for &(start, _) in &dispatch_head_by_jit_pc {
+                for &(start, _, owner) in &head_block_ranges {
                     Self::upsert_predecessor_twin(
                         &mut pcdep_trivia_marker_by_jit_pc,
-                        start as usize,
-                        head_pcdep.clone(),
+                        start,
+                        head_block_pcdep[owner].1.clone(),
                     );
                 }
             }
@@ -22601,6 +22864,106 @@ def f(g):
                 .iter()
                 .any(|&pc| pyjit.merge_entry_for(pc).is_some()),
             "finally handler greens {handler_pcs:?} must keep a merge sandwich"
+        );
+    }
+
+    #[test]
+    fn armed_trace_hook_raise_inside_try_keeps_catch_on_the_arm() {
+        let source = "\
+def f(x):
+    try:
+        return x + 1
+    except Exception:
+        return 0
+";
+        let code = first_nested_function_code(source);
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(!entries.is_empty());
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("try/except must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let arm_pc = ops
+            .iter()
+            .find(|op| op.opname == "inline_call_r_r")
+            .map(|op| op.pc)
+            .expect("bytecode_only_trace arm");
+        assert!(
+            pyjit.metadata.dispatch_head_contains(arm_pc),
+            "arm inline_call must stay in dispatch_head_by_jit_pc"
+        );
+        let arm_idx = ops.iter().position(|op| op.pc == arm_pc).unwrap();
+        let after: Vec<_> = ops[arm_idx + 1..]
+            .iter()
+            .map(|op| op.opname)
+            .take_while(|&name| name != "getfield_vable_i")
+            .collect();
+        assert!(
+            after.contains(&"catch_exception"),
+            "tr_armed catch_exception must sit on the inline_call's exception edge, got {after:?}"
+        );
+        assert!(
+            ops.iter()
+                .filter(|op| op.opname.starts_with("switch"))
+                .count()
+                >= 2,
+            "head already switches on next_instr; exception dispatch adds a second switch"
+        );
+    }
+
+    #[test]
+    fn armed_trace_hook_without_exception_table_has_no_arm_catch() {
+        let source = "\
+def f(x):
+    return x + 1
+";
+        let code = first_nested_function_code(source);
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(entries.is_empty());
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("plain function must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let arm_pc = ops
+            .iter()
+            .find(|op| op.opname == "inline_call_r_r")
+            .map(|op| op.pc)
+            .expect("bytecode_only_trace arm");
+        assert!(
+            pyjit.metadata.dispatch_head_contains(arm_pc),
+            "arm inline_call must stay in dispatch_head_by_jit_pc"
+        );
+        let arm_idx = ops.iter().position(|op| op.pc == arm_pc).unwrap();
+        let after: Vec<_> = ops[arm_idx + 1..]
+            .iter()
+            .map(|op| op.opname)
+            .take_while(|&name| name != "getfield_vable_i")
+            .collect();
+        assert!(
+            !after.contains(&"catch_exception"),
+            "arm with no exception table must not grow catch_exception, got {after:?}"
         );
     }
 

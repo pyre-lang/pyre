@@ -17604,21 +17604,22 @@ fn publish_generator_suspension<Sym: WalkSym>(
         .record_op_with_descr(OpCode::SetfieldGc, &[frame_box, value_op], descr);
 }
 
-/// `popvalue_maybe_none` (`pyframe.py`) stores None over the popped slot.
+/// Write `value` into the generator frame's locals slot and record the store.
 ///
 /// The generator frame is not the trace's standard virtualizable, so the
-/// marker's `setarrayitem_vable_r` did not write this array. Null the live
-/// slot and record the same store (`GetfieldGc` of `locals_cells_stack_w`,
-/// then `SetarrayitemGc` of `PY_NULL`).
-fn publish_generator_slot_null<Sym: WalkSym>(
+/// marker's `setarrayitem_vable_r` did not write this array. Store `value`
+/// in the live slot and record the same store (`GetfieldGc` of
+/// `locals_cells_stack_w`, then `SetarrayitemGc` of `value`).
+fn publish_generator_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_root: usize,
     frame_box: OpRef,
     index: usize,
+    value: pyre_object::PyObjectRef,
 ) {
     let frame = live_generator_frame(frame_root);
     unsafe {
-        (*frame).set_locals_w(index, std::ptr::null_mut());
+        (*frame).set_locals_w(index, value);
     }
     let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
     let locals_array =
@@ -17633,10 +17634,10 @@ fn publish_generator_slot_null<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(array_ptr)),
     );
     let idx = ctx.trace_ctx.const_int(index as i64);
-    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    let value_ref = ctx.trace_ctx.const_ref(value as i64);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetarrayitemGc,
-        &[locals_array, idx, null_ref],
+        &[locals_array, idx, value_ref],
         crate::state::pyobject_gcarray_descr(),
     );
 }
@@ -19618,15 +19619,11 @@ fn walk_generator_resume<Sym: WalkSym>(
     let gen_frame = live_generator_frame(frame_root);
     fbw_arm_durable_frame_undo(gen_frame as usize);
     let resumed_depth = unsafe {
-        // `pushvalue_none` (`pyframe.py`) counts a slot that `popvalue` already
-        // set to None. A traced yield publishes the depth and leaves the
-        // yielded int in that slot; clear it before the count.
+        // `resume_execute_frame` (`pyframe.py`): `self.pushvalue(w_arg_or_err)`
+        // with the `w_None` that `next()` sends.
         let depth = (*gen_frame).valuestackdepth;
-        if !(*(*gen_frame).locals_cells_stack_w).as_slice()[depth].is_null() {
-            (*gen_frame).set_locals_w(depth, std::ptr::null_mut());
-        }
-        (*gen_frame).pushvalue_none();
-        (*gen_frame).valuestackdepth.saturating_sub(1)
+        (*gen_frame).pushvalue(pyre_object::w_none());
+        depth
     };
 
     let saved_fbw_mode = ctx.fbw_mode.clone();
@@ -19635,16 +19632,20 @@ fn walk_generator_resume<Sym: WalkSym>(
     // CALL-site coordinates the way `try_walker_inline_user_call` does.
     let parent_inline_subwalk = ctx.fbw_mode.inline_subwalk;
     ctx.fbw_mode.inline_subwalk = true;
-    // The slot `pushvalue_none` just counted may still hold the object the
-    // previous traced yield left behind. Recording already nulled it; the
-    // compiled resume has to as well, before anything reads the frame back.
-    // `pushvalue_none` does not record; pass the root so the frame is
+    // The slot `pushvalue` just wrote is `w_None` (`next()` sends that).
+    // `pushvalue` does not record; pass the root so the frame is
     // re-read around the GetfieldGcR that follows.
-    publish_generator_slot_null(ctx, frame_root, frame_box, resumed_depth);
-    // The `pushvalue_none` above is `resume_execute_frame`'s push; record
+    publish_generator_slot(
+        ctx,
+        frame_root,
+        frame_box,
+        resumed_depth,
+        pyre_object::w_none(),
+    );
+    // The `pushvalue` above is `resume_execute_frame`'s push; record
     // its depth store, the inverse of the yield's recorded pop, so the
     // compiled resume leaves the depth the body's merge promote reads.
-    // `publish_generator_slot_null` can minor-collect, so re-read the frame.
+    // `publish_generator_slot` can minor-collect, so re-read the frame.
     let gen_frame = live_generator_frame(frame_root);
     publish_generator_suspension(
         ctx,
@@ -19653,7 +19654,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         "valuestackdepth",
         unsafe { (*gen_frame).valuestackdepth } as i64,
     );
-    // `publish_generator_slot_null` / `publish_generator_suspension` record
+    // `publish_generator_slot` / `publish_generator_suspension` record
     // GetfieldGcR / SetarrayitemGc / SetfieldGc and can minor-collect.
     // Re-read before naming the resume frame.
     let resume = GeneratorResumeSubwalk {
