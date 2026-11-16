@@ -18,6 +18,7 @@ use std::rc::Rc;
 #[cfg(feature = "test-support")]
 use crate::OpRef;
 use crate::intbound::{IntBound, IntBoundRc};
+use crate::lifetime::Lifetime;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
@@ -269,14 +270,14 @@ pub trait ForwardingHost {
     /// Packed `_forwarded` word without cloning the slot.
     fn packed_forwarded_word(&self) -> u64;
 
-    /// `regalloc.py get_lifetime` read: peek `FW_INFO_OTHER` and clone only
-    /// the `OpInfo::Lifetime` `Rc`, not the boxed `OpInfo`.
-    fn get_lifetime_info(&self) -> Option<Rc<dyn std::any::Any>> {
+    /// `regalloc.py get_lifetime` read: peek the OTHER Lifetime subtag and
+    /// clone the thin `Rc<Lifetime>`.
+    fn get_lifetime_info(&self) -> Option<Rc<Lifetime>> {
         lifetime_info_from_packed(self.packed_forwarded_word())
     }
 
     /// `LifetimeManager.__setitem__` → `box.set_forwarded(lt)`.
-    fn set_lifetime_info(&self, info: Rc<dyn std::any::Any>) {
+    fn set_lifetime_info(&self, info: Rc<Lifetime>) {
         self.set_forwarded_info(OpInfo::Lifetime(info));
     }
 
@@ -499,6 +500,11 @@ const FW_SMALL_WIDE: u64 = 4;
 const FW_INFO_PTR: u64 = 5;
 const FW_INFO_BOUND: u64 = 6;
 const FW_INFO_OTHER: u64 = 7;
+/// Bit 3 of an OTHER word: 0 = boxed `EmptyInfo` / `FloatConstInfo`,
+/// 1 = thin `Rc<Lifetime>`. Heap pointers are 16-byte aligned, so bits
+/// 0–3 of the payload are free (`FW_TAG` occupies 0–2).
+const FW_OTHER_SUBTAG: u64 = 1 << 3;
+const FW_OTHER_ALIGN: u64 = 0b1111;
 /// Heap pointers are 48-bit.
 const FWD_PTR_MASK: u64 = (1 << 48) - 1;
 
@@ -506,6 +512,21 @@ const FWD_PTR_MASK: u64 = (1 << 48) - 1;
 fn fwd_ptr(w: u64) -> u64 {
     w & FWD_PTR_MASK & !FW_TAG
 }
+
+/// OTHER payload pointer: also drop the bit-3 subtag.
+#[inline]
+fn fwd_ptr_other(w: u64) -> u64 {
+    w & FWD_PTR_MASK & !FW_OTHER_ALIGN
+}
+
+#[inline]
+fn is_lifetime_other(w: u64) -> bool {
+    w & FW_TAG == FW_INFO_OTHER && w & FW_OTHER_SUBTAG != 0
+}
+
+/// 16-byte-aligned heap box for OTHER infos that are not `Lifetime`.
+#[repr(align(16))]
+struct OtherInfoHeap(OpInfo);
 
 pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
     match v {
@@ -539,19 +560,17 @@ pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
     }
 }
 
-/// Peek a packed `_forwarded` word for `OpInfo::Lifetime` and clone only
-/// that `Rc`. Does not clone the boxed `OpInfo`.
+/// Peek a packed `_forwarded` word for a thin `Rc<Lifetime>` and clone it.
 #[inline]
-pub(crate) fn lifetime_info_from_packed(w: u64) -> Option<Rc<dyn std::any::Any>> {
-    if w == 0 || w & FW_TAG != FW_INFO_OTHER {
+pub(crate) fn lifetime_info_from_packed(w: u64) -> Option<Rc<Lifetime>> {
+    if !is_lifetime_other(w) {
         return None;
     }
-    // SAFETY: `FW_INFO_OTHER` payload is `Box<OpInfo>` owned by the slot.
-    let info = unsafe { &*(fwd_ptr(w) as *const OpInfo) };
-    match info {
-        OpInfo::Lifetime(rc) => Some(Rc::clone(rc)),
-        _ => None,
-    }
+    // SAFETY: OTHER subtag 1 payload is `Rc<Lifetime>` owned by the slot.
+    let rc = unsafe { Rc::from_raw(fwd_ptr_other(w) as *const Lifetime) };
+    let out = Rc::clone(&rc);
+    std::mem::forget(rc);
+    Some(out)
 }
 
 fn pack_info(info: OpInfo) -> u64 {
@@ -566,9 +585,14 @@ fn pack_info(info: OpInfo) -> u64 {
             debug_assert_eq!(p & FW_TAG, 0);
             p | FW_INFO_BOUND
         }
+        OpInfo::Lifetime(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_OTHER_ALIGN, 0);
+            p | FW_INFO_OTHER | FW_OTHER_SUBTAG
+        }
         other => {
-            let p = Box::into_raw(Box::new(other)) as u64;
-            debug_assert_eq!(p & FW_TAG, 0);
+            let p = Box::into_raw(Box::new(OtherInfoHeap(other))) as u64;
+            debug_assert_eq!(p & FW_OTHER_ALIGN, 0);
             p | FW_INFO_OTHER
         }
     }
@@ -616,10 +640,17 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
             out
         }
         FW_INFO_OTHER => {
-            let boxed = unsafe { Box::from_raw(fwd_ptr(w) as *mut OpInfo) };
-            let out = Forwarded::Info((*boxed).clone());
-            std::mem::forget(boxed);
-            out
+            if is_lifetime_other(w) {
+                let rc = unsafe { Rc::from_raw(fwd_ptr_other(w) as *const Lifetime) };
+                let out = Forwarded::Info(OpInfo::Lifetime(Rc::clone(&rc)));
+                std::mem::forget(rc);
+                out
+            } else {
+                let boxed = unsafe { Box::from_raw(fwd_ptr_other(w) as *mut OtherInfoHeap) };
+                let out = Forwarded::Info(boxed.0.clone());
+                std::mem::forget(boxed);
+                out
+            }
         }
         _ => Forwarded::None,
     }
@@ -671,7 +702,13 @@ pub(crate) fn drop_packed_forwarded(w: u64) {
         FW_CONST => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) }),
         FW_INFO_PTR => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) }),
         FW_INFO_BOUND => drop(unsafe { IntBoundRc::from_raw(fwd_ptr(w) as *const ()) }),
-        FW_INFO_OTHER => drop(unsafe { Box::from_raw(fwd_ptr(w) as *mut OpInfo) }),
+        FW_INFO_OTHER => {
+            if is_lifetime_other(w) {
+                drop(unsafe { Rc::from_raw(fwd_ptr_other(w) as *const Lifetime) })
+            } else {
+                drop(unsafe { Box::from_raw(fwd_ptr_other(w) as *mut OtherInfoHeap) })
+            }
+        }
         _ => {}
     }
 }

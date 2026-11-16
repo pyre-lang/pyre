@@ -607,7 +607,13 @@ impl<'a> RegAlloc<'a> {
                 TargetArgLoc::Reg { regnum, is_xmm } if !hinted.contains(arg) => {
                     hinted.push(arg.clone());
                     let r = crate::regloc::RegLoc::new(regnum, is_xmm);
-                    self.longevity.fixed_register(position, r, Some(arg));
+                    let all_regs = if is_xmm {
+                        &self.xrm.all_regs
+                    } else {
+                        &self.rm.all_regs
+                    };
+                    self.longevity
+                        .fixed_register(position, r, Some(arg), all_regs);
                 }
                 _ => {}
             }
@@ -2163,7 +2169,13 @@ impl<'a> RegAlloc<'a> {
                     }
                     Loc::Reg(r) if !hinted.contains(iarg) => {
                         hinted.push(iarg.clone());
-                        self.longevity.fixed_register(position, r, Some(iarg));
+                        let all_regs = if r.is_float() {
+                            &self.xrm.all_regs
+                        } else {
+                            &self.rm.all_regs
+                        };
+                        self.longevity
+                            .fixed_register(position, r, Some(iarg), all_regs);
                     }
                     _ => {}
                 }

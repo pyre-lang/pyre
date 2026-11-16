@@ -4708,7 +4708,7 @@ fn invert_condition(cc: IntCC) -> IntCC {
 /// `regalloc.py get_lifetime(box).last_usage`. `None` when the box has
 /// no Lifetime or `last_usage < 0` (unused inputarg `(-1, -1)`).
 fn last_usage_of(box_: &Operand) -> Option<i32> {
-    majit_backend::regalloc::get_lifetime::<(), ()>(box_)
+    majit_backend::regalloc::get_lifetime(box_)
         .map(|lt| lt.last_usage.get())
         .filter(|&u| u >= 0)
 }
@@ -4879,7 +4879,7 @@ mod longevity_last_usage_tests {
 
     fn install_longevity(inputargs: &[InputArgRc], ops: &[OpRc]) {
         clear_compile_forwarded(inputargs, ops);
-        let _ = majit_backend::regalloc::compute_vars_longevity::<(), ()>(inputargs, ops);
+        let _ = majit_backend::regalloc::compute_vars_longevity::<()>(inputargs, ops);
     }
 
     #[test]
@@ -4934,7 +4934,7 @@ mod longevity_last_usage_tests {
         let inputargs = [i0];
         install_longevity(&inputargs, &ops);
         assert_eq!(last_usage_of(&add_box), Some(1));
-        let lt = majit_backend::regalloc::get_lifetime::<(), ()>(&add_box).unwrap();
+        let lt = majit_backend::regalloc::get_lifetime(&add_box).unwrap();
         assert!(
             lt.real_usages
                 .borrow()
@@ -4993,7 +4993,7 @@ mod longevity_last_usage_tests {
         let ops = [add, finish];
         let inputargs = [i0];
         install_longevity(&inputargs, &ops);
-        assert!(majit_backend::regalloc::get_lifetime::<(), ()>(&add_box).is_none());
+        assert!(majit_backend::regalloc::get_lifetime(&add_box).is_none());
         assert_eq!(last_usage_of(&add_box), None);
     }
 
@@ -12652,7 +12652,7 @@ impl CraneliftBackend {
         // regalloc.py compute_vars_longevity — last_usage lives on each
         // producer box. get_gcmap / next_op_can_accept_cc read it there.
         clear_compile_forwarded(inputargs, ops);
-        let _longevity = majit_backend::regalloc::compute_vars_longevity::<(), ()>(inputargs, ops);
+        let _longevity = majit_backend::regalloc::compute_vars_longevity::<()>(inputargs, ops);
 
         // pyjitpl.py `cpu.propagate_exception_descr` — snapshot the
         // attached descr pointer at compile time so the OpCode::CheckMemoryError
@@ -12956,7 +12956,7 @@ impl CraneliftBackend {
                 .map(Operand::from_bound_inputarg)
                 .chain(ops.iter().map(Operand::from_bound_op))
                 .filter_map(|box_| {
-                    majit_backend::regalloc::get_lifetime::<(), ()>(&box_)
+                    majit_backend::regalloc::get_lifetime(&box_)
                         .map(|lt| (lt.definition_pos.get(), lt.last_usage.get()))
                 })
                 .collect();
@@ -14018,7 +14018,7 @@ impl CraneliftBackend {
                 let result = Operand::from_bound_op(op);
                 debug_assert_eq!(
                     last_usage_of(&result).is_none(),
-                    majit_backend::regalloc::get_lifetime::<(), ()>(&result).is_none(),
+                    majit_backend::regalloc::get_lifetime(&result).is_none(),
                     "dead-op skip: last_usage_of and get_lifetime must agree"
                 );
                 if last_usage_of(&result).is_none() {

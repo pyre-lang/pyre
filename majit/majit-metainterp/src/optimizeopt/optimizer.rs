@@ -2088,39 +2088,33 @@ impl Optimizer {
         op: &majit_ir::operand::Operand,
         ctx: &mut OptContext,
     ) -> majit_ir::operand::Operand {
-        let opref = op.to_opref();
-        // optimizer.py: op = get_box_replacement(op)
+        // optimizer.py Optimizer.force_box: op = get_box_replacement(op)
         if op.is_constant() {
             return op.clone();
         }
         let resolved_box = op.get_box_replacement(false);
-        let resolved_op = Some(resolved_box);
-        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
-        // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
-        // The pool is keyed by the pure op's result Box. When that result
-        // folded to an inline Const, the Const can never be a pool key (the
-        // value is reproduced by inlining at use sites, not by a produced
-        // short box), so `op in potential_extra_ops` is always false and no
-        // short-preamble op is recorded. Skip the recording for const-resolved
-        // results — otherwise the Const reaches `used_boxes` and the carried
-        // label slot trips `OpRef::raw()` in unroll.rs.
-        if !resolved.is_constant() {
-            let tracked = resolved_op
-                .as_ref()
-                .and_then(|resolved_box| ctx.take_potential_extra_op(resolved_box))
-                .or_else(|| {
-                    if opref == resolved {
-                        None
-                    } else {
-                        ctx.take_potential_extra_op(op)
-                    }
-                });
+        // optimizer.py Optimizer.force_box: potential_extra_ops.pop(op)
+        // then short_preamble_producer.add_preamble_op. The pool is keyed
+        // by the pure op's result Box. When that result folded to an
+        // inline Const, the Const can never be a pool key (the value is
+        // reproduced by inlining at use sites, not by a produced short
+        // box), so `op in potential_extra_ops` is always false and no
+        // short-preamble op is recorded. Skip the recording for
+        // const-resolved results — otherwise the Const reaches `used_boxes`
+        // and the carried label slot trips `OpRef::raw()` in unroll.rs.
+        if !resolved_box.is_constant() {
+            let tracked = ctx.take_potential_extra_op(&resolved_box).or_else(|| {
+                if resolved_box.same_box(op) {
+                    None
+                } else {
+                    ctx.take_potential_extra_op(op)
+                }
+            });
             if let Some(preamble_op) = tracked {
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — the resolved Box itself is handed to the builder.
-                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
-                // — walk the box's own `_forwarded` chain (total; identity on a
-                // miss), object-native rather than positional.
+                // shortpreamble.py add_preamble_op:
+                // `op = preamble_op.op.get_box_replacement()` — walk the
+                // box's own `_forwarded` chain and hand that Box to the
+                // builder.
                 let resolved_for_pop = preamble_op.op.get_box_replacement(false);
                 if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
@@ -2129,15 +2123,14 @@ impl Optimizer {
                 }
             }
         }
-        let resolved_box = resolved_op.expect("get_box_replacement is total");
         // `optimizer.py Optimizer.force_box` returns a Const unchanged after
         // the potential-extra-op lookup: Const carries no PtrInfo and cannot
         // be virtual.
         if resolved_box.is_constant() {
             return resolved_box;
         }
-        // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
-        //     return ConstInt(info.get_constant_int())
+        // optimizer.py Optimizer.force_box: if op.type == 'i' and
+        // info.is_constant(): return ConstInt(info.get_constant_int())
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
@@ -2367,7 +2360,10 @@ impl Optimizer {
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF => {
                 // Check arg(0) is not null constant.
-                if let Some(0) = ctx.get_constant_int_box(&op.arg(0).get_box_replacement(false)) {
+                if let Some(0) = op
+                    .arg_ref(0)
+                    .with_box_replacement(|t| ctx.get_constant_int_box(t))
+                {
                     return false; // would deref null
                 }
                 true
@@ -4817,7 +4813,7 @@ impl Optimizer {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             let b_old = Operand::from_bound_op(op_rc);
-            let b_new = current_op.arg(0).get_box_replacement(false);
+            let b_new = current_op.arg_ref(0).get_box_replacement(false);
             ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }
@@ -5176,7 +5172,7 @@ impl Optimizer {
         // `_forwarded` info, so emitted ops and get_producing_op consumers can
         // read info off op.arg(i).
         for i in 0..op.num_args() {
-            let arg = self.force_box(&op.arg(i), ctx);
+            let arg = self.force_box(op.arg_ref(i), ctx);
             op.setarg(i, arg);
         }
         // force_box may force a virtual whose materialization defers an
@@ -5482,14 +5478,19 @@ impl Optimizer {
                             // `compile_loop_body`) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.resolve_operand_operand(&pf_op.arg(1));
-                            let idx = match boxindex.const_int() {
-                                Some(v) if (0..=i32::MAX as i64).contains(&v) => v,
+                            let idx_ok = ctx.with_resolved_operand(pf_op.arg_ref(1), |boxindex| {
+                                match boxindex.const_int() {
+                                    Some(v) if (0..=i32::MAX as i64).contains(&v) => Some(v),
+                                    _ => None,
+                                }
+                            });
+                            let idx = match idx_ok {
+                                Some(v) => v,
                                 // Defer the abort; the caller checks the signal
                                 // after `emit_guard_operation` returns and
                                 // abandons the trace before the bogus entry is
                                 // used.
-                                _ => {
+                                None => {
                                     ctx.signal_invalid_loop(
                                         "_add_pending_fields: SETARRAYITEM_GC index \
                                              must be a non-negative Const i32 (TagOverflow)",
@@ -5836,29 +5837,27 @@ impl Optimizer {
     /// ```
     fn _maybe_replace_guard_value_if_changed(op: &Op, ctx: &mut OptContext) -> Option<Op> {
         // optimizer.py `_maybe_replace_guard_value`: if op.getarg(0).type == 'i'
-        let arg0 = op.arg(0);
+        let arg0 = op.arg_ref(0);
         if arg0.type_() != majit_ir::Type::Int {
             return None;
         }
         // optimizer.py `_maybe_replace_guard_value`:
         //   b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = {
-            let b = ctx.resolve_operand_operand(&arg0);
-            ctx.getintbound_handle(&b).borrow().clone()
-        };
+        // `getintbound_handle` walks the held box (`with_resolved_operand`).
+        let b = ctx.getintbound_handle(arg0).borrow().clone();
         if !b.is_bool() {
             return None;
         }
         // optimizer.py `_maybe_replace_guard_value`: constvalue = op.getarg(1).getint()
-        let constvalue = op.arg(1).get_box_replacement(false).const_int()?;
+        let constvalue = op.arg_ref(1).with_box_replacement(|t| t.const_int())?;
         // optimizer.py `_maybe_replace_guard_value`: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
             _ => return None,
         };
-        // optimizer.py: replace_op_with(op, opnum, [op.getarg(0)], descr)
-        let newop = Op::new(new_opcode, &[arg0]);
+        // optimizer.py replace_op_with(op, opnum, [op.getarg(0)], descr)
+        let newop = Op::new(new_opcode, std::slice::from_ref(arg0));
         newop.pos().set(op.pos().get());
         if let Some(d) = op.getdescr() {
             newop.setdescr(d);

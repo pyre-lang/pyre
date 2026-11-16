@@ -7506,39 +7506,19 @@ impl<'a> ResumeDataDirectReader<'a> {
         (jitcode_pos, pc)
     }
 
-    /// resume.py next_int
-    #[inline]
+    /// resume.py `AbstractResumeDataReader.next_int` —
+    /// `decode_int(self.resumecodereader.next_item())`.
+    #[inline(always)]
     pub fn next_int(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.finish_int(tagged)
-    }
-
-    #[inline]
-    fn finish_int(&mut self, tagged: i16) -> i64 {
-        // resume.py decode_int `TAGINT`: the payload is the signed value.
-        if (tagged as u16) & TAGMASK as u16 == TAGINT as u16 {
-            return (tagged >> 2) as i64;
-        }
         self.decode_int(tagged)
     }
 
-    /// resume.py next_ref
-    #[inline]
+    /// resume.py `AbstractResumeDataReader.next_ref` —
+    /// `decode_ref(self.resumecodereader.next_item())`.
+    #[inline(always)]
     pub fn next_ref(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.finish_ref_slot(tagged)
-    }
-
-    #[inline]
-    fn finish_ref_slot(&mut self, tagged: i16) -> i64 {
-        // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
-        if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
-            let mut idx = (tagged >> 2) as i32;
-            if idx < 0 {
-                idx += self.count;
-            }
-            return self.cpu_get_value(idx as usize);
-        }
         self.decode_ref(tagged)
     }
 
@@ -8016,70 +7996,50 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py decode_int
+    /// resume.py `ResumeDataDirectReader.decode_int`
+    #[inline(always)]
     pub fn decode_int(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
-        match tag {
-            TAGCONST => {
-                // resume.py:1555 — ConstInt.getint(): return the i64 value.
-                let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts[idx].getint()
+        if tag == TAGCONST {
+            let idx = (num - TAG_CONST_OFFSET) as usize;
+            self.consts[idx].getint()
+        } else if tag == TAGINT {
+            num as i64
+        } else if tag == TAGVIRTUAL {
+            let idx = self.virtual_index(num);
+            self.getvirtual_int(idx)
+        } else {
+            debug_assert_eq!(tag, TAGBOX);
+            let mut idx = num;
+            if idx < 0 {
+                idx += self.count;
             }
-            TAGINT => {
-                // resume.py:1557
-                num as i64
-            }
-            TAGVIRTUAL => {
-                // resume.py:1559
-                let idx = self.virtual_index(num);
-                self.getvirtual_int(idx)
-            }
-            TAGBOX => {
-                // resume.py:1561-1564
-                let mut idx = num;
-                if idx < 0 {
-                    idx += self.count;
-                }
-                self.cpu_get_value(idx as usize)
-            }
-            _ => unreachable!("bad tag: {tag}"),
+            self.cpu_get_value(idx as usize)
         }
     }
 
-    /// resume.py decode_ref
+    /// resume.py `ResumeDataDirectReader.decode_ref`
+    #[inline(always)]
     pub fn decode_ref(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
-        match tag {
-            TAGCONST => {
-                // resume.py:1569-1571
-                if tagged_eq(tagged, NULLREF) {
-                    return 0; // ConstPtr.value (null pointer)
-                }
-                // resume.py:1571
-                let idx = (num - TAG_CONST_OFFSET) as usize;
-                // history.py ConstPtr.getref_base() returns the GCREF value.
-                self.consts[idx].getref_base().as_usize() as i64
+        if tag == TAGCONST {
+            if tagged_eq(tagged, NULLREF) {
+                return 0;
             }
-            TAGVIRTUAL => {
-                // resume.py:1573
-                let idx = self.virtual_index(num);
-                self.getvirtual_ptr(idx)
+            let idx = (num - TAG_CONST_OFFSET) as usize;
+            self.consts[idx].getref_base().as_usize() as i64
+        } else if tag == TAGVIRTUAL {
+            let idx = self.virtual_index(num);
+            self.getvirtual_ptr(idx)
+        } else {
+            if tag != TAGBOX {
+                panic!("decode_ref: unexpected tag {tag}");
             }
-            TAGBOX => {
-                // resume.py decode_ref TAGBOX: cpu.get_ref_value(self.deadframe, num).
-                let mut idx = num;
-                if idx < 0 {
-                    idx += self.count;
-                }
-                self.cpu_get_value(idx as usize)
+            let mut idx = num;
+            if idx < 0 {
+                idx += self.count;
             }
-            _ => {
-                // resume.py `assert tag == TAGBOX`: in a ref slot
-                // only TAGCONST / TAGVIRTUAL / TAGBOX are valid.  TAGINT
-                // here means the numbering stage produced an int-tagged
-                // entry in a ref position — a producer bug.
-                panic!("decode_ref: unexpected tag {tag}")
-            }
+            self.cpu_get_value(idx as usize)
         }
     }
 

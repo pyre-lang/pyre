@@ -1746,12 +1746,18 @@ impl BlackholeInterpreter {
 
     /// blackhole.py handle_rvmprof_enter.
     pub fn handle_rvmprof_enter(&mut self) {
-        let code = &self.jitcode.code;
+        let code: &[u8] = self.jitcode.code.as_slice();
         let mut position = self.position;
-        let mut opcode = code[position];
+        debug_assert!(position < code.len());
+        // SAFETY: `position` is a resume pc inside the seated jitcode
+        // (`resume.py` `blackhole_from_resumedata` calls `setposition` with it
+        // right before this), and a `live/` marker is always followed by another
+        // instruction (`assembler.py` `Assembler.assemble`).
+        let mut opcode = unsafe { *code.get_unchecked(position) };
         if opcode == self.op_live {
             position += majit_jitcode::liveness::OFFSET_SIZE + 1;
-            opcode = code[position];
+            debug_assert!(position < code.len());
+            opcode = unsafe { *code.get_unchecked(position) };
         }
         if opcode == self.op_rvmprof_code {
             let leaving = self.registers_i[code[position + 1] as usize];
@@ -1908,6 +1914,30 @@ impl BlackholeInterpreter {
         // instead of the writer.  `jit_strict_mode` is the untranslated-build
         // analog: debug builds plus `MAJIT_STRICT`.
         let check_startpoints = crate::jit_strict_mode();
+        if trace || check_startpoints {
+            self.dispatch_loop_untranslated(trace, check_startpoints)
+        } else {
+            self.dispatch_loop_impl::<false>(false, false)
+        }
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn dispatch_loop_untranslated(&mut self, trace: bool, check_startpoints: bool) -> BhRunOutcome {
+        self.dispatch_loop_impl::<true>(trace, check_startpoints)
+    }
+
+    /// The `UNTRANSLATED = false` instance is the translated `dispatch_loop`
+    /// (`blackhole.py` guards the startpoints assert and the verbose prints with
+    /// `not we_are_translated()`); `UNTRANSLATED = true` keeps both.
+    #[inline(always)]
+    fn dispatch_loop_impl<const UNTRANSLATED: bool>(
+        &mut self,
+        trace: bool,
+        check_startpoints: bool,
+    ) -> BhRunOutcome {
+        let trace = UNTRANSLATED && trace;
+        let check_startpoints = UNTRANSLATED && check_startpoints;
         // `blackhole.py` `BlackholeInterpreter.run` binds the bytecode ONCE —
         // `self.dispatch_loop(self, self.jitcode.code, self.position)` — and
         // `dispatch_loop` carries it as a parameter for the whole loop.  Bind it

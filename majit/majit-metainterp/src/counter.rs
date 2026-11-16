@@ -472,14 +472,23 @@ impl JitCounterInner {
     /// drivers may file a cell under the same raw hash; a minted key is
     /// unique across drivers ([`Self::mint_cell_key`]).
     fn cell_by_key(&self, jitdriver_sd: usize, cell_key: u64) -> Option<Rc<BaseJitCell>> {
-        let mut cell = self.lookup_chain(self.bucket_of(cell_key)).clone();
-        while let Some(c) = cell {
+        fn walk(
+            cell: Option<&Rc<BaseJitCell>>,
+            jitdriver_sd: usize,
+            cell_key: u64,
+        ) -> Option<Rc<BaseJitCell>> {
+            let c = cell?;
             if c.jitdriver_sd == jitdriver_sd && c.cell_key.get() == Some(cell_key) {
-                return Some(c);
+                return Some(Rc::clone(c));
             }
-            cell = c.next.borrow().clone();
+            let next = c.next.borrow();
+            walk(next.as_ref(), jitdriver_sd, cell_key)
         }
-        None
+        walk(
+            self.lookup_chain(self.bucket_of(cell_key)).as_ref(),
+            jitdriver_sd,
+            cell_key,
+        )
     }
 
     /// Whether any driver's cell holds `cell_key`.

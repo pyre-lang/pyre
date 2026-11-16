@@ -67,9 +67,9 @@ pub enum OpInfo {
     /// info.py FloatConstInfo — Float constant carrier.
     FloatConstInfo(FloatConstInfo),
     /// `regalloc.py Lifetime(AbstractInfo)` stored by `get_lifetime` /
-    /// `LifetimeManager.__setitem__` (`box.set_forwarded(lt)`). Packed
-    /// through `FW_INFO_OTHER`. Not optimizer information.
-    Lifetime(std::rc::Rc<dyn std::any::Any>),
+    /// `LifetimeManager.__setitem__` (`box.set_forwarded(lt)`). Packed as a
+    /// thin `Rc` under `FW_INFO_OTHER` with bit-3 subtag 1.
+    Lifetime(std::rc::Rc<crate::lifetime::Lifetime>),
 }
 
 impl std::fmt::Debug for OpInfo {

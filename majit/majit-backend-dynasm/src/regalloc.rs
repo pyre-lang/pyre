@@ -32,13 +32,13 @@ use majit_ir::{InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TempVar, Type};
 use smallvec::SmallVec;
 
 pub use majit_backend::regalloc::{FrameLayout, UNDEF_POS, compute_vars_longevity};
-pub type Lifetime = majit_backend::regalloc::Lifetime<RegLoc, FrameLoc>;
+pub type Lifetime = majit_backend::regalloc::Lifetime;
 pub type FixedRegisterPositions = majit_backend::regalloc::FixedRegisterPositions<RegLoc>;
-pub type LifetimeManager = majit_backend::regalloc::LifetimeManager<RegLoc, FrameLoc>;
+pub type LifetimeManager = majit_backend::regalloc::LifetimeManager<RegLoc>;
 pub type FrameManager = majit_backend::regalloc::FrameManager<DynasmFrameLayout>;
 
-/// Pin `get_lifetime` to dynasm `Lifetime<RegLoc, FrameLoc>` so call sites
-/// (including `visit_boxes_with_frame_loc`) keep the pre-move signature.
+/// `regalloc.py get_lifetime` — thin wrapper over the shared non-generic
+/// lookup so dynasm call sites keep this module's import path.
 #[inline]
 pub fn get_lifetime(box_: &Operand) -> Option<Rc<Lifetime>> {
     majit_backend::regalloc::get_lifetime(box_)
@@ -87,8 +87,9 @@ pub fn visit_boxes_with_frame_loc(
 ) {
     let mut visit_box = |box_: &Operand| {
         if let Some(lt) = get_lifetime(box_)
-            && let Some(floc) = lt.current_frame_loc.get()
+            && let Some(pos) = lt.current_frame_loc.get()
         {
+            let floc = DynasmFrameLayout::frame_pos(pos as usize, box_.type_(), fm.base_ofs);
             visit(box_.to_opref(), floc);
         }
     };
@@ -497,7 +498,7 @@ impl RegisterManager {
                 .filter(|r| !self.no_lower_byte_regs.contains(r))
                 .copied()
                 .collect();
-            let newloc = longevity.try_pick_free_reg(self.position, v, &free_regs);
+            let newloc = longevity.try_pick_free_reg(self.position, v, &free_regs, &self.all_regs);
             newloc?;
             let newloc = newloc.unwrap();
             self.free_regs.retain(|r| *r != newloc);
@@ -513,7 +514,7 @@ impl RegisterManager {
         if res.is_some() {
             return res;
         }
-        let loc = longevity.try_pick_free_reg(self.position, v, &self.free_regs);
+        let loc = longevity.try_pick_free_reg(self.position, v, &self.free_regs, &self.all_regs);
         match loc {
             None => None,
             Some(reg) => {
@@ -1566,15 +1567,15 @@ impl<'a> RegAlloc<'a> {
                 index += 1;
                 continue;
             };
-            let loc = self
+            let pos = self
                 .longevity
                 .get(v)
                 .and_then(|lifetime| lifetime.current_frame_loc.get())
                 .expect("gcmap frame binding without current_frame_loc");
-            debug_assert_eq!(DynasmFrameLayout::get_loc_index(&loc), index);
+            debug_assert_eq!(pos as usize, index);
             let size = DynasmFrameLayout::frame_size(self.tp(v));
             if v.type_() == Type::Ref && self.rm.is_still_alive(v, &self.longevity) {
-                gcmap_set_bit(gcmap, loc.get_position() + JITFRAME_FIXED_SIZE);
+                gcmap_set_bit(gcmap, pos as usize + JITFRAME_FIXED_SIZE);
             }
             index += size;
         }

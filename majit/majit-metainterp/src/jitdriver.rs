@@ -2384,6 +2384,26 @@ fn map_runner_resume(resume: Option<usize>) -> FunctionEntryRunner {
     }
 }
 
+/// Greens a door already holding `live` should compare.
+///
+/// `GreenRefPin::reload` rewrites Ref slots in `live.values`; those bits
+/// are the `*greenargs` `warmstate.py maybe_compile_and_run` walks with
+/// `JitCell.comparekey`. Types come from the caller (`G::TYPES`) when
+/// supplied, else `live.types`.
+#[inline(always)]
+fn live_or_passed_greenargs<'a>(
+    live: Option<&'a majit_ir::GreenKey>,
+    greenargs: Option<(&'a [i64], &'a [GreenType])>,
+) -> Option<(&'a [i64], &'a [GreenType])> {
+    match live {
+        Some(live) => Some((
+            live.values.as_slice(),
+            greenargs.map_or(live.types.as_slice(), |(_, types)| types),
+        )),
+        None => greenargs,
+    }
+}
+
 fn door_ref_pin<St: JitState>(
     _state: &St,
     values: &[i64],
@@ -6068,11 +6088,9 @@ impl<S: JitState> JitDriver<S> {
         let pin = door_ref_pin(state, green_values, G::TYPES, caller_pin_save);
         let mut live = majit_ir::GreenKey::from_greenargs(green_values, G::TYPES);
         pin.reload(&mut live);
-        let values = live.values.clone();
-        let types = live.types.clone();
         self.back_edge_greenargs(
             green_key_hash,
-            Some((values.as_slice(), types.as_slice())),
+            Some((green_values, G::TYPES)),
             Some((&pin, &mut live)),
             target_pc,
             state,
@@ -6330,12 +6348,10 @@ impl<S: JitState> JitDriver<S> {
         let mut live = pin.live_clone(&green_key);
         let hash = live.get_uhash();
         pin.reload(&mut live);
-        let values = live.values.clone();
-        let types = live.types.clone();
         Ok(self
             .back_edge_greenargs(
                 hash,
-                Some((values.as_slice(), types.as_slice())),
+                Some((green_key.values.as_slice(), green_key.types.as_slice())),
                 Some((&pin, &mut live)),
                 target_pc,
                 state,
@@ -7029,7 +7045,10 @@ impl<S: JitState> JitDriver<S> {
         // does not occupy this door. Entry is the cell's procedure token.
         let jd_no = self.index().unwrap_or(0);
         let door = match self.meta.warm_state_ref_for_driver(jd_no) {
-            Some(warm) => warm.door_cell(green_key_hash, greenargs),
+            Some(warm) => warm.door_cell(
+                green_key_hash,
+                live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs),
+            ),
             None => DoorCell::Empty,
         };
         match door {
@@ -7132,7 +7151,10 @@ impl<S: JitState> JitDriver<S> {
         let carried_token = carried_procedure_token.is_some();
         let green_key = match &carried_procedure_token {
             Some(_) => green_key_hash,
-            None => self.resolved_entry_cell_key(green_key_hash, greenargs),
+            None => self.resolved_entry_cell_key(
+                green_key_hash,
+                live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs),
+            ),
         };
         // `warmstate.py maybe_compile_and_run`: `if cell.flags & JC_TRACING:
         // return`. Skip only THIS cell's `JC_TRACING`. A parked outer attempt
@@ -7228,7 +7250,9 @@ impl<S: JitState> JitDriver<S> {
                 let _direct_confirm_roots = direct_live_values
                     .as_mut()
                     .map(|values| crate::warmstate::root_confirm_ref_values(values));
-                let confirm_types = self.confirm_enter_jit_green_types(greenargs);
+                let confirm_args =
+                    live_or_passed_greenargs(pin_live.as_ref().map(|(_, live)| &**live), greenargs);
+                let confirm_types = self.confirm_enter_jit_green_types(confirm_args);
                 let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
                 if !self
                     .meta
@@ -7236,7 +7260,7 @@ impl<S: JitState> JitDriver<S> {
                     .is_some_and(|warm| {
                         warm.confirm_compiled_entry_for_cell_key(
                             green_key,
-                            greenargs.map(|(v, _)| v),
+                            confirm_args.map(|(v, _)| v),
                             &confirm_types,
                             &confirm_reds,
                         )
@@ -8188,17 +8212,19 @@ impl<S: JitState> JitDriver<S> {
             // `ResumeDataDirectReader(metainterp_sd, ...)` and
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
-            // in place. The decode borrows that table; it does not
-            // take a copy. `borrow_mut` only for `setup_jitdrivers_sd` and the
-            // `blackhole_from_resumedata` acquire loop; drop it
-            // before `resume_mainloop` so a nested resume can acquire
-            // from this same builder (`blackhole.py`
+            // in place. Snapshot the published `Arc<[u8]>` once and
+            // borrow `&[u8]` from it; the lock is not held across
+            // `blackhole_from_resumedata`. `borrow_mut` only for
+            // `setup_jitdrivers_sd` and the `blackhole_from_resumedata`
+            // acquire loop; drop it before `resume_mainloop` so a nested
+            // resume can acquire from this same builder (`blackhole.py`
             // `BlackholeInterpBuilder.acquire_interp`).
             if self.state_field_layout.total_live_values() == 0 {
                 self.state_field_layout = state.state_field_layout();
             }
             let cpu = self.meta.blackhole_cpu();
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta.staticdata);
+            let all_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
             let (mut bh, vable_ptr) = {
                 let mut bh_builder = self.meta.staticdata.blackholeinterpbuilder.borrow_mut();
                 bh_builder.debug_assert_cpu(cpu);
@@ -8214,12 +8240,11 @@ impl<S: JitState> JitDriver<S> {
                 if bh_builder.state_field_layout != self.state_field_layout {
                     bh_builder.state_field_layout = self.state_field_layout.clone();
                 }
-                let all_liveness = self.meta.staticdata.liveness_info.read();
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     jitcodes,
                     rd_consts_slice,
-                    &all_liveness,
+                    all_liveness.as_ref(),
                     fail_args,
                     rd_virtuals_slice,
                     Some(rd_pendingfields), // rd_guard_pendingfields
@@ -8413,7 +8438,6 @@ impl<S: JitState> JitDriver<S> {
                                 let jc = std::sync::Arc::clone(
                                     &self.meta.jitcodes()[terminal.jitcode_index],
                                 );
-                                let all_liveness = self.meta.staticdata.liveness_info.read();
                                 writeback_live_state_scalars_from_blackhole(
                                     state,
                                     &layout,
@@ -8423,7 +8447,7 @@ impl<S: JitState> JitDriver<S> {
                                     &terminal.registers_i,
                                     &terminal.registers_r,
                                     &terminal.registers_f,
-                                    &all_liveness,
+                                    all_liveness.as_ref(),
                                 );
                             }
                         }

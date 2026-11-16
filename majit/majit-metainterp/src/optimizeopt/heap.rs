@@ -847,20 +847,24 @@ pub struct OptHeapState {
     /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
     /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
     /// `self` so the nested walk sees the same caches.
-    home: Weak<RefCell<Option<OptHeapState>>>,
+    home: Weak<RefCell<Option<Box<OptHeapState>>>>,
     /// True only while `with_taken_state` holds the live value outside the
     /// cell, outermost level.
     taken: bool,
 }
 
 pub struct OptHeap {
-    state: Rc<RefCell<Option<OptHeapState>>>,
+    /// `heap.py OptHeap` is a heap-allocated instance. Take / put-back and
+    /// `emit_extra` park this pointer.
+    state: Rc<RefCell<Option<Box<OptHeapState>>>>,
 }
 
 impl OptHeap {
     pub fn new() -> Self {
         Self {
-            state: Rc::new_cyclic(|weak| RefCell::new(Some(OptHeapState::new(weak.clone())))),
+            state: Rc::new_cyclic(|weak| {
+                RefCell::new(Some(Box::new(OptHeapState::new(weak.clone()))))
+            }),
         }
     }
 
@@ -893,7 +897,7 @@ impl OptHeap {
 }
 
 impl OptHeapState {
-    pub fn new(home: Weak<RefCell<Option<OptHeapState>>>) -> Self {
+    pub fn new(home: Weak<RefCell<Option<Box<OptHeapState>>>>) -> Self {
         OptHeapState {
             vrefinfo: crate::virtualref::VirtualRefInfo::new(),
             cached_fields: Vec::new(),
@@ -912,8 +916,8 @@ impl OptHeapState {
         }
     }
 
-    fn placeholder(&self) -> OptHeapState {
-        Self::new(self.home.clone())
+    fn placeholder(&self) -> Box<OptHeapState> {
+        Box::new(Self::new(self.home.clone()))
     }
 
     fn cached_field_pos_for_descr(&self, descr: &DescrRef) -> Option<usize> {
@@ -1340,14 +1344,14 @@ impl OptHeapState {
         if self.taken {
             let cell = self.home.upgrade().expect("OptHeap state home");
             let mut live = self.placeholder();
-            std::mem::swap(self, &mut live);
+            std::mem::swap(self, live.as_mut());
             // Park the live state. This is the only placeholder construction:
             // `vstring.py` `optstring.emit_extra` re-enters
             // `OptHeap.propagate_forward`.
             cell.borrow_mut().replace(live);
             Self::send_extra_after_heap(opt, op, ctx);
             let mut live = cell.borrow_mut().take().expect("OptHeap state taken");
-            std::mem::swap(self, &mut live);
+            std::mem::swap(self, live.as_mut());
         } else {
             Self::send_extra_after_heap(opt, op, ctx);
         }

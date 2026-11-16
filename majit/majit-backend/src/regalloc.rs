@@ -9,8 +9,6 @@
 //!
 //! Functions:
 //!   compute_vars_longevity — regalloc.py
-use std::cell::{Cell, RefCell};
-use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -25,179 +23,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{InputArgRc, OpCode, OpRc, Type};
 use smallvec::SmallVec;
 
-// ── Constants ──────────────────────────────────────────────────────
-
-/// regalloc.py UNDEF_POS
-pub const UNDEF_POS: i32 = -42;
-
-// ── Lifetime ───────────────────────────────────────────────────────
-
-/// regalloc.py `Lifetime` — liveness information for a single variable.
-/// Interior mutability so a shared `Rc<Lifetime>` (`Lifetime.share_with`)
-/// can be updated without a side-table lookup.
-pub struct Lifetime<R = (), F = ()> {
-    /// `Lifetime.definition_pos` — operations-slice index where the variable is defined
-    pub definition_pos: Cell<i32>,
-    /// `Lifetime.last_usage` — operations-slice index of last use (including failargs/jump)
-    pub last_usage: Cell<i32>,
-    /// `Lifetime.real_usages` — *real* usages (as op argument, excluding
-    /// jump/failargs). Four inline slots cover the common SSA use-count
-    /// so the first `push` does not heap-grow 16 B per live box.
-    pub real_usages: RefCell<Option<SmallVec<[i32; 4]>>>,
-    /// `Lifetime.fixed_positions` — positions requiring specific registers
-    pub fixed_positions: RefCell<Option<Vec<(i32, R)>>>,
-    /// `Lifetime.share_with` — another Lifetime that wants to share a register
-    pub share_with: RefCell<Option<Rc<Lifetime<R, F>>>>,
-    /// `Lifetime._definition_pos_shared`
-    _definition_pos_shared: Cell<i32>,
-    /// `Lifetime.current_register_index` into RegisterManager.all_regs (-1 = not in reg)
-    pub current_register_index: Cell<i32>,
-    /// `Lifetime.current_frame_loc` — frame location where the box currently lives
-    pub current_frame_loc: Cell<Option<F>>,
-    /// `Lifetime.hint_frame_pos` — hinted frame location (at the end of the trace)
-    pub hint_frame_pos: Cell<i32>,
-}
-
-impl<R, F> Lifetime<R, F> {
-    pub fn new(definition_pos: i32, last_usage: i32) -> Self {
-        Lifetime {
-            definition_pos: Cell::new(definition_pos),
-            last_usage: Cell::new(last_usage),
-            real_usages: RefCell::new(None),
-            fixed_positions: RefCell::new(None),
-            share_with: RefCell::new(None),
-            _definition_pos_shared: Cell::new(UNDEF_POS),
-            current_register_index: Cell::new(-1),
-            current_frame_loc: Cell::new(None),
-            hint_frame_pos: Cell::new(-1),
-        }
-    }
-
-    /// `Lifetime.last_usage_including_sharing` — follows `share_with` as a
-    /// Lifetime object, with no map lookup.
-    pub fn last_usage_including_sharing(&self) -> i32 {
-        let mut result = self.last_usage.get();
-        let mut share = self.share_with.borrow().clone();
-        while let Some(lt) = share {
-            result = lt.last_usage.get();
-            share = lt.share_with.borrow().clone();
-        }
-        result
-    }
-
-    /// `Lifetime.is_last_real_use_before`
-    pub fn is_last_real_use_before(&self, position: i32) -> bool {
-        match &*self.real_usages.borrow() {
-            None => true,
-            Some(usages) => *usages.last().unwrap() <= position,
-        }
-    }
-
-    /// `Lifetime.next_real_usage` — binary search for next real usage after position.
-    pub fn next_real_usage(&self, position: i32) -> i32 {
-        debug_assert!(position >= self.definition_pos.get());
-        let usages = self.real_usages.borrow();
-        let l = usages.as_ref().unwrap();
-        if position >= *l.last().unwrap() {
-            return -1;
-        }
-        let mut low: usize = 0;
-        let mut high: usize = l.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if position < l[mid] {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        l[low]
-    }
-
-    /// `Lifetime.definition_pos_shared`
-    pub fn definition_pos_shared(&self) -> i32 {
-        let shared = self._definition_pos_shared.get();
-        if shared != UNDEF_POS {
-            shared
-        } else {
-            self.definition_pos.get()
-        }
-    }
-
-    /// `Lifetime.fixed_register`
-    pub fn fixed_register(&self, position: i32, reg: R) -> i32 {
-        debug_assert!(self.definition_pos.get() <= position && position <= self.last_usage.get());
-        let mut positions = self.fixed_positions.borrow_mut();
-        let res;
-        if let Some(pos) = positions.as_ref() {
-            debug_assert!(position > pos.last().unwrap().0);
-            res = pos.last().unwrap().0;
-        } else {
-            *positions = Some(Vec::new());
-            res = self.definition_pos_shared();
-        }
-        positions.as_mut().unwrap().push((position, reg));
-        res
-    }
-
-    /// `Lifetime.find_fixed_register` — follows `share_with` as a Lifetime
-    /// object, with no map lookup.
-    pub fn find_fixed_register(&self, opindex: i32) -> Option<R>
-    where
-        R: Copy,
-    {
-        if let Some(ref positions) = *self.fixed_positions.borrow() {
-            for &(index, reg) in positions {
-                if opindex <= index {
-                    return Some(reg);
-                }
-            }
-        }
-        if let Some(share_lt) = self.share_with.borrow().clone() {
-            return share_lt.find_fixed_register(opindex);
-        }
-        None
-    }
-
-    /// `Lifetime.check_invariants`
-    pub fn check_invariants(&self) {
-        debug_assert!(self.definition_pos.get() <= self.last_usage.get());
-        if let Some(ref usages) = *self.real_usages.borrow() {
-            let mut sorted = usages.clone();
-            sorted.sort();
-            debug_assert_eq!(usages, &sorted);
-            debug_assert!(self.last_usage.get() >= *usages.iter().max().unwrap());
-            debug_assert!(self.definition_pos.get() < *usages.iter().min().unwrap());
-        }
-    }
-}
-
-impl<R: fmt::Debug + Copy, F: fmt::Debug + Copy> fmt::Debug for Lifetime<R, F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}:{:?}({})",
-            self.definition_pos.get(),
-            *self.real_usages.borrow(),
-            self.last_usage.get()
-        )?;
-        if let Some(ref fp) = *self.fixed_positions.borrow() {
-            for &(index, reg) in fp {
-                write!(f, " @{} in {:?}", index, reg)?;
-            }
-        }
-        if self.current_register_index.get() >= 0 {
-            write!(f, " reg_idx:{}", self.current_register_index.get())?;
-        }
-        if self.current_frame_loc.get().is_some() {
-            write!(f, " frame:{:?}", self.current_frame_loc.get())?;
-        }
-        if self.hint_frame_pos.get() >= 0 {
-            write!(f, " hint:{}", self.hint_frame_pos.get())?;
-        }
-        Ok(())
-    }
-}
+pub use majit_ir::lifetime::{Lifetime, UNDEF_POS};
 
 // ── FixedRegisterPositions ─────────────────────────────────────────
 
@@ -242,64 +68,76 @@ impl<R> FixedRegisterPositions<R> {
 
 /// `regalloc.py get_lifetime(box)` — `box.get_forwarded()` as a `Lifetime`.
 #[inline]
-pub fn get_lifetime<R: 'static, F: 'static>(box_: &Operand) -> Option<Rc<Lifetime<R, F>>> {
-    let info = box_.get_lifetime_info()?;
-    Rc::downcast(info).ok()
+pub fn get_lifetime(box_: &Operand) -> Option<Rc<Lifetime>> {
+    box_.get_lifetime_info()
 }
 
 /// regalloc.py `LifetimeManager` — owns `fixed_register_use` only.
 /// Per-box Lifetime lives on the box (`LifetimeManager.__setitem__` →
 /// `box.set_forwarded(lt)`; `__getitem__` → `get_lifetime`).
 ///
-/// `F` is carried so `get`/`contains`/`set` downcast the same
-/// `Lifetime<R, F>` the boxes hold. `fixed_register_use` is keyed by `R` only.
-pub struct LifetimeManager<R = (), F = ()> {
+/// `fixed_register_use` is keyed by the concrete register `R`.
+pub struct LifetimeManager<R = ()> {
     /// `LifetimeManager.fixed_register_use` — register → FixedRegisterPositions
     pub fixed_register_use: IndexMap<R, FixedRegisterPositions<R>, FxBuildHasher>,
-    _frame: PhantomData<F>,
 }
 
-impl<R, F> Default for LifetimeManager<R, F> {
+impl<R> Default for LifetimeManager<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R, F> LifetimeManager<R, F> {
+impl<R> LifetimeManager<R> {
     pub fn new() -> Self {
         LifetimeManager {
             fixed_register_use: IndexMap::with_hasher(FxBuildHasher),
-            _frame: PhantomData,
         }
     }
-}
 
-impl<R: Copy + Eq + Hash + 'static, F: Copy + 'static> LifetimeManager<R, F> {
     pub fn contains(&self, v: &Operand) -> bool {
-        get_lifetime::<R, F>(v).is_some()
+        get_lifetime(v).is_some()
     }
 
-    pub fn get(&self, v: &Operand) -> Option<Rc<Lifetime<R, F>>> {
+    pub fn get(&self, v: &Operand) -> Option<Rc<Lifetime>> {
         get_lifetime(v)
     }
 
-    pub fn set(&mut self, v: &Operand, lifetime: Lifetime<R, F>) -> Rc<Lifetime<R, F>> {
+    pub fn set(&mut self, v: &Operand, lifetime: Lifetime) -> Rc<Lifetime> {
         debug_assert!(
-            get_lifetime::<R, F>(v).is_none() || v.is_temp_var(),
+            get_lifetime(v).is_none() || v.is_temp_var(),
             "LifetimeManager.__setitem__: box already has a Lifetime"
         );
         let rc = Rc::new(lifetime);
         v.set_lifetime_info(rc.clone());
         rc
     }
+}
+
+impl<R: Copy + Eq + Hash> LifetimeManager<R> {
+    fn all_regs_index(all_regs: &[R], register: R) -> i32 {
+        all_regs
+            .iter()
+            .position(|&r| r == register)
+            .expect("fixed_register: register not in all_regs") as i32
+    }
 
     /// `LifetimeManager.fixed_register`
-    pub fn fixed_register(&mut self, opindex: i32, register: R, var: Option<&Operand>) {
+    ///
+    /// `all_regs` is the `RegisterManager.all_regs` that `register` belongs
+    /// to; the box's Lifetime stores that list's index.
+    pub fn fixed_register(
+        &mut self,
+        opindex: i32,
+        register: R,
+        var: Option<&Operand>,
+        all_regs: &[R],
+    ) {
         let definition_pos = match var {
             None => opindex,
             Some(v) => {
-                let lt = get_lifetime::<R, F>(v).unwrap();
-                lt.fixed_register(opindex, register)
+                let lt = get_lifetime(v).unwrap();
+                lt.fixed_register(opindex, Self::all_regs_index(all_regs, register))
             }
         };
         self.fixed_register_use
@@ -309,8 +147,8 @@ impl<R: Copy + Eq + Hash + 'static, F: Copy + 'static> LifetimeManager<R, F> {
 
     /// `LifetimeManager.try_use_same_register`
     pub fn try_use_same_register(&mut self, v0: &Operand, v1: &Operand) {
-        let lt0 = get_lifetime::<R, F>(v0).unwrap();
-        let lt1 = get_lifetime::<R, F>(v1).unwrap();
+        let lt0 = get_lifetime(v0).unwrap();
+        let lt1 = get_lifetime(v1).unwrap();
         let def0 = lt0.definition_pos.get();
         let last0 = lt0.last_usage.get();
         let def1 = lt1.definition_pos.get();
@@ -351,7 +189,7 @@ impl<R: Copy + Eq + Hash + 'static, F: Copy + 'static> LifetimeManager<R, F> {
         v: &Operand,
         free_regs: &[R],
     ) -> Option<R> {
-        let longevity_var = get_lifetime::<R, F>(v).unwrap();
+        let longevity_var = get_lifetime(v).unwrap();
         let last_usage = longevity_var.last_usage_including_sharing();
         let mut min_fixed_use_after = i32::MAX;
         let mut best_reg = None;
@@ -381,17 +219,29 @@ impl<R: Copy + Eq + Hash + 'static, F: Copy + 'static> LifetimeManager<R, F> {
     }
 
     /// regalloc.py LifetimeManager.try_pick_free_reg
-    pub fn try_pick_free_reg(&self, position: i32, v: &Operand, free_regs: &[R]) -> Option<R> {
+    ///
+    /// `all_regs` is the same `RegisterManager.all_regs` whose indices
+    /// `Lifetime.find_fixed_register` stores.
+    pub fn try_pick_free_reg(
+        &self,
+        position: i32,
+        v: &Operand,
+        free_regs: &[R],
+        all_regs: &[R],
+    ) -> Option<R> {
         if free_regs.is_empty() {
             return None;
         }
-        let longevity_var = get_lifetime::<R, F>(v).unwrap();
+        let longevity_var = get_lifetime(v).unwrap();
         // check whether there is a fixed register and whether it's free
-        let fixed_reg = longevity_var.find_fixed_register(position);
-        if let Some(reg) = fixed_reg
-            && free_regs.contains(&reg)
-        {
-            return Some(reg);
+        if let Some(idx) = longevity_var.find_fixed_register(position) {
+            let idx = idx as usize;
+            if idx < all_regs.len() {
+                let reg = all_regs[idx];
+                if free_regs.contains(&reg) {
+                    return Some(reg);
+                }
+            }
         }
         // try to find a register that's free for the whole lifetime of v
         let loc = self.free_reg_whole_lifetime(position, v, free_regs);
@@ -407,10 +257,10 @@ impl<R: Copy + Eq + Hash + 'static, F: Copy + 'static> LifetimeManager<R, F> {
 // ── compute_vars_longevity ─────────────────────────────────────────
 
 /// regalloc.py compute_vars_longevity — backward liveness analysis.
-pub fn compute_vars_longevity<R: Copy + Eq + Hash + 'static, F: Copy + 'static>(
+pub fn compute_vars_longevity<R>(
     inputargs: &[InputArgRc],
     operations: &[OpRc],
-) -> LifetimeManager<R, F> {
+) -> LifetimeManager<R> {
     // x86/regalloc.py `_prepare` asserts `arg.get_forwarded() is None` for
     // inputargs; `LifetimeManager.__setitem__` asserts the slot is empty.
     #[cfg(debug_assertions)]
@@ -495,7 +345,7 @@ pub fn compute_vars_longevity<R: Copy + Eq + Hash + 'static, F: Copy + 'static>(
 
     // `compute_vars_longevity` reverse real_usages and check invariants
     let reverse_usages = |box_: &Operand| {
-        if let Some(lifetime) = get_lifetime::<R, F>(box_) {
+        if let Some(lifetime) = get_lifetime(box_) {
             if let Some(ref mut usages) = *lifetime.real_usages.borrow_mut() {
                 usages.reverse();
             }
@@ -538,20 +388,15 @@ pub struct FrameManager<L: FrameLayout> {
 
 /// `BindingsIterItems` — lazy walk of occupied frame slots.
 ///
-/// Pyre keeps `Lifetime` in [`LifetimeManager`] rather than on the box's
-/// `_forwarded`, so the iterator holds the manager as the `get_lifetime`
-/// lookup.
+/// `Lifetime.current_frame_loc` is a frame position; the iterator rebuilds
+/// `L::Loc` via [`FrameLayout::frame_pos`].
 pub struct BindingsIterItems<'a, L: FrameLayout, R> {
     fm: &'a FrameManager<L>,
-    longevity: &'a LifetimeManager<R, L::Loc>,
+    longevity: &'a LifetimeManager<R>,
     index: usize,
 }
 
-impl<'a, L: FrameLayout, R> Iterator for BindingsIterItems<'a, L, R>
-where
-    R: Copy + Eq + Hash + 'static,
-    L::Loc: Copy + 'static,
-{
+impl<'a, L: FrameLayout, R> Iterator for BindingsIterItems<'a, L, R> {
     type Item = (Operand, L::Loc);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -566,9 +411,9 @@ where
             };
             self.index = index + L::frame_size(box_.type_());
             let lifetime = self.longevity.get(&box_).expect("lifetime is not None");
-            let loc = lifetime.current_frame_loc.get().expect("loc is not None");
-            // Translated RPython drops `assert` (`simplify.py remove_assertion_errors`).
-            debug_assert_eq!(L::get_loc_index(&loc), index);
+            let pos = lifetime.current_frame_loc.get().expect("loc is not None");
+            debug_assert_eq!(pos as usize, index);
+            let loc = L::frame_pos(pos as usize, box_.type_(), self.fm.base_ofs);
             return Some((box_, loc));
         }
     }
@@ -604,29 +449,27 @@ impl<L: FrameLayout> FrameManager<L> {
         }
     }
 
+    /// Rebuild `L::Loc` from a stored frame position.
+    fn loc_from_pos(&self, v: &Operand, pos: i32) -> L::Loc {
+        L::frame_pos(pos as usize, v.type_(), self.base_ofs)
+    }
+
     /// regalloc.py FrameManager.get
-    pub fn get<R: Copy + Eq + Hash + 'static>(
-        &self,
-        v: &Operand,
-        longevity: &LifetimeManager<R, L::Loc>,
-    ) -> Option<L::Loc>
-    where
-        L::Loc: Copy + 'static,
-    {
-        longevity.get(v).and_then(|lt| lt.current_frame_loc.get())
+    pub fn get<R>(&self, v: &Operand, longevity: &LifetimeManager<R>) -> Option<L::Loc> {
+        longevity
+            .get(v)
+            .and_then(|lt| lt.current_frame_loc.get())
+            .map(|pos| self.loc_from_pos(v, pos))
     }
 
     /// regalloc.py FrameManager.loc
-    pub fn loc<R: Copy + Eq + Hash + 'static>(
+    pub fn loc<R>(
         &mut self,
         v: &Operand,
         tp: Type,
         must_exist: bool,
-        longevity: &mut LifetimeManager<R, L::Loc>,
-    ) -> L::Loc
-    where
-        L::Loc: Copy + 'static,
-    {
+        longevity: &mut LifetimeManager<R>,
+    ) -> L::Loc {
         if let Some(loc) = self.get(v, longevity) {
             return loc;
         }
@@ -637,15 +480,12 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// regalloc.py FrameManager.get_new_loc
-    pub fn get_new_loc<R: Copy + Eq + Hash + 'static>(
+    pub fn get_new_loc<R>(
         &mut self,
         v: &Operand,
         tp: Type,
-        longevity: &mut LifetimeManager<R, L::Loc>,
-    ) -> L::Loc
-    where
-        L::Loc: Copy + 'static,
-    {
+        longevity: &mut LifetimeManager<R>,
+    ) -> L::Loc {
         let size = L::frame_size(tp);
         let hint = self.get_frame_pos_hint(v, longevity);
         let newloc = self._find_frame_location(size, tp, hint);
@@ -720,15 +560,13 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// regalloc.py FrameManager.bind
-    pub fn bind<R: Copy + Eq + Hash + 'static>(
+    pub fn bind<R>(
         &mut self,
         v: &Operand,
         loc: L::Loc,
         tp: Type,
-        longevity: &mut LifetimeManager<R, L::Loc>,
-    ) where
-        L::Loc: Copy + 'static,
-    {
+        longevity: &mut LifetimeManager<R>,
+    ) {
         let pos = L::get_loc_index(&loc);
         let size = L::frame_size(tp);
         if pos + size > self.current_frame_depth {
@@ -743,17 +581,14 @@ impl<L: FrameLayout> FrameManager<L> {
             self.boxes_in_frame[index] = Some(v.clone());
         }
         let lifetime = longevity.get(v).expect("bind: variable not in longevity");
-        lifetime.current_frame_loc.set(Some(loc));
+        lifetime.current_frame_loc.set(Some(pos as i32));
     }
 
     /// `FrameManager.bindings_iteritems`
-    pub fn bindings_iteritems<'a, R: Copy + Eq + Hash + 'static>(
+    pub fn bindings_iteritems<'a, R>(
         &'a self,
-        longevity: &'a LifetimeManager<R, L::Loc>,
-    ) -> BindingsIterItems<'a, L, R>
-    where
-        L::Loc: Copy + 'static,
-    {
+        longevity: &'a LifetimeManager<R>,
+    ) -> BindingsIterItems<'a, L, R> {
         BindingsIterItems {
             fm: self,
             longevity,
@@ -762,12 +597,7 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// `FrameManager.finish_binding`
-    pub fn finish_binding<R: Copy + Eq + Hash + 'static>(
-        &self,
-        longevity: &LifetimeManager<R, L::Loc>,
-    ) where
-        L::Loc: Copy + 'static,
-    {
+    pub fn finish_binding<R>(&self, longevity: &LifetimeManager<R>) {
         #[cfg(debug_assertions)]
         self._check_invariants(longevity);
         #[cfg(not(debug_assertions))]
@@ -775,25 +605,15 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// regalloc.py FrameManager.mark_as_free
-    pub fn mark_as_free<R: Copy + Eq + Hash + 'static>(
-        &mut self,
-        v: &Operand,
-        tp: Type,
-        longevity: &mut LifetimeManager<R, L::Loc>,
-    ) where
-        L::Loc: Copy + 'static,
-    {
+    pub fn mark_as_free<R>(&mut self, v: &Operand, tp: Type, longevity: &mut LifetimeManager<R>) {
         let loc = match self.get(v, longevity) {
             Some(loc) => loc,
             None => return, // not in frame
         };
         let lifetime = longevity.get(v).unwrap();
         debug_assert_eq!(
-            lifetime
-                .current_frame_loc
-                .get()
-                .map(|cur| L::get_loc_index(&cur)),
-            Some(L::get_loc_index(&loc)),
+            lifetime.current_frame_loc.get(),
+            Some(L::get_loc_index(&loc) as i32),
             "FrameManager.mark_as_free: current_frame_loc is loc"
         );
         lifetime.current_frame_loc.set(None);
@@ -808,14 +628,12 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// regalloc.py FrameManager.add_frame_pos_hint
-    pub fn add_frame_pos_hint<R: Copy + Eq + Hash + 'static>(
+    pub fn add_frame_pos_hint<R>(
         &self,
         v: &Operand,
         loc: L::Loc,
-        longevity: &mut LifetimeManager<R, L::Loc>,
-    ) where
-        L::Loc: Copy + 'static,
-    {
+        longevity: &mut LifetimeManager<R>,
+    ) {
         let lifetime = longevity.get(v);
         debug_assert!(
             lifetime.is_some(),
@@ -827,14 +645,7 @@ impl<L: FrameLayout> FrameManager<L> {
     }
 
     /// `FrameManager.get_frame_pos_hint`
-    pub fn get_frame_pos_hint<R: Copy + Eq + Hash + 'static>(
-        &self,
-        v: &Operand,
-        longevity: &LifetimeManager<R, L::Loc>,
-    ) -> i32
-    where
-        L::Loc: Copy + 'static,
-    {
+    pub fn get_frame_pos_hint<R>(&self, v: &Operand, longevity: &LifetimeManager<R>) -> i32 {
         longevity
             .get(v)
             .map(|lt| lt.hint_frame_pos.get())
@@ -843,12 +654,7 @@ impl<L: FrameLayout> FrameManager<L> {
 
     /// `FrameManager._check_invariants`
     #[cfg(debug_assertions)]
-    fn _check_invariants<R: Copy + Eq + Hash + 'static>(
-        &self,
-        longevity: &LifetimeManager<R, L::Loc>,
-    ) where
-        L::Loc: Copy + 'static,
-    {
+    fn _check_invariants<R>(&self, longevity: &LifetimeManager<R>) {
         debug_assert_eq!(self.boxes_in_frame.len(), self.current_frame_depth);
         let mut all = vec![false; self.get_frame_depth()];
         for (b, loc) in self.bindings_iteritems(longevity) {
@@ -977,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_frame_manager_allocate() {
-        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let mut longevity = LifetimeManager::<()>::new();
         let (_ia0, v0) = ia_pair(Type::Int, 0);
         let (_ia1, v1) = ia_pair(Type::Int, 1);
         let (_ia2, v2) = ia_pair(Type::Int, 2);
@@ -1028,7 +834,7 @@ mod tests {
 
     #[test]
     fn with_start_free_depth_preallocates_free_slots_and_allocates_from_zero() {
-        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let mut longevity = LifetimeManager::<()>::new();
         let (_ia, v) = ia_pair(Type::Int, 0);
         longevity.set(&v, Lifetime::new(0, 10));
 
@@ -1044,7 +850,7 @@ mod tests {
 
     #[test]
     fn bindings_iteritems_yields_each_bound_box_once_with_its_index() {
-        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let mut longevity = LifetimeManager::<()>::new();
         let (_ia0, v0) = ia_pair(Type::Int, 0);
         let (_ia1, v1) = ia_pair(Type::Int, 1);
         let (_ia2, v2) = ia_pair(Type::Int, 2);
@@ -1072,7 +878,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FrameManager.bind: box already in frame")]
     fn bind_same_box_twice_panics_in_debug() {
-        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let mut longevity = LifetimeManager::<()>::new();
         let (_ia0, v0) = ia_pair(Type::Int, 0);
         longevity.set(&v0, Lifetime::new(0, 10));
 
@@ -1086,7 +892,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "add_frame_pos_hint: box has no Lifetime")]
     fn add_frame_pos_hint_without_lifetime_panics_in_debug() {
-        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let mut longevity = LifetimeManager::<()>::new();
         let (_ia0, v0) = ia_pair(Type::Int, 0);
         let fm = FrameManager::<TestFrameLayout>::new(0);
         let loc = TestFrameLayout::frame_pos(0, Type::Int, 0);

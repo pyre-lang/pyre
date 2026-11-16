@@ -33,6 +33,23 @@ impl RegisterHints {
         }
     }
 
+    /// `LifetimeManager.fixed_register` with the `all_regs` list that
+    /// contains `reg` (GPR vs XMM).
+    fn pin_register(
+        &self,
+        longevity: &mut LifetimeManager,
+        position: i32,
+        reg: RegLoc,
+        var: Option<&Operand>,
+    ) {
+        let all_regs = if reg.is_float() {
+            &self.all_regs_xmm
+        } else {
+            &self.all_regs_gpr
+        };
+        longevity.fixed_register(position, reg, var, all_regs);
+    }
+
     /// `isinstance(arg, ConstInt) and arg.value` — the ConstInt payload
     /// is on the operand (`ConstInt.getint`).
     fn get_const_int(&self, arg: &Operand) -> Option<i64> {
@@ -280,7 +297,7 @@ impl RegisterHints {
         let x = op.arg(0);
         let y = op.arg(1);
         if !y.is_constant() {
-            longevity.fixed_register(position, ECX, Some(&y));
+            self.pin_register(longevity, position, ECX, Some(&y));
         }
         if !x.is_constant() {
             longevity.try_use_same_register(&x, result);
@@ -292,8 +309,8 @@ impl RegisterHints {
     /// 64x64→128 MUL on x86 returns low in rax, high in rdx.  Reserve
     /// both at this position so the result/temp aren't spilled over.
     fn consider_uint_mul_high(&self, longevity: &mut LifetimeManager, position: i32) {
-        longevity.fixed_register(position, EAX, None);
-        longevity.fixed_register(position, EDX, None);
+        self.pin_register(longevity, position, EAX, None);
+        self.pin_register(longevity, position, EDX, None);
     }
 
     /// reghint.py `consider_call_malloc_nursery` and its
@@ -306,8 +323,8 @@ impl RegisterHints {
         result: &Operand,
         position: i32,
     ) {
-        longevity.fixed_register(position, ECX, Some(result));
-        longevity.fixed_register(position, EDX, None);
+        self.pin_register(longevity, position, ECX, Some(result));
+        self.pin_register(longevity, position, EDX, None);
     }
 
     /// reghint.py `_consider_real_call`.
@@ -367,7 +384,7 @@ impl RegisterHints {
                 if next_arg_xmm < ARGUMENTS_XMM.len() {
                     let tgt = ARGUMENTS_XMM[next_arg_xmm];
                     if !operand.is_constant() && !hinted_args.contains(operand) {
-                        longevity.fixed_register(position, tgt, Some(operand));
+                        self.pin_register(longevity, position, tgt, Some(operand));
                         hinted_xmm.push(tgt);
                         hinted_args.push(operand.clone());
                     }
@@ -376,7 +393,7 @@ impl RegisterHints {
             } else if next_arg_gpr < ARGUMENTS_GPR.len() {
                 let tgt = ARGUMENTS_GPR[next_arg_gpr];
                 if !operand.is_constant() && !hinted_args.contains(operand) {
-                    longevity.fixed_register(position, tgt, Some(operand));
+                    self.pin_register(longevity, position, tgt, Some(operand));
                     hinted_gpr.push(tgt);
                     hinted_args.push(operand.clone());
                 }
@@ -403,13 +420,13 @@ impl RegisterHints {
         };
         for &reg in gpr_regs {
             if !hinted_gpr.contains(&reg) {
-                longevity.fixed_register(position, reg, None);
+                self.pin_register(longevity, position, reg, None);
             }
         }
         // reghint.py:192-194 XMM: every x86-64 XMM reg is caller-save.
         for &reg in &self.all_regs_xmm {
             if !hinted_xmm.contains(&reg) {
-                longevity.fixed_register(position, reg, None);
+                self.pin_register(longevity, position, reg, None);
             }
         }
     }
@@ -471,16 +488,28 @@ mod tests {
         let ops: Vec<OpRc> = vec![OpRc::new(call), OpRc::new(finish)];
         rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
-        RegisterHints::new(vec![], vec![], vec![], vec![]).add_hints(
-            &mut longevity,
-            &inputargs,
-            &ops,
-        );
+        RegisterHints::new(
+            crate::x86::regalloc::SAVE_AROUND_CALL_CORE_REGS.to_vec(),
+            crate::x86::regalloc::ALL_FLOAT_REGS.to_vec(),
+            crate::x86::regalloc::ALL_CORE_REGS.to_vec(),
+            crate::x86::regalloc::ALL_FLOAT_REGS.to_vec(),
+        )
+        .add_hints(&mut longevity, &inputargs, &ops);
         let fixed = |v: &Operand| longevity.get(v).unwrap().find_fixed_register(0);
-        assert_eq!(fixed(&f), Some(ARGUMENTS_XMM[0]));
+        let xmm_idx = crate::x86::regalloc::ALL_FLOAT_REGS
+            .iter()
+            .position(|&r| r == ARGUMENTS_XMM[0])
+            .unwrap() as i32;
+        assert_eq!(fixed(&f), Some(xmm_idx));
         // The separate GPR/XMM counters are the SysV numbering.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(fixed(&i), Some(ARGUMENTS_GPR[0]));
+        {
+            let gpr_idx = crate::x86::regalloc::ALL_CORE_REGS
+                .iter()
+                .position(|&r| r == ARGUMENTS_GPR[0])
+                .unwrap() as i32;
+            assert_eq!(fixed(&i), Some(gpr_idx));
+        }
     }
 
     /// `consider_int_sub` negates the constant. `i64::MIN` has no

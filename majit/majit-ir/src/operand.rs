@@ -947,9 +947,9 @@ impl Operand {
         self.with_forwarding_host("set_forwarded_info", |h| h.set_forwarded_info(info));
     }
 
-    /// `regalloc.py get_lifetime` — clone only the `OpInfo::Lifetime` `Rc`.
+    /// `regalloc.py get_lifetime` — clone the thin `Rc<Lifetime>`.
     #[inline]
-    pub fn get_lifetime_info(&self) -> Option<Rc<dyn std::any::Any>> {
+    pub fn get_lifetime_info(&self) -> Option<Rc<crate::lifetime::Lifetime>> {
         if self.packed == 0 {
             return None;
         }
@@ -981,7 +981,7 @@ impl Operand {
     }
 
     /// `LifetimeManager.__setitem__` → `box.set_forwarded(lt)`.
-    pub fn set_lifetime_info(&self, info: Rc<dyn std::any::Any>) {
+    pub fn set_lifetime_info(&self, info: Rc<crate::lifetime::Lifetime>) {
         assert!(
             !self.is_constant(),
             "set_lifetime_info on Const violates the AbstractValue invariant \
