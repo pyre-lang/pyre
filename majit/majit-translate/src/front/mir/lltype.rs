@@ -9049,6 +9049,38 @@ pub(in crate::front::mir) fn type_decl_is_by_value_integer_newtype(
     integer_newtype_scalar_field_structural(field, llbc).is_some()
 }
 
+/// True when `ty` is a primitive word, not an instance with a classdef.
+///
+/// RPython `history.getkind` of that word is `'int'` / `'float'`
+/// (`IntegerRepr` / `BoolRepr` / `FloatRepr`). `unaryop.py`
+/// `SomeObject.getattr` has no attributes on an integer, so an inherent
+/// method whose receiver is this word is a `simple_call` of the FunDecl
+/// (`description.py` `FunctionDesc`), not `CallTarget::Method`.
+pub(in crate::front::mir) fn tyref_is_primitive_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    matches!(
+        tyref_to_value_type_with(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+            | ValueType::Int128
+            | ValueType::UInt128
+    )
+}
+
 fn integer_newtype_inner_field_structural<'a>(
     decl: &TypeDecl,
     fields: &'a [FieldDecl],
@@ -15036,6 +15068,57 @@ pub(in crate::front::mir) fn fun_decl_is_convert_into_impl(llbc: &Llbc, fd: &Fun
 /// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
 pub(in crate::front::mir) fn fun_decl_is_reflexive_from(llbc: &Llbc, fd: &FunDecl) -> bool {
     trait_impl_id_for_fundecl(fd).is_some_and(|impl_id| trait_impl_is_reflexive_from(llbc, impl_id))
+}
+
+/// `alloc::string::ToString` — the trait whose `to_string` is `str(value)`
+/// (`rbuiltin.py` `rtype_builtin_str` / `ll_str`).
+pub(in crate::front::mir) fn trait_decl_is_to_string(llbc: &Llbc, trait_id: u64) -> bool {
+    llbc.trait_by_id(trait_id)
+        .is_some_and(|td| td.item_meta.name_path_str() == "alloc::string::ToString")
+}
+
+/// FunDecl whose selected impl is `alloc::string::ToString`.
+pub(in crate::front::mir) fn fun_decl_is_to_string(llbc: &Llbc, fd: &FunDecl) -> bool {
+    trait_impl_id_for_fundecl(fd)
+        .and_then(|impl_id| trait_impl_decl_id(llbc, impl_id))
+        .is_some_and(|trait_id| trait_decl_is_to_string(llbc, trait_id))
+}
+
+/// Substituted receiver of `ToString::to_string` is string-family:
+/// `str(s)` of a string is the string (`rstr.py` one immutable rpy_string;
+/// `rbuiltin.py` `rtype_builtin_str` / `ll_str`). Direct calls alias
+/// (`is_to_string_identity`); a fn-item value is
+/// `FunctionDesc.getuniquegraph` of that instantiation
+/// (`description.py` `specialize`, `bookkeeper.py` `getdesc`).
+pub(in crate::front::mir) fn to_string_instantiation_is_string_identity(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    types: &[serde_json::Value],
+    const_generics: &[serde_json::Value],
+) -> bool {
+    if !fun_decl_is_to_string(llbc, fd) {
+        return false;
+    }
+    let Some(src) = fd.signature.inputs.first() else {
+        return false;
+    };
+    let ty = crate::front::clause_spec::subst_tyref(src, llbc, types, const_generics);
+    tyref_is_string_family(&ty, llbc)
+}
+
+/// [`to_string_instantiation_is_string_identity`] of a call / `FnDef`
+/// constant's `generics`. `None` type arguments leave the generic template.
+pub(in crate::front::mir) fn fun_decl_to_string_is_string_identity(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    generics: &serde_json::Value,
+) -> bool {
+    let Some((types, const_generics)) =
+        crate::front::clause_spec::concrete_type_args(generics, llbc)
+    else {
+        return false;
+    };
+    to_string_instantiation_is_string_identity(llbc, fd, &types, &const_generics)
 }
 
 /// Outcome of devirtualizing a blanket `core::convert::<Impl>::into`

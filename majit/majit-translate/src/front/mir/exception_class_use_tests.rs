@@ -4,7 +4,9 @@
 use std::panic::AssertUnwindSafe;
 
 use crate::flowspace::model::Variable;
-use crate::model::{BlockId, CallTarget, ExitCase, FunctionGraph, LinkArg, OpKind, ValueType};
+use crate::model::{
+    BlockId, CallTarget, ExitCase, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+};
 use majit_charon_reader::ullbc::TyRef;
 use serde_json::{Value, json};
 
@@ -3044,8 +3046,8 @@ fn vec_string_join_reader(enum_leaf: &str, fun_id: u64, join_fun_id: u64) -> Val
 }
 
 /// `posonly_kwds.join(", ")` on a marked exception's `Vec<String>` attr
-/// is `<[S]>::join`. The list word stays `list_of_str`, and the adapter
-/// rewrites that call to `str.join` (`rtype_method_join`).
+/// is `<[S]>::join`. The front rewrites that call to `sep.join(items)`
+/// (`unaryop.py` `method_join`, `rstr.py` `AbstractStringRepr.rtype_method_join`).
 #[test]
 fn exception_class_vec_string_join_lowers_to_str_join() {
     use crate::flowspace::model::Hlvalue;
@@ -3054,19 +3056,38 @@ fn exception_class_vec_string_join_lowers_to_str_join() {
     let reader = vec_string_join_reader("BadVec", 1, 0);
     let llbc = enum_vec_string_field_llbc("BadVec", true, vec![join_fun, reader]);
     let graph = lower(&llbc, "getmsg");
-    let join_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
-        .into_iter()
-        .filter(|op| match &op.kind {
+    let residual_slice_join = super::window_graph_ops(&graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => {
+            } if {
                 let n = segments.len();
                 n >= 3
                     && segments[n - 3] == "slice"
                     && segments[n - 2] == "<Impl>"
                     && segments[n - 1] == "join"
             }
+        )
+    });
+    assert!(
+        !residual_slice_join,
+        "string-family slice join must not residualize FunctionPath; graph={}",
+        graph.dump()
+    );
+    let join_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } => name == "join" && receiver_root.as_deref() == Some("str"),
             _ => false,
         })
         .collect();
@@ -3074,15 +3095,15 @@ fn exception_class_vec_string_join_lowers_to_str_join() {
     let OpKind::Call { args, .. } = &join_calls[0].kind else {
         unreachable!("filtered to Call");
     };
-    let Some(LinkArg::Value(receiver)) = args.first() else {
-        panic!("join receiver is the list word; graph={}", graph.dump());
+    assert_eq!(args.len(), 2, "sep.join(items); graph={}", graph.dump());
+    let Some(LinkArg::Value(list)) = args.get(1) else {
+        panic!("join argument is the list word; graph={}", graph.dump());
     };
     assert_eq!(
-        receiver.concretetype().as_ref(),
+        list.concretetype().as_ref(),
         Some(&list_ll),
-        "join receiver concretetype {}; graph={}",
-        receiver
-            .concretetype()
+        "join list concretetype {}; graph={}",
+        list.concretetype()
             .map(|ty| format!("{ty:?}"))
             .unwrap_or_else(|| "none".to_string()),
         graph.dump()
@@ -3114,15 +3135,78 @@ fn exception_class_vec_string_join_lowers_to_str_join() {
     .unwrap_or_else(|err| panic!("{err}; graph={}", graph.dump()));
     assert_eq!(translated.len(), 2, "{}", graph.dump());
     assert_eq!(translated[0].opname, "getattr");
-    assert_eq!(translated[0].args[0], arg_hls[1]);
+    assert_eq!(translated[0].args[0], arg_hls[0]);
     let Hlvalue::Constant(method) = &translated[0].args[1] else {
         panic!("method name is a Constant");
     };
     assert_eq!(method.value.as_text(), Some("join"));
     assert_eq!(translated[1].opname, "simple_call");
     assert_eq!(translated[1].args[0], translated[0].result);
-    assert_eq!(translated[1].args[1], arg_hls[0]);
+    assert_eq!(translated[1].args[1], arg_hls[1]);
     assert_eq!(translated[1].result, result_hl);
+}
+
+/// `sep.join(items)` annotates as `SomeString` (`unaryop.py` `method_join`).
+#[test]
+fn slice_join_method_annotates_as_somestring() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeString, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let mut graph = FunctionGraph::new("join_strs");
+    let start = graph.startblock;
+    let sep = graph.alloc_value_var();
+    graph.push_inputarg_var(start, sep.clone());
+    graph.push_op_with_result_var(
+        start,
+        OpKind::Input {
+            name: "sep".to_string(),
+            ty: ValueType::Str,
+            class_root: None,
+        },
+        sep.clone(),
+    );
+    let items = graph.alloc_value_var();
+    graph.push_inputarg_var(start, items.clone());
+    graph.push_op_with_result_var(
+        start,
+        OpKind::Input {
+            name: "items".to_string(),
+            ty: ValueType::Ref(None),
+            class_root: Some("[str]".to_string()),
+        },
+        items.clone(),
+    );
+    let result = graph.alloc_value_var();
+    graph.block_mut(start).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::method("join", Some("str".into())),
+            args: crate::model::call_args(vec![sep, items]),
+            result_ty: ValueType::Str,
+        },
+    });
+    graph.set_return(start, Some(result));
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift sep.join(items)");
+    let s_str = SomeValue::String(SomeString::new(false, false));
+    let s_list = SomeValue::List(
+        ann.bookkeeper
+            .newlist(std::slice::from_ref(&s_str), None)
+            .expect("list of str"),
+    );
+    let cells = vec![Some(s_str), Some(s_list)];
+    let ret = ann
+        .build_graph_types(&lifted.graph, &cells, true)
+        .expect("annotate sep.join(items)")
+        .expect("join result");
+    assert!(
+        matches!(ret, SomeValue::String(_)),
+        "sep.join(items) annotates as SomeString, got {ret:?}"
+    );
 }
 
 #[test]

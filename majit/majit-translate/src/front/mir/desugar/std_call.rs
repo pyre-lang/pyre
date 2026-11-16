@@ -108,6 +108,43 @@ pub(in crate::front::mir) fn is_char_from_u32_unchecked(name: &str) -> bool {
     name == CHAR_FROM_U32_UNCHECKED_PATH
 }
 
+/// `<[S] as Join<&str>>::join(&slice, sep)` in extracted LLBC. Matched
+/// in full like [`ARRAY_FROM_FN_PATH`]. `Join::join` for slices is the
+/// `alloc::slice` impl. `unaryop.py` `method_join` and `rstr.py`
+/// `AbstractStringRepr.rtype_method_join` are `sep.join(items)`
+/// (`LLHelpers.ll_join`).
+const SLICE_JOIN_PATH: &str = "alloc::slice::<Impl>::join";
+
+/// [`SLICE_JOIN_PATH`], compared to `name_path_str()`.
+fn is_slice_join_path(path: &str) -> bool {
+    path == SLICE_JOIN_PATH
+}
+
+fn json_tyref_is_string_family(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    tyref_is_string_family(&TyRef::Other(node.clone().into()), llbc)
+}
+
+/// Item type of a string-family `join` receiver: `&[S]`, `Box<[S]>`,
+/// `Vec<S>`, or a borrow of those, after peeling references
+/// (`tyref_is_string_family`).
+fn tyref_join_items_are_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    if let Some(elem) = tyref_slice_elem(ty, llbc) {
+        return json_tyref_is_string_family(elem, llbc);
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if node.get("Adt").and_then(type_decl_ref_builtin) == Some("Slice") {
+        return adt_node_type_subst(node, llbc)
+            .first()
+            .is_some_and(|elem| json_tyref_is_string_family(elem, llbc));
+    }
+    tyref_is_vec_value(ty, llbc)
+        && adt_node_type_subst(node, llbc)
+            .first()
+            .is_some_and(|elem| json_tyref_is_string_family(elem, llbc))
+}
+
 /// `from_fn::<T, N, F>(f)` as `[f(0), …, f(N-1)]` when `N` is concrete and
 /// `F`'s `FnMut::call_mut` (or the closure body when `F` is `Fn` / `FnMut`)
 /// is a local unstructured body. `from_fn` requires `F: FnMut`; a
@@ -4704,6 +4741,60 @@ impl<'a> Lowering<'a> {
             ("replace", 3) if path.contains("str") => Some("replace"),
             _ => None,
         }
+    }
+
+    /// `<[S] as Join<&str>>::join(items, sep)` when S and sep are
+    /// string-family. Upstream `unaryop.py` `method_join` is
+    /// `sep.join(items)` (`rstr.py` `AbstractStringRepr.rtype_method_join`,
+    /// `LLHelpers.ll_join`). A non-string-family `join` stays residual.
+    pub(in crate::front::mir) fn try_lower_slice_join(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        items_ty: Option<&TyRef>,
+        sep_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !is_slice_join_path(&path) {
+            return Ok(false);
+        }
+        let Some(items_ty) = items_ty else {
+            return Ok(false);
+        };
+        let Some(sep_ty) = sep_ty else {
+            return Ok(false);
+        };
+        if !tyref_is_string_family(sep_ty, self.llbc) {
+            return Ok(false);
+        }
+        if !tyref_join_items_are_string_family(items_ty, self.llbc) {
+            return Ok(false);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::method("join", Some("str".into())),
+                args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
+                result_ty: ValueType::Str,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `Wtf8::from_bytes_unchecked` — the inverse of `Wtf8::as_bytes`.

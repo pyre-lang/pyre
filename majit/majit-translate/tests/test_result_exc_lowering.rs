@@ -2137,6 +2137,99 @@ fn sre_flag_names_folds_to_a_str_list() {
     );
 }
 
+/// `flag_items.join("|")` is `<[String]>::join`. The front rewrites it
+/// to `sep.join(items)` (`unaryop.py` `method_join`).
+#[test]
+fn sre_pattern_flag_tail_slice_join_lowers_to_str_join() {
+    let g = lower_function(
+        interp(),
+        "pyre_interpreter::module::_sre::interp_sre::sre_pattern_flag_tail",
+    )
+    .expect("sre_pattern_flag_tail lowers");
+    let mut residual = 0usize;
+    let mut method_join = 0usize;
+    for op in g.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let n = segments.len();
+                if n >= 3
+                    && segments[n - 3] == "slice"
+                    && segments[n - 2] == "<Impl>"
+                    && segments[n - 1] == "join"
+                {
+                    residual += 1;
+                }
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        receiver_root,
+                        ..
+                    },
+                ..
+            } if name == "join" && receiver_root.as_deref() == Some("str") => {
+                method_join += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        residual, 0,
+        "sre_pattern_flag_tail left alloc::slice::<Impl>::join"
+    );
+    assert!(
+        method_join >= 1,
+        "sre_pattern_flag_tail must emit str.join, got {method_join}"
+    );
+}
+
+/// `sre_match_repr_str` pins `m` then calls `m.get()`. The pin word is
+/// an integer, so `get` is a FunDecl call, not `CallTarget::Method`.
+#[test]
+fn sre_match_repr_str_rooted_object_get_is_direct_call() {
+    let g = lower_function(
+        interp(),
+        "pyre_interpreter::module::_sre::interp_sre::sre_match_repr_str",
+    )
+    .expect("sre_match_repr_str lowers");
+    let mut method_get = 0usize;
+    let mut fun_get = 0usize;
+    for op in g.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "get" => {
+                method_get += 1;
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    },
+                ..
+            } if segments.last().map(String::as_str) == Some("get") && fun_decl_id.is_some() => {
+                fun_get += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        method_get, 0,
+        "sre_match_repr_str left CallTarget::Method get"
+    );
+    assert!(
+        fun_get >= 1,
+        "sre_match_repr_str must call get as a FunDecl, got {fun_get}"
+    );
+}
+
 fn leftover_ok_or_else(graph: &majit_translate::model::FunctionGraph) -> usize {
     graph
         .blocks

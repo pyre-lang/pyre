@@ -2002,6 +2002,20 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[S] as Join<&str>>::join(items, sep)` is `sep.join(items)`
+                // (`unaryop.py` `method_join`, `rstr.py`
+                // `AbstractStringRepr.rtype_method_join`).
+                if self.try_lower_slice_join(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                    second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `Wtf8::from_bytes_unchecked` / `str::from_utf8_unchecked`
                 // identity is rewritten to `same_as` after Result-scope /
                 // combinator capture (`from_bytes_one_word`).
@@ -10116,12 +10130,15 @@ impl<'a> Lowering<'a> {
         // Only a body this LLBC extracted can be copied here. An Opaque
         // import is the same function object in the defining crate
         // (`bookkeeper.py` `getdesc`); enqueue on that crate's queue.
-        // The reflexive `impl<T> From<T> for T` is the exception: its
-        // body is identity and `declare_spec` builds that graph
-        // (`FunctionDesc.getuniquegraph`).
+        // Two identity bodies are the exception and `declare_spec`
+        // builds them (`FunctionDesc.getuniquegraph`):
+        //   * the reflexive `impl<T> From<T> for T`
+        //   * `ToString::to_string` whose substituted receiver is
+        //     string-family (`rstr.py` / `rbuiltin.py` `rtype_builtin_str`)
         let path = fd.item_meta.name_path();
         if !crate::front::clause_spec::decl_has_unstructured_body(fd)
             && !fun_decl_is_reflexive_from(self.llbc, fd)
+            && !fun_decl_to_string_is_string_identity(self.llbc, fd, generics)
         {
             return self.enqueue_cross_crate_spec(fd, generics, &path);
         }
@@ -10689,6 +10706,23 @@ impl<'a> Lowering<'a> {
                 // call registry resolves the constructor (an associated
                 // function, called through `FunctionPath`).
                 if fd.first_arg_local_name().is_some_and(|n| n != "self") {
+                    return None;
+                }
+                // A Rust inherent method is statically dispatched. When the
+                // receiver is a primitive word (`IntegerRepr.lowleveltype`),
+                // `CallTarget::Method` would `getattr` that integer
+                // (`unaryop.py` `SomeObject.getattr`). The FunDecl is a
+                // `simple_call` of a function constant (`description.py`
+                // `FunctionDesc`) with the receiver as argument zero.
+                if fd.signature.inputs.first().is_some_and(|ty| {
+                    tyref_is_primitive_word(
+                        ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                }) {
                     return None;
                 }
                 // `SomePtr.getattr` (`unaryop.py`) resolves struct fields and

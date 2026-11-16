@@ -12418,6 +12418,201 @@ fn integer_newtype_shared_ref_method_returns_the_inner_integer() {
     );
 }
 
+/// A by-value one-integer Copy newtype is that integer. Its inherent
+/// `fn get(self)` is a direct FunDecl call (`description.py`
+/// `FunctionDesc`), not `getattr` of `"get"` on the integer
+/// (`unaryop.py` `SomeObject.getattr`). A two-field sibling keeps Method.
+#[test]
+fn integer_newtype_inherent_get_is_a_direct_call() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = fixture_span();
+    let generics = empty_generics();
+    let slot_ty = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": generics}
+    });
+    let pair_ty = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": generics}
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let impl_seg = |owner: serde_json::Value| {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, owner]},
+            "kind": "InherentImplBlock"
+        }}})
+    };
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index, "name": name, "span": span, "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let method_decl =
+        |id: u64, owner: &str, owner_ty: &serde_json::Value, impl_owner: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": fixture_item_meta(serde_json::json!([
+                    ident("fixture"), ident(owner), impl_seg(impl_owner), ident("get")
+                ])),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [owner_ty.clone()],
+                    "output": unit
+                },
+                "body": {"Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, None, &unit),
+                            local(1, Some("self"), owner_ty)
+                        ]
+                    },
+                    "body": [{
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": "Return"}
+                    }]
+                }}
+            })
+        };
+    let call_term = |fun: u64, arg: u64, arg_ty: &serde_json::Value, target: u64| {
+        serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {
+                "span": span,
+                "kind": {
+                    "Call": {
+                        "call": {
+                            "func": {
+                                "Regular": {
+                                    "kind": {"Fun": fun},
+                                    "generics": generics
+                                }
+                            },
+                            "args": [{"Move": place(arg, arg_ty)}]
+                        },
+                        "dest": place(0, &unit),
+                        "target": target,
+                        "on_unwind": 1
+                    }
+                }
+            }
+        })
+    };
+    let usize_field = serde_json::json!([{
+        "name": null,
+        "ty": usize_ty(),
+        "attr_info": null
+    }]);
+    let slot_decl = struct_decl(0, ident_path(&["fixture", "Slot"]), usize_field, false);
+    let pair_decl = struct_decl(1, ident_path(&["fixture", "Pair"]), two_i64_fields(), false);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "caller"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [slot_ty, pair_ty],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 2,
+                "locals": [
+                    local(0, None, &unit),
+                    local(1, Some("slot"), &slot_ty),
+                    local(2, Some("pair"), &pair_ty)
+                ]
+            },
+            "body": [
+                call_term(1, 1, &slot_ty, 2),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                },
+                call_term(2, 2, &pair_ty, 3),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [slot_decl, pair_decl],
+            "fun_decls": [
+                caller,
+                method_decl(1, "Slot", &slot_ty, slot_ty.clone()),
+                method_decl(2, "Pair", &pair_ty, pair_ty.clone())
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let slot: TyRef = serde_json::from_value(slot_ty.clone()).unwrap();
+    assert_eq!(
+        super::tyref_to_value_type(&slot, &llbc),
+        ValueType::Unsigned,
+        "Slot(usize) is the inner word"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let slot_get = ops.iter().find(|op| match &op.kind {
+        OpKind::Call {
+            target:
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                    ..
+                },
+            ..
+        } => segments.last().map(String::as_str) == Some("get") && *fun_decl_id == Some(1),
+        _ => false,
+    });
+    assert!(
+        slot_get.is_some(),
+        "Slot::get must be a FunDecl call, graph={}",
+        graph.dump()
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::Method { name, receiver_root, .. },
+                ..
+            } if name == "get" && receiver_root.as_deref() == Some("Slot")
+        )),
+        "Slot::get must not be getattr on the integer, graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::Method { name, receiver_root, .. },
+                ..
+            } if name == "get" && receiver_root.as_deref() == Some("Pair")
+        )),
+        "Pair::get stays CallTarget::Method, graph={}",
+        graph.dump()
+    );
+}
+
 fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
     let mut decl = serde_json::json!({
         "def_id": def_id,

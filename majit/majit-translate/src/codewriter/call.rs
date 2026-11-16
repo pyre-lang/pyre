@@ -9218,15 +9218,14 @@ impl CallControl {
             // `annrpython.py consider_op` never `recursivecall`s a
             // helper whose Call `translate_op` rewrites to a
             // high-level op (`rlist.py rtype_newlist` lowers to
-            // `gendirectcall` at rtyping) or to `str.join`
-            // (`rstr.py rtype_method_join`) when the receiver is a
-            // list of str. Empty callees is the
+            // `gendirectcall` at rtyping). Empty callees is the
             // existing no-graph path: no block, no notify, no
             // AccessDirect copy. `find_all_graphs` still follows
             // the graph (`call.py guess_call_kind`).
             if !bfs_phase
-                && crate::translator::rtyper::flowspace_adapter::call_rewritten_before_recursivecall(
-                    target, args,
+                && crate::translator::rtyper::flowspace_adapter::function_path_is_high_level_op(
+                    target,
+                    args.len(),
                 )
             {
                 return Vec::new();

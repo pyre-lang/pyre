@@ -4091,6 +4091,23 @@ impl<'l> CrateLowering<'l> {
                 body = crate::front::clause_spec::identity_unstructured(&ty);
             }
         }
+        if to_string_instantiation_is_string_identity(llbc, fd, &req.types, &req.const_generics) {
+            // `<T as ToString>::to_string` of a string-family T is
+            // `str(s)` of a string: the string itself (`rstr.py` one
+            // immutable rpy_string; `rbuiltin.py` `rtype_builtin_str` /
+            // `ll_str`). alloc extracts as Opaque; a fn-item value is
+            // `FunctionDesc.getuniquegraph` of that instantiation, the
+            // same identity direct calls alias (`is_to_string_identity`).
+            if let Some(src) = fd.signature.inputs.first() {
+                let ty = crate::front::clause_spec::subst_tyref(
+                    src,
+                    llbc,
+                    &req.types,
+                    &req.const_generics,
+                );
+                body = crate::front::clause_spec::identity_unstructured(&ty);
+            }
+        }
         let Some(mut body) = body else {
             skipped
                 .borrow_mut()
