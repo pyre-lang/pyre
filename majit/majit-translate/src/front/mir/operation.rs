@@ -10637,20 +10637,14 @@ impl<'a> Lowering<'a> {
         // independent layout-side identity and preserves every concrete type
         // argument, including primitive payloads for which the annotator does
         // not split classdefs.
-        let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
         // Duplicate-leaf hardening drops the shared `closure` /
-        // `closure#N` alias from the field registry.  Field reads of a
-        // capture must key the crate-stripped path the registry kept —
-        // the same spelling [`tyref_input_class_root`] uses for the env
-        // parameter.
-        // Closure leaves are tombstoned, so [`class_identity_spelling`]
-        // would call [`tombstoned_owner_spelling`]. That returns the full
-        // declaration path when stripping yields the leaf (a crate-root
-        // closure) or when the stripped path itself is tombstoned;
-        // [`strip_crate_prefix`] does not. Keep the crate-stripped path.
+        // `closure#N` alias from the field registry. Field reads of a
+        // capture key the env with [`closure_env_class_identity`] — the
+        // same spelling [`tyref_input_class_root`] intern's. Identify by
+        // `TypeDeclSrc::Closure`.
         let owner_base = class_identity_spelling(&name_path, self.tombstoned_leaves);
-        let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
-            strip_crate_prefix(&name_path)
+        let owner_root = if type_decl_is_closure_env(td) {
+            closure_env_class_identity(td, self.tombstoned_leaves)
         } else {
             match inst_adt.and_then(|adt| {
                 adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves)

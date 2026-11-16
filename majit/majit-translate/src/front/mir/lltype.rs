@@ -1823,6 +1823,7 @@ pub(in crate::front::mir) fn input_param_value_type(
             ValueType::Void
         }
     } else if matches!(ty, ValueType::Ref(None))
+        && !tyref_is_closure_env(local_ty, llbc)
         && let Some(scalar) = tyref_scalar_pointee_value_type(local_ty, llbc)
             .or_else(|| tyref_nested_ref_to_scalar_value_type(local_ty, llbc))
     {
@@ -2411,8 +2412,8 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     if exception_carrier_node(node, llbc) {
         return None;
     }
-    let name = adt_node_def_id(node)
-        .and_then(|id| llbc.type_by_id(id))
+    let td = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id));
+    let name = td
         .map(|td| strip_crate_prefix(td.item_meta.name_path_str()))
         .unwrap_or_default();
     if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
@@ -2421,8 +2422,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     // A closure environment is the callable's instance, not a C struct
     // (`rpbc.py FunctionsPBCRepr`). `note_raw_word_owner` and
     // `raw_struct_ptr_from_layout` already leave it out.
-    let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
-    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+    if td.is_some_and(type_decl_is_closure_env) {
         return None;
     }
     if tyref_is_zero_sized(&TyRef::Other(node.clone().into()), llbc) {
@@ -3390,6 +3390,17 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     {
         return ValueType::Ref(frame_anchor::frame_class_root(llbc, tombstoned));
     }
+    // A compiler env (`TypeDeclSrc::Closure`) is the struct of its
+    // upvars (`description.py` `FunctionDesc`, `rpbc.py` frozen PBC).
+    // rustc may emit a one-field `repr(transparent)` layout around
+    // capture 0; peeling that word intern's a different ClassDef (or
+    // none) and `self.__pos_0` walls on a classdef-less `SomeInstance`.
+    // Intern uses the same [`class_identity_spelling`] ordinary structs
+    // use. Identify the env by `src`, never by the shared `closure` /
+    // `closure#N` leaf.
+    if tyref_is_closure_env(ty, llbc) {
+        return ValueType::Ref(tyref_input_class_root(ty, llbc, tombstoned));
+    }
     // A `repr(transparent)` GC handle keeps the wrapper's class. The
     // handle intern's as a subclass of `Deref::Target` (`error::PyError`
     // under `error::PyErrorObject`); painting the target made getattr of
@@ -3994,6 +4005,21 @@ pub(in crate::front::mir) fn operand_const_u8(llbc: &Llbc, op: &Operand) -> Opti
 /// `closure#N` name leaf.
 pub(in crate::front::mir) fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
     matches!(td.src, TypeDeclSrc::Closure(_))
+}
+
+/// Intern key and FieldRead owner of a compiler env.
+///
+/// One spelling for [`tyref_input_class_root`], [`struct_copy_owner_keys`],
+/// and [`Lowering::resolve_adt_field`]. [`class_identity_spelling`] of the
+/// TypeDecl path: for `getattr_surrogate::closure#2` the leaf is tombstoned
+/// and stripping is not the leaf, so this is the crate-stripped path
+/// (`baseobjspace::getattr_surrogate::closure#2`). Identify by
+/// [`TypeDeclSrc::Closure`].
+pub(in crate::front::mir) fn closure_env_class_identity(
+    td: &TypeDecl,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    class_identity_spelling(&td.item_meta.name_path_str(), tombstoned)
 }
 
 /// A compiler-synthesised tuple, `str`, or `Box` declaration. Its `TypeDecl`
@@ -7483,13 +7509,8 @@ pub(in crate::front::mir) fn struct_copy_owner_keys(
     tombstoned: &std::collections::HashSet<String>,
 ) -> (String, majit_ir::descr::StructId) {
     let name_path = td.item_meta.name_path_str();
-    let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
-    // Same closure exception as [`Lowering::resolve_adt_field`]: a crate-root
-    // or cross-crate-stripped closure would get the full path from
-    // [`tombstoned_owner_spelling`], while field reads keep the crate-stripped
-    // path.
-    let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
-        strip_crate_prefix(&name_path)
+    let owner_root = if type_decl_is_closure_env(td) {
+        closure_env_class_identity(td, tombstoned)
     } else {
         class_identity_spelling(&name_path, tombstoned)
     };
@@ -7976,12 +7997,17 @@ pub(in crate::front::mir) fn adt_declares_field(td: &TypeDecl, name: &str) -> bo
 }
 
 /// The struct-root `class_root` for a `Ref`-typed input param: the bare
-/// ADT leaf (`tyref_class_root`), except for a closure env, whose shared
-/// bare leaf `closure` `harden_duplicate_leaf_metadata` drops from the
-/// field registry — carry its full `::` `name_path` (a surviving
-/// registry key) so `derive_subject_inputcells` projects the captured
-/// fields rather than seeding a classdef-less `SomeInstance(None)` shell
-/// its `self.<capture>` reads would wall on.  RPython forbids closures.
+/// ADT leaf (`tyref_class_root`), except for a closure env.
+///
+/// RPython has no closures (`description.py` `FunctionDesc`, `rpbc.py`):
+/// a known callee's free variables are explicit arguments or a frozen
+/// PBC. The Charon env is that struct — its fields are the upvars —
+/// so intern uses the same [`class_identity_spelling`] ordinary structs
+/// use. [`tyref_class_root_with`] peels a one-field `repr(transparent)`
+/// env to capture 0; that identity is a different ClassDef (or none)
+/// and `self.__pos_0` walls on a classdef-less `SomeInstance`. Identify
+/// the env by `TypeDeclSrc::Closure`, never by the shared `closure` /
+/// `closure#N` leaf `harden_duplicate_leaf_metadata` drops.
 pub(in crate::front::mir) fn tyref_input_class_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -8006,15 +8032,15 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     if let Some(key) = tyref_exception_class_key(ty, llbc) {
         return Some(key);
     }
-    let leaf = tyref_class_root_with(ty, llbc, tombstoned);
-    if leaf
-        .as_deref()
-        .is_some_and(majit_charon_reader::ullbc::is_closure_leaf)
+    if tyref_is_closure_env(ty, llbc)
+        && let Some(td) = tyref_node(ty, llbc)
+            .and_then(|n| strip_ty_wrappers(n, llbc))
+            .and_then(adt_node_def_id)
+            .and_then(|id| llbc.type_by_id(id))
     {
-        adt_path_of_tyref(ty, llbc).or(leaf)
-    } else {
-        leaf
+        return Some(closure_env_class_identity(td, tombstoned));
     }
+    tyref_class_root_with(ty, llbc, tombstoned)
 }
 
 /// Instantiation class of a split-eligible tagged enum used as a `Ref`
@@ -8345,6 +8371,13 @@ pub(in crate::front::mir) fn transparent_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
+    // A compiler env is a struct of its upvars, even when rustc wraps
+    // capture 0 in `repr(transparent)` (`description.py` `FunctionDesc`,
+    // `rpbc.py`). Projecting `__pos_N` is getattr of that field, not
+    // identity on the env word.
+    if type_decl_is_closure_env(decl) {
+        return None;
+    }
     if !decl.is_repr_transparent()
         && llbc
             .transparent_scalar_kind(&decl.item_meta.name_path())
@@ -8542,10 +8575,17 @@ fn one_word_handle_field_spelling(
 /// is a no-op alias of that `RDict` (`heaptracker.py all_fielddescrs` /
 /// `inline_struct_field_leaves`). A pointer-shaped payload is a GC handle
 /// (`PyError.0` is `*mut PyErrorObject`) and keeps the wrapper's own field.
+/// A compiler env (`TypeDeclSrc::Closure`) is a struct of its upvars,
+/// even when rustc emits a one-field `repr(transparent)` layout around
+/// the first capture (`rpbc.py` frozen PBC / `description.py`
+/// `FunctionDesc`).
 pub(in crate::front::mir) fn transparent_by_value_inner_fields<'a>(
     td: &'a TypeDecl,
     llbc: &'a Llbc,
 ) -> Option<(&'a TypeDecl, &'a [FieldDecl])> {
+    if type_decl_is_closure_env(td) {
+        return None;
+    }
     let (index, _) = transparent_nonzst_field(td, llbc)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
@@ -8914,6 +8954,11 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     // depth word (`dont_look_inside_return_token` / ARG kinds).
     if frame_anchor::tyref_is_anchor(ty, llbc) || frame_anchor::tyref_is_borrow_of_anchor(ty, llbc)
     {
+        return None;
+    }
+    // The env is a struct of upvars even when rustc wraps capture 0 in
+    // `repr(transparent)` (`description.py` `FunctionDesc`, `rpbc.py`).
+    if tyref_is_closure_env(ty, llbc) {
         return None;
     }
     // Peel the reference the way the atomic sibling does. A borrow of the
@@ -15392,9 +15437,6 @@ fn type_arg_referent_is_raw_storage(
     }
     let path = td.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or(path);
-    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
-        return false;
-    }
     let canon = strip_crate_prefix(&path);
     if is_str_family_class_root(&canon)
         || is_str_family_class_root(leaf)

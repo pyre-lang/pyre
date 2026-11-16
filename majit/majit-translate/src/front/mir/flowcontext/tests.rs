@@ -9416,6 +9416,272 @@ fn closure_capturing_fieldless_enum_annotates() {
         .expect("Discriminant of a borrowed fieldless-enum tag annotates");
 }
 
+/// A closure env that captures a local and another closure, called through
+/// FunctionPath of the body, annotates its upvar FieldRead. Harvest already
+/// registers the env as an ordinary struct (`derive_program_metadata`);
+/// `Input.class_root` must name that intern key so `getattr("__pos_0")` is
+/// not a classdef-less SomeInstance. RPython has no closures: a known
+/// function's free variables are explicit arguments / a frozen PBC
+/// (`description.py` `FunctionDesc`, `rpbc.py`).
+#[test]
+fn closure_env_upvar_read_annotates_through_function_path() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": path,
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let builtin_closure = |n: u64| serde_json::json!({"Builtin": ["Closure", n]});
+    let generics =
+        serde_json::json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let adt = |id| serde_json::json!({"Adt": {"id": id, "generics": generics}});
+    let word = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let inner_ty = adt(1);
+    let outer_ty = adt(2);
+    let borrowed_inner = serde_json::json!({"Ref": ["_", inner_ty.clone(), "Shared"]});
+    let borrowed_outer = serde_json::json!({"Ref": ["_", outer_ty.clone(), "Shared"]});
+    let field = |ty: &serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    // Trait impl of Fn::call, matching `getattr_surrogate::{'Impl': {'Trait': N}}::call`.
+    let outer_impl = serde_json::json!({"Impl": {"Trait": 0}});
+    let layout = |size, offsets: Vec<u64>, transparent: bool| {
+        serde_json::json!([{
+            "key": "x86_64-unknown-linux-gnu",
+            "value": {
+                "size": size, "align": 8,
+                "variant_layouts": [{"field_offsets": offsets}],
+                "repr": {"repr_algo": "Rust", "transparent": transparent}
+            }
+        }])
+    };
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [place(1, &borrowed_outer), "Deref"]},
+             "ty": outer_ty.clone()},
+            {"Field": [null, 0]}
+        ]},
+        "ty": borrowed_inner.clone()
+    });
+    let file = serde_json::json!({"charon_version": "0.1.201", "has_errors": false,
+        "translated": {"crate_name": "fixture",
+            "type_decls": [
+                null,
+                {"def_id": 1, "item_meta": meta(vec![
+                    ident("fixture"), ident("getattr_surrogate"), builtin_closure(1)
+                ]),
+                 "kind": {"Struct": [field(&word)]},
+                 "layout": layout(8, vec![0], true),
+                 "src": {"Closure": {"info": {"kind": "Fn"}}}},
+                {"def_id": 2, "item_meta": meta(vec![
+                    ident("fixture"), ident("getattr_surrogate"), builtin_closure(2)
+                ]),
+                 "kind": {"Struct": [field(&borrowed_inner)]},
+                 "layout": layout(8, vec![0], true),
+                 "src": {"Closure": {"info": {"kind": "Fn"}}}},
+                {"def_id": 3, "item_meta": meta(vec![
+                    ident("fixture"), ident("sibling"), builtin_closure(2)
+                ]),
+                 "kind": {"Struct": [field(&word), field(&word)]},
+                 "layout": layout(16, vec![0, 8], false),
+                 "src": {"Closure": {"info": {"kind": "Fn"}}}}
+            ],
+            "fun_decls": [
+                {"def_id": 0, "item_meta": meta(vec![ident("fixture"), ident("outer_calls_captured")]),
+                 "signature": {"is_unsafe": false, "inputs": [borrowed_outer.clone()], "output": borrowed_inner.clone()},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 1, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": borrowed_inner.clone()},
+                        {"index": 1, "name": "env", "span": span, "ty": borrowed_outer.clone()}
+                    ]},
+                    "body": [
+                        {"statements": [], "kind": "Regular",
+                         "terminator": {"span": span, "kind": {"Call": {
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                "args": [{"Move": place(1, &borrowed_outer)}]},
+                            "dest": place(0, &borrowed_inner),
+                            "target": 1, "on_unwind": 2
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                    ]
+                 }}},
+                {"def_id": 1, "item_meta": meta(vec![
+                    ident("fixture"), ident("getattr_surrogate"), builtin_closure(2),
+                    outer_impl, ident("call")
+                ]),
+                 "signature": {"is_unsafe": false, "inputs": [borrowed_outer.clone()], "output": borrowed_inner.clone()},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 1, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": borrowed_inner.clone()},
+                        {"index": 1, "name": "self", "span": span, "ty": borrowed_outer.clone()}
+                    ]},
+                    "body": [
+                        {"statements": [{"span": span, "kind": {"Assign": [
+                            place(0, &borrowed_inner),
+                            {"Use": [{"Read": field_place}, "No"]}
+                        ]}}],
+                         "kind": "Regular",
+                         "terminator": {"span": span, "kind": "Return"}}
+                    ]
+                 }}}
+            ],
+            "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let context = super::LowerContext::new(&llbc);
+    let registry = context.struct_field_registry();
+    let closure_keys: Vec<_> = registry
+        .fields
+        .keys()
+        .filter(|k| k.contains("closure"))
+        .cloned()
+        .collect();
+    assert!(
+        registry.struct_root_rows_known("getattr_surrogate::closure#2")
+            || registry.fields.contains_key("getattr_surrogate::closure#2")
+            || registry
+                .fields
+                .contains_key("fixture::getattr_surrogate::closure#2"),
+        "harvest must register the outer env as an ordinary struct, keys={closure_keys:?}"
+    );
+
+    let borrowed_ty = serde_json::from_value::<TyRef>(borrowed_outer.clone()).expect("ref TyRef");
+    assert!(
+        super::tyref_is_closure_env(&borrowed_ty, &llbc),
+        "src Closure identifies the outer env"
+    );
+    let peeled =
+        super::tyref_class_root_with(&borrowed_ty, &llbc, super::tombstoned_leaves_of(&llbc));
+    let input_root =
+        super::tyref_input_class_root(&borrowed_ty, &llbc, super::tombstoned_leaves_of(&llbc));
+    assert!(
+        input_root.as_deref().is_some_and(|root| {
+            root.contains("getattr_surrogate") && root.contains("closure#2")
+        }),
+        "Input class_root of a known closure env must be the outer harvest intern key, got {input_root:?} (peeled {peeled:?})"
+    );
+
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            let p = fd.item_meta.name_path();
+            p.contains("closure#2") && p.ends_with("call")
+        })
+        .expect("outer closure call FunDecl");
+    let graph = super::lower_fun_decl(&context, fd).expect("lower outer call");
+
+    let inputs: Vec<_> = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == graph.startblock)
+        .expect("startblock")
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            crate::model::OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } => Some((name.clone(), ty.clone(), class_root.clone())),
+            _ => None,
+        })
+        .collect();
+    let self_root = inputs.first().and_then(|(_, _, root)| root.as_deref());
+    assert!(
+        self_root
+            .is_some_and(|root| root.contains("getattr_surrogate") && root.contains("closure#2")),
+        "self Input of the call body must name the outer env intern key, got {inputs:?}"
+    );
+
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    let field_owner = ops.iter().find_map(|op| match &op.kind {
+        crate::model::OpKind::FieldRead { field, .. } if field.name == "__pos_0" => {
+            field.owner_root.clone()
+        }
+        _ => None,
+    });
+    assert!(
+        field_owner.is_some(),
+        "call body must FieldRead __pos_0; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        field_owner.as_deref(),
+        self_root,
+        "FieldRead owner_root must be the Input intern key"
+    );
+
+    let driver =
+        crate::test_support::lower_function(&llbc, "outer_calls_captured").expect("driver lowers");
+    let mut method_call = Vec::new();
+    let mut direct = Vec::new();
+    for block in &driver.blocks {
+        for op in &block.operations {
+            let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                crate::model::CallTarget::Method { name, .. } if name == "call" => {
+                    method_call.push(format!("{target:?}"));
+                }
+                crate::model::CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("call") =>
+                {
+                    assert!(!args.is_empty(), "env as arg[0]; args={args:?}");
+                    direct.push(segments.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        method_call.is_empty(),
+        "must not getattr \"call\": {method_call:?}"
+    );
+    assert_eq!(
+        direct.len(),
+        1,
+        "one FunctionPath of the body; got {direct:?}"
+    );
+
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(registry));
+    let cells = derive_subject_inputcells(&graph, Some(&bk)).expect("typed Input ops must project");
+    let SomeValue::Instance(inst) = &cells[0] else {
+        panic!("env Input must seed SomeInstance, got {:?}", cells[0]);
+    };
+    assert!(
+        inst.classdef.is_some(),
+        "env Input must intern the known struct ClassDef, got {inst:?}"
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper
+        .set_struct_fields(bk.struct_fields.borrow().clone().expect("fields"));
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift call body");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .expect("upvar getattr of a known closure env must annotate");
+}
+
 /// A rustc closure env that captures `&TransparentWrapper` of a scalar
 /// must annotate: the stored word is Integer and the env field must be
 /// that same Integer (`rclass.py` field reprs; `annotator/model.py` `unionof`).
