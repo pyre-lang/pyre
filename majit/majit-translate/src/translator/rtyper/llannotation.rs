@@ -30,7 +30,7 @@ use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeAddress, SomeBool, SomeBuiltinMethod, SomeChar, SomeFloat,
     SomeInstance, SomeInteger, SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeRustVec,
-    SomeSingleFloat, SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none, s_str0,
+    SomeSingleFloat, SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none, s_str0, union,
 };
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
@@ -834,11 +834,21 @@ fn interior_ptr_struct_field_type(
 
 /// `_abstract_ptr.__setattr__` requires `T1 == T2` (`typeOf(val)` vs the
 /// field type). `SomePtr.setattr` feeds `annotation_to_lltype(s_value)`
-/// into that check.
+/// into that check. The high-level spelling of a pointer field is
+/// accepted the same way the field read produces it.
 fn interior_leaf_store_value_fits(
     expected: &lltype::LowLevelType,
     s_value: &SomeValue,
 ) -> Result<(), AnnotatorError> {
+    if let lltype::LowLevelType::Ptr(_) = expected {
+        let s_hl = highlevel_of_ptr_field_annotation(lltype_to_annotation(expected.clone()));
+        if !matches!(s_hl, SomeValue::Ptr(_))
+            && let Ok(merged) = union(&s_hl, s_value)
+            && merged == s_hl
+        {
+            return Ok(());
+        }
+    }
     match annotation_to_lltype(s_value, None) {
         Ok(got) if got == *expected => Ok(()),
         Ok(got) => Err(AnnotatorError::new(format!(
@@ -1784,6 +1794,18 @@ mod tests {
                 || msg.contains("store through interior ptr"),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn interior_leaf_store_accepts_somestring_into_strptr_field() {
+        use crate::annotator::model::SomeString;
+
+        let s_value = SomeValue::String(SomeString::new(true, true));
+        interior_leaf_store_value_fits(
+            &*crate::translator::rtyper::lltypesystem::rstr::STRPTR,
+            &s_value,
+        )
+        .expect("nullable SomeString into STRPTR");
     }
 
     #[test]

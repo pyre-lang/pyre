@@ -7833,12 +7833,13 @@ impl CallControl {
         if !self.is_known_struct(&row.ty) {
             return None;
         }
-        let mut leaves = self.struct_field_entries(&row.ty)?.iter().filter(|inner| {
-            let (_, ir_type, _) = get_type_flag(&inner.ty, &self.raw_alloc_flavor_structs);
-            ir_type != majit_ir::value::Type::Void && inner.name != "typeptr"
-        });
-        let leaf = leaves.next()?;
-        if leaves.next().is_some() || self.is_known_struct(&leaf.ty) {
+        let entries = self.struct_field_entries(&row.ty)?;
+        if entries.len() != 1 {
+            return None;
+        }
+        let leaf = &entries[0];
+        let (_, ir_type, _) = get_type_flag(&leaf.ty, &self.raw_alloc_flavor_structs);
+        if ir_type == majit_ir::value::Type::Void || self.is_known_struct(&leaf.ty) {
             return None;
         }
         Some(format!("{field}.{}", leaf.name))
@@ -8075,10 +8076,11 @@ impl CallControl {
             return None;
         }
         let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
-        // A by-value one-word wrapper field (`IdentityKey(PyObjectRef)` as
-        // `Entry.key`) is read as its word (`tyref_is_identity_field_word`):
-        // that is its one leaf, `heaptracker.py all_fielddescrs` spelling it
-        // `key.<leaf>` on the flattened STRUCT.
+        // A by-value one-field newtype (`IdentityKey(PyObjectRef)` as
+        // `Entry.key`) is the word it wraps
+        // (`tyref_is_identity_field_word`), so its interior field is that
+        // one leaf. `all_interiorfielddescrs` rejects every other
+        // `array(struct(struct))`.
         let single_leaf = self.single_leaf_path(&elem_name, field_name);
         let field_name: &str = single_leaf.as_deref().unwrap_or(field_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
@@ -8112,16 +8114,19 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // `heaptracker.py all_interiorfielddescrs`: a by-value nested
-            // struct field is not a leaf; `get_fielddescr_index_in` recurses
-            // into it, and its
-            // dotted `outer.inner` leaf resolves on the inner struct, as in
-            // the `fielddescrof_concrete` walk.
+            // Only the one-field newtype leaf named by `single_leaf_path`
+            // resolves through a nested struct; any other nested struct
+            // field is skipped and yields no descr (`UnsupportedFieldExc`
+            // upstream).
             let nested_leaf = if self.is_known_struct(fty) {
-                let leaf = field_name
-                    .strip_prefix(fname.as_str())
-                    .and_then(|rest| rest.strip_prefix('.'))
-                    .and_then(|tail| self.nested_struct_leaf(fty, tail));
+                let leaf = if single_leaf.is_some() {
+                    field_name
+                        .strip_prefix(fname.as_str())
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .and_then(|tail| self.nested_struct_leaf(fty, tail))
+                } else {
+                    None
+                };
                 if leaf.is_none() {
                     offset = offset.saturating_add(compute_struct_size(self, fty));
                     continue;
@@ -21120,6 +21125,43 @@ mod tests {
             .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
             .expect("float interiorfield");
         assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
+    }
+
+    #[test]
+    fn interiorfielddescr_collapses_only_one_field_newtype() {
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(
+            ["EntryTwo", "EntryOne", "TwoRowKey", "IdentityKey"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "EntryTwo".to_string(),
+            vec![("key".to_string(), "TwoRowKey".to_string())],
+        );
+        registry.fields.insert(
+            "EntryOne".to_string(),
+            vec![("key".to_string(), "IdentityKey".to_string())],
+        );
+        registry.fields.insert(
+            "TwoRowKey".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("b".to_string(), "i64".to_string()),
+            ],
+        );
+        registry.fields.insert(
+            "IdentityKey".to_string(),
+            vec![("inner".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        assert_eq!(cc.single_leaf_path("EntryTwo", "key"), None);
+        assert_eq!(
+            cc.single_leaf_path("EntryOne", "key"),
+            Some("key.inner".to_string())
+        );
     }
 
     /// Harvest stores `[module::Item; N]`. ARRAY.OF is that TypeDecl path,

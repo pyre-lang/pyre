@@ -82,8 +82,13 @@ fn setinteriorfield_field_name(
 }
 
 fn gcarray_of_struct(parent: &LowLevelType) -> Option<&Struct> {
-    let LowLevelType::Array(arr) = parent else {
-        return None;
+    let arr = match parent {
+        LowLevelType::Array(arr) => arr.as_ref(),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) => arr,
+            _ => return None,
+        },
+        _ => return None,
     };
     if arr._gckind != GcKind::Gc {
         return None;
@@ -352,6 +357,39 @@ fn rewrite_one_store(
     ])
 }
 
+fn reject_container_valued_element_field(
+    graph: &FunctionGraph,
+    parent: Option<&LowLevelType>,
+    field: &FieldDescriptor,
+) {
+    let Some(parent) = parent else {
+        return;
+    };
+    let Some(item) = gcarray_of_struct(parent) else {
+        return;
+    };
+    let Some(field_ty) = item.getattr_field_type(&field.name) else {
+        return;
+    };
+    // A by-value one-field newtype (`IdentityKey(PyObjectRef)` as
+    // `Entry.key`) is the word it wraps, the same one leaf
+    // `CallControl::single_leaf_path` resolves its descr through.
+    if let LowLevelType::Struct(inner) = &field_ty
+        && let [only] = inner._names.as_slice()
+        && inner
+            .getattr_field_type(only)
+            .is_some_and(|leaf| !matches!(leaf, LowLevelType::Struct(_) | LowLevelType::Array(_)))
+    {
+        return;
+    }
+    if matches!(field_ty, LowLevelType::Struct(_) | LowLevelType::Array(_)) {
+        panic!(
+            "unexpected array(struct(struct)) (all_interiorfielddescrs): graph {} field {}",
+            graph.name, field.name
+        );
+    }
+}
+
 /// `InteriorPtrRepr.rtype_getattr` / `getinteriorfieldargs`: unpack
 /// Interior `{ptr,index}` then `getinteriorfield`.
 fn rewrite_one_field_read(
@@ -368,6 +406,7 @@ fn rewrite_one_field_read(
         return None;
     }
     let parent = interior_struct_parent(base);
+    reject_container_valued_element_field(graph, parent.as_ref(), field);
     let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
     let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
     Some(vec![
@@ -395,6 +434,59 @@ fn rewrite_one_field_read(
                 base: v_ptr,
                 index: v_index,
                 field: field.clone(),
+                item_ty: ty.clone(),
+                array_type_id: parent.as_ref().and_then(array_type_id_from_parent),
+                array: parent.as_ref().and_then(parent_array),
+            },
+        },
+    ])
+}
+
+/// `InteriorPtrRepr.rtype_setattr` / `getinteriorfieldargs`: unpack
+/// Interior `{ptr,index}` then `setinteriorfield`.
+fn rewrite_one_field_write(
+    graph: &mut FunctionGraph,
+    base: &Variable,
+    field: &FieldDescriptor,
+    value: &LinkArg,
+    ty: &ValueType,
+    interiors: &HashSet<Variable>,
+) -> Option<Vec<SpaceOperation>> {
+    if is_interior_wrapper_field(field)
+        || (!interiors.contains(base) && !concretetype_is_interior_struct(base))
+    {
+        return None;
+    }
+    let parent = interior_struct_parent(base);
+    reject_container_valued_element_field(graph, parent.as_ref(), field);
+    let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+    let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+    Some(vec![
+        SpaceOperation {
+            result: Some(v_ptr.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: FieldDescriptor::new("ptr", Some("Interior".into())),
+                ty: ValueType::Ref(None),
+                pure: true,
+            },
+        },
+        SpaceOperation {
+            result: Some(v_index.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: FieldDescriptor::new("index", Some("Interior".into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        },
+        SpaceOperation {
+            result: None,
+            kind: OpKind::InteriorFieldWrite {
+                base: v_ptr,
+                index: v_index,
+                field: field.clone(),
+                value: value.expect_variable().clone(),
                 item_ty: ty.clone(),
                 array_type_id: parent.as_ref().and_then(array_type_id_from_parent),
                 array: parent.as_ref().and_then(parent_array),
@@ -434,6 +526,20 @@ fn rewrite_block_stores(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped)
                         ty,
                         &interiors,
                     ) {
+                        new_ops.extend(rewritten);
+                    } else {
+                        new_ops.push(op);
+                    }
+                }
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value,
+                    ty,
+                } => {
+                    if let Some(rewritten) =
+                        rewrite_one_field_write(graph, base, field, value, ty, &interiors)
+                    {
                         new_ops.extend(rewritten);
                     } else {
                         new_ops.push(op);
@@ -1205,6 +1311,160 @@ mod tests {
             !matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "key")
                 && !matches!(op.kind, OpKind::New { .. })
         }));
+    }
+
+    #[test]
+    fn element_field_write_through_interior_wrapper_is_setinteriorfield() {
+        use crate::model::FieldDescriptor;
+
+        let mut graph = FunctionGraph::new("take_slot_value");
+        let entry = graph.startblock;
+        let input = |graph: &mut FunctionGraph, name: &str, ty: ValueType| {
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let entries = input(&mut graph, "entries", ValueType::Ref(None));
+        let index = input(&mut graph, "i", ValueType::Int);
+        let value = input(&mut graph, "v", ValueType::Ref(None));
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        graph.push_inputarg_var(entry, value.clone());
+        let interior = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Interior".into(),
+                    owner_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        stamp_interior_concretetype(&interior);
+        let write = |graph: &mut FunctionGraph, name: &str, stored: Variable, ty: ValueType| {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: interior.clone(),
+                    field: FieldDescriptor::new(name, Some("Interior".into())),
+                    value: LinkArg::Value(stored),
+                    ty,
+                },
+                false,
+            )
+        };
+        write(&mut graph, "ptr", entries, ValueType::Ref(None));
+        write(&mut graph, "index", index, ValueType::Int);
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: interior,
+                field: FieldDescriptor::new("value", Some("Entry".into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        let writes: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldWrite { field, .. } => Some(field.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes, vec!["value".to_string()]);
+        assert!(graph.iter_block_ops().all(|(_, op)| {
+            !matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.owner_root.as_deref() == Some("Entry")
+            )
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected array(struct(struct))")]
+    fn container_field_read_through_interior_wrapper_panics() {
+        use crate::model::FieldDescriptor;
+
+        let mut graph = FunctionGraph::new("container_inner");
+        let entry = graph.startblock;
+        let input = |graph: &mut FunctionGraph, name: &str, ty: ValueType| {
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let entries = input(&mut graph, "entries", ValueType::Ref(None));
+        let index = input(&mut graph, "i", ValueType::Int);
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        let interior = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Interior".into(),
+                    owner_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        let inner = Struct::new(
+            "Inner",
+            vec![
+                ("x".into(), GCREF.clone()),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let parent = gcarray_of_entry(vec![(
+            "inner".into(),
+            LowLevelType::Struct(Box::new(inner)),
+        )]);
+        let item_ty = match &parent {
+            LowLevelType::Array(arr) => arr.OF.clone(),
+            _ => panic!("container parent"),
+        };
+        let ip = SomeInteriorPtr::new(InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(item_ty.clone()),
+            offsets: vec![InteriorOffset::Index(0)],
+        });
+        let parent_ptr =
+            crate::translator::rtyper::rmodel::ptr_from_container_lowleveltype(&ip.ll_ptrtype);
+        let interior_struct = parent_ptr._interior_ptr_type_with_index(&item_ty);
+        interior.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(interior_struct),
+        }))));
+        let inner_read = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: interior,
+                    field: FieldDescriptor::new("inner", Some("Entry".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(inner_read));
+        rewrite_store_through_ptr(&mut graph, &HashMap::new());
     }
 
     #[test]
