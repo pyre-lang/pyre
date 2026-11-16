@@ -3830,6 +3830,7 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
 /// where `pygraph` is hand-constructed without going through
 /// `build_flow`.  Pure constructor — no annotator / rtyper side
 /// effects.
+#[cfg(test)]
 pub(crate) fn build_stub_pygraph_for_lltype(
     name: String,
     signature: Signature,

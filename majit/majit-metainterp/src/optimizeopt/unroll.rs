@@ -6119,7 +6119,7 @@ mod tests {
         // `attach_iter_cache` here would keep the stale box and number
         // TAGBOX of the null result instead.
         use crate::resume::{
-            BoxEnv, ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotBox, TAGBOX, untag,
+            ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotBox, TAGBOX, untag,
         };
 
         let env = SimpleBoxEnv::new();
@@ -10850,7 +10850,7 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int]);
         let passed = ctx.inputarg_at(0).expect("inputarg 0 must be bound");
         let func = Operand::const_from_value(Value::Int(0x1000));
-        let mut call = Op::new(OpCode::CallR, &[func, passed.clone()]);
+        let call = Op::new(OpCode::CallR, &[func, passed.clone()]);
         call.pos().set(OpRef::ref_op(2));
         call.setdescr(make_call_descr(
             vec![Type::Int, Type::Int],

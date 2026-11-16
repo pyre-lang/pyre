@@ -7769,7 +7769,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
         let ge_rhs = rooted_resop_operand(Type::Int, 10_000);
-        let mut preamble_op = Op::new(
+        let preamble_op = Op::new(
             OpCode::IntGe,
             &[rooted_resop_operand(Type::Int, 3), ge_rhs.clone()],
         );
@@ -7793,7 +7793,7 @@ mod tests {
             }],
         );
         let replay_op = {
-            let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[b14.clone()]);
+            let op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[b14.clone()]);
             op.pos().set(OpRef::op_typed(14, op.result_type()));
             OpRc::new(op)
         };

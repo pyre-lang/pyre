@@ -3212,7 +3212,7 @@ mod tests {
 
         // Query op carries the bound boxes (b_query forwards to
         // b_canonical via make_equal_to).
-        let mut q = Op::new(OpCode::IntAdd, &[b_query.clone(), b_other.clone()]);
+        let q = Op::new(OpCode::IntAdd, &[b_query.clone(), b_other.clone()]);
         q.pos().set(OpRef::int_op(99));
         assert!(
             pass.get_pure_result(&q, &mut ctx)
@@ -3285,7 +3285,7 @@ mod tests {
 
     #[test]
     fn test_known_result_call_pure_lookup() {
-        let mut pass = OptPure::new();
+        let pass = OptPure::new();
         let ctx = OptContext::with_num_inputs(4, 0);
         // Bind the matched call args so same_box resolves them.
         let b100 = rooted_resop_operand(Type::Int, 100);
@@ -3539,7 +3539,7 @@ mod tests {
 
         let a0 = rooted_resop_operand(Type::Int, 0);
         let a1 = rooted_resop_operand(Type::Int, 1);
-        let mut op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
+        let op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
         op.pos().set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -3584,7 +3584,7 @@ mod tests {
         let a100 = rooted_resop_operand(Type::Int, 100);
         let a0 = rooted_resop_operand(Type::Int, 0);
         let a1 = rooted_resop_operand(Type::Int, 1);
-        let mut op = Op::new(OpCode::CallPureI, &[a100.clone(), a0.clone(), a1.clone()]);
+        let op = Op::new(OpCode::CallPureI, &[a100.clone(), a0.clone(), a1.clone()]);
         op.pos().set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![
@@ -3651,7 +3651,7 @@ mod tests {
         pass.setup();
 
         let a0 = rooted_resop_operand(Type::Int, 0);
-        let mut op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0.clone()]);
+        let op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0.clone()]);
         op.pos().set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],

@@ -4925,7 +4925,6 @@ mod tests {
 
     #[test]
     fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
-        use majit_ir::OpRef;
         struct RefOnlyVirtualEnv {
             constants: indexmap::IndexMap<u32, (i64, majit_ir::Type)>,
             replacements: indexmap::IndexMap<u32, majit_ir::OpRef>,

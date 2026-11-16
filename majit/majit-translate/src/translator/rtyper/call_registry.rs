@@ -1647,6 +1647,7 @@ impl CallRegistry {
     /// Re-registration with the same key replaces the source template
     /// and asserts on signature equality (same contract as
     /// [`Self::get_or_register`]).
+    #[cfg(test)]
     pub fn register_callee(
         &self,
         key: FunctionPathKey,

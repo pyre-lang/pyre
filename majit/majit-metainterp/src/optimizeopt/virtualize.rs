@@ -4562,7 +4562,7 @@ mod tests {
         pass.setup();
 
         let vable = ctx.inputargs[0].clone();
-        let mut get = Op::new(OpCode::GetfieldRawI, &[vable]);
+        let get = Op::new(OpCode::GetfieldRawI, &[vable]);
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
@@ -4588,7 +4588,7 @@ mod tests {
 
         let vable = ctx.inputargs[0].clone();
         let value = ctx.inputargs[1].clone();
-        let mut set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
+        let set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
         let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut None, &mut ctx);
@@ -5027,7 +5027,7 @@ mod tests {
         // vstruct virtual; emitting it `force_box`es a unique nursery
         // object every iteration.
         let sd = size_descr(1);
-        let mut guard = Op::new(
+        let guard = Op::new(
             OpCode::GuardClass,
             &[
                 crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
@@ -7263,7 +7263,7 @@ mod tests {
         }
 
         let mut ctx = OptContext::new(wrapped.len());
-        let mut pass = OptVirtualize::new();
+        let pass = OptVirtualize::new();
         pass.setup();
 
         for &(opref, size) in raw_bufs {

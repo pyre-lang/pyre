@@ -39,7 +39,6 @@ majit-trace = { workspace = true }
 majit-gc = { workspace = true }
 majit-rlib = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
-serde_json = { workspace = true }
 bincode = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -78,6 +77,7 @@ walkdir = { workspace = true, optional = true }
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }
 majit-translate = { workspace = true }
+serde_json = { workspace = true }
 majit-charon-reader = { workspace = true }
 insta = { workspace = true }
 # `#[test]`s here drive interpreter frames through `init_typeobjects` without

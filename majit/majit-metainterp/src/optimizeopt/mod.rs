@@ -9331,7 +9331,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_set_ptr_info_mirrors_box_info() {
         // PtrInfo applies to ref-typed boxes.
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
+        let ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
@@ -10066,7 +10066,7 @@ mod boxref_forwarding_tests {
     /// unreachable.
     #[test]
     fn clear_forwarded_drops_int_bound() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
+        let ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (old_box, _ia) = bound_inputarg_operand(Type::Int, 0);
         ctx.setintbound(
             &old_box,
@@ -10400,7 +10400,7 @@ mod constant_ptr_info_tests {
     /// parent raw buffer.
     #[test]
     fn is_raw_ptr_accepts_virtual_raw_slice() {
-        let mut ctx = OptContext::new(0);
+        let ctx = OptContext::new(0);
         let parent_box = rooted_resop_operand(Type::Ref, 10_010);
         let slice_box = rooted_resop_operand(Type::Ref, 10_011);
         ctx.set_ptr_info(
@@ -10426,7 +10426,7 @@ mod constant_ptr_info_tests {
     /// a base `StrPtrInfo`, not one of the virtual subclasses.
     #[test]
     fn make_nonnull_str_initializes_ptr_variant() {
-        let mut ctx = OptContext::new(0);
+        let ctx = OptContext::new(0);
         let op_box = rooted_resop_operand(Type::Ref, 10_012);
 
         ctx.make_nonnull_str(&op_box, 0);
@@ -11251,7 +11251,7 @@ mod rd_virtual_info_builder_tests {
             .unwrap();
         let visitor: DescrRef = visitor_sd;
 
-        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ctx = OptContext::with_num_inputs(16, 0);
         let int_val = crate::history::test_support::rooted_resop_operand(Type::Int, 50);
         let ref_val = crate::history::test_support::rooted_resop_operand(Type::Ref, 51);
         let virtual_box = crate::history::test_support::rooted_resop_operand(Type::Ref, 7);
@@ -11318,7 +11318,7 @@ mod rd_virtual_info_builder_tests {
             .unwrap();
         let visitor: DescrRef = visitor_sd;
 
-        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ctx = OptContext::with_num_inputs(16, 0);
         let ref_val = crate::history::test_support::rooted_resop_operand(Type::Ref, 51);
         let virtual_box = crate::history::test_support::rooted_resop_operand(Type::Ref, 8);
         let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
@@ -11375,7 +11375,7 @@ mod rd_virtual_info_builder_tests {
             .unwrap();
         let arraydescr: DescrRef = array_sd;
 
-        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ctx = OptContext::with_num_inputs(16, 0);
         let int_val = crate::history::test_support::rooted_resop_operand(Type::Int, 60);
         let ref_val = crate::history::test_support::rooted_resop_operand(Type::Ref, 61);
         let virtual_box = crate::history::test_support::rooted_resop_operand(Type::Ref, 8);
@@ -11502,7 +11502,7 @@ mod rd_virtual_info_builder_tests {
             1
         );
 
-        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ctx = OptContext::with_num_inputs(16, 0);
         let int_val = crate::history::test_support::rooted_resop_operand(Type::Int, 70);
         let ref_val = crate::history::test_support::rooted_resop_operand(Type::Ref, 71);
         let virtual_box = crate::history::test_support::rooted_resop_operand(Type::Ref, 9);
@@ -11703,7 +11703,7 @@ mod opt_box_env_tests {
 
     #[test]
     fn native_box_env_reads_live_constant_info_and_typed_constants() {
-        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ctx = OptContext::with_num_inputs(16, 0);
         let producer = rooted_resop_operand(Type::Ref, 21);
         let env = OptBoxEnv { ctx: &ctx };
         let resolved = producer.get_box_replacement(false);

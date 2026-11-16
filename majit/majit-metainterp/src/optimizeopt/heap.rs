@@ -5185,7 +5185,7 @@ mod tests {
     ) {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
-        let mut preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
+        let preamble_op = Op::with_descr(opcode, &[object.clone()], descr.clone());
         preamble_op.pos().set(source.to_opref());
         ctx.initialize_imported_short_preamble_builder(
             &[object.clone(), resolved.clone()],
@@ -6329,7 +6329,7 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         // The index argument is the box the constant is attached to.
         ctx.make_constant_box(&idx, majit_ir::Value::Int(3));
-        let mut pass = OptHeap::new();
+        let pass = OptHeap::new();
         pass.setup();
         for op in &ops {
             let resolved = op.clone();
@@ -6372,7 +6372,7 @@ mod tests {
     fn arrayitem_key_rejects_a_negative_constant_index() {
         let d = descr(0);
         let idx = rooted_resop_operand(Type::Int, 50);
-        let mut op = Op::with_descr(
+        let op = Op::with_descr(
             OpCode::GetarrayitemGcPureI,
             &[rooted_resop_operand(Type::Int, 100), idx.clone()],
             d,

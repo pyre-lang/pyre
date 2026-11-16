@@ -211,7 +211,7 @@ pub mod integer {
             );
             if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "perm") } {
                 let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
-                ns = pyre_object::gc_roots::pin_root(ns);
+                let _ = pyre_object::gc_roots::pin_root(ns);
                 function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
                 ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
                 pyre_interpreter::__pyre_store!(ns, "perm", function);

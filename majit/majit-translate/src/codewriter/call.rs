@@ -17253,6 +17253,7 @@ pub(crate) fn gcarray_char() -> crate::translator::rtyper::lltypesystem::lltype:
 }
 
 /// `rffi.CCHARP.TO` = `Array(Char, hints={'nolength': True})`.
+#[cfg(test)]
 pub(crate) fn ccharp_array() -> crate::translator::rtyper::lltypesystem::lltype::Array {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
     match &*crate::translator::rtyper::lltypesystem::rffi::CCHARP {

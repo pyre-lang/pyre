@@ -14139,8 +14139,13 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> CompileResult {
-        let frame =
-            self.execute_assembler_at_dispatch_key(token, green_key, live_values, dispatch_key);
+        let frame = self.execute_assembler_at_dispatch_key(
+            token,
+            #[cfg(feature = "__execute-stage-probe")]
+            green_key,
+            live_values,
+            dispatch_key,
+        );
         self.handle_executed_frame_detailed(green_key, frame)
     }
 
@@ -14260,7 +14265,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
         procedure_token: &Arc<JitCellToken>,
-        green_key: u64,
+        #[cfg(feature = "__execute-stage-probe")] green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
     ) -> majit_backend::DeadFrame {

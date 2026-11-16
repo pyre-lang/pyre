@@ -1041,7 +1041,7 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
             MINTED_EXC_NAME_LENMAX,
         );
         defs.push_str(&format!(
-            "static {ident}: pyre_object::PyType = pyre_object::pyobject::new_pytype(\"{}\");\n",
+            "#[allow(non_upper_case_globals)]\nstatic {ident}: pyre_object::PyType = pyre_object::pyobject::new_pytype(\"{}\");\n",
             escape_rust_string(&row.name)
         ));
         let emit_destructor = !row.raw_owned.is_empty();
@@ -1075,7 +1075,7 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
                 escape_rust_string(&row.name)
             );
             defs.push_str(&format!(
-                "#[cfg(not(target_arch = \"wasm32\"))]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n}}\n"
+                "#[cfg(not(target_arch = \"wasm32\"))]\n#[allow(non_upper_case_globals)]\n#[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]\n#[linkme(crate = ::majit_ir::linkme)]\nstatic {alloc_fnaddr_name}: ::majit_ir::helper_fnaddr::HelperFnAddr =\n    ::majit_ir::helper_fnaddr::HelperFnAddr::new(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n#[cfg(target_arch = \"wasm32\")]\n#[::ctor::ctor(unsafe)]\nfn {alloc_fnaddr_name}() {{\n    ::majit_ir::helper_fnaddr::register(\"{fnaddr_path}\", {alloc_name} as *const (), 0, \">w\");\n}}\n"
             ));
         }
         let destructor_field = if emit_destructor {

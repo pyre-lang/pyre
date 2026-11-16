@@ -979,8 +979,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // `setup_bridge_sym` decoded. Null refs and unboxed boxes stay. The
     // result slot is still overwritten when the stack image is captured.
     // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
-    // re-running the root CALL is not a resume of this frame. `resume_pc`
-    // is the encoded word (`MIFrame.pc`).
+    // re-running the root CALL is not a resume of this frame.
     let stack_regs = root_sym.registers_r();
     let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
     let call_stack_overrides = (root_sym.nlocals()..stack_end)
@@ -1030,6 +1029,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         } else {
             return None;
         };
+    // The recipe word is the post-call resume pc.
     // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
     // pc (`setup_resume_at_op`) whichever call op it paused after.
     let resume_marker_jit_pc = pjc

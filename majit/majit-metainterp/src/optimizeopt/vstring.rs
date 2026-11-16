@@ -1945,7 +1945,7 @@ mod tests {
         let mut ctx =
             OptContext::with_num_inputs_and_start_pos(wrapped.len(), 0, 0, start_next_pos);
 
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         pass.setup();
 
         for rc in &wrapped {
@@ -2355,7 +2355,7 @@ mod tests {
         // STRGETITEM(slice, index) with a non-constant index.
         let index = iop(302);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[slice, index.clone()]);
+        let getitem = Op::new(OpCode::Strgetitem, &[slice, index.clone()]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
 
@@ -2404,7 +2404,7 @@ mod tests {
         let index = iop(302);
         ctx.make_constant_box(&index, Value::Int(1));
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[slice, index]);
+        let getitem = Op::new(OpCode::Strgetitem, &[slice, index]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
 

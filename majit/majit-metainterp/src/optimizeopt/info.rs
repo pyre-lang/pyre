@@ -2948,7 +2948,7 @@ mod tests {
 
     #[test]
     fn test_str_ptr_info_plain_constant_string_spec_rejects_intbound_constant_chars() {
-        let mut ctx = OptContext::new(16);
+        let ctx = OptContext::new(16);
         let ch_box = field_op(Type::Int, 10);
         ctx.setintbound(&ch_box, &IntBound::from_constant(97));
 

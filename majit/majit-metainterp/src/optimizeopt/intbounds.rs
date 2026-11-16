@@ -2148,7 +2148,7 @@ mod tests {
     }
 
     fn make_op(opcode: OpCode, args: &[Operand], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
+        let op = Op::new(opcode, args);
         op.pos().set(OpRef::op_typed(pos, op.result_type()));
         op
     }
@@ -2158,7 +2158,7 @@ mod tests {
     /// (optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`).
     /// Sharer guards (descrless) keep using `make_op`.
     fn make_guard_with_descr(opcode: OpCode, args: &[Operand], pos: u32) -> Op {
-        let mut op = make_op(opcode, args, pos);
+        let op = make_op(opcode, args, pos);
         assert!(
             opcode.is_guard(),
             "make_guard_with_descr requires a guard opcode"
@@ -2810,7 +2810,7 @@ mod tests {
     #[test]
     fn test_arraylen_nonneg() {
         let arr = rooted_resop_operand(Type::Int, 0);
-        let mut op = make_op(OpCode::ArraylenGc, &[arr], 1);
+        let op = make_op(OpCode::ArraylenGc, &[arr], 1);
         op.setdescr(descr(1));
         let op_rc = OpRc::new(op);
         let len_box = Operand::from_bound_op(&op_rc);
@@ -3130,7 +3130,7 @@ mod tests {
         // OptIntBounds pass is stateless except for `last_emitted_*`
         // (everything else lives on `box._forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
-        let mut pass = OptIntBounds::new();
+        let pass = OptIntBounds::new();
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.state
             .borrow_mut()
@@ -3169,7 +3169,7 @@ mod tests {
         let func = rooted_resop_operand(Type::Int, 10);
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i1 = rooted_resop_operand(Type::Int, 1);
-        let mut call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
+        let call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
         call.setdescr(call_descr(12, majit_ir::OopSpecIndex::IntPyDiv));
         let call_rc = OpRc::new(call);
         let call_box = Operand::from_bound_op(&call_rc);
@@ -3191,7 +3191,7 @@ mod tests {
         let func = rooted_resop_operand(Type::Int, 10);
         let i0 = rooted_resop_operand(Type::Int, 0);
         let i1 = rooted_resop_operand(Type::Int, 1);
-        let mut call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
+        let call = make_op(OpCode::CallPureI, &[func, i0.clone(), i1.clone()], 2);
         call.setdescr(call_descr(14, majit_ir::OopSpecIndex::IntPyMod));
         let call_rc = OpRc::new(call);
         let call_box = Operand::from_bound_op(&call_rc);

@@ -3462,7 +3462,7 @@ mod tests {
     fn test_export_nonvirtual_array_preserves_widened_lenbound() {
         // virtualstate.py NotVirtualStateInfoPtr.__init__: the
         // non-virtual ArrayPtrInfo leaf retains getlenbound(None).widen().
-        let mut ctx = OptContext::new(32);
+        let ctx = OptContext::new(32);
         let array_box = rooted_resop_operand(Type::Ref, 10);
         ctx.set_ptr_info(
             &array_box,

@@ -2569,7 +2569,7 @@ mod tests {
         // `force_op_from_preamble_op` requires a short-preamble producer.
         ctx.initialize_imported_short_preamble_builder(&[], &[], &[]);
         let source_op = crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 1);
-        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
+        let replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
         replay.pos().set(source_op.to_opref());
         let pass = OptRewrite::new();
         pass.loop_invariant_results.borrow_mut().insert(
@@ -2739,7 +2739,7 @@ mod tests {
         )));
         resolve_op_args_in_ctx(&mut call, &mut ctx);
         let op_rc = OpRc::new(call.clone());
-        let mut pass = OptRewrite::new();
+        let pass = OptRewrite::new();
         let result = pass.propagate_forward(&call, &op_rc, &mut None, &mut ctx);
         (result, ctx, op_rc)
     }

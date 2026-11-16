@@ -294,6 +294,7 @@ impl IdentityDesc {
 
     /// `IdentityDesc.enter_tunnel`. Union `s_obj` into `s_input`; if it
     /// changed, `annotator.reflowfromposition` every recorded leave.
+    #[cfg(test)]
     pub(crate) fn enter_tunnel(
         &mut self,
         bk: &Bookkeeper,
@@ -1870,6 +1871,7 @@ fn projected_contains_list(value: &SomeValue) -> bool {
 /// struct whose last field is not a flexible array does not.
 /// The owner stays a struct unless [`flexible_gcarray_wrapper_items_field`]
 /// matches the two-field `GcArray` layout.
+#[cfg(test)]
 pub(super) fn flexible_gcarray_items_field(
     reg: &crate::front::StructFieldRegistry,
     owner: &str,
@@ -2766,6 +2768,7 @@ impl Bookkeeper {
     /// key (qualified path, crate-stripped path, or the dual-published
     /// leaf): a same-leaf enum with variants, or a struct that merely
     /// shares the leaf, does not match.
+    #[cfg(test)]
     fn enum_decl_has_zero_variants(&self, ty: &str) -> bool {
         let t = majit_ir::descr::strip_generic_args(ty.trim());
         let t = t.as_ref();
@@ -8664,6 +8667,7 @@ fn collect_referenced_struct_names(
 /// (`result_exc::is_uninhabited_ok`). A user enum is uninhabited when
 /// its declaration has zero variants (`enum Infallible {}`), not when
 /// its leaf happens to be `Infallible`.
+#[cfg(test)]
 pub(super) fn is_uninhabited_ok_spelling(ty: &str, bk: &Bookkeeper) -> bool {
     let t = ty.trim();
     let leaf = t.rsplit("::").next().unwrap_or(t);
