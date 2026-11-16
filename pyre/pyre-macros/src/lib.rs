@@ -1532,6 +1532,18 @@ fn type_is_py_object_ref(ty: &Type) -> bool {
     )
 }
 
+/// Last path segment is `IntArray` (`IntArray`, `crate::IntArray`,
+/// `::pyre_object::IntArray`). RPython treats `Ptr(GcArray(Signed))` as a
+/// GC pointer field; the layout generator emits `offset_of!(Struct, field.block)`.
+fn type_is_int_array(ty: &Type) -> bool {
+    let ty = unwrap_type_group(ty);
+    let Type::Path(p) = ty else { return false };
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "IntArray")
+}
+
 fn path_is_ident(p: &syn::Path, name: &str) -> bool {
     p.segments.len() == 1 && p.segments[0].ident == name
 }
@@ -1622,10 +1634,11 @@ fn _unused() {
 //       }
 //   }
 //
-// `PTR_OFFSETS` auto-derived from the user's struct: every field whose
-// type is `PyObjectRef` becomes one entry via `std::mem::offset_of!`.
-// Primitive fields (`u64` / `i32` / etc.) are skipped because the GC
-// doesn't need to trace them.
+// `PTR_OFFSETS` auto-derived from the user's struct in field order:
+// `PyObjectRef` → `offset_of!(Struct, field)`; `IntArray` →
+// `offset_of!(Struct, field.block)` (`Ptr(GcArray(Signed))`). Primitive
+// fields (`u64` / `i32` / etc.) are skipped because the GC doesn't need
+// to trace them.
 //
 // `type_id = N` is required (manual): the GC's `pytype_to_tid` table
 // asserts a contiguous monotonic sequence at JIT-init in
@@ -2029,7 +2042,7 @@ fn expand_pyre_class(
         },
     };
 
-    // Collect `PyObjectRef` fields' offsets for GC tracing.  `ob` is the
+    // Collect GC pointer offsets from field types.  `ob` is the
     // `PyObject` header; its `w_class` word is the instance -> class edge
     // and is listed explicitly.  A `#[pyre_class]` instance created for a
     // Python subclass carries the (managed) heap type there, and the
@@ -2037,7 +2050,15 @@ fn expand_pyre_class(
     // instance's own type id — a parent tid contributes none — so leaving
     // it out let the subclass type be swept while instances were live.
     // `ob_type` stays out: it always points at the `static PyType`.
+    //
+    // RPython derives a struct's GC pointer offsets from its field types:
+    // `PyObjectRef` is a GC pointer, and `IntArray.block` is
+    // `Ptr(GcArray(Signed))`.  An `IntArray` field therefore contributes
+    // `offset_of!(Struct, field.block)` in field order.
     let mut ptr_field_idents: Vec<syn::Ident> = Vec::new();
+    let mut int_array_field_idents: Vec<syn::Ident> = Vec::new();
+    let mut ptr_offsets_inits: Vec<proc_macro2::TokenStream> =
+        vec![quote! { ::std::mem::offset_of!(#st_name, ob.w_class) }];
     for f in named.named.iter() {
         let Some(ident) = f.ident.clone() else {
             continue;
@@ -2046,18 +2067,14 @@ fn expand_pyre_class(
             continue;
         }
         if type_is_py_object_ref(&f.ty) {
-            ptr_field_idents.push(ident);
+            ptr_field_idents.push(ident.clone());
+            ptr_offsets_inits.push(quote! { ::std::mem::offset_of!(#st_name, #ident) });
+        } else if type_is_int_array(&f.ty) {
+            int_array_field_idents.push(ident.clone());
+            ptr_offsets_inits.push(quote! { ::std::mem::offset_of!(#st_name, #ident.block) });
         }
     }
-    let ptr_offsets_len = ptr_field_idents.len() + 1;
-    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> =
-        std::iter::once(quote! { ::std::mem::offset_of!(#st_name, ob.w_class) })
-            .chain(
-                ptr_field_idents
-                    .iter()
-                    .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) }),
-            )
-            .collect();
+    let ptr_offsets_len = ptr_offsets_inits.len();
 
     let payload_restores: Vec<proc_macro2::TokenStream> = ptr_field_idents
         .iter()
@@ -2069,7 +2086,112 @@ fn expand_pyre_class(
             }
         })
         .collect();
-    let payload_binding = if ptr_field_idents.is_empty() {
+    let ptr_field_count = ptr_field_idents.len();
+    let instance_int_array_payload_reloads: Vec<proc_macro2::TokenStream> = int_array_field_idents
+        .iter()
+        .enumerate()
+        .map(|(i, ident)| {
+            let idx = 1usize + ptr_field_count + i;
+            quote! {
+                payload.#ident.reload_block(__base + #idx);
+            }
+        })
+        .collect();
+    let instance_int_array_obj_reloads: Vec<proc_macro2::TokenStream> = int_array_field_idents
+        .iter()
+        .enumerate()
+        .map(|(i, ident)| {
+            let idx = 1usize + ptr_field_count + i;
+            quote! {
+                (&mut (*(obj as *mut Self)).#ident).reload_block(__base + #idx);
+            }
+        })
+        .collect();
+    let instance_int_array_obj_reload_stmt = if int_array_field_idents.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            if !obj.is_null() {
+                unsafe {
+                    #(#instance_int_array_obj_reloads)*
+                }
+            }
+        }
+    };
+    let pin_refs_stmt = if int_array_field_idents.is_empty() {
+        quote! {
+            let __refs = [w_subtype, #(payload.#ptr_field_idents),*];
+        }
+    } else {
+        quote! {
+            let __refs = [
+                w_subtype,
+                #(payload.#ptr_field_idents,)*
+                #(payload.#int_array_field_idents.block as ::pyre_object::PyObjectRef,)*
+            ];
+        }
+    };
+    let int_array_pin_lets: Vec<proc_macro2::TokenStream> = int_array_field_idents
+        .iter()
+        .map(|ident| {
+            let slot = format_ident!("__ia_{}", ident);
+            quote! { let #slot = payload.#ident.pin_block(); }
+        })
+        .collect();
+    let int_array_payload_reloads_named: Vec<proc_macro2::TokenStream> = int_array_field_idents
+        .iter()
+        .map(|ident| {
+            let slot = format_ident!("__ia_{}", ident);
+            quote! { payload.#ident.reload_block(#slot); }
+        })
+        .collect();
+    let int_array_obj_reloads_named: Vec<proc_macro2::TokenStream> = int_array_field_idents
+        .iter()
+        .map(|ident| {
+            let slot = format_ident!("__ia_{}", ident);
+            quote! {
+                (&mut (*(obj as *mut Self)).#ident).reload_block(#slot);
+            }
+        })
+        .collect();
+    let allocate_payload_binding = if int_array_field_idents.is_empty() {
+        quote! { payload }
+    } else {
+        quote! { mut payload }
+    };
+    let allocate_return = if int_array_field_idents.is_empty() {
+        quote! {
+            ::pyre_object::lltype::malloc_typed_young_nonmoving(full) as ::pyre_object::PyObjectRef
+        }
+    } else {
+        quote! {
+            let obj = ::pyre_object::lltype::malloc_typed_young_nonmoving(full)
+                as ::pyre_object::PyObjectRef;
+            if !obj.is_null() {
+                unsafe {
+                    #(#int_array_obj_reloads_named)*
+                }
+            }
+            obj
+        }
+    };
+    let allocate_stable_return = if int_array_field_idents.is_empty() {
+        quote! {
+            ::pyre_object::lltype::malloc_typed_stable(full) as ::pyre_object::PyObjectRef
+        }
+    } else {
+        quote! {
+            let obj = ::pyre_object::lltype::malloc_typed_stable(full)
+                as ::pyre_object::PyObjectRef;
+            if !obj.is_null() {
+                unsafe {
+                    #(#int_array_obj_reloads_named)*
+                }
+            }
+            obj
+        }
+    };
+    let payload_binding = if ptr_field_idents.is_empty() && int_array_field_idents.is_empty() {
         quote! { payload }
     } else {
         quote! { mut payload }
@@ -2179,7 +2301,7 @@ fn expand_pyre_class(
                         return obj;
                     }
                     let _roots = ::pyre_object::gc_roots::push_roots();
-                    let __refs = [w_subtype, #(payload.#ptr_field_idents),*];
+                    #pin_refs_stmt
                     let __base = ::pyre_object::gc_roots::pin_roots(&__refs);
                     let type_id = match <#user_struct_name as ::pyre_object::lltype::GcType>::type_id() {
                         ::pyre_object::lltype::TypeIdCell::UNASSIGNED => 0,
@@ -2191,6 +2313,7 @@ fn expand_pyre_class(
                     );
                     let w_subtype = ::pyre_object::gc_roots::shadow_stack_get(__base);
                     #(#payload_restores)*
+                    #(#instance_int_array_payload_reloads)*
                     let user = #user_struct_name {
                         base: Self {
                             ob: ::pyre_object::PyObject {
@@ -2215,6 +2338,7 @@ fn expand_pyre_class(
                             raw as ::pyre_object::PyObjectRef
                         }
                     };
+                    #instance_int_array_obj_reload_stmt
                     ::pyre_object::gc_hook::maybe_register_finalizer(obj);
                     obj
                 }
@@ -2356,8 +2480,10 @@ fn expand_pyre_class(
             /// function is `dont_look_inside` and its calls are residual
             /// (`policy.py look_inside_graph`).
             #[::majit_macros::dont_look_inside]
-            pub fn allocate(payload: Self) -> ::pyre_object::PyObjectRef {
+            pub fn allocate(#allocate_payload_binding: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
+                #(#int_array_pin_lets)*
+                #(#int_array_payload_reloads_named)*
                 let full = Self {
                     ob: ::pyre_object::PyObject {
                         ob_type: &#pytype_static as *const ::pyre_object::PyType,
@@ -2365,7 +2491,7 @@ fn expand_pyre_class(
                     },
                     ..payload
                 };
-                ::pyre_object::lltype::malloc_typed_young_nonmoving(full) as ::pyre_object::PyObjectRef
+                #allocate_return
             }
 
             /// Stable-address variant of [`Self::allocate`]: allocates via
@@ -2378,8 +2504,10 @@ fn expand_pyre_class(
             /// function is `dont_look_inside` and its calls are residual
             /// (`policy.py look_inside_graph`).
             #[::majit_macros::dont_look_inside]
-            pub fn allocate_stable(payload: Self) -> ::pyre_object::PyObjectRef {
+            pub fn allocate_stable(#allocate_payload_binding: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
+                #(#int_array_pin_lets)*
+                #(#int_array_payload_reloads_named)*
                 let full = Self {
                     ob: ::pyre_object::PyObject {
                         ob_type: &#pytype_static as *const ::pyre_object::PyType,
@@ -2387,7 +2515,7 @@ fn expand_pyre_class(
                     },
                     ..payload
                 };
-                ::pyre_object::lltype::malloc_typed_stable(full) as ::pyre_object::PyObjectRef
+                #allocate_stable_return
             }
 
             #allocate_instance_fn

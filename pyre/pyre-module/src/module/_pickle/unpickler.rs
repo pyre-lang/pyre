@@ -2018,16 +2018,35 @@ fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Resul
 }
 
 /// `get_extension` (EXT1 / EXT2 / EXT4) — resolve a `copyreg` extension code
-/// to its registered global via `_extension_cache` / `_inverted_registry`.
+/// to its registered global via `State.w_extension_cache` /
+/// `State.w_inverted_registry`.
 fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
-    let mut copyreg = import_module("copyreg")?;
-    let cache = pyre_object::with_roots!(copyreg => pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_cache"))?;
-    if let Some(obj) = unsafe { pyre_object::w_dict_lookup(cache, pyre_object::w_int_new(code)) } {
+    let Some(state) = super::pickle_state() else {
+        if code <= 0 {
+            // Corrupt or hostile pickle (0 is forbidden by add_extension).
+            return Err(unpickling_error("EXT specifies code <= 0"));
+        }
+        return Err(PyError::value_error(format!(
+            "unregistered extension code {code}"
+        )));
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(code));
+    let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_cache = unsafe { std::ptr::addr_of!((*state).w_extension_cache).read() };
+    if let Some(obj) = pyre_interpreter::baseobjspace::finditem(
+        w_cache,
+        pyre_object::gc_roots::shadow_stack_get(code_slot),
+    )? && !unsafe { pyre_object::is_none(obj) }
+    {
         push(slot, obj);
         return Ok(());
     }
-    let inverted = pyre_interpreter::baseobjspace::getattr_str(copyreg, "_inverted_registry")?;
-    let key = match unsafe { pyre_object::w_dict_lookup(inverted, pyre_object::w_int_new(code)) } {
+    let w_inverted = unsafe { std::ptr::addr_of!((*state).w_inverted_registry).read() };
+    let w_key = match pyre_interpreter::baseobjspace::finditem(
+        w_inverted,
+        pyre_object::gc_roots::shadow_stack_get(code_slot),
+    )? {
         Some(k) if !unsafe { pyre_object::is_none(k) } => k,
         _ => {
             if code <= 0 {
@@ -2039,19 +2058,26 @@ fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
             )));
         }
     };
-    // `key` is the `(module, name)` tuple registered for this code.
-    let w_module = unsafe { pyre_object::tupleobject::w_tuple_getitem(key, 0).unwrap() };
-    let w_name = unsafe { pyre_object::tupleobject::w_tuple_getitem(key, 1).unwrap() };
-    let obj = call_find_class(slot, w_module, w_name)?;
-    // `_extension_cache[code] = obj`; pin `obj` across the dict lookups.
-    let _roots = pyre_object::gc_roots::push_roots();
+    // `w_key` is the `(module, name)` pair registered for this code
+    // (`get_extension` `space.listview(w_key)`).
+    let _ = pyre_object::gc_roots::pin_root(w_key);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let pair = pyre_interpreter::baseobjspace::fixedview(
+        pyre_object::gc_roots::shadow_stack_get(key_slot),
+        2,
+    )?;
+    let pair_base = pyre_object::gc_roots::pin_roots(&[pair[0], pair[1]]);
+    let obj = call_find_class(
+        slot,
+        pyre_object::gc_roots::shadow_stack_get(pair_base),
+        pyre_object::gc_roots::shadow_stack_get(pair_base + 1),
+    )?;
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let copyreg = import_module("copyreg")?;
-    let cache = pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    let w_cache = unsafe { std::ptr::addr_of!((*state).w_extension_cache).read() };
     pyre_interpreter::baseobjspace::setitem(
-        cache,
-        pyre_object::w_int_new(code),
+        w_cache,
+        pyre_object::gc_roots::shadow_stack_get(code_slot),
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
     )?;
     push(slot, pyre_object::gc_roots::shadow_stack_get(obj_slot));

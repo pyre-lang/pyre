@@ -1017,27 +1017,30 @@ pub(crate) fn deque_repeat(
     }
 }
 
-fn reverse_unlocked(mut self_obj: PyObjectRef) {
-    let len = deque_len(self_obj);
-    for index in 0..(len >> 1) {
-        let (left_block, left_index) = locate(self_obj, index);
-        let (right_block, right_index) = locate(self_obj, len - index - 1);
-        let left = block_get(left_block, left_index);
-        let right = block_get(right_block, right_index);
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base =
-            pyre_object::gc_roots::pin_roots(&[self_obj, left, right, left_block, right_block]);
-        block_set(
-            pyre_object::gc_roots::shadow_stack_get(base + 3),
-            left_index,
-            pyre_object::gc_roots::shadow_stack_get(base + 2),
-        );
-        block_set(
-            pyre_object::gc_roots::shadow_stack_get(base + 4),
-            right_index,
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-        );
-        self_obj = pyre_object::gc_roots::shadow_stack_get(base);
+fn reverse_unlocked(self_obj: PyObjectRef) {
+    let deque = W_Deque::from_obj(self_obj).expect("deque");
+    let mut li = deque.leftindex;
+    let mut lb = deque.leftblock;
+    let mut ri = deque.rightindex;
+    let mut rb = deque.rightblock;
+    // The block `data` is a list whose setitem the GC analysis treats as
+    // collecting, so the cursor blocks and the pending value are rooted
+    // across it.
+    for _ in 0..(deque.len >> 1) {
+        let mut left = block_get(lb, li);
+        let right = block_get(rb, ri);
+        pyre_object::with_roots!(lb, left, rb => block_set(lb, li, right));
+        pyre_object::with_roots!(lb, rb => block_set(rb, ri, left));
+        li += 1;
+        if li >= BLOCKLEN {
+            lb = block(lb).rightlink;
+            li = 0;
+        }
+        ri -= 1;
+        if ri < 0 {
+            rb = block(rb).leftlink;
+            ri = BLOCKLEN - 1;
+        }
     }
 }
 

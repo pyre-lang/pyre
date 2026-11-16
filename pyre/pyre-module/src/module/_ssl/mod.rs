@@ -194,27 +194,22 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     err
 }
 
-/// CPython's `SSLError` is an `OSError` subclass, but its string form is the
-/// TLS message rather than the generic two-item exception tuple.  Keep this
-/// policy in the `_ssl` boundary instead of teaching the process-wide
-/// exception formatter about an extension-module class.
+/// `SSLError.__str__`: a non-empty `strerror` is the message, otherwise
+/// `str(self.args)`. `os_error_fill_slots` stores that text on the OSError
+/// `w_strerror` slot. Keep the policy on this class rather than the
+/// process-wide exception formatter.
 fn ssl_error_str(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let mut exc = args[0];
-    let w_args = pyre_object::with_roots!(exc => unsafe {
+    let w_strerror = unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(exc) };
+    if !w_strerror.is_null() && unsafe { is_str(w_strerror) && w_str_len(w_strerror) > 0 } {
+        return Ok(w_strerror);
+    }
+    let mut w_args = pyre_object::with_roots!(exc => unsafe {
         pyre_object::interp_exceptions::w_exception_get_args(exc)
     });
-    let len = unsafe { pyre_object::w_tuple_len(w_args) };
-    if len >= 2 {
-        let message = unsafe {
-            pyre_object::w_tuple_getitem(w_args, 1)
-                .expect("SSLError argument tuple has a second element")
-        };
-        pyre_interpreter::builtins::builtin_str(&[message])
-    } else {
-        Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-            pyre_interpreter::display::base_exception_str_wtf8(exc)?
-        }))
-    }
+    pyre_object::with_roots!(w_args => {
+        pyre_interpreter::builtins::builtin_str(&[w_args])
+    })
 }
 
 fn native_result<T>(result: Result<T, (i32, String)>) -> Result<T, pyre_interpreter::PyError> {

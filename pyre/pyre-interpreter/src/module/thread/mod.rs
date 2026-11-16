@@ -1983,59 +1983,6 @@ fn make_thread_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(obj)
 }
 
-fn call_thread_target(
-    callable: PyObjectRef,
-    positional: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-    ec: *const crate::PyExecutionContext,
-) -> Result<PyObjectRef, crate::PyError> {
-    if kwargs.is_none_or(|d| unsafe { w_dict_str_entries(d) }.is_empty()) {
-        return crate::call::call_function_impl_result(callable, positional);
-    }
-    let kwargs = kwargs.unwrap();
-    let entries = unsafe { w_dict_str_entries(kwargs) };
-    let (target, args) = unsafe {
-        if is_method(callable) {
-            let func = w_method_get_func(callable);
-            let receiver = w_method_get_self(callable);
-            let mut args = Vec::with_capacity(positional.len() + 1);
-            args.push(receiver);
-            args.extend_from_slice(positional);
-            (func, args)
-        } else {
-            (callable, positional.to_vec())
-        }
-    };
-    if unsafe { crate::is_function(target) } {
-        let mut mixed = args;
-        let mut names = pyre_object::gc_roots::RootedItems::new();
-        names.push(target);
-        for (name, value) in entries {
-            mixed.push(value);
-            names.push(w_str_new_managed(&name));
-        }
-        let kwarg_names = w_tuple_new((1..names.len()).map(|i| names.get(i)).collect());
-        // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
-        // can collect. `target` is passed to
-        // `call_user_function_plain_with_ctx` afterwards, so publish it with
-        // the mixed arguments and the kwnames tuple and read it back.
-        let n_mixed = mixed.len();
-        let roots = pyre_object::gc_roots::push_roots();
-        let head = roots.publish(&[names.get(0), kwarg_names]);
-        let mixed_base = roots.publish(&mixed);
-        roots.normalize(head, 2 + n_mixed);
-        let mixed_now: Vec<PyObjectRef> = (0..n_mixed).map(|i| roots.get(mixed_base + i)).collect();
-        let resolved =
-            crate::call::resolve_kwargs(roots.get(head), &mixed_now, roots.get(head + 1), false)?;
-        let target = roots.get(head);
-        crate::call::call_user_function_plain_with_ctx(ec, target, &resolved)
-    } else {
-        Err(crate::PyError::type_error(
-            "keyword arguments for this thread target are not supported",
-        ))
-    }
-}
-
 /// os_thread.py `class Bootstrapper`: "A global container used to pass
 /// information to newly starting threads."
 ///
@@ -2300,15 +2247,6 @@ fn spawn_thread(
             THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
             bootstrap.publish(ident);
 
-            let callable = pyre_object::gc_roots::shadow_stack_get(worker_base);
-            let w_args = pyre_object::gc_roots::shadow_stack_get(worker_base + 1);
-            let args = if w_args.is_null() {
-                Vec::new()
-            } else {
-                unsafe { w_tuple_items_copy_as_vec(w_args) }
-            };
-            let kwargs = Some(pyre_object::gc_roots::shadow_stack_get(worker_base + 2))
-                .filter(|w_kwargs| !w_kwargs.is_null());
             let has_handle = !pyre_object::gc_roots::shadow_stack_get(worker_base + 3).is_null();
             // `JitDriver` currently owns a per-TLS background compiler.
             // Creating a compiler thread for every short-lived Python thread
@@ -2316,7 +2254,24 @@ fn spawn_thread(
             // worker frames through the same interpreter source until the
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
-            if let Err(error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
+            // `Bootstrapper.run`: `space.call_args(w_callable, args)` with
+            // `args = Arguments.frompacked(space, w_args, w_kwargs)`. The packed
+            // tuple and dict sit in the bootstrapper slots; `frompacked` can
+            // collect, so the callable is re-read from its slot afterwards.
+            let w_args = pyre_object::gc_roots::shadow_stack_get(worker_base + 1);
+            let w_kwargs = pyre_object::gc_roots::shadow_stack_get(worker_base + 2);
+            let args = crate::argument::Arguments::frompacked(
+                (!w_args.is_null()).then_some(w_args),
+                (!w_kwargs.is_null()).then_some(w_kwargs),
+            );
+            let call_result = match args {
+                Ok(args) => {
+                    let callable = pyre_object::gc_roots::shadow_stack_get(worker_base);
+                    crate::call::call_args(callable, &args)
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = call_result {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let mut error = error;
                 let error_slot = error.pin(&_roots);
