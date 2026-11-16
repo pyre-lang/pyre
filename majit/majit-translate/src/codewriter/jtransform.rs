@@ -866,6 +866,18 @@ fn prepend_const_prefix(prefix: &mut Vec<SpaceOperation>, result: RewriteResult)
     }
 }
 
+/// `RootScope.save_point` is the address word itself (`history.py` `getkind`
+/// of a raw `Ptr`). `__pos_0` is Charon's positional spelling of that field.
+fn field_is_rootscope_save_point_word(field: &FieldDescriptor) -> bool {
+    let Some(root) = field.owner_root.as_deref() else {
+        return false;
+    };
+    if !crate::front::mir::is_root_scope_class_root(root) {
+        return false;
+    }
+    field.name == "save_point" || field.name == "__pos_0"
+}
+
 /// Result of rewriting a single operation.
 ///
 /// RPython: `rewrite_operation()` returns SpaceOperation, list, None, or Constant.
@@ -1183,6 +1195,7 @@ pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
         || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
+        || crate::front::std_identity::is_manually_drop_new_path(segments)
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -3614,6 +3627,41 @@ fn wide_inline_borrow_offset(
     inline_aggregate_offset(field, cc)
 }
 
+/// Offset of any field of a raw owner for `rewrite_op_getsubstruct`.
+///
+/// `jtransform.py rewrite_op_getsubstruct` is `int_add(ptr, offsetof)`
+/// for every field of a `_gckind == 'raw'` STRUCT. [`wide_inline_borrow_offset`]
+/// only covers a FLAG_STRUCT wider than a word; a Pointer field
+/// (`CodeObject.obj_name`) taken_by_address is still getsubstruct.
+/// Charon leaves CodeObject offsets unresolved, so a missing layout row
+/// falls back to [`crate::codeobject_layout::exact_layout_for`].
+fn raw_taken_by_address_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<Result<usize, ()>> {
+    if !field.taken_by_address || field.vec_part.is_some() {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    // `rtuple.py` lays `TUPLE_TYPE` out from its item spellings, one word
+    // per `Vec` item. That offset does not address an item of the host
+    // tuple the pointer names.
+    if majit_ir::descr::positional_shape_id(owner).is_some() {
+        return None;
+    }
+    if let Some(layout) = cc.and_then(|cc| cc.struct_layout_for(owner))
+        && let Some(row) = layout.fields.iter().find(|row| row.name == field.name)
+    {
+        return Some(Ok(row.offset));
+    }
+    if let Some(off) = crate::codeobject_layout::exact_layout_for(owner)
+        .and_then(|exact| exact.field_offsets.get(&field.name).copied())
+    {
+        return Some(Ok(off as usize));
+    }
+    Some(Err(()))
+}
+
 /// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
 fn lltype_vtype_name(
     ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
@@ -3782,6 +3830,7 @@ impl<'a> Transformer<'a> {
     /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
     /// rewrites that object.
     pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
+        crate::translator::rtyper::cutover::stamp_rootscope_int_bank(&graph);
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -5666,8 +5715,10 @@ impl<'a> Transformer<'a> {
     /// the call to the declared void so the residual_call emits a `_v`
     /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
     /// register holding the void call's garbage.  The declared-void shell
-    /// case and a declared int-bank `RESULT` under a frontend `Ref` token
-    /// are rewritten; other calls keep `result_ty`.
+    /// case, a declared int-bank `RESULT` under a frontend `Ref` token, and
+    /// a declared raw `Ptr` (`history.py` `getkind` `'int'`) /
+    /// `llmemory.GCREF` whose frontend dest disagrees are rewritten; other
+    /// calls keep `result_ty`.
     ///
     /// `declared` is `FUNC.RESULT` of the called function's lltype
     /// (`call.py getcalldescr` for `direct_call` and `indirect_call`
@@ -5680,9 +5731,8 @@ impl<'a> Transformer<'a> {
         op_result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ValueType {
-        if declared == Some(majit_ir::value::Type::Void)
-            && self.resolve_call_result(op_result, result_ty).kind == 'r'
-        {
+        let resolved_kind = self.resolve_call_result(op_result, result_ty).kind;
+        if declared == Some(majit_ir::value::Type::Void) && resolved_kind == 'r' {
             ValueType::Void
         } else if matches!(result_ty, ValueType::Ref(_))
             && declared == Some(majit_ir::value::Type::Int)
@@ -5691,8 +5741,48 @@ impl<'a> Transformer<'a> {
             // aggregate token. This also covers a caller whose annotation
             // did not publish the raw result's concrete Ptr.
             ValueType::Int
+        } else if declared == Some(majit_ir::value::Type::Ref) && resolved_kind == 'i' {
+            // `call.py RESULT == FUNC.RESULT`: a `llmemory.GCREF` /
+            // `W_Root` callee whose frontend dest was a raw pointer word
+            // still returns a Ref. Without this, `flatten.py make_return`
+            // `int_return`s while the caller encodes `inline_call_*_r`.
+            ValueType::Ref(None)
+        } else if declared == Some(majit_ir::value::Type::Int) && resolved_kind == 'r' {
+            // Dual of the GCREF arm: `history.py` `getkind` of a raw `Ptr`
+            // is `'int'`. A frontend dest typed `*const ()` / aggregate
+            // Ref still calls a FUNC.RESULT `'i'` callee
+            // (`w_code_get_ptr`). Without this, `flatten.py` `make_return`
+            // `int_return`s while the caller encodes `inline_call_*_r`.
+            ValueType::Int
         } else {
             result_ty.clone()
+        }
+    }
+
+    /// `call.py RESULT == FUNC.RESULT`: a `llmemory.GCREF` dest that
+    /// [`Self::effective_call_result_ty`] rewrote to Ref must not stay in
+    /// the int bank from a front `*mut` word
+    /// (`stamp_unknown_results_from_declared_ty`).
+    fn stamp_gcref_func_result(
+        &self,
+        declared: Option<majit_ir::value::Type>,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) {
+        if declared != Some(majit_ir::value::Type::Ref) {
+            return;
+        }
+        let Some(var) = result else {
+            return;
+        };
+        match FunctionGraph::concretetype_of(var) {
+            crate::codewriter::type_state::ConcreteType::Signed
+            | crate::codewriter::type_state::ConcreteType::Unknown => {
+                FunctionGraph::set_concretetype_of_inline(
+                    var,
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -10474,6 +10564,23 @@ impl<'a> Transformer<'a> {
             });
             return RewriteResult::Replace(Vec::new());
         }
+        // `RootScope` is the save_point address word (`history.py` `getkind`
+        // of a raw `Ptr` / `llmemory.Address`). `emit_root_scope_close`
+        // already passes that word; a FieldRead of `save_point` is identity,
+        // not `getfield_raw` of a struct at that integer.
+        if let OpKind::FieldRead { base, .. } = &op.kind
+            && field_is_rootscope_save_point_word(field)
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: getfield({}.{}) → identity save_point word",
+                    field.owner_root.as_deref().unwrap_or("RootScope"),
+                    field.name
+                ),
+            });
+            return RewriteResult::Identity(base.clone());
+        }
         // `jtransform.py rewrite_op_getfield`: `RESULT = op.result.concretetype`.
         // The frontend FieldRead carries `ty: Int` (`W_BytesIO.pos`) while
         // the dest cell stays Unknown; stamp it the way the vtable-slot
@@ -10586,6 +10693,33 @@ impl<'a> Transformer<'a> {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
             };
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
+        // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)` for
+        // any field of a `_gckind == 'raw'` STRUCT. A Pointer field
+        // taken_by_address (`&code.obj_name`) is still that address, not
+        // `getfield_raw_r`. A GC owner keeps the existing getfield path.
+        if let Some(offset) = raw_taken_by_address_offset(field, self.callcontrol.as_deref()) {
+            let gc = crate::codewriter::type_state::field_owner_is_gc(
+                field,
+                self.callcontrol.as_deref(),
+            );
+            if !gc {
+                if offset.is_err() {
+                    return RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::Abort {
+                            kind: crate::model::UnknownKind::UnsupportedExpr {
+                                variant: crate::model::UnsupportedExprKind::RawAddr,
+                            },
+                        },
+                    }]);
+                }
+                let offset = offset.expect("raw offset");
+                let OpKind::FieldRead { base, .. } = &op.kind else {
+                    unreachable!("rewrite_op_getfield called on non-FieldRead op")
+                };
+                return self.rewrite_raw_substruct_address(op, base, offset, graph);
+            }
         }
         // A place read of the same aggregate (`(*raw).inline.field`) does
         // not set `taken_by_address`. On a raw container that read is still
@@ -13174,6 +13308,7 @@ impl<'a> Transformer<'a> {
                         .and_then(|cc| cc.declared_result_type_for_target(target));
                     let effective_result_ty =
                         self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+                    self.stamp_gcref_func_result(declared, op.result.as_ref());
                     let non_void_args = self
                         .callcontrol
                         .as_deref()
@@ -13285,6 +13420,7 @@ impl<'a> Transformer<'a> {
                         .and_then(|cc| cc.declared_result_type_for_target(target));
                     let effective_result_ty =
                         self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+                    self.stamp_gcref_func_result(declared, op.result.as_ref());
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -17346,6 +17482,7 @@ impl<'a> Transformer<'a> {
         });
         let effective_result_ty =
             self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+        self.stamp_gcref_func_result(declared, op.result.as_ref());
         let resolved_result = self.resolve_call_result(op.result.as_ref(), &effective_result_ty);
         let result_kind = resolved_result.kind;
         self.stamp_call_result(graph, op.result.clone(), &effective_result_ty);
@@ -23588,6 +23725,142 @@ mod tests {
         assert!(
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "one-word raw struct borrow must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `&storage.1` of a host `(Vec, Vec)` is not `int_add` of the
+    /// `TUPLE_TYPE` item offset.
+    #[test]
+    fn positional_tuple_item_borrow_is_not_a_raw_substruct_offset() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let owner =
+            "Tuple<alloc::vec::Vec<*mut object::PyObject>,alloc::vec::Vec<*mut object::PyObject>>";
+        assert!(majit_ir::descr::positional_shape_id(owner).is_some());
+        let field = FieldDescriptor::new("__pos_1", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            raw_taken_by_address_offset(&field, Some(&CallControl::new())),
+            None
+        );
+    }
+
+    /// `&code.obj_name` on a flavor-raw `CodeObject` is
+    /// `rewrite_op_getsubstruct` (`int_add` of offsetof), not
+    /// `getfield_raw_r`. `rclass.py getgcflavor` of `_alloc_flavor_ = "raw"`
+    /// is STRUCT._gckind `'raw'` even when `owner_declared_gc` recorded
+    /// `Some(true)` because a `Vec` field failed `adt_def_is_raw_storage`.
+    #[test]
+    fn raw_pointer_borrow_from_flavor_raw_codeobject_is_not_getfield_raw_r() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "bytecode::CodeObject";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let obj_name_off = crate::codeobject_layout::exact_layout_for(owner)
+            .and_then(|exact| exact.field_offsets.get("obj_name").copied())
+            .expect("host CodeObject records obj_name") as usize;
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let field = FieldDescriptor::new("obj_name", Some(owner.into()))
+            .with_taken_by_address(true)
+            .with_owner_declared_gc(Some(true));
+        let mut cc_fallback = CallControl::new();
+        cc_fallback
+            .raw_alloc_flavor_structs
+            .insert(owner.to_string());
+        assert_eq!(
+            raw_taken_by_address_offset(&field, Some(&cc_fallback)),
+            Some(Ok(obj_name_off)),
+            "Charon-unresolved CodeObject still names obj_name via exact_layout_for"
+        );
+
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert(owner.to_string());
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: obj_name_off + word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "obj_name".into(),
+                    offset: obj_name_off,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+        assert_eq!(
+            raw_taken_by_address_offset(&field, Some(&cc)),
+            Some(Ok(obj_name_off)),
+        );
+        assert_eq!(wide_inline_borrow_offset(&field, Some(&cc)), None);
+
+        let mut graph = FunctionGraph::new("reraise_obj_name");
+        let code =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, code.clone());
+        let name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: code,
+                    field: field.clone(),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(name));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        {
+            let ops: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .collect();
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "obj_name"
+                )),
+                "taken_by_address of raw obj_name is getsubstruct, not getfield; ops={ops:?}"
+            );
+            if obj_name_off != 0 {
+                assert!(
+                    ops.iter()
+                        .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add") }),
+                    "nonzero offsetof is int_add; ops={ops:?}"
+                );
+            }
+        }
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "flavor-raw Pointer borrow must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }
@@ -38383,6 +38656,55 @@ mod tests {
         }
     }
 
+    /// `ManuallyDrop::new` is `repr(transparent)` over the payload.
+    /// `jtransform.py rewrite_op_same_as` aliases the operand.
+    #[test]
+    fn manually_drop_new_is_operand_alias() {
+        let peeled: Vec<String> = ["mem", "manually_drop", "ManuallyDrop", "new"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            is_same_as_identity_call_path(&peeled),
+            "prefix-peeled ManuallyDrop::new is rewrite_op_same_as"
+        );
+        let user: Vec<String> = ["my_crate", "ManuallyDrop", "new"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_same_as_identity_call_path(&user),
+            "a user ManuallyDrop::new is an ordinary call"
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("manually_drop_new");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_ty = ValueType::Ref(None);
+        let target = CallTarget::function_path(["mem", "manually_drop", "ManuallyDrop", "new"]);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "manually_drop_new",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias for ManuallyDrop::new"),
+        }
+    }
+
     /// `jtransform.py rewrite_op_cast_opaque_ptr` returns None.
     #[test]
     fn cast_opaque_ptr_elides_to_operand_alias() {
@@ -47665,6 +47987,57 @@ mod tests {
                     .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
             }),
             "typeptr getfield of a parameter must become guard_class"
+        );
+    }
+
+    /// `RootScope` is the save_point word. A FieldRead of that field is
+    /// identity, not `getfield_raw` of a struct at the integer.
+    #[test]
+    fn rewrite_op_getfield_rootscope_save_point_is_identity() {
+        let mut graph = FunctionGraph::new("root_scope_base");
+        let bb = graph.startblock;
+        let scope = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: Some(scope.clone()),
+            kind: OpKind::Input {
+                name: "roots".into(),
+                ty: ValueType::Int,
+                class_root: Some("RootScope".into()),
+            },
+        });
+        let save = graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: scope.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "save_point",
+                        Some("RootScope".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(save));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "save_point"
+                    )
+                })
+            }),
+            "RootScope.save_point FieldRead must become identity, got {:?}",
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter().map(|op| format!("{:?}", op.kind)))
+                .collect::<Vec<_>>()
         );
     }
 

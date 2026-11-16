@@ -4119,10 +4119,11 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
 
 /// The leaked `CodeObject` address stored on a known `PyCode`.
 ///
-/// `CodeObject` is raw (`_alloc_flavor_ = raw`); the result is an Address,
-/// the same kind `history.py getkind` gives a `Ptr` whose `TO._gckind ==
-/// 'raw'`. Erasing to `*const ()` banks the result as a GC ref and makes
-/// callers emit `inline_call_*_r` against a callee that `int_return`s.
+/// `CodeObject` is raw (`_alloc_flavor_ = raw`); the result is an Address.
+/// `history.getkind` of that `Ptr` is `'int'` (`rclass.py` `getgcflavor`,
+/// `TO._gckind == 'raw'`). Erasing to `*const ()` banks the result as a GC
+/// ref and makes callers emit `inline_call_*_r` against a callee that
+/// `int_return`s.
 ///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.

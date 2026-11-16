@@ -21095,6 +21095,117 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
     );
 }
 
+/// Live interpreter ULLBC sees `GCREFOpaque` as a Foreign Opaque
+/// (`GcType` lives in majit-gc). `history.py` `getkind` of
+/// `Ptr(GcOpaqueType)` is `'ref'`; `llmemory.py` `GCREF`.
+#[test]
+fn foreign_opaque_gcrefopaque_ptr_is_gcref_ref() {
+    let opaque = serde_json::json!({
+        "def_id": 0,
+        "item_meta": crate::front::mir::tests::interior_meta(
+            &["majit_gc", "header", "GCREFOpaque"],
+            false,
+        ),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 0,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let llbc = crate::front::mir::tests::llbc_with_types("pyre_interpreter", vec![opaque], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let ty = fixture_ty(serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "generics": empty_generics()}
+        }, "Mut"]
+    }));
+    assert!(
+        tyref_is_gcref_spelling(&ty, &llbc),
+        "Foreign Opaque *mut GCREFOpaque is llmemory.GCREF"
+    );
+    assert!(
+        !super::ty_is_raw_address(&ty, &llbc, &gc, &empty),
+        "GcOpaqueType is not a raw Ptr"
+    );
+    assert_eq!(
+        super::tyref_to_value_type_with(&ty, &llbc, super::no_tombstoned_leaves(), &gc, &empty,),
+        ValueType::Ref(None)
+    );
+    assert_eq!(
+        dont_look_inside_return_token(&ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty,)
+            .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
+    );
+}
+
+/// `w_code_get_ptr` returns `*const CodeObject`. `history.py` `getkind`
+/// of that raw `Ptr` is `'int'` (`rclass.py` `getgcflavor`). The header
+/// stamps `raw:<owner>` so `call.py` `RESULT == FUNC.RESULT` rewrites a
+/// frontend Ref dest to `inline_call_*_i`.
+#[test]
+fn live_w_code_get_ptr_result_kind() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    let flavors =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    let fd = llbc
+        .local_fn("w_code_get_ptr")
+        .expect("w_code_get_ptr in interpreter ULLBC");
+    let out = &fd.signature.output;
+    let vt =
+        super::tyref_to_value_type_with(out, llbc, super::no_tombstoned_leaves(), &gc, &flavors);
+    let token =
+        dont_look_inside_return_token(out, llbc, crate::ErrorCarrierSpec::default(), &gc, &flavors);
+    let spelling = tyref_is_gcref_spelling(out, llbc);
+    assert!(
+        !spelling,
+        "raw CodeObject pointer is not GCREF; vt={vt:?} token={token:?}"
+    );
+    let token = token.expect("w_code_get_ptr residual token");
+    assert!(
+        token.starts_with("raw:") && token.contains("CodeObject"),
+        "signature token is raw:CodeObject; vt={vt:?} token={token}"
+    );
+    match &vt {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.contains("CodeObject"),
+                "front dest names CodeObject; vt={vt:?}"
+            );
+        }
+        ValueType::Int => {}
+        other => panic!("front dest of *const CodeObject is Ref or Int; got {other:?}"),
+    }
+
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["w_code_get_ptr"],
+    )
+    .expect("header of w_code_get_ptr");
+    let func = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_get_ptr")
+        .expect("w_code_get_ptr semantic");
+    let header = func
+        .return_type
+        .as_deref()
+        .expect("look_inside FUNC.RESULT of raw Ptr");
+    assert!(
+        header.starts_with("raw:") && header.contains("CodeObject"),
+        "look_inside FUNC.RESULT is raw:CodeObject; header={header:?} class_root={:?}",
+        func.return_class_root
+    );
+}
+
 /// `heaptracker.all_fielddescrs` and `_reccopy` walk the whole finite by-value
 /// structure. A Rust struct cannot contain itself by value, so twenty nested
 /// levels still yield every leaf.
