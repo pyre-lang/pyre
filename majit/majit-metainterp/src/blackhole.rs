@@ -912,11 +912,26 @@ impl BlackholeInterpreter {
         self.init_register_files_from_runtime_jitcode(jitcode);
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
+            let code = &self.jitcode.code;
+            let dest = position
+                .checked_sub(1)
+                .and_then(|i| code.get(i).copied())
+                .unwrap_or(0xff);
+            let start = position.saturating_sub(12);
+            let result_kind = self
+                .jitcode
+                .try_body()
+                .and_then(|body| body.resulttypes.as_ref())
+                .and_then(|types| types.get(&position).copied());
             eprintln!(
-                "[bh-setpos] jitcode={:?} index={:?} position={position} code_len={}",
+                "[bh-setpos] jitcode={:?} index={:?} position={position} code_len={} num_regs=({},{},{}) dest_byte={dest} resulttypes={result_kind:?} bytes[{start}..{position}]={:?}",
                 self.jitcode.name,
                 self.jitcode.try_index(),
                 self.jitcode.code.len(),
+                self.jitcode.num_regs_i(),
+                self.jitcode.num_regs_r(),
+                self.jitcode.num_regs_f(),
+                &code[start..position.min(code.len())],
             );
         }
     }
@@ -2286,11 +2301,12 @@ impl BlackholeInterpreter {
             self.last_opcode_position = pos_before;
             if trace {
                 eprintln!(
-                    "[bh-trace] pos={} op={} reg0={} reg1={}",
+                    "[bh-trace] pos={} op={} i0={} i1={} r0={:x}",
                     pos_before,
                     opcode,
                     self.registers_i.first().copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
+                    self.registers_r.first().copied().unwrap_or(0) as u64,
                 );
             }
             match self.dispatch_step(opcode, code) {
@@ -5470,6 +5486,78 @@ mod tests {
             bh.setposition(std::sync::Arc::new(jitcode), resume_pos);
             bh.setup_return_value_i(42);
             assert_eq!(bh.registers_i[7], 42);
+        }
+
+        /// `BlackholeInterpreter.setposition` + `run` on a helper (non-portal)
+        /// jitcode. Every JitCode is runnable (`blackhole.py setposition`).
+        #[test]
+        fn helper_jitcode_blackhole_resumes_at_pc_from_register_banks() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+
+            let mut helper = JitCodeBuilder::default();
+            helper.record_binop_i(0, OpCode::IntMul, 0, 1);
+            let add_pc = helper.current_pos();
+            helper.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            helper.int_return(2);
+            let helper_jc = std::sync::Arc::new(helper.finish());
+
+            let mut frame = MIFrame::new(helper_jc, add_pc);
+            frame.int_regs[0] = Some(OpRef::const_int(40));
+            frame.int_regs[1] = Some(OpRef::const_int(2));
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = build_test_bh_builder();
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(42)
+            );
+        }
+
+        /// An abort after an effect in a helper converts in place:
+        /// `convert_and_run_from_pyjitpl` resumes the helper after the effect
+        /// and writes the result into the caller's pending slot
+        /// (`_setup_return_value_i` / `_done_with_this_frame`). Starting the
+        /// helper at 0 would re-run `int_mul` and return 82.
+        #[test]
+        fn helper_abort_after_effect_converts_into_caller_without_replaying() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+
+            let mut helper = JitCodeBuilder::default();
+            helper.record_binop_i(0, OpCode::IntMul, 0, 1);
+            let add_pc = helper.current_pos();
+            helper.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            helper.int_return(2);
+            let helper_jc = std::sync::Arc::new(helper.finish());
+
+            let mut parent = JitCodeBuilder::default();
+            parent.inline_call_r_i(0, &[], Some(7));
+            let after_call = parent.current_pos();
+            parent.int_return(7);
+            let parent_jc = std::sync::Arc::new(parent.finish());
+            assert_eq!(
+                parent_jc.code[after_call - 1],
+                7,
+                "caller resumes on the inline_call result register"
+            );
+
+            let parent_frame = MIFrame::new(parent_jc, after_call);
+            let mut helper_frame = MIFrame::new(helper_jc, add_pc);
+            helper_frame.int_regs[0] = Some(OpRef::const_int(40));
+            helper_frame.int_regs[1] = Some(OpRef::const_int(2));
+
+            let mut framestack = MIFrameStack::new(parent_frame);
+            framestack.push(helper_frame);
+
+            let mut builder = build_test_bh_builder();
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(42),
+                "helper must resume after the skipped mul (40*2) and return 40+2"
+            );
         }
 
         #[test]
