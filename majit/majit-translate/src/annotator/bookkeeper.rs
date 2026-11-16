@@ -1904,6 +1904,13 @@ fn field_ty_is_integer_word(ty: &str) -> bool {
     )
 }
 
+/// Pointer-word field type (`Ptr` / `&T` / `*mut T`). Layout of the
+/// field, not its declared name.
+fn field_ty_is_pointer_word(ty: &str) -> bool {
+    let t = ty.trim();
+    t.starts_with('&') || t.starts_with('*')
+}
+
 /// Last field of a `GcArray` wrapper: exactly two fields, an integer
 /// word then `[T; 0]`. `lltype.py` `GcArray` is this layout; a
 /// `GcStruct` with `_arrayfld` keeps every other name in `_flds`
@@ -4909,6 +4916,12 @@ impl Bookkeeper {
         if !self.projected_struct_rows.borrow_mut().insert(intern_key) {
             return Ok(());
         }
+        let interior_index_field: Option<String> = {
+            let guard = self.struct_fields.borrow();
+            guard
+                .as_ref()
+                .and_then(|reg| synthetic_interior_ptr_index_field(n, reg))
+        };
         let host = self.intern_class_by_qualname(n);
         let classdef = self.getuniqueclassdef(&host)?;
         // The constructor materializes the nullable sum variant in each
@@ -4960,12 +4973,16 @@ impl Bookkeeper {
             // raw owner write SomePtr (`push_roots` RootScope). Promoting
             // that slot to Instance made setattr refuse Ptr ∪ Instance.
             let owner_leaf = n.rsplit("::").next().unwrap_or(n);
-            let s_value =
-                if row.is_positional && !majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
-                    self.by_value_payload_annotation(&row.ty)
-                } else {
-                    self.project_struct_field_type(&row.ty)
-                };
+            let s_value = if interior_index_field.as_deref() == Some(row.name.as_str()) {
+                // Array offset (`rtype_getitem`). Signed-nonneg ∪ r_uint
+                // unifies (`binaryop.py`); a signed-unproven shell walls it.
+                SomeValue::Integer(super::model::SomeInteger::new(true, false))
+            } else if row.is_positional && !majit_charon_reader::ullbc::is_closure_leaf(owner_leaf)
+            {
+                self.by_value_payload_annotation(&row.ty)
+            } else {
+                self.project_struct_field_type(&row.ty)
+            };
             // A raw owner's `Box<[T]>` is the raw two-word pair, not a list
             // (`raw_owner_boxed_slice_annotation`).
             let raw_owner_boxed_slice = !row.is_positional && self.is_raw_alloc_flavor(n);
@@ -5067,6 +5084,17 @@ impl Bookkeeper {
                     self.transparent_scalar_annotation(&row.ty).is_some()
                         && matches!(&attr.s_value, SomeValue::Instance(_))
                         && matches!(s_value, SomeValue::Integer(_));
+                // `tyref_to_attr_value_type` banks Signed as Int, so FORCE
+                // shells Interior.index as the signed-unproven Int-bank
+                // shell. The lltype is still Signed; the writers are array
+                // offsets (`usize` / nonneg int). Replace ONLY that exact
+                // FORCE shell so `r_uint ∪ int` does not wall setattr.
+                let is_interior_index_int_force_shell = interior_index_field.as_deref()
+                    == Some(row.name.as_str())
+                    && crate::codewriter::annotation_state::valuetype_to_someshell(
+                        &crate::model::ValueType::Int,
+                    )
+                    .is_some_and(|shell| shell == attr.s_value);
                 // A harvested FnPtr-field family does not intern a field
                 // type (`project_struct_field_type`). The attribute starts
                 // as `s_ImpossibleValue` (`classdesc.py Attribute.__init__`);
@@ -5089,6 +5117,7 @@ impl Bookkeeper {
                     || is_window_integer_force_shell
                     || is_raw_boxed_slice_integer_force_shell
                     || is_transparent_scalar_instance_shell
+                    || is_interior_index_int_force_shell
                 {
                     attr.s_value = s_value;
                 }
@@ -8345,6 +8374,33 @@ fn struct_root_is_core_option_or_result_template(
     })
 }
 
+/// `Ptr._interior_ptr_type_with_index` (`lltype.py`): two-field
+/// `{ptr: Ptr(ARRAY), index: Signed}` GcStruct, not a harvested TypeDecl.
+/// `index` is an array offset, so its ClassDef attr is nonneg Signed.
+fn synthetic_interior_ptr_index_field(
+    root: &str,
+    reg: &crate::front::StructFieldRegistry,
+) -> Option<String> {
+    if struct_root_declaration_id(reg, root).is_some() {
+        return None;
+    }
+    let rows = reg.intern_field_rows(root)?;
+    let [ptr, index] = rows else {
+        return None;
+    };
+    if !field_ty_is_pointer_word(&ptr.ty) || !field_ty_is_integer_word(&index.ty) {
+        return None;
+    }
+    let leaf = majit_ir::descr::strip_generic_args(root.rsplit("::").next().unwrap_or(root));
+    if leaf.as_ref() != "Interior" {
+        return None;
+    }
+    if ptr.name != "ptr" || index.name != "index" {
+        return None;
+    }
+    Some(index.name.clone())
+}
+
 /// Declared two-field `{integer, [T; 0]}` (`lltype.py` `GcArray`).
 /// A primitive ITEM is `Ptr(GcArray)`; an object/struct ITEM is the
 /// `FixedSizeListRepr` list on `attrs[items]`. Neither is a ClassDef intern.
@@ -10508,6 +10564,75 @@ mod tests {
             bk.getuniqueclassdef_for_struct_root("object_array::ItemsBlock")
                 .is_err(),
             "object-item GcArray wrapper must not intern a ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interior_index_is_nonneg_signed() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Interior".to_string(),
+            vec![
+                ("ptr".to_string(), "&()".to_string()),
+                ("index".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("Interior")
+            .expect("Interior intern's a ClassDef");
+        let s_index = super::super::classdesc::ClassDef::about_attribute(&cd, "index")
+            .expect("Interior.index attr");
+        match &s_index {
+            SomeValue::Integer(i) => {
+                assert!(i.nonneg, "array offset is nonneg Signed");
+                assert!(!i.unsigned, "lltype index is Signed");
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+        super::super::model::union(&s_index, &super::super::model::s_uint())
+            .expect("usize writer unifies with nonneg Signed");
+    }
+
+    #[test]
+    fn synthetic_interior_ptr_index_field_requires_interior_leaf_and_ptr_index_names() {
+        use crate::front::StructFieldRegistry;
+        let ptr_index = vec![
+            ("ptr".to_string(), "&()".to_string()),
+            ("index".to_string(), "i64".to_string()),
+        ];
+        let mut interior = StructFieldRegistry::default();
+        interior
+            .fields
+            .insert("Interior".to_string(), ptr_index.clone());
+        assert_eq!(
+            synthetic_interior_ptr_index_field("Interior", &interior).as_deref(),
+            Some("index")
+        );
+        let mut qualified = StructFieldRegistry::default();
+        qualified
+            .fields
+            .insert("crate::foo::Interior<K, V>".to_string(), ptr_index.clone());
+        assert_eq!(
+            synthetic_interior_ptr_index_field("crate::foo::Interior<K, V>", &qualified).as_deref(),
+            Some("index")
+        );
+        let mut entry = StructFieldRegistry::default();
+        entry.fields.insert("Entry".to_string(), ptr_index);
+        assert_eq!(synthetic_interior_ptr_index_field("Entry", &entry), None);
+        let mut renamed = StructFieldRegistry::default();
+        renamed.fields.insert(
+            "Interior".to_string(),
+            vec![
+                ("base".to_string(), "&()".to_string()),
+                ("offset".to_string(), "i64".to_string()),
+            ],
+        );
+        assert_eq!(
+            synthetic_interior_ptr_index_field("Interior", &renamed),
+            None
         );
     }
 

@@ -137,8 +137,8 @@ use majit_charon_reader::{
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
     Block, BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph,
-    InlineLeaf, Link, LinkArg, OpKind, SpaceOperation, ValueType, container_leaf_descriptor,
-    nest_inline_leaf,
+    InlineLeaf, Link, LinkArg, OpKind, RawWordDescr, SpaceOperation, ValueType,
+    container_leaf_descriptor, nest_inline_leaf,
 };
 use serde_json::Value;
 

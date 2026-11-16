@@ -785,6 +785,15 @@ pub struct ScalarFieldWord {
     pub width: ScalarFieldWidth,
 }
 
+/// Item word of a call-returned scalar reference lowered as
+/// `raw_store` / `raw_load` at offset 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawWordDescr {
+    pub item_ty: ValueType,
+    pub itemsize: usize,
+    pub is_item_signed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDescriptor {
     pub name: String,
@@ -1598,6 +1607,34 @@ pub enum OpKind {
         /// ARRAY lltype (`rewrite_op_setinteriorfield`
         /// `v_inst.concretetype.TO`). `array_type_id` is the dump spelling.
         array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+    },
+    /// Address-of a field of a GcArray element InteriorPtr.
+    ///
+    /// `_interior_ptr._expose` wraps a nested container; a GCREF / primitive
+    /// field is returned as a value. Rust takes the address of a GCREF /
+    /// primitive field (`&(*elem).field` / `&mut (*elem).field`): offsets
+    /// carry `Field(name)` and `TO` is the field type. Distinct from
+    /// [`OpKind::FieldRead`] (getattr-as-load) and from `direct_ptradd`.
+    InteriorPtrExpose {
+        base: crate::flowspace::model::Variable,
+        field: FieldDescriptor,
+        ty: ValueType,
+    },
+    /// Store through a call-returned scalar reference (`*p = v`).
+    /// A leaf `SomeInteriorPtr` lowers to `setinteriorfield`; an address
+    /// word (`SomeInteger`) lowers to `raw_store` at offset 0 with `raw`.
+    StoreThroughPtr {
+        ptr: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
+        raw: Option<RawWordDescr>,
+    },
+    /// Load through a call-returned scalar reference (`*p`). The op's
+    /// `result` is the loaded value. A leaf `SomeInteriorPtr` lowers to
+    /// `getinteriorfield`; an address word (`SomeInteger`) lowers to
+    /// `raw_load` at offset 0 with `raw`.
+    LoadThroughPtr {
+        ptr: crate::flowspace::model::Variable,
+        raw: RawWordDescr,
     },
     Call {
         target: CallTarget,

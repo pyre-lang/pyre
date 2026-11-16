@@ -6908,6 +6908,28 @@ impl CallControl {
     }
 
     /// Offset of `field` in the registered layout of `owner`, when one is.
+    /// `field.<leaf>` when `field` of `owner` is a by-value struct with
+    /// exactly one non-`Void` leaf; `None` otherwise.
+    fn single_leaf_path(&self, owner: &str, field: &str) -> Option<String> {
+        let row = self
+            .struct_field_entries(owner)?
+            .iter()
+            .find(|row| row.name == field)?;
+        if !self.is_known_struct(&row.ty) {
+            return None;
+        }
+        let entries = self.struct_field_entries(&row.ty)?;
+        if entries.len() != 1 {
+            return None;
+        }
+        let leaf = &entries[0];
+        let (_, ir_type, _) = get_type_flag(&leaf.ty, &self.raw_alloc_flavor_structs);
+        if ir_type == majit_ir::value::Type::Void || self.is_known_struct(&leaf.ty) {
+            return None;
+        }
+        Some(format!("{field}.{}", leaf.name))
+    }
+
     fn layout_field_offset(
         &self,
         sid: Option<majit_ir::descr::StructId>,
@@ -7087,19 +7109,28 @@ impl CallControl {
         // An interned pointer-item ARRAY sharing a dump STRUCT spelling
         // must not reuse that intern id (`descr.py` `isinstance(ARRAY.OF,
         // lltype.Struct)`).
+        let cache_field = interned_of_struct
+            .as_deref()
+            .and_then(|owner| {
+                let owner = self
+                    .array_of_field_owner(owner)
+                    .unwrap_or_else(|| owner.to_string());
+                self.single_leaf_path(&owner, field_name)
+            })
+            .unwrap_or_else(|| field_name.to_string());
         if interned_of_struct.is_some()
             && let Some(id) = intern_id
             && let Some(cached) = self
                 .interiorfield_descrs
                 .borrow()
-                .get(&(id, field_name.to_string()))
+                .get(&(id, cache_field.clone()))
                 .cloned()
         {
             cached.set_index(idx);
             let atid = array_type_id_of_lltype(&self.interned_array(id));
             let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
                 array_id: majit_ir::descr::path_hash(&atid),
-                name: field_name.to_string(),
+                name: cache_field,
             };
             return Some((cached, member));
         }
@@ -7130,6 +7161,13 @@ impl CallControl {
             return None;
         }
         let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
+        // A by-value one-field newtype (`IdentityKey(PyObjectRef)` as
+        // `Entry.key`) is the word it wraps
+        // (`tyref_is_identity_field_word`), so its interior field is that
+        // one leaf. `all_interiorfielddescrs` rejects every other
+        // `array(struct(struct))`.
+        let single_leaf = self.single_leaf_path(&elem_name, field_name);
+        let field_name: &str = single_leaf.as_deref().unwrap_or(field_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
@@ -7161,31 +7199,49 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: step past a by-value nested struct
-            // field's bytes; `get_fielddescr_index_in` recurses into it for
-            // the position.  Mirrors the `fielddescrof_concrete` walk; the
-            // corpus's array-element structs carry no by-value nested struct
-            // field, so this never fires there.
-            if self.is_known_struct(fty) {
-                offset = offset.saturating_add(compute_struct_size(self, fty));
-                continue;
-            }
-            if fname == field_name {
+            // Only the one-field newtype leaf named by `single_leaf_path`
+            // resolves through a nested struct; any other nested struct
+            // field is skipped and yields no descr (`UnsupportedFieldExc`
+            // upstream).
+            let nested_leaf = if self.is_known_struct(fty) {
+                let leaf = if single_leaf.is_some() {
+                    field_name
+                        .strip_prefix(fname.as_str())
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .and_then(|tail| self.nested_struct_leaf(fty, tail))
+                } else {
+                    None
+                };
+                if leaf.is_none() {
+                    offset = offset.saturating_add(compute_struct_size(self, fty));
+                    continue;
+                }
+                leaf
+            } else {
+                None
+            };
+            if nested_leaf.is_some() || fname == field_name {
                 // `all_interiorfielddescrs` takes the offset from the
                 // registered layout (`symbolic.get_field_token`). The running
                 // total above does not insert `repr(C)` padding, so a `bool`
                 // before a pointer is one byte early. Prefer the layout field
                 // when it is present.
-                let (offset, field_size, flag, ir_type) = self
-                    .struct_layout_for(&elem_name)
-                    .and_then(|layout| {
+                let layout_field = |name: &str| {
+                    self.struct_layout_for(&elem_name).and_then(|layout| {
                         layout
                             .fields
                             .iter()
-                            .find(|f| f.name == field_name)
+                            .find(|f| f.name == name)
                             .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
                     })
-                    .unwrap_or((offset, field_size, flag, ir_type));
+                };
+                let (offset, field_size, flag, ir_type) = match nested_leaf {
+                    Some((flag, ir_type, field_size, inner)) => {
+                        let at = layout_field(fname).map_or(offset, |(at, ..)| at);
+                        (at.saturating_add(inner), field_size, flag, ir_type)
+                    }
+                    None => layout_field(field_name).unwrap_or((offset, field_size, flag, ir_type)),
+                };
                 // Use-import resolver: hash the canonical
                 // `defining_module::Bare` form so analyzer hits the
                 // same `_cache_size` slot the runtime's qualified
@@ -16516,7 +16572,11 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
     //   anything else truthy -> Yes
     match op {
         // RPython LL: getfield_gc, setfield_gc → cannot raise
-        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
+        OpKind::FieldRead { .. }
+        | OpKind::FieldWrite { .. }
+        | OpKind::InteriorPtrExpose { .. }
+        | OpKind::StoreThroughPtr { .. }
+        | OpKind::LoadThroughPtr { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
@@ -19660,6 +19720,43 @@ mod tests {
             .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
             .expect("float interiorfield");
         assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
+    }
+
+    #[test]
+    fn interiorfielddescr_collapses_only_one_field_newtype() {
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(
+            ["EntryTwo", "EntryOne", "TwoRowKey", "IdentityKey"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "EntryTwo".to_string(),
+            vec![("key".to_string(), "TwoRowKey".to_string())],
+        );
+        registry.fields.insert(
+            "EntryOne".to_string(),
+            vec![("key".to_string(), "IdentityKey".to_string())],
+        );
+        registry.fields.insert(
+            "TwoRowKey".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("b".to_string(), "i64".to_string()),
+            ],
+        );
+        registry.fields.insert(
+            "IdentityKey".to_string(),
+            vec![("inner".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        assert_eq!(cc.single_leaf_path("EntryTwo", "key"), None);
+        assert_eq!(
+            cc.single_leaf_path("EntryOne", "key"),
+            Some("key.inner".to_string())
+        );
     }
 
     /// Harvest stores `[module::Item; N]`. ARRAY.OF is that TypeDecl path,

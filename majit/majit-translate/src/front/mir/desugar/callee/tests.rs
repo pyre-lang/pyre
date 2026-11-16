@@ -1436,6 +1436,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
     };
     let llbc = fixture_llbc();
     let accepts = |body: &Unstructured| super::add_dest_used_only_as_struct_field(&llbc, body, 1);
+    let elem_accepts = |body: &Unstructured| super::add_dest_used_as_struct_elem(&llbc, body, 1);
 
     let read = body_of(vec![
         stmt(serde_json::json!({"StorageLive": 1})),
@@ -1464,6 +1465,10 @@ fn add_dest_struct_field_guard_classifies_uses() {
         "Assign": [place_local(2), {"Use": [{"Read": place_local(1)}, "No"]}]
     }))]);
     assert!(!accepts(&escape), "the pointer escapes by value");
+    assert!(
+        !elem_accepts(&escape),
+        "a pointer copied into an unused local has no elem"
+    );
 
     let bare = body_of(vec![stmt(serde_json::json!({
         "Assign": [place_local(2), {"Use": [{"Read": deref_place(1)}, "No"]}]
@@ -1512,6 +1517,20 @@ fn add_dest_struct_field_guard_classifies_uses() {
     assert!(
         accepts(&address_typevar),
         "&(*dest).field of a TypeVar is a value read"
+    );
+    assert!(
+        elem_accepts(&address),
+        "&(*dest).field is an element use for getitem SSA"
+    );
+
+    let reborrow = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "Ref": {"place": deref_place(1), "kind": "Mut", "ptr_metadata": null}
+        }]
+    }))]);
+    assert!(
+        elem_accepts(&reborrow),
+        "&mut *dest is an element use for getitem SSA"
     );
 
     let deeper = body_of(vec![stmt(serde_json::json!({
@@ -1584,6 +1603,64 @@ fn add_dest_struct_field_guard_classifies_uses() {
         serde_json::from_value::<Unstructured>(body_json).expect("call fixture parses")
     };
     assert!(accepts(&call_body), "a call argument is a value field use");
+
+    let elem_escape_call = {
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 0, "locals": [local(0), local(1), local(2)]},
+            "body": [{
+                "statements": [
+                    stmt(serde_json::json!({
+                        "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
+                    })),
+                    stmt(serde_json::json!({
+                        "Assign": [place_local(2), {
+                            "Ref": {"place": field_place(1, 0), "kind": "Shared", "ptr_metadata": null}
+                        }]
+                    })),
+                ],
+                "kind": "Regular",
+                "terminator": {
+                    "kind": {
+                        "Call": {
+                            "call": {
+                                "func": {
+                                    "Regular": {
+                                        "kind": {"Fun": 1},
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    }
+                                },
+                                "args": [{"Read": place_local(1)}]
+                            },
+                            "dest": place_local(2),
+                            "target": 0,
+                            "on_unwind": 0
+                        }
+                    }
+                }
+            }]
+        });
+        serde_json::from_value::<Unstructured>(body_json).expect("elem+escape call fixture parses")
+    };
+    assert!(
+        !elem_accepts(&elem_escape_call),
+        "a by-value call argument of dest escapes even with a Ref elem use"
+    );
+
+    let raw_addr = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "RawPtr": {"place": field_place(1, 0), "kind": "Mut", "ptr_metadata": null}
+        }]
+    }))]);
+    assert!(
+        !elem_accepts(&raw_addr),
+        "&raw of an element field is not an elem use"
+    );
 }
 
 /// Distinctive `fn(bool) -> bool` so this fixture cannot collide with

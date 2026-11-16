@@ -3170,6 +3170,21 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached the JitCode assembler; the rtyper \
+                 must lower _interior_ptr._expose before codewriter emission \
+                 (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached the JitCode assembler; the rtyper \
+                 must lower this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_setattr)"
+            ),
+            OpKind::LoadThroughPtr { .. } => panic!(
+                "OpKind::LoadThroughPtr reached the JitCode assembler; the rtyper \
+                 must lower this load-through to getinteriorfield \
+                 (InteriorPtrRepr.rtype_getattr)"
+            ),
             // `arraylen_gc(array, arraydescr)` — `len(l.items)` reads the
             // GcArray length header. Operand shape `rd>i`: base reg + descr
             // + int result. The descr is `arraydescrof(ARRAY)` with a
@@ -4065,6 +4080,9 @@ impl AssemblerEncode for Assembler {
                 OpKind::ArrayWrite { .. } => "ArrayWrite",
                 OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
                 OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
+                OpKind::InteriorPtrExpose { .. } => "InteriorPtrExpose",
+                OpKind::StoreThroughPtr { .. } => "StoreThroughPtr",
+                OpKind::LoadThroughPtr { .. } => "LoadThroughPtr",
                 OpKind::Call { .. } => "Call",
                 OpKind::GuardTrue { .. } => "GuardTrue",
                 OpKind::GuardFalse { .. } => "GuardFalse",
@@ -7804,6 +7822,21 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::InteriorFieldWrite { item_ty, .. } => {
             format!("setinteriorfield_gc_{}", value_type_to_kind(item_ty))
         }
+        OpKind::InteriorPtrExpose { .. } => panic!(
+            "OpKind::InteriorPtrExpose reached the JitCode assembler; the rtyper \
+             must lower _interior_ptr._expose before codewriter emission \
+             (InteriorPtrRepr)"
+        ),
+        OpKind::StoreThroughPtr { .. } => panic!(
+            "OpKind::StoreThroughPtr reached the JitCode assembler; the rtyper \
+             must lower this store-through to setinteriorfield \
+             (InteriorPtrRepr.rtype_setattr)"
+        ),
+        OpKind::LoadThroughPtr { .. } => panic!(
+            "OpKind::LoadThroughPtr reached the JitCode assembler; the rtyper \
+             must lower this load-through to getinteriorfield \
+             (InteriorPtrRepr.rtype_getattr)"
+        ),
         OpKind::Call { result_ty, .. } => {
             format!("direct_call_{}", value_type_to_kind(result_ty))
         }

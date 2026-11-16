@@ -588,6 +588,49 @@ impl Repr for IntegerRepr {
         )?;
         hop.gendirectcall(&helper, vlist)
     }
+
+    /// Address-word store through a call-returned scalar reference.
+    /// `rtyper.rs` `"raw_store"` keeps `[addr, offs, value]`; offset 0
+    /// is a Signed constant.
+    fn rtype_store_through_ptr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
+        let c_zero = Hlvalue::Constant(HighLevelOp::inputconst(
+            &LowLevelType::Signed,
+            &ConstValue::Int(0),
+        )?);
+        let r_value = hop
+            .args_r
+            .borrow()
+            .get(1)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| {
+                TyperError::message("IntegerRepr.rtype_store_through_ptr missing value repr")
+            })?;
+        let v_value = hop.inputarg(&r_value, 1)?;
+        Ok(hop.genop(
+            "raw_store",
+            vec![v_addr, c_zero, v_value],
+            GenopResult::Void,
+        ))
+    }
+
+    /// Address-word load through a call-returned scalar reference.
+    /// `rtyper.rs` `"raw_load"` keeps `[addr, offs]` and the result
+    /// lowleveltype from `hop.r_result`; offset 0 is a Signed constant.
+    fn rtype_load_through_ptr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
+        let c_zero = Hlvalue::Constant(HighLevelOp::inputconst(
+            &LowLevelType::Signed,
+            &ConstValue::Int(0),
+        )?);
+        let result_lltype = hop_r_result(hop)?.lowleveltype().clone();
+        Ok(hop.genop(
+            "raw_load",
+            vec![v_addr, c_zero],
+            GenopResult::LLType(result_lltype),
+        ))
+    }
 }
 
 // ____________________________________________________________

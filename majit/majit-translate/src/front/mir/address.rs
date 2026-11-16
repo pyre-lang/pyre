@@ -308,7 +308,7 @@ fn residual_scalar_word_descr(
     }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     if json_ty_is_copy_scalar(node, llbc) {
-        return json_ty_raw_store_descr(node, llbc)
+        return json_ty_raw_store_descr(node, llbc, gc_struct_ids)
             .filter(|(_, size, _)| *size > 0 && *size <= RAW_SCALAR_SPILL_BYTES);
     }
     let obj = node.as_object()?;
@@ -340,7 +340,7 @@ fn residual_arg_store_descr(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<(ValueType, usize, bool)> {
-    json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc)
+    json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc, gc_struct_ids)
         .or_else(|| residual_scalar_word_descr(ty, llbc, gc_struct_ids))
 }
 
@@ -460,6 +460,7 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
                 arg_count,
                 id as usize,
                 llbc,
+                gc_struct_ids,
             );
         }
     }
@@ -501,7 +502,14 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
                 let PlaceKind::Local(id) = place.kind else {
                     continue;
                 };
-                bind_closure_captured_cell_local(&mut locals, &mut descr, body, id as usize, llbc);
+                bind_closure_captured_cell_local(
+                    &mut locals,
+                    &mut descr,
+                    body,
+                    id as usize,
+                    llbc,
+                    gc_struct_ids,
+                );
             }
         }
     }
@@ -531,6 +539,7 @@ fn bind_function_local_primitive_cell(
     arg_count: usize,
     id: usize,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     // Residual `&T` of a parameter stays a function-scope spill
     // (`collect_function_scope_spill_cells`). A closure capture of that
@@ -538,7 +547,15 @@ fn bind_function_local_primitive_cell(
     if id <= arg_count {
         return;
     }
-    bind_cell_scalar_local(locals, descr, body, id, llbc, primitive_scalar_cell_descr);
+    bind_cell_scalar_local(
+        locals,
+        descr,
+        body,
+        id,
+        llbc,
+        gc_struct_ids,
+        primitive_scalar_cell_descr,
+    );
 }
 
 /// Exclusive capture of a by-value primitive, or of a `repr(transparent)`
@@ -550,6 +567,7 @@ fn bind_closure_captured_cell_local(
     body: &Unstructured,
     id: usize,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     if id == 0 {
         return;
@@ -560,6 +578,7 @@ fn bind_closure_captured_cell_local(
         body,
         id,
         llbc,
+        gc_struct_ids,
         function_local_primitive_cell_descr,
     );
 }
@@ -570,7 +589,12 @@ fn bind_cell_scalar_local(
     body: &Unstructured,
     id: usize,
     llbc: &Llbc,
-    cell_descr_of: impl FnOnce(&TyRef, &Llbc) -> Option<(ValueType, usize, bool)>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    cell_descr_of: impl FnOnce(
+        &TyRef,
+        &Llbc,
+        &std::collections::HashSet<majit_ir::descr::StructId>,
+    ) -> Option<(ValueType, usize, bool)>,
 ) {
     if locals.contains(id) {
         return;
@@ -578,18 +602,22 @@ fn bind_cell_scalar_local(
     let Some(decl) = body.locals.locals.get(id) else {
         return;
     };
-    let Some(cell_descr) = cell_descr_of(&decl.ty, llbc) else {
+    let Some(cell_descr) = cell_descr_of(&decl.ty, llbc, gc_struct_ids) else {
         return;
     };
     locals.insert(id);
     descr[id] = Some(cell_descr);
 }
 
-fn primitive_scalar_cell_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+fn primitive_scalar_cell_descr(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<(ValueType, usize, bool)> {
     if !tyref_is_primitive_scalar(ty, llbc) {
         return None;
     }
-    tyref_node(ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+    tyref_node(ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc, gc_struct_ids))
 }
 
 /// Char-varsize cell descr of a function-local primitive, or of a
@@ -598,9 +626,10 @@ fn primitive_scalar_cell_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, us
 fn function_local_primitive_cell_descr(
     ty: &TyRef,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<(ValueType, usize, bool)> {
     tyref_primitive_or_transparent_primitive_node(ty, llbc)
-        .and_then(|node| json_ty_raw_store_descr(node, llbc))
+        .and_then(|node| json_ty_raw_store_descr(node, llbc, gc_struct_ids))
 }
 
 /// Residual `&T` of a parameter or field: one Char-varsize cell for the

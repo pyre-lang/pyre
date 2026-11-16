@@ -993,6 +993,18 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("setattr"))
     }
 
+    fn rtype_interior_ptr_expose(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("interior_ptr_expose"))
+    }
+
+    fn rtype_store_through_ptr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("store_through_ptr"))
+    }
+
+    fn rtype_load_through_ptr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("load_through_ptr"))
+    }
+
     fn rtype_len(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(self.missing_rtype_operation("len"))
     }
@@ -2231,31 +2243,7 @@ impl Repr for PtrRepr {
                     .pop()
                     .ok_or_else(|| TyperError::message("PtrRepr.rtype_getitem missing array"))?;
                 let interior_ptr_type = self.ptrtype()._interior_ptr_type_with_index(&item_type);
-                let v_interior_ptr = hop
-                    .genop(
-                        "malloc",
-                        vec![
-                            lowlevel_type_const(LowLevelType::Struct(Box::new(
-                                interior_ptr_type.clone(),
-                            ))),
-                            gc_flavor_const()?,
-                        ],
-                        GenopResult::LLType(LowLevelType::Ptr(Box::new(lltype::Ptr {
-                            TO: lltype::PtrTarget::Struct(interior_ptr_type),
-                        }))),
-                    )
-                    .ok_or_else(|| TyperError::message("malloc unexpectedly returned no value"))?;
-                hop.genop(
-                    "setfield",
-                    vec![v_interior_ptr.clone(), void_field_const("ptr"), v_array],
-                    GenopResult::Void,
-                );
-                hop.genop(
-                    "setfield",
-                    vec![v_interior_ptr.clone(), void_field_const("index"), v_index],
-                    GenopResult::Void,
-                );
-                return Ok(Some(v_interior_ptr));
+                return rtype_interior_getitem_malloc(hop, v_array, v_index, interior_ptr_type);
             }
             let vlist = hop.inputargs(vec![
                 ConvertedTo::from(self),
@@ -2313,7 +2301,39 @@ impl Repr for PtrRepr {
     }
 }
 
-fn ptr_from_container_lowleveltype(
+/// `rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`.
+fn rtype_interior_getitem_malloc(
+    hop: &HighLevelOp,
+    v_array: Hlvalue,
+    v_index: Hlvalue,
+    interior_ptr_type: lltype::Struct,
+) -> RTypeResult {
+    let v_interior_ptr = hop
+        .genop(
+            "malloc",
+            vec![
+                lowlevel_type_const(LowLevelType::Struct(Box::new(interior_ptr_type.clone()))),
+                gc_flavor_const()?,
+            ],
+            GenopResult::LLType(LowLevelType::Ptr(Box::new(lltype::Ptr {
+                TO: lltype::PtrTarget::Struct(interior_ptr_type),
+            }))),
+        )
+        .ok_or_else(|| TyperError::message("malloc unexpectedly returned no value"))?;
+    hop.genop(
+        "setfield",
+        vec![v_interior_ptr.clone(), void_field_const("ptr"), v_array],
+        GenopResult::Void,
+    );
+    hop.genop(
+        "setfield",
+        vec![v_interior_ptr.clone(), void_field_const("index"), v_index],
+        GenopResult::Void,
+    );
+    Ok(Some(v_interior_ptr))
+}
+
+pub(crate) fn ptr_from_container_lowleveltype(
     ptrtype: &crate::translator::rtyper::lltypesystem::lltype::InteriorPtr,
 ) -> crate::translator::rtyper::lltypesystem::lltype::Ptr {
     use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
@@ -2581,31 +2601,7 @@ impl Repr for InteriorPtrRepr {
             })?;
             let interior_ptr_type =
                 ptr_type(self.lowleveltype())._interior_ptr_type_with_index(&item_type);
-            let v_interior_ptr = hop
-                .genop(
-                    "malloc",
-                    vec![
-                        lowlevel_type_const(LowLevelType::Struct(Box::new(
-                            interior_ptr_type.clone(),
-                        ))),
-                        gc_flavor_const()?,
-                    ],
-                    GenopResult::LLType(LowLevelType::Ptr(Box::new(lltype::Ptr {
-                        TO: lltype::PtrTarget::Struct(interior_ptr_type),
-                    }))),
-                )
-                .ok_or_else(|| TyperError::message("malloc unexpectedly returned no value"))?;
-            hop.genop(
-                "setfield",
-                vec![v_interior_ptr.clone(), void_field_const("ptr"), v_array],
-                GenopResult::Void,
-            );
-            hop.genop(
-                "setfield",
-                vec![v_interior_ptr.clone(), void_field_const("index"), v_index],
-                GenopResult::Void,
-            );
-            return Ok(Some(v_interior_ptr));
+            return rtype_interior_getitem_malloc(hop, v_array, v_index, interior_ptr_type);
         }
         let mut inputs = hop.inputargs(vec![
             ConvertedTo::from(self),
@@ -2653,6 +2649,52 @@ impl Repr for InteriorPtrRepr {
         vlist.push(v_value);
         hop.genop("setinteriorfield", vlist, GenopResult::Void);
         Ok(None)
+    }
+
+    fn rtype_interior_ptr_expose(&self, hop: &HighLevelOp) -> RTypeResult {
+        // Extra Field offset lives on the result annotation / repr
+        // metadata. Runtime words stay `{ptr,index}` when an index is
+        // present (`InteriorPtrRepr.__init__` `numitemoffsets > 0`).
+        hop.inputarg(self, 0).map(Some)
+    }
+
+    fn rtype_store_through_ptr(&self, hop: &HighLevelOp) -> RTypeResult {
+        assert!(
+            !self.result_target().is_container_type(),
+            "store_through_ptr requires a leaf-TO interior pointer, got {:?}",
+            self.result_target()
+        );
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r.get(1).and_then(|r| r.as_ref()).ok_or_else(|| {
+            TyperError::message("InteriorPtrRepr.rtype_store_through_ptr missing value repr")
+        })?;
+        let mut inputs =
+            hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(r_value)])?;
+        let v_value = inputs.pop().ok_or_else(|| {
+            TyperError::message("InteriorPtrRepr.rtype_store_through_ptr missing value")
+        })?;
+        let v_self = inputs.pop().ok_or_else(|| {
+            TyperError::message("InteriorPtrRepr.rtype_store_through_ptr missing self")
+        })?;
+        let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
+        vlist.push(v_value);
+        Ok(hop.genop("setinteriorfield", vlist, GenopResult::Void))
+    }
+
+    fn rtype_load_through_ptr(&self, hop: &HighLevelOp) -> RTypeResult {
+        assert!(
+            !self.result_target().is_container_type(),
+            "load_through_ptr requires a leaf-TO interior pointer, got {:?}",
+            self.result_target()
+        );
+        let v_self = hop.inputarg(self, 0)?;
+        let vlist = self.getinteriorfieldargs(hop, v_self)?;
+        let r_result = hop_r_result(hop)?;
+        Ok(hop.genop(
+            "getinteriorfield",
+            vlist,
+            GenopResult::LLType(r_result.lowleveltype().clone()),
+        ))
     }
 }
 
@@ -4572,6 +4614,146 @@ mod tests {
         let ops = hop.llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "setinteriorfield");
+    }
+
+    #[test]
+    fn interiorptr_rtype_store_through_ptr_emits_setinteriorfield_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, Struct,
+        };
+
+        // Leaf-TO interior: offsets already hold Index + Field("value"),
+        // so `InteriorPtrRepr.rtype_store_through_ptr` is
+        // `getinteriorfieldargs` + `v_value` → `setinteriorfield`
+        // (`InteriorPtrRepr.rtype_setattr` / `getinteriorfieldargs`).
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(array_type),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![
+                InteriorOffset::Index(0),
+                InteriorOffset::Field("value".into()),
+            ],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "store_through_ptr");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(8),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_iptr_dyn), Some(r_signed)]);
+
+        assert!(r_iptr.rtype_store_through_ptr(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        let set = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "setinteriorfield")
+            .expect("leaf-TO store-through must emit setinteriorfield");
+        assert_eq!(set.args.len(), 4);
+    }
+
+    #[test]
+    fn interiorptr_rtype_load_through_ptr_emits_getinteriorfield() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, Struct,
+        };
+
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(array_type),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![
+                InteriorOffset::Index(0),
+                InteriorOffset::Field("value".into()),
+            ],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "load_through_ptr");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
+        hop.args_v.borrow_mut().extend([Hlvalue::Variable(v_self)]);
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr))]);
+        hop.args_r.borrow_mut().extend([Some(r_iptr_dyn)]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        assert!(r_iptr.rtype_load_through_ptr(&hop).unwrap().is_some());
+        let ops = hop.llops.borrow();
+        let get = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "getinteriorfield")
+            .expect("leaf-TO load-through must emit getinteriorfield");
+        assert_eq!(get.args.len(), 3);
+    }
+
+    #[test]
+    fn interiorptr_rtype_expose_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, Struct,
+        };
+
+        // Extra Field offset lives on the result annotation / repr
+        // metadata. Runtime words stay `{ptr,index}`
+        // (`InteriorPtrRepr.__init__` `numitemoffsets > 0`).
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(array_type),
+            TO: Box::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![("value".into(), LowLevelType::Signed)],
+            )))),
+            offsets: vec![InteriorOffset::Index(0)],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "interior_ptr_expose");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self.clone()),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("value"),
+                LowLevelType::Void,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr)),
+            const_string_annotation("value"),
+        ]);
+        hop.args_r.borrow_mut().extend([Some(r_iptr_dyn), None]);
+
+        let result = r_iptr.rtype_interior_ptr_expose(&hop).unwrap().unwrap();
+        let Hlvalue::Variable(v) = result else {
+            panic!("expose identity must return the source variable");
+        };
+        assert_eq!(v.id(), v_self.id());
     }
 
     #[test]
