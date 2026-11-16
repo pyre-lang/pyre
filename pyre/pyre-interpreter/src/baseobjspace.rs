@@ -21123,118 +21123,142 @@ pub(crate) fn batched_next_w(obj: PyObjectRef) -> PyResult {
     }
 }
 
+/// `W_Product._rotate_previous_gears`: carry from the last gear through
+/// earlier gears until one does not roll over.
+///
+/// `#[inline(never)]` keeps this loop in its own Charon leaf so
+/// [`fill_next_result`]'s last-gear path stays loop-free.
+#[inline(never)]
+unsafe fn rotate_previous_gears(obj_slot: usize) {
+    type W_Product = pyre_object::interp_itertools::W_Product;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let gears = (*(w_self as *const W_Product)).gears;
+    let mut x = pyre_object::w_list_len(gears) as isize - 1;
+    debug_assert!(x >= 0);
+    let xu = x as usize;
+    let item = product_gear_item(obj_slot, xu, 0);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    pyre_object::w_list_setitem((*(w_self as *const W_Product)).lst, xu as i64, item);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    (&mut (*(w_self as *mut W_Product)).indices)[xu] = 0;
+    x -= 1;
+    while x >= 0 {
+        let xu = x as usize;
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let index = (&(*(w_self as *const W_Product)).indices)[xu] + 1;
+        let gears = (*(w_self as *const W_Product)).gears;
+        let gear =
+            pyre_object::w_list_getitem(gears, xu as i64).expect("product gear index in range");
+        let gear = pyre_object::gc_roots::pin_root(gear);
+        let gear_len = pyre_object::w_list_len(gear) as i64;
+        if index < gear_len {
+            let item =
+                pyre_object::w_list_getitem(gear, index).expect("product item index in range");
+            let item = pyre_object::gc_roots::pin_root(item);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            pyre_object::w_list_setitem((*(w_self as *const W_Product)).lst, xu as i64, item);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (&mut (*(w_self as *mut W_Product)).indices)[xu] = index;
+            return;
+        }
+        let item = pyre_object::w_list_getitem(gear, 0).expect("non-empty product gear");
+        let item = pyre_object::gc_roots::pin_root(item);
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        pyre_object::w_list_setitem((*(w_self as *const W_Product)).lst, xu as i64, item);
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        (&mut (*(w_self as *mut W_Product)).indices)[xu] = 0;
+        x -= 1;
+    }
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let state = &mut *(w_self as *mut W_Product);
+    state.lst = std::ptr::null_mut();
+    state.stopped = true;
+}
+
+/// `W_Product.fill_next_result`: first result, or the last gear in a
+/// function with no loop, to allow the JIT to look inside.
+#[inline(never)]
+unsafe fn fill_next_result(obj_slot: usize) {
+    type W_Product = pyre_object::interp_itertools::W_Product;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let lst_is_null = (*(w_self as *const W_Product)).lst.is_null();
+    if lst_is_null {
+        let gears = (*(w_self as *const W_Product)).gears;
+        let gear_count = pyre_object::w_list_len(gears);
+        let placeholders = vec![pyre_object::w_none(); gear_count];
+        let initial = pyre_object::w_list_new(placeholders);
+        let initial = pyre_object::gc_roots::pin_root(initial);
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        (*(w_self as *mut W_Product)).lst = initial;
+        pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
+        for index in 0..gear_count {
+            let item = product_gear_item(obj_slot, index, 0);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            pyre_object::w_list_setitem((*(w_self as *const W_Product)).lst, index as i64, item);
+        }
+        return;
+    }
+    let gears = (*(w_self as *const W_Product)).gears;
+    let x = pyre_object::w_list_len(gears) as isize - 1;
+    if x >= 0 {
+        let x = x as usize;
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let index = (&(*(w_self as *const W_Product)).indices)[x] + 1;
+        let gears = (*(w_self as *const W_Product)).gears;
+        let gear =
+            pyre_object::w_list_getitem(gears, x as i64).expect("product gear index in range");
+        let gear = pyre_object::gc_roots::pin_root(gear);
+        let gear_len = pyre_object::w_list_len(gear) as i64;
+        if index < gear_len {
+            let item =
+                pyre_object::w_list_getitem(gear, index).expect("product item index in range");
+            let item = pyre_object::gc_roots::pin_root(item);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            pyre_object::w_list_setitem((*(w_self as *const W_Product)).lst, x as i64, item);
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (&mut (*(w_self as *mut W_Product)).indices)[x] = index;
+        } else {
+            rotate_previous_gears(obj_slot);
+        }
+    } else {
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        (*(w_self as *mut W_Product)).stopped = true;
+    }
+}
+
+unsafe fn product_gear_item(obj_slot: usize, gear_index: usize, item_index: i64) -> PyObjectRef {
+    type W_Product = pyre_object::interp_itertools::W_Product;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let gears = (*(w_self as *const W_Product)).gears;
+    let gear =
+        pyre_object::w_list_getitem(gears, gear_index as i64).expect("product gear index in range");
+    let gear = pyre_object::gc_roots::pin_root(gear);
+    let item = pyre_object::w_list_getitem(gear, item_index).expect("product item index in range");
+    pyre_object::gc_roots::pin_root(item)
+}
+
 /// interp_itertools.py W_Product.next_w.
 pub(crate) fn product_next_w(obj: PyObjectRef) -> PyResult {
     unsafe {
-        // itertools.product — PyPy W_Product.fill_next_result /
-        // _rotate_previous_gears.  The rightmost pool advances like an
-        // odometer; only one result tuple is allocated per call.
-
+        type W_Product = pyre_object::interp_itertools::W_Product;
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
-        if state.stopped {
+        if !(*(w_self as *const W_Product)).stopped {
+            fill_next_result(obj_slot);
+        }
+        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        if (*(w_self as *const W_Product)).stopped {
             return Err(PyError::stop_iteration());
         }
 
-        if state.lst.is_null() {
-            // First pass: fill the result list with gear[0].
-            let gear_count = pyre_object::w_list_len(state.gears);
-            let mut item_slots = Vec::with_capacity(gear_count);
-            for index in 0..gear_count {
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let gears = (*(w_self as *const pyre_object::interp_itertools::W_Product)).gears;
-                let gear = pyre_object::w_list_getitem(gears, index as i64)
-                    .expect("product gear index in range");
-                if pyre_object::w_list_len(gear) == 0 {
-                    let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
-                    state.stopped = true;
-                    return Err(PyError::stop_iteration());
-                }
-                let item = pyre_object::w_list_getitem(gear, 0).expect("non-empty product gear");
-                let _ = pyre_object::gc_roots::pin_root(item);
-                item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
-            }
-            let initial_items = objects_from_root_slots(&item_slots);
-            let initial = pyre_object::w_list_new(initial_items);
-            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            (*(w_self as *mut pyre_object::interp_itertools::W_Product)).lst = initial;
-            pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
-        } else {
-            let gear_count = pyre_object::w_list_len(state.gears);
-            if gear_count == 0 {
-                let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
-                state.stopped = true;
-                return Err(PyError::stop_iteration());
-            }
-
-            // Advance right-to-left until one gear does not roll over.
-            let mut position = gear_count;
-            let mut advanced = false;
-            while position > 0 {
-                position -= 1;
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
-                let gear = pyre_object::w_list_getitem(state.gears, position as i64)
-                    .expect("product gear index in range");
-                let old_index_obj = pyre_object::w_list_getitem(state.indices, position as i64)
-                    .expect("product index in range");
-                let old_index = pyre_object::w_int_get_value(old_index_obj) as usize;
-                let next_index = old_index + 1;
-                let gear_len = pyre_object::w_list_len(gear);
-                let stored_index = if next_index < gear_len {
-                    advanced = true;
-                    next_index
-                } else {
-                    0
-                };
-
-                // Integer boxing can collect. Re-read the owner and pool
-                // before publishing both the index and selected item.
-                let w_index = pyre_object::w_int_new(stored_index as i64);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
-                let gear = pyre_object::w_list_getitem(state.gears, position as i64)
-                    .expect("product gear index in range");
-                let item = pyre_object::w_list_getitem(gear, stored_index as i64)
-                    .expect("product item index in range");
-                let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(item);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
-                pyre_object::w_list_setitem(state.indices, position as i64, w_index);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
-                pyre_object::w_list_setitem(
-                    state.lst,
-                    position as i64,
-                    pyre_object::gc_roots::shadow_stack_get(item_slot),
-                );
-                if advanced {
-                    break;
-                }
-            }
-            if !advanced {
-                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
-                state.lst = std::ptr::null_mut();
-                state.stopped = true;
-                return Err(PyError::stop_iteration());
-            }
-        }
-
-        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let lst = (*(w_self as *const pyre_object::interp_itertools::W_Product)).lst;
+        let lst = (*(w_self as *const W_Product)).lst;
         let result_len = pyre_object::w_list_len(lst);
         let mut result_slots = Vec::with_capacity(result_len);
         for index in 0..result_len {
-            // Reading an element out of an unboxed list boxes it, and that
-            // allocation can relocate the list itself, so the owner supplies
-            // it again on every step instead of a word carried across.
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let lst = (*(w_self as *const pyre_object::interp_itertools::W_Product)).lst;
+            let lst = (*(w_self as *const W_Product)).lst;
             let item =
                 pyre_object::w_list_getitem(lst, index as i64).expect("product result in range");
             let _ = pyre_object::gc_roots::pin_root(item);

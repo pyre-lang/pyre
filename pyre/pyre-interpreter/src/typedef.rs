@@ -37816,9 +37816,6 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let gears = pyre_object::w_list_new(gear_items);
     let _ = pyre_object::gc_roots::pin_root(gears);
     let gears_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut index_items = crate::builtins::try_vec_with_capacity(npools)?;
-    index_items.extend((0..npools).map(|_| pyre_object::w_int_new(0)));
-    let indices = pyre_object::w_list_new(index_items);
     let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
     let w_subtype = if std::ptr::eq(cls, exact) {
@@ -37828,7 +37825,6 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     };
     Ok(pyre_object::interp_itertools::w_product_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(gears_slot) },
-        indices,
         stopped,
         w_subtype,
     ))

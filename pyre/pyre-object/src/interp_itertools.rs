@@ -546,27 +546,40 @@ pub unsafe fn w_batched_set_exhausted(obj: PyObjectRef) {
 // ```
 //
 // Each translated RPython list is represented by an owned W_ListObject.  The
-// outer `gears` list owns list snapshots of the input pools; `indices` and
-// `lst` preserve the upstream mutable per-iterator state.  A null `lst`
-// represents PyPy's None sentinel before the first result and after rollover.
+// outer `gears` list owns list snapshots of the input pools; `lst` is the
+// mutable result scratch.  `indices` is `W_Product.__init__`'s
+// `[0] * len(self.gears)`: an RPython list of plain integers, stored as
+// [`crate::IntArray`] so a read or write never boxes.  A null `lst` is
+// PyPy's None sentinel before the first result and after rollover.  An empty
+// `indices` is `__init__`'s `None` when a gear is empty (`stopped`).
 #[pyre_class("itertools.product", static_name = "PRODUCT", user_layout)]
 pub struct W_Product {
     pub gears: PyObjectRef,
-    pub indices: PyObjectRef,
+    pub indices: crate::IntArray,
     pub lst: PyObjectRef,
     pub stopped: bool,
 }
 
-pub fn w_product_new(
-    gears: PyObjectRef,
-    indices: PyObjectRef,
-    stopped: bool,
-    w_subtype: PyObjectRef,
-) -> PyObjectRef {
+pub fn w_product_new(gears: PyObjectRef, stopped: bool, w_subtype: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let gears = crate::gc_roots::pin_root(gears);
-    let indices = crate::gc_roots::pin_root(indices);
-    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    let gears_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(w_subtype);
+    let subtype_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // `W_Product.__init__`: empty gear → `indices = None`; otherwise
+    // `indices = [0] * len(self.gears)`.
+    let n = unsafe { crate::listobject::w_list_len(gears) };
+    let indices = if stopped || n == 0 {
+        crate::IntArray::empty()
+    } else {
+        let fresh = crate::IntArray::from_vec(vec![0; n]);
+        if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
+            return crate::PY_NULL;
+        }
+        fresh
+    };
+    let gears = crate::gc_roots::shadow_stack_get(gears_slot);
+    let w_subtype = crate::gc_roots::shadow_stack_get(subtype_slot);
     W_Product::allocate_instance(
         W_Product {
             ob: PyObject {
@@ -1467,13 +1480,13 @@ mod tests {
     }
 
     #[test]
-    fn w_product_gc_descriptor_traces_all_owned_lists() {
+    fn w_product_gc_descriptor_traces_owned_lists_and_index_block() {
         assert_eq!(
             W_PRODUCT_GC_PTR_OFFSETS,
             [
                 std::mem::offset_of!(W_Product, ob.w_class),
                 std::mem::offset_of!(W_Product, gears),
-                std::mem::offset_of!(W_Product, indices),
+                std::mem::offset_of!(W_Product, indices.block),
                 std::mem::offset_of!(W_Product, lst),
             ]
         );
