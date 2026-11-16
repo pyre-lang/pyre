@@ -7274,83 +7274,6 @@ fn pygraph_from_adapter_graph(graph: crate::flowspace::model::GraphRef) -> Rc<Py
     })
 }
 
-/// Dual-gate slot on always-raise wrappers is an unfollowed Ok-arm phi
-/// (a colored block inputarg), not `getreturnvar()`. `normalizecalls.py`
-/// `normalize_calltable_row_annotation` only unions graph args and
-/// `getreturnvar()`. Phase A leaves the Ok-arm twin unbound; Phase B
-/// stamps Impossible→Void; `flatten.py` `getcolor` still colors it.
-/// Bind only those colored unbound phi twins to the family Instance
-/// return so dual-gate compares GcRef.
-fn widen_impossible_value_to_var_twins(
-    annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    call_registry: &CallRegistry,
-    builtin_wrapper_graphs: &[crate::parse::CallPath],
-    function_graphs: &crate::codewriter::call::GraphStore,
-) {
-    use crate::annotator::model::SomeValue;
-    let work: Vec<(Vec<Variable>, SomeValue)> = {
-        let tp = call_registry.two_phase();
-        builtin_wrapper_graphs
-            .iter()
-            .filter_map(|path| {
-                let subject = tp.subjects.get(path)?;
-                let ret = subject.graph.borrow().getreturnvar();
-                let s_payload = annotator.annotation(&ret)?;
-                if !matches!(s_payload, SomeValue::Instance(_)) {
-                    return None;
-                }
-                let twins = function_graphs.get(path).map_or_else(Vec::new, |legacy| {
-                    phi_unbound_twins(legacy.as_ref(), subject, annotator)
-                });
-                Some((twins, s_payload))
-            })
-            .collect()
-    };
-    for (twins, s_payload) in work {
-        for mut v in twins {
-            match annotator.annotation(&Hlvalue::Variable(v.clone())) {
-                None | Some(SomeValue::Impossible) => {
-                    annotator.setbinding(&mut v, s_payload.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Colored, unbound block inputarg twins. Dual-gate `getcolor` still
-/// emits these Ok-arm phis on always-raise wrappers.
-fn phi_unbound_twins(
-    legacy: &LegacyGraph,
-    subject: &crate::translator::rtyper::call_registry::TwoPhaseSubject,
-    annotator: &crate::annotator::annrpython::RPythonAnnotator,
-) -> Vec<Variable> {
-    use crate::annotator::model::SomeValue;
-    let colored = colored_operand_vars(legacy);
-    let mut out = Vec::new();
-    let mut push = |typed: &Variable| match annotator.annotation(&Hlvalue::Variable(typed.clone()))
-    {
-        None | Some(SomeValue::Impossible) => out.push(typed.clone()),
-        _ => {}
-    };
-    for block in &legacy.blocks {
-        for ia in &block.inputargs {
-            if !colored.contains(ia) {
-                continue;
-            }
-            if let Some(typed) = subject.value_to_var.get(ia) {
-                push(typed);
-            }
-            if let Some(typeds) = subject.value_to_var_candidates.get(ia) {
-                for typed in typeds {
-                    push(typed);
-                }
-            }
-        }
-    }
-    out
-}
-
 fn rtype_skip_wrapper_subjects(
     call_registry: &CallRegistry,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
@@ -7387,7 +7310,6 @@ fn consider_builtin_wrapper_call_site(
     call_registry: &CallRegistry,
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
-    function_graphs: &crate::codewriter::call::GraphStore,
 ) -> Result<(), crate::annotator::model::AnnotatorError> {
     use crate::annotator::argument::simple_args;
     use crate::annotator::description::{FunctionDesc, GraphCacheKey};
@@ -7458,17 +7380,6 @@ fn consider_builtin_wrapper_call_site(
             normalize_calltable_row_annotation(annotator, graphs)?;
         }
     }
-    // Always-raising wrappers already bind `getreturnvar()` as the
-    // `PyResult` `SomeInstance` (signature / reachable except-path).
-    // Dual-gate slot is the unfollowed Ok-arm phi, still Impossible →
-    // Void. `unionof(s_ImpossibleValue, X) == X`: give that extract the
-    // family return so Phase B rtypes GcRef.
-    widen_impossible_value_to_var_twins(
-        annotator,
-        call_registry,
-        builtin_wrapper_graphs,
-        function_graphs,
-    );
     if descs.is_empty() {
         return Ok(());
     }
@@ -7846,52 +7757,37 @@ fn run_two_phase_prepass_inner(
     // upstream shape — annotator.complete() — is otherwise a deferred
     // optimisation).
 
-    // ── Inheritance-id barrier — number every classdef ONCE now, with the
-    // complete Phase-A annotate-all classdef set and BEFORE Phase B rtypes
-    // and materializes any vtable. Upstream runs this in
-    // `RPythonTyper.specialize` via `perform_normalizations` before any vtable
-    // materialisation (annrpython complete: `if block_subset is None:
-    // perform_normalizations`); pyre's per-subject annotate defers
-    // `annotator.complete()`, so do the inheritance-id half explicitly here.
-    // With nothing yet baked, `assign_inheritance_ids`' global sort applies
-    // unconditionally (`shifts_baked_id` is false), so a later subclass nests
-    // into its parent bracket instead of dropping to the append-only fallback
-    // once a subclassrange has been baked into the immutable jitcode const pool
-    // during Phase B (#203 gap 9). The pass is idempotent without new
-    // classdefs, so Phase B's per-subject numbering is then a no-op.
-    // A failed session init must NOT fall through to Phase B: that would let
-    // `run_phase_b_rtype_isolated` materialize vtables without the global
-    // `assign_inheritance_ids` pass and reopen the stale minid/maxid contract
-    // this barrier exists to hold. Surface and skip — Phase B is incremental,
-    // so the next call retries with a live session.
+    // Seed every annotated graph's return var (`annrpython.py`
+    // `RPythonAnnotator.complete` return-var seeding). Per-subject
+    // annotate defers `complete()`, so an always-raising callee graph
+    // (all paths reach the exceptblock, returnblock unreachable) would
+    // otherwise enter Phase B with an unannotated return var and crash
+    // `setconcretetype(getreturnvar())`.
+    //
+    // Inheritance ids are numbered later: upstream `annrpython.py`
+    // `RPythonAnnotator.simplify` runs `normalizecalls.py`
+    // `perform_normalizations` (which includes `assign_inheritance_ids`)
+    // after `compute_at_fixpoint` when `block_subset is None`. Isolated
+    // simplify always passes a per-graph subset, so that driver runs at
+    // the tail of `run_phase_b_rtype_isolated`. A failed session init
+    // must NOT fall through to Phase B (precedent: `ensure_session` Err
+    // returns before `run_phase_b_rtype_isolated`).
     let (annotator, _rtyper) = match call_registry.ensure_session() {
         Ok(session) => session,
         Err(err) => {
             if rtyper_verbose_enabled() {
-                eprintln!(
-                    "[PREPASS inheritance-id barrier] ensure_session failed, \
-                     skipping Phase B: {err:?}"
-                );
+                eprintln!("[PREPASS] ensure_session failed, skipping Phase B: {err:?}");
             }
             return;
         }
     };
-    crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
-
-    // Seed every annotated graph's return var (annrpython.py:258-261).
-    // Per-subject annotate defers `annotator.complete()`, so its
-    // return-var seeding never runs; an always-raising callee graph
-    // (all paths reach the exceptblock, returnblock unreachable) would
-    // otherwise enter Phase B with an unannotated return var and crash
-    // `setconcretetype(getreturnvar())`. Run the seeding here, alongside
-    // the other explicit stand-ins for the deferred complete().
     annotator.seed_all_annotated_return_vars();
 
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
-    // progress survives even if this call is cut short. Call-family
-    // normalization runs at the tail of the isolated simplify inside
-    // `run_phase_b_rtype_isolated`.
+    // progress survives even if this call is cut short.
+    // `normalizecalls.py` `perform_normalizations` runs at the tail of
+    // the isolated simplify inside `run_phase_b_rtype_isolated`.
     run_phase_b_rtype_isolated(
         call_registry,
         determinism_trace,
@@ -7955,26 +7851,11 @@ fn run_phase_b_rtype_isolated(
     record_tdc_cuts_for_subjects(&annotator, call_registry, function_graphs);
     let callsite_callees = snapshot_callsite_callees(&annotator, call_registry);
     run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
-    // Call-family normalization at the tail of this isolated simplify.
-    // Upstream `annrpython.py` `RPythonAnnotator.simplify` runs
-    // `perform_normalizations` after `compute_at_fixpoint` when
-    // `block_subset is None`. `rtyper.py` `RPythonTyper.specialize`
-    // calls `simplify` once. Two-phase `run_annotator_simplify_isolated`
-    // always passes a per-graph `block_subset`, so it never reaches
-    // `perform_normalizations`; the call-family half runs here, after
-    // that isolated simplify (and its one `compute_at_fixpoint`) and
-    // before rtyping. `assign_inheritance_ids` already ran;
-    // `seed_all_annotated_return_vars` still precedes this rewrite so
-    // `normalize_calltable_row_annotation` can
-    // `setbinding(graph.getreturnvar(), generalizedresult)` with
-    // `unionof(s_ImpossibleValue, X) == X`.
+    // Keep `consider_builtin_wrapper_call_site` here: two-phase subjects
+    // skip `FunctionDesc.pycall`, so the generated wrappers need their
+    // PBC call-family row before the whole-program driver.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        consider_builtin_wrapper_call_site(
-            call_registry,
-            &annotator,
-            builtin_wrapper_graphs,
-            function_graphs,
-        )
+        consider_builtin_wrapper_call_site(call_registry, &annotator, builtin_wrapper_graphs)
     })) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
@@ -7990,16 +7871,32 @@ fn run_phase_b_rtype_isolated(
             );
         }
     }
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Err(err) =
-            crate::translator::rtyper::normalizecalls::normalize_call_familes(&annotator)
-        {
-            eprintln!("[PREPASS normalize_call_familes] {err}");
-        }
+    // Upstream `annrpython.py` `RPythonAnnotator.simplify` runs
+    // `normalizecalls.py` `perform_normalizations` after
+    // `compute_at_fixpoint` when `block_subset is None`. Isolated
+    // `run_annotator_simplify_isolated` always passes a per-graph
+    // `block_subset`, so it never reaches that driver; call it here,
+    // after that isolated simplify and its one `compute_at_fixpoint`
+    // and before rtyping. `seed_all_annotated_return_vars` still
+    // precedes this rewrite so `normalize_calltable_row_annotation`
+    // can `setbinding(graph.getreturnvar(), generalizedresult)` with
+    // `unionof(s_ImpossibleValue, X) == X`. Errors propagate: do not
+    // continue into rtyping (same skip as an `ensure_session` failure
+    // at the start of this function).
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::translator::rtyper::normalizecalls::perform_normalizations(&annotator)
     })) {
-        let msg = crate::annotator::model::panic_payload_text(&*payload)
-            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        eprintln!("[PREPASS normalize_call_familes] panicked: {msg}");
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            eprintln!("[PREPASS perform_normalizations] {err}");
+            return;
+        }
+        Err(payload) => {
+            let msg = crate::annotator::model::panic_payload_text(&*payload)
+                .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+            eprintln!("[PREPASS perform_normalizations] panicked: {msg}");
+            return;
+        }
     }
     mark_callers_of_incomplete_callees_rtype_skipped(&annotator, call_registry, &callsite_callees);
     apply_tdc_cuts_to_graphstore(call_registry, function_graphs);
