@@ -173,10 +173,9 @@ pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
 /// above as something a reader can join against.
 ///
 /// This array is the slot count — [`BRIDGE_DIAG`] takes its length from it —
-/// so a tally cannot be added without naming it. The wasm host mirrors these
-/// keys positionally (it links no majit crate) and prints them under
-/// `[jit-stats] bridge_diag`; without a declaration to compare against, a slot
-/// bumped here and unnamed there is simply never reported.
+/// so a tally cannot be added without naming it. The wasm host generates
+/// the same keys at build time (it links no majit crate) and prints them
+/// under `[jit-stats] bridge_diag`.
 ///
 /// A few slots are legend entries that no site bumps today (a decline that was
 /// split finer, and the two `ml_*` sub-breakdowns). They keep their names so

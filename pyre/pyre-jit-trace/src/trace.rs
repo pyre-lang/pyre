@@ -9173,8 +9173,8 @@ mod tests {
 // (`pyre_fbw_diag`).  An export cannot shift the module's function-index
 // space, unlike an import, which would break the JIT's baked indices.
 //
-// Slot layout is duplicated in the runner's decoder
-// (`pyre-wasm-runner/src/main.rs`).
+// pyre-wasm-runner generates its decoder layout from this module
+// (`pyre-wasm-runner/build.rs`).
 pub mod fbw_diag {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9271,8 +9271,8 @@ pub mod fbw_diag {
     /// The `[jit-stats]` key for each tally slot, in index order, so a slot
     /// cannot be added without naming it and no reader can print a subset of
     /// them by accident.  Both readers join these against `get(i)`:
-    /// `pyre/pyrex` reads them directly, `pyre-wasm-runner` mirrors the array
-    /// positionally (it links no pyre crate), so a native and a wasm
+    /// `pyre/pyrex` reads them directly; `pyre-wasm-runner` generates the same
+    /// keys at build time (it links no pyre crate), so a native and a wasm
     /// `[jit-stats] fbw_diag` line carry the same keys in the same order and
     /// diff field by field.
     ///
@@ -9317,8 +9317,8 @@ pub mod fbw_diag {
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
     ///
-    /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
-    /// constant (`main.rs`); the two have to move together.
+    /// `pyre-wasm-runner` generates its ring geometry from these constants at
+    /// build time (`pyre-wasm-runner/build.rs`).
     pub const RING_BASE: usize = LABELS.len();
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
@@ -9424,5 +9424,92 @@ pub mod fbw_diag {
             | ((exec_mf as u64).min(FIELD_MASK) << SHIFT_EXEC_MF)
             | ((leg as u64) << SHIFT_LEG);
         FBW_DIAG[entry + NAME_SLOTS].store(flags, Ordering::Relaxed);
+    }
+
+    /// Generating the readers' keys from `LABELS` keeps every reader in
+    /// step with the array, but cannot prove the array agrees with the slot
+    /// CONSTANTS, which is what the bump sites actually index by. Both
+    /// staying in step while `LABELS` shifts against
+    /// `WALKS`/`MIDBODY_LATCH`/... would rename every tally on both backends
+    /// at once. Bind each label to its own constant.
+    ///
+    /// Two entries deliberately break the mechanical `ESCAPE_*` ->
+    /// `fbw_escape_*` reading — `ESCAPE_FORCE_BY_PORTAL` is
+    /// `fbw_force_by_portal`, not `fbw_escape_force_by_portal` — which is why
+    /// this is written out rather than derived from the constant names.
+    #[cfg(test)]
+    mod slot_labels {
+        use super::*;
+
+        #[test]
+        fn each_label_sits_at_its_own_slot_constant() {
+            let bindings = [
+                (WALKS, "fbw_walks"),
+                (ROLLED_BACK_WITH_EFFECTS, "fbw_rolled_back_with_effects"),
+                (MIDBODY_LATCH, "fbw_midbody_latch"),
+                (
+                    MIDBODY_LATCH_NEW_UNJOURNALED,
+                    "fbw_midbody_latch_new_unjournaled",
+                ),
+                (ESCAPE_PLAIN_FALLBACK, "fbw_escape_plain_fallback"),
+                (
+                    ESCAPE_PLAIN_FALLBACK_UNCLEAN,
+                    "fbw_escape_plain_fallback_unclean",
+                ),
+                (ESCAPE_PORTAL_ONLY, "fbw_escape_portal_only"),
+                (
+                    ESCAPE_PUBLISHED_CALLEE_ONLY,
+                    "fbw_escape_published_callee_only",
+                ),
+                (
+                    ESCAPE_PORTAL_AND_PUBLISHED_CALLEE,
+                    "fbw_escape_portal_and_published_callee",
+                ),
+                (ESCAPE_FORCE_BY_PORTAL, "fbw_force_by_portal"),
+                (ESCAPE_FORCE_BY_CALLEE_ONLY, "fbw_force_by_callee_only"),
+                (
+                    STORE_JOURNAL_ROLLBACK_FAILED,
+                    "fbw_store_journal_rollback_failed",
+                ),
+                (
+                    BLACKHOLE_ADOPTED_SINGLE_FRAME,
+                    "fbw_blackhole_adopted_single_frame",
+                ),
+                (
+                    BLACKHOLE_ADOPTED_MULTI_FRAME,
+                    "fbw_blackhole_adopted_multi_frame",
+                ),
+                (GATE_DECLINED_SHAPE, "gate_declined_shape"),
+                (BRIDGE_EC_FROM_PORTAL_RED, "bridge_ec_from_portal_red"),
+                (BRIDGE_EC_MISSING, "bridge_ec_missing"),
+                (FORITER_ITEM_DROPPED, "fbw_foriter_item_dropped"),
+            ];
+
+            // Exhaustiveness: a slot added to `fbw_diag` grows `LABELS`
+            // (rustc enforces that), but nothing would notice that its
+            // constant went unbound here. Require the bound slots to be
+            // exactly `0..RING_BASE`.
+            let mut bound: Vec<usize> = bindings.iter().map(|&(slot, _)| slot).collect();
+            bound.sort_unstable();
+            assert_eq!(
+                bound,
+                (0..RING_BASE).collect::<Vec<_>>(),
+                "the slot constants bound below are not exactly 0..RING_BASE — a \
+                 new fbw_diag slot was added without binding its constant to its \
+                 label here",
+            );
+
+            for (slot, expected) in bindings {
+                assert_eq!(
+                    LABELS[slot], expected,
+                    "slot {slot} is named {:?} but the constant that indexes it \
+                     means {expected:?}. A slot constant was inserted or \
+                     renumbered without moving its entry in LABELS, so every \
+                     bump from this slot on is reported under another slot's \
+                     key — on BOTH backends at once.",
+                    LABELS[slot],
+                );
+            }
+        }
     }
 }

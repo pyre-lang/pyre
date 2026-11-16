@@ -27,16 +27,8 @@ mod wasmi_host;
 #[global_allocator]
 static GLOBAL: memory_ceiling::ProcessAllocator = memory_ceiling::ProcessAllocator::new();
 
-bitflags::bitflags! {
-    /// Mirror of `pyre_jit_trace::trace::fbw_diag::RingFlags`.
-    #[repr(transparent)]
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    struct FbwRingFlags: u64 {
-        const VALID = 1 << 0;
-        const COMMITTED = 1 << 1;
-        const BRIDGE = 1 << 2;
-    }
-}
+// Generated from the authority arrays (`pyre-wasm-runner/build.rs`).
+include!(concat!(env!("OUT_DIR"), "/diag_mirrors.rs"));
 
 use std::path::{Path, PathBuf};
 
@@ -743,103 +735,26 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // The `Counters.ABORT_*` split behind `loops_aborted` (diagnostic).
         // The native backends get this from MAJIT_LOG's summary, which the
         // guest cannot read; without it a wasm-only `loops_aborted` regression
-        // names no reason. Labels mirror
+        // names no reason. Labels are generated from
         // `majit_metainterp::jitprof::ABORT_COUNTER_KINDS`, which is
         // append-only, so a guest older than this runner just reads 0 for a
         // trailing label.
         if let Ok(ab) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_abort_diag") {
-            let labels = [
-                "too_long",
-                "bridge_or_generic",
-                "bad_loop",
-                "escape",
-                "force_quasiimmut",
-                "segmented_trace",
-            ];
-            let mut parts = Vec::with_capacity(labels.len());
-            for (i, lbl) in labels.iter().enumerate() {
+            let mut parts = Vec::with_capacity(ABORT_DIAG_LABELS.len());
+            for (i, lbl) in ABORT_DIAG_LABELS.iter().enumerate() {
                 let n = ab.call(&mut store, i as u32).unwrap_or(0);
                 parts.push(format!("{lbl}={n}"));
             }
             eprintln!("[jit-stats] abort_diag {}", parts.join(" "));
         }
-        // compile_bridge outcome tallies (diagnostic). POSITIONAL MIRROR of
-        // `majit_backend_wasm::BRIDGE_DIAG_LABELS`, which carries the legend
-        // for every slot; the runner links no majit crate, so a slot added
-        // there must be APPENDED here or its tally is bumped in the guest and
-        // reported by nobody.
+        // compile_bridge outcome tallies (diagnostic). Labels are generated
+        // from `majit_backend_wasm::BRIDGE_DIAG_LABELS`, which carries the
+        // legend for every slot. The runner links no majit crate, so the
+        // build script copies that array; a slot added there is named here
+        // on the next rebuild.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
-            let labels = [
-                "entered",
-                "decl_callasm",
-                "decl_multipeel",
-                "decl_notdirect",
-                "decl_refhome",
-                "BRIDGE_OK",
-                "loopclosing",
-                "src_preamble",
-                "ml_descr_none",
-                "ml_unsafe_label",
-                "ml_arity_mismatch",
-                "decl_noadvance",
-                "ca_cell_set",
-                "ca_cells_zero",
-                "accepted_ca",
-                "unused_ca_trampoline",
-                "forced_ca_terminal_decline",
-                "ml_no_descr",
-                "ml_unpublished",
-                "pub_peeled",
-                "pub_flat",
-                "pub_flat_skipped",
-                "label_retracted",
-                "cl_entered",
-                "cl_ok",
-                "cl_decl_unsupported",
-                "cl_decl_host_reject",
-                "cell_set",
-                "cell_missing",
-                "cell_rebridge",
-                "reemit_failed",
-                "reemit_ok",
-                "inline_ok",
-                "inline_decl_not_direct",
-                "inline_decl_not_loop_closing",
-                "inline_decl_not_reemittable",
-                "inline_decl_already_owned",
-                "inline_decl_frame",
-                "inline_decl_not_header",
-                "inline_decl_no_loop_label",
-                "inline_decl_value_layout",
-                "inline_decl_ref_layout",
-                "inline_decl_missing_label",
-                "inline_decl_other",
-                "bridge_param_ok",
-                "bridge_param_decl_source_frame",
-                "bridge_param_decl_arity",
-                "bridge_param_label_suppressed",
-                "inline_decl_label_resume_layout",
-                "inline_decl_call_assembler",
-                "inline_decl_owner_invalidated",
-                "inline_foreign_jump",
-                "inline_ok_outside_loop",
-                "inline_decl_no_trip_helper",
-                "inline_deferred",
-                "inline_trip_fired",
-                "inline_decl_defer_invalidation_guard",
-                "ca_decl_opcode",
-                "ca_decl_descr",
-                "ca_decl_types",
-                "ca_decl_unregistered",
-                "ca_decl_materialize",
-                "ca_decl_geometry",
-                "ca_decl_terminal",
-                "inline_decl_foreign_eager",
-                "inline_decl_eager_too_large",
-                "cl_decl_codegen",
-            ];
             let mut parts = Vec::new();
-            for (i, lbl) in labels.iter().enumerate() {
+            for (i, lbl) in BRIDGE_DIAG_LABELS.iter().enumerate() {
                 let n = diag.call(&mut store, i as u32).unwrap_or(0);
                 parts.push(format!("{lbl}={n}"));
             }
@@ -864,21 +779,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 );
             }
         }
-        // The portal's own decision tallies. POSITIONAL MIRROR of
-        // `pyre_jit::eval::PORTAL_DIAG_LABELS`, but unlike `bridge_diag` above
+        // The portal's own decision tallies. Labels are generated from
+        // `pyre_jit::eval::PORTAL_DIAG_LABELS`. Unlike `bridge_diag` above
         // the guest also exports the slot count, so a slot added there without
-        // a label here is reported as `slot<N>` rather than silently dropped.
+        // a rebuild here is reported as `slot<N>` rather than silently dropped.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_portal_diag") {
-            let labels = ["can_enter_jit", "can_enter_jit_taken"];
             let guest_len = instance
                 .get_typed_func::<(), u32>(&mut store, "pyre_jit_portal_diag_len")
                 .ok()
                 .and_then(|f| f.call(&mut store, ()).ok())
-                .unwrap_or(labels.len() as u32) as usize;
+                .unwrap_or(PORTAL_DIAG_LABELS.len() as u32) as usize;
             let mut parts = Vec::new();
-            for i in 0..guest_len.max(labels.len()) {
+            for i in 0..guest_len.max(PORTAL_DIAG_LABELS.len()) {
                 let n = diag.call(&mut store, i as u32).unwrap_or(0);
-                match labels.get(i) {
+                match PORTAL_DIAG_LABELS.get(i) {
                     Some(lbl) => parts.push(format!("{lbl}={n}")),
                     None => parts.push(format!("slot{i}={n}")),
                 }
@@ -932,21 +846,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // PYRE_WASM_JIT_STATS, so printing them here would have kept them off
         // every gated wasm run.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            // POSITIONAL MIRROR of the ring geometry and bit layout in
+            // Ring geometry and bit layout generated from
             // `pyre_jit_trace::trace::fbw_diag`. The runner links no pyre
-            // crate and decodes the ring by arithmetic on these, so a stale
-            // copy reads the wrong words and prints them as a walk outcome
-            // instead of failing. Named rather than spelled inline so the
-            // mirror is something a test can compare.
-            const RING_BASE: u32 = 18;
-            const RING_ENTRIES: u32 = 24;
-            const RING_STRIDE: u32 = 5;
-            const NAME_SLOTS: u32 = 4;
-            const SHIFT_EFFECTS: u32 = 8;
-            const SHIFT_JOURNAL: u32 = 24;
-            const SHIFT_EXEC_MF: u32 = 40;
-            const SHIFT_LEG: u32 = 56;
-            const FIELD_MASK: u64 = 0xffff;
+            // crate and decodes the ring by arithmetic on these constants.
             let mut slot = |i: u32| fbw.call(&mut store, i).unwrap_or(0);
             let walks = slot(0);
             // `fbw_diag::record` keeps the FIRST `RING_ENTRIES` walks and lets
@@ -989,115 +891,14 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 );
             }
         }
-        // must_compile / start_retrace gate tallies (diagnostic). Positional
-        // mirror of `majit_metainterp::MC_DIAG_LABELS`; the runner links no
-        // majit crate, so a new slot must be appended in both. Appending keeps
-        // the existing indices, which is the only edit that cannot silently
-        // rename every tally after it.
+        // must_compile / start_retrace gate tallies (diagnostic). Labels are
+        // generated from `majit_metainterp::MC_DIAG_LABELS`; the runner links
+        // no majit crate, so a new slot is named here on the next rebuild.
+        // Authority is append-only: inserting in the middle would rename
+        // every tally after the insertion point.
         if let Ok(mc) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_mc_diag") {
-            let labels = [
-                "mc_entered",
-                "decl_shortcircuit",
-                "descr0_skip",
-                "busy_skip",
-                "FIRED",
-                "stack_full",
-                "retrace_entered",
-                "retrace_bailed",
-                "cb_entered",
-                "cb_invalidloop",
-                "cb_retrace_req",
-                "cb_arity_giveup",
-                "sbt_entered",
-                "sbt_not_faildescr",
-                "sbt_no_jct",
-                "sbt_no_meta",
-                "sbt_cant_trace",
-                "sbt_short_vals",
-                "caro_backedge",
-                "caro_funcentry",
-                "caro_no_portal",
-                "caro_no_merge_entry",
-                "caro_not_tracing",
-                "stfe_cell_busy",
-                "stfe_dead_token",
-                "stfe_tick",
-                "toolong_suppressed",
-                "wct_declined",
-                "cl_hct_giveup",
-                "ct_no_front_token",
-                "ct_origin_loop_gone",
-                "ct_entry_bridge_failed",
-                "ct_no_entry_data",
-                "ct_not_tracing",
-                "ceb_no_loop",
-                "ceb_dead_token",
-                "ceb_invalidloop",
-                "ceb_retrace_req",
-                "ceb_backend_panic",
-                "ceb_backend_err",
-                "abrt_too_long",
-                "abrt_bridge",
-                "abrt_bad_loop",
-                "abrt_escape",
-                "abrt_force_qmut",
-                "abrt_segmented",
-                "abrt_other",
-                "giveup_invalidloop",
-                "giveup_compileloop_err",
-                "giveup_bridge_aborted",
-                "bridge_declined_close",
-                "bridge_no_targets_close",
-                "abort_after_declined",
-                "ct_compile_bridge_false",
-                "mp_shape_filtered",
-                "retrace_mp_untyped",
-                "close_hdr_fallback",
-                "retrace_arity_giveup",
-                "ptp_push",
-                "ptp_pop",
-                "forced_never_compiled",
-                "mst_entered",
-                "mst_sync_before_false",
-                "mst_live_values_mismatch",
-                "stfe_declined_compiled",
-                "stfe_declined_tracing",
-                "stfe_declined_tracing_stale",
-                "bridge_unattempted_close",
-                "xloop_close_decision_reached",
-                "xloop_close_target_compiled",
-                "xloop_close_published",
-                "abrt_unclassified_default",
-                "unroll_cancelled_invalid_loop",
-                "unroll_free_retry_rescued",
-                "unroll_free_retry_failed",
-                "qmut_deps_simple_loop",
-                "qmut_deps_entry_bridge",
-                "qmut_deps_blackhole_arm",
-                "retrace_close_resumed",
-                "guard_resume_bridge_no_handoff",
-                "abort_ceiling_banned",
-                "abort_ceiling_refused",
-                "bridge_abort_permanent",
-                "guard_resume_decline_no_state",
-                "guard_resume_decline_foreign_jitcode",
-                "guard_resume_decline_replay_incomplete",
-                "guard_resume_decline_regcount",
-                "guard_resume_decline_unreadable_reg",
-                "guard_resume_decline_unregistered_jitcode",
-                "guard_resume_decline_no_inline_call_site",
-                "guard_resume_decline_call_not_jitcode",
-                "guard_resume_decline_callee_mismatch",
-                "guard_resume_decline_return_slot",
-                "guard_resume_decline_reserved_identity",
-                "inline_frame_trim_blanked_live_int",
-                "confirm_enter_jit_missing_key",
-                "bridge_close_head_target_has_virtual_state",
-                "peel_less_loop_label_is_const_specialized",
-                "segmented_loop_label_is_const_specialized",
-            ];
             let mut parts = Vec::new();
-            for (i, lbl) in labels.iter().enumerate() {
+            for (i, lbl) in MC_DIAG_LABELS.iter().enumerate() {
                 parts.push(format!(
                     "{lbl}={}",
                     mc.call(&mut store, i as u32).unwrap_or(0)
@@ -1245,10 +1046,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // admission-gate refusals — reached through the slot-indexed
         // `pyre_fbw_diag` export rather than a counter export of its own.
         //
-        // POSITIONAL MIRROR of `pyre_jit_trace::trace::fbw_diag::LABELS` — the
-        // same discipline as the mc_diag labels above, since the runner links
-        // no pyre crate: a slot added there must be APPENDED here, and the two
-        // arrays make this line and the native reader's
+        // Labels generated from `pyre_jit_trace::trace::fbw_diag::LABELS`, as
+        // the mc_diag labels above are, since the runner links no pyre crate.
+        // A slot added there is named here on the next rebuild, and the
+        // two arrays make this line and the native reader's
         // (`pyre/pyrex/src/lib.rs`) carry the same keys in the same order.
         // Printing a subset is what this replaces: the two readers used to
         // print disjoint halves, so five slots were bumped on native and
@@ -1275,33 +1076,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // to 0 when the export is absent, which reads as healthy. Hence the one
         // lookup feeding the refusal below, and hence this line — not the
         // counter line — being where those five keys are emitted now.
-        // The value array is built FROM the label array below, so a label
-        // added without a slot (or the reverse) is impossible to write rather
+        // The value array is built FROM FBW_DIAG_LABELS, so a label added
+        // without a slot (or the reverse) is impossible to write rather
         // than a `zip` that silently drops the tail.
-        let fbw_labels = [
-            "fbw_walks",
-            "fbw_rolled_back_with_effects",
-            "fbw_midbody_latch",
-            "fbw_midbody_latch_new_unjournaled",
-            "fbw_escape_plain_fallback",
-            "fbw_escape_plain_fallback_unclean",
-            "fbw_escape_portal_only",
-            "fbw_escape_published_callee_only",
-            "fbw_escape_portal_and_published_callee",
-            "fbw_force_by_portal",
-            "fbw_force_by_callee_only",
-            "fbw_store_journal_rollback_failed",
-            "fbw_blackhole_adopted_single_frame",
-            "fbw_blackhole_adopted_multi_frame",
-            "gate_declined_shape",
-            "bridge_ec_from_portal_red",
-            "bridge_ec_missing",
-            "fbw_foriter_item_dropped",
-        ];
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
             .and_then(|f| {
-                let mut values = fbw_labels.map(|_| 0u64);
+                let mut values = vec![0u64; FBW_DIAG_LABELS.len()];
                 for (slot, value) in values.iter_mut().enumerate() {
                     *value = f.call(&mut store, slot as u32)?;
                 }
@@ -1310,7 +1091,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             Ok(values) => values,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                fbw_labels.map(|_| 0u64)
+                vec![0u64; FBW_DIAG_LABELS.len()]
             }
         };
         if !missing.is_empty() {
@@ -1322,7 +1103,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             std::process::exit(1);
         }
         let mut fbw = String::from("[jit-stats] fbw_diag");
-        for (key, value) in fbw_labels.iter().zip(fbw_slots) {
+        for (key, value) in FBW_DIAG_LABELS.iter().zip(fbw_slots) {
             fbw.push_str(&format!(" {key}={value}"));
         }
         eprintln!("{fbw}");
