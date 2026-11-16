@@ -6745,10 +6745,15 @@ pub(in crate::front::mir) fn scan_rvalue_struct_elem(
         }
         // Address-of a field, or a reborrow of the element, is the getitem
         // producer. Fusion still counts these Other (`scan_rvalue_struct_field`).
-        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+        Rvalue::Ref { place, .. } => {
             if place_is_struct_elem_use_of(place, dest) {
                 *elems += 1;
             } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::RawPtr { place, .. } => {
+            if place_references_local(place, dest) {
                 *other += 1;
             }
         }

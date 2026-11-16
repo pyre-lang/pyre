@@ -47851,7 +47851,17 @@ fn deref_store_through_returned_tuple_field_emits_store_through_ptr() {
         "kind": {"Projection": [tuple_field, "Deref"]},
         "ty": i64_ty
     });
-    let helper = interior_opaque(0, &["fixture", "get_pair"], vec![], tuple_ty.clone());
+    // A helper with a body the flow space lowers; an opaque host
+    // function has no graph to return an interior pointer from.
+    let helper = interior_fun(
+        0,
+        "get_pair",
+        0,
+        vec![],
+        tuple_ty.clone(),
+        vec![interior_local(0, None, &tuple_ty)],
+        vec![interior_bb(vec![], interior_return())],
+    );
     let caller = interior_fun(
         1,
         "store_through_tuple_field",
@@ -47891,6 +47901,235 @@ fn deref_store_through_returned_tuple_field_emits_store_through_ptr() {
     assert_eq!(
         stores, 1,
         "caller must emit one store-through; ops={caller_ops:?}"
+    );
+}
+
+/// `core::iter::...::next` has no body the flow space lowers, so its
+/// unwrapped field address is not a call-result pointer: the store is
+/// the one-word `raw_store` into the host slot.
+#[test]
+fn deref_store_through_enumerate_next_unwrap_field_is_raw_store() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let v_ref = interior_mut_ref(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [usize_ty.clone(), v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let option_ty = option_adt_node(1, tuple_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(3, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let helper = interior_opaque(
+        0,
+        &["core", "iter", "adapters", "enumerate", "<Impl>", "next"],
+        vec![],
+        option_ty.clone(),
+    );
+    let unwrap = interior_opaque(
+        1,
+        &["core", "option", "<Impl>", "unwrap"],
+        vec![option_ty.clone()],
+        tuple_ty.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "store_through_enumerate_field",
+        1,
+        vec![i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("v"), &i64_ty),
+            interior_local(2, Some("opt"), &option_ty),
+            interior_local(3, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(0, vec![], interior_place(2, &option_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &option_ty))],
+                    interior_place(3, &tuple_ty),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    interior_use(interior_place(1, &i64_ty)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(1)],
+        vec![helper, unwrap, caller],
+    );
+    let caller_graph = lower_interior(&llbc, "store_through_enumerate_field");
+    let caller_ops = graph_ops(&caller_graph);
+    assert!(
+        !caller_ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. })),
+        "a host callee result is not a store-through pointer; ops={caller_ops:?}"
+    );
+    assert_eq!(
+        caller_ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::RawStore { .. }))
+            .count(),
+        1,
+        "caller must emit one raw_store; ops={caller_ops:?}"
+    );
+}
+
+/// `let x = *get_slot_mut(..)` of a call-returned `&mut i64` is
+/// `LoadThroughPtr`.
+#[test]
+fn call_result_scalar_deref_load_emits_load_through_ptr() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let v_ref = interior_mut_ref(i64_ty.clone());
+    let value_field = interior_field(3, &ptr, &adt, &i64_ty, 1);
+    let helper = interior_fun(
+        0,
+        "get_slot_mut",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        v_ref.clone(),
+        vec![
+            interior_local(0, None, &v_ref),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &v_ref),
+                    serde_json::json!({
+                        "Ref": {"place": value_field, "kind": "Mut", "ptr_metadata": null}
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), usize_ty.clone()],
+        ptr.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "load_through_slot",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &v_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &v_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(3, &v_ref, &i64_ty)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![interior_point()], vec![helper, add, caller]);
+    let caller_graph = lower_interior(&llbc, "load_through_slot");
+    let caller_ops = graph_ops(&caller_graph);
+    let loads: Vec<_> = caller_ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::LoadThroughPtr { raw, .. } => Some(raw.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loads.len(),
+        1,
+        "caller must emit one load-through; ops={caller_ops:?}"
+    );
+    assert_eq!(loads[0].item_ty, ValueType::Int);
+    assert_eq!(loads[0].itemsize, 8);
+    assert!(loads[0].is_item_signed);
+    assert!(
+        caller_ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::RawLoad { .. })),
+        "call-result scalar deref must not emit RawLoad; ops={caller_ops:?}"
     );
 }
 

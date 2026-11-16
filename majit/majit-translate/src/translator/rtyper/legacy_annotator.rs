@@ -2096,6 +2096,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::RawLoad { item_ty, .. } | OpKind::GcLoadIndexed { item_ty, .. } => {
             item_ty.clone()
         }
+        OpKind::LoadThroughPtr { raw, .. } => raw.item_ty.clone(),
         OpKind::RawStore { .. } => ValueType::Void,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,

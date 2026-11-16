@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 use crate::annotator::model::SomeValue;
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    ConcreteType, ExitSwitch, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
-    ValueType,
+    ConcreteType, ExitSwitch, FieldDescriptor, FunctionGraph, LinkArg, OpKind, RawWordDescr,
+    SpaceOperation, ValueType,
 };
 use crate::translator::rtyper::flowspace_adapter::LegacyToTyped;
 use crate::translator::rtyper::llannotation::SomeInteriorPtr;
@@ -34,6 +34,19 @@ fn interior_ptr_annotation(map: &LegacyToTyped, var: &Variable) -> Option<SomeIn
         }
     }
     None
+}
+
+fn published_annotation(map: &LegacyToTyped, var: &Variable) -> Option<SomeValue> {
+    for src in map.get(var).into_iter().chain(std::iter::once(var)) {
+        if let Some(ann) = src.annotation.borrow().as_ref() {
+            return Some((**ann).clone());
+        }
+    }
+    None
+}
+
+fn integer_address_annotation(map: &LegacyToTyped, var: &Variable) -> bool {
+    matches!(published_annotation(map, var), Some(SomeValue::Integer(_)))
 }
 
 /// `InteriorPtrRepr.getinteriorfieldargs` walks every offset in order
@@ -296,65 +309,213 @@ fn rewrite_interior_getitem_producers(graph: &mut FunctionGraph, value_to_var: &
     }
 }
 
+/// `rtyper.rs` `"raw_store"` at offset 0: the address-word lowering of
+/// a store through a call-returned scalar reference.
+fn raw_store_ops(
+    graph: &mut FunctionGraph,
+    ptr: &Variable,
+    value: &Variable,
+    descr: &RawWordDescr,
+) -> Vec<SpaceOperation> {
+    let offset = graph.alloc_value_var_with_type(ConcreteType::Signed);
+    vec![
+        SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        },
+        SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base: ptr.clone(),
+                offset,
+                value: value.clone(),
+                item_ty: descr.item_ty.clone(),
+                itemsize: descr.itemsize,
+                is_item_signed: descr.is_item_signed,
+            },
+        },
+    ]
+}
+
+/// `rtyper.rs` `"raw_load"` at offset 0: the address-word lowering of a
+/// load through a call-returned scalar reference.
+fn raw_load_ops(
+    graph: &mut FunctionGraph,
+    result: Option<Variable>,
+    ptr: &Variable,
+    raw: &RawWordDescr,
+) -> Vec<SpaceOperation> {
+    let offset = graph.alloc_value_var_with_type(ConcreteType::Signed);
+    vec![
+        SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        },
+        SpaceOperation {
+            result,
+            kind: OpKind::RawLoad {
+                base: ptr.clone(),
+                offset,
+                item_ty: raw.item_ty.clone(),
+                itemsize: raw.itemsize,
+                is_item_signed: raw.is_item_signed,
+            },
+        },
+    ]
+}
+
+/// A graph the two-phase prepass did not annotate (the legacy walker
+/// owns it) has no repr to pick interior vs raw lowering. Its pointer
+/// words are address words, so a load / store through a call-returned
+/// scalar reference is the offset-0 `raw_load` / `raw_store`, the
+/// lowering every such deref had before it carried a repr choice. A
+/// store without a raw word descr is left for the leftover check.
+pub(crate) fn lower_through_ptr_without_annotation(graph: &mut FunctionGraph) {
+    let block_ids: Vec<_> = graph.iter_blocks().map(|b| b.id).collect();
+    for id in block_ids {
+        let ops = std::mem::take(&mut graph.block_mut(id).operations);
+        let mut new_ops = Vec::with_capacity(ops.len());
+        for op in ops {
+            match &op.kind {
+                OpKind::LoadThroughPtr { ptr, raw } => {
+                    new_ops.extend(raw_load_ops(graph, op.result.clone(), ptr, raw));
+                }
+                OpKind::StoreThroughPtr {
+                    ptr,
+                    value,
+                    raw: Some(descr),
+                } => new_ops.extend(raw_store_ops(graph, ptr, value, descr)),
+                _ => new_ops.push(op),
+            }
+        }
+        graph.block_mut(id).operations = new_ops;
+    }
+}
+
 fn rewrite_one_store(
     graph: &mut FunctionGraph,
     ptr: &Variable,
     value: &Variable,
+    raw: Option<&RawWordDescr>,
     value_to_var: &LegacyToTyped,
 ) -> Result<Vec<SpaceOperation>, String> {
-    let Some(ip) = interior_ptr_annotation(value_to_var, ptr) else {
-        return Err("leftover StoreThroughPtr without a leaf-TO SomeInteriorPtr annotation".into());
-    };
-    if ip.ll_ptrtype.TO.is_container_type() {
-        return Err(format!(
-            "store_through_ptr requires a leaf-TO interior pointer, got {:?}",
-            ip.ll_ptrtype.TO
-        ));
+    if let Some(ip) = interior_ptr_annotation(value_to_var, ptr) {
+        if ip.ll_ptrtype.TO.is_container_type() {
+            return Err(format!(
+                "store_through_ptr requires a leaf-TO interior pointer, got {:?}",
+                ip.ll_ptrtype.TO
+            ));
+        }
+        // `rewrite_op_setinteriorfield` drops a Void value before the
+        // GcArray-of-Struct assert.
+        if FunctionGraph::concretetype_of(value) == ConcreteType::Void {
+            return Ok(Vec::new());
+        }
+        let field = setinteriorfield_field_name(&ip.ll_ptrtype.PARENTTYPE, &ip.ll_ptrtype.offsets)?;
+        let item_ty = item_ty_of(value, &ip);
+        let array_type_id = array_type_id_from_parent(&ip.ll_ptrtype.PARENTTYPE);
+        // `Ptr._interior_ptr_type_with_index` is the `{ptr, index}` GcStruct;
+        // `InteriorPtrRepr.getinteriorfieldargs` unpacks those fields.
+        let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        return Ok(vec![
+            SpaceOperation {
+                result: Some(v_ptr.clone()),
+                kind: OpKind::FieldRead {
+                    base: ptr.clone(),
+                    field: FieldDescriptor::new("ptr", Some("Interior".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+            },
+            SpaceOperation {
+                result: Some(v_index.clone()),
+                kind: OpKind::FieldRead {
+                    base: ptr.clone(),
+                    field: FieldDescriptor::new("index", Some("Interior".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::InteriorFieldWrite {
+                    base: v_ptr,
+                    index: v_index,
+                    field: FieldDescriptor::new(field, None),
+                    value: value.clone(),
+                    item_ty,
+                    array_type_id,
+                    array: parent_array(&ip.ll_ptrtype.PARENTTYPE),
+                },
+            },
+        ]);
     }
-    // `rewrite_op_setinteriorfield` drops a Void value before the
-    // GcArray-of-Struct assert.
-    if FunctionGraph::concretetype_of(value) == ConcreteType::Void {
-        return Ok(Vec::new());
+    if let Some(descr) = raw
+        && integer_address_annotation(value_to_var, ptr)
+    {
+        return Ok(raw_store_ops(graph, ptr, value, descr));
     }
-    let field = setinteriorfield_field_name(&ip.ll_ptrtype.PARENTTYPE, &ip.ll_ptrtype.offsets)?;
-    let item_ty = item_ty_of(value, &ip);
-    let array_type_id = array_type_id_from_parent(&ip.ll_ptrtype.PARENTTYPE);
-    // `Ptr._interior_ptr_type_with_index` is the `{ptr, index}` GcStruct;
-    // `InteriorPtrRepr.getinteriorfieldargs` unpacks those fields.
-    let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    Ok(vec![
-        SpaceOperation {
-            result: Some(v_ptr.clone()),
-            kind: OpKind::FieldRead {
-                base: ptr.clone(),
-                field: FieldDescriptor::new("ptr", Some("Interior".into())),
-                ty: ValueType::Ref(None),
-                pure: true,
+    Err("leftover StoreThroughPtr without a leaf-TO SomeInteriorPtr annotation".into())
+}
+
+fn rewrite_one_load(
+    graph: &mut FunctionGraph,
+    result: Option<Variable>,
+    ptr: &Variable,
+    raw: &RawWordDescr,
+    value_to_var: &LegacyToTyped,
+) -> Vec<SpaceOperation> {
+    if let Some(ip) = interior_ptr_annotation(value_to_var, ptr)
+        && !ip.ll_ptrtype.TO.is_container_type()
+    {
+        let field =
+            match setinteriorfield_field_name(&ip.ll_ptrtype.PARENTTYPE, &ip.ll_ptrtype.offsets) {
+                Ok(name) => name,
+                Err(msg) => panic!("rewrite_op_getinteriorfield: graph {} {msg}", graph.name),
+            };
+        let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        return vec![
+            SpaceOperation {
+                result: Some(v_ptr.clone()),
+                kind: OpKind::FieldRead {
+                    base: ptr.clone(),
+                    field: FieldDescriptor::new("ptr", Some("Interior".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
             },
-        },
-        SpaceOperation {
-            result: Some(v_index.clone()),
-            kind: OpKind::FieldRead {
-                base: ptr.clone(),
-                field: FieldDescriptor::new("index", Some("Interior".into())),
-                ty: ValueType::Int,
-                pure: true,
+            SpaceOperation {
+                result: Some(v_index.clone()),
+                kind: OpKind::FieldRead {
+                    base: ptr.clone(),
+                    field: FieldDescriptor::new("index", Some("Interior".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
             },
-        },
-        SpaceOperation {
-            result: None,
-            kind: OpKind::InteriorFieldWrite {
-                base: v_ptr,
-                index: v_index,
-                field: FieldDescriptor::new(field, None),
-                value: value.clone(),
-                item_ty,
-                array_type_id,
-                array: parent_array(&ip.ll_ptrtype.PARENTTYPE),
+            SpaceOperation {
+                result,
+                kind: OpKind::InteriorFieldRead {
+                    base: v_ptr,
+                    index: v_index,
+                    field: FieldDescriptor::new(field, None),
+                    item_ty: raw.item_ty.clone(),
+                    array_type_id: array_type_id_from_parent(&ip.ll_ptrtype.PARENTTYPE),
+                    array: parent_array(&ip.ll_ptrtype.PARENTTYPE),
+                },
             },
-        },
-    ])
+        ];
+    }
+    if integer_address_annotation(value_to_var, ptr) {
+        return raw_load_ops(graph, result, ptr, raw);
+    }
+    panic!(
+        "rewrite_op_getinteriorfield: graph {} load_through_ptr on {:?}",
+        graph.name,
+        published_annotation(value_to_var, ptr)
+    );
 }
 
 fn reject_container_valued_element_field(
@@ -507,13 +668,22 @@ fn rewrite_block_stores(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped)
         let mut new_ops = Vec::with_capacity(ops.len());
         for op in ops {
             match &op.kind {
-                OpKind::StoreThroughPtr { ptr, value } => {
-                    match rewrite_one_store(graph, ptr, value, value_to_var) {
+                OpKind::StoreThroughPtr { ptr, value, raw } => {
+                    match rewrite_one_store(graph, ptr, value, raw.as_ref(), value_to_var) {
                         Ok(rewritten) => new_ops.extend(rewritten),
                         Err(msg) => {
                             panic!("rewrite_op_setinteriorfield: graph {} {msg}", graph.name)
                         }
                     }
+                }
+                OpKind::LoadThroughPtr { ptr, raw } => {
+                    new_ops.extend(rewrite_one_load(
+                        graph,
+                        op.result.clone(),
+                        ptr,
+                        raw,
+                        value_to_var,
+                    ));
                 }
                 OpKind::FieldRead {
                     base, field, ty, ..
@@ -634,6 +804,12 @@ fn reject_leftover_interior_ops(graph: &FunctionGraph) {
                 "leftover StoreThroughPtr in graph {}; the rtyper must lower \
                  this store-through to setinteriorfield \
                  (InteriorPtrRepr.rtype_store_through_ptr)",
+                graph.name
+            ),
+            OpKind::LoadThroughPtr { .. } => panic!(
+                "leftover LoadThroughPtr in graph {}; the rtyper must lower \
+                 this load-through to getinteriorfield \
+                 (InteriorPtrRepr.rtype_load_through_ptr)",
                 graph.name
             ),
             OpKind::InteriorPtrExpose { .. } => panic!(
@@ -937,8 +1113,8 @@ mod tests {
     use std::collections::HashMap;
     use std::rc::Rc;
 
-    use crate::annotator::model::SomeValue;
-    use crate::model::ValueType;
+    use crate::annotator::model::{SomeInteger, SomeValue};
+    use crate::model::{RawWordDescr, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{
         Array, GCREF, InteriorOffset, InteriorPtr, Ptr, PtrTarget, Struct,
     };
@@ -993,6 +1169,7 @@ mod tests {
             OpKind::StoreThroughPtr {
                 ptr: ptr.clone(),
                 value: value.clone(),
+                raw: None,
             },
             false,
         );
@@ -1044,6 +1221,188 @@ mod tests {
             op.kind,
             OpKind::StoreThroughPtr { .. } | OpKind::RawStore { .. }
         )));
+    }
+
+    fn signed_word_descr() -> RawWordDescr {
+        RawWordDescr {
+            item_ty: ValueType::Int,
+            itemsize: 8,
+            is_item_signed: true,
+        }
+    }
+
+    fn integer_address_annotation_value() -> SomeValue {
+        SomeValue::Integer(SomeInteger::new(false, false))
+    }
+
+    fn load_through_graph(annotation: SomeValue, raw: RawWordDescr) -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("caller_load");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, ptr.clone());
+        graph
+            .push_op_var(
+                entry,
+                OpKind::LoadThroughPtr {
+                    ptr: ptr.clone(),
+                    raw,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, None);
+        *ptr.annotation.borrow_mut() = Some(Rc::new(annotation));
+        (graph, ptr)
+    }
+
+    #[test]
+    fn load_through_leaf_interior_ptr_is_getinteriorfield() {
+        let (mut graph, ptr) =
+            load_through_graph(leaf_interior_ptr_annotation(), signed_word_descr());
+        let mut value_to_var = HashMap::new();
+        value_to_var.insert(ptr.clone(), ptr.clone());
+        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        let reads: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldRead { item_ty, field, .. } => {
+                    Some((item_ty.clone(), field.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![(ValueType::Int, "value".to_string())]);
+        assert!(graph.iter_block_ops().all(|(_, op)| !matches!(
+            op.kind,
+            OpKind::LoadThroughPtr { .. } | OpKind::RawLoad { .. }
+        )));
+    }
+
+    #[test]
+    fn load_through_integer_address_is_raw_load() {
+        let (mut graph, ptr) =
+            load_through_graph(integer_address_annotation_value(), signed_word_descr());
+        let mut value_to_var = HashMap::new();
+        value_to_var.insert(ptr.clone(), ptr.clone());
+        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        let loads: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::RawLoad {
+                    base,
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                    ..
+                } => Some((base.clone(), item_ty.clone(), *itemsize, *is_item_signed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].0, ptr);
+        assert_eq!(loads[0].1, ValueType::Int);
+        assert_eq!(loads[0].2, 8);
+        assert!(loads[0].3);
+        assert!(
+            graph
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::ConstInt(0)))
+        );
+        assert!(
+            graph
+                .iter_block_ops()
+                .all(|(_, op)| !matches!(op.kind, OpKind::LoadThroughPtr { .. }))
+        );
+    }
+
+    #[test]
+    fn store_through_integer_address_is_raw_store() {
+        let mut graph = FunctionGraph::new("caller_store");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "v".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, ptr.clone());
+        graph.push_inputarg_var(entry, value.clone());
+        graph.push_op_var(
+            entry,
+            OpKind::StoreThroughPtr {
+                ptr: ptr.clone(),
+                value: value.clone(),
+                raw: Some(signed_word_descr()),
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+        *ptr.annotation.borrow_mut() = Some(Rc::new(integer_address_annotation_value()));
+        let mut value_to_var = HashMap::new();
+        value_to_var.insert(ptr.clone(), ptr.clone());
+        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        let stores: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::RawStore {
+                    base,
+                    value: stored,
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                    ..
+                } => Some((
+                    base.clone(),
+                    stored.clone(),
+                    item_ty.clone(),
+                    *itemsize,
+                    *is_item_signed,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].0, ptr);
+        assert_eq!(stores[0].1, value);
+        assert_eq!(stores[0].2, ValueType::Int);
+        assert_eq!(stores[0].3, 8);
+        assert!(stores[0].4);
+        assert!(
+            graph
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::ConstInt(0)))
+        );
+        assert!(
+            graph
+                .iter_block_ops()
+                .all(|(_, op)| !matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        );
     }
 
     #[test]
@@ -1172,6 +1531,7 @@ mod tests {
             OpKind::StoreThroughPtr {
                 ptr: exposed.clone(),
                 value: value.clone(),
+                raw: None,
             },
             false,
         );

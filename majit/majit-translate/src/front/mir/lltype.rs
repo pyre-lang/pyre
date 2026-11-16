@@ -14065,7 +14065,7 @@ pub(in crate::front::mir) fn json_ty_byte_size(
 /// (`history.getkind` of `Ptr(TO)` follows `TO._gckind`). A pointer to
 /// a GCREF stays a raw address: that pointee is itself a pointer, not
 /// an ADT.
-fn json_ty_thin_ptr_pointee_is_declared_gc(
+pub(in crate::front::mir) fn json_ty_thin_ptr_pointee_is_declared_gc(
     node: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,

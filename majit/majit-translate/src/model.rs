@@ -869,6 +869,15 @@ pub struct ScalarFieldWord {
     pub width: ScalarFieldWidth,
 }
 
+/// Item word of a call-returned scalar reference lowered as
+/// `raw_store` / `raw_load` at offset 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawWordDescr {
+    pub item_ty: ValueType,
+    pub itemsize: usize,
+    pub is_item_signed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDescriptor {
     pub name: String,
@@ -1763,14 +1772,21 @@ pub enum OpKind {
         field: FieldDescriptor,
         ty: ValueType,
     },
-    /// Store through a pointer-typed SSA that is not a same-body interior
-    /// alias and not a raw word (`*p = v` of a GCREF / `&mut` field).
-    /// Two operands: the pointer and the value. Flowspace setattr-shaped
-    /// store with no MIR field name; `InteriorPtrRepr` leaf-TO
-    /// store-through is the rtyper form. Never `raw_store` of a GCREF.
+    /// Store through a call-returned scalar reference (`*p = v`).
+    /// A leaf `SomeInteriorPtr` lowers to `setinteriorfield`; an address
+    /// word (`SomeInteger`) lowers to `raw_store` at offset 0 with `raw`.
     StoreThroughPtr {
         ptr: crate::flowspace::model::Variable,
         value: crate::flowspace::model::Variable,
+        raw: Option<RawWordDescr>,
+    },
+    /// Load through a call-returned scalar reference (`*p`). The op's
+    /// `result` is the loaded value. A leaf `SomeInteriorPtr` lowers to
+    /// `getinteriorfield`; an address word (`SomeInteger`) lowers to
+    /// `raw_load` at offset 0 with `raw`.
+    LoadThroughPtr {
+        ptr: crate::flowspace::model::Variable,
+        raw: RawWordDescr,
     },
     Call {
         target: CallTarget,

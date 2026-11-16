@@ -22174,7 +22174,10 @@ fn remaining_pointer_residual_mut_arg_unifies_field_borrow_and_get_slot() {
         .iter()
         .flat_map(|block| block.operations.iter())
         .any(|op| match &op.kind {
-            OpKind::RawStore { .. } => true,
+            // A thin pointer to a declared-GC struct is a `'r'` word,
+            // which `rewrite_op_raw_store` refuses; the store through the
+            // returned slot is setattr-on-pointer for the rtyper.
+            OpKind::StoreThroughPtr { raw: None, .. } => true,
             OpKind::Call { target, .. } => {
                 let name = target.to_string();
                 name.contains("deref_write")

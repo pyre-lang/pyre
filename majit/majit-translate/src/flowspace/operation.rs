@@ -229,6 +229,10 @@ pub enum OpKind {
     /// form is `InteriorPtrRepr.getinteriorfieldargs` plus
     /// `setinteriorfield`.
     StoreThroughPtr,
+    /// Load through a call-returned scalar reference. Operands are the
+    /// pointer and the TYPE constant; the rtyper form is
+    /// `getinteriorfield` or `raw_load` from the pointer's repr.
+    LoadThroughPtr,
 }
 
 /// RPython `operation.py` `canraise` entries reference the Python
@@ -404,6 +408,7 @@ impl OpKind {
             "call_args" => OpKind::CallArgs,
             "interior_ptr_expose" => OpKind::InteriorPtrExpose,
             "store_through_ptr" => OpKind::StoreThroughPtr,
+            "load_through_ptr" => OpKind::LoadThroughPtr,
             _ => return None,
         })
     }
@@ -517,6 +522,7 @@ impl OpKind {
             OpKind::CallArgs => "call_args",
             OpKind::InteriorPtrExpose => "interior_ptr_expose",
             OpKind::StoreThroughPtr => "store_through_ptr",
+            OpKind::LoadThroughPtr => "load_through_ptr",
         }
     }
 
@@ -612,7 +618,8 @@ impl OpKind {
             | OpKind::Contains
             | OpKind::GetAttr
             | OpKind::InteriorPtrExpose
-            | OpKind::StoreThroughPtr => Some(2),
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => Some(2),
 
             // ternary
             OpKind::SetAttr
@@ -779,7 +786,8 @@ impl OpKind {
             | OpKind::Next
             | OpKind::SimpleCall
             | OpKind::CallArgs
-            | OpKind::StoreThroughPtr => false,
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => false,
         }
     }
 
@@ -847,7 +855,8 @@ impl OpKind {
             | OpKind::SimpleCall
             | OpKind::CallArgs
             | OpKind::InteriorPtrExpose
-            | OpKind::StoreThroughPtr => Dispatch::Single,
+            | OpKind::StoreThroughPtr
+            | OpKind::LoadThroughPtr => Dispatch::Single,
 
             // DoubleDispatchMixin: `add_operator(…, dispatch=2)`.
             OpKind::Is
@@ -5325,6 +5334,7 @@ mod tests {
             OpKind::NewRustVecFixed,
             OpKind::InteriorPtrExpose,
             OpKind::StoreThroughPtr,
+            OpKind::LoadThroughPtr,
         ] {
             let name = kind.opname();
             assert_eq!(

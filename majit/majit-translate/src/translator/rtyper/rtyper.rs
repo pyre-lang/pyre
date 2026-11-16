@@ -2294,6 +2294,9 @@ impl RPythonTyper {
             "store_through_ptr" => {
                 self.translate_unary_operation(hop, |r, hop| r.rtype_store_through_ptr(hop))
             }
+            "load_through_ptr" => {
+                self.translate_unary_operation(hop, |r, hop| r.rtype_load_through_ptr(hop))
+            }
             "len" => self.translate_unary_operation(hop, |r, hop| r.rtype_len(hop)),
             "bool" => self.translate_unary_operation(hop, |r, hop| r.rtype_bool(hop)),
             "simple_call" => self.translate_unary_operation(hop, |r, hop| r.rtype_simple_call(hop)),

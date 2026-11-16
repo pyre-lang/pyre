@@ -1022,6 +1022,9 @@ fn infer_concrete_from_op(
         OpKind::RawLoad { item_ty, .. } | OpKind::GcLoadIndexed { item_ty, .. } => {
             valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs)
         }
+        OpKind::LoadThroughPtr { raw, .. } => {
+            valuetype_to_concrete_for_legacy(&raw.item_ty, raw_alloc_flavor_structs)
+        }
         // `OpKind::Abort` for unsupported syntax — macros, unsupported
         // literals, fallback expressions.  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's

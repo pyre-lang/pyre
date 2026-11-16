@@ -238,6 +238,12 @@ pub(crate) fn authoritative_result_type_from_op(
                 raw_alloc_flavor_structs,
             ))
         }
+        OpKind::LoadThroughPtr { raw, .. } => {
+            concrete_if_known(valuetype_to_concrete_for_legacy(
+                &raw.item_ty,
+                raw_alloc_flavor_structs,
+            ))
+        }
         OpKind::Call { result_ty, .. }
         | OpKind::IndirectCall { result_ty, .. }
         | OpKind::BinOp { result_ty, .. }

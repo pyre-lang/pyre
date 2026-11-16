@@ -17672,7 +17672,8 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         OpKind::FieldRead { .. }
         | OpKind::FieldWrite { .. }
         | OpKind::InteriorPtrExpose { .. }
-        | OpKind::StoreThroughPtr { .. } => RaiseClass::No,
+        | OpKind::StoreThroughPtr { .. }
+        | OpKind::LoadThroughPtr { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
