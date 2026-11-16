@@ -2439,8 +2439,8 @@ pub(crate) fn semantic_slot_for_reg_color(
 /// it at this PC per the `(bank, color, slot)` map. Used by the deep-kept
 /// operand-stack recovery in `walker_capture_snapshot_for_last_guard_impl` to
 /// name the guard-PC register (`registers_r[color]`) holding a kept operand-
-/// stack slot the walk mirror lost. Returns the smallest matching color;
-/// `None` when no live Ref color owns the slot at this PC.
+/// stack slot. Returns the smallest matching color; `None` when no live Ref
+/// color owns the slot at this PC.
 pub(crate) fn semantic_slot_color_for_ref_slot(
     pcdep_entries: &[(u8, u16, u16)],
     slot: usize,
@@ -15321,7 +15321,6 @@ mod tests {
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
-                depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),

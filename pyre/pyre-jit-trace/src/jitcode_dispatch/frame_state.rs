@@ -28,46 +28,6 @@ pub struct WalkFrameStateData {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
-    /// PyPy-faithful kept-operand-stack snapshot: the walk-level
-    /// symbolic operand stack, indexed by ABSOLUTE operand-stack depth
-    /// (slot `s`, `s in 0..vstack_depth`).  The Python operand stack is
-    /// all-Ref (`W_Root`), so a single `Vec<OpRef>` (Ref bank) suffices.
-    /// This is the walker analog of PyPy's `MIFrame.registers_r`
-    /// valuestack array snapshotted by `get_list_of_active_boxes`
-    /// (`pyjitpl.py`) — the authoritative per-slot box source the
-    /// `stack_sync` vable overlay reads at a branch guard instead of the
-    /// unreliable `registers_r[stack_slot_color_map[s]]` static-color read.
-    ///
-    /// Maintained ONLY when `sym.owns_virtualizable_shadow()`; on any
-    /// unmodeled stack effect the maintenance sets `vstack_valid = false`
-    /// and `stack_sync` omits every operand slot, which resume
-    /// re-materializes (zero regression).
-    ///
-    /// The mirror is the SOLE kept-stack source at a branch guard: the
-    /// flat `stack_slot_color_map` static-color read it once fell back to
-    /// is retired, so a slot the mirror does not cover is omitted rather
-    /// than read from the flat map.  `PYRE_VSTACK_DIAG` logs the per-op
-    /// reconcile trace.
-    pub vstack_boxes: Vec<OpRef>,
-    /// #73: the last Ref box written via [`super::write_ref_reg`] during the
-    /// CURRENT Python opcode — the box a value-producing opcode lands on
-    /// the operand-stack TOS.  Reset to `OpRef::NONE` at every opcode
-    /// boundary; read by [`super::reconcile_vstack_at_boundary`] for the
-    /// RESULT-TO-TOS class.
-    pub vstack_last_ref: OpRef,
-    /// The `(py_pc, depth, boxes)` the mirror held when `vstack_reorder_ceiling`
-    /// was armed.  A layout excursion that returns to that exact coordinate has
-    /// retired no Python opcode, so the operand stack it left is still the
-    /// operand stack it comes back to and the saved boxes are restored verbatim
-    /// — the shadow reseed cannot reconstruct them, because mid-expression the
-    /// virtualizable's stack region holds the NULLs the in-flight opcode's
-    /// `popvalue_maybe_none` wrote.  `None` outside a region.
-    ///
-    /// There is nothing to snapshot upstream: `pyjitpl.py`
-    /// `MIFrame.run_one_step` steps a live frame whose `registers_r` survive
-    /// the step.  This mirror is instead reconstructed from source pcs, and
-    /// that reconstruction is exactly what an excursion can lose.
-    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
     /// The exception a bridge resumes with, and after a walked
     /// `set_current_exception` the value that store published.  Read by the
     /// nullary bare-reraise folds, and by the PUSH_EXC_INFO `prev` save only
@@ -163,9 +123,6 @@ impl Default for WalkFrameStateData {
         Self {
             callee_shadow: None,
             outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
             concrete_registers_r: Vec::new(),
@@ -250,15 +207,6 @@ impl WalkFrameState {
         for slot in &mut data.outer_active_boxes {
             replace(slot);
         }
-        for slot in &mut data.vstack_boxes {
-            replace(slot);
-        }
-        replace(&mut data.vstack_last_ref);
-        if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
-            for slot in boxes {
-                replace(slot);
-            }
-        }
         if let Some(shadow) = &mut data.callee_shadow {
             replace(&mut shadow.frame_box);
             for slot in shadow.opref.values_mut() {
@@ -313,15 +261,6 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
     };
     for value in &mut data.outer_active_boxes {
         walk_frame_box(value, visitor);
-    }
-    for value in &mut data.vstack_boxes {
-        walk_frame_box(value, visitor);
-    }
-    walk_frame_box(&mut data.vstack_last_ref, visitor);
-    if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
-        for value in boxes {
-            walk_frame_box(value, visitor);
-        }
     }
     if let Some(shadow) = &mut data.callee_shadow {
         walk_frame_box(&mut shadow.frame_box, visitor);
@@ -396,9 +335,6 @@ mod tests {
         WalkFrameState::new(WalkFrameStateData {
             callee_shadow: Some(shadow),
             outer_active_boxes: vec![op],
-            vstack_boxes: vec![op],
-            vstack_last_ref: op,
-            vstack_reorder_saved: Some((0, 1, vec![op], vec![true])),
             current_exception_seed: Some(op),
             // Only the symbolic seed may use a sentinel: concrete exceptions
             // have their real children traversed by the callback.
@@ -418,18 +354,6 @@ mod tests {
         let op_ok = |op: OpRef| op.as_const_ptr() == Some(GcRef(value));
         assert_eq!(state.outer_active_boxes.len(), 1);
         assert!(state.outer_active_boxes.iter().copied().all(op_ok));
-        assert!(state.vstack_boxes.iter().copied().all(op_ok));
-        assert!(op_ok(state.vstack_last_ref));
-        assert!(
-            state
-                .vstack_reorder_saved
-                .as_ref()
-                .unwrap()
-                .2
-                .iter()
-                .copied()
-                .all(op_ok)
-        );
         assert!(op_ok(state.current_exception_seed.unwrap()));
         assert!(
             matches!(state.concrete_registers_r[0], ConcreteValue::Ref(p) if p as usize == mirror)
@@ -557,9 +481,6 @@ mod tests {
         paused.replace_active_box(old, new);
         let state = state.borrow();
         assert_eq!(state.outer_active_boxes, [new]);
-        assert_eq!(state.vstack_boxes, [new]);
-        assert_eq!(state.vstack_last_ref, new);
-        assert_eq!(state.vstack_reorder_saved.as_ref().unwrap().2, [new]);
         assert_eq!(state.current_exception_seed, Some(new));
         let shadow = state.callee_shadow.as_ref().unwrap();
         assert_eq!(shadow.frame_box, new);

@@ -148,7 +148,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
     // allocates fresh `Vec<OpRef>`s sized to `top_num_regs_* +
     // top_constants_*.len()` — replacing the prior TODO that
-    // reused `sym.registers_r` (a Python locals/stack mirror) as the
+    // reused `sym.registers_r` (a Python locals/stack image) as the
     // MIFrame register file.  The codewriter-compiled arm jitcode
     // expects `R[0]_r = handler = MIFrame self ptr`, which the
     // `argboxes_*` parameters supply via the `setup_call` analog
@@ -221,7 +221,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // PyPy `pyjitpl.py MIFrame.__init__` analog: allocate
     // fresh per-bank register vectors sized to `top_num_regs_* +
     // top_constants_*.len()`.  This replaces the prior TODO
-    // that reused `sym.registers_r` (a Python locals/stack mirror,
+    // that reused `sym.registers_r` (a Python locals/stack image,
     // whose `[0]` slot is Python local 0) as the MIFrame register
     // file.  The codewriter-compiled arm jitcode emits getfield
     // chains rooted at `R[0] = handler = MIFrame self ptr`; the
@@ -434,9 +434,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     pyre_object::PY_NULL
                 },
                 outer_active_boxes: Vec::new(),
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: None,
@@ -471,34 +468,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // resume data pointing at the wrong frame.
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
         let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&wc.frame_state);
-        // #73: seed the walk-level operand-stack box mirror
-        // at entry.  The mirror is only enabled when the outer sym owns the
-        // virtualizable shadow (the production full-body loop trace) — the
-        // synthetic/test entries leave it disabled (`vstack_valid = false`).
-        // Seed at the FIRST-walked jitcode pc (`position`), not `entry_py_pc`,
-        // so the first `step_vstack_mirror` is a no-op (no spurious
-        // entry-boundary reconcile of the not-yet-executed first opcode).
-        // Pure side-data: the snapshot read stays LEGACY until a later slice
-        // makes it authoritative.
         // Exception-edge bridge: enter at the in-frame `except` handler target
-        // instead of the no-exception fallthrough.  `vstack_enter_exception_
-        // handler` re-seeds the operand-stack mirror at handler-entry depth and
-        // places the caught exception box on the new TOS (the same reconstruction
-        // the mid-walk SubRaise catch routing uses at handler entry); `wc.
-        // last_exc_value` is already the standing exception box, so the handler's
-        // `last_exc_value/>r` reads it.  On the normal path, seed the mirror at
-        // the first-walked pc as before.
+        // instead of the no-exception fallthrough.  `wc.last_exc_value` is
+        // already the standing exception box, so the handler's
+        // `last_exc_value/>r` reads it.
         // `finishframe_exception` already moved the top frame. A pc that
         // differs from the failing guard's resume pc is the handler;
         // otherwise keep the exception-table catch the unprepared path uses.
@@ -607,9 +584,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // prepend, so emission order is the chain read outermost-first.
             record_exc_edge_discarded_tracebacks(&mut wc, value_op, &mut exc_edge_box);
             record_bridge_handler_entry_traceback(&mut wc, value_op, exc_edge_box, position)?;
-            // Reconstruct the handler-entry operand stack + push the exc box on
-            // the new TOS (mirrors the mid-walk SubRaise catch routing).
-            vstack_enter_exception_handler(&mut wc, catch_target, value_op);
             // The exception is now caught by this frame's handler; drain the
             // residual-call cell (`blackhole.rs route_to_catch`).
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -639,7 +613,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     seed.exc_concrete,
                     position,
                 )?;
-                vstack_enter_exception_handler(&mut wc, catch_target, seed.exc);
                 catch_target
             } else {
                 // No handler in the root frame: `finishframe_exception` ran out
@@ -733,19 +706,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     },
                 )?;
             }
-            seed_vstack_mirror(&mut wc, sym, position);
             position
         };
-        // `opimpl_goto_if_not` / `generate_guard` snapshot live boxes from
-        // per-pc liveness with no extra seed, but the walker overlay still
-        // needs an on-entry mirror so a later depth>1 branch can name those
-        // boxes.  The prepared exception-resume arm used to skip this when
-        // `catch_exception` was absent (no standing exception on the
-        // no-match bridge), leaving `vstack_valid=false` through the
-        // handler-adjacent Python loop in `searches()`.
-        if !wc.vstack_valid && !carrier_raise_escapes {
-            seed_vstack_mirror(&mut wc, sym, walk_position);
-        }
         let outcome = if carrier_raise_escapes {
             let (finish_arg, finish_arg_type) = wc
                 .session
@@ -766,8 +728,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // fold's freshly minted `ConstPtr` sits in a bank no root area
             // reaches.
             let _bank_guard = crate::trace::InlineRegisterBankGuard::enter(wc.registers_r);
-            // After the register banks and the vstack mirror exist, so the
-            // guard's resume snapshot can rebuild this frame.
+            // After the register banks exist, so the guard's resume snapshot
+            // can rebuild this frame.
             pin_nonconst_standing_exception_class(&mut wc, walk_position)?;
             walk(jitcode_code, walk_position, &mut wc)
         };
@@ -1017,8 +979,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // `setup_bridge_sym` decoded. Null refs and unboxed boxes stay. The
     // result slot is still overwritten when the stack image is captured.
     // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
-    // re-running the root CALL is not a resume of this frame. `call_pc` is
-    // the opcode that ends at `MIFrame.pc`; `resume_pc` is that pc.
+    // re-running the root CALL is not a resume of this frame. `resume_pc`
+    // is the encoded word (`MIFrame.pc`).
     let stack_regs = root_sym.registers_r();
     let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
     let call_stack_overrides = (root_sym.nlocals()..stack_end)
@@ -1027,19 +989,10 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
             paused_stack_box(trace_ctx, opref).map(|value| (slot, value))
         })
         .collect();
-    let call_pc = root_word.and_then(|resume| {
-        let code = unsafe { &*root_sym.jitcode() }
-            .payload
-            .jitcode
-            .code
-            .as_slice();
-        super::jitcode_op_ending_at(code, resume).map(|op| op.pc)
-    });
 
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_pc,
         resume_pc: root_word,
         call_stack_overrides,
         blackhole,
@@ -1077,9 +1030,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         } else {
             return None;
         };
-    // The recipe word is the post-call resume pc. The CALL is the opcode
-    // that ends there (`MIFrame.pc`); the opcode name is not consulted.
-    let call_pc = super::jitcode_op_ending_at(pjc.jitcode.code.as_slice(), entry).map(|op| op.pc);
     // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
     // pc (`setup_resume_at_op`) whichever call op it paused after.
     let resume_marker_jit_pc = pjc
@@ -1260,7 +1210,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: None,
-        call_pc,
         resume_pc: Some(entry),
         call_stack_overrides: Vec::new(),
         blackhole,
@@ -1321,6 +1270,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         w_code,
         is_being_profiled,
         false,
+        None,
         None,
         None,
         None,
@@ -1479,7 +1429,6 @@ fn route_deepest_carrier_exc_edge<Sym: WalkSym>(
     sub_wc.fbw_mode.class_of_last_exc_is_const = true;
     record_exc_edge_discarded_tracebacks(sub_wc, value_op, &mut exc_box);
     record_bridge_handler_entry_traceback(sub_wc, value_op, exc_box, resume_pc)?;
-    vstack_enter_exception_handler(sub_wc, catch_target, value_op);
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     Ok(catch_target)
 }
@@ -1928,7 +1877,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             pending_tails.push(InlineParentFrame {
                 jitcode_index: parent_recipe.jitcode_index as u32,
                 call_jitcode_pc: None,
-                call_pc: None,
                 resume_pc: Some(resume_pc),
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
@@ -2033,9 +1981,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     .then_some(root_sym.last_exc_box()),
                 current_exception_seed_concrete: root_sym.last_exc_value(),
                 outer_active_boxes: outer_active_boxes,
-                vstack_boxes: Vec::new(),
-                vstack_last_ref: OpRef::NONE,
-                vstack_reorder_saved: None,
                 inline_w_globals: callee_w_globals,
                 inline_w_code: callee_w_code,
                 ..Default::default()
@@ -2088,13 +2033,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             is_authoritative_executor: true,
             pending_guard_snapshot_error: None,
 
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-
-            vstack_reorder_ceiling: u32::MAX,
-
-            vstack_handler_landing_py: None,
             // `get_list_of_active_boxes` (`pyjitpl.py`) reads
             // `pc = self.pc - SIZE_LIVE_OP`. `setup_resume_at_op` leaves
             // `MIFrame.pc` at the rebuilt resume coordinate, so a plain
@@ -2188,9 +2126,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }
         // The decoded multi-frame recipe carries this callee's semantic
         // operand stack after its locals/cells prefix.  Preserve that red
-        // frame state on the same per-frame shadow and seed the walk mirror
-        // from it; dropping these slots collapses bridge resume onto the root
-        // frame and later CALL operands reconstruct as NULL.
+        // frame state on the same per-frame shadow (`registers_r` plus the
+        // concrete bank); dropping these slots collapses bridge resume onto
+        // the root frame and later CALL operands reconstruct as NULL.
         let stack_base = local_oprefs.len();
         let n_stack = resumed_stack_oprefs.len().max(rooted_stack_concretes.len());
         for s in 0..n_stack {
@@ -2224,33 +2162,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 return Some(Err(error));
             }
         }
-        if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
-            && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
-            && frame.0.jitcode.code.len() == callee_code.len()
-            && let Some((py_pc, _code_ptr, depth)) = frame.vstack_coordinate_for_jitcode_pc(entry)
-            && depth == resumed_stack_oprefs.len()
-        {
-            sub_wc.frame_state.borrow_mut().vstack_boxes = resumed_stack_oprefs.to_vec();
-            sub_wc.vstack_depth = depth;
-            sub_wc.vstack_cur_pypc = py_pc;
-            sub_wc.vstack_valid = true;
-        }
-        // `resume.py rebuild_from_resumedata` seeds the rebuilt MIFrame's
-        // operand stack directly from the frame recipe.  `ActiveResumeFrame`
-        // is only an optional richer coordinate source; a carrier recipe is
-        // already the authoritative per-frame state and must not be discarded
-        // when that helper object is absent.  Otherwise the first may-force
-        // call invalidates the heapcache, a later CALL reads a color-reloaded
-        // box with no runtime value, and an effectful sub-walk replays from the
-        // guard (the framed-pickle stream is consumed twice).
-        if !sub_wc.vstack_valid {
-            sub_wc.frame_state.borrow_mut().vstack_boxes = resumed_stack_oprefs.to_vec();
-            sub_wc.vstack_depth = resumed_stack_oprefs.len();
-            sub_wc.vstack_cur_pypc =
-                crate::py_coord::resume_py_pc_for_jitcode_word(consts.jitcode_index, entry as i32)
-                    as u32;
-            sub_wc.vstack_valid = true;
-        }
         // As above: the callee bank is a local of this frame.
         let bank_guard = crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
         // `pyjitpl.py finishframe_exception`: `frame.pc = target; raise ChangeFrame`.
@@ -2273,7 +2184,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     drop(bank_guard);
                     return Some(Err(error));
                 }
-                vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
                 catch_target
             }
             Some(FrameHandlerEntry::Restored {
@@ -2352,7 +2262,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                             drop(bank_guard);
                             return Some(Err(error));
                         }
-                        vstack_enter_exception_handler(&mut sub_wc, catch_target, value_op);
                         catch_target
                     }
                     None => {

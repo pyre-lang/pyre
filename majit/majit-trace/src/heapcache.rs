@@ -335,6 +335,19 @@ impl CacheEntry {
             seen.clear();
         }
     }
+
+    fn retain_live_frontend_ops(&mut self, live: &dyn Fn(OpRef) -> bool) {
+        self.cache_anything
+            .retain(|&ref_box, fieldbox| live(ref_box) && live(*fieldbox));
+        self.cache_seen_allocation
+            .retain(|&ref_box, fieldbox| live(ref_box) && live(*fieldbox));
+        if let Some(seen) = &mut self.quasiimmut_seen {
+            seen.retain(|&ref_box| live(ref_box));
+        }
+        if self.last_const_box.is_some_and(|slot| !live(slot)) {
+            self.last_const_box = None;
+        }
+    }
 }
 
 /// RPython heapcache.py: FieldUpdater helper struct.
@@ -1077,6 +1090,50 @@ impl HeapCache {
         }
         if let Some(slot) = self.loopinvariant_result {
             visit(slot);
+        }
+    }
+
+    /// `history.py` `*FrontendOp` is a unique Python object; `heapcache.py`
+    /// `cache_anything[box]` keys that identity. `history.cut` discards ops
+    /// and those objects can never collide with a later `record_*`. Pyre's
+    /// `OpRef` is a TAGBOX index (`recorder.cut` / `history.cut` reuse it).
+    /// A `*Op` at `raw() >= live_index` is a discarded FrontendOp; Const /
+    /// InputArg identities survive the cut.
+    fn frontend_op_survives_cut(op: OpRef, live_index: u32) -> bool {
+        match op {
+            OpRef::None
+            | OpRef::ConstInt(_)
+            | OpRef::ConstFloat(_)
+            | OpRef::ConstPtr(_)
+            | OpRef::InputArgInt(_)
+            | OpRef::InputArgFloat(_)
+            | OpRef::InputArgRef(_) => true,
+            OpRef::IntOp(x) | OpRef::FloatOp(x) | OpRef::RefOp(x) | OpRef::VoidOp(x) => {
+                x < live_index
+            }
+            OpRef::TempVar(_) => false,
+        }
+    }
+
+    /// Drop `cache_anything` entries whose key or fieldbox is a discarded
+    /// `*FrontendOp` after `recorder.cut` (`pos._index` is the new
+    /// `box_count`). Upstream never needs this: a new `*FrontendOp(pos,
+    /// value)` is a new Python object, so it cannot hit the old dict key.
+    pub fn drop_dead_frontend_ops(&mut self, live_index: u32) {
+        let live = |op: OpRef| Self::frontend_op_survives_cut(op, live_index);
+        for entry in self.heap_cache.values_mut() {
+            entry.retain_live_frontend_ops(&live);
+        }
+        for index_map in self.heap_array_cache.values_mut() {
+            for entry in index_map.values_mut() {
+                entry.retain_live_frontend_ops(&live);
+            }
+        }
+        if self.loopinvariant_result.is_some_and(|slot| !live(slot)) {
+            self.loopinvariant_descr = None;
+            self.loopinvariant_arg0 = None;
+            self.loopinvariant_result = None;
+            self.loopinvariant_resvalue = None;
         }
     }
 
@@ -2718,6 +2775,28 @@ mod tests {
             Some(OpRef::ref_op(30))
         );
         assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None); // invalidated
+    }
+
+    /// `history.cut` discards `*FrontendOp` objects; pyre's OpRef index is
+    /// reused, so a cache row that still names a box at the cut must go.
+    #[test]
+    fn drop_dead_frontend_ops_drops_cut_boxes_and_keeps_inputargs() {
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
+        let live_obj = OpRef::input_arg_ref(0);
+        let dead_obj = OpRef::ref_op(10);
+        let live_field = OpRef::input_arg_ref(1);
+        let dead_field = OpRef::ref_op(11);
+        cache.getfield_now_known(live_obj, 1, dead_field, IDENTITY_ORACLE);
+        cache.getfield_now_known(dead_obj, 1, live_field, IDENTITY_ORACLE);
+        cache.getfield_now_known(live_obj, 2, live_field, IDENTITY_ORACLE);
+        cache.drop_dead_frontend_ops(10);
+        assert_eq!(cache.getfield_cached(live_obj, 1, IDENTITY_ORACLE), None);
+        assert_eq!(cache.getfield_cached(dead_obj, 1, IDENTITY_ORACLE), None);
+        assert_eq!(
+            cache.getfield_cached(live_obj, 2, IDENTITY_ORACLE),
+            Some(live_field)
+        );
     }
 
     /// Two STRUCTs sharing `(offset, size, Ref)` intern distinct HeapCache

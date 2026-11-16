@@ -7284,11 +7284,9 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // and double-applies the residual's non-journaled body effects.
         //
         // `tracing_before_residual_call` stamps the identity box
-        // (`standard_virtualizable_ptr` / the live frame). A root portal seed
-        // can point `virtualizable_heap_ptr` at the `snapshot_for_tracing`
-        // copy, which still holds an Active compiled-loop token, so the heap
-        // filter above misses TOKEN_TRACING_RESCALL. `force_now` on the frame
-        // Python handed over clears the stamped token.
+        // (`standard_virtualizable_ptr` / the live frame), and `force_now`
+        // decides from that object's own `vable_token`.  `force_now` on the
+        // frame Python handed over clears the stamped token.
         if traced_frame_escaped {
             pyre_jit_trace::jitcode_dispatch::attribute_last_escape_force();
             let frame_rescall = matches!(

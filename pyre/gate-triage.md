@@ -94,7 +94,7 @@ Kept as-is; listed for completeness.
   not experiments: `PYRE_FBW_DEBUG_ABORT`, `_INLINE_DIAG`, `_MF_DIAG`,
   `_STRICT_DIAG`, `PYRE_WALK_PERFN_JITCODE`, `PYRE_DUMP_PERFN_JITCODE`,
   `PYRE_PCDEP_VALIDATE`, `MAJIT_MIR_FRAMESTATE_DEBUG`,
-  `_FRAMESTATE_STRICT`, `MAJIT_MIR_FRONTEND_DEBUG`, `PYRE_VSTACK_DIAG`,
+  `_FRAMESTATE_STRICT`, `MAJIT_MIR_FRONTEND_DEBUG`,
   `MAJIT_PROFILE_PIPELINE`,
   `MAJIT_RTYPER_VERBOSE`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`,
@@ -296,14 +296,14 @@ configuration.
 `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
 `MAJIT_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `MAJIT_NO_UNROLL`,
-`PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
+`PYRE_PCMAP_AFTERRESIDUAL_AUDIT`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
 `MAJIT_PORTAL_RCA`, `PYRE_PORTAL_INTERPRET`, `PYRE_PORTAL_METATRACE`,
 `MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_SS_COLLECT_ALL`, `PYRE_SS_STATS`,
 `PYRE_UNJOURNALED_SITE`,
-`PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
+`PYRE_VSTACK_EXACT_AUDIT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
@@ -338,16 +338,8 @@ value knobs bound the capture window, sampling rate, and report size. This is a
 diagnostic tool rather than a temporary runtime experiment, so it retires only
 if the example itself is removed.
 
-`PYRE_VSTACK_NO_EXACT` and `PYRE_VSTACK_KEEP_REORDER` are A/B switches over the
-walk-level operand-stack mirror, each restoring the behaviour its default
-replaced: resolving the mirror's Python-PC coordinate from the floor tier rather
-than from the per-emission segmentation, and leaving an armed out-of-order
-region in place across a mirror re-seed. They exist so each switchover stays
-measurable on one binary — any env var of any name moves the allocation layout,
-so a knob and its control must live in the same build. Each goes when the
-behaviour it restores has no plausible reader left to compare against.
-`PYRE_VSTACK_EXACT_AUDIT` dumps that segmentation table at build time and, on
-the walk side, the coordinate it yields; it is a report with no ON behaviour.
+`PYRE_VSTACK_EXACT_AUDIT` dumps the codewriter's per-emission Python-PC
+segmentation table at build time; it is a report with no ON behaviour.
 
 `PYRE_UNJOURNALED_SITE` names the site and the call opcode behind the
 walk-level "this walk still owes an effect" flag, which six call sites set and

@@ -1,10 +1,10 @@
 # CPython-suite gap: iteration tests cannot exercise a JIT inline-walk abort stack.
 # parity-tests reason: this is a pyre trace-abort operand-stack regression.
 
-# An aborted CALL sub-walk rebuilds the FOR_ITER caller's stack from the vstack
-# and the encoded residual. Method-form CALLs have a variable-width leading Int
-# list; reading them at the plain-call offset once restored the iterator as the
-# subscript index. `re._compile_info` reaches that exact hot BRANCH/`p[0]`
+# An aborted CALL sub-walk rebuilds the FOR_ITER caller's stack from
+# `registers_r` / `virtualizable_boxes` and the encoded residual. Method-form
+# CALLs have a variable-width leading Int list; reading them at the plain-call
+# offset once restored the iterator as the subscript index. `re._compile_info` reaches that exact hot BRANCH/`p[0]`
 # shape only with a large alternation, and compilation itself exposes a wrong
 # operand by raising.
 

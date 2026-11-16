@@ -7500,15 +7500,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                             recorded,
                             majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
                         );
-                        // `pyjitpl.py` keeps the residual CALL result in the
-                        // MIFrame Ref register consumed by the enclosing
-                        // Python opcode.  This direct-record path bypasses
-                        // `write_ref_reg`, so publish the same last-Ref value
-                        // to the operand-stack mirror explicitly.  Without
-                        // it a CALL returning None leaves a NULL hole at the
-                        // following POP_TOP and an abort cannot flush past an
-                        // already-executed mutation such as `seen.add(w)`.
-                        ctx.frame_state.borrow_mut().vstack_last_ref = recorded;
                     }
                     majit_ir::Type::Float => {
                         ctx.trace_ctx.set_opref_concrete(
@@ -7558,20 +7549,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     body,
                     for_iter_journaled,
                 );
-                // #73/#267: the item lands on the operand-stack TOS through the
-                // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
-                // `setarrayitem_vable_r` push, and the residual result is
-                // stamped via `set_opref_concrete`, not `write_ref_reg` — so
-                // neither mirror chokepoint sees the item and `vstack_last_ref`
-                // still holds whatever inner box the ForIterNext produced.  Seed
-                // it with the item OpRef so the FOR_ITER boundary
-                // (`ResultToTos`) places the item, not a stale box, on the new
-                // TOS.  This runs for every `ForIterNext` residual once it
-                // returns, placing the item OpRef on the new TOS for the
-                // FOR_ITER `ResultToTos` boundary. An inline const has no slot.
-                if !recorded.is_none() && recorded.inline_const_to_value().is_none() {
-                    ctx.frame_state.borrow_mut().vstack_last_ref = recorded;
-                }
                 if fbw_debug_abort_enabled() {
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
@@ -7982,7 +7959,7 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
     // Same dispatch-loop head rule as [`live_py_pc_from_snapshot`].
     if !ctx.fbw_mode.transparent_helper_subwalk
-        && let Some(py_pc) = super::vstack_mirror::dispatch_head_py_pc(ctx, &pjc, jit_pc)
+        && let Some(py_pc) = super::dispatch_head_py_pc(ctx, &pjc, jit_pc)
     {
         return Some(py_pc);
     }
@@ -8008,7 +7985,7 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
     // static table only knows where flatten laid the head out. A transparent
     // helper sub-walk's registers are the helper's, not this jitcode's.
     if !ctx.fbw_mode.transparent_helper_subwalk
-        && let Some(py_pc) = super::vstack_mirror::dispatch_head_py_pc(ctx, &jc.payload, jit_pc)
+        && let Some(py_pc) = super::dispatch_head_py_pc(ctx, &jc.payload, jit_pc)
     {
         return Some(py_pc);
     }
@@ -8056,8 +8033,7 @@ fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) 
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
     // laid out past the last opcode start, where the floor mapping names a
-    // later instruction; the exact table names the owning opcode
-    // (`vstack_step_py_pc` prefers it for the same reason).
+    // later instruction; the exact table names the owning opcode.
     let py_pc =
         crate::pyjitcode::exact_py_pc_for_jitcode_pc(&payload.metadata.py_exact_by_jit_pc, jit_pc)
             .unwrap_or_else(|| {
@@ -8209,6 +8185,13 @@ fn inline_callee_shadow_states<Sym: WalkSym>(
         }
         if let HelperCallEntry::Frame(entry) = &level.call_entry {
             if let Some(state) = entry.frame_state.as_ref() {
+                push_unique_frame_state(&mut out, state);
+            }
+        }
+    }
+    if let Some(level) = session.pending_portal_level.as_ref() {
+        for parent in &level.parents {
+            if let Some(state) = parent.frame_state.as_ref() {
                 push_unique_frame_state(&mut out, state);
             }
         }
@@ -13928,11 +13911,6 @@ mod tests {
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
@@ -14098,11 +14076,6 @@ mod tests {
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             pending_guard_snapshot_error: None,
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };

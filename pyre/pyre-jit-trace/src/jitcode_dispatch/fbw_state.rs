@@ -423,7 +423,6 @@ pub(crate) fn fbw_store_journal_reset() {
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
@@ -467,7 +466,6 @@ pub struct ParkedWalkTls {
     executed_residual_plain: u32,
     executed_effect_count: usize,
     heap_writing_effect_count: usize,
-    opcode_entry_effects: Option<(usize, usize)>,
     structural_abort_opcode_effects: Option<(usize, usize)>,
     abort_call_resume: Option<super::InlineAbortCarrier>,
     built_exc: std::collections::HashSet<OpRef>,
@@ -546,7 +544,6 @@ pub fn park_walk_tls() {
         executed_residual_plain: super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.replace(0)),
         executed_effect_count: super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.replace(0)),
         heap_writing_effect_count: super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.replace(0)),
-        opcode_entry_effects: super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.take()),
         structural_abort_opcode_effects: super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
             .with(|c| c.take()),
         abort_call_resume: super::FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take()),
@@ -596,7 +593,6 @@ pub fn restore_walk_tls() {
     super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(parked.executed_residual_plain));
     super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(parked.executed_effect_count));
     super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(parked.heap_writing_effect_count));
-    super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(parked.opcode_entry_effects));
     super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
         .with(|c| c.set(parked.structural_abort_opcode_effects));
     super::FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = parked.abort_call_resume);
@@ -3578,12 +3574,6 @@ pub(crate) fn bump_keep_recording_too_long_once(session: &std::cell::RefCell<Wal
 
 pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
-}
-
-/// Record the executed-effect odometer as the walk enters Python opcode
-/// `py_pc` (see [`FBW_OPCODE_ENTRY_EFFECTS`]).
-pub(crate) fn fbw_note_opcode_entry_effects(py_pc: usize) {
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(Some((py_pc, fbw_executed_effect_count()))));
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).

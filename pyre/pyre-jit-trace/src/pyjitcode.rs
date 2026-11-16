@@ -104,8 +104,8 @@ pub struct PyJitCodeMetadata {
     /// trailing marker is re-keyed to the call's fallthrough.
     ///
     /// That makes "did the walk leave the opcode it was in" answerable rather
-    /// than inferable: the PC owning `jit_pc` differing from the mirror's
-    /// current coordinate IS the opcode boundary. Empty for skeleton / fixture
+    /// than inferable: the PC owning `jit_pc` differing from the previous
+    /// step's coordinate is the opcode boundary. Empty for skeleton / fixture
     /// metadata, in which case consumers must fall back to the floor tier.
     pub py_exact_by_jit_pc: Vec<(u32, u32)>,
     /// Exact `abort_permanent` jitcode offset → the Python PC whose lowering
@@ -195,20 +195,10 @@ pub struct PyJitCodeMetadata {
     /// (same offsets, same order); each value is
     /// `liveness_for(code).depth_at_py_pc().get(py).copied().unwrap_or(0)` for
     /// that segment's py. NO block-head marker precedence and NO trivia skip —
-    /// a floor lookup reproduces `depth_at_py_pc[vstack_containing_py_pc(jit_pc)]`
-    /// for every jit_pc. Empty for skeleton / fixture metadata.
-    pub depth_containing_by_jit_pc: Vec<(u32, u16)>,
-    /// Slice D (#73): exact-match STATIC-liveness depth twin of the block-head
-    /// marker resolution (`metadata_block_head_py_pc`). Keys mirror
-    /// `block_head_py_by_jit_pc` exactly (same marker offsets, same order); each
-    /// value is
-    /// `liveness_for(code).depth_at_py_pc().get(block_head_py).copied().unwrap_or(0)`
-    /// for that marker's py. EXACT binary search only (no predecessor, no
-    /// floor) — a miss means `start_pc` is not a block-head marker and the
-    /// consumer falls back to the floor twin, mirroring
-    /// `vstack_initial_py_pc`'s `metadata_block_head_py_pc(...).unwrap_or(floor)`.
+    /// a floor lookup reproduces
+    /// `depth_at_py_pc[floor_segment_for_jitcode_pc(jit_pc)]` for every jit_pc.
     /// Empty for skeleton / fixture metadata.
-    pub depth_block_head_by_jit_pc: Vec<(usize, u16)>,
+    pub depth_containing_by_jit_pc: Vec<(u32, u16)>,
     /// Reproduces `pcdep_color_slots[skip_python_trivia_forward(
     /// containing_py_pc_for_jitcode_pc(jit_pc))]`, resolved with the same exact-marker
     /// and predecessor-op-start tiers as the trivia-aware depth twin.
@@ -1018,7 +1008,7 @@ impl PyJitCode {
     /// byte offset via the `depth_containing_by_jit_pc` twin. Same
     /// `partition_point` floor pivot as `floor_segment_for_jitcode_pc` over the
     /// same keys as `py_floor_by_jit_pc`, so it equals
-    /// `liveness_for(code).depth_at_py_pc().get(vstack_containing_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
+    /// `liveness_for(code).depth_at_py_pc().get(floor_py as usize).copied().unwrap_or(0)`
     /// by construction — no block-head marker precedence, no trivia skip. `None`
     /// when the twin is empty (skeleton / fixture) — see
     /// [`Self::depth_containing_populated`].
@@ -1033,19 +1023,6 @@ impl PyJitCode {
     /// py_pc-keyed static-liveness read there.
     pub fn depth_containing_populated(&self) -> bool {
         !self.metadata.depth_containing_by_jit_pc.is_empty()
-    }
-
-    /// Exact-match block-head marker STATIC-liveness depth keyed by a JitCode
-    /// byte offset via the `depth_block_head_by_jit_pc` twin.
-    /// Equals `liveness_for(code).depth_at_py_pc().get(metadata_block_head_py_pc(jit_pc) as usize).copied().unwrap_or(0)`
-    /// when `jit_pc` is a block-head marker offset; `None` when it is not (the
-    /// consumer then falls back to the floor twin) or the table is empty.
-    pub fn depth_block_head_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
-        let table = &self.metadata.depth_block_head_by_jit_pc;
-        table
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-            .ok()
-            .map(|i| table[i].1)
     }
 
     /// The const operand-stack slots keyed by a JitCode byte offset via
@@ -1481,7 +1458,6 @@ impl PyJitCodeMetadata {
             depth_trivia_marker_by_jit_pc: Vec::new(),
             depth_trivia_pred_by_jit_pc: Vec::new(),
             depth_containing_by_jit_pc: Vec::new(),
-            depth_block_head_by_jit_pc: Vec::new(),
             pcdep_trivia_marker_by_jit_pc: Vec::new(),
             pcdep_trivia_pred_by_jit_pc: Vec::new(),
             const_ref_trivia_marker_by_jit_pc: Vec::new(),

@@ -2514,6 +2514,7 @@ impl TraceCtx {
     /// regresses bench (tested under ).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
+        self.heap_cache.drop_dead_frontend_ops(pos._index);
         if let Some(observer) = self.cut_observer {
             observer(&pos);
         }
@@ -2527,6 +2528,7 @@ impl TraceCtx {
     /// optimizer remaps every published snapshot.
     pub fn cut_trace_with_snapshots(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
+        self.heap_cache.drop_dead_frontend_ops(pos._index);
         if self.recorder.has_byte_buffer() {
             // `cut_at` does not rewind `_snapshot_data`. Live guards after
             // the cut no longer name the discarded captures.
@@ -3889,6 +3891,7 @@ impl TraceCtx {
         if all_const {
             // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
+            self.heap_cache.drop_dead_frontend_ops(patch_pos._index);
             // history.py/268/314 — Const{Int,Float,Ptr}.value inline.
             let const_opref = match resbox_as_const {
                 Value::Int(v) => OpRef::const_int(v),
@@ -3914,6 +3917,7 @@ impl TraceCtx {
         };
         let pure_opcode = OpCode::call_pure_for_type(ret_type);
         self.recorder.cut(patch_pos);
+        self.heap_cache.drop_dead_frontend_ops(patch_pos._index);
         // pyjitpl.py MetaInterp.record_result_of_call_pure →
         // history.record_nospec(opnum, argboxes, resbox_as_const, descr)
         self.recorder.record_op_with_descr_value(

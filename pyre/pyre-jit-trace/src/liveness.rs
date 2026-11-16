@@ -884,25 +884,6 @@ pub(crate) fn target_pc(
     }
 }
 
-/// Handler PC an exception raised at `pc` transfers to, or `None` when no
-/// entry covers `pc`.
-///
-/// [`target_pc`] only reads a branch delta out of the instruction's own
-/// operand, so it cannot see this edge: under the zero-cost exception tables
-/// the target lives in `co_exceptiontable`, not in the raising opcode. The
-/// edge is no less a control-flow successor for that — a caller enumerating
-/// an opcode's successors needs both.
-///
-/// `lookup_exceptiontable` speaks byte offsets and the walk speaks code-unit
-/// indices, so both ends are converted here, the same convention the
-/// codewriter states at its own decode sites.
-pub(crate) fn exception_target_pc(code: &CodeObject, pc: usize) -> Option<usize> {
-    let offset = u32::try_from(pc * 2).ok()?;
-    let (target, _depth, _lasti) =
-        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, offset)?;
-    Some(target as usize / 2)
-}
-
 /// Cache liveness info per CodeObject pointer.
 /// codewriter/liveness.py parity: thread-local cache of computed liveness.
 pub fn liveness_for(code: *const CodeObject) -> &'static LiveVars {

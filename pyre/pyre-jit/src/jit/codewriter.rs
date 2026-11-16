@@ -13660,9 +13660,10 @@ impl CodeWriter {
                             // (jtransform.py `do_fixed_list_setitem`, vable
                             // branch); a guard-failure resume walk reconstructs
                             // the live frame from those slots, so emit the crossed
-                            // `setarrayitem_vable_r` writes that keep the mirror
-                            // consistent.  Previously this arm emitted
-                            // `abort_permanent`, which made any resume walk that
+                            // `setarrayitem_vable_r` writes that keep the
+                            // virtualizable array consistent.  Previously this
+                            // arm emitted `abort_permanent`, which made any
+                            // resume walk that
                             // reached a SWAP (e.g. the `return`-from-`except`
                             // cleanup `SWAP 2; POP_EXCEPT; RETURN_VALUE`) fail.
                             let depth = i.get(op_arg) as usize;
@@ -16399,7 +16400,7 @@ impl CodeWriter {
                 {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
                     // pyframe.py `pushvalue` semantics — graph
-                    // dual-write of the stack mirror.
+                    // dual-write of the virtualizable operand stack.
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
@@ -17476,7 +17477,7 @@ impl CodeWriter {
         // many-to-one only over the positions it folds, and the marker splices
         // only insert.  A future pass that deletes an ordinary op, or an
         // encoder arm that emits nothing, breaks that chain — loudly here
-        // rather than silently in the walk mirror's coordinate.
+        // rather than silently in the walker's jitcode-pc coordinate.
         debug_assert!(
             pc_runs.windows(2).all(|w| w[0].0 != w[1].0),
             "pc-run starts must land on distinct jitcode offsets: {pc_runs:?}"
@@ -17623,31 +17624,16 @@ impl CodeWriter {
             );
         }
 
-        // Floor-only depth twin of the containing-opcode resolution
-        // (`vstack_containing_py_pc`). Shares `py_floor_by_jit_pc`'s keys
-        // EXACTLY — no block-head marker precedence, no trivia skip — so a
-        // `partition_point(off <= jit_pc)` floor lookup reproduces
+        // Floor-only depth twin of the containing-opcode resolution.
+        // Shares `py_floor_by_jit_pc`'s keys EXACTLY — no block-head marker
+        // precedence, no trivia skip — so a `partition_point(off <= jit_pc)`
+        // floor lookup reproduces
         // `liveness_for(code).depth_at_py_pc().get(containing_py).copied().unwrap_or(0)`
         // for every jit_pc, including the out-of-range → 0 collapse baked here.
         let depth_containing_by_jit_pc: Vec<(u32, u16)> = {
             let static_depth =
                 pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
             py_floor_by_jit_pc
-                .iter()
-                .map(|&(off, py)| (off, static_depth.get(py as usize).copied().unwrap_or(0)))
-                .collect()
-        };
-
-        // Exact-match depth twin of the block-head marker resolution
-        // (`metadata_block_head_py_pc`). Same keys as
-        // `block_head_py_by_jit_pc`, values from the SAME static liveness the
-        // floor twin reads, so an exact lookup reproduces
-        // `depth_at_py_pc[metadata_block_head_py_pc(jit_pc)]` at seam #7's
-        // permuted FOR_ITER-entry arm. Empty when the code has no block heads.
-        let depth_block_head_by_jit_pc: Vec<(usize, u16)> = {
-            let static_depth =
-                pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
-            block_head_py_by_jit_pc
                 .iter()
                 .map(|&(off, py)| (off, static_depth.get(py as usize).copied().unwrap_or(0)))
                 .collect()
@@ -17852,8 +17838,7 @@ impl CodeWriter {
         let mut const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         // Trivia-aware predecessor twin of the STATIC dense
-        // liveness depth.  The ENCODE-side branch-resume depth reader
-        // (`branch_resume_target_stack_depth`) does NOT
+        // liveness depth.  The encode-side reader does NOT
         // read `depth_at_py_pc[inv(target)]` directly — it advances the inverted
         // py through `skip_python_trivia_forward` (a not-taken branch coordinate
         // can land on a `NOT_TAKEN`/`Cache` trivia op) BEFORE indexing the
@@ -18277,7 +18262,6 @@ impl CodeWriter {
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,
             depth_containing_by_jit_pc,
-            depth_block_head_by_jit_pc,
             pcdep_trivia_marker_by_jit_pc,
             pcdep_trivia_pred_by_jit_pc,
             const_ref_trivia_marker_by_jit_pc,
