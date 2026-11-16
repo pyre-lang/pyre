@@ -427,6 +427,15 @@ pub(in crate::front::mir) struct AggregateField {
     /// Declaring class of a marked exception-class field
     /// (`ClassDef.get_owner`). `None` keeps the constructor's result class.
     pub(in crate::front::mir) owner_root: Option<String>,
+    /// Closure-env exclusive borrow of a primitive: the stored word is the
+    /// raw cell address (`rdtoa.py` `strtod` `end_ptr`). `history.getkind`
+    /// of a raw Ptr is `'int'`.
+    pub(in crate::front::mir) cell_address: bool,
+    /// Closure-env shared borrow of a primitive: FORCE seeds the attr as
+    /// the peeled scalar (`tyref_shared_borrow_primitive_value`). A cell
+    /// address stored here is converted by `emit_cell_load`
+    /// (`InstanceRepr.rtype_setattr` / `hop.inputargs`).
+    pub(in crate::front::mir) peeled_shared_primitive: bool,
 }
 
 /// Owner of a constructor `setfield`.
@@ -646,6 +655,10 @@ fn ctor_ccharp_field_store(
     field: &AggregateField,
     value: &Variable,
 ) -> Result<(Variable, ValueType), LowerError> {
+    if field.cell_address {
+        // Raw cell address. `history.getkind` of a raw Ptr is `'int'`.
+        return Ok((value.clone(), ValueType::Int));
+    }
     if field.list_of_str {
         // The operand stays the moved rust-heap header.
         // `HighLevelOp.convertvar` runs in `jtransform` before

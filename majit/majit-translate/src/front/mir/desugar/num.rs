@@ -1587,6 +1587,8 @@ impl<'a> Lowering<'a> {
                     list_of_str: false,
                     raw_owned_root: None,
                     owner_root: None,
+                    cell_address: false,
+                    peeled_shared_primitive: false,
                 })
                 .collect(),
         };

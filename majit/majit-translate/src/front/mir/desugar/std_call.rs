@@ -7514,10 +7514,16 @@ impl<'a> Lowering<'a> {
             && let Some((_, name, ty, _, _)) = self.resolve_adt_field(&base.ty, payload)
             && let Some(type_path) = self.field_decl_path(&base.ty)
         {
+            let owner_is_closure_env = self
+                .field_base_adt(&base.ty)
+                .and_then(type_decl_ref_adt_id)
+                .and_then(|id| self.llbc.type_by_id(id))
+                .is_some_and(type_decl_is_closure_env);
             published_struct_field_layout(
                 &type_path,
                 &name,
                 &ty,
+                owner_is_closure_env,
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,

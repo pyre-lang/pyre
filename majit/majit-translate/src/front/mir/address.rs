@@ -451,23 +451,63 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             let PlaceKind::Local(id) = place.kind else {
                 continue;
             };
-            let id = id as usize;
-            if id <= arg_count {
-                continue;
-            }
-            let Some(decl) = body.locals.locals.get(id) else {
+            bind_function_local_primitive_cell(
+                &mut locals,
+                &mut descr,
+                body,
+                arg_count,
+                id as usize,
+                llbc,
+            );
+        }
+    }
+    // Exclusive borrow of a function-local primitive stored into a
+    // closure-env aggregate (`Rvalue::Aggregate`, `TypeDeclSrc::Closure`).
+    // The callee writes through that address (`rewrite_op_raw_store`);
+    // the parent must use the same Char-varsize cell (`rdtoa.py`
+    // `strtod` `end_ptr`). A shared `&P` capture stays the peeled
+    // scalar (`tyref_shared_borrow_primitive_value`).
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
-            if !tyref_is_primitive_scalar(&decl.ty, llbc) {
-                continue;
-            }
-            let Some(cell_descr) =
-                tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
-            else {
+            let Rvalue::Aggregate(_, operands) = rvalue else {
                 continue;
             };
-            locals.insert(id);
-            descr[id] = Some(cell_descr);
+            if !tyref_is_closure_env(&dest.ty, llbc) {
+                continue;
+            }
+            for op in operands {
+                let Some(passed) = operand_tyref(op) else {
+                    continue;
+                };
+                if !pointer_kind_is_mut(passed, llbc, "Ref", 2) {
+                    continue;
+                }
+                if !tyref_is_ref_of_residual_scalar_word(passed, llbc, gc_struct_ids) {
+                    continue;
+                }
+                let Some(place) =
+                    body_resolved_borrow_place(body, forward, operand_local(Some(op)), llbc)
+                else {
+                    continue;
+                };
+                let PlaceKind::Local(id) = place.kind else {
+                    continue;
+                };
+                bind_function_local_primitive_cell(
+                    &mut locals,
+                    &mut descr,
+                    body,
+                    arg_count,
+                    id as usize,
+                    llbc,
+                );
+            }
         }
     }
     let mut has_storage_live = bit_set::BitSet::with_capacity(n_locals);
@@ -487,6 +527,32 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
         descr,
         has_storage_live,
     }
+}
+
+fn bind_function_local_primitive_cell(
+    locals: &mut bit_set::BitSet,
+    descr: &mut [Option<(ValueType, usize, bool)>],
+    body: &Unstructured,
+    arg_count: usize,
+    id: usize,
+    llbc: &Llbc,
+) {
+    if id <= arg_count || locals.contains(id) {
+        return;
+    }
+    let Some(decl) = body.locals.locals.get(id) else {
+        return;
+    };
+    if !tyref_is_primitive_scalar(&decl.ty, llbc) {
+        return;
+    }
+    let Some(cell_descr) =
+        tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+    else {
+        return;
+    };
+    locals.insert(id);
+    descr[id] = Some(cell_descr);
 }
 
 /// Residual `&T` of a parameter or field: one Char-varsize cell for the
@@ -962,13 +1028,98 @@ impl<'a> Lowering<'a> {
     }
 
     pub(in crate::front::mir) fn variable_is_cell_ptr(&self, var: &Variable) -> bool {
-        self.cell_locals.iter().any(|local| {
+        self.cell_local_of_ptr(var).is_some()
+    }
+
+    pub(in crate::front::mir) fn cell_local_of_ptr(&self, var: &Variable) -> Option<usize> {
+        self.cell_locals.iter().find(|&local| {
             self.local_var
                 .get(local)
                 .and_then(|slot| slot.as_ref())
                 .and_then(|value| value.one().ok())
                 .is_some_and(|ptr| ptr == *var)
         })
+    }
+
+    /// `(*env).flag` whose declared type is an exclusive borrow of a
+    /// primitive: the field word is the cell address
+    /// (`closure_env_field_is_cell_address`).
+    pub(in crate::front::mir) fn closure_env_cell_address_field_pointee(
+        &self,
+        place: &Place,
+    ) -> Option<TyRef> {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+            return None;
+        };
+        let field_payload = v.as_object().and_then(|m| m.get("Field"))?;
+        if !tyref_is_closure_env(&inner.ty, self.llbc) {
+            return None;
+        }
+        let (_, _, field_ty, _, _) = self.resolve_adt_field(&inner.ty, field_payload)?;
+        let pointee = closure_env_field_is_cell_address(true, &field_ty, self.llbc)?;
+        Some(TyRef::Other(pointee.into()))
+    }
+
+    /// Exclusive reborrow `&mut *(*env).flag`: the field already holds
+    /// the cell address (`reborrow_cell_param` of a cell parameter).
+    pub(in crate::front::mir) fn exclusive_reborrow_cell_address_inner(
+        &self,
+        place: &Place,
+    ) -> Option<Place> {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        if !matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
+            return None;
+        }
+        self.closure_env_cell_address_field_pointee(inner)?;
+        Some(clone_place(inner))
+    }
+
+    /// Place whose representation is a cell address: a function-local
+    /// cell, a cell parameter (`reborrow_cell_param`), or a closure-env
+    /// cell-address field.
+    pub(in crate::front::mir) fn place_is_cell_address_repr(&self, place: &Place) -> bool {
+        self.place_is_cell_address_repr_at(place, true)
+    }
+
+    /// `follow_recorded_borrow` is one hop through `atomic_ref_place` /
+    /// `concrete_borrow_place` (the latter already walks Deref at most
+    /// 8 times). The recursive call passes `false`, so a Local-to-Local
+    /// cycle in `atomic_ref_place` cannot loop.
+    fn place_is_cell_address_repr_at(&self, place: &Place, follow_recorded_borrow: bool) -> bool {
+        if self.cell_local_of_address_place(place).is_some()
+            || self.reborrow_cell_param(place).is_some()
+            || self.closure_env_cell_address_field_pointee(place).is_some()
+            || self.exclusive_reborrow_cell_address_inner(place).is_some()
+        {
+            return true;
+        }
+        let PlaceKind::Local(i) = &place.kind else {
+            return false;
+        };
+        let i = *i as usize;
+        if follow_recorded_borrow && let Some(recorded) = self.atomic_ref_place.get(&i) {
+            let followed = self.concrete_borrow_place(recorded.clone());
+            if self.place_is_cell_address_repr_at(&followed, false) {
+                return true;
+            }
+        }
+        if !follow_recorded_borrow {
+            return false;
+        }
+        self.local_var
+            .get(i)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())
+            .is_some_and(|var| self.variable_is_cell_ptr(&var))
+    }
+
+    pub(in crate::front::mir) fn operand_is_cell_address_repr(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self.place_is_cell_address_repr(place),
+            Operand::Const(_) => false,
+        }
     }
 
     fn operand_names_cell_address(&self, op: &Operand) -> bool {
