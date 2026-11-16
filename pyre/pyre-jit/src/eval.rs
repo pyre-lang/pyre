@@ -502,7 +502,7 @@ unsafe fn pyre_object_eq_w_trampoline(
     match pyre_interpreter::baseobjspace::eq_w(a, b) {
         Ok(v) => v,
         Err(mut e) => {
-            pyre_interpreter::baseobjspace::note_dict_callback_raise(false);
+            pyre_interpreter::baseobjspace::note_dict_callback_raise(&e, false);
             crate::call_jit::publish_residual_call_exception(e.to_exc_object());
             false
         }
@@ -525,7 +525,7 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
     match pyre_interpreter::builtins::try_hash_value(obj) {
         Ok(h) => h,
         Err(mut e) => {
-            pyre_interpreter::baseobjspace::note_dict_callback_raise(true);
+            pyre_interpreter::baseobjspace::note_dict_callback_raise(&e, true);
             crate::call_jit::publish_residual_call_exception(e.to_exc_object());
             0
         }

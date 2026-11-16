@@ -282,10 +282,14 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     let obj = crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
-    // Infallible path: `hash_w` raised through `rpyexc_raise`. Swallow
+    // Infallible path: when `hash_w` raised through `rpyexc_raise`, swallow
     // that one exception (`rpyexc_fetch`) so a later checked op does not
-    // observe it. Checked callers use `object_key_for_checked`.
-    let _ = crate::interp_exceptions::rpyexc_fetch();
+    // observe it. Checked callers use `object_key_for_checked`. The test
+    // follows the call (`exceptiontransform.py` `gen_exc_check`), so a
+    // hash that returned leaves the exception state alone.
+    if crate::interp_exceptions::rpyexc_occurred() {
+        let _ = crate::interp_exceptions::rpyexc_fetch();
+    }
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     ObjectKey { hash, obj }
 }
