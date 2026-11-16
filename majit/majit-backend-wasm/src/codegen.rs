@@ -7045,6 +7045,14 @@ fn build_function(
             sink.local_get(k as u32 + 1);
             if value_types.ty(ia.index) == ValType::F64 {
                 sink.f64_reinterpret_i64();
+            } else if ia.tp.get() == Type::Ref {
+                // Same pointer-width load as the frame-entry arm's
+                // `i64.load32_u`. The wide i64 param ABI is type-blind
+                // (`build_label_param_shim` `i64.load`, JUMP / param-dispatch
+                // `emit_resolve`); a wasm32 Ref can carry leftover high bits,
+                // and `PtrEq` is `i64.eq`.
+                sink.i32_wrap_i64();
+                sink.i64_extend_i32_u();
             }
         } else {
             let offset = frame.spill_slot_ofs(k as u64);
@@ -7159,6 +7167,12 @@ fn build_function(
             for (i, la) in all_label_args[labels_passed].iter().enumerate() {
                 if label_param_entry {
                     sink.local_get(i as u32 + 1);
+                    if la.ty() == Some(Type::Ref) {
+                        // Same wrap as the param-entry loader / frame-entry
+                        // `i64.load32_u`.
+                        sink.i32_wrap_i64();
+                        sink.i64_extend_i32_u();
+                    }
                 } else {
                     sink.local_get(0);
                     sink.i64_load(mem64(frame.spill_slot_ofs(i as u64)));
