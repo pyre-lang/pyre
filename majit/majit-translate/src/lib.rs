@@ -203,6 +203,8 @@ fn build_semantic_program_via_active_frontend(
     front::SemanticProgram,
     std::collections::HashSet<majit_ir::descr::StructId>,
     Vec<String>,
+    std::collections::HashSet<majit_ir::descr::StructId>,
+    std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     #[cfg(feature = "mir-frontend")]
     {
@@ -252,6 +254,7 @@ fn build_semantic_program_via_active_frontend(
             let mut profilefunc_spellings = Vec::new();
             let mut fnptr_field_families = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
+            let mut repr_transparent = std::collections::HashSet::new();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             // `_exception_class_<Enum>` is a program-wide class property.
             // Each artefact appends its own harvest once, in dependency
@@ -351,6 +354,7 @@ fn build_semantic_program_via_active_frontend(
                     &raw_alloc_flavor_structs,
                 ));
                 declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
+                repr_transparent.extend(front::mir::harvest_repr_transparent_struct_ids(&llbc));
                 let mut impl_folds = Vec::new();
                 for (path, op) in front::mir::discover_foldable_const_lits(&llbc) {
                     if path.contains('<') {
@@ -418,6 +422,7 @@ fn build_semantic_program_via_active_frontend(
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
             let gc_struct_ids = declared_gc.gc_struct_ids();
+            let field0_parents = declared_gc.field0_parent_ids().clone();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
             published_structs.dedup_by(|a, b| a.path == b.path);
             for (ord, p) in paths.iter().enumerate() {
@@ -518,7 +523,13 @@ fn build_semantic_program_via_active_frontend(
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
-            return (program, gc_struct_ids, eval_override_graphs);
+            return (
+                program,
+                gc_struct_ids,
+                eval_override_graphs,
+                repr_transparent,
+                field0_parents,
+            );
         }
     }
     let _ = (
@@ -1609,7 +1620,7 @@ fn analyze_pipeline_from_module_paths(
         .filter(|spec| spec.split_portal && spec.portal_runner.is_some())
         .map(|spec| spec.portal.canonical_key())
         .collect();
-    let (mut program, declared_gc, eval_override_graphs) =
+    let (mut program, declared_gc, eval_override_graphs, repr_transparent, field0_parents) =
         build_semantic_program_via_active_frontend(
             module_paths,
             static_addrs,
@@ -2011,6 +2022,7 @@ fn analyze_pipeline_from_module_paths(
     call_control.immutable_fields_by_struct = immutable_fields;
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
+    call_control.field0_parents = field0_parents;
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the
@@ -2221,6 +2233,8 @@ fn analyze_pipeline_from_module_paths(
             } else {
                 crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
             };
+        layout.repr_transparent =
+            crate::front::mir::struct_id_is_repr_transparent(&repr_transparent, sid, &struct_name);
         if census_struct_layouts {
             let variants = struct_layout_variants.entry(sid).or_default();
             if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {

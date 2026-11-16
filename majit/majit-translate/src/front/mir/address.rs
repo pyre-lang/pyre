@@ -344,6 +344,8 @@ fn residual_arg_store_descr(
         .or_else(|| residual_scalar_word_descr(ty, llbc, gc_struct_ids))
 }
 
+/// Residual rustc `&T` of a copy word. An oopspec callee is rewritten
+/// by `jtransform.py` `handle_builtin_call` and keeps the word.
 fn residual_scalar_ref_callee(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -2339,7 +2341,17 @@ impl<'a> Lowering<'a> {
             if self.tyref_is_nullable_gcref(&ty) {
                 continue;
             }
-            if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
+            if tyref_is_raw_pointer(&ty, self.llbc) {
+                // A thin scalar raw pointer (`*mut i64`) can be the
+                // relocated slot (`rffi.scoped_alloc` of Signed). A GC
+                // / byte pointer (`*mut PyObject`, `GCREF`, `*mut u8` /
+                // `rffi.py` `CCHARP`) is not this slot.
+                if raw_scalar_address_value_type(&ty, self.llbc).is_some() {
+                    return true;
+                }
+                continue;
+            }
+            if output_type_is_ref(&ty, self.llbc) {
                 return true;
             }
             match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {

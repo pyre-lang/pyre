@@ -1777,6 +1777,258 @@ fn exception_class_string_attr_read_as_str_is_rstr() {
     );
 }
 
+/// `String::as_str` of a rust-heap `{cap, ptr, len}` header is
+/// `Repr.rtype_str`, not identity. The residual `&str` trampoline
+/// (`codepoints_in_utf8`) rebuilds via `rstr_payload` from `Ptr(STR)`.
+#[test]
+fn rust_heap_string_as_str_is_rtype_str() {
+    let string_ty = adt(0);
+    let out = str_ref_ty();
+    let as_str = super::window_opaque_fun(
+        0,
+        &["alloc", "string", "String", "as_str"],
+        vec![shared_ref(&string_ty)],
+        out.clone(),
+    );
+    let (unwind, ret) = super::window_unwind_and_return_blocks();
+    let viewer = fun(
+        1,
+        &["fixture", "view_as_str"],
+        vec![string_ty.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("s"), &string_ty),
+            ],
+            vec![
+                regular(
+                    vec![],
+                    call_regular(0, local_place(1, &string_ty), local_place(0, &out), 2, 1),
+                ),
+                unwind,
+                ret,
+            ],
+        ),
+    );
+    let llbc = super::window_llbc(vec![opaque_string_decl(0)], vec![as_str, viewer]);
+    let graph = lower(&llbc, "view_as_str");
+    let source = sole_input(&graph);
+    let conversions: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: uop, operand, result_ty, .. }
+                    if uop == "str" && operand == &source && *result_ty == ValueType::Str
+            )
+        })
+        .collect();
+    assert_eq!(
+        conversions.len(),
+        1,
+        "as_str of a rust-heap String is UnaryOp str; graph={}",
+        graph.dump()
+    );
+    let produced = conversions[0].result.as_ref().expect("str() result");
+    assert_ne!(
+        produced.id(),
+        source.id(),
+        "str() must allocate a new STR, not alias the String header"
+    );
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR),
+        "the view is Ptr(STR); graph={}",
+        graph.dump()
+    );
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.exits)
+        .find_map(|link| {
+            (link.target == graph.returnblock).then(|| match link.args.first() {
+                Some(LinkArg::Value(value)) => Some(value.clone()),
+                _ => None,
+            })
+        })
+        .expect("return link")
+        .expect("return value");
+    assert_eq!(
+        returned.id(),
+        produced.id(),
+        "the returned word is the converted STR"
+    );
+    assert!(
+        !names_rust_string_copy(&graph),
+        "the copy is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        names_rust_string_copy(&transformed),
+        "jtransform residualizes rust-heap as_str through jit_ll_str_from_rust_string; graph={}",
+        transformed.dump()
+    );
+}
+
+/// `code.varnames[i].as_str()`: host `Box<[String]>` items are three-word
+/// headers. Place Index is an interior pointer (`rptr.py` InteriorPtrRepr),
+/// not a one-word `ArrayRead` of the UTF-8 data pointer, and `as_str` is
+/// `Repr.rtype_str`.
+#[test]
+fn box_string_index_as_str_is_interior_ptr_then_rtype_str() {
+    let holder_adt = adt(0);
+    let holder_ref = shared_ref(&holder_adt);
+    let string_ty = adt(1);
+    let box_ty = json!({
+        "Adt": {
+            "id": 2,
+            "builtin": "Box",
+            "generics": {
+                "regions": [],
+                "types": [{"Slice": [string_ty.clone(), null]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let out = str_ref_ty();
+    let n = usize_ty();
+    let holder = json!({
+        "def_id": 0,
+        "item_meta": super::window_meta(&["fixture", "Holder"], true),
+        "kind": {"Struct": [named_field("varnames", &box_ty)]}
+    });
+    let as_str = super::window_opaque_fun(
+        0,
+        &["alloc", "string", "String", "as_str"],
+        vec![shared_ref(&string_ty)],
+        out.clone(),
+    );
+    let deref_h = super::window_place(
+        json!({"Projection": [local_place(1, &holder_ref), "Deref"]}),
+        &holder_adt,
+    );
+    let names = super::window_place(
+        json!({"Projection": [deref_h, {"Field": [null, 0]}]}),
+        &box_ty,
+    );
+    let indexed = super::window_place(
+        json!({"Projection": [names, {"Index": {
+            "offset": {"Read": local_place(2, &n)},
+            "from_end": false
+        }}]}),
+        &string_ty,
+    );
+    let (unwind, ret) = super::window_unwind_and_return_blocks();
+    let viewer = fun(
+        1,
+        &["fixture", "view_index_as_str"],
+        vec![holder_ref.clone(), n.clone()],
+        out.clone(),
+        unstructured(
+            2,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("code"), &holder_ref),
+                named_local(2, Some("i"), &n),
+            ],
+            vec![
+                regular(
+                    vec![],
+                    json!({"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 0},
+                            "generics": super::window_empty_generics()
+                        }},
+                        "args": [{"Read": indexed}]},
+                        "dest": local_place(0, &out),
+                        "target": 2,
+                        "on_unwind": 1
+                    }}),
+                ),
+                unwind,
+                ret,
+            ],
+        ),
+    );
+    let llbc = super::window_llbc(vec![holder, opaque_string_decl(1)], vec![as_str, viewer]);
+    let graph = lower(&llbc, "view_index_as_str");
+    let array_reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
+        .collect();
+    assert!(
+        array_reads.is_empty(),
+        "host Box<[String]> index is not ArrayRead; graph={}",
+        graph.dump()
+    );
+    let ptradds: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        ptradds.len(),
+        1,
+        "index is direct_ptradd of the fat data word; graph={}",
+        graph.dump()
+    );
+    let conversions: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: uop, result_ty, .. }
+                    if uop == "str" && *result_ty == ValueType::Str
+            )
+        })
+        .collect();
+    assert_eq!(
+        conversions.len(),
+        1,
+        "as_str of the interior &String is UnaryOp str; graph={}",
+        graph.dump()
+    );
+    let produced = conversions[0].result.as_ref().expect("str() result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR),
+        "the view is Ptr(STR); graph={}",
+        graph.dump()
+    );
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.exits)
+        .find_map(|link| {
+            (link.target == graph.returnblock).then(|| match link.args.first() {
+                Some(LinkArg::Value(value)) => Some(value.clone()),
+                _ => None,
+            })
+        })
+        .expect("return link")
+        .expect("return value");
+    assert_eq!(
+        returned.id(),
+        produced.id(),
+        "the returned word is the converted STR"
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        names_rust_string_copy(&transformed),
+        "jtransform residualizes rust-heap as_str through jit_ll_str_from_rust_string; graph={}",
+        transformed.dump()
+    );
+}
+
 #[test]
 fn exception_class_string_attr_rust_heap_use_is_unsupported() {
     let enum_ty = adt(0);

@@ -391,6 +391,19 @@ pub fn path_hash(s: &str) -> u64 {
     h.finish()
 }
 
+/// ARRAY identity for `LLType::Array` / `DescrSetMember::Array`.
+///
+/// `path_hash` can theoretically be 0, and `ArrayDescr::cache_key`
+/// defaults to 0; `effectinfo.py compute_bitstrings` has no sentinel, and
+/// `prepass.rs add_descr` skips `type_id == 0`. Map 0 to 1 so every
+/// producer publishes a real identity.
+pub fn array_identity_hash(s: &str) -> u64 {
+    match path_hash(s) {
+        0 => 1,
+        h => h,
+    }
+}
+
 /// Whether a struct SizeDescr still carries the truncated low word of its
 /// serialized structural identity instead of a collector-issued type id.
 ///

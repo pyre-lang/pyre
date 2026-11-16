@@ -4208,14 +4208,25 @@ fn declared_return_annotation(
     if token != Some("ref") {
         return None;
     }
+    let bk = registry.bookkeeper();
+    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
+    // the same shell FieldRead and a `raw:<owner>` token already use.
+    // Before `return_container_root` so a wrapper whose field projection
+    // is SomeString still returns SomePtr. SomeInstance here made
+    // mergeinputargs raise Instance(X) ∪ Ptr(X) (`llannotation.py`
+    // pairtype(SomePtr, SomeObject).union).
+    if let Some(root) = graph.return_class_root.as_deref()
+        && let Some(cell) = bk.raw_struct_ptr_annotation(root)
+    {
+        return Some(cell);
+    }
     if let Some(spelling) = graph.return_container_root.as_deref() {
-        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        let projected = bk.project_struct_field_type(spelling);
         if !matches!(projected, crate::annotator::model::SomeValue::Impossible) {
             return Some(projected);
         }
     }
     let root = graph.return_class_root.as_deref()?;
-    let bk = registry.bookkeeper();
     // `llmemory.py` `GCREF`; `lltype.GcOpaqueType` has no ClassDef.
     // `llannotation.py` `lltype_to_annotation` of that Ptr is `SomePtr`.
     // A leftover `"gcref"` token on a registered GC pointer keeps its
@@ -4250,13 +4261,6 @@ fn declared_return_annotation(
     // struct. Residual `FrameAnchor::new` must meet live's Unsigned
     // Input as Integer, not SomePtr.
     if let Some(cell) = bk.transparent_scalar_annotation(root) {
-        return Some(cell);
-    }
-    // A by-value `rffi.py` `CStruct` is Ptr of that struct
-    // (`history.getkind`), the same shell FieldRead and a `raw:<owner>`
-    // token already use. A Rust-repr aggregate is `rclass.py`
-    // `getinstancerepr` (SomeInstance).
-    if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
     // `*mut T` / `*const T` onto a harvested owner is the same
@@ -9352,13 +9356,19 @@ fn reconcile_elided_phi_inputargs(
 /// `rclass.py getinstancerepr(rtyper, classdef)` `lowleveltype` for a
 /// named `Ref(Some(name))`.
 ///
-/// `name` is resolved through `Bookkeeper::project_struct_field_type`
-/// so an alias (`PyObjectRef`, `*mut PyObject`, `NonNull<PyObject>`,
-/// `IdentityKey`) becomes the same `SomeInstance(classdef)` the
-/// struct-field projector already uses. A registered classdef is
-/// `getinstancerepr`; `Impossible` / a classdef-less instance is
-/// `llmemory.GCREF`, never `OBJECTPTR`. `getuniqueclassdef_for_struct_root`
-/// is not called on an unknown name (that would mint a shell).
+/// A `StructFieldRegistry` key uses `getuniqueclassdef_for_struct_root`
+/// (the same lookup `derive_subject_inputcells` uses for an Input class
+/// root) so pass-2 `project_struct_rows` completes attrs before
+/// `InstanceRepr.setup`. A harvest leaf whose `canonical_struct_name` is
+/// also a registry key intern's that host — `ensure_session` already
+/// projected it; intern of the leaf would mint a FORCE-only ClassDef
+/// whose pass-2 is skipped. An unregistered alias (`PyObjectRef`,
+/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`) is resolved
+/// through `Bookkeeper::project_struct_field_type`. A registered
+/// classdef is `getinstancerepr`; `Impossible` / a classdef-less
+/// instance is `llmemory.GCREF`, never `OBJECTPTR`.
+/// `getuniqueclassdef_for_struct_root` is not called on an unknown name
+/// (that would mint a shell).
 fn lltype_for_named_ref(
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
     name: &str,
@@ -9373,6 +9383,46 @@ fn lltype_for_named_ref(
     let Some(ann) = rtyper.annotator.upgrade() else {
         return GCREF.clone();
     };
+    if let Some(lltype) = ann.bookkeeper.gc_struct_ptr_lltype(name) {
+        return lltype;
+    }
+    // rtyper.py setconcretetype / bindingrepr reads the ClassDef after
+    // its attrs are complete; same lookup as derive_subject_inputcells.
+    // A harvest leaf intern joins that host via canonical_struct_name.
+    let intern_root = ann
+        .bookkeeper
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .and_then(|reg| {
+            if !reg.fields.contains_key(name) {
+                return None;
+            }
+            let canonical = majit_ir::descr::canonical_struct_name(name);
+            if canonical.as_str() != name && reg.fields.contains_key(canonical.as_str()) {
+                Some(canonical)
+            } else {
+                Some(name.to_string())
+            }
+        });
+    if let Some(intern_root) = intern_root {
+        match ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root(&intern_root)
+        {
+            Ok(classdef) => {
+                let repr =
+                    getinstancerepr(rtyper, Some(&classdef), Flavor::Gc).unwrap_or_else(|e| {
+                        panic!("lltype_for_named_ref: getinstancerepr({name}): {e}")
+                    });
+                Repr::setup(repr.as_ref()).unwrap_or_else(|e| {
+                    panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}")
+                });
+                return repr.lowleveltype().clone();
+            }
+            Err(_) => return GCREF.clone(),
+        }
+    }
     let SomeValue::Instance(inst) = ann.bookkeeper.project_struct_field_type(name) else {
         return GCREF.clone();
     };
@@ -19305,6 +19355,7 @@ mod tests {
             size,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![crate::call::StructFieldLayout {
                 name: name.into(),
                 offset,
@@ -19676,6 +19727,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "x".into(),
                     offset: 0,
@@ -21407,6 +21459,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -21770,6 +21823,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),

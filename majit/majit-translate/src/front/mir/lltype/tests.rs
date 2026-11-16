@@ -3050,17 +3050,17 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         "residual FUNC.RESULT of &RawFlavorStruct is raw:<owner>, got {harvested_token:?}"
     );
     assert_eq!(
-            dont_look_inside_return_token(
-                &get_ptr_fd.signature.output,
-                &llbc,
-                spec,
-                &empty_gc,
-                &empty,
-            )
-            .as_deref(),
-            Some("ref"),
-            "empty flavor set keeps the residual token as ref"
-        );
+        dont_look_inside_return_token(
+            &get_ptr_fd.signature.output,
+            &llbc,
+            spec,
+            &empty_gc,
+            &empty,
+        )
+        .as_deref(),
+        Some("ref"),
+        "empty flavor set keeps the residual token as ref"
+    );
     let graph = crate::test_support::lower_function(&llbc, "inspect").expect("lower inspect");
     let input = graph
         .blocks
@@ -7171,6 +7171,51 @@ fn window_classifier_predicates() {
         &llbc,
         crate::ErrorCarrierSpec::default()
     ));
+}
+
+fn window_local_len_shadow(block_u8: bool, str_view: bool, list_view: bool) -> Option<usize> {
+    let shared = window_shared_slice();
+    let locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": 0,
+        "locals": [window_local(0, &shared)]
+    }))
+    .expect("window Locals");
+    let llbc = window_llbc(vec![], vec![]);
+    super::pair_len_shadows_of(
+        &locals,
+        &llbc,
+        &[false],
+        &[str_view],
+        &[list_view],
+        &[],
+        &[block_u8],
+        crate::ErrorCarrierSpec::default(),
+    )[0]
+}
+
+/// A `&[u8]` window that is also a BytesBlock / STR `as_bytes` view
+/// stays one `Ptr(STR)` word (`rstr.py` `STR`): no length shadow.
+#[test]
+fn window_block_u8_local_has_no_length_shadow() {
+    assert!(
+        window_local_len_shadow(false, false, false).is_some(),
+        "a host `&[u8]` window keeps a length shadow"
+    );
+    assert_eq!(
+        window_local_len_shadow(true, false, false),
+        None,
+        "block_u8 window is one Ptr(STR) word"
+    );
+    assert_eq!(
+        window_local_len_shadow(false, true, false),
+        None,
+        "str_view window is one Ptr(STR) word"
+    );
+    assert_eq!(
+        window_local_len_shadow(false, false, true),
+        None,
+        "list_view window stays the list"
+    );
 }
 
 #[test]
@@ -15042,6 +15087,8 @@ fn stamp_option_method_inputs(
         &gc_struct_ids,
         false,
         &empty_s,
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     graph
         .block(graph.startblock)
