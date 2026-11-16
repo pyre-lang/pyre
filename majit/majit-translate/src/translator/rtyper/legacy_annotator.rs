@@ -1109,8 +1109,11 @@ fn stamp_someptr_lltype(var: &Variable, sv: &SomeValue) {
 /// `ann_cast_int_to_ptr(PtrT, s_int)` → `SomePtr(PtrT.const)`. Dest
 /// already carrying a `Ptr` (`emit_dest_typed_cast_int_to_ptr`) keeps
 /// that `PtrT`. 1-arg `cast_int_to_ptr_call` omits PtrT; dest is
-/// `llmemory.GCREF` (`emit_host_cast_llop` / `result_ty: Ref`). Missing
-/// PtrT on a non-Ref dest is `CCHARP` (`emit_ccharp_nullptr`).
+/// `llmemory.GCREF` (`emit_host_cast_llop` / `result_ty: Ref`), matching
+/// `builtin.rs` `lltype_cast_int_to_ptr`. `stamp_declared_return` may
+/// overlay canonical `OBJECTPTR` on that result (`rclass.py`); that is
+/// not PtrT. Missing PtrT on a non-Ref dest is `CCHARP`
+/// (`emit_ccharp_nullptr`).
 fn someptr_from_cast_int_to_ptr(
     result: &Variable,
     args: &[LinkArg],
@@ -1123,7 +1126,11 @@ fn someptr_from_cast_int_to_ptr(
     {
         return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
     }
-    if let Some(ct) = result.concretetype().as_ref()
+    // 2-arg overlay stamp (`emit_dest_typed_cast_int_to_ptr`) when the
+    // PtrT constant is not in `args`. 1-arg is GCREF even when
+    // `stamp_declared_return` wrote `OBJECTPTR` on the result cell.
+    if args.len() == 2
+        && let Some(ct) = result.concretetype().as_ref()
         && let LowLevelType::Ptr(ptr_ty) = ct
     {
         return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));

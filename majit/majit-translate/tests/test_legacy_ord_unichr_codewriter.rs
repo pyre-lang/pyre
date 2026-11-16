@@ -200,6 +200,7 @@ fn skip_arm_unichr_call_codewrites_without_int_unichr() {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__majit_unichr".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: GraphSpecialization::Regular,
                 },
                 args: call_args(vec![input]),

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use pyre_object::pyobject::*;
+use rustpython_wtf8::Wtf8;
 
 /// pypy/interpreter/gateway.py `class SignatureBuilder`.
 ///
@@ -460,6 +461,45 @@ pub struct BuiltinCodePassThroughArguments0 {
 #[derive(Debug, Clone)]
 pub struct BuiltinCodePassThroughArguments1 {
     pub code: PyObjectRef,
+}
+
+impl BuiltinCodePassThroughArguments1 {
+    /// gateway.py `BuiltinCodePassThroughArguments1.funcrun_obj`: call the
+    /// builtin with `[w_obj] + args_w`.
+    ///
+    /// `args` is a native Vec no root walker updates. Publish `[code, w_obj,
+    /// ...args]` before any collecting call (`builtin_code_call` does the
+    /// same for its slice), then rebuild the flat `[w_obj, ...args]` from
+    /// the forwarded slots. A `|index| get` closure over the RootScope
+    /// unions `Ptr(RootScope)` with the index word; the copy helper is the
+    /// `framework.py pop_roots` loop, outside this graph.
+    ///
+    /// Not inlined into `funccall_valuestack`: a rest-copy loop in that
+    /// graph is `loop-without-unroll_safe` under `access_directly`.
+    #[inline(never)]
+    pub fn funcrun_obj(
+        code: PyObjectRef,
+        w_obj: PyObjectRef,
+        args: Vec<PyObjectRef>,
+    ) -> PyObjectRef {
+        let n_rest = args.len();
+        let roots = pyre_object::gc_roots::push_roots();
+        let root_base = roots.base();
+        let _ = roots.pin_root(code);
+        let _ = roots.pin_root(w_obj);
+        let args_base = roots.publish(&args);
+        roots.normalize(args_base, n_rest);
+        let mut live = vec![pyre_object::PY_NULL; 1 + n_rest];
+        live[0] = roots.get(root_base + 1);
+        pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut live[1..]);
+        match unsafe { crate::builtin_code_call(roots.get(root_base), &live) } {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1333,6 +1373,13 @@ pub(crate) unsafe fn builtin_code_check_receiver(
 /// is current at entry.  `dropvalues()` retires the frame slots that would
 /// otherwise root a peeked argument, so a frame dispatch has to publish before
 /// it drops, not after.
+///
+/// Residual in the JIT: its body hands `args` to the builtin's Rust-ABI
+/// `func` / `wrapper.call` through an indirect call, and a slice argument
+/// through an indirect call has no word-ABI lowering. `gateway.py
+/// BuiltinCode.funcrun` is traced upstream and only the fastcall itself is
+/// a residual call; that shape needs the builtin bodies to expose word-ABI
+/// entry points.
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.

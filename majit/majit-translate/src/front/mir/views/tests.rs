@@ -3,10 +3,10 @@ use crate::model::{CallTarget, LinkArg, OpKind};
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    fixture_item_meta, graph_ops, ident_path, std_extern_call_fixture_with_types,
-    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
-    window_meta, window_opaque_fun, window_place, window_shared_slice, window_span,
-    window_unwind_and_return_blocks, window_usize,
+    call_leafs, fixture_item_meta, graph_ops, ident_path, llbc_with_trait_impls,
+    std_extern_call_fixture_with_types, window_call_leafs, window_empty_generics, window_graph_ops,
+    window_llbc, window_local, window_meta, window_opaque_fun, window_place, window_shared_slice,
+    window_span, window_unwind_and_return_blocks, window_usize,
 };
 
 /// `k = w_bytes_data(key); entries.get(k)` keeps `k` as one `Ptr(STR)`
@@ -152,6 +152,45 @@ fn rust_vec_std_leaf_accepts_both_callee_spellings() {
     ] {
         assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
     }
+    for (p, leaf) in [
+        (path(&["alloc", "vec", "<Impl>", "deref_mut"]), "deref_mut"),
+        (path(&["alloc", "vec", "Vec", "deref_mut"]), "deref_mut"),
+        (path(&["vec", "Vec", "deref_mut"]), "deref_mut"),
+        (
+            path(&["alloc", "vec", "<Impl>", "as_mut_slice"]),
+            "as_mut_slice",
+        ),
+        (path(&["vec", "Vec", "as_slice"]), "as_slice"),
+    ] {
+        assert_eq!(super::rust_vec_slice_view_leaf(&p), Some(leaf), "{p:?}");
+    }
+    for p in [
+        path(&["alloc", "vec", "<Impl>", "extend_from_slice"]),
+        path(&["alloc", "vec", "Vec", "extend_from_slice"]),
+        path(&["vec", "Vec", "extend_from_slice"]),
+    ] {
+        assert_eq!(
+            super::rust_vec_std_leaf(&p),
+            Some("extend_from_slice"),
+            "{p:?}"
+        );
+        assert!(super::path_is_vec_extend_from_slice(&p.join("::")), "{p:?}");
+    }
+    assert!(super::path_is_vec_slice_view("vec::Vec::deref_mut"));
+    assert!(!super::path_is_vec_slice_view("vec::Vec::push"));
+    assert!(super::path_is_vec_extend_from_slice(
+        "alloc::vec::<Impl>::extend_from_slice"
+    ));
+    assert!(!super::path_is_vec_extend_from_slice("vec::Vec::extend"));
+    assert!(super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::runtime_ops::build_list_from_refs"
+    ));
+    assert!(super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::build_tuple_from_refs"
+    ));
+    assert!(!super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::runtime_ops::build_map_from_refs"
+    ));
     assert_eq!(
         super::rust_vec_std_leaf(&path(&[
             "vec",
@@ -373,6 +412,77 @@ fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
             "Vec::{leaf} items word is cast_int_to_ptr(CCHARP); ops={ops:?}"
         );
     }
+}
+
+#[test]
+fn payload_enum_vec_deref_stays_residual() {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let slot_ty = serde_json::json!({
+        "Adt": {"id": 1, "generics": generics(vec![])}
+    });
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics(vec![slot_ty.clone()])}
+    });
+    let slot_slice = serde_json::json!({
+        "Ref": ["'_", {"Slice": [slot_ty, null]}, "Shared"]
+    });
+    let item_meta = |path: &[&str]| {
+        let name: Vec<serde_json::Value> = path
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {
+                "attributes": [], "inline": null, "rename": null, "public": true
+            },
+            "is_local": false
+        })
+    };
+    let vec_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["alloc", "vec", "Vec"]),
+        "kind": {"Struct": []}
+    });
+    let slot_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "SlotValue"]),
+        "kind": {"Enum": [
+            {"name": "Int", "fields": [{
+                "name": "v",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }]}
+        ]}
+    });
+    let llbc = std_extern_call_fixture_with_types(
+        "vec_slot_deref",
+        &["vec", "Vec", "deref"],
+        &[vec_ty],
+        slot_slice,
+        vec![vec_decl, slot_decl],
+    );
+    let graph =
+        super::lower_function(&llbc, "vec_slot_deref").expect("payload-enum Vec deref must lower");
+    let leafs = call_leafs(&graph_ops(&graph));
+    assert!(
+        leafs.iter().any(|leaf| leaf == "deref"),
+        "Vec<SlotValue>::deref stays residual; leafs={leafs:?}"
+    );
+    assert!(
+        !leafs.iter().any(|leaf| leaf.starts_with("ll_vec_items")),
+        "payload-enum Vec deref is not a pair view; leafs={leafs:?}"
+    );
 }
 
 /// `code.varnames.len()` and `code.localspluskinds[i]` share one field
@@ -599,6 +709,27 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         ),
         None
     );
+    assert!(super::tyref_is_fat_slice(
+        &TyRef::Other(serde_json::json!({
+            "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"]
+        }).into()),
+        &llbc,
+    ));
+    assert!(super::tyref_is_fat_slice(
+        &TyRef::Other(
+            serde_json::json!({
+                "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"]
+            })
+            .into()
+        ),
+        &llbc,
+    ));
+    assert!(!super::tyref_is_fat_slice(
+        &TyRef::Other(serde_json::json!({
+            "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"]
+        }).into()),
+        &llbc,
+    ));
     assert_eq!(
         kind(
             serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
@@ -611,7 +742,10 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         ),
         None
     );
-    assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
+    assert_eq!(
+        kind(serde_json::json!({ "Slice": [usize_ty.clone(), null] })),
+        None
+    );
     assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
     assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
     assert_eq!(
@@ -620,6 +754,11 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     );
     assert_eq!(
         super::spelling_pair_field_kind("[*mut u8]"),
+        Some(VecItemKind::Int),
+        "*mut u8 is rffi.CCHARP, a word"
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("[GCREF]"),
         Some(VecItemKind::Ref)
     );
     assert!(super::gcref_item_spelling("GCREF"));
@@ -652,6 +791,41 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         })),
         None,
         "object-pointer &[T] stays the length-prefixed object array"
+    );
+    // A slice of a Copy associated type is the same `{ptr, len}` fat
+    // pointer. Unique-impl resolution spells a raw pointer; an
+    // unresolved projection is still one word.
+    let ptr = serde_json::json!({"RawPtr": [usize_ty.clone(), "Mut"]});
+    let binding = serde_json::json!({
+        "kind": {"TraitType": [0, 0]},
+        "skip_binder": {"value": ptr}
+    });
+    let row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": []}},
+        "types": [binding],
+        "implied_trait_refs": []
+    });
+    let unique = llbc_with_trait_impls(serde_json::json!([row.clone()]));
+    let projection = serde_json::json!({
+        "TraitType": [
+            {"kind": {"Clause": {"Bound": [0, 0]}}, "trait_decl_ref": {"skip_binder": {"id": 0}}},
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
+    assert_eq!(
+        super::tyref_pair_slice_item_kind(
+            &TyRef::Other(slice_of(projection.clone()).into()),
+            &unique
+        ),
+        Some(VecItemKind::Int),
+        "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
+    );
+    let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
+    assert_eq!(
+        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection).into()), &ambiguous),
+        Some(VecItemKind::Ref)
     );
 }
 
@@ -769,4 +943,58 @@ fn alloc_vec_from_elem_requires_the_allocator_namespace() {
         "vec".into(),
         "from_elem".into(),
     ]));
+}
+
+fn rust_vec_stamp_llbc() -> Llbc {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [crate::front::mir::tests::vec_decl_json()],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+/// `alloc_value_var_with_type(Signed)` writes the kind-collapsed integer.
+/// `stamp_rust_vec_header` replaces it with `RustVecRepr.lowleveltype`
+/// (`rtyper.py` `setconcretetype` from `FUNC.RESULT`).
+#[test]
+fn stamp_rust_vec_header_replaces_kind_collapsed_signed() {
+    use crate::flowspace::model::Variable;
+    use crate::model::{ConcreteType, getkind};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rrustvec::rust_vec_item_kind;
+    use majit_ir::rvec::VecItemKind;
+
+    let llbc = rust_vec_stamp_llbc();
+    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json().into());
+    let var = Variable::new();
+    var.set_concretetype(Some(LowLevelType::Signed));
+    super::stamp_rust_vec_header(&var, &ty, &llbc);
+    let ct = var.concretetype().expect("RustVec header");
+    assert_eq!(getkind(&ct), ConcreteType::Signed);
+    assert_eq!(rust_vec_item_kind(&ct), Some(VecItemKind::Int));
+}
+
+/// A GC pointer already on the cell is not a kind-collapsed integer.
+/// `_handle_list_call` must still see that layout, not a raw header.
+#[test]
+fn stamp_rust_vec_header_keeps_existing_gc_pointer() {
+    use crate::flowspace::model::Variable;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    use crate::translator::rtyper::rrustvec::rust_vec_item_kind;
+
+    let llbc = rust_vec_stamp_llbc();
+    let ty = TyRef::Other(crate::front::mir::tests::vec_usize_ty_json().into());
+    let var = Variable::new();
+    var.set_concretetype(Some((*OBJECTPTR).clone()));
+    super::stamp_rust_vec_header(&var, &ty, &llbc);
+    assert_eq!(var.concretetype().as_ref(), Some(&*OBJECTPTR));
+    assert_eq!(rust_vec_item_kind(&var.concretetype().unwrap()), None);
 }

@@ -14,6 +14,7 @@
 //! / `_getnewargs`.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 use crate::PyResult;
 use crate::error::PyError;

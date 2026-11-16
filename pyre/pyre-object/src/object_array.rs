@@ -9,7 +9,7 @@ use crate::{PY_NULL, PyObjectRef};
 /// (`rlist.py`) is a plain Signed. `AtomicUsize::new` is identity on
 /// the inner usize (`std_identity`), so looking inside records the
 /// field write rather than a residual.
-pub(crate) fn length_cell(n: usize) -> AtomicUsize {
+pub fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }
 

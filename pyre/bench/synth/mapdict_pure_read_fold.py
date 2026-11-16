@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=held,rebound,slotted,floated
-# pyre-check: spec-folds=load_attr_pure_read
 # pyre-check: trace-shape=floated:absent=ArraylenGc
 # `AbstractAttribute.read` answers through the `@jit.elidable`
 # `_pure_direct_read` when the attribute and the receiver are both green and

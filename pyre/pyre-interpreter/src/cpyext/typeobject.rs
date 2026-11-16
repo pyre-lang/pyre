@@ -8,6 +8,7 @@
 
 use super::pyobject::{self, CPyObject, REFCNT_FROM_PYPY, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
+use rustpython_wtf8::Wtf8;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 
 /// `PyVarObject` — a `PyObject` with the variable-part length.
@@ -5451,7 +5452,9 @@ fn stamp_objclass(w_type: PyObjectRef, tp: *mut CPyTypeObject) {
     }
     for name in names {
         let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
-        if let Some(descriptor) = unsafe { crate::baseobjspace::lookup_in_type(w_type, &name) } {
+        if let Some(descriptor) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_type, name.as_str()) }
+        {
             carrier_set(
                 descriptor,
                 OBJCLASS_KEY,

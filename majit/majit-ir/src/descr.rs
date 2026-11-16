@@ -6764,28 +6764,16 @@ fn heaptracker_skips_listed_field(fd: &dyn FieldDescr) -> bool {
 }
 
 fn listed_fielddescrs(all: Vec<Arc<dyn FieldDescr>>) -> Vec<Arc<dyn FieldDescr>> {
-    let listed: Vec<Arc<dyn FieldDescr>> = all
-        .into_iter()
+    // `heaptracker.py all_fielddescrs`: skip `typeptr` and `c__pad*`.
+    // Listed order is STRUCT._names ("order is not relevant, except for
+    // tests"). `index_in_parent` is `get_fielddescr_index_in`, which
+    // skips `typeptr` but not `c__pad`, and a dual-mint group
+    // (`W_TypeObject` payload-order specs vs layout-order heaptracker)
+    // numbers a different walk. Listed position therefore need not
+    // equal `index_in_parent`; consumers key by offset / field_key.
+    all.into_iter()
         .filter(|fd| !heaptracker_skips_listed_field(fd.as_ref()))
-        .collect();
-    // `heaptracker.py get_fielddescr_index_in` numbers after skipping
-    // `typeptr`; `descr.py get_field_descr` writes that index once at mint.
-    // A producer that counted typeptr fails here rather than being rewritten.
-    for (i, fd) in listed.iter().enumerate() {
-        debug_assert!(
-            fd.index_in_parent() == i,
-            "field {} has index_in_parent {} at listed position {}; listed=[{}]",
-            fd.field_name(),
-            fd.index_in_parent(),
-            i,
-            listed
-                .iter()
-                .map(|f| f.field_name())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-    listed
+        .collect()
 }
 
 fn gc_pointers_in_fixed_part(
