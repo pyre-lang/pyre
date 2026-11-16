@@ -1113,11 +1113,11 @@ pub(crate) fn build_ll_utf8iter_helper_graph(
         ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
         LowLevelType::Void,
     );
-    let cflags = Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let cflags = gc_flavor_const()?;
     let v_iter = variable_with_lltype("iter", iter_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
-        vec![Hlvalue::Constant(c1), Hlvalue::Constant(cflags)],
+        vec![Hlvalue::Constant(c1), cflags],
         Hlvalue::Variable(v_iter.clone()),
     ));
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -8554,10 +8554,14 @@ pub(crate) fn build_ll_streq_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.elidable` + `@jit.oopspec('stroruni.equal(s1, s2)')`
+    // (`LLHelpers.ll_streq`).
+    func.oopspec = Some("stroruni.equal(s1, s2)".to_string());
+    func._elidable_function_ = true;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -9062,10 +9066,14 @@ pub(crate) fn build_ll_strcmp_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.elidable` + `@jit.oopspec('stroruni.cmp(s1, s2)')`
+    // (`LLHelpers.ll_strcmp`).
+    func.oopspec = Some("stroruni.cmp(s1, s2)".to_string());
+    func._elidable_function_ = true;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -14068,10 +14076,14 @@ pub(crate) fn build_ll_strconcat_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.elidable` + `@jit.oopspec('stroruni.concat(s1, s2)')`
+    // (`LLHelpers.ll_strconcat`).
+    func.oopspec = Some("stroruni.concat(s1, s2)".to_string());
+    func._elidable_function_ = true;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -14555,10 +14567,14 @@ fn build_ll_stringslice_core_helper_graph(
         )
         .into_ref(),
     ]);
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.oopspec('stroruni.slice(s1, start, stop)')` + `@jit.elidable`
+    // (`LLHelpers._ll_stringslice`).
+    func.oopspec = Some("stroruni.slice(s1, start, stop)".to_string());
+    func._elidable_function_ = true;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -15990,6 +16006,48 @@ mod tests {
             Some(LowLevelType::Bool),
             "ll_streq must return Bool"
         );
+    }
+
+    /// `LLHelpers.ll_streq` `@jit.elidable` +
+    /// `@jit.oopspec('stroruni.equal(s1, s2)')`.
+    #[test]
+    fn streq_helper_carries_stroruni_equal_oopspec() {
+        let helper = build_ll_streq_helper_graph("ll_streq", STRPTR.clone())
+            .expect("build_ll_streq_helper_graph");
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("stroruni.equal(s1, s2)"),
+            "builder stamps `ll_streq.oopspec` (`LLHelpers.ll_streq`)"
+        );
+        assert!(
+            helper.func._elidable_function_,
+            "rlib/jit.py elidable stamps GraphFunc._elidable_function_"
+        );
+        let inner = helper.graph.borrow();
+        assert_eq!(
+            inner.func.as_ref().and_then(|func| func.oopspec.as_deref()),
+            Some("stroruni.equal(s1, s2)"),
+            "graph.func.oopspec is the same stamp `guess_call_kind` reads"
+        );
+        assert!(
+            inner
+                .func
+                .as_ref()
+                .is_some_and(|func| func._elidable_function_),
+            "graph.func._elidable_function_ is the same stamp getcalldescr reads"
+        );
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 2);
+        for (i, expected) in ["s1", "s2"].iter().enumerate() {
+            let Hlvalue::Variable(v) = &startblock.inputargs[i] else {
+                panic!("startblock input {i} must be a Variable");
+            };
+            assert!(
+                v.name().starts_with(expected),
+                "input {i} variable name = {:?}, expected prefix {expected}",
+                v.name()
+            );
+        }
     }
 
     /// Passing a non-Ptr lltype should be rejected — propagated from
@@ -17466,6 +17524,48 @@ mod tests {
             uni_copy_opnames,
             vec!["copyunicodecontent", "copyunicodecontent"]
         );
+    }
+
+    /// `LLHelpers.ll_strconcat` `@jit.elidable` +
+    /// `@jit.oopspec('stroruni.concat(s1, s2)')`.
+    #[test]
+    fn strconcat_helper_carries_stroruni_concat_oopspec() {
+        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+            .expect("build_ll_strconcat_helper_graph");
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("stroruni.concat(s1, s2)"),
+            "builder stamps `ll_strconcat.oopspec` (`LLHelpers.ll_strconcat`)"
+        );
+        assert!(
+            helper.func._elidable_function_,
+            "rlib/jit.py elidable stamps GraphFunc._elidable_function_"
+        );
+        let inner = helper.graph.borrow();
+        assert_eq!(
+            inner.func.as_ref().and_then(|func| func.oopspec.as_deref()),
+            Some("stroruni.concat(s1, s2)"),
+            "graph.func.oopspec is the same stamp `guess_call_kind` reads"
+        );
+        assert!(
+            inner
+                .func
+                .as_ref()
+                .is_some_and(|func| func._elidable_function_),
+            "graph.func._elidable_function_ is the same stamp getcalldescr reads"
+        );
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 2);
+        for (i, expected) in ["s1", "s2"].iter().enumerate() {
+            let Hlvalue::Variable(v) = &startblock.inputargs[i] else {
+                panic!("startblock input {i} must be a Variable");
+            };
+            assert!(
+                v.name().starts_with(expected),
+                "input {i} variable name = {:?}, expected prefix {expected}",
+                v.name()
+            );
+        }
     }
 
     /// `ll_count_char` synthesised against `Ptr(STR)` produces a

@@ -103,6 +103,21 @@ impl majit_jitcode::codewriter::codewriter::CodeWriterSetup for CodeWriterWithCa
     }
 }
 
+/// The `remove_obvious_noops` step of `warmspot.py prejit_optimizations` /
+/// `all.py backend_optimizations`. Runs per graph on Spine B's input because
+/// Spine A still reads the shared rtyped graph by op index; at cut-over it
+/// becomes one `backend_optimizations(graphs=…)` call with the remaining
+/// sub-passes (constfold, remove_asserts, merge_if_blocks) in upstream order.
+fn prejit_remove_obvious_noops(
+    graph: &crate::flowspace::model::FunctionGraph,
+    translator: &crate::translator::translator::TranslationContext,
+) {
+    crate::translator::backendopt::removenoops::remove_same_as(graph);
+    crate::translator::simplify::eliminate_empty_blocks(graph);
+    crate::translator::simplify::transform_dead_op_vars(graph, Some(translator));
+    crate::translator::backendopt::removenoops::remove_duplicate_casts(graph, translator);
+}
+
 impl CodeWriter {
     /// Pair this codewriter with the `CallControl` it drove, for
     /// `MetaInterpStaticData.finish_setup(codewriter)`.
@@ -1161,6 +1176,38 @@ impl CodeWriter {
         verbose: bool,
         index: usize,
     ) {
+        // `warmspot.py WarmRunnerDesc.__init__` → `prejit_optimizations` →
+        // `all.py backend_optimizations` `remove_obvious_noops` before
+        // jtransform sees the graph. No dual-gate session (unit fixtures)
+        // skips the pass. Drop the registry before the rest of Spine B.
+        {
+            let translator = self
+                .dual_gate_registry(callcontrol)
+                .session_if_started()
+                .map(|(ann, _rt)| std::rc::Rc::clone(&ann.translator));
+            if let Some(translator) = translator {
+                prejit_remove_obvious_noops(flow_graph, &translator);
+            }
+        }
+        // `call.py CallControl.find_all_graphs` walks regular `direct_call`
+        // callees. Spine B restricts that walk to rtyper low-level helper
+        // graphs so leftover `_name`s become specialized leaves before
+        // oopspec publication and `lower_graph_with_callees` read them.
+        // Clone the rtyper `Rc` out so the registry borrow ends before
+        // `callcontrol` is passed `&mut`.
+        {
+            let rtyper = self
+                .dual_gate_registry(callcontrol)
+                .session_if_started()
+                .map(|(_ann, rt)| std::rc::Rc::clone(&rt));
+            if let Some(rt) = rtyper {
+                crate::codewriter::strfind::register_lowlevel_helper_callees(
+                    callcontrol,
+                    &rt,
+                    flow_graph,
+                );
+            }
+        }
         // jtransform.py transform_graph starts with
         // constant_fold_ll_issubclass(graph, cpu) on the flowspace
         // graph. Spine B is the remaining entry that still holds
@@ -1171,7 +1218,70 @@ impl CodeWriter {
             let matcher = ed.fn_exception_match.borrow();
             crate::jtransform::constant_fold_ll_issubclass_flowgraph(flow_graph, matcher.as_ref());
         }
-        let lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
+        // `call.py guess_call_kind` reads `funcobj.graph.func.oopspec`.
+        // Stamp leftover `direct_call` CallPaths before
+        // `lower_graph_with_callees` so the Call keys the same
+        // `_name`-split path the leftover arm falls back to.
+        {
+            let oopspec_marks = {
+                let registry = self.dual_gate_registry(callcontrol);
+                let tp = registry.two_phase();
+                let mut marks = Vec::new();
+                for block in flow_graph.iterblocks() {
+                    for op in &block.borrow().operations {
+                        if op.opname != "direct_call" {
+                            continue;
+                        }
+                        let Some(callee) = op.args.first() else {
+                            continue;
+                        };
+                        let func =
+                            crate::codewriter::jtransform_opname::callee_func_from_funcptr(callee);
+                        let Some(callee_graph) = func.graph_ref() else {
+                            // No name table: a helper whose funcptr has no
+                            // `graph` cannot expose `graph.func.oopspec`.
+                            continue;
+                        };
+                        if tp
+                            .subject_paths
+                            .contains_key(&crate::flowspace::model::GraphKey::of(&callee_graph))
+                        {
+                            continue;
+                        }
+                        let callee_graph_b = callee_graph.borrow();
+                        let Some(spec) = callee_graph_b
+                            .func
+                            .as_ref()
+                            .and_then(|func| func.oopspec.clone())
+                        else {
+                            continue;
+                        };
+                        let path = crate::codewriter::jtransform_opname::callpath_from_func_name(
+                            &func._name,
+                        );
+                        let argnames =
+                            crate::codewriter::jtransform_opname::startblock_oopspec_argnames(
+                                &callee_graph_b,
+                            );
+                        marks.push((path, spec, argnames));
+                    }
+                }
+                marks
+            };
+            for (path, spec, argnames) in oopspec_marks {
+                callcontrol.mark_oopspec(path.clone(), spec);
+                callcontrol.mark_oopspec_argnames(path, argnames);
+            }
+        }
+        let lowered = {
+            let registry = self.dual_gate_registry(callcontrol);
+            let tp = registry.two_phase();
+            crate::codewriter::jtransform_opname::lower_graph_with_callees(flow_graph, &|g| {
+                tp.subject_paths
+                    .get(&crate::flowspace::model::GraphKey::of(g))
+                    .cloned()
+            })
+        };
         // `lower_graph` leaves `direct_call` as `OpKind::Call`. Assembler
         // encodes a leftover Call as `direct_call_*`; there is no such
         // opcode in a jitcode (`jtransform.py rewrite_op_direct_call`).
@@ -1197,6 +1307,81 @@ impl CodeWriter {
             verbose,
             index,
         );
+    }
+
+    /// #2646 instrument: assemble `path`'s rtyper-lowered two-phase graph through the opname spine into a
+    /// detached JitCode, so it can be compared with the production spine's JitCode for the same graph.
+    /// Returns None when the path has no two-phase subject or the subject was annotate/rtype skipped.
+    #[cfg(test)]
+    pub(crate) fn opname_spine_jitcode_for_two_phase_subject(
+        &mut self,
+        path: &crate::parse::CallPath,
+        callcontrol: &mut CallControl,
+        config: &GraphTransformConfig,
+        index: usize,
+    ) -> Option<std::sync::Arc<JitCode>> {
+        let copy = {
+            let registry = self.dual_gate_registry(callcontrol);
+            let tp = registry.two_phase();
+            let subject = tp.subjects.get(path)?;
+            if tp.rtype_skipped.contains(&subject.graph_key)
+                || tp.annotate_skipped.contains_key(path)
+            {
+                return None;
+            }
+            crate::flowspace::model::copygraph(
+                &subject.graph.borrow(),
+                false,
+                &std::collections::HashMap::new(),
+                false,
+            )
+        };
+        // Shell name mirrors `CallControl::get_jitcode` / Spine A for this path.
+        let leaf = path
+            .last_segment()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{path:?}"));
+        let name = match path.specialization {
+            crate::parse::GraphSpecialization::Regular => leaf,
+            crate::parse::GraphSpecialization::AccessDirect => {
+                format!("{leaf}{}", crate::parse::ACCESS_DIRECT_ALT_SUFFIX)
+            }
+        };
+        let jit = std::sync::Arc::new(JitCode::new(name));
+        self.transform_opname_graph_to_jitcode(
+            &copy,
+            path,
+            callcontrol,
+            config,
+            &jit,
+            false,
+            index,
+        );
+        Some(jit)
+    }
+
+    /// Byte-level comparison of two assembled JitCodes: the bincode serialisation of the body
+    /// (`JitCodeBody`: code, constant pools, reloc pools, register counts, labels, result types)
+    /// and the bincode of `calldescr()`. The shell header (`fnaddr`) is excluded because
+    /// `get_jitcode` writes it independently of the spine. Returns None when identical, else a
+    /// report naming the first differing component followed by both `dump()` texts.
+    #[cfg(test)]
+    pub(crate) fn jitcode_byte_diff(a: &JitCode, b: &JitCode) -> Option<String> {
+        let dumps = || format!("--- a dump ---\n{}\n--- b dump ---\n{}", a.dump(), b.dump());
+        if a.body().code != b.body().code {
+            return Some(format!("body code bytes\n{}", dumps()));
+        }
+        let a_body = bincode::serialize(a.body()).expect("JitCodeBody bincode (a)");
+        let b_body = bincode::serialize(b.body()).expect("JitCodeBody bincode (b)");
+        if a_body != b_body {
+            return Some(format!("whole-body bincode\n{}", dumps()));
+        }
+        let a_calldescr = bincode::serialize(a.calldescr()).expect("calldescr bincode (a)");
+        let b_calldescr = bincode::serialize(b.calldescr()).expect("calldescr bincode (b)");
+        if a_calldescr != b_calldescr {
+            return Some(format!("calldescr bincode\n{}", dumps()));
+        }
+        None
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py).
@@ -1867,5 +2052,547 @@ mod exception_class_hierarchy_tests {
                 .expect("cached base"),
             &base
         ));
+    }
+}
+
+#[cfg(test)]
+mod opname_spine_prejit_tests {
+    use super::prejit_remove_obvious_noops;
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::codewriter::call::CallControl;
+    use crate::codewriter::codewriter::CodeWriter;
+    use crate::codewriter::jtransform::GraphTransformConfig;
+    use crate::codewriter::jtransform_opname::{callpath_from_func_name, lower_graph_with_callees};
+    use crate::codewriter::strfind::{register_lowlevel_helper_callees, specialized_helper_leaf};
+    use crate::flatten::{FlatOp, SSARepr};
+    use crate::flowspace::model::{
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
+        Variable,
+    };
+    use crate::model::{CallTarget, OpKind};
+    use crate::parse::CallPath;
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
+    };
+    use crate::translator::rtyper::lltypesystem::rbuilder::{
+        STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, build_ll_append_char_helper_graph,
+        build_ll_grow_by_helper_graph,
+    };
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        STRPTR, build_ll_mallocstr_helper_graph, build_ll_strconcat_helper_graph,
+        chars_array_ptr_lltype_from_strptr, direct_call_funcobjs,
+    };
+    use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+    use crate::translator::rtyper::rlist::{
+        build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
+    };
+    use crate::translator::rtyper::rtyper::{
+        RPythonTyper, constant_with_lltype, functionptr_const, variable_with_lltype,
+    };
+    use crate::translator::translator::TranslationContext;
+    use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+    use std::rc::Rc;
+
+    fn graph_opnames(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn has_getfield_named(graph: &FunctionGraph, field: &str) -> bool {
+        graph.iterblocks().into_iter().any(|block| {
+            block.borrow().operations.iter().any(|op| {
+                op.opname == "getfield"
+                    && op.args.get(1).is_some_and(|arg| match arg {
+                        Hlvalue::Constant(c) => c.value.as_byte_str() == Some(field.as_bytes()),
+                        _ => false,
+                    })
+            })
+        })
+    }
+
+    fn field_name_const(name: &str) -> Hlvalue {
+        constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
+    }
+
+    fn method_fnptr_type() -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![OBJECTPTR.clone()],
+                result: LowLevelType::Signed,
+            }),
+        }))
+    }
+
+    fn close_return(
+        start: &crate::flowspace::model::BlockRef,
+        graph: &FunctionGraph,
+        value: Variable,
+    ) {
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    /// `MethodsPBCRepr.redispatch_call` for a single-function family:
+    /// `getfield(v, typeptr)` → `cast_pointer` → Void `getfield(cls_m)`
+    /// → unused, plus `direct_call(c_fn, v)`.
+    fn dead_method_class_lookup_graph() -> FunctionGraph {
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let vtable = variable_with_lltype("vtable", CLASSTYPE.clone());
+        let v_func = variable_with_lltype("v_func", LowLevelType::Void);
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "w_bytearray_len",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let ft = FuncType {
+            args: vec![OBJECTPTR.clone()],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr(ft, "c_fn", None, Some("c_fn".to_string()));
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(v.clone()), field_name_const("typeptr")],
+                Hlvalue::Variable(cls.clone()),
+            ),
+            SpaceOperation::new(
+                "cast_pointer",
+                vec![Hlvalue::Variable(cls)],
+                Hlvalue::Variable(vtable.clone()),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(vtable), field_name_const("cls_m")],
+                Hlvalue::Variable(v_func),
+            ),
+            SpaceOperation::new(
+                "direct_call",
+                vec![c_fn, Hlvalue::Variable(v)],
+                Hlvalue::Variable(result.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, result);
+        graph
+    }
+
+    /// Same class-lookup chain, but `cls_m` is a live funcptr consumed by
+    /// `indirect_call`.
+    fn live_method_class_lookup_graph() -> FunctionGraph {
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let vtable = variable_with_lltype("vtable", CLASSTYPE.clone());
+        let v_func = variable_with_lltype("v_func", method_fnptr_type());
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "method_indirect",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(v.clone()), field_name_const("typeptr")],
+                Hlvalue::Variable(cls.clone()),
+            ),
+            SpaceOperation::new(
+                "cast_pointer",
+                vec![Hlvalue::Variable(cls)],
+                Hlvalue::Variable(vtable.clone()),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(vtable), field_name_const("cls_m")],
+                Hlvalue::Variable(v_func.clone()),
+            ),
+            SpaceOperation::new(
+                "indirect_call",
+                vec![
+                    Hlvalue::Variable(v_func),
+                    Hlvalue::Variable(v),
+                    Hlvalue::Constant(Constant::new(ConstValue::None)),
+                ],
+                Hlvalue::Variable(result.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, result);
+        graph
+    }
+
+    #[test]
+    fn opname_spine_drops_dead_method_class_lookup() {
+        let graph = dead_method_class_lookup_graph();
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        let opnames = graph_opnames(&graph);
+        assert!(
+            !opnames
+                .iter()
+                .any(|name| name == "getfield" || name == "cast_pointer"),
+            "dead typeptr/cls_m lookup must drop; ops={opnames:?}"
+        );
+        assert_eq!(opnames, vec!["direct_call"]);
+
+        let lowered = crate::codewriter::jtransform_opname::lower_graph(&graph);
+        let saw_guard = lowered.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
+        });
+        assert!(!saw_guard, "lowered graph must not emit guard_class");
+
+        let path = CallPath::from_segments(["w_bytearray_len"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            !dump.contains("guard_class"),
+            "assembled jitcode must not contain guard_class; dump:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn opname_spine_keeps_class_lookup_feeding_indirect_call() {
+        let graph = live_method_class_lookup_graph();
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        assert!(
+            has_getfield_named(&graph, "typeptr"),
+            "typeptr getfield feeding indirect_call must survive; ops={:?}",
+            graph_opnames(&graph)
+        );
+    }
+
+    /// Spine B `direct_call` of `ll_fixed_length` is `arraylen_gc`, not a
+    /// leftover `residual_call` (`do_fixed_list_len`, `jtransform.py`).
+    #[test]
+    fn opname_spine_direct_call_to_fixed_list_length_helper_is_arraylen() {
+        let helper = build_ll_fixed_length_helper_graph(
+            "ll_fixed_length",
+            items_array_ptr_lltype(&LowLevelType::Signed),
+        )
+        .expect("build_ll_fixed_length_helper_graph");
+        let ft = FuncType {
+            args: vec![items_array_ptr_lltype(&LowLevelType::Signed)],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr_for_graph_with_type(&helper.graph, ft);
+        let l = variable_with_lltype("l", items_array_ptr_lltype(&LowLevelType::Signed));
+        let result = variable_with_lltype("result", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(l.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_fixed_len",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![c_fn, Hlvalue::Variable(l)],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let path = CallPath::from_segments(["caller_fixed_len"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("arraylen"),
+            "assembled jitcode must contain arraylen; dump:\n{dump}"
+        );
+        assert!(
+            !dump.contains("residual_call"),
+            "assembled jitcode must not contain residual_call; dump:\n{dump}"
+        );
+        let _keep_helper = helper;
+    }
+
+    /// Spine B `direct_call` of `ll_strconcat` is a residual call with
+    /// `OopSpecIndex::StrConcat` / `ExtraEffect::ElidableOrMemoryError`
+    /// (`_handle_stroruni_call`, `jtransform.py`).
+    #[test]
+    fn opname_spine_direct_call_to_strconcat_helper_is_str_concat_residual() {
+        let helper = build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone())
+            .expect("build_ll_strconcat_helper_graph");
+        let ft = FuncType {
+            args: vec![STRPTR.clone(), STRPTR.clone()],
+            result: STRPTR.clone(),
+        };
+        let funcptr = functionptr_for_graph_with_type(&helper.graph, ft);
+        let s1 = variable_with_lltype("s1", STRPTR.clone());
+        let s2 = variable_with_lltype("s2", STRPTR.clone());
+        let result = variable_with_lltype("result", STRPTR.clone());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(s1.clone()),
+            Hlvalue::Variable(s2.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_strconcat",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        let c_fn = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![c_fn, Hlvalue::Variable(s1), Hlvalue::Variable(s2)],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let path = CallPath::from_segments(["caller_strconcat"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("residual_call"),
+            "assembled jitcode must contain residual_call; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let residuals: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::CallResidual { descriptor, .. } => Some(&descriptor.extra_info),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            residuals.len(),
+            1,
+            "exactly one residual_call; dump:\n{dump}"
+        );
+        assert_eq!(residuals[0].oopspecindex, OopSpecIndex::StrConcat);
+        assert_eq!(residuals[0].extraeffect, ExtraEffect::ElidableOrMemoryError);
+        let _keep_helper = helper;
+    }
+
+    #[test]
+    fn opname_spine_prejit_removes_same_as() {
+        let x = Variable::named("x");
+        let y = Variable::named("y");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let graph = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![Hlvalue::Variable(x.clone())],
+            Hlvalue::Variable(y.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(y)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let translator = TranslationContext::new();
+        prejit_remove_obvious_noops(&graph, &translator);
+        assert!(
+            start.borrow().operations.is_empty(),
+            "same_as must be removed"
+        );
+        let link_arg = start.borrow().exits[0].borrow().args[0]
+            .clone()
+            .expect("link arg");
+        assert_eq!(link_arg, Hlvalue::Variable(x));
+    }
+
+    /// Spine B `direct_call` of a stringbuilder helper resolves by the
+    /// specialized `cachedgraph` leaf (`call.py CallControl.find_all_graphs`
+    /// restricted to `rtyper.lowlevel_helper_graphs`).
+    #[test]
+    fn opname_spine_stringbuilder_helpers_resolve_by_specialized_graph_path() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_append_char".to_string(),
+                vec![STRINGBUILDERPTR.clone(), LowLevelType::Char],
+                LowLevelType::Void,
+                move |rtyper, _args, _result| {
+                    let chars_ptr = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+                    let malloc = rtyper.lowlevel_helper_function_with_builder(
+                        "mallocstr".to_string(),
+                        vec![LowLevelType::Signed],
+                        STRPTR.clone(),
+                        move |_r, _a, _res| {
+                            build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+                        },
+                    )?;
+                    let mallocfn = functionptr_const(rtyper, &malloc)?;
+                    let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                        "ll_grow_by".to_string(),
+                        vec![STRINGBUILDERPTR.clone(), LowLevelType::Signed],
+                        LowLevelType::Void,
+                        move |_r, _a, _res| {
+                            build_ll_grow_by_helper_graph(
+                                "ll_grow_by",
+                                STRINGBUILDERPTR.clone(),
+                                STRINGPIECEPTR.clone(),
+                                STRINGPIECE.clone(),
+                                STRPTR.clone(),
+                                mallocfn,
+                            )
+                        },
+                    )?;
+                    let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+                    build_ll_append_char_helper_graph(
+                        "ll_append_char",
+                        STRINGBUILDERPTR.clone(),
+                        LowLevelType::Char,
+                        chars_ptr,
+                        STRPTR.clone(),
+                        grow_by_fn,
+                    )
+                },
+            )
+            .expect("ll_append_char helper");
+
+        let c_fn = functionptr_const(&rtyper, &helper).expect("ll_append_char funcptr");
+        let builder = variable_with_lltype("ll_builder", STRINGBUILDERPTR.clone());
+        let ch = variable_with_lltype("ch", LowLevelType::Char);
+        let result = variable_with_lltype("result", LowLevelType::Void);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(builder.clone()),
+            Hlvalue::Variable(ch.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "caller_append_char",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fn),
+                Hlvalue::Variable(builder),
+                Hlvalue::Variable(ch),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&start, &graph, result);
+
+        let mut cc = CallControl::new();
+        register_lowlevel_helper_callees(&mut cc, &rtyper, &graph);
+
+        let funcs = direct_call_funcobjs(&graph);
+        assert_eq!(funcs.len(), 1, "caller has one direct_call");
+        let expected_leaf = specialized_helper_leaf(
+            "ll_append_char",
+            &[STRINGBUILDERPTR.clone(), LowLevelType::Char],
+        );
+        assert_eq!(funcs[0]._name, expected_leaf);
+        let path = callpath_from_func_name(&funcs[0]._name);
+        assert!(
+            cc.has_function_graph(&path),
+            "missing {path}; registered {:?}",
+            cc.function_graphs().keys()
+        );
+        if cc.is_candidate(&path) {
+            assert!(
+                cc.jitcode_handle(&path).is_some(),
+                "look-inside helper has a jitcode handle"
+            );
+        }
+
+        let concat = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_strconcat".to_string(),
+                vec![STRPTR.clone(), STRPTR.clone()],
+                STRPTR.clone(),
+                move |_r, _a, _res| build_ll_strconcat_helper_graph("ll_strconcat", STRPTR.clone()),
+            )
+            .expect("ll_strconcat helper");
+        let concat_fn = functionptr_const(&rtyper, &concat).expect("ll_strconcat funcptr");
+        let s1 = variable_with_lltype("s1", STRPTR.clone());
+        let s2 = variable_with_lltype("s2", STRPTR.clone());
+        let concat_result = variable_with_lltype("result", STRPTR.clone());
+        let concat_start = Block::shared(vec![
+            Hlvalue::Variable(s1.clone()),
+            Hlvalue::Variable(s2.clone()),
+        ]);
+        let concat_caller = FunctionGraph::with_return_var(
+            "caller_strconcat",
+            concat_start.clone(),
+            Hlvalue::Variable(concat_result.clone()),
+        );
+        concat_start
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(
+                "direct_call",
+                vec![
+                    Hlvalue::Constant(concat_fn),
+                    Hlvalue::Variable(s1),
+                    Hlvalue::Variable(s2),
+                ],
+                Hlvalue::Variable(concat_result.clone()),
+            ));
+        close_return(&concat_start, &concat_caller, concat_result);
+
+        register_lowlevel_helper_callees(&mut cc, &rtyper, &concat_caller);
+        let concat_funcs = direct_call_funcobjs(&concat_caller);
+        assert_eq!(concat_funcs.len(), 1);
+        let published = callpath_from_func_name(&concat_funcs[0]._name);
+        let lowered = lower_graph_with_callees(&concat_caller, &|_| None);
+        let call_targets: Vec<_> = lowered
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_targets,
+            vec![CallTarget::from_call_path(&published)],
+            "oopspec publication path equals the lowered Call path"
+        );
+        let _keep = ann;
     }
 }

@@ -534,6 +534,8 @@ trait AssemblerEncode {
         state: &mut AssemblyState,
     ) -> (u8, char);
 
+    fn emit_const_i_from_ref_addr(&mut self, addr: i64, state: &mut AssemblyState) -> (u8, char);
+
     fn emit_llexitcase(
         &mut self,
         value: &ConstValue,
@@ -2091,28 +2093,7 @@ impl AssemblerEncode for Assembler {
                     .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
                 match dest.map(|(_, kc)| kc).unwrap_or('r') {
                     'i' => {
-                        if let Some(name) = self.type_static_const_by_addr(*addr) {
-                            panic!(
-                                "ConstRefAddr of type-static {name} dest is Int; \
-                                 a PyType is GC (history.py getkind) — graph {:?}",
-                                self.current_graph_name,
-                            );
-                        }
-                        let (idx, src_argcode) = if let Some(name) = self.static_ref_by_addr(*addr)
-                        {
-                            (
-                                self.emit_const_i_reloc(
-                                    *addr,
-                                    ConstIRelocKind::StaticAddr {
-                                        name: name.to_string(),
-                                    },
-                                    state,
-                                ),
-                                'i',
-                            )
-                        } else {
-                            self.emit_const_i_allow_short(*addr, use_c_form("int_copy"), state)
-                        };
+                        let (idx, src_argcode) = self.emit_const_i_from_ref_addr(*addr, state);
                         finish_const_copy(
                             self,
                             startposition,
@@ -4307,6 +4288,32 @@ impl AssemblerEncode for Assembler {
         {
             return (self.emit_vtable_const(impl_key, trait_leaf, state), 'i');
         }
+        // `Assembler.emit_const` kind `'int'`: `Ptr` → `see_raw_object` →
+        // `cast_ptr_to_adr` → `Address` → `adr2int` (`assembler.py`). A
+        // non-null function pointer is that symbolic address, stored as
+        // `ConstIRelocKind::FnAddr` via `emit_fnaddr_const` — never the
+        // short form.
+        if let ConstValue::LLPtr(ptr) = value {
+            if ptr.nonzero()
+                && matches!(
+                    ptr._TYPE.TO,
+                    crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
+                )
+            {
+                let callee =
+                    crate::codewriter::jtransform_opname::callee_name_from_funcptr_value(value);
+                let target = crate::model::CallTarget::function_path(
+                    callee.split("::").filter(|s| !s.is_empty()),
+                );
+                return (self.emit_fnaddr_const(&target, state, callcontrol), 'i');
+            }
+        }
+        if let ConstValue::LLAddress(
+            crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n),
+        ) = value
+        {
+            return self.emit_const_i_from_ref_addr(*n, state);
+        }
         let value = Self::resolve_const_i_value(value, callcontrol);
         self.emit_const_i_allow_short(value, allow_short, state)
     }
@@ -4440,6 +4447,34 @@ impl AssemblerEncode for Assembler {
             (value as i8 as u8, 'c')
         } else {
             (self.emit_const_i(value, state), 'i')
+        }
+    }
+
+    /// `'i'` decision of `OpKind::ConstRefAddr` (`Assembler.emit_const`
+    /// Address → int via `adr2int`): a type-static is GC so dest Int
+    /// panics; a catalogued host static is `ConstIRelocKind::StaticAddr`;
+    /// otherwise raw bits, short-form when `int_copy` allows it.
+    fn emit_const_i_from_ref_addr(&mut self, addr: i64, state: &mut AssemblyState) -> (u8, char) {
+        if let Some(name) = self.type_static_const_by_addr(addr) {
+            panic!(
+                "ConstRefAddr of type-static {name} dest is Int; \
+                 a PyType is GC (history.py getkind) — graph {:?}",
+                self.current_graph_name,
+            );
+        }
+        if let Some(name) = self.static_ref_by_addr(addr) {
+            (
+                self.emit_const_i_reloc(
+                    addr,
+                    ConstIRelocKind::StaticAddr {
+                        name: name.to_string(),
+                    },
+                    state,
+                ),
+                'i',
+            )
+        } else {
+            self.emit_const_i_allow_short(addr, use_c_form("int_copy"), state)
         }
     }
 
@@ -4599,6 +4634,17 @@ impl AssemblerEncode for Assembler {
                     "reference pointer constants must be GC-managed"
                 );
                 0
+            }
+            // Adapter `const_ref_addr_define_hlvalue`: a GCREF `_ptr`
+            // whose object is `_ptr_obj::IntCast(a)`. Same call Spine A's
+            // `ConstRefAddr` dest `'r'` arm makes (`emit_type_static_or_bits`).
+            ConstValue::LLPtr(ptr)
+                if ptr.nonzero()
+                    && let Ok(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(a),
+                    )) = ptr._obj0_value() =>
+            {
+                a
             }
             ConstValue::HostObject(obj) => host_object_ref_bits(obj, callcontrol),
             ConstValue::LLAddress(
@@ -10122,6 +10168,28 @@ mod tests {
     }
 
     #[test]
+    fn emit_const_i_relocates_a_catalogued_static_address() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+
+        let mut asm = Assembler::new();
+        asm.intern_static_ref_addrs(&[("dictstrategy::EMPTY", 0x1000)]);
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        let value = ConstValue::LLAddress(_address::IntCast(0x1000));
+        let (_idx, argcode) =
+            asm.emit_const_i_from_const_allow_short(&value, true, &mut state, None);
+        assert_eq!(argcode, 'i');
+        assert_eq!(state.constants_i, vec![0x1000]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(
+            state.reloc_consts_i[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "dictstrategy::EMPTY".into()
+            }
+        );
+    }
+
+    #[test]
     fn const_ref_addr_named_static_int_dest_uses_i_reloc() {
         use crate::model::{OpKind, SpaceOperation};
 
@@ -11911,6 +11979,43 @@ mod tests {
             body.constants_r[d.constants_r_index].get(),
             UNIT_VARIANT_CONST_SENTINEL_BASE,
         );
+    }
+
+    #[test]
+    fn emit_const_r_pools_type_static_for_gcref_static_address() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _ptr, _ptr_obj, GCREF, LowLevelType,
+        };
+
+        let addr = 0x1020_3040i64;
+        let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+            panic!("GCREF must be a Ptr");
+        };
+        let ptr = _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(addr))), true);
+
+        let mut asm_r = Assembler::new();
+        asm_r.intern_type_static_addrs(&[("pyobject::INT_TYPE", addr)]);
+        let mut state_r = empty_state();
+        state_r.num_regs_r = 1;
+        let _ = asm_r.emit_const_r(&ConstValue::LLPtr(Box::new(ptr)), &mut state_r, None);
+
+        let (result, regallocs) = color_result(RegKind::Ref, 0);
+        let op = crate::model::SpaceOperation {
+            result: Some(result),
+            kind: crate::model::OpKind::ConstRefAddr(addr),
+        };
+        let mut asm_addr = Assembler::new();
+        asm_addr.intern_type_static_addrs(&[("pyobject::INT_TYPE", addr)]);
+        let mut state_addr = empty_state();
+        state_addr.num_regs_r = 1;
+        asm_addr.encode_op(&op, &regallocs, &mut state_addr, None);
+
+        assert_eq!(state_r.constants_r, state_addr.constants_r);
+        assert_eq!(state_r.type_static_consts, state_addr.type_static_consts);
+        assert_eq!(state_r.type_static_consts.len(), 1);
+        assert_eq!(state_r.type_static_consts[0].name, "pyobject::INT_TYPE");
+        let idx = state_r.type_static_consts[0].constants_r_index;
+        assert_eq!(state_r.constants_r[idx], TYPE_STATIC_CONST_SENTINEL_BASE);
     }
 
     #[test]

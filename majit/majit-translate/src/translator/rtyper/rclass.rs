@@ -2953,18 +2953,18 @@ impl InstanceRepr {
             ConstValue::LowLevelType(Box::new(object_lltype.clone())),
             LowLevelType::Void,
         );
-        // upstream: `cflags = inputconst(Void, {'flavor': flavor})` plus
-        // `flags['nonmovable'] = True` when requested. The flavor
-        // sentinel matches the `newtuple` emitter's encoding; the
-        // lowering pass reads the type from `ctype` and the flavor here.
-        let flavor_sentinel = match (self.gcflavor, nonmovable) {
-            (Flavor::Gc, false) => "flavor=gc",
-            (Flavor::Gc, true) => "flavor=gc;nonmovable",
-            (Flavor::Raw, false) => "flavor=raw",
-            (Flavor::Raw, true) => "flavor=raw;nonmovable",
-        };
+        // `InstanceRepr.new_instance`: `flags = {'flavor': self.gcflavor}`;
+        // `flags['nonmovable'] = True` when `nonmovable`; then
+        // `cflags = inputconst(Void, flags)`.
+        let mut flags = IndexMap::from([(
+            ConstValue::byte_str("flavor"),
+            ConstValue::byte_str(self.gcflavor.llflavor()),
+        )]);
+        if nonmovable {
+            flags.insert(ConstValue::byte_str("nonmovable"), ConstValue::Bool(true));
+        }
         let cflags =
-            Constant::with_concretetype(ConstValue::byte_str(flavor_sentinel), LowLevelType::Void);
+            Constant::with_concretetype(ConstValue::Dict(Arc::new(flags)), LowLevelType::Void);
         // upstream: `vptr = llops.genop('malloc', vlist,
         //                              resulttype=Ptr(self.object_type))`.
         let vptr = llops
@@ -4572,6 +4572,7 @@ impl Repr for InstanceRepr {
         // the declared type is a pointer to `QuasiImmut`
         // (`InstanceRepr._setup_repr`). Local to this setup, not a field.
         let mut native_mutate_watchers: HashSet<String> = HashSet::new();
+        let mut fieldnames: IndexMap<ConstValue, ConstValue> = IndexMap::new();
         for (attr_name, (s_value, readonly)) in &attrs_sorted {
             if *readonly {
                 continue;
@@ -4594,6 +4595,12 @@ impl Repr for InstanceRepr {
             } else {
                 format!("inst_{attr_name}")
             };
+            if ll_name != *attr_name {
+                fieldnames.insert(
+                    ConstValue::byte_str(ll_name.as_str()),
+                    ConstValue::byte_str(attr_name.as_str()),
+                );
+            }
             fields.insert(attr_name.clone(), (ll_name.clone(), r.clone()));
             myllfields.push((ll_name, r.lowleveltype().clone()));
         }
@@ -4633,7 +4640,18 @@ impl Repr for InstanceRepr {
         // `MkStruct` so the `virtualizable_accessor` hint can name the
         // redirected fields the way `accessor.fields` does after setup.
         *self.fields.borrow_mut() = fields.clone();
-        let struct_hints = self.virtualizable_accessor_hint()?;
+        let mut struct_hints = self.virtualizable_accessor_hint()?;
+        // Binds the rtyper's mangled `inst_<attr>` STRUCT field to the
+        // Rust layout's attribute name, in the shape of `rffi_platform`'s
+        // layout hints (`_hints['fieldoffsets']`, `_hints['c_name']`) —
+        // rustc fixes the layout, as the C compiler does for
+        // `rffi_platform.Struct`.
+        if !fieldnames.is_empty() {
+            struct_hints.push((
+                "fieldnames".to_string(),
+                ConstValue::Dict(Arc::new(fieldnames)),
+            ));
+        }
         let name = classdef_rc.borrow().name.clone();
         let mut struct_fields = Vec::with_capacity(1 + myllfields.len());
         struct_fields.push(("super".into(), rbase.object_type().clone()));
@@ -7325,6 +7343,42 @@ mod tests {
             .get("super")
             .expect("object_type Struct must carry 'super' field");
         assert_eq!(*super_field, OBJECT.clone());
+    }
+
+    #[test]
+    fn instance_repr_struct_records_attr_names_of_mangled_fields() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("m::W_X", None);
+        attach_attr(
+            &classdef,
+            "name",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
+            .expect("getinstancerepr(classdef)");
+        Repr::setup(repr.as_ref()).expect("InstanceRepr._setup_repr");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type must still be ForwardReference wrapper");
+        };
+        let resolved = fwd.resolved().expect("object_type must be resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type must resolve to Struct");
+        };
+        let hint = body
+            ._hints
+            .get("fieldnames")
+            .expect("STRUCT _hints['fieldnames']");
+        let ConstValue::Dict(map) = hint else {
+            panic!("fieldnames hint must be a dict, got {hint:?}");
+        };
+        assert_eq!(
+            map.get(&ConstValue::byte_str("inst_name")),
+            Some(&ConstValue::byte_str("name")),
+            "inst_name maps to the attribute name"
+        );
     }
 
     #[test]

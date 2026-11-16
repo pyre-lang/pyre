@@ -846,6 +846,7 @@ mod tests {
                 inline_vec: false,
                 vec_part: None,
                 owner_declared_gc: None,
+                owner_typeptr_hint: false,
                 host_index: None,
                 scalar_word: None,
             },

@@ -38,7 +38,7 @@ use crate::translator::rtyper::rlist::{
     ListIteratorRepr, ListLayout, ListRepr, build_ll_newlist_helper_graph,
     build_ll_setitem_fast_helper_graph,
 };
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, gc_flavor_const};
 use crate::translator::rtyper::rtuple::TupleRepr;
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
@@ -2341,12 +2341,11 @@ pub(crate) fn build_ll_rangeiter_helper_graph(
         ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
         LowLevelType::Void,
     );
-    let c_flags =
-        Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let c_flags = gc_flavor_const()?;
     let v_iter = variable_with_lltype("iter", iter_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
-        vec![Hlvalue::Constant(c_type), Hlvalue::Constant(c_flags)],
+        vec![Hlvalue::Constant(c_type), c_flags],
         Hlvalue::Variable(v_iter.clone()),
     ));
 
@@ -2433,12 +2432,11 @@ fn emit_gc_malloc(
         )))),
         LowLevelType::Void,
     );
-    let c_flags =
-        Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let c_flags = gc_flavor_const()?;
     let v_l = variable_with_lltype("l", ptr_lltype.clone());
     block.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
-        vec![Hlvalue::Constant(c_type), Hlvalue::Constant(c_flags)],
+        vec![Hlvalue::Constant(c_type), c_flags],
         Hlvalue::Variable(v_l.clone()),
     ));
     Ok(v_l)

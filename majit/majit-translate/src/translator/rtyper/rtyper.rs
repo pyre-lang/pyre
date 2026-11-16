@@ -953,6 +953,17 @@ impl RPythonTyper {
         Ok(LowLevelFunction::from_pygraph(name, args, result, graph))
     }
 
+    /// `annlowlevel.py` helper graphs live on `rtyper.lowlevel_helper_graphs`
+    /// (`FunctionDesc.cachedgraph` under
+    /// `LowLevelAnnotatorPolicy.lowlevelspecialize`). True iff some cached
+    /// helper graph's identity is `graph_id`.
+    pub(crate) fn is_lowlevel_helper_graph(&self, graph_id: usize) -> bool {
+        self.lowlevel_helper_graphs
+            .borrow()
+            .values()
+            .any(|pygraph| GraphKey::of(&pygraph.graph).as_usize() == graph_id)
+    }
+
     /// Synthesized helper graphs skip `RPythonTyper.specialize_block`, so
     /// exception-handler links keep the host-class `exitcase` that
     /// `Link::new` stores. `RPythonTyper.specialize_block` →

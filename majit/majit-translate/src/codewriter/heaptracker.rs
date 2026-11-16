@@ -163,6 +163,11 @@ pub(crate) fn is_host_object_header_owner(cc: &CallControl, owner: &str) -> bool
 /// class word of this owner's object header, the typeptr at the end of
 /// the offset-0 first-field chain ([`is_first_field_chain_typeptr`]).
 pub fn is_typeptr_field(cc: &CallControl, field: &crate::model::FieldDescriptor) -> bool {
+    // `jtransform.py is_typeptr_getset`: field name `'typeptr'` and
+    // `op.args[0].concretetype.TO._hints.get('typeptr')`.
+    if field.owner_typeptr_hint {
+        return field.name == "typeptr";
+    }
     is_first_field_chain_typeptr(
         field.owner_root.as_deref().unwrap_or(""),
         &field.name,

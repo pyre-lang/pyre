@@ -25,7 +25,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     self, _ptr, LowLevelType, MallocFlavor, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, gc_flavor_const};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, constant_with_lltype,
     exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
@@ -1363,11 +1363,11 @@ pub(crate) fn build_ll_tupleiter_helper_graph(
         ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
         LowLevelType::Void,
     );
-    let cflags = Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let cflags = gc_flavor_const()?;
     let v_iter = variable_with_lltype("iter", tupleiter_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
-        vec![Hlvalue::Constant(c1), Hlvalue::Constant(cflags)],
+        vec![Hlvalue::Constant(c1), cflags],
         Hlvalue::Variable(v_iter.clone()),
     ));
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1823,16 +1823,12 @@ impl TupleRepr {
             ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
             LowLevelType::Void,
         );
-        // upstream `cflags = inputconst(Void, {'flavor': 'gc'})`. We
-        // surface the flavor via a Void-typed Str sentinel matching
-        // how other malloc emitters in pyre encode it; the lowering
-        // pass reads the type from `c1` and the flavor from `cflags`.
-        let cflags =
-            Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+        // upstream `cflags = inputconst(Void, {'flavor': 'gc'})` (`newtuple`).
+        let cflags = gc_flavor_const()?;
         let v_result = llops
             .genop(
                 "malloc",
-                vec![Hlvalue::Constant(c1), Hlvalue::Constant(cflags)],
+                vec![Hlvalue::Constant(c1), cflags],
                 GenopResult::LLType(r_tuple.lltype.clone()),
             )
             .expect("malloc with non-Void result yields a Variable");

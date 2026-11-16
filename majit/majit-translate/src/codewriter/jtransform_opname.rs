@@ -70,14 +70,19 @@ use std::rc::Rc;
 
 use crate::flowspace::model::Variable as FVar;
 use crate::flowspace::model::{
-    Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, Hlvalue,
+    Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, GraphRef, Hlvalue,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
 };
+use crate::parse::CallPath;
 use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE_JITTED_TAG_ID};
-use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
-use crate::translator::rtyper::lltypesystem::rstr::{STR, UNICODE};
+use crate::translator::rtyper::lltypesystem::lltype::{
+    _address, Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
+};
+use crate::translator::rtyper::lltypesystem::rstr::{
+    STR, STRPTR, UNICODE, prebuilt_str_bytes_and_hash,
+};
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
 /// inherent id, so identity is the allocation address (RPython compares
@@ -122,11 +127,25 @@ impl StrFamily {
 /// operands and block inputargs — they are the same
 /// `crate::flowspace::model::Variable` type and carry their `concretetype`
 /// cell through unchanged, so no value-bridge round-trip is needed.
+pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
+    lower_graph_with_callees(graph, &|_| None)
+}
+
+/// Lower `graph`, resolving each `direct_call` / `jit_conditional_call`
+/// callee by graph identity when `callee_path` returns a [`CallPath`].
+///
+/// `call.py graphs_from` looks up `funcobj.graph` in
+/// `CallControl.jitcodes = {graph: jitcode}`; a miss falls back to
+/// `_func._name` (the `ll_*` helper path through
+/// `register_opname_helper_graph`).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
+pub fn lower_graph_with_callees(
+    graph: &FlowGraph,
+    callee_path: &dyn Fn(&GraphRef) -> Option<CallPath>,
+) -> crate::model::FunctionGraph {
     let mut out = crate::model::FunctionGraph::new(graph.name.clone());
     let family = detect_family(graph);
 
@@ -176,8 +195,34 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
         // `getsubstruct` aliases are block-local: a chars-array Variable maps
         // back to the string Variable it was derived from in this block.
         let mut chars_alias: HashMap<FVar, FVar> = HashMap::new();
+        // `Transformer.optimize_block` `renamings` / `do_rename`'s Void
+        // branch (`jtransform.py`): block-local exactly like upstream's
+        // `renamings`.
+        let mut void_renamings: HashMap<FVar, Hlvalue> = HashMap::new();
         for op in &fb_ref.operations {
-            transduce_op(&mut out, id, op, &mut chars_alias, &family);
+            if matches!(
+                op.opname.as_str(),
+                "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr"
+            ) {
+                if let Hlvalue::Variable(result) = &op.result {
+                    if matches!(result.concretetype(), Some(LowLevelType::Void)) {
+                        void_renamings.insert(result.clone(), void_none_hlvalue());
+                        continue;
+                    }
+                }
+            }
+            if let Some(renamed) = rename_void_op_args(op, &void_renamings) {
+                transduce_op(
+                    &mut out,
+                    id,
+                    &renamed,
+                    &mut chars_alias,
+                    &family,
+                    callee_path,
+                );
+            } else {
+                transduce_op(&mut out, id, op, &mut chars_alias, &family, callee_path);
+            }
         }
 
         let we_are_jitted_switch = matches!(
@@ -196,12 +241,19 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                     .as_ref()
                     .expect("opname-spine link has no target block");
                 let target_id = block_map[&Rc::as_ptr(target)];
+                let target_inputargs = out.block(target_id).inputargs.clone();
+                let graph_name = out.name.clone();
                 let args: Vec<LinkArg> = link
                     .args
                     .iter()
-                    .map(|arg| {
-                        linkarg_from_hlvalue(
-                            arg.as_ref().expect("opname-spine link arg is undefined"),
+                    .enumerate()
+                    .map(|(i, arg)| {
+                        // `Transformer._do_renaming_on_link` (`jtransform.py`).
+                        let hlv = arg.as_ref().expect("opname-spine link arg is undefined");
+                        linkarg_from_hlvalue_matching_target(
+                            rename_void_hlvalue(hlv, &void_renamings),
+                            target_inputargs.get(i),
+                            &graph_name,
                         )
                     })
                     .collect();
@@ -216,8 +268,14 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                 // make_exception_link (it asserts they are Some and, for an
                 // empty-target handler, unwraps them). Dropping them turns a
                 // faithful OverflowError edge into a flatten-time panic.
-                model_link.last_exception = link.last_exception.as_ref().map(linkarg_from_hlvalue);
-                model_link.last_exc_value = link.last_exc_value.as_ref().map(linkarg_from_hlvalue);
+                model_link.last_exception = link
+                    .last_exception
+                    .as_ref()
+                    .map(|hlv| linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings)));
+                model_link.last_exc_value = link
+                    .last_exc_value
+                    .as_ref()
+                    .map(|hlv| linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings)));
                 model_link
             })
             .collect();
@@ -238,7 +296,11 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
             }
             None
         } else {
-            match &fb_ref.exitswitch {
+            match fb_ref
+                .exitswitch
+                .as_ref()
+                .map(|hlv| rename_void_hlvalue(hlv, &void_renamings))
+            {
                 Some(Hlvalue::Variable(v)) => Some(ExitSwitch::Value(v.clone())),
                 _ => None,
             }
@@ -273,7 +335,7 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
 /// Same source as `effect_graph_from_rtyped_helper`'s `OpKind::Input { name }`
 /// (`Variable::name_prefix` when renamed); strip the intern trailing `_`
 /// so the names match harvested `#[oopspec]` argnames (no numbering suffix).
-fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
+pub(crate) fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
     graph
         .startblock
         .borrow()
@@ -307,6 +369,7 @@ fn transduce_op(
     op: &crate::flowspace::model::SpaceOperation,
     chars_alias: &mut HashMap<FVar, FVar>,
     family: &StrFamily,
+    callee_path: &dyn Fn(&GraphRef) -> Option<CallPath>,
 ) {
     match op.opname.as_str() {
         // `getsubstruct(s, "chars")` — interior pointer with no runtime
@@ -683,8 +746,16 @@ fn transduce_op(
                 OpKind::LoweredBlackholeOp {
                     opname: opname.to_string(),
                     args: vec![
-                        record_exact_value_linkarg(&op.args[0]),
-                        record_exact_value_linkarg(&op.args[1]),
+                        linkarg_from_hlvalue_matching_target(
+                            &op.args[0],
+                            hlvalue_as_var(&op.args[1]).as_ref(),
+                            &out.name,
+                        ),
+                        linkarg_from_hlvalue_matching_target(
+                            &op.args[1],
+                            hlvalue_as_var(&op.args[0]).as_ref(),
+                            &out.name,
+                        ),
                     ],
                 },
                 false,
@@ -701,14 +772,14 @@ fn transduce_op(
         "getfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
-            let owner_root = owner_root_of(&base);
+            let field = field_descriptor_of(&base, &field_name, "getfield");
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
                 OpKind::FieldRead {
                     base,
-                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    field,
                     ty,
                     pure: false,
                 },
@@ -795,14 +866,14 @@ fn transduce_op(
         "setfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
-            let owner_root = owner_root_of(&base);
+            let field = field_descriptor_of(&base, &field_name, "setfield");
             let value = linkarg_from_hlvalue(&op.args[2]);
             let ty = hlvalue_value_type(&op.args[2]);
             out.push_op_var(
                 block,
                 OpKind::FieldWrite {
                     base,
-                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    field,
                     value,
                     ty,
                 },
@@ -961,27 +1032,27 @@ fn transduce_op(
                 result,
             );
         }
-        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is the
-        // `_func._name` carried by the leading funcptr constant
-        // (`ConstValue::LLPtr` → `_ptr_obj::Func`); it becomes a
-        // `CallTarget::FunctionPath` whose single segment matches the helper's
-        // registered `CallPath`, so `register_opname_helper_graph` makes it
-        // resolve as a *regular* callee rather than a residual synthetic
-        // fnaddr.  The trailing operands are the call arguments; `OpKind::Call`
-        // takes `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
+        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is
+        // `funcobj.graph` when `callee_path` knows that graph (`call.py
+        // graphs_from`); otherwise `_func._name` on the leading funcptr
+        // (`ConstValue::LLPtr` → `_ptr_obj::Func`), split on `::` so
+        // `majit_rlib::jit::isconstant` and `register_opname_helper_graph`
+        // hit a regular CallPath rather than a residual fnaddr.  The
+        // trailing operands are the call arguments; `OpKind::Call` takes
+        // `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
         // are materialised through the same `ConstInt`/`ConstBool` path the
         // `int_*` arm uses.  The builder helpers' `direct_call`s all return a
         // value (`ll_min` → uint, `mallocfn` → the char buffer), so the result
         // is bound as a result var.
         "direct_call" => {
-            let callee = callee_name_from_funcptr(&op.args[0]);
-            // `_func._name` is the `::`-joined CallPath
-            // (`functionptr(ft, key.segments().join("::"), …)`). Split so
-            // a call to `majit_rlib::jit::isconstant` hits the marked
-            // oopspec rather than a one-segment residual.
-            let target = crate::model::CallTarget::function_path(
-                callee.split("::").filter(|s| !s.is_empty()),
-            );
+            let func = callee_func_from_funcptr(&op.args[0]);
+            // `call.py graphs_from` resolves `funcobj.graph` by identity
+            // (`CallControl.jitcodes = {graph: jitcode}`), never by
+            // `_func._name`.
+            let target = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => CallTarget::from_call_path(&callpath_from_func_name(&func._name)),
+            };
             // `ll_get_raw_address_of_string` is a FunctionPath Call. This
             // transducer has no CallControl; `rewrite_op_direct_call`
             // mints the `dont_look_inside` residual before `guess_call_kind`
@@ -1014,7 +1085,15 @@ fn transduce_op(
             );
             check_cond_call_operands(&op.args);
             let cond = materialize(out, block, &op.args[0]);
-            let callee = callee_name_from_funcptr(&op.args[1]);
+            let func = callee_func_from_funcptr(&op.args[1]);
+            // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
+            let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => {
+                    let name = callee_name_from_funcptr(&op.args[1]);
+                    CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
+                }
+            };
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
@@ -1023,7 +1102,7 @@ fn transduce_op(
                 out,
                 block,
                 cond,
-                &callee,
+                callee,
                 extra_args,
                 result,
                 "conditional_call",
@@ -1042,7 +1121,15 @@ fn transduce_op(
             );
             check_cond_call_operands(&op.args);
             let value = materialize(out, block, &op.args[0]);
-            let callee = callee_name_from_funcptr(&op.args[1]);
+            let func = callee_func_from_funcptr(&op.args[1]);
+            // `call.py graphs_from` (`funcobj.graph`), same as `direct_call`.
+            let callee = match func.graph_ref().and_then(|g| callee_path(&g)) {
+                Some(path) => CallTarget::from_call_path(&path),
+                None => {
+                    let name = callee_name_from_funcptr(&op.args[1]);
+                    CallTarget::function_path(name.split("::").filter(|s| !s.is_empty()))
+                }
+            };
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
@@ -1051,7 +1138,7 @@ fn transduce_op(
                 out,
                 block,
                 value,
-                &callee,
+                callee,
                 extra_args,
                 result,
                 "conditional_call_elidable",
@@ -1079,12 +1166,16 @@ fn transduce_op(
                 result,
             );
         }
-        // `Transformer.rewrite_op_likely` / `rewrite_op_unlikely` return
-        // None ("no real effect"): the result is renamed to args[0].
-        // Emit `same_as` so the shared identity rewrite does that rename.
-        "likely" | "unlikely" => {
-            let operand = materialize(out, block, &op.args[0]);
+        // `Transformer.rewrite_op_same_as`, `rewrite_op_cast_pointer`, and
+        // `rewrite_op_cast_opaque_ptr` (`jtransform.py`) return None: the
+        // result is renamed to the argument, which is what the shared
+        // `UnaryOp same_as` handling in `Transformer` does.
+        "same_as" | "cast_pointer" | "likely" | "unlikely" | "cast_opaque_ptr" => {
             let result = expect_var(&op.result);
+            if let Hlvalue::Constant(c) = &op.args[0] {
+                assert_rtyped_link_constant_kind(&out.name, c, &result);
+            }
+            let operand = materialize(out, block, &op.args[0]);
             let result_ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
@@ -1134,7 +1225,7 @@ pub(crate) fn emit_conditional_call_oopspec(
         out,
         block,
         cond,
-        callee_name,
+        CallTarget::function_path(callee_name.split("::").filter(|s| !s.is_empty())),
         extra_args,
         result,
         "conditional_call",
@@ -1159,7 +1250,7 @@ pub(crate) fn emit_conditional_call_value_oopspec(
         out,
         block,
         value,
-        callee_name,
+        CallTarget::function_path(callee_name.split("::").filter(|s| !s.is_empty())),
         extra_args,
         result,
         "conditional_call_elidable",
@@ -1179,7 +1270,7 @@ fn emit_conditional_call_oopspec_named(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
     cond: FVar,
-    callee_name: &str,
+    callee: CallTarget,
     extra_args: Vec<FVar>,
     result: FVar,
     helper_prefix: &str,
@@ -1189,9 +1280,23 @@ fn emit_conditional_call_oopspec_named(
         n <= 4,
         "the helper leaf `{helper_prefix}{{n}}` only exists for 0..=4"
     );
-    let fn_target = CallTarget::function_path(
-        std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
-    );
+    let fn_target = match callee {
+        CallTarget::FunctionPath {
+            mut segments,
+            fun_decl_id,
+            specialization,
+        } => {
+            segments.insert(0, FN_CONST_HEAD.to_string());
+            CallTarget::FunctionPath {
+                segments,
+                fun_decl_id,
+                specialization,
+            }
+        }
+        other => panic!(
+            "jtransform_opname::lower_graph: jit_conditional_call callee is not a FunctionPath: {other:?}"
+        ),
+    };
     let fn_var = out
         .push_op_var(
             block,
@@ -1352,6 +1457,13 @@ fn str_family_from_lltype(ty: &LowLevelType) -> Option<StrFamily> {
     } else {
         None
     }
+}
+
+/// `v.concretetype == rstr.STRPTR` (`Ptr(STR)` / `rpy_string`).
+/// `StringRepr.convert_const` stamps this lltype; UNICODE is
+/// `UNICODEPTR` and stays out.
+fn is_str_ptr(p: &Ptr) -> bool {
+    LowLevelType::Ptr(Box::new(p.clone())) == *STRPTR
 }
 
 #[expect(
@@ -1542,17 +1654,6 @@ fn malloc_flags_zero(hlv: &Hlvalue) -> bool {
     )
 }
 
-/// `jit_record_exact_value` operands pass through as [`LinkArg`], the
-/// same Variable-or-Constant carrier `FieldWrite.value` uses, so a
-/// Constant reaches `Assembler.emit_const` with its original
-/// `ConstValue`.
-fn record_exact_value_linkarg(hlv: &Hlvalue) -> LinkArg {
-    match hlv {
-        Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
-        Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
-    }
-}
-
 /// Runtime call operands, dropping Void. Void is compile-time only.
 ///
 /// `jtransform.py Transformer.make_three_lists` skips `kind == 'void'`
@@ -1647,6 +1748,38 @@ pub(crate) fn materialize_constant(
                         OpKind::ConstInt(0)
                     }
                 }
+                // Adapter `const_ref_addr_define_hlvalue`: a GCREF `_ptr`
+                // whose object is `_ptr_obj::IntCast(a)`. Spine A carries
+                // this as `OpKind::ConstRefAddr(a)` (`Assembler.emit_const`
+                // kind `'ref'`).
+                ConstValue::LLPtr(ptr)
+                    if ptr.nonzero()
+                        && let Ok(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(a),
+                        )) = ptr._obj0_value() =>
+                {
+                    OpKind::ConstRefAddr(a)
+                }
+                // `Assembler.emit_const` kind `'ref'`: a prebuilt
+                // `Ptr(STR)` from `StringRepr.convert_const` is stored
+                // in `constants_r`. The rich-graph carrier is
+                // `OpKind::ConstStr` of the `rpy_string.chars` bytes
+                // (`prebuilt_str_bytes_and_hash`). UNICODE stays
+                // unmaterialised.
+                ConstValue::LLPtr(ptr) if is_str_ptr(p) => match prebuilt_str_bytes_and_hash(ptr) {
+                    Some((bytes, _)) => OpKind::ConstStr(bytes),
+                    None => fail(),
+                },
+                _ => fail(),
+            },
+            // `Assembler.emit_const` (`assembler.py`): Address → int via
+            // `adr2int`. A catalogued address is relocated
+            // (`ConstIRelocKind::StaticAddr`); otherwise the assembler
+            // keeps the raw bits — the same split Spine A's
+            // `ConstRefAddr` arm does. `_address::Null` is 0.
+            Some(LowLevelType::Address) => match &c.value {
+                ConstValue::LLAddress(_address::IntCast(n)) => OpKind::ConstRefAddr(*n),
+                ConstValue::LLAddress(_address::Null) => OpKind::ConstInt(0),
                 _ => fail(),
             },
             None => match &c.value {
@@ -1688,19 +1821,54 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
     }
 }
 
+/// `_func._name` split used when `graphs_from` has no subject path
+/// (`call.py` falls back to the funcobj name). Shared with the opname
+/// spine's oopspec walk so `mark_oopspec` keys the same CallPath the
+/// leftover `direct_call` Call will guess.
+pub(crate) fn callpath_from_func_name(name: &str) -> CallPath {
+    CallPath::from_segments(name.split("::").filter(|s| !s.is_empty()))
+}
+
 /// Decode a `direct_call` callee operand — the leading funcptr constant.
 /// `ConstValue::LLPtr` wraps an `_ptr` whose underlying object is an
 /// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
 /// `CallPath` a helper is registered under.
 fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
-    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    callee_func_from_funcptr(hlv)._name
+}
+
+/// Same decode as [`callee_name_from_funcptr`], returning the `_func`
+/// so Spine B can resolve by `graph_ref()` (`call.py graphs_from`
+/// `funcobj.graph`).
+pub(crate) fn callee_func_from_funcptr(
+    hlv: &Hlvalue,
+) -> crate::translator::rtyper::lltypesystem::lltype::_func {
     let Hlvalue::Constant(c) = hlv else {
         panic!("jtransform_opname::lower_graph: direct_call callee operand is not a constant");
     };
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let ConstValue::LLPtr(ptr) = &c.value else {
         panic!(
             "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
             c.value
+        );
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => func,
+        other => panic!(
+            "jtransform_opname::lower_graph: direct_call callee funcptr does not resolve to a Func object: {other:?}"
+        ),
+    }
+}
+
+/// `_func._name` of a non-null funcptr `ConstValue::LLPtr`. Shared with
+/// `Assembler.emit_const_i_from_const_allow_short` (`assembler.rs`).
+pub(crate) fn callee_name_from_funcptr_value(value: &ConstValue) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let ConstValue::LLPtr(ptr) = value else {
+        panic!(
+            "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
+            value
         );
     };
     match ptr._obj0_value() {
@@ -1727,18 +1895,93 @@ fn field_name_of(hlv: &Hlvalue) -> String {
     }
 }
 
+/// Owning `Struct` of a field-access base — `jtransform.py
+/// rewrite_op_getfield`: `STRUCT = v_inst.concretetype.TO`.  A resolved
+/// `ForwardReference` is unwrapped the way `LowLevelType::short_name` /
+/// `Hash` unwrap `LowLevelType::ForwardReference` (`lltype.rs`).
+fn owner_struct_of(base: &FVar) -> Option<Struct> {
+    match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => owner_struct_of_ptr_target(&ptr.TO),
+        _ => None,
+    }
+}
+
+fn owner_struct_of_ptr_target(to: &PtrTarget) -> Option<Struct> {
+    match to {
+        PtrTarget::Struct(s) => Some(s.clone()),
+        PtrTarget::ForwardReference(fr) => resolved_struct_of(fr),
+        _ => None,
+    }
+}
+
+fn resolved_struct_of(fr: &ForwardReference) -> Option<Struct> {
+    match fr.resolved() {
+        Some(LowLevelType::Struct(s)) => Some(*s),
+        Some(_) => None,
+        None => panic!(
+            "jtransform_opname::owner_struct_of: ForwardReference is unresolved \
+             (cpu.fielddescrof needs STRUCT)"
+        ),
+    }
+}
+
+fn owner_struct_of_lltype(ty: &LowLevelType) -> Option<Struct> {
+    match ty {
+        LowLevelType::Ptr(ptr) => owner_struct_of_ptr_target(&ptr.TO),
+        LowLevelType::Struct(s) => Some((**s).clone()),
+        LowLevelType::ForwardReference(fr) => resolved_struct_of(fr),
+        _ => None,
+    }
+}
+
 /// The owning struct leaf of a field access — the pointee-struct name of
 /// the base pointer's `concretetype` (`Ptr(Struct("stringbuilder"))` →
 /// `"stringbuilder"`).  `None` when the base is not a pointer-to-struct,
 /// in which case the layout layer falls back to its type-string heuristic.
 fn owner_root_of(base: &FVar) -> Option<String> {
-    match base.concretetype()? {
-        LowLevelType::Ptr(ptr) => match ptr.TO {
-            PtrTarget::Struct(s) => Some(s._name),
-            _ => None,
-        },
-        _ => None,
+    owner_struct_of(base).map(|s| s._name)
+}
+
+/// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
+fn owner_typeptr_hint_of(base: &FVar) -> bool {
+    owner_struct_of(base)
+        .is_some_and(|s| matches!(s._hints.get("typeptr"), Some(ConstValue::Bool(true))))
+}
+
+/// `FieldDescriptor` for a non-Void `getfield` / `setfield`.  Upstream
+/// `rewrite_op_getfield` always has the STRUCT (`cpu.fielddescrof(STRUCT,
+/// c_fieldname.value)`); a `Ptr` base without one is refused.  `_hints
+/// ['fieldnames']` maps the rtyper's mangled `inst_<attr>` ll name to the
+/// Rust layout attribute name.
+fn field_descriptor_of(
+    base: &FVar,
+    ll_field_name: &str,
+    opname: &str,
+) -> crate::model::FieldDescriptor {
+    let owner = owner_struct_of(base);
+    if matches!(base.concretetype(), Some(LowLevelType::Ptr(_))) && owner.is_none() {
+        panic!(
+            "jtransform_opname::lower_graph: {opname} on {ll_field_name} has no STRUCT owner \
+             (cpu.fielddescrof(STRUCT, name))"
+        );
     }
+    let field_name = owner
+        .as_ref()
+        .map(|s| field_name_for_struct(s, ll_field_name))
+        .unwrap_or_else(|| ll_field_name.to_string());
+    crate::model::FieldDescriptor::new(field_name, owner_root_of(base))
+        .with_owner_typeptr_hint(owner_typeptr_hint_of(base))
+}
+
+fn field_name_for_struct(owner: &Struct, ll_name: &str) -> String {
+    if let Some(ConstValue::Dict(map)) = owner._hints.get("fieldnames") {
+        if let Some(mapped) = map.get(&ConstValue::byte_str(ll_name)) {
+            if let Some(bytes) = mapped.as_byte_str() {
+                return String::from_utf8_lossy(bytes).into_owned();
+            }
+        }
+    }
+    ll_name.to_string()
 }
 
 /// Whether an operand is the null pointer constant (`ConstValue::None`),
@@ -1757,12 +2000,110 @@ fn lltype_is_gc_ptr(var: &FVar) -> bool {
     }
 }
 
+/// `Constant(None, lltype.Void)` — `Transformer.optimize_block.do_rename`
+/// (`jtransform.py`) Void branch.
+fn void_none_hlvalue() -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ))
+}
+
+/// `Transformer._do_renaming` (`jtransform.py`): clone the op with renamed
+/// args only when some arg is in the block-local Void `renamings`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn rename_void_op_args(
+    op: &crate::flowspace::model::SpaceOperation,
+    void_renamings: &HashMap<FVar, Hlvalue>,
+) -> Option<crate::flowspace::model::SpaceOperation> {
+    if !op.args.iter().any(|arg| match arg {
+        Hlvalue::Variable(v) => void_renamings.contains_key(v),
+        _ => false,
+    }) {
+        return None;
+    }
+    let mut renamed = op.clone();
+    for arg in &mut renamed.args {
+        if let Hlvalue::Variable(v) = arg {
+            if let Some(mapped) = void_renamings.get(v) {
+                *arg = mapped.clone();
+            }
+        }
+    }
+    Some(renamed)
+}
+
+/// `Transformer._do_renaming_on_link` (`jtransform.py`): map a Variable
+/// through the block-local Void `renamings`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn rename_void_hlvalue<'a>(
+    hlv: &'a Hlvalue,
+    void_renamings: &'a HashMap<FVar, Hlvalue>,
+) -> &'a Hlvalue {
+    match hlv {
+        Hlvalue::Variable(v) => void_renamings.get(v).unwrap_or(hlv),
+        _ => hlv,
+    }
+}
+
 /// Map a flowspace link arg (`Variable` or `Constant`) to the model
 /// `LinkArg` — model links carry mixed var/const args directly.
 fn linkarg_from_hlvalue(hlv: &Hlvalue) -> LinkArg {
     match hlv {
         Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
         Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
+    }
+}
+
+/// `rtyper.py insert_link_conversions` rewrites each Constant link arg
+/// with `inputconst(r_a2, a1.value)` into the dest inputarg's repr, so
+/// `getkind` of the constant equals the target's. A mismatch is an
+/// ill-typed rtyped graph.
+fn linkarg_from_hlvalue_matching_target(
+    hlv: &Hlvalue,
+    target: Option<&FVar>,
+    graph_name: &str,
+) -> LinkArg {
+    if let (Hlvalue::Constant(c), Some(target)) = (hlv, target) {
+        assert_rtyped_link_constant_kind(graph_name, c, target);
+    }
+    linkarg_from_hlvalue(hlv)
+}
+
+fn history_kind_name(k: crate::model::ConcreteType) -> &'static str {
+    match k {
+        crate::model::ConcreteType::Signed => "int",
+        crate::model::ConcreteType::GcRef => "ref",
+        crate::model::ConcreteType::Float => "float",
+        crate::model::ConcreteType::Void => "void",
+        crate::model::ConcreteType::Unknown => "unknown",
+    }
+}
+
+fn assert_rtyped_link_constant_kind(graph_name: &str, c: &Constant, target: &FVar) {
+    let Some(const_ty) = c.concretetype.as_ref() else {
+        return;
+    };
+    let Some(target_ty) = target.concretetype() else {
+        return;
+    };
+    let k1 = crate::model::getkind(const_ty);
+    let k2 = crate::model::getkind(&target_ty);
+    if k1 == crate::model::ConcreteType::Void || k2 == crate::model::ConcreteType::Void {
+        return;
+    }
+    if k1 != k2 {
+        panic!(
+            "ill-typed rtyped graph {graph_name}: link constant kind {} != target kind {}",
+            history_kind_name(k1),
+            history_kind_name(k2),
+        );
     }
 }
 
@@ -1854,12 +2195,13 @@ fn value_type_from_lltype(lltype: &LowLevelType) -> ValueType {
 fn malloc_struct_owner(hlv: &Hlvalue) -> String {
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
-            ConstValue::LowLevelType(lltype) => match &**lltype {
-                LowLevelType::Struct(s) => s._name.clone(),
-                other => panic!(
-                    "jtransform_opname::lower_graph: malloc type operand is not a Struct: {other:?}"
-                ),
-            },
+            ConstValue::LowLevelType(lltype) => owner_struct_of_lltype(lltype)
+                .map(|s| s._name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "jtransform_opname::lower_graph: malloc type operand is not a Struct: {lltype:?}"
+                    )
+                }),
             other => panic!(
                 "jtransform_opname::lower_graph: malloc first operand is not a LowLevelType const: {other:?}"
             ),
@@ -1915,15 +2257,15 @@ fn is_unichar_array_ptr(var: &FVar) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lower_graph, materialize_constant};
+    use super::{lower_graph, lower_graph_with_callees, materialize_constant};
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
-        Link, SpaceOperation, c_last_exception,
+        Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc,
+        Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{
-        Array, LowLevelType, Ptr, PtrTarget, Struct,
+        Array, ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
@@ -2499,6 +2841,48 @@ mod tests {
                 .expect("integer-bank alias graph drains to JitCode")
                 .code
                 .is_empty()
+        );
+    }
+
+    /// `Transformer.rewrite_op_cast_opaque_ptr` (`jtransform.py`) returns
+    /// None: the result is aliased to `op.args[0]`, the same `same_as`
+    /// rewrite as `rewrite_op_same_as` / `rewrite_op_cast_pointer`.
+    #[test]
+    fn lower_graph_aliases_cast_opaque_ptr_to_same_as() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "cast_opaque_ptr_alias",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let casted = variable_with_lltype("casted", STRPTR.clone());
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_opaque_ptr",
+            vec![Hlvalue::Variable(p.clone())],
+            Hlvalue::Variable(casted.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(casted.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        assert_eq!(startblock_unops(&model), vec!["same_as".to_string()]);
+        let op = &model.block(model.startblock).operations[0];
+        let OpKind::UnaryOp { operand, .. } = &op.kind else {
+            panic!("cast_opaque_ptr must lower to UnaryOp same_as, got {op:?}");
+        };
+        assert_eq!(op.result.as_ref(), Some(&casted));
+        assert_eq!(operand, &p);
+        assert_eq!(
+            model.block(model.startblock).exits[0].args,
+            vec![LinkArg::Value(casted)]
         );
     }
 
@@ -3287,6 +3671,116 @@ mod tests {
         );
         assert_eq!(*argc, 2, "size + the materialised 1280");
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    fn funcptr_named_with_graph(
+        name: &str,
+    ) -> (
+        crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        crate::flowspace::model::GraphRef,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, functionptr_for_graph_with_type,
+        };
+        let start = Block::shared(vec![]);
+        let graph = std::rc::Rc::new(std::cell::RefCell::new(FlowGraph::new(name, start)));
+        let ft = FuncType {
+            args: vec![],
+            result: LowLevelType::Signed,
+        };
+        let ptr = functionptr_for_graph_with_type(&graph, ft);
+        (ptr, graph)
+    }
+
+    fn flow_graph_direct_calling(
+        funcptr: crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    ) -> FlowGraph {
+        let startblock = Block::shared(vec![]);
+        let return_var = variable_with_lltype("out", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "caller_direct_call",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![callee],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    fn lowered_direct_call_target(model: &crate::model::FunctionGraph) -> crate::model::CallTarget {
+        model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .expect("direct_call lowers to Call")
+    }
+
+    /// `call.py graphs_from` resolves by `funcobj.graph`, so a funcptr whose
+    /// `_name` is the rustc-style `a::<Impl>::m` still becomes the subject's
+    /// CallPath when the resolver maps that graph.
+    #[test]
+    fn lower_graph_direct_call_target_is_the_callee_graph_path() {
+        let (funcptr, callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let key = crate::flowspace::model::GraphKey::of(&callee_graph);
+        let resolved = crate::parse::CallPath::from_segments(["T", "m"]);
+        let model = lower_graph_with_callees(&flow, &|g| {
+            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
+        });
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::from_call_path(&resolved)
+        );
+    }
+
+    /// A subject path's `GraphSpecialization` is copied onto the CallTarget
+    /// (`CallTarget::from_call_path`).
+    #[test]
+    fn lower_graph_direct_call_keeps_callee_specialization() {
+        let (funcptr, callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let key = crate::flowspace::model::GraphKey::of(&callee_graph);
+        let resolved = crate::parse::CallPath {
+            segments: vec!["T".into(), "m".into()],
+            specialization: crate::parse::GraphSpecialization::AccessDirect,
+        };
+        let model = lower_graph_with_callees(&flow, &|g| {
+            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
+        });
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::from_call_path(&resolved)
+        );
+    }
+
+    /// `ll_*` helpers are not two-phase subjects: resolver `None` keeps
+    /// `_func._name` segments.
+    #[test]
+    fn lower_graph_direct_call_without_subject_graph_uses_func_name() {
+        let (funcptr, _callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
+        let flow = flow_graph_direct_calling(funcptr);
+        let model = lower_graph_with_callees(&flow, &|_| None);
+        assert_eq!(
+            lowered_direct_call_target(&model),
+            crate::model::CallTarget::function_path(["a", "<Impl>", "m"])
+        );
     }
 
     /// Void-typed `direct_call` operands are compile-time only
@@ -4773,6 +5267,128 @@ mod tests {
         assert_eq!(result.concretetype(), Some(expected));
     }
 
+    /// `Assembler.emit_const` kind `'ref'`: `StringRepr.convert_const`
+    /// prebuilt `Ptr(STR)` (`const_str_cache_llstr`) is `ConstStr` of
+    /// the `rpy_string.chars` bytes.
+    #[test]
+    fn lower_graph_materializes_prebuilt_str_ptr_as_const_str() {
+        let start = Block::shared(vec![]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "prebuilt_str_const",
+            start.clone(),
+            Hlvalue::Variable(returned.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![strptr_const()],
+            Hlvalue::Variable(returned.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(returned.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstStr(b) if b == b"hello")),
+            "prebuilt Ptr(STR) becomes ConstStr(b\"hello\"): {ops:?}"
+        );
+    }
+
+    fn gcref_static_address_const(addr: i64) -> (Constant, LowLevelType) {
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF};
+        let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
+            panic!("GCREF must be a Ptr");
+        };
+        let p = _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(addr))), true);
+        (
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone()),
+            GCREF.clone(),
+        )
+    }
+
+    #[test]
+    fn materialize_constant_gcref_static_address_is_const_ref_addr() {
+        let (c, ptr_ty) = gcref_static_address_const(0x1000);
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_gcref_static");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstRefAddr(0x1000)),
+            "GCREF IntCast static address becomes ConstRefAddr: {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(ptr_ty));
+    }
+
+    /// `Assembler.emit_const` Address → `adr2int`; Spine A carries
+    /// `cast_int_to_adr(n)` (`_address::IntCast(n)`) as `ConstRefAddr(n)`.
+    /// `_address::Null` stays `ConstInt(0)`.
+    #[test]
+    fn materialize_constant_address_intcast_is_const_ref_addr() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        let c = Constant::with_concretetype(
+            ConstValue::LLAddress(_address::IntCast(42)),
+            LowLevelType::Address,
+        );
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_address_intcast");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstRefAddr(42)),
+            "Address IntCast(42) becomes ConstRefAddr(42): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Address));
+
+        let null = Constant::with_concretetype(
+            ConstValue::LLAddress(_address::Null),
+            LowLevelType::Address,
+        );
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_address_null");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &null, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstInt(0)),
+            "Address Null becomes ConstInt(0): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Address));
+    }
+
+    #[test]
+    #[should_panic(expected = "ill-typed rtyped graph")]
+    fn lower_graph_link_constant_kind_mismatch_panics() {
+        let start = Block::shared(vec![]);
+        let returned = variable_with_lltype("returned", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "link_kind_mismatch",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        start.closeblock(vec![
+            Link::new(
+                vec![signed_const(42)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let _ = lower_graph(&graph);
+    }
+
     /// `rewrite_op_cast_primitive` / `rewrite_op_force_cast`: a Number
     /// constant operand materialises as `ConstInt` carrying 200.
     #[test]
@@ -4934,5 +5550,287 @@ mod tests {
             Some(&LinkArg::Value(null_var)),
             "first argument is the ConstRefNull result: {call_args:?}"
         );
+    }
+
+    fn transform_lowered(model: crate::model::FunctionGraph) -> crate::model::FunctionGraph {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+
+        let mut cc = CallControl::new();
+        Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&model)
+            .graph
+    }
+
+    fn close_return(startblock: &BlockRef, graph: &FlowGraph, value: Variable) {
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+    }
+
+    /// `jtransform.py handle_getfield_typeptr`: `getfield(v, 'typeptr')` on
+    /// `Ptr(rclass.OBJECT)` is `-live-` + `guard_class(v)`, not a FieldRead.
+    /// `rclass.OBJECT` has no CallControl row; the STRUCT `_hints['typeptr']`
+    /// is what `is_typeptr_getset` reads.
+    #[test]
+    fn lower_graph_object_typeptr_getfield_becomes_guard_class() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let cls = variable_with_lltype("cls", CLASSTYPE.clone());
+        let graph = FlowGraph::with_return_var(
+            "object_typeptr_getfield",
+            startblock.clone(),
+            Hlvalue::Variable(cls.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(cls.clone()),
+        ));
+        close_return(&startblock, &graph, cls);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let saw_handle = ops.windows(2).any(|window| {
+            matches!(&window[0].kind, OpKind::Live { forced } if forced.is_empty())
+                && matches!(&window[1].kind, OpKind::GuardClass { base } if *base == v)
+        });
+        assert!(
+            saw_handle,
+            "handle_getfield_typeptr is -live- + GuardClass {{ base: v }}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
+            "OBJECT typeptr getfield must not stay FieldRead: {ops:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_setfield`: `is_typeptr_getset` drops the
+    /// store (`# done by 'new'`).
+    #[test]
+    fn lower_graph_object_typeptr_setfield_is_dropped() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, OBJECTPTR};
+
+        let v = variable_with_lltype("v", OBJECTPTR.clone());
+        let c = variable_with_lltype("c", CLASSTYPE.clone());
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(v.clone()),
+            Hlvalue::Variable(c.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "object_typeptr_setfield",
+            startblock.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+                Hlvalue::Variable(c),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&startblock, &graph, v);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.is_empty(),
+            "is_typeptr_getset setfield emits nothing; ops={ops:?}"
+        );
+    }
+
+    /// A `GcStruct` named field `typeptr` without `_hints['typeptr']` is an
+    /// ordinary load. `is_typeptr_getset` requires the hint.
+    #[test]
+    fn lower_graph_unhinted_typeptr_field_stays_field_read() {
+        let s = Struct::gc("S", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(s),
+        }));
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("tp", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "unhinted_typeptr_getfield",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("typeptr"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let transformed = transform_lowered(lower_graph(&graph));
+        let ops: Vec<_> = transformed
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let field = ops.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(field),
+            _ => None,
+        });
+        let field = field.unwrap_or_else(|| panic!("unhinted typeptr stays FieldRead: {ops:?}"));
+        assert_eq!(field.name, "typeptr");
+        assert!(
+            !field.owner_typeptr_hint,
+            "GcStruct S does not carry the typeptr hint"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::GuardClass { .. })),
+            "unhinted typeptr is not GuardClass: {ops:?}"
+        );
+    }
+
+    /// `Ptr(ForwardReference(<resolved GcStruct m::W_X>))` with
+    /// `_hints['fieldnames']` mapping `inst_name` → `name`.  Models
+    /// `InstanceRepr.object_type` after `_setup_repr.become`.
+    fn w_x_instance_ptr() -> LowLevelType {
+        use std::sync::Arc;
+        let mut fieldnames = indexmap::IndexMap::new();
+        fieldnames.insert(
+            ConstValue::byte_str("inst_name"),
+            ConstValue::byte_str("name"),
+        );
+        let body = Struct::gc_with_hints(
+            "m::W_X",
+            vec![("inst_name".into(), LowLevelType::Signed)],
+            vec![("fieldnames".into(), ConstValue::Dict(Arc::new(fieldnames)))],
+        );
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Struct(Box::new(body)))
+            .expect("ForwardReference.become GcStruct");
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }))
+    }
+
+    /// `jtransform.py rewrite_op_getfield`: `STRUCT = v_inst.concretetype.TO`
+    /// after `ForwardReference.become`; `cpu.fielddescrof(STRUCT, name)`
+    /// uses the `fieldnames` hint so the descriptor is `name` on `m::W_X`.
+    #[test]
+    fn lower_graph_getfield_through_forward_reference_keeps_struct_owner() {
+        let ptr_ty = w_x_instance_ptr();
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("name", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "getfield_forward_reference",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("inst_name"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let model = lower_graph(&graph);
+        let field = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field),
+                _ => None,
+            })
+            .expect("getfield lowers to FieldRead");
+        assert_eq!(field.name, "name");
+        assert_eq!(field.owner_root.as_deref(), Some("m::W_X"));
+    }
+
+    #[test]
+    fn lower_graph_setfield_through_forward_reference_keeps_struct_owner() {
+        let ptr_ty = w_x_instance_ptr();
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "setfield_forward_reference",
+            startblock.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str("inst_name"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&startblock, &graph, v);
+
+        let model = lower_graph(&graph);
+        let field = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field),
+                _ => None,
+            })
+            .expect("setfield lowers to FieldWrite");
+        assert_eq!(field.name, "name");
+        assert_eq!(field.owner_root.as_deref(), Some("m::W_X"));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no STRUCT owner")]
+    fn lower_graph_getfield_without_struct_owner_panics() {
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let v = variable_with_lltype("v", ptr_ty);
+        let startblock = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let result = variable_with_lltype("x", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "getfield_without_struct_owner",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(v),
+                constant_with_lltype(ConstValue::byte_str("item"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+        let _ = lower_graph(&graph);
     }
 }

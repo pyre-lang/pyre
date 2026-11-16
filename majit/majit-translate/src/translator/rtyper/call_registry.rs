@@ -70,7 +70,7 @@ use crate::annotator::description::{AnnSignature, FunctionDesc, copy_or_mint_uni
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
+use crate::flowspace::model::{ConstValue, Constant, GraphFunc, GraphKey, HostObject};
 use crate::flowspace::pygraph::PyGraph;
 use crate::parse::{CallPath, GraphSpecialization};
 
@@ -492,6 +492,10 @@ pub struct SubjectTdcPlan {
 #[derive(Default)]
 pub struct TwoPhaseTypeCache {
     pub subjects: HashMap<CallPath, TwoPhaseSubject>,
+    /// Graph-identity key of `call.py CallControl.jitcodes` /
+    /// `graphs_from`'s `funcobj.graph`; inverse of [`Self::subjects`],
+    /// filled with it.
+    pub subject_paths: IndexMap<GraphKey, CallPath>,
     /// Flowspace graph keys whose Phase-B rtype failed → publish Skips them
     /// to the legacy walker (the migration-scaffold fallback).
     pub rtype_skipped: HashSet<crate::flowspace::model::GraphKey>,
@@ -515,6 +519,16 @@ pub struct TwoPhaseTypeCache {
     /// Unresolved cutoff count (`unresolved=`). A plan with any
     /// unresolved cut is not recorded in `tdc_cut_applied`.
     pub tdc_cut_unresolved: usize,
+}
+
+impl TwoPhaseTypeCache {
+    /// Record a subject and the inverse `graph → path` map
+    /// (`call.py CallControl.jitcodes` / `graphs_from` `funcobj.graph`).
+    pub fn insert_subject(&mut self, path: CallPath, subject: TwoPhaseSubject) {
+        self.subject_paths
+            .insert(subject.graph_key.clone(), path.clone());
+        self.subjects.insert(path, subject);
+    }
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /

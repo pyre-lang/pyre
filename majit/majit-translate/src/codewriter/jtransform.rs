@@ -14188,16 +14188,18 @@ impl<'a> Transformer<'a> {
     /// the caller falls through to the residual path
     /// (`jtransform.py` raises `NotSupported`).
     ///
-    /// No arm here checks `vable_array_vars`, and none is owed.  Upstream
-    /// splits on `resizable`: the `do_fixed_list_len/getitem/setitem` arms
-    /// take a `lltype.GcArray` receiver — which is what a virtualizable array
-    /// field holds — and so open with that check, while the
-    /// `do_resizable_list_*` arms take a `GcStruct` and do not.  Every
-    /// spelling below is of the resizable family, its receiver a
-    /// `W_ListObject`.  pyre reaches a fixed array through
-    /// `getarrayitem` / `setarrayitem` / `getarraysize` instead, which carry
-    /// the check in their own dispatch arms and emit the same three
-    /// instructions the fixed arms do.
+    /// `do_fixed_list_len` / `do_fixed_list_getitem` /
+    /// `do_fixed_list_getitem_foldable` / `do_fixed_list_setitem`
+    /// (`jtransform.py`) take a `lltype.GcArray` receiver — which is
+    /// what a virtualizable array field holds — and emit `arraylen_gc` /
+    /// `getarrayitem_gc[_pure]` / `setarrayitem_gc`.  A `Ptr(Array)` GC
+    /// receiver on `list.len` / `list.getitem` / `list.getitem_foldable` /
+    /// `list.setitem` builds the same op the opname spine's
+    /// `getarraysize` / `getarrayitem` / `setarrayitem` arm produces
+    /// (`pure: true` for foldable) and routes it through
+    /// `rewrite_op_getarraysize` / `rewrite_op_getarrayitem` /
+    /// `rewrite_op_setarrayitem` so the `vable_array_vars` handling stays
+    /// in one place.  The resizable `W_ListObject` spellings below do not.
     fn _handle_list_call(
         &mut self,
         oopspec_name: &str,
@@ -14352,6 +14354,17 @@ impl<'a> Transformer<'a> {
                 }
                 other => other,
             });
+        }
+        // `do_fixed_list_len` / `do_fixed_list_getitem` /
+        // `do_fixed_list_getitem_foldable` / `do_fixed_list_setitem`
+        // (`jtransform.py`): receiver `lltype.Ptr(GcArray)`.
+        if matches!(
+            oopspec_name,
+            "list.len" | "list.getitem" | "list.getitem_foldable" | "list.setitem"
+        ) && let Some(list_ty) = list_ty.as_ref()
+            && let Some(array) = gc_array_ptr_from_lltype(list_ty)
+        {
+            return self._do_fixed_list_array_op(oopspec_name, op, args, graph, graph_name, array);
         }
         // Field owner for the `W_ListObject` storage struct.  The dotted
         // names address the fused offsets the runtime descr group
@@ -15501,6 +15514,132 @@ impl<'a> Transformer<'a> {
             detail: detail.to_string(),
         });
         Some(RewriteResult::Replace(ops))
+    }
+
+    /// `do_fixed_list_len` / `do_fixed_list_getitem` /
+    /// `do_fixed_list_getitem_foldable` / `do_fixed_list_setitem`
+    /// (`jtransform.py`). Builds the same `ArrayLen` / `ArrayRead` /
+    /// `ArrayWrite` the opname spine's `getarraysize` / `getarrayitem` /
+    /// `setarrayitem` arm produces, then routes through the existing
+    /// rewrite so `vable_array_vars` stays in one place.
+    fn _do_fixed_list_array_op(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        graph: &FunctionGraph,
+        graph_name: &str,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> Option<RewriteResult> {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let l = args.first()?.clone();
+        let array_type_id = Some(crate::codewriter::call::array_type_id_of_lltype(&array));
+        let nolength = matches!(array._hints.get("nolength"), Some(ConstValue::Bool(true)));
+        let item_ty_from_array = match &array.OF {
+            LowLevelType::Void => ValueType::Void,
+            LowLevelType::Struct(_) => ValueType::Ref(None),
+            other => match crate::model::getkind(other) {
+                crate::codewriter::type_state::ConcreteType::Signed => ValueType::Int,
+                crate::codewriter::type_state::ConcreteType::GcRef => ValueType::Ref(None),
+                crate::codewriter::type_state::ConcreteType::Float => ValueType::Float,
+                crate::codewriter::type_state::ConcreteType::Void => ValueType::Void,
+                crate::codewriter::type_state::ConcreteType::Unknown => ValueType::Int,
+            },
+        };
+        let detail = match oopspec_name {
+            "list.len" => "do_fixed_list_len → arraylen_gc",
+            "list.getitem" => "do_fixed_list_getitem → getarrayitem_gc",
+            "list.getitem_foldable" => "do_fixed_list_getitem_foldable → getarrayitem_gc_pure",
+            "list.setitem" => "do_fixed_list_setitem → setarrayitem_gc",
+            _ => return None,
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: detail.to_string(),
+        });
+        match oopspec_name {
+            "list.len" => {
+                let array_op = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ArrayLen {
+                        base: l.clone(),
+                        array_type_id,
+                        array: Some(array),
+                        nolength,
+                        gckind: crate::model::ArrayGcKind::Gc,
+                    },
+                };
+                Some(
+                    match self.rewrite_op_getarraysize(&array_op, &l, graph_name) {
+                        RewriteResult::Keep => RewriteResult::Replace(vec![array_op]),
+                        other => other,
+                    },
+                )
+            }
+            "list.getitem" | "list.getitem_foldable" => {
+                let index = args.get(1)?.clone();
+                let item_ty = op
+                    .result
+                    .as_ref()
+                    .and_then(|v| self.get_value_type(v))
+                    .unwrap_or(item_ty_from_array);
+                // `do_fixed_list_getitem(self, op, args, arraydescr, pure=False)`:
+                // `_pure` is only the `pure` argument, True solely from
+                // `do_fixed_list_getitem_foldable`. `ARRAY._immutable_field`
+                // belongs to `rewrite_op_getarrayitem`, not this lane.
+                let pure = oopspec_name == "list.getitem_foldable";
+                let array_op = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ArrayRead {
+                        base: l.clone(),
+                        index: index.clone(),
+                        item_ty: item_ty.clone(),
+                        array_type_id,
+                        array: Some(array),
+                        nolength,
+                        gckind: crate::model::ArrayGcKind::Gc,
+                        pure,
+                    },
+                };
+                Some(
+                    match self
+                        .rewrite_op_getarrayitem(&array_op, &l, &index, &item_ty, graph_name, graph)
+                    {
+                        RewriteResult::Keep => RewriteResult::Replace(vec![array_op]),
+                        other => other,
+                    },
+                )
+            }
+            "list.setitem" => {
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let item_ty = self.get_value_type(&value).unwrap_or(item_ty_from_array);
+                let value_arg = crate::model::LinkArg::Value(value);
+                let array_op = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ArrayWrite {
+                        base: l.clone(),
+                        index: index.clone(),
+                        value: value_arg.clone(),
+                        item_ty: item_ty.clone(),
+                        array_type_id,
+                        array: Some(array),
+                        nolength,
+                        gckind: crate::model::ArrayGcKind::Gc,
+                    },
+                };
+                Some(
+                    match self.rewrite_op_setarrayitem(
+                        &array_op, &l, &index, &value_arg, &item_ty, graph_name,
+                    ) {
+                        RewriteResult::Keep => RewriteResult::Replace(vec![array_op]),
+                        other => other,
+                    },
+                )
+            }
+            _ => None,
+        }
     }
 
     /// The raw-resizable arm of `_handle_list_call`: the `ll_vec_*` helpers'
@@ -18086,6 +18225,23 @@ fn fixed_repeat_identity(
         array_type_id,
         clears: fixed_list_clears(&item),
     })
+}
+
+/// `Ptr(Array)` GC array (`do_fixed_list_*` receiver, `jtransform.py`).
+/// Follows `ForwardReference` the way `gc_array_from_lltype` does.
+fn gc_array_ptr_from_lltype(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::ForwardReference(fwd) => gc_array_ptr_from_lltype(&fwd.resolved()?),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => Some(arr.clone()),
+            PtrTarget::ForwardReference(fwd) => gc_array_ptr_from_lltype(&fwd.resolved()?),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// High-level `newlist(item0, …, itemN)` (`OpKind::NewList`).
@@ -50000,6 +50156,148 @@ mod tests {
             other => panic!("expected FieldWrite, got {other:?}"),
         }
         assert_eq!(ops[0].result, None);
+    }
+
+    /// `do_fixed_list_len` (`jtransform.py`): `list.len` on `Ptr(GcArray)`
+    /// lowers to `arraylen_gc`.
+    #[test]
+    fn handle_list_call_fixed_array_len_lowers_to_arraylen() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut graph = FunctionGraph::new("fixed_array_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        l.set_concretetype(Some(
+            crate::translator::rtyper::rlist::items_array_ptr_lltype(&LowLevelType::Signed),
+        ));
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let Some(RewriteResult::Replace(ops)) = transformer._handle_list_call(
+            "list.len",
+            &op,
+            std::slice::from_ref(&l),
+            &mut graph,
+            "fixed_array_len",
+        ) else {
+            panic!("list.len on Ptr(GcArray) must lower");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::ArrayLen {
+                base,
+                array_type_id,
+                gckind,
+                ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                assert_eq!(*gckind, crate::model::ArrayGcKind::Gc);
+                assert_eq!(ops[0].result.as_ref(), Some(&result));
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
+    }
+
+    /// `do_fixed_list_getitem_foldable` (`jtransform.py`):
+    /// `list.getitem_foldable` on `Ptr(GcArray)` is `getarrayitem_gc_pure`.
+    #[test]
+    fn handle_list_call_fixed_array_getitem_foldable_is_pure_arrayread() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut graph = FunctionGraph::new("fixed_array_getitem_foldable");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        l.set_concretetype(Some(
+            crate::translator::rtyper::rlist::items_array_ptr_lltype(&LowLevelType::Signed),
+        ));
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let got = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(got.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let Some(RewriteResult::Replace(ops)) = transformer._handle_list_call(
+            "list.getitem_foldable",
+            &op,
+            &[l.clone(), index.clone()],
+            &mut graph,
+            "fixed_array_getitem_foldable",
+        ) else {
+            panic!("list.getitem_foldable on Ptr(GcArray) must lower");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::ArrayRead {
+                base,
+                index: read_index,
+                pure,
+                gckind,
+                array_type_id,
+                ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(read_index, &index);
+                assert!(*pure, "foldable getitem must be getarrayitem_gc_pure");
+                assert_eq!(*gckind, crate::model::ArrayGcKind::Gc);
+                assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                assert_eq!(ops[0].result.as_ref(), Some(&got));
+            }
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
+    }
+
+    /// `do_fixed_list_getitem` (`jtransform.py`): `_pure` is only the
+    /// `pure` argument. An `ARRAY._immutable_field` hint does not make
+    /// `list.getitem` a pure read.
+    #[test]
+    fn handle_list_call_fixed_array_getitem_on_immutable_array_is_not_pure() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        let mut graph = FunctionGraph::new("fixed_array_getitem_immutable");
+        let array = Array::gc_with_hints(
+            LowLevelType::Signed,
+            vec![("immutable".into(), ConstValue::Bool(true))],
+        );
+        assert!(
+            array._immutable_field(),
+            "fixture must be an immutable ARRAY"
+        );
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        l.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(array),
+        }))));
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let got = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(got.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let Some(RewriteResult::Replace(ops)) = transformer._handle_list_call(
+            "list.getitem",
+            &op,
+            &[l.clone(), index.clone()],
+            &mut graph,
+            "fixed_array_getitem_immutable",
+        ) else {
+            panic!("list.getitem on Ptr(GcArray) must lower");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::ArrayRead { pure, .. } => {
+                assert!(
+                    !*pure,
+                    "list.getitem must stay getarrayitem_gc even on an immutable ARRAY"
+                );
+            }
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
     }
 
     /// An unhandled list oopspec spelling returns `None` so the caller
