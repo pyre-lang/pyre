@@ -1920,13 +1920,22 @@ fn real_main() {
         for (path, jitcode) in &pipeline.jitcodes_by_path {
             paths[jitcode.index()] = Some(path.clone());
         }
+        let alias_groups = if pipeline.jitcode_alias_paths.len() == frozen_jitcodes.len() {
+            pipeline.jitcode_alias_paths.clone()
+        } else {
+            Vec::new()
+        };
         let reachable = majit_translate::artifacts::reachable_symbolic_residual_table(
             &frozen_jitcodes,
             &frozen_descrs,
         );
-        let (index, jitcodes_bin) =
-            majit_translate::artifacts::JitCodeIndex::encode(&frozen_jitcodes, paths, reachable)
-                .expect("encode JitCode archive");
+        let (index, jitcodes_bin) = majit_translate::artifacts::JitCodeIndex::encode(
+            &frozen_jitcodes,
+            paths,
+            alias_groups,
+            reachable,
+        )
+        .expect("encode JitCode archive");
         let jitcodes_index_bin = bincode::serialize(&index).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();

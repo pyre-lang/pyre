@@ -41,8 +41,14 @@ impl EmbeddedArtifacts {
         for (path, jitcode) in &pipeline.jitcodes_by_path {
             paths[jitcode.index()] = Some(path.clone());
         }
+        let alias_groups = if pipeline.jitcode_alias_paths.len() == pipeline.jitcodes.len() {
+            pipeline.jitcode_alias_paths.clone()
+        } else {
+            Vec::new()
+        };
         let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
-        let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths, reachable)?;
+        let (index, bodies) =
+            JitCodeIndex::encode(&pipeline.jitcodes, paths, alias_groups, reachable)?;
         Ok(Self {
             version: ARTIFACT_VERSION,
             index,
@@ -229,6 +235,7 @@ mod tests {
             vec![Some(crate::parse::CallPath::from_segments([
                 "module", "helper",
             ]))],
+            Vec::new(),
             reachable,
         )
         .unwrap();
@@ -418,7 +425,8 @@ mod tests {
         assert_eq!(row(5), (Vec::<i64>::new(), 1));
 
         let paths = vec![None; jitcodes.len()];
-        let (index, bodies) = JitCodeIndex::encode(&jitcodes, paths, table.clone()).unwrap();
+        let (index, bodies) =
+            JitCodeIndex::encode(&jitcodes, paths, Vec::new(), table.clone()).unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
         assert_eq!(
             decoded.reachable_symbolic_residuals,

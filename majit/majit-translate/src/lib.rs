@@ -938,6 +938,7 @@ fn alias_unique_call_path(
         return;
     }
     graphs.share_path(unique.clone(), registered);
+    graphs.mark_canonical_path(registered);
 }
 
 /// Harvest/display path this funcobj was registered under: trait-impl
@@ -3058,6 +3059,17 @@ fn analyze_pipeline_from_module_paths(
             alias_unique_call_path(&mut call_control, unique.as_ref(), &harvest, &expected_key);
         }
     }
+    // DISPLAY/harvest is the `get_jitcode` / `getfunctionptr` key
+    // (`call.py CallControl.get_jitcode`). Stamp it after every alias is
+    // bound so a HashMap-order first-bound crate prefix cannot become the
+    // jitcodes key.
+    for func in &program.functions {
+        if let Some(harvest) = harvest_registration_path(func) {
+            call_control
+                .function_graphs_mut()
+                .mark_canonical_path(&harvest);
+        }
+    }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
@@ -3440,6 +3452,7 @@ fn analyze_pipeline_from_module_paths(
         symbolic_fnaddr_paths: Vec::new(),
         indirectcalltarget_indices: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
+        jitcode_alias_paths: Vec::new(),
         insns: indexmap::IndexMap::new(),
         descrs: Vec::new(),
         all_liveness: Vec::new(),
@@ -3522,6 +3535,26 @@ fn analyze_pipeline_from_module_paths(
     // that look up a JitCode by graph identity cannot reconstruct the key
     // from the alloc-ordered `pipeline.jitcodes` vector alone.
     pipeline.jitcodes_by_path = call_control.jitcodes().clone();
+    // GraphStore aliases of each canonical jitcodes key. Frozen into
+    // `JitCodeIndex.alias_groups` so `pathed_jitcode` can resolve any
+    // spelling of the one graph (`call.py CallControl.get_jitcode` keys
+    // by graph object). `CallControl.jitcodes` itself stays one harvest key.
+    {
+        let graphs = call_control.function_graphs();
+        let mut alias_groups = vec![Vec::new(); pipeline.jitcodes.len()];
+        for (canonical, jitcode) in &pipeline.jitcodes_by_path {
+            let idx = jitcode.index();
+            if idx >= alias_groups.len() {
+                continue;
+            }
+            alias_groups[idx] = graphs
+                .alias_paths(canonical)
+                .into_iter()
+                .filter(|alias| alias != canonical)
+                .collect();
+        }
+        pipeline.jitcode_alias_paths = alias_groups;
+    }
     pipeline.insns = insns;
     pipeline.descrs = descrs;
     // Snapshotted in `make_jitcodes` from the assembler's shared `all_liveness`
