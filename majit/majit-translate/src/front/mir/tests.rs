@@ -36203,6 +36203,23 @@ fn interior_field(
     })
 }
 
+fn interior_local_field(
+    index: u64,
+    owner_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(index, owner_ty),
+                {"Field": [null, field_idx]}
+            ]
+        },
+        "ty": field_ty
+    })
+}
+
 fn interior_stmt(kind: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"kind": kind, "span": interior_span()}).into()
 }
@@ -38873,6 +38890,941 @@ fn nested_closure_forwards_cell_address_field() {
             } if field.owner_root.as_deref() == Some("fixture::InnerEnv") && *v == field_read
         )),
         "inner env must store the outer field value; ops={ops:?}"
+    );
+}
+
+/// `let p = &mut *(*env).n; let r = *p;` of a cell-address env field.
+/// `Rvalue::Ref` returns the field value (the cell address);
+/// `*p` is `rewrite_op_raw_load` through that address.
+#[test]
+fn deref_of_cell_address_reborrow_temp_is_raw_load() {
+    let i64_ty = interior_i64();
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let n_deref = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(1, &mut_env, &env_ty, &mut_i64, 0),
+                "Deref"
+            ]
+        },
+        "ty": i64_ty.clone()
+    });
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "call_mut",
+        1,
+        vec![mut_env.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("env"), &mut_env),
+            interior_local(2, Some("p"), &mut_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": n_deref,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "call_mut")
+        .expect("lower *p of a cell-address reborrow temporary");
+    let ops = graph_ops(&graph);
+    let field_read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } if field.name == "n" => op.result.clone(),
+        _ => None,
+    });
+    let field_read = field_read.unwrap_or_else(|| {
+        panic!("reborrow of the cell-address field must getfield it; ops={ops:?}")
+    });
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawLoad { base, .. } if *base == field_read
+        )),
+        "Deref of the reborrow temporary must RawLoad through the env field; ops={ops:?}"
+    );
+}
+
+/// `let p = &mut *(*env).n; *p = v;` of a cell-address env field.
+/// `*p = v` is `rewrite_op_raw_store` through that address.
+#[test]
+fn deref_store_through_cell_address_reborrow_temp_is_raw_store() {
+    let i64_ty = interior_i64();
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let n_deref = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(1, &mut_env, &env_ty, &mut_i64, 0),
+                "Deref"
+            ]
+        },
+        "ty": i64_ty.clone()
+    });
+    let p_place = interior_place(3, &mut_i64);
+    let caller = interior_caller(
+        "call_mut",
+        2,
+        vec![mut_env.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("env"), &mut_env),
+            interior_local(2, Some("v"), &i64_ty),
+            interior_local(3, Some("p"), &mut_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": n_deref,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_deref(3, &mut_i64, &i64_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": interior_place(2, &i64_ty)}, "No"]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "call_mut")
+        .expect("lower *p = v of a cell-address reborrow temporary");
+    let ops = graph_ops(&graph);
+    let field_read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } if field.name == "n" => op.result.clone(),
+        _ => None,
+    });
+    let field_read = field_read.unwrap_or_else(|| {
+        panic!("reborrow of the cell-address field must getfield it; ops={ops:?}")
+    });
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore { base, .. } if *base == field_read
+        )),
+        "Deref store through the reborrow temporary must RawStore through the env field; ops={ops:?}"
+    );
+}
+
+/// `let p = &mut *(*env).n; let s = &*p;` stored into a shared capture.
+/// The shared field is the peeled scalar (`tyref_shared_borrow_primitive_value`);
+/// the store converts the cell address (`InstanceRepr.rtype_setattr`).
+#[test]
+fn shared_capture_through_cell_address_reborrow_temp_stores_raw_load() {
+    let i64_ty = interior_i64();
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let shared_i64 = interior_shared(i64_ty.clone());
+    let env_ty = interior_adt(0);
+    let env_shared_ty = interior_adt(1);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let n_deref = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(1, &mut_env, &env_ty, &mut_i64, 0),
+                "Deref"
+            ]
+        },
+        "ty": i64_ty.clone()
+    });
+    let p_place = interior_place(2, &mut_i64);
+    let s_place = interior_place(3, &shared_i64);
+    let caller = interior_caller(
+        "call_mut",
+        1,
+        vec![mut_env.clone()],
+        env_shared_ty.clone(),
+        vec![
+            interior_local(0, None, &env_shared_ty),
+            interior_local(1, Some("env"), &mut_env),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("s"), &shared_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": n_deref,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    s_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_deref(2, &mut_i64, &i64_ty),
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &env_shared_ty),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [1, null, null]},
+                            [{"Move": s_place}]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let env_shared_decl = interior_closure_env(1, "EnvShared", &[("n", shared_i64)], 2);
+    let llbc = llbc_with_types("fixture", vec![env_decl, env_shared_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "call_mut")
+        .expect("lower shared capture through a cell-address reborrow temporary");
+    let ops = graph_ops(&graph);
+    let field_read = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } if field.name == "n" => op.result.clone(),
+        _ => None,
+    });
+    let field_read = field_read.unwrap_or_else(|| {
+        panic!("reborrow of the cell-address field must getfield it; ops={ops:?}")
+    });
+    let shared_value = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(v),
+            ..
+        } if field.owner_root.as_deref() == Some("fixture::EnvShared") => Some(v.clone()),
+        _ => None,
+    });
+    let shared_value =
+        shared_value.unwrap_or_else(|| panic!("shared env must store a field; ops={ops:?}"));
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawLoad { base, .. }
+                if *base == field_read && op.result.as_ref() == Some(&shared_value)
+        )),
+        "shared capture through the reborrow temporary must RawLoad the cell; ops={ops:?}"
+    );
+}
+
+/// `fn f(mut n: i64) -> i64 { (|| n += 1)(); n }`: a by-value primitive
+/// argument is a Char-varsize cell (`rdtoa.py` `strtod` `end_ptr`),
+/// initialized from the incoming argument.
+#[test]
+fn by_value_primitive_argument_captured_in_closure_env_is_raw_cell() {
+    let i64_ty = interior_i64();
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let n_place = interior_place(1, &i64_ty);
+    let borrow_place = interior_place(2, &mut_i64);
+    let env_place = interior_place(3, &env_ty);
+    let recv_place = interior_place(4, &mut_env);
+    let caller = interior_caller(
+        "observe_n",
+        1,
+        vec![i64_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("n"), &i64_ty),
+            interior_local(2, Some("borrow"), &mut_i64),
+            interior_local(3, Some("env"), &env_ty),
+            interior_local(4, Some("recv"), &mut_env),
+            interior_local(5, Some("call_ret"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        borrow_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": n_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        env_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": borrow_place.clone()}]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        recv_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": env_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![serde_json::json!({"Move": recv_place})],
+                    interior_place(5, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    serde_json::json!({
+                        "Use": [{"Read": n_place}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let call_mut = interior_opaque(1, &["fixture", "call_mut"], vec![mut_env], unit);
+    let llbc = llbc_with_types("fixture", vec![env_decl], vec![caller, call_mut]);
+    let graph = crate::test_support::lower_function(&llbc, "observe_n")
+        .expect("lower parent that captures a by-value primitive argument");
+    let ops = graph_ops(&graph);
+    let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let cell_ptr =
+        cell_ptr.unwrap_or_else(|| panic!("parent must allocate a Char-varsize cell; ops={ops:?}"));
+    let input = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Input { name, .. } if name == "n" => op.result.clone(),
+        _ => None,
+    });
+    let input = input.unwrap_or_else(|| panic!("argument n must be an Input; ops={ops:?}"));
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore { base, value, .. } if *base == cell_ptr && *value == input
+        )),
+        "cell must be initialized from the incoming argument; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+                ..
+            } if *v == cell_ptr
+        )),
+        "closure env must store the cell address as an int word; ops={ops:?}"
+    );
+    let call_idx = ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::Call { .. }))
+        .unwrap_or_else(|| panic!("call_mut must be present; ops={ops:?}"));
+    let load_base = ops[call_idx + 1..].iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } => Some(base.clone()),
+        _ => None,
+    });
+    let load_base = load_base.unwrap_or_else(|| {
+        panic!("read of n after call_mut must be RawLoad of the cell; ops={ops:?}")
+    });
+    assert!(
+        load_base == cell_ptr
+            || graph
+                .blocks
+                .iter()
+                .any(|block| block.inputargs.iter().any(|ia| *ia == load_base)),
+        "RawLoad after call_mut must use the cell pointer; ops={ops:?}"
+    );
+}
+
+fn capture_mut_place_into_closure_env(
+    name: &str,
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+    locals: Vec<serde_json::Value>,
+    borrow_local: u64,
+    env_local: u64,
+    borrow_place: serde_json::Value,
+    extra_types: Vec<serde_json::Value>,
+) -> Result<crate::model::FunctionGraph, super::LowerError> {
+    let i64_ty = interior_i64();
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty, "Mut"]});
+    let env_ty = interior_adt(0);
+    let borrow_tmp = interior_place(borrow_local, &mut_i64);
+    let env_place = interior_place(env_local, &env_ty);
+    let caller = interior_caller(
+        name,
+        arg_count,
+        inputs,
+        env_ty.clone(),
+        locals,
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    borrow_tmp.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": borrow_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place.clone(),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, null, null]},
+                            [{"Move": borrow_tmp}]
+                        ]
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &env_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": env_place}, "No"]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let mut types = vec![env_decl];
+    types.extend(extra_types);
+    let llbc = llbc_with_types("fixture", types, vec![caller]);
+    crate::test_support::lower_function(&llbc, name)
+}
+
+/// Edition-2021 disjoint capture of a primitive field of a by-value local.
+#[test]
+fn capture_of_local_struct_primitive_field_reports_owner() {
+    let i64_ty = interior_i64();
+    let s_ty = interior_adt(1);
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let result = capture_mut_place_into_closure_env(
+        "capture_field",
+        1,
+        vec![s_ty.clone()],
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("s"), &s_ty),
+            interior_local(2, Some("borrow"), &mut_i64),
+            interior_local(3, Some("env"), &env_ty),
+        ],
+        2,
+        3,
+        interior_local_field(1, &s_ty, &i64_ty, 0),
+        vec![interior_struct(
+            1,
+            &["fixture", "S"],
+            &[("count", i64_ty)],
+            8,
+            &[0],
+            false,
+        )],
+    );
+    match result {
+        Ok(graph) => {
+            let ops = graph_ops(&graph);
+            panic!("local struct field capture lowered; investigate owner; ops={ops:?}");
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not the address of a cell local") || msg.contains("raw cell address"),
+                "local struct field capture decline; got {msg}"
+            );
+        }
+    }
+}
+
+/// Edition-2021 disjoint capture of a primitive array element.
+#[test]
+fn capture_of_local_array_primitive_element_reports_owner() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let arr_ty = serde_json::json!({"Array": [
+        i64_ty.clone(),
+        [{"Integer": {"Unsigned": ["Usize", "2"]}}, usize_ty.clone()],
+        null
+    ]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let elem_place = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(1, &arr_ty),
+                {"Index": {
+                    "offset": {"Read": interior_place(2, &usize_ty)},
+                    "from_end": false
+                }}
+            ]
+        },
+        "ty": i64_ty.clone()
+    });
+    let result = capture_mut_place_into_closure_env(
+        "capture_elem",
+        2,
+        vec![arr_ty.clone(), usize_ty.clone()],
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("a"), &arr_ty),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("borrow"), &mut_i64),
+            interior_local(4, Some("env"), &env_ty),
+        ],
+        3,
+        4,
+        elem_place,
+        vec![],
+    );
+    match result {
+        Ok(graph) => {
+            let ops = graph_ops(&graph);
+            panic!("array element capture lowered; investigate owner; ops={ops:?}");
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not the address of a cell local") || msg.contains("raw cell address"),
+                "array element capture decline; got {msg}"
+            );
+        }
+    }
+}
+
+/// Primitive field reached through an `&mut` parameter of a classdef-less
+/// (raw) struct: `|| s.count += 1` for `s: &mut S`.
+#[test]
+fn capture_of_raw_struct_field_through_mut_param_reports_owner() {
+    let i64_ty = interior_i64();
+    let s_ty = interior_adt(1);
+    let mut_s = serde_json::json!({"Ref": [null, s_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let result = capture_mut_place_into_closure_env(
+        "capture_raw_field",
+        1,
+        vec![mut_s.clone()],
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("s"), &mut_s),
+            interior_local(2, Some("borrow"), &mut_i64),
+            interior_local(3, Some("env"), &env_ty),
+        ],
+        2,
+        3,
+        interior_field(1, &mut_s, &s_ty, &i64_ty, 0),
+        vec![interior_c_struct(
+            1,
+            &["fixture", "RawS"],
+            &[("count", i64_ty)],
+            8,
+            &[0],
+            false,
+        )],
+    );
+    match result {
+        Ok(graph) => {
+            let ops = graph_ops(&graph);
+            let has_cell = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER
+                )
+            });
+            let has_addr = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite {
+                        ty: ValueType::Int,
+                        ..
+                    }
+                )
+            });
+            panic!(
+                "raw struct field through &mut param lowered cell={has_cell} int_store={has_addr}; ops={ops:?}"
+            );
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not the address of a cell local")
+                    || msg.contains("raw cell address")
+                    || msg.contains("RawAddr"),
+                "raw struct field through &mut param decline; got {msg}"
+            );
+        }
+    }
+}
+
+/// Primitive field reached through an `&mut` parameter of a GC object.
+/// RPython has no GC interior pointer; the capture must decline.
+#[test]
+fn capture_of_gc_struct_field_through_mut_param_declines() {
+    let i64_ty = interior_i64();
+    let s_ty = interior_adt(1);
+    let mut_s = serde_json::json!({"Ref": [null, s_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let borrow_tmp = interior_place(2, &mut_i64);
+    let env_place = interior_place(3, &env_ty);
+    let caller = interior_caller(
+        "capture_gc_field",
+        1,
+        vec![mut_s.clone()],
+        env_ty.clone(),
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("s"), &mut_s),
+            interior_local(2, Some("borrow"), &mut_i64),
+            interior_local(3, Some("env"), &env_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    borrow_tmp.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": interior_field(1, &mut_s, &s_ty, &i64_ty, 0),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place.clone(),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, null, null]},
+                            [{"Move": borrow_tmp}]
+                        ]
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &env_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": env_place}, "No"]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("n", mut_i64)], 1);
+    let s_decl = interior_struct(
+        1,
+        &["fixture", "GcS"],
+        &[("count", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let gctype_trait = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false),
+        "methods": []
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [1, s_ty.clone()]}]}
+        }
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![env_decl, s_decl],
+        vec![caller],
+        vec![gctype_trait],
+        vec![gctype_impl],
+    );
+    match crate::test_support::lower_function(&llbc, "capture_gc_field") {
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not the address of a cell local")
+                    || msg.contains("raw cell address")
+                    || msg.contains("RawAddr"),
+                "GC interior field capture must decline; got {msg}"
+            );
+        }
+        Ok(graph) => {
+            let ops = graph_ops(&graph);
+            panic!("GC struct field through &mut param must not lower a cell address; ops={ops:?}");
+        }
+    }
+}
+
+/// `&mut` capture of a `repr(transparent)` scalar wrapper shares storage
+/// with the parent like a primitive (`rdtoa.py` `strtod` `end_ptr`).
+#[test]
+fn mut_capture_of_transparent_scalar_wrapper_is_raw_cell() {
+    let i64_ty = interior_i64();
+    let wrap_ty = interior_adt(1);
+    let mut_wrap = serde_json::json!({"Ref": [null, wrap_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let w_place = interior_place(1, &wrap_ty);
+    let borrow_place = interior_place(2, &mut_wrap);
+    let env_place = interior_place(3, &env_ty);
+    let recv_place = interior_place(4, &mut_env);
+    let caller = interior_caller(
+        "observe_w",
+        0,
+        vec![],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("w"), &wrap_ty),
+            interior_local(2, Some("borrow"), &mut_wrap),
+            interior_local(3, Some("env"), &env_ty),
+            interior_local(4, Some("recv"), &mut_env),
+            interior_local(5, Some("call_ret"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        w_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [1, null, null]},
+                                [interior_const_i64("1", &i64_ty)]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        borrow_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": w_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        env_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": borrow_place.clone()}]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        recv_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": env_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![serde_json::json!({"Move": recv_place})],
+                    interior_place(5, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_local_field(1, &wrap_ty, &i64_ty, 0)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("w", mut_wrap)], 1);
+    let wrap_decl = interior_struct(1, &["fixture", "Wrap"], &[("inner", i64_ty)], 8, &[0], true);
+    let call_mut = interior_opaque(1, &["fixture", "call_mut"], vec![mut_env], unit);
+    let llbc = llbc_with_types("fixture", vec![env_decl, wrap_decl], vec![caller, call_mut]);
+    let graph = crate::test_support::lower_function(&llbc, "observe_w")
+        .expect("lower parent that captures &mut Wrap into a closure env");
+    let ops = graph_ops(&graph);
+    let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let cell_ptr =
+        cell_ptr.unwrap_or_else(|| panic!("parent must allocate a Char-varsize cell; ops={ops:?}"));
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+                ..
+            } if *v == cell_ptr
+        )),
+        "closure env must store the cell address as an int word; ops={ops:?}"
+    );
+    let call_idx = ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::Call { .. }))
+        .unwrap_or_else(|| panic!("call_mut must be present; ops={ops:?}"));
+    let load_base = ops[call_idx + 1..].iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } => Some(base.clone()),
+        _ => None,
+    });
+    let load_base = load_base.unwrap_or_else(|| {
+        panic!("read of w.0 after call_mut must be RawLoad of the cell; ops={ops:?}")
+    });
+    assert!(
+        load_base == cell_ptr
+            || graph
+                .blocks
+                .iter()
+                .any(|block| block.inputargs.iter().any(|ia| *ia == load_base)),
+        "RawLoad after call_mut must use the cell pointer; ops={ops:?}"
+    );
+}
+
+/// `let p = &mut obj.field; *p = v; let r = *p;`
+/// Documents whether the read after the write reuses the value captured
+/// when `p` was created (`atomic_ref_place` projection cache).
+/// `InstanceRepr.rtype_getattr` emits a fresh getfield.
+#[test]
+#[ignore = "atomic_ref_place projection cache returns the FieldRead captured when p was bound; InstanceRepr.rtype_getattr emits a fresh getfield"]
+fn deref_read_after_write_through_field_borrow_temp() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "read_after_write",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("v"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    interior_place(3, &i64_ty),
+                    serde_json::json!({
+                        "Use": [interior_const_i64("2", &i64_ty), "No"]
+                    }),
+                ),
+                interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_deref(2, &mut_i64, &i64_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": interior_place(3, &i64_ty)}, "No"]
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "read_after_write")
+        .expect("lower p = &mut obj.field; *p = v; r = *p");
+    let ops = graph_ops(&graph);
+    let field_read_idxs: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => Some(i),
+            _ => None,
+        })
+        .collect();
+    let field_write_idx = ops.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "field"
+        )
+    });
+    let field_write_idx =
+        field_write_idx.unwrap_or_else(|| panic!("*p = v must FieldWrite the field; ops={ops:?}"));
+    let fresh_getfield_after_write = field_read_idxs.iter().any(|&i| i > field_write_idx);
+    assert!(
+        fresh_getfield_after_write,
+        "read after write through the field borrow reused the pre-write FieldRead \
+         (`atomic_ref_place` projection cache); InstanceRepr.rtype_getattr emits a \
+         fresh getfield; ops={ops:?}"
     );
 }
 

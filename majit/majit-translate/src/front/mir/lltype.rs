@@ -4003,7 +4003,32 @@ pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
     ))
 }
 
-/// Pointee of an exclusive borrow of a primitive (`&mut bool`, `&mut u8`).
+/// Primitive scalar node of `ty`, or of a `repr(transparent)` wrapper
+/// whose unique non-ZST field is that primitive (`Wrap(i64)`). A
+/// transparent GCREF newtype is not a primitive and stays out.
+///
+/// [`tyref_transparent_inner_value_type`] answers the register bank
+/// (and the external-scalar table); this is the Charon Scalar node
+/// the cell descr / exclusive-borrow pointee need.
+pub(in crate::front::mir) fn tyref_primitive_or_transparent_primitive_node<'l>(
+    ty: &'l TyRef,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = tyref_node(ty, llbc)?;
+    if let Some(prim) = tyref_primitive_node(node, llbc) {
+        return Some(prim);
+    }
+    let (index, _) = tyref_transparent_nonzst_field(ty, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    tyref_node(&field.ty, llbc).and_then(|inner| tyref_primitive_node(inner, llbc))
+}
+
+/// Pointee of an exclusive borrow of a primitive (`&mut bool`, `&mut u8`),
+/// or of a `repr(transparent)` wrapper of one (`&mut Wrap(i64)`).
 ///
 /// The env field holds the raw cell address (`rdtoa.py` `strtod`
 /// `end_ptr`); `history.getkind` of that raw Ptr is `'int'`. Shared `&P`
@@ -4014,7 +4039,8 @@ pub(in crate::front::mir) fn tyref_exclusive_borrow_primitive_pointee(
 ) -> Option<serde_json::Value> {
     let node = tyref_node(ty, llbc)?;
     let pointee = type_node_mut_ref_pointee(node, llbc)?;
-    tyref_primitive_node(pointee, llbc).cloned()
+    let pointee_ty = TyRef::Other(pointee.clone().into());
+    tyref_primitive_or_transparent_primitive_node(&pointee_ty, llbc).cloned()
 }
 
 /// Closure-env field whose declared type is an exclusive borrow of a
