@@ -58,7 +58,11 @@ pub fn install_optional_modules() {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::bz2::init);
-    pyre_interpreter::importing::register_builtin_module("_pickle", module::_pickle::init);
+    pyre_interpreter::importing::register_builtin_module_with_startup(
+        "_pickle",
+        module::_pickle::init,
+        module::_pickle::startup_pickle_module,
+    );
     pyre_interpreter::importing::register_builtin_module("_random", module::_random::init);
     pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);

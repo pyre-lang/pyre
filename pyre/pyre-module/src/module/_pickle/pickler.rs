@@ -1029,8 +1029,8 @@ mod memo_proxy {
     }
 }
 
-/// `State.w_dispatch_table` (`copyreg.dispatch_table`), or `PY_NULL` when the
-/// cached state is unavailable.
+/// `State.w_dispatch_table` (`copyreg.dispatch_table`), or `PY_NULL` before
+/// `Module.startup` has published the state.
 pub(crate) fn copyreg_dispatch_table() -> PyObjectRef {
     match super::pickle_state() {
         Some(state) => unsafe { std::ptr::addr_of!((*state).w_dispatch_table).read() },
@@ -3383,16 +3383,16 @@ fn save_toplevel_by_name(
     Ok(())
 }
 
-/// `save_global`: look up `(module_name, name)` in `State.w_extension_registry`.
-/// A missing key is `Ok(None)`; a present value is `space.int_w`'d (TypeError
-/// for `None`/`object()`, OverflowError for a bigint that does not fit).
+/// `save_global2`: look up `(module_name, name)` in `State.w_extension_registry`.
+/// A missing key is `Ok(None)`; a present value is `space.int_w`'d
+/// (`object()` TypeError, `2**1000` OverflowError).
 fn extension_code(module_name: &str, name: &str) -> Result<Option<i64>, PyError> {
     let Some(state) = super::pickle_state() else {
         return Ok(None);
     };
     // Build the (module, name) key before touching the cached slot, then pin
     // it across `finditem` — the same bracketing `compat_map` uses for its
-    // mapping key (`save_global` `w_mod_and_name`).
+    // mapping key (`save_global2` `w_mod_and_name`).
     let mut key_items = pyre_object::gc_roots::RootedItems::new();
     key_items.push(pyre_object::w_str_new_managed(module_name));
     key_items.push(pyre_object::w_str_new_managed(name));
@@ -3401,28 +3401,58 @@ fn extension_code(module_name: &str, name: &str) -> Result<Option<i64>, PyError>
     let key = pyre_object::gc_roots::pin_root(key);
     let w_registry = unsafe { std::ptr::addr_of!((*state).w_extension_registry).read() };
     match pyre_interpreter::baseobjspace::finditem(w_registry, key)? {
-        Some(w_code) => Ok(Some(pyre_interpreter::baseobjspace::int_w(w_code)?)),
+        Some(w_code) => {
+            // [3.15-spec] None code raises TypeError (pickletester test_bad_ext_code); W_Pickler.save_global2 skips it.
+            let w_code = pyre_object::gc_roots::pin_root(w_code);
+            if unsafe { pyre_object::is_none(w_code) } {
+                return Err(PyError::type_error(
+                    "'NoneType' object cannot be interpreted as an integer",
+                ));
+            }
+            Ok(Some(pyre_interpreter::baseobjspace::int_w(w_code)?))
+        }
         None => Ok(None),
     }
 }
 
-/// Emit the size-appropriate EXT opcode for an extension code. `save_global`
-/// requires `0 < code <= 0x7fffffff`; anything else is out of range.
+/// `write_packB` — `opcode + chr(val)`.
+fn write_pack_b(buf: &mut Framer, opcode: u8, val: i64) {
+    buf.push(opcode);
+    buf.push(val as u8);
+}
+
+/// `write_packH` — opcode plus two little-endian bytes (`val & 0xff` each).
+fn write_pack_h(buf: &mut Framer, opcode: u8, mut val: i64) {
+    buf.push(opcode);
+    for _ in 0..2 {
+        buf.push((val & 0xff) as u8);
+        val >>= 8;
+    }
+}
+
+/// `write_packi` / `packi` — opcode plus four little-endian bytes.
+fn write_pack_i(buf: &mut Framer, opcode: u8, mut val: i64) {
+    buf.push(opcode);
+    for _ in 0..4 {
+        buf.push((val & 0xff) as u8);
+        val >>= 8;
+    }
+}
+
+/// `save_global2` EXT1/EXT2/EXT4 after `code = space.int_w(w_code)`.
 fn write_ext(buf: &mut Framer, code: i64) -> Result<(), PyError> {
+    // save_global2 asserts `code > 0`; test_bad_ext_code observes RuntimeError for <=0 and >0x7fffffff.
     if code <= 0 || code > 0x7fffffff {
         return Err(PyError::runtime_error(format!(
             "extension code {code} is out of range"
         )));
     }
     if code <= 0xff {
-        buf.push(op::EXT1);
-        buf.push(code as u8);
+        write_pack_b(buf, op::EXT1, code);
     } else if code <= 0xffff {
-        buf.push(op::EXT2);
-        buf.extend_from_slice(&(code as u16).to_le_bytes());
+        write_pack_h(buf, op::EXT2, code);
     } else {
-        buf.push(op::EXT4);
-        buf.extend_from_slice(&(code as i32).to_le_bytes());
+        write_pack_i(buf, op::EXT4, code);
     }
     Ok(())
 }
