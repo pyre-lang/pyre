@@ -3425,7 +3425,7 @@ impl PyError {
         // lookup stay inside the try below.
         let mut w_hook_class = pyre_object::with_roots!(
             space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
-            => unraisable_hook_args_type()
+            => crate::module::sys::vm::unraisable_hook_args_type()
         )
         .unwrap_or_else(|e| panic!("UnraisableHookArgs: {e:?}"));
         // `error.py OperationError.write_unraisable`:
@@ -3938,36 +3938,6 @@ fn wrap_pos(num: i64) -> PyObjectRef {
     } else {
         pyre_object::w_int_new(num)
     }
-}
-
-/// `gateway.py ApplevelClass.getwdict` / `space.fromcache(ApplevelCache)`:
-/// wget of `UnraisableHookArgs` is a memoized, built-once cache, not a
-/// traced graph. Opaque (`import_module_importhook` is the same
-/// `dont_look_inside` `Result<PyObjectRef, PyError>` shape) so the builder
-/// stays off `write_unraisable`. A MemoryError is `Err` so the caller can
-/// let that wget raise.
-#[majit_macros::dont_look_inside]
-fn unraisable_hook_args_type() -> Result<PyObjectRef, crate::PyError> {
-    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
-    if let Some(existing) = TYPE.get() {
-        return Ok(existing);
-    }
-    // `error.py write_unraisable` reads `UnraisableHookArgs` from
-    // `app_hookargs` (`vm.py`) *before* its `try`. Construction here is
-    // lazy; a MemoryError is `Err` so the caller can let that wget raise.
-    let cls = crate::_structseq::try_make_struct_seq_with_extra(
-        "sys.UnraisableHookArgs",
-        &[
-            "exc_type",
-            "exc_value",
-            "exc_traceback",
-            "err_msg",
-            "object",
-        ],
-        &["extra_line"],
-    )?;
-    TYPE.set(cls);
-    Ok(TYPE.get().unwrap_or(cls))
 }
 
 /// Resolve an exception instance's actual Python class name for display.

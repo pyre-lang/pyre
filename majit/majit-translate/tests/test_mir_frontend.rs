@@ -3573,11 +3573,11 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
+        .expect("FrameBox::new_placed");
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new_placed");
         assert!(
             !graph
                 .blocks
@@ -3592,7 +3592,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                         } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
                     )
                 }),
-            "FrameBox::new still has core::ptr::write"
+            "FrameBox::new_placed still has core::ptr::write"
         );
         let cast_results: std::collections::HashSet<u64> = graph
             .blocks
@@ -3629,7 +3629,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                         OpKind::FieldWrite { field, .. } if field.name == "ob_header"
                     )
                 }),
-            "FrameBox::new must not store the inlined ob_header as one word"
+            "FrameBox::new_placed must not store the inlined ob_header as one word"
         );
         assert!(
             graph
@@ -3688,9 +3688,40 @@ fn op_is_cast_ptr_to_int(op: &majit_translate::model::SpaceOperation) -> bool {
     }
 }
 
+fn used_variable_ids(
+    graph: &majit_translate::model::FunctionGraph,
+) -> std::collections::HashSet<u64> {
+    use majit_translate::inline::op_variable_refs;
+    use majit_translate::model::ExitSwitch;
+    let mut used = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            used.extend(op_variable_refs(&op.kind).into_iter().map(|var| var.id()));
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                used.insert(var.id());
+            }
+            Some(ExitSwitch::Fused { args, .. }) => {
+                used.extend(args.iter().map(|var| var.id()));
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let Some(var) = arg.as_variable() {
+                    used.insert(var.id());
+                }
+            }
+        }
+    }
+    used
+}
+
 /// After rtyping, unused `p as usize` must not remain as `cast_ptr_to_int`.
 /// `GcRef` retypes the source pointer; a surviving `CastPtrToInt` forces
-/// the virtual `NewWithVtable`.
+/// the virtual `NewWithVtable`. Casts with a user (the raw spill buffer of
+/// the allocation out-params) stay.
 #[test]
 fn frame_box_new_unused_cast_ptr_to_int_dies_after_rtype() {
     use majit_translate::front::mir::lower_fun_decl;
@@ -3703,20 +3734,25 @@ fn frame_box_new_unused_cast_ptr_to_int_dies_after_rtype() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
+        .expect("FrameBox::new_placed");
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new_placed");
         let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let used = used_variable_ids(&transformed.graph);
+        let unused: Vec<u64> = transformed
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| op_is_cast_ptr_to_int(op))
+            .filter_map(|op| op.result.as_ref().map(|var| var.id()))
+            .filter(|id| !used.contains(id))
+            .collect();
         assert!(
-            !transformed
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(op_is_cast_ptr_to_int),
-            "unused rtyped cast_ptr_to_int must die after transform_graph: {}",
+            unused.is_empty(),
+            "unused rtyped cast_ptr_to_int must die after transform_graph: unused={unused:?} {}",
             transformed.graph.dump()
         );
     });
@@ -4037,7 +4073,7 @@ fn frame_box_owner_root_word_roundtrips() {
             text.ends_with("into_raw") || text.contains("addr_of_mut")
         }
 
-        let new_graph = lower_pyframe(llbc, context, "pub fn new(mut frame: PyFrame)");
+        let new_graph = lower_pyframe(llbc, context, "fn new_placed(mut frame: PyFrame");
         let mut owner_value = None;
         let mut ptr_writes: Vec<&LinkArg> = Vec::new();
         for block in &new_graph.blocks {
@@ -4062,8 +4098,8 @@ fn frame_box_owner_root_word_roundtrips() {
                 }
             }
         }
-        let owner_value = owner_value.expect("FrameBox::new writes owner_root");
-        assert!(!ptr_writes.is_empty(), "FrameBox::new writes ptr");
+        let owner_value = owner_value.expect("FrameBox::new_placed writes owner_root");
+        assert!(!ptr_writes.is_empty(), "FrameBox::new_placed writes ptr");
         let stored = defining_op(&new_graph, owner_value);
         assert_eq!(
             majit_translate::model::cast_instance_root(&stored.kind),
@@ -4088,7 +4124,7 @@ fn frame_box_owner_root_word_roundtrips() {
             .collect();
         assert!(
             !alloc_results.is_empty(),
-            "FrameBox::new must call the frame allocator"
+            "FrameBox::new_placed must call the frame allocator"
         );
         let operand_ancestors = ancestors(&new_graph, new_operand);
         assert!(
@@ -4302,7 +4338,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
 
     let llbc = load_llbc(INTERPRETER_LLBC);
     let sources = [
-        "pub fn new(mut frame: PyFrame)",
+        "fn new_placed(mut frame: PyFrame",
         "fn frame_ptr(&self)",
         "pub fn is_gc_owned(&self)",
         "pub fn into_raw(mut self)",

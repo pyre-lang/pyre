@@ -10790,16 +10790,22 @@ fn seed_bridge_standing_exception_from_current(
     // SAVE_EXCEPTION result as its exception.
     let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get())
         as pyre_object::PyObjectRef;
-    let exc_box = if exc.is_null() {
-        OpRef::NONE
+    let (exc_box, live) = if exc.is_null() {
+        (OpRef::NONE, pyre_object::PY_NULL)
     } else {
-        ctx.const_ref(exc as i64)
+        // Same intern-then-re-read as `seed_standing_exception_for_walk`.
+        let (exc_box, concrete) = crate::jitcode_dispatch::intern_live_exc(ctx, exc as usize);
+        let live = match concrete {
+            ConcreteValue::Ref(p) => p,
+            _ => pyre_object::PY_NULL,
+        };
+        (exc_box, live)
     };
-    sym.current_exc_value.set(exc);
+    sym.current_exc_value.set(live);
     sym.current_exc_box = exc_box;
-    sym.last_exc_value.set(exc);
+    sym.last_exc_value.set(live);
     sym.last_exc_box = exc_box;
-    sym.class_of_last_exc_is_const = !exc.is_null();
+    sym.class_of_last_exc_is_const = !live.is_null();
 }
 
 impl JitState for PyreJitState {

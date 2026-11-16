@@ -4826,24 +4826,24 @@ fn _flat_pycall(
     // FrameBox: the callee runs through the JIT, so it must be a
     // header-bearing heap frame (write barrier reads a valid header at
     // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
-    let mut new_frame = match crate::pyframe::FrameBox::new(
-        match pyre_object::with_roots!(func =>
-            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                code as *const (),
-                &[], // locals filled below directly from stack
-                w_globals,
-                crate::call::getexecutioncontext(),
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )
+    // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
+    let mut new_frame = match pyre_object::with_roots!(func => {
+        let inner = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            code as *const (),
+            &[], // locals filled below directly from stack
+            w_globals,
+            crate::call::getexecutioncontext(),
+            closure,
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ) {
             Ok(f) => f,
             Err(e) => {
                 crate::call::set_call_error(e);
                 return pyre_object::PY_NULL;
             }
-        },
-    ) {
+        };
+        crate::pyframe::FrameBox::new(inner)
+    }) {
         Ok(f) => f,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -4928,22 +4928,21 @@ fn _flat_pycall_defaults(
     let closure = unsafe { function_get_closure(func) };
 
     // FrameBox: header-bearing heap frame for the JIT write barrier.
-    let mut new_frame = match crate::pyframe::FrameBox::new(
-        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            code as *const (),
-            &[], // locals filled below
-            w_globals,
-            crate::call::getexecutioncontext(),
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                return pyre_object::PY_NULL;
-            }
-        },
+    let inner = match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        code as *const (),
+        &[], // locals filled below
+        w_globals,
+        crate::call::getexecutioncontext(),
+        closure,
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            return pyre_object::PY_NULL;
+        }
+    };
+    let mut new_frame = match crate::pyframe::FrameBox::new(inner) {
         Ok(f) => f,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -4983,8 +4982,10 @@ fn _flat_pycall_defaults(
 
     // function.py `_flat_pycall_defaults` — return new_frame.run.
     // Same callee root as `_flat_pycall`: `FrameBox`'s `OwnerRootGuard`.
+    // `shadowstack.py` `push_roots` / `pop_roots`: reload after `FrameBox::new`.
     if new_frame._is_generator_or_coroutine() {
-        match crate::call::frame_into_generator_for_function(new_frame, _roots.get(inputs_base)) {
+        let func = _roots.get(inputs_base);
+        match crate::call::frame_into_generator_for_function(new_frame, func) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

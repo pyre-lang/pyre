@@ -2345,6 +2345,11 @@ pub fn handle_exception_with_context(
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
         *next_instr = (target_bytes / 2) as usize;
+        // The handler pc goes on the live frame here, where the anchor still
+        // names it (`pyopcode.py` `dispatch_bytecode` sets `last_instr` on the
+        // reloaded `self`); a caller's pre-call frame pointer is stale after
+        // the collecting calls above.
+        frame.set_last_instr_from_next_instr(*next_instr);
         return true;
     }
 
@@ -2388,7 +2393,23 @@ pub(crate) fn eval_frame_plain(
 
 enum FrameResume {
     Yielded(PyObjectRef),
-    Dispatch(Option<PyError>),
+    Dispatch,
+}
+
+/// The resumption payload is an error: hand it to this frame's own
+/// exception table (`pyframe.py` `resume_execute_frame` →
+/// `handle_operation_error`). `Err` means no handler caught it.
+fn dispatch_resume_error(frame: &mut PyFrame, mut err: PyError) -> Result<(), PyError> {
+    let mut next_instr = frame.next_instr();
+    if !handle_exception_with_context(
+        frame,
+        &mut err,
+        &mut next_instr,
+        ContextSource::ResumedFrameOnly,
+    ) {
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// pyframe.py `resume_execute_frame`.  A suspended `yield from` is
@@ -2417,22 +2438,27 @@ fn prepare_frame_resume(
             // `resume_execute_frame` continues after `next_yield_from`.
             Ok(None) => {
                 crate::baseobjspace::position_after_send(unsafe { &mut *anchor.live() })?;
-                return Ok(FrameResume::Dispatch(None));
+                return Ok(FrameResume::Dispatch);
             }
-            // The delegate's error is thrown into this frame's own dispatch;
-            // the sent value was the delegate's and is not resumed here.
-            Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
+            Err(err) => {
+                // The delegate can collect, so the error goes to the frame
+                // re-read off the anchor.
+                dispatch_resume_error(unsafe { &mut *anchor.live() }, err)?;
+                return Ok(FrameResume::Dispatch);
+            }
         }
     }
     if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
-        return Ok(FrameResume::Dispatch(Some(
+        dispatch_resume_error(
+            frame,
             crate::pyopcode::s_application_exception_operr(w_arg_or_err),
-        )));
+        )?;
+        return Ok(FrameResume::Dispatch);
     }
     if !w_arg_or_err.is_null() {
         let _ = frame.resume_execute_frame(w_arg_or_err)?;
     }
-    Ok(FrameResume::Dispatch(None))
+    Ok(FrameResume::Dispatch)
 }
 
 /// Seed a suspended frame with its resumption payload, leaving it positioned to
@@ -2450,20 +2476,7 @@ pub fn prepare_frame_resume_for_dispatch(
 ) -> Result<Option<PyObjectRef>, PyError> {
     match prepare_frame_resume(frame, resume.w_arg_or_err)? {
         FrameResume::Yielded(value) => Ok(Some(value)),
-        FrameResume::Dispatch(Some(mut err)) => {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception_with_context(
-                frame,
-                &mut err,
-                &mut next_instr,
-                ContextSource::ResumedFrameOnly,
-            ) {
-                return Err(err);
-            }
-            frame.last_instr = next_instr as isize - 1;
-            Ok(None)
-        }
-        FrameResume::Dispatch(None) => Ok(None),
+        FrameResume::Dispatch => Ok(None),
     }
 }
 
@@ -2696,10 +2709,10 @@ pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
     eval_loop(frame, ec, /* relink */ true)
 }
 
-/// The frame passed here is a `FrameBox` frame that a minor collection does
-/// not move. After every collecting call the loop still re-reads it from its
-/// `FrameAnchor` slot (`shadowstack.py` `pop_roots`), matching
-/// `eval_loop_jit`. A JIT nursery frame is resumed through `eval_loop_jit`.
+/// The frame passed here is a `FrameBox` frame that a minor collection can
+/// move, so the loop re-reads it from its `FrameAnchor` slot after every
+/// collecting call (`shadowstack.py` `pop_roots`), matching `eval_loop_jit`.
+/// A JIT nursery frame is resumed through `eval_loop_jit`.
 fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
@@ -2711,7 +2724,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
     // nested activation (depth 2); a callback entered from a depth-1 opcode
     // handler runs at depth 2 with that handler suspended. Operands stay on
     // the frame value stack or are pinned (`with_roots!`), the interpreter
-    // frame is a `FrameBox` (young-nonmoving), and the result push goes
+    // frame is a `FrameBox`, and the result push goes
     // through `FrameAnchor`. This loop reloads the frame from its
     // `FrameAnchor` slot after each collecting call (`framework.py`
     // `gct_direct_call`, `shadowstack.py` `push_roots` / `pop_roots`).

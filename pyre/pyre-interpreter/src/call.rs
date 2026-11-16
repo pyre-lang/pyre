@@ -1469,16 +1469,18 @@ pub fn call_user_function_resolved(
 
     // Generator function
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
-            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
+        let gen_frame = pyre_object::with_roots!(callable => {
+            let inner = PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 args,
                 w_globals,
                 execution_context,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ))?,
-        )?;
+            )?;
+            crate::pyframe::FrameBox::new(inner)
+        })?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -2911,16 +2913,18 @@ pub fn call_user_function_plain_with_ctx(
     let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, false))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
-            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
+        let gen_frame = pyre_object::with_roots!(callable => {
+            let inner = PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
                 w_globals,
                 execution_context,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ))?,
-        )?;
+            )?;
+            crate::pyframe::FrameBox::new(inner)
+        })?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
@@ -5771,22 +5775,24 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = match crate::pyframe::FrameBox::new(
-            match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
+        let gen_frame = match pyre_object::with_roots!(func => {
+            let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 w_code as *const (),
                 &final_args,
                 w_globals,
                 exec_ctx,
                 closure,
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )) {
+            ) {
                 Ok(f) => f,
                 Err(e) => {
                     set_call_error(e);
                     return PY_NULL;
                 }
-            },
-        ) {
+            };
+            crate::pyframe::FrameBox::new(inner)
+        }) {
             Ok(f) => f,
             Err(e) => {
                 set_call_error(e);
@@ -5802,22 +5808,21 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
         };
     }
 
-    let mut frame = match crate::pyframe::FrameBox::new(
-        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            &final_args,
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        },
+    let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        w_code as *const (),
+        &final_args,
+        w_globals,
+        exec_ctx,
+        closure,
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
+    let mut frame = match crate::pyframe::FrameBox::new(inner) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);
@@ -5880,22 +5885,24 @@ fn call_user_function_resolved_frameless(
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
-    let mut frame = match crate::pyframe::FrameBox::new(
-        match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
+    // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
+    let mut frame = match pyre_object::with_roots!(func => {
+        let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
             args,
             w_globals,
             exec_ctx,
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )) {
+        ) {
             Ok(f) => f,
             Err(e) => {
                 set_call_error(e);
                 return PY_NULL;
             }
-        },
-    ) {
+        };
+        crate::pyframe::FrameBox::new(inner)
+    }) {
         Ok(f) => f,
         Err(e) => {
             set_call_error(e);

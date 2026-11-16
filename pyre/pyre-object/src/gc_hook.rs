@@ -313,9 +313,9 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// Unlike the stable twin this one *collects*: `external_malloc` runs
 /// `minor_collection_with_major_progress` when `threshold_reached` holds,
 /// and the hook keeps that. So every word the caller will store into the
-/// block has to be a root across the call and read back afterwards, the
-/// way `FrameBox::new` publishes a frame's inputs; a caller that builds the
-/// payload first takes [`try_gc_alloc_young_nonmoving_no_collect_raw`].
+/// block has to be a root across the call and read back afterwards; a
+/// caller that builds the payload first takes
+/// [`try_gc_alloc_young_nonmoving_no_collect_raw`].
 ///
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]

@@ -505,11 +505,13 @@ pub struct GcRewriterImpl {
     ///
     /// Upstream has no such twin: `gen_malloc_fixedsize` is reached only by an
     /// oversized NEW there, and an oversized object is non-moving whichever arm
-    /// it takes.  pyre reuses the same generator for a descr that demands a
-    /// non-moving address at *any* size — `PYFRAME_DESCR_GROUP.size_descr` is
-    /// the live one — and that demand is not something
-    /// `malloc_big_fixedsize`'s own allocator can answer any more, now that it
-    /// dispatches on size and its small arm is the nursery.
+    /// it takes.  The same generator is reused for a descr that demands a
+    /// non-moving address at *any* size —
+    /// `W_OBJECT_OBJECT_DESCR_GROUP.size_descr` and
+    /// `W_OBJECT_OBJECT_USER_SIZE_DESCR` are the live ones — and that
+    /// demand is not something `malloc_big_fixedsize`'s own allocator can
+    /// answer any more, now that it dispatches on size and its small arm
+    /// is the nursery.
     pub malloc_big_fixedsize_oldgen_fn: i64,
     /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
     pub malloc_array_descr: DescrRef,

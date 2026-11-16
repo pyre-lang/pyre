@@ -25,11 +25,10 @@ use crate::{
 /// `0x[0-9a-fA-F]+`), so the text follows `getaddrstring` on every host.
 ///
 /// The bits are whatever the caller already computed. A Rust struct that is
-/// not a moving GC object — `PyFrame` (born with `try_gc_alloc_stable_raw`)
-/// and the `_thread` lock types (born with `malloc_typed_stable`) — passes
-/// its own address here. A GC object that can move prints
-/// [`repr_gc_addr`] instead, so the text is `getaddrstring`'s id rather than
-/// the nursery address it currently occupies.
+/// not a moving GC object — the `_thread` lock types (born with
+/// `malloc_typed_stable`) — passes its own address here. A GC object that
+/// can move prints [`repr_gc_addr`] instead, so the text is
+/// `getaddrstring`'s id rather than the nursery address it currently occupies.
 pub fn repr_addr(addr: usize) -> String {
     const HEX_WIDTH: usize = size_of::<usize>() * 2;
     let mut digits = [b' '; HEX_WIDTH];

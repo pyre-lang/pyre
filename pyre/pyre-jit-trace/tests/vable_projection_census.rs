@@ -25,10 +25,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The only function permitted to project a virtualizable field off a
-/// non-dereferenced base. It takes the frame by value, so every
-/// `frame.<field>` is a projection off a local aggregate rather than off a
-/// dereference.
-const ALLOWED: &[&str] = &["pyre_interpreter::pyframe::{FrameBox}::new"];
+/// non-dereferenced base. `FrameBox::new_placed` is the by-value frame
+/// constructor, so every `frame.<field>` is a projection off a local
+/// aggregate rather than off a dereference.
+const ALLOWED: &[&str] = &["pyre_interpreter::pyframe::{FrameBox}::new_placed"];
 
 const CORPUS_FILES: &[&str] = &[
     "pyre-object.ullbc",
@@ -154,7 +154,7 @@ fn impl_owner_leaf(llbc: &Llbc, skip_binder: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Charon pretty-print spelling, e.g. `pyre_interpreter::pyframe::{FrameBox}::new`.
+/// Charon pretty-print spelling, e.g. `pyre_interpreter::pyframe::{FrameBox}::new_placed`.
 fn display_fn_name(llbc: &Llbc, fd: &FunDecl) -> String {
     let mut out = String::new();
     for seg in fd.item_meta.template_name() {
@@ -445,7 +445,7 @@ fn census_corpus(allowed: &[&str]) -> (Census, Result<(), Vec<String>>) {
     (census, result)
 }
 
-/// `FrameBox::new` taking the frame by value is the standing witness that
+/// `FrameBox::new_placed` taking the frame by value is the standing witness that
 /// the census still matches the shape. A function outside ALLOWED acquiring
 /// the same projection, or the constructor losing it, is the tripwire.
 ///
@@ -621,7 +621,7 @@ fn framebox_impl_new(stmts: Vec<Value>) -> Value {
             ident("pyre_interpreter"),
             ident("pyframe"),
             impl_seg,
-            ident("new"),
+            ident("new_placed"),
         ],
         adt_ty(0),
         stmts,
@@ -703,7 +703,7 @@ fn by_value_frame_constructor_is_counted() {
     assert_eq!(
         census
             .non_deref
-            .get("pyre_interpreter::pyframe::{FrameBox}::new"),
+            .get("pyre_interpreter::pyframe::{FrameBox}::new_placed"),
         Some(&2),
         "{:?}",
         census.non_deref

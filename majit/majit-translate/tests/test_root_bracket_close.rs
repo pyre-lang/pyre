@@ -1824,7 +1824,7 @@ fn zip_two_tuple_next_erases_the_nested_root_brackets() {
     });
 }
 
-/// `FrameBox::new` closes with `drop(frame_root)`, which Charon spells as
+/// `FrameBox::new_placed` closes with `drop(frame_root)`, which Charon spells as
 /// `_t = Move(guard); core::mem::drop(Move(_t))`. Production harvests
 /// pyre-object's root-stack effects before lowering the interpreter, the
 /// same order `lib.rs` uses; that Call is Close of the watched Guard so
@@ -1848,11 +1848,11 @@ fn frame_box_new_erases_the_explicit_drop_root_bracket() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
-    let graph =
-        lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower FrameBox::new: {e:?}"));
+        .expect("FrameBox::new_placed");
+    let graph = lower_fun_decl(&context, fd)
+        .unwrap_or_else(|e| panic!("lower FrameBox::new_placed: {e:?}"));
     let leftover: Vec<String> = graph
         .blocks
         .iter()
@@ -1882,7 +1882,7 @@ fn frame_box_new_erases_the_explicit_drop_root_bracket() {
         .collect();
     assert!(
         leftover.is_empty(),
-        "FrameBox::new still calls root-bracket leaves after explicit-drop erasure: {leftover:?}"
+        "FrameBox::new_placed still calls root-bracket leaves after explicit-drop erasure: {leftover:?}"
     );
 }
 

@@ -5065,6 +5065,8 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // own-frame write into it as the sub-walk records them — but the walk
     // stopped AT the merge point, before the opcode that would have spilled
     // `last_instr` for it.
+    let concrete_callee_frame =
+        live_callee_frame(ctx.trace_ctx, callee_frame, concrete_callee_frame);
     unsafe { (*concrete_callee_frame).last_instr = target_pc as isize - 1 };
     // `do_recursive_call` bakes `portal_runner_adr`.  That address is what the
     // runtime CALL_ASSEMBLER calls when the callee has no compiled loop yet:
@@ -7076,6 +7078,22 @@ fn live_frame_chain_ptr(
         .unwrap_or(fallback)
 }
 
+/// The concrete frame `callee_frame` names, read back from its concrete
+/// stamp. A moving collection forwards a `set_opref_concrete` stamp
+/// (`TraceCtx::concrete_of_opref`) but not a raw copy of the address, so a
+/// frame address held across a collecting call is re-read here, the reload
+/// `shadowstack.py` `pop_roots` performs on a GCREF local.
+fn live_callee_frame(
+    ctx: &TraceCtx,
+    callee_frame: OpRef,
+    raw: *mut pyre_interpreter::PyFrame,
+) -> *mut pyre_interpreter::PyFrame {
+    if raw.is_null() {
+        return raw;
+    }
+    ctx.virtualref_entry_ptr((callee_frame, raw as usize)) as *mut pyre_interpreter::PyFrame
+}
+
 /// `executioncontext.py ExecutionContext.enter`, at an inlined call.
 ///
 /// ```python
@@ -7126,9 +7144,10 @@ fn walker_ec_enter(
         crate::descr::pyframe_f_backref_descr(),
     );
     // `self.topframeref = jit.virtual_ref(frame)`.
-    // The frame is the old-gen `FrameBox` seeded above this call, so the
-    // pointer `virtual_ref_during_tracing` stores in `forced` does not move.
+    // The frame is a nursery object and can move; it is re-read from
+    // its stamp after each `record_op` above.
     // The vref itself is old-gen (`alloc_virtual_ref`).
+    let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame as usize);
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -7141,8 +7160,9 @@ fn walker_ec_enter(
     );
     // The recording-time shadow of the `SetfieldGc` above: `PyFrame.f_backref`
     // is a `Type::Ref` field, so the emitted store carries the generational
-    // barrier and the concrete store has to carry it too.  This frame is an
-    // old-gen `FrameBox` and the caller's vref can be young.
+    // barrier and the concrete store has to carry it too.  The frame can be old
+    // (it survived a minor) while the caller's vref is young.
+    let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as pyre_object::gc_hook::GCREF);
     majit_gc::bh_probe_note_store(
         concrete_frame as usize,
@@ -7300,12 +7320,14 @@ pub(crate) fn walker_ec_leave(
             flags_descr.clone(),
         );
         ctx.heapcache_setfield_cached(callee_frame, flags_descr.index(), new_flags);
+        let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
         unsafe { (*concrete_frame).set_frame_finished_execution(true) };
     }
     // `self.topframeref = frame.f_backref` — no parens: the caller's vref
     // moves back unforced, so a caller frame that stayed virtual stays virtual.
     // Same window as `walker_ec_enter`: pin the callee's `f_backref` before
     // `record_op`, which can minor-collect.
+    let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     let f_backref_raw = unsafe { (*concrete_frame).f_backref };
     let pinned_f_backref = pin_frame_chain_ptr(f_backref_raw);
     let f_backref = ctx.record_op_with_descr(
@@ -7323,8 +7345,10 @@ pub(crate) fn walker_ec_leave(
         f_backref,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
     );
+    let concrete_frame = live_callee_frame(ctx, callee_frame, concrete_frame);
     let escaped = unsafe {
         let frame_vref = (*concrete_ec).topframeref();
+        let pinned_frame_vref = pin_frame_chain_ptr(frame_vref);
         (*concrete_ec).set_topframeref(concrete_f_backref);
         let escaped = (*concrete_frame).escaped() || got_exception;
         if escaped {
@@ -7333,6 +7357,7 @@ pub(crate) fn walker_ec_leave(
             // was still free to keep virtual.  `get_f_back` forces, which is
             // `f_back = frame.f_backref()` with the parens.
             let f_back = (*concrete_frame).get_f_back();
+            let pinned_f_back = pin_frame_chain_ptr(f_back);
             if !f_back.is_null() {
                 // `f_back.mark_as_escaped()` is traced: the store lands in
                 // the trace and in the heapcache, on the box this walk holds
@@ -7362,10 +7387,12 @@ pub(crate) fn walker_ec_leave(
                     // unescaped frames' flags too.
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                 }
+                let f_back = live_frame_chain_ptr(pinned_f_back.as_ref(), f_back);
                 (*f_back).mark_as_escaped();
             }
             // `frame_vref()` — force the leaving frame's own vref so it
             // outlives the JIT frame.
+            let frame_vref = live_frame_chain_ptr(pinned_frame_vref.as_ref(), frame_vref);
             let _ = pyre_interpreter::executioncontext::force_vref(frame_vref);
         }
         escaped
@@ -7589,6 +7616,12 @@ fn record_ec_enter_virtual_ref(
         &[callee_frame, caller_topframeref],
         crate::descr::pyframe_f_backref_descr(),
     );
+    // The two `record_op`s above can collect and move the frame.
+    let concrete_frame = live_callee_frame(
+        ctx,
+        callee_frame,
+        concrete_frame as *mut pyre_interpreter::PyFrame,
+    ) as usize;
     let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame);
     ctx.set_opref_concrete(
         vref,
@@ -11936,19 +11969,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // callee frame seeded, nothing entered. `enter` writes only
             // `topframeref`/`f_backref`, which the unarmed `call_trace` path
             // does not read.
+            let call_trace_frame =
+                live_callee_frame(ctx.trace_ctx, ca_callee_frame, ca_concrete_frame);
             walker_inline_execute_frame_call_trace(
                 ctx,
                 op.pc,
                 ca_callee_ec,
                 ca_callee_frame,
                 concrete_ec,
-                ca_concrete_frame,
+                call_trace_frame,
             )?;
+            let live_enter_frame =
+                live_callee_frame(ctx.trace_ctx, ca_callee_frame, ca_concrete_frame);
             walker_ec_enter(
                 ctx.trace_ctx,
                 ca_callee_frame,
                 ca_callee_ec,
-                ca_concrete_frame,
+                live_enter_frame,
                 concrete_ec,
             );
             // This inlined level is an activation `execute_frame` would have
@@ -12109,6 +12146,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             .filter(|owner| *owner != caller_inflight_owner);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
+        concrete_callee_frame =
+            live_callee_frame(sub_wc.trace_ctx, ca_callee_frame, concrete_callee_frame);
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
         // Seed the callee's per-slot concrete-locals shadow from the param
         // boxes.  Two distinct consumers, gated differently:
@@ -12772,11 +12811,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let _ = pyre_object::gc_roots::pin_root(exc_ptr);
             slot
         });
+        let live_leave_frame = live_callee_frame(ctx.trace_ctx, ca_callee_frame, ca_concrete_frame);
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,
             ca_callee_ec,
-            ca_concrete_frame,
+            live_leave_frame,
             concrete_ec,
             got_exception,
         );

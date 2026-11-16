@@ -8574,6 +8574,8 @@ pub fn eval_with_jit(
     // entry.  The portal runner is pyre's JIT-aware execution entry for the
     // same frame and must perform the interpreter-side check before compiled
     // code exists; compiled callees additionally carry the backend prologue.
+    // Both checks allocate only on their `Err` path, after which the frame
+    // is not used, so the frame needs no root across them.
     pyre_interpreter::stack_check::drain_jit_pending_exception()?;
     pyre_interpreter::stack_check::stack_check()?;
     eval_with_jit_inner(frame, resume)

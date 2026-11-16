@@ -7462,10 +7462,19 @@ pub(crate) fn seed_standing_exception_for_walk<Sym: WalkSym>(
     if grab != 0 {
         let exc = grab as pyre_object::PyObjectRef;
         if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
-            let exc_box = trace_ctx.const_ref(exc as i64);
-            sym.set_current_exc_value(exc);
+            // `const_ref` intern appends to the Trace and can collect.
+            // `ExceptionRoot` walks these cells (`pyjitpl.py`
+            // `execute_ll_raised`); store the live address
+            // (`intern_live_exc` / `history.py` `ConstPtr` /
+            // `shadowstack.py` `pop_roots`).
+            let (exc_box, concrete) = intern_live_exc(trace_ctx, exc as usize);
+            let live = match concrete {
+                ConcreteValue::Ref(p) => p,
+                _ => pyre_object::PY_NULL,
+            };
+            sym.set_current_exc_value(live);
             sym.set_current_exc_box(exc_box);
-            sym.set_last_exc_value(exc);
+            sym.set_last_exc_value(live);
             sym.set_last_exc_box(exc_box);
             sym.set_class_of_last_exc_is_const(true);
             return;

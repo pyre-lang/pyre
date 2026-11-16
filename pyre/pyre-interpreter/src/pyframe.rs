@@ -459,8 +459,9 @@ pub mod frame_locals_proxy {
             // `mapping` materializes a fresh dict, so every element of the
             // caller's slice is a pre-allocation copy by the time the call
             // reads it.  Publish the slice, take the snapshot, then rebuild it.
-            // The proxy payload itself is born non-moving, so `self` and the
-            // frame it reaches stay valid across the allocation.
+            // The proxy is non-moving; its `w_frame` field is forwarded by the
+            // collector, so the frame is read through the field after the
+            // allocation.
             let roots = pyre_object::gc_roots::push_roots();
             let args_base = roots.publish(args);
             roots.normalize(args_base, args.len());
@@ -554,16 +555,17 @@ pub mod frame_locals_proxy {
             // per local and `get_or_create_extra_locals` allocates the dict, so
             // both stores below would otherwise write pre-allocation copies.
             let roots = pyre_object::gc_roots::push_roots();
-            let key_slot = roots.publish(&[key, value]);
-            roots.normalize(key_slot, 2);
+            let key_slot = roots.publish(&[key, value, self.w_frame]);
+            roots.normalize(key_slot, 3);
             // The stores below target `locals_cells_stack_w`, so materialize it
             // first.  The force follows the publish rather than preceding the
             // region: it can collect, and `key` and `value` are pre-allocation
             // copies until they are rooted.
             self.force_locals();
             let value_slot = key_slot + 1;
+            let frame_slot = key_slot + 2;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
-                let frame = self.frame();
+                let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
                 let is_cell_kind = {
                     let code = frame.code();
                     index >= code.varnames.len() || super::cell_slot(code, index)
@@ -576,7 +578,8 @@ pub mod frame_locals_proxy {
             // `f_extra_locals` exact dict.  In particular, a PEP 709 hidden
             // local is read from the fast slot but proxy writes of the same
             // name do not mutate that slot or the module/eval locals mapping.
-            let extra = self.frame().get_or_create_extra_locals()?;
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }
+                .get_or_create_extra_locals()?;
             crate::baseobjspace::setitem(extra, roots.get(key_slot), roots.get(value_slot))
                 .map(|_| ())
         }
@@ -617,6 +620,12 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
+            // The frame is a movable nursery object; `w_str_new_managed`,
+            // `hash_w_strict` and `eq_w` below can collect, so pin it before
+            // those calls and re-read it after (`shadowstack.py`
+            // `push_roots` / `pop_roots`).
+            let frame_slot = candidate_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             // No force here; see [`Self::force_locals`] on the read direction.
             // An exact `str` is decided by WTF-8 bytes, so its hash is not
             // read and cannot fail.  Every other key is hashed before the
@@ -662,9 +671,9 @@ pub mod frame_locals_proxy {
             // descent's blocker frontier (`fast2locals`).
             let code = self.frame().code();
             let nvar = code.varnames.len();
-            // The name borrow ends before `self.frame()`.  `locals_w!` stays
-            // in this function so the virtualizable array getfield and the
-            // access share a basic block.
+            // The name borrow ends before the frame is re-read from
+            // `frame_slot`.  `locals_w!` stays in this function so the
+            // virtualizable array getfield and the access share a basic block.
             macro_rules! consider_local {
                 ($index:expr, $name:expr, $is_cell:expr) => {{
                     let same = {
@@ -680,7 +689,7 @@ pub mod frame_locals_proxy {
                         }
                     };
                     if same {
-                        let frame = self.frame();
+                        let frame = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
                         if $index < locals_w!(frame).len() {
                             let slot = locals_w!(frame)[$index];
                             let value = super::unwrap_localsplus_slot($is_cell, slot);
@@ -812,19 +821,45 @@ pub mod frame_locals_proxy {
             } else {
                 unsafe { pyre_object::dictmultiobject::w_dict_len(extra) as i64 }
             };
-            // `code` addresses the compiler code object, which lives outside
-            // the GC heap and so stays valid across those collections.
+            // Same slot order as [`Self::locals_plus_value`]: varnames, then
+            // the pure-cellvar band, then freevars.  Positional indexing
+            // rather than that `Vec` because this graph is `unroll_safe`: a
+            // collected `Vec` puts the iterator and the allocation on the
+            // descent's blocker frontier.  Nothing in the loops allocates,
+            // so the frame cannot move.
             let code = self.frame().code();
-            for (index, _name, cell_slot) in locals_plus_names(code) {
+            let nvar = code.varnames.len();
+            for index in 0..nvar {
+                let is_cell = super::cell_slot(code, index);
                 let frame = self.frame();
-                if index >= locals_w!(frame).len() {
-                    continue;
+                if index < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(is_cell, locals_w!(frame)[index]);
+                    // `framelocalsproxy_hasval`.
+                    if !value.is_null() {
+                        size += 1;
+                    }
                 }
-                let slot = locals_w!(frame)[index];
-                let value = super::unwrap_localsplus_slot(cell_slot, slot);
-                // `framelocalsproxy_hasval`.
-                if !value.is_null() {
-                    size += 1;
+            }
+            let npure = super::npure_cellvars(code);
+            for i in 0..npure {
+                let slot = nvar + i;
+                let frame = self.frame();
+                if slot < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(true, locals_w!(frame)[slot]);
+                    if !value.is_null() {
+                        size += 1;
+                    }
+                }
+            }
+            let nfree = code.freevars.len();
+            for i in 0..nfree {
+                let slot = nvar + npure + i;
+                let frame = self.frame();
+                if slot < locals_w!(frame).len() {
+                    let value = super::unwrap_localsplus_slot(true, locals_w!(frame)[slot]);
+                    if !value.is_null() {
+                        size += 1;
+                    }
                 }
             }
             size
@@ -985,12 +1020,14 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if let Some(value) = self.locals_plus_value(roots.get(key_slot))? {
                 return Ok(value);
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if !extra.is_null() {
-                let extra_slot = key_slot + 1;
+                let extra_slot = key_slot + 2;
                 let _ = roots.pin_root(extra);
                 if let Some(value) =
                     crate::baseobjspace::finditem(roots.get(extra_slot), roots.get(key_slot))?
@@ -1025,17 +1062,19 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if self.key_is_fast_local(roots.get(key_slot))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
             // A delete does not create the extras dict that a store would.
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 return Err(crate::PyError::key_error_with_key(roots.get(key_slot)));
             }
-            let extra_slot = key_slot + 1;
+            let extra_slot = key_slot + 2;
             let _ = roots.pin_root(extra);
             crate::baseobjspace::delitem(roots.get(extra_slot), roots.get(key_slot))
         }
@@ -1068,14 +1107,16 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
+            let frame_slot = key_slot + 1;
+            let _ = roots.pin_root(self.w_frame);
             if self.locals_plus_value(roots.get(key_slot))?.is_some() {
                 return Ok(true);
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 return Ok(false);
             }
-            let extra_slot = key_slot + 1;
+            let extra_slot = key_slot + 2;
             let _ = roots.pin_root(extra);
             crate::baseobjspace::contains(roots.get(extra_slot), roots.get(key_slot))
         }
@@ -1207,12 +1248,14 @@ pub mod frame_locals_proxy {
             let args_base = roots.publish(&args[1..]);
             let nargs = args.len() - 1;
             roots.normalize(args_base, nargs);
+            let frame_slot = args_base + nargs;
+            let _ = roots.pin_root(self.w_frame);
             if self.key_is_fast_local(roots.get(args_base))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_extra_locals();
+            let extra = unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) }.get_extra_locals();
             if extra.is_null() {
                 // A frame with no extras dict answers the default if one was
                 // passed and reports the key itself otherwise; it does not
@@ -1223,7 +1266,7 @@ pub mod frame_locals_proxy {
                     Err(crate::PyError::key_error_with_key(roots.get(args_base)))
                 };
             }
-            let extra_slot = args_base + nargs;
+            let extra_slot = frame_slot + 1;
             let _ = roots.pin_root(extra);
             let mut call_args = Vec::with_capacity(nargs);
             for i in 0..nargs {
@@ -1799,10 +1842,10 @@ impl FrameBox {
     ///
     /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
     /// GC object whose lifetime is its reachability.  When the GC hook is
-    /// installed this allocates a non-moving YOUNG `PYFRAME_GC_TYPE_ID`
-    /// block (`external_malloc(..., alloc_young=True)`, through
-    /// `try_gc_alloc_young_nonmoving_raw`); the collector reclaims the frame
-    /// and its GC-managed locals and debug data once no root
+    /// installed this allocates a nursery `PYFRAME_GC_TYPE_ID` block
+    /// (`malloc_fixedsize`, through `try_gc_alloc_collecting_rooted`); the
+    /// collector reclaims the frame and its GC-managed locals and debug data
+    /// once no root
     /// (the handle's own owner root while it lives, then `walk_pyframe_roots`
     /// over the `CURRENT_FRAME` / `f_backref` chain or a traced edge such as
     /// a traceback's `tb_frame`) reaches it, so `Drop` performs no manual
@@ -1817,21 +1860,24 @@ impl FrameBox {
     /// 92-99.7% of the nursery surviving each minor on a module-level loop
     /// calling a compiled function that raises, against 15% with the JIT off.
     ///
-    /// The non-moving part is pyre's, not upstream's: `pyframe.py class
-    /// PyFrame(W_Root)` declares no placement hint and a minor collection
-    /// relocates it, rewriting every referring slot
-    /// (`rpython/memory/gc/incminimark.py` / `:2252`) because the
-    /// translator delivers roots as slot addresses and rewrites live GCREF
-    /// locals in them (`rpython/memory/gctransform/shadowstack.py:43-46`).
-    /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
-    /// across its own allocations, so this allocation standing still is what
-    /// takes the place of that rewrite.  It is not a rule about every frame —
-    /// a compiled trace's inlined-callee frame is a nursery allocation
-    /// (`emit_new_pyframe_inline_with_params` -> `NewWithVtable`), so the
-    /// crossing into raw-pointer territory is guarded at the seams instead,
-    /// by `crate::eval::FrameAnchor` and the JIT layer's `FrameRoot`.
+    /// The frame moves like upstream's (`pyframe.py class PyFrame(W_Root)`
+    /// declares no placement hint, and a minor collection relocates it,
+    /// rewriting every referring slot). The translator delivers roots as
+    /// slot addresses and rewrites live GCREF locals in them
+    /// (`shadowstack.py` `push_roots` / `pop_roots`); Rust has no such pass,
+    /// so a caller that keeps a frame address across an allocation holds it
+    /// in a shadow-stack slot and reads it back: this function's own
+    /// `owner_root`, `crate::eval::FrameAnchor` in the dispatch loop and the
+    /// opcode handlers, and the JIT layer's `FrameRoot`.
     ///
-    /// Making it uniform is one line —
+    /// A young-nonmoving frame (`external_malloc(alloc_young=True)`) was the
+    /// earlier stand-in for that rewrite, and it was not free: once a
+    /// bounded heap is at its limit `threshold_reached` stays true, and every
+    /// `external_malloc` runs a minor collection plus a major step sized
+    /// `totalsize + nursery_size/2`, so each Python call after a
+    /// `MemoryError` drove the collector toward the fatal second arrival.
+    ///
+    /// Making every frame old-gen is one line —
     /// `PYFRAME_DESCR_GROUP.size_descr.set_non_moving(true)` sends
     /// `NewWithVtable` down `gen_malloc_fixedsize` to the old generation —
     /// and it costs 3.6x on `bench/fib_recursive.py`: 0.39s against 1.43s,
@@ -1850,7 +1896,18 @@ impl FrameBox {
     /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
     /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
     /// distinguishes them with `try_gc_owns_object`.
-    pub fn new(mut frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+    pub fn new(frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+        Self::new_placed(frame, false)
+    }
+
+    /// [`FrameBox::new`] for a frame whose address must not change: a
+    /// young-nonmoving block (`external_malloc(..., alloc_young=True)`), for
+    /// [`PyFrame::snapshot_for_tracing`] only.
+    pub fn new_nonmoving(frame: PyFrame) -> Result<FrameBox, crate::PyError> {
+        Self::new_placed(frame, true)
+    }
+
+    fn new_placed(mut frame: PyFrame, nonmoving: bool) -> Result<FrameBox, crate::PyError> {
         // `frame` is an RPython aggregate local whose GCREF fields are all
         // translated livevars across the frame allocation. Publish every field
         // before it, the way `gct_fv_gc_malloc` brackets a malloc with the
@@ -1915,10 +1972,30 @@ impl FrameBox {
         };
         let inputs = frame_root.publish(published);
         frame_root.normalize(inputs, published.len());
-        let raw = pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
-            PYFRAME_GC_TYPE_ID,
-            std::mem::size_of::<PyFrame>(),
-        );
+        let mut needs_write_barrier = true;
+        let raw = if nonmoving {
+            pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
+                PYFRAME_GC_TYPE_ID,
+                std::mem::size_of::<PyFrame>(),
+            )
+        } else {
+            // `malloc_fixedsize` (`incminimark.py`): a nursery bump that runs
+            // `collect_and_reserve` only when the nursery is full. Every input
+            // is already on `frame_root`; the hook's own slot carries the
+            // locals array, and the read-back below goes through `frame_root`
+            // like the other fields.
+            let mut allocation_root = frame_root.get(inputs + 2) as pyre_object::gc_hook::GCREF;
+            pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
+                pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+                    PYFRAME_GC_TYPE_ID,
+                    std::mem::size_of::<PyFrame>(),
+                    &mut allocation_root,
+                    &mut needs_write_barrier,
+                )
+            })
+            .allocated_or_raise()
+            .unwrap_or(std::ptr::null_mut())
+        };
         if !raw.is_null() {
             // RPython allocation results stay live in the translated shadow
             // stack while the caller initializes their fields.  Free-threaded
@@ -1955,13 +2032,14 @@ impl FrameBox {
             unsafe {
                 std::ptr::write(ptr, frame);
             }
-            // A young frame needs no barrier for the young argument / locals
-            // objects it names, and the barrier's TRACK_YOUNG_PTRS test
-            // answers so.  A refused young birth is old-gen, and that frame
-            // must be remembered for the next minor tracer, exactly as
-            // `generator.rs`'s `w_generator_or_coroutine_new` does for a
-            // stable generator wrapping young frame contents.
-            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+            // A nursery frame needs no barrier for the young objects it names,
+            // and the barrier's TRACK_YOUNG_PTRS test answers so. A frame the
+            // collecting malloc placed old (`needs_write_barrier`) must be
+            // remembered for the next minor tracer, as `generator.rs`'s
+            // `w_generator_or_coroutine_new` does for a stable generator.
+            if needs_write_barrier {
+                pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+            }
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
@@ -1993,9 +2071,8 @@ impl FrameBox {
     ///
     /// The sole caller is [`Self::new`]'s fallback for the window before the
     /// GC hook is installed (bootstrap, unit tests).  Nothing is collected in
-    /// that window, so a frame allocated here is never swept and never moves,
-    /// which is what lets the rest of the interpreter treat every frame
-    /// address as stable.
+    /// that window, so a frame allocated here is never swept and never
+    /// moves.
     fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
@@ -2187,7 +2264,7 @@ impl FrameBox {
         // rewrite it. `owner_root` is the same slot; `FrameAnchor` is the
         // reload used after each collecting call.
         let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(self.frame_ptr()) };
-        unsafe { (*frame_anchor.live()).run_generator_prologue()? };
+        PyFrame::run_generator_prologue(&frame_anchor)?;
         let register_final = unsafe {
             crate::pycode::w_code_yields_inside_try(
                 (*frame_anchor.live()).pycode as pyre_object::PyObjectRef,
@@ -4988,8 +5065,12 @@ impl PyFrame {
         // skip its frame edge and `TraceCtx::virtualizable_heap_ptr` has no
         // slot to read back.  Same allocation shape as
         // `snapshot_for_generator` below, for the same reason.
-        let mut frame =
-            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
+        // The snapshot is pyre's own stand-in for the `MIFrame` stack and its
+        // address is the walk's `cf_addr` identity, so it is young-nonmoving
+        // rather than a moving nursery frame.
+        let mut frame = FrameBox::new_nonmoving(
+            self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?,
+        )?;
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -5067,8 +5148,8 @@ impl PyFrame {
     /// frame), and the generator's custom trace greys the frame block.
     pub fn snapshot_for_generator(&self) -> Result<FrameBox, crate::PyError> {
         // `build_snapshot_frame` finishes its allocations before returning.
-        // `FrameBox::new` then uses the non-collecting `alloc_in_oldgen` path
-        // and write-barriers the frame before this returns.
+        // `FrameBox::new` then allocates a nursery frame, which moves like any
+        // generator frame (`generator.py` holds it through a traced field).
         let mut frame =
             FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc)?)?;
         frame.fix_array_ptrs();
@@ -5829,19 +5910,28 @@ impl PyFrame {
         // the quote character too).  `code_repr` is a separate decision and
         // keeps its own quotes around a `%U`, which is why the two disagree on
         // the same path.
+        let lineno = self.get_last_lineno();
+        let roots = pyre_object::gc_roots::push_roots();
+        let frame_slot = roots.pin_roots(&[self as *const PyFrame as pyre_object::PyObjectRef]);
         let w_name =
             unsafe { crate::pycode::w_code_name_obj(self.pycode as pyre_object::PyObjectRef) };
+        let name = if !w_name.is_null() {
+            unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
+        } else {
+            rustpython_wtf8::Wtf8Buf::new()
+        };
+        // `getaddrstring` id; read from the root because `w_code_name_obj` can collect.
+        let addr = crate::display::repr_gc_addr(roots.get(frame_slot));
         let mut repr = rustpython_wtf8::Wtf8Buf::new();
         repr.push_str("<frame at ");
-        repr.push_str(&crate::display::repr_addr(self as *const PyFrame as usize));
+        repr.push_str(&addr);
         repr.push_str(", file ");
         repr.push_str(&crate::display::format_wtf8_repr(&filename));
         repr.push_str(", line ");
-        repr.push_str(&self.get_last_lineno().to_string());
+        repr.push_str(&lineno.to_string());
         repr.push_str(", code ");
-        if !w_name.is_null() {
-            repr.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
-        }
+        repr.push_wtf8(&name);
+        repr.push_str(">");
         repr
     }
 
@@ -5897,7 +5987,7 @@ impl PyFrame {
                         &mut *frame_anchor.live(),
                     )
                 };
-                if !self.clear_references() {
+                if !unsafe { &mut *frame_anchor.live() }.clear_references() {
                     return Err(crate::runtime_ops::fetch_memory_error());
                 }
                 return Ok(());
@@ -7003,19 +7093,28 @@ impl PyFrame {
     ///
     /// The prefix handlers are the same `execute_make_cell` /
     /// `execute_copy_free_vars` / `execute_load_fast` / `execute_get_iter` /
-    /// `execute_get_aiter` the eval loop uses. `RETURN_GENERATOR` itself is not executed: the
+    /// `execute_get_aiter` the eval loop uses. The frame is re-read from
+    /// the caller's anchor before each handler because `MAKE_CELL` allocates.
+    /// `RETURN_GENERATOR` itself is not executed: the
     /// generator is allocated by the caller after this returns. The frame
     /// stays at `last_instr == -1`; [`Self::next_instr`] reports
     /// `after_return_generator_index` (the `POP_TOP`) so the first resume
     /// starts there. An error raised here propagates to the caller without a
     /// traceback entry for this frame, which `_PyFrame_IsIncomplete` keeps out
     /// of tracebacks until it reaches `_co_firsttraceable`.
-    pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
-        let after_return_generator = crate::pycode::after_return_generator_index(self.code());
-        if after_return_generator == 0 {
-            return Ok(());
+    pub fn run_generator_prologue(
+        frame_anchor: &crate::eval::FrameAnchor,
+    ) -> Result<(), crate::PyError> {
+        let after_return_generator;
+        let code;
+        {
+            let frame = unsafe { &mut *frame_anchor.live() };
+            after_return_generator = crate::pycode::after_return_generator_index(frame.code());
+            if after_return_generator == 0 {
+                return Ok(());
+            }
+            code = unsafe { &*pyframe_get_pycode(frame) };
         }
-        let code = unsafe { &*pyframe_get_pycode(self) };
         let mut pc = 0usize;
         while pc < after_return_generator {
             let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc)
@@ -7024,20 +7123,25 @@ impl PyFrame {
             };
             match instruction {
                 crate::bytecode::Instruction::MakeCell { .. } => {
-                    let _ = crate::pyopcode::execute_make_cell(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_make_cell(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::CopyFreeVars { .. } => {
-                    let _ = crate::pyopcode::execute_copy_free_vars(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_copy_free_vars(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::LoadFast { .. }
                 | crate::bytecode::Instruction::LoadFastBorrow { .. } => {
-                    let _ = crate::pyopcode::execute_load_fast(self, code, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_load_fast(frame, code, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::GetIter { .. } => {
-                    let _ = crate::pyopcode::execute_get_iter(self, instruction, op_arg)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_get_iter(frame, instruction, op_arg)?;
                 }
                 crate::bytecode::Instruction::GetAiter => {
-                    let _ = crate::pyopcode::execute_get_aiter(self)?;
+                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let _ = crate::pyopcode::execute_get_aiter(frame)?;
                 }
                 crate::bytecode::Instruction::ReturnGenerator => {
                     // CPython copies the frame after this opcode; do not
@@ -8282,6 +8386,18 @@ x = 7
         payload as pyre_object::gc_hook::GCREF
     }
 
+    /// `GcAllocCollectingRootedHookFn` fake: a headered nursery block that
+    /// never collects, so `root` stays as given and no barrier is needed.
+    unsafe fn headered_young_alloc_rooted(
+        type_id: u32,
+        payload_size: usize,
+        _root: *mut pyre_object::gc_hook::GCREF,
+        needs_write_barrier: *mut bool,
+    ) -> pyre_object::gc_hook::GCREF {
+        unsafe { *needs_write_barrier = false };
+        headered_young_alloc(type_id, payload_size)
+    }
+
     fn young_frame_alloc_is_owned(addr: usize) -> bool {
         YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow().contains(&addr))
     }
@@ -8290,6 +8406,7 @@ x = 7
     impl Drop for ClearYoungFrameHooks {
         fn drop(&mut self) {
             pyre_object::gc_hook::clear_gc_alloc_young_nonmoving_hook();
+            pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
             pyre_object::gc_hook::clear_gc_owns_object_hook();
             YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().clear());
         }
@@ -8339,6 +8456,7 @@ x = 7
                 .push(snapshot.locals_cells_stack_w as usize)
         });
         pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(headered_young_alloc);
+        pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(headered_young_alloc_rooted);
         pyre_object::gc_hook::register_gc_owns_object_hook(young_frame_alloc_is_owned);
         let boxed = super::FrameBox::new(snapshot).expect("frame allocation");
         assert!(

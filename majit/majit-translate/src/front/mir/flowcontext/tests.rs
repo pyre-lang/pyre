@@ -13764,11 +13764,11 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
             fd.item_meta
                 .source_text
                 .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+                .is_some_and(|text| text.starts_with("fn new_placed(mut frame: PyFrame"))
         })
-        .expect("FrameBox::new");
+        .expect("FrameBox::new_placed");
     crate::test_support::with_lowering(llbc, |context| {
-        let graph = super::lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = super::lower_fun_decl(context, fd).expect("lower FrameBox::new_placed");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
@@ -13779,7 +13779,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
                 )
             }),
-            "FrameBox::new still has core::ptr::write"
+            "FrameBox::new_placed still has core::ptr::write"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -13788,7 +13788,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     OpKind::FieldWrite { field, .. } if field.name == "ob_header"
                 )
             }),
-            "FrameBox::new must not store the inlined ob_header as one word"
+            "FrameBox::new_placed must not store the inlined ob_header as one word"
         );
         let header_leaves: Vec<_> = graph
             .blocks

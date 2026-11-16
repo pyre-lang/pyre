@@ -31,21 +31,18 @@
 //! only through the hand-written `pytraceback_object_custom_trace`
 //! hook, which forwards it as a mutable slot.
 //!
-//! The pointee must additionally never move.  That is not an upstream
-//! requirement and nothing in this file causes it: an executing frame
-//! is reached through a live Rust `&mut PyFrame` that spans every
-//! allocation the running opcode performs, and RPython's translator
-//! rewrites exactly those live references in their shadow-stack slots
-//! (`rpython/memory/gctransform/shadowstack.py`) where Rust has
-//! no equivalent pass.  `FrameBox::new` allocating non-moving stands
-//! in for that rewrite, and this file's conditional frame edge and
-//! `w_code` snapshot are downstream of it.
+//! The frame moves, matching `pyframe.py class PyFrame(W_Root)`.  An
+//! executing frame is reached through a live Rust `&mut PyFrame` that
+//! spans every allocation the running opcode performs; the opcode path
+//! reads it back through `crate::eval::FrameAnchor` (`shadowstack.py`
+//! `push_roots` / `pop_roots`).  This file's conditional frame edge and
+//! `w_code` snapshot are downstream of that rewrite.
 //!
-//! The rule holds for frames that reach here, not for every frame: a
-//! compiled trace's own inlined-callee frame is a nursery allocation,
-//! and making that uniform times `fib_recursive` out of its gate, so
-//! the crossing is guarded at the seams instead (see `gate-triage.md`).
-//! `record_application_traceback` is one of those seams.
+//! A compiled trace's own inlined-callee frame is a nursery allocation
+//! too, and making every frame old-gen times `fib_recursive` out of its
+//! gate, so the crossing is guarded at the seams instead (see
+//! `gate-triage.md`).  `record_application_traceback` is one of those
+//! seams.
 
 use pyre_object::pyobject::*;
 
@@ -160,11 +157,11 @@ pub fn w_pytraceback_new(
 ) -> PyObjectRef {
     // `frame` is pinned alongside the two managed fields, because the
     // allocation below can safepoint and a raw `*mut PyFrame` held only in
-    // this function's locals is reachable from no root walker.  Most frames
-    // are allocated non-moving (`FrameBox::new`).  A compiled trace's
-    // inlined-callee frame is a nursery object, so a minor triggered here
-    // would recycle an unrooted copy.  Upstream relocates that frame and
-    // rewrites the slot (`incminimark.py minor_collection`).
+    // this function's locals is reachable from no root walker.  Frames are
+    // nursery objects (`FrameBox::new`, and a compiled trace's inlined
+    // callee), so a minor triggered here would recycle an unrooted copy.
+    // Upstream relocates that frame and rewrites the slot
+    // (`incminimark.py minor_collection`).
     let roots = pyre_object::gc_roots::push_roots();
     let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 

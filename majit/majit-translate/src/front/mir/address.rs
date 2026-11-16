@@ -2533,6 +2533,13 @@ impl<'a> Lowering<'a> {
         let Some(ty) = self.mir_local_ty(local) else {
             return true;
         };
+        // A GC reference is kind `'ref'` (`history.py` `getkind` on
+        // `llmemory.GCREF`), never a raw scalar's address, so it cannot
+        // carry the spilled cell; `raw_scalar_spill_result_escapes` makes
+        // the same exemption.
+        if self.tyref_is_nullable_gcref(&ty) {
+            return false;
+        }
         if depth > 8 {
             return self.raw_scalar_spill_result_escapes(&ty);
         }

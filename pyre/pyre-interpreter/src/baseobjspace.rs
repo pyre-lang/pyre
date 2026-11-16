@@ -17729,6 +17729,7 @@ fn generator_unpack_into(
             // the frame rests on `POP_TOP` after the wrap-time prologue,
             // and that pop consumes the None.  Later resumes after
             // `YIELD_VALUE` use the same push so `x = yield` sees it.
+            let frame = &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
             w_generator_set_started(gen_obj());
             let result = generator_invoke_execute_frame(gen_obj(), frame, pyre_object::w_none());
             match result {
@@ -17736,6 +17737,12 @@ fn generator_unpack_into(
                 // finalized the frame for any escaping error.
                 Err(e) => return Err(e),
                 Ok(w_result) => {
+                    // The generator body can collect and move the frame, so the
+                    // frame is re-read from the pinned generator (`generator.py`
+                    // `unpack_into` `frame = self.frame`; `shadowstack.py`
+                    // `pop_roots`).
+                    let frame =
+                        &mut *(w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame);
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
@@ -24838,13 +24845,15 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
     // send GeneratorExit (or the error that close raised) into this frame.
     // Doing the delegate close here, not only inside JIT resume, keeps
     // `os.fwalk().close()` from depending on whether the portal compiled.
-    let err = if generator_get_delegate(gen_obj).is_null() {
-        PyError::new(PyErrorKind::GeneratorExit, String::new())
-    } else {
-        pyre_object::with_roots!(gen_obj => generator_close_iter(gen_obj))
-            .err()
-            .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
-    };
+    let err = pyre_object::with_roots!(gen_obj => {
+        if generator_get_delegate(gen_obj).is_null() {
+            PyError::new(PyErrorKind::GeneratorExit, String::new())
+        } else {
+            generator_close_iter(gen_obj)
+                .err()
+                .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
+        }
+    });
     let sent = pyre_object::with_roots!(gen_obj => {
         generator_send_error(gen_obj, err, None)
     });
@@ -25692,11 +25701,14 @@ pub fn generator_finalize(mut gen_obj: PyObjectRef) -> PyResult {
                 // generator.py `AsyncGenerator._finalize_`: the collector
                 // cleared the frame's weakref before `_finalize_`, so re-arm
                 // `frame.f_generator_wref = rweakref.ref(self)` before calling
-                // `w_finalizer`.  The pinned generator owns the non-moving
-                // frame across the WEAKREF allocation.
+                // `w_finalizer`.  The frame can move during the WEAKREF
+                // allocation, so it is re-read from the pinned generator
+                // (`shadowstack.py` `pop_roots` reload).
                 let wref = pyre_object::weakref::w_weakref_new(
                     pyre_object::gc_roots::shadow_stack_get(base),
                 );
+                let frame_ptr =
+                    w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(base));
                 (*(frame_ptr as *mut crate::pyframe::PyFrame)).f_generator_wref =
                     wref as PyObjectRef;
                 if pyre_object::gc_hook::try_gc_owns_object(
