@@ -1266,10 +1266,10 @@ impl UnionBuilder {
             _ => {
                 let mut hashable_args = pyre_object::w_frozenset_new();
                 unsafe {
-                    pyre_object::w_set_copy_storage_from(
+                    pyre_object::with_roots!(hashable_args => pyre_object::w_set_copy_storage_from(
                         hashable_args,
                         pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot),
-                    )
+                    ))
                 };
                 let unhashable_args = if self.unhashable_slots.is_empty() {
                     pyre_object::PY_NULL
