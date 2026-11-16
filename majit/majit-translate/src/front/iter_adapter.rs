@@ -41,14 +41,18 @@
 //! Opaque and one residual stub is shared across instantiations, so this
 //! pass rewrites at the call site — where `it` and `f` are concrete —
 //! instead of letting `mergeinputargs` union unrelated iterator items.
-//! `FilterMap::next` / `Iter::position` still stay residual.
+//! `Iterator::find` / `Iterator::position` are the same loop with an
+//! `Option` result (`Some(x)` / `Some(i)` or `None`). `FilterMap::next`
+//! still stays residual.
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::iter_next::{
     BackEdges, is_iter_op_segments, is_iterator_next_target, originates_from_iter_op,
     walk_back_to_source, walk_back_with,
 };
-use crate::front::option_variant::{close_goto_mixed, emit_narrow, reproduce_exit_args};
+use crate::front::option_variant::{
+    close_goto_mixed, emit_narrow, emit_option_variant, reproduce_exit_args,
+};
 use crate::front::result_exc::{back_substitute, op_operand_vars};
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
@@ -620,6 +624,50 @@ pub(crate) struct IteratorAnySite {
     /// Element kind recorded beside the synthesized `next` so
     /// `front::iter_next` can pick the list vs range answer.
     pub inner_item_ty: ValueType,
+}
+
+/// `Iterator::find` returns `Option<Item>`; `position` returns
+/// `Option<usize>` (`rpython/annotator/unaryop.py` `SomeIterator.next`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IteratorFindKind {
+    Find,
+    Position,
+}
+
+/// A recognized `Iterator::find(it, f)` / `position(it, f)` construction
+/// site. Dest is `Option`, not `bool` — do not reuse [`IteratorAnySite`].
+#[derive(Clone)]
+pub(crate) struct IteratorFindSite {
+    pub result_var: Variable,
+    pub kind: IteratorFindKind,
+    pub call_once_owner: String,
+    pub payload_ty: ValueType,
+    pub payload_class_root: Option<String>,
+    pub args_tuple_suffix: String,
+    pub inner_item_ty: ValueType,
+    pub option_owner: String,
+    pub some_owner: String,
+    pub dest_payload_ty: ValueType,
+    pub niche: bool,
+    pub niche_null_cast: Option<(String, ValueType)>,
+    pub payload_narrow_root: Option<String>,
+}
+
+/// Residual `Iterator::find` / `Iterator::position`. The capture site
+/// still proves the dest is `Option` and the predicate is a closure ADT;
+/// this only names the leaf.
+pub(crate) fn is_iterator_find_or_position_target(target: &CallTarget) -> Option<IteratorFindKind> {
+    let name = match target {
+        CallTarget::Method { name, .. } => name.as_str(),
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str)?,
+        CallTarget::Indirect { method_name, .. } => method_name.as_str(),
+        _ => return None,
+    };
+    match name {
+        "find" => Some(IteratorFindKind::Find),
+        "position" => Some(IteratorFindKind::Position),
+        _ => None,
+    }
 }
 
 /// `true` iff `path` names the `Map` adapter ADT
@@ -1527,6 +1575,324 @@ fn rewire_one_iterator_any_site(
         &name,
     )?;
     close_goto_mixed(graph, done_true, b_target, true_link_args);
+
+    let emit_id = graph.blocks[a].id;
+    close_goto_mixed(
+        graph,
+        emit_id,
+        header,
+        header_sources.into_iter().map(LinkArg::Value).collect(),
+    );
+    Ok(opt)
+}
+
+/// Rewrite every recorded `find(it, f)` / `position(it, f)` into
+/// `loop { next(it) -> None => None; Some(x) => if f(x) { Some(x|i) } else continue }`.
+/// Fail-safe: a structural mismatch leaves the residual (census Skip).
+pub(crate) fn rewire_iterator_find_sites(
+    graph: &mut FunctionGraph,
+    sites: &[IteratorFindSite],
+) -> Vec<(Variable, ValueType)> {
+    let mut next_results = Vec::new();
+    for site in sites {
+        if site.call_once_owner.is_empty() {
+            continue;
+        }
+        match rewire_one_iterator_find_site(graph, site) {
+            Ok(next_opt) => next_results.push((next_opt, site.inner_item_ty.clone())),
+            Err(decline) => {
+                crate::decline::record_reason(
+                    crate::decline::gate::ITER_ADAPTER,
+                    "iterator-find-site-declined",
+                    &decline,
+                    &graph.name,
+                );
+            }
+        }
+    }
+    next_results
+}
+
+fn emit_find_option_result(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    site: &IteratorFindSite,
+    payload: Option<Variable>,
+) -> Variable {
+    if site.niche {
+        match payload {
+            None => graph.push_niche_null(block, site.niche_null_cast.as_ref()),
+            Some(v) => emit_narrow(graph, block, v, &site.payload_narrow_root),
+        }
+    } else {
+        match payload {
+            None => emit_option_variant(graph, block, &site.option_owner, 0, None, None),
+            Some(v) => emit_option_variant(
+                graph,
+                block,
+                &site.option_owner,
+                1,
+                Some((&site.some_owner, v, site.dest_payload_ty.clone())),
+                None,
+            ),
+        }
+    }
+}
+
+fn rewire_one_iterator_find_site(
+    graph: &mut FunctionGraph,
+    site: &IteratorFindSite,
+) -> Result<Variable, String> {
+    let name = graph.name.clone();
+    let kind_label = match site.kind {
+        IteratorFindKind::Find => "Iterator::find",
+        IteratorFindKind::Position => "Iterator::position",
+    };
+    let a = graph
+        .blocks
+        .iter()
+        .position(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.result_var))
+        })
+        .ok_or_else(|| format!("{name}: {kind_label} result var has no producer block"))?;
+    let ci = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .ok_or_else(|| format!("{name}: {kind_label} call op not found in block {a}"))?;
+    if ci + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: {kind_label} call is not the last op of block {a}"
+        ));
+    }
+    let (inner, env) = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call { args, .. } if args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
+        other => {
+            return Err(format!(
+                "{name}: {kind_label} producer op is not a 2-arg call: {other:?}"
+            ));
+        }
+    };
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!(
+            "{name}: {kind_label} call block {a} does not have a single exit"
+        ));
+    };
+    if exit.exitcase.is_some() || exit.last_exception.is_some() || exit.last_exc_value.is_some() {
+        return Err(format!(
+            "{name}: {kind_label} call block {a} exit is not a plain goto"
+        ));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    if !inner_is_list_or_range(graph, &inner) {
+        return Err(format!(
+            "{name}: {kind_label} inner is neither a list iter nor an exclusive Range"
+        ));
+    }
+    if !var_in_block_scope(graph, a, &inner) || !var_in_block_scope(graph, a, &env) {
+        return Err(format!(
+            "{name}: {kind_label} operands are not in scope at the call"
+        ));
+    }
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != site.result_var
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+    for v in &carried {
+        if !var_in_block_scope(graph, a, v) {
+            return Err(format!(
+                "{name}: {kind_label} continuation value is not in scope at the call"
+            ));
+        }
+    }
+
+    graph.blocks[a].operations.remove(ci);
+
+    let is_position = matches!(site.kind, IteratorFindKind::Position);
+    let mut header_sources = vec![inner.clone(), env.clone()];
+    if is_position {
+        let zero = graph.alloc_value_var();
+        graph.blocks[a].operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        header_sources.push(zero);
+    }
+    for v in &carried {
+        if !header_sources.contains(v) {
+            header_sources.push(v.clone());
+        }
+    }
+    let (header, header_inputs) = graph.create_block_with_arg_vars(header_sources.len());
+    let it_h = header_inputs[0].clone();
+
+    let opt = graph.alloc_value_var();
+    graph.block_mut(header).operations.push(SpaceOperation {
+        result: Some(opt.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::method("next", None),
+            args: crate::model::call_args(vec![it_h]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+
+    let mut switch_sources = vec![opt.clone()];
+    switch_sources.extend(header_inputs.iter().cloned());
+    let (switch_bb, switch_inputs) = graph.create_block_with_arg_vars(switch_sources.len());
+    let opt_c = switch_inputs[0].clone();
+    close_goto_mixed(
+        graph,
+        header,
+        switch_bb,
+        switch_sources.iter().cloned().map(LinkArg::Value).collect(),
+    );
+
+    let mut done_sources = Vec::with_capacity(carried.len());
+    for v in &carried {
+        let idx = header_sources
+            .iter()
+            .position(|s| s == v)
+            .expect("carried find-call values are header sources");
+        done_sources.push(switch_inputs[1 + idx].clone());
+    }
+    let body_sources: Vec<Variable> = switch_inputs.clone();
+    let (body_bb, body_inputs) = graph.create_block_with_arg_vars(body_sources.len());
+    let (done_none, done_none_inputs) = graph.create_block_with_arg_vars(done_sources.len());
+    let (done_some, done_some_inputs) = graph.create_block_with_arg_vars(1 + carried.len());
+
+    let disc = graph.alloc_value_var();
+    graph.block_mut(switch_bb).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::FieldRead {
+            base: opt_c.clone(),
+            field: FieldDescriptor::new("__discriminant", None),
+            ty: ValueType::Int,
+            pure: true,
+        },
+    });
+    let none_link = Link::new_mixed(
+        done_sources.iter().cloned().map(LinkArg::Value).collect(),
+        done_none,
+        Some(ExitCase::Const(ConstValue::Int(0))),
+    )
+    .with_llexitcase_from_exitcase();
+    let some_link = Link::new_mixed(
+        body_sources.iter().cloned().map(LinkArg::Value).collect(),
+        body_bb,
+        Some(ExitCase::Const(ConstValue::Int(1))),
+    )
+    .with_llexitcase_from_exitcase();
+    graph.set_control_flow_metadata(
+        switch_bb,
+        Some(ExitSwitch::Value(disc)),
+        vec![none_link, some_link],
+    );
+
+    let opt_b = body_inputs[0].clone();
+    let it_b = body_inputs[1].clone();
+    let env_b = body_inputs[2].clone();
+    let payload = graph.alloc_value_var();
+    graph.block_mut(body_bb).operations.push(SpaceOperation {
+        result: Some(payload.clone()),
+        kind: OpKind::FieldRead {
+            base: opt_b,
+            field: FieldDescriptor::new("__pos_0", None),
+            ty: site.payload_ty.clone(),
+            pure: true,
+        },
+    });
+    let call_result = emit_call_mut(
+        graph,
+        body_bb,
+        env_b.clone(),
+        Some((
+            payload.clone(),
+            site.payload_ty.clone(),
+            site.payload_class_root.clone(),
+        )),
+        &site.call_once_owner,
+        ValueType::Bool,
+        &site.args_tuple_suffix,
+    );
+    let some_payload = if is_position {
+        body_inputs[3].clone()
+    } else {
+        payload
+    };
+    let mut true_args = vec![some_payload];
+    for v in &carried {
+        let idx = header_sources
+            .iter()
+            .position(|s| s == v)
+            .expect("carried find-call values are header sources");
+        true_args.push(body_inputs[1 + idx].clone());
+    }
+    let mut false_args = vec![it_b, env_b];
+    if is_position {
+        let counter = body_inputs[3].clone();
+        let one = graph.alloc_value_var();
+        graph.block_mut(body_bb).operations.push(SpaceOperation {
+            result: Some(one.clone()),
+            kind: OpKind::ConstInt(1),
+        });
+        let next_i = graph.alloc_value_var();
+        graph.block_mut(body_bb).operations.push(SpaceOperation {
+            result: Some(next_i.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: counter,
+                rhs: one,
+                result_ty: site.dest_payload_ty.clone(),
+            },
+        });
+        false_args.push(next_i);
+        false_args.extend(body_inputs.iter().skip(4).cloned());
+    } else {
+        false_args.extend(body_inputs.iter().skip(3).cloned());
+    }
+    graph.set_branch(
+        body_bb,
+        call_result,
+        done_some,
+        true_args,
+        header,
+        false_args,
+    );
+
+    let none_val = emit_find_option_result(graph, done_none, site, None);
+    let none_link_args = reproduce_exit_args(
+        &saved_exit,
+        &site.result_var,
+        &none_val,
+        &carried,
+        &done_none_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, done_none, b_target, none_link_args);
+
+    let some_val =
+        emit_find_option_result(graph, done_some, site, Some(done_some_inputs[0].clone()));
+    let some_carried_inputs = &done_some_inputs[1..];
+    let some_link_args = reproduce_exit_args(
+        &saved_exit,
+        &site.result_var,
+        &some_val,
+        &carried,
+        some_carried_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, done_some, b_target, some_link_args);
 
     let emit_id = graph.blocks[a].id;
     close_goto_mixed(
@@ -3621,6 +3987,153 @@ mod tests {
             count_calls(&g, is_iterator_any_target),
             1,
             "Iterator::any residual survives a decline"
+        );
+    }
+
+    fn iterator_find_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["slice", "iter", "Iter", "find"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    fn iterator_find_production_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: [
+                "slice",
+                "iter",
+                "Iter",
+                "<impl core::iter::traits::iterator::Iterator<core::slice::iter::Iter<v0>>>",
+                "find",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    fn iterator_find_site(result_var: Variable) -> IteratorFindSite {
+        IteratorFindSite {
+            result_var,
+            kind: IteratorFindKind::Find,
+            call_once_owner: "test::closure".into(),
+            payload_ty: ValueType::Int,
+            payload_class_root: None,
+            args_tuple_suffix: "<i64>".into(),
+            inner_item_ty: ValueType::Int,
+            option_owner: "core::option::Option".into(),
+            some_owner: "core::option::Option::Some".into(),
+            dest_payload_ty: ValueType::Int,
+            niche: false,
+            niche_null_cast: None,
+            payload_narrow_root: None,
+        }
+    }
+
+    fn build_iterator_find_two_blocks() -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_iterator_find");
+        let n = g.startblock;
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "some".to_string(),
+                            "container".to_string(),
+                            "make".to_string(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: iter_target(),
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let env = g.push_op_var(n, OpKind::ConstInt(7), true).unwrap();
+        let (a, a_args) = g.create_block_with_arg_vars(2);
+        let it_a = a_args[0].clone();
+        let env_a = a_args[1].clone();
+        let found = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: iterator_find_target(),
+                    args: crate::model::call_args(vec![it_a, env_a]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(n, a, vec![it.clone(), env.clone()]);
+        g.set_goto(a, b, vec![found.clone()]);
+        (g, found)
+    }
+
+    #[test]
+    fn iterator_find_path_is_recognised() {
+        assert_eq!(
+            is_iterator_find_or_position_target(&iterator_find_target()),
+            Some(IteratorFindKind::Find)
+        );
+        assert_eq!(
+            is_iterator_find_or_position_target(&iterator_find_production_target()),
+            Some(IteratorFindKind::Find)
+        );
+        assert_eq!(
+            is_iterator_find_or_position_target(&CallTarget::method("position", None)),
+            Some(IteratorFindKind::Position)
+        );
+        assert!(is_iterator_find_or_position_target(&iterator_any_target()).is_none());
+        assert!(!is_iterator_any_target(&iterator_find_target()));
+    }
+
+    #[test]
+    fn rewrite_lowers_iterator_find_to_next_call_mut() {
+        let (mut g, found) = build_iterator_find_two_blocks();
+        let nexts = rewire_iterator_find_sites(&mut g, &[iterator_find_site(found)]);
+        assert_eq!(nexts.len(), 1, "the find chain must fold");
+        assert_eq!(
+            count_calls(&g, |t| is_iterator_find_or_position_target(t).is_some()),
+            0,
+            "Iterator::find residual must be gone"
+        );
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_mut")
+            ),
+            1,
+            "the Some arm calls the closure through call_mut"
+        );
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "next")
+            ),
+            1,
+            "synthesized next on the inner iterator"
         );
     }
 }

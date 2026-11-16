@@ -419,9 +419,10 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `true` when `reg` is `core::slice::<Impl>::first` or `last`.
-    /// Those share `get`'s `T` generic, so this gates the
-    /// `slice_get_element` walk.
+    /// `true` when `reg` is `core::slice::<Impl>::first`, `last`, or
+    /// `last_mut`. Those share `get`'s `T` generic, so this gates the
+    /// `slice_get_element` walk. `last_mut` is `last` with a mutable
+    /// borrow; for a GC-ref element `ArrayRead` yields the pointer.
     pub(in crate::front::mir) fn is_slice_first_or_last_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -429,7 +430,9 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path_str(),
-                "core::slice::<Impl>::first" | "core::slice::<Impl>::last"
+                "core::slice::<Impl>::first"
+                    | "core::slice::<Impl>::last"
+                    | "core::slice::<Impl>::last_mut"
             )
         })
     }

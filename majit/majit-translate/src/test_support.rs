@@ -241,13 +241,34 @@ pub(crate) fn lower_function_with_static_addrs(
 ) -> Result<FunctionGraph, LowerError> {
     if let Some(shared) = as_production_llbc(llbc) {
         with_shared_lowering(shared, |ctx| {
-            let fd = shared
-                .local_fn(function_name)
+            let fd = crate::front::llbc_hints::fun_decl_for_name(shared, function_name)
                 .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
             lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
         })
     } else {
         crate::front::mir::lower_function_with_static_addrs(llbc, function_name, static_addrs)
+    }
+}
+
+/// Lower the FunDecl at `fun_decl_id`. Charon's `name_path()` is
+/// `{module}::<Impl>::{leaf}` for every inherent impl in a module, so
+/// [`lower_function_with_static_addrs`] via `local_fn` binds the first
+/// match (`InternalSpaceCache::getorbuild` vs `SpaceCache::getorbuild`).
+pub(crate) fn lower_fun_decl_id_with_static_addrs(
+    llbc: &Llbc,
+    fun_decl_id: u64,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<FunctionGraph, LowerError> {
+    let missing = || LowerError::FunctionNotFound(format!("def_id {fun_decl_id}"));
+    if let Some(shared) = as_production_llbc(llbc) {
+        with_shared_lowering(shared, |ctx| {
+            let fd = shared.fn_by_id(fun_decl_id).ok_or_else(missing)?;
+            lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
+        })
+    } else {
+        let fd = llbc.fn_by_id(fun_decl_id).ok_or_else(missing)?;
+        let context = LowerContext::new(llbc);
+        lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
     }
 }
 

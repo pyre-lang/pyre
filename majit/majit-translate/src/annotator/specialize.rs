@@ -1653,6 +1653,22 @@ mod tests {
         assert!(err.to_string().contains("must be a class or a frozen PBC"));
     }
 
+    #[test]
+    fn all_values_someinstance_errors() {
+        // Isolated `ObjSpace::new()` is a non-constant SomeInstance;
+        // `all_values` refuses it the same way as any non-PBC argument.
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeInstance;
+        let cdef = Some(ClassDef::new_standalone("isolated.ObjSpace", None));
+        let s = SomeValue::Instance(SomeInstance::new(
+            cdef,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let err = all_values(&s).unwrap_err();
+        assert!(err.to_string().contains("must be a class or a frozen PBC"));
+    }
+
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::classdesc::ClassDictEntry;
     use crate::flowspace::model::{BlockRef, Hlvalue, LinkRef};

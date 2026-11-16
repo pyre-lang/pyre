@@ -171,8 +171,7 @@ pub fn lower_function_with_static_addrs(
     function_name: &str,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
-    let fd = llbc
-        .local_fn(function_name)
+    let fd = crate::front::llbc_hints::fun_decl_for_name(llbc, function_name)
         .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
     let context = LowerContext::new(llbc);
     lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
@@ -529,6 +528,7 @@ pub(crate) fn absorb_semantic_program(
             }
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
+            acc.freeze_classes.extend(prog.freeze_classes);
             for hint in prog.exception_class_hints {
                 crate::front::llbc_hints::push_program_exception_class_hint(
                     &mut acc.exception_class_hints,
@@ -743,6 +743,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
+            freeze_classes: std::collections::HashSet::new(),
             raw_alloc_flavor_structs: std::collections::HashSet::new(),
             exception_class_hints: Vec::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
@@ -3941,7 +3942,10 @@ impl<'l> CrateLowering<'l> {
         // every call, so hold the one projection this build needs: it is
         // both the "has a lowerable body" gate and the input the lowering
         // below reads.
-        let Some(mut body) = fd.unstructured() else {
+        let Some(mut body) =
+            maybe_oparg_arg_get_identity_body(llbc, fd, &fd.signature.inputs, &fd.signature.output)
+                .or_else(|| fd.unstructured())
+        else {
             return Err(DeclBuildError::NoBody);
         };
         clear_unreachable_blocks(llbc, &mut body);
@@ -4046,13 +4050,29 @@ impl<'l> CrateLowering<'l> {
         } = self.state;
         let llbc = self.llbc;
         let fd = llbc.fn_by_id(req.fn_id)?;
-        let mut body = crate::front::clause_spec::substituted_unstructured(
-            fd,
+        let signature = crate::front::clause_spec::substituted_signature(
+            &fd.signature,
             llbc,
-            &req.trait_refs,
             &req.types,
             &req.const_generics,
         );
+        // `Arg::<T>::get` is the identity of its `OpArg` argument
+        // (`oparg_arg_get_alias` at call sites). The spec copy still
+        // lands in the GraphStore because `enqueue_spec` runs before
+        // the alias, so the FunDecl body itself is that identity
+        // (`instruction.rs` `Arg::get`; `identity_unstructured` of
+        // input 1). Fieldless-enum T keeps the original body.
+        let mut body =
+            maybe_oparg_arg_get_identity_body(llbc, fd, &signature.inputs, &signature.output)
+                .or_else(|| {
+                    crate::front::clause_spec::substituted_unstructured(
+                        fd,
+                        llbc,
+                        &req.trait_refs,
+                        &req.types,
+                        &req.const_generics,
+                    )
+                });
         if body.is_none() && fun_decl_is_reflexive_from(llbc, fd) {
             // `impl<T> From<T> for T` is `fn from(t: T) -> T { t }`.
             // core extracts as Opaque; `FunctionDesc.getuniquegraph`
@@ -4077,12 +4097,6 @@ impl<'l> CrateLowering<'l> {
         clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
-        let signature = crate::front::clause_spec::substituted_signature(
-            &fd.signature,
-            llbc,
-            &req.types,
-            &req.const_generics,
-        );
         let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
@@ -4355,6 +4369,7 @@ impl CrateLoweringState {
             // (the `attributes` array carries DocComment / Outer but not our
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
+            freeze_classes: std::collections::HashSet::new(),
             raw_alloc_flavor_structs: self.raw_alloc_flavor_structs.clone(),
             exception_class_hints: self.exception_class_hints.clone(),
             enum_variant_by_discriminant,
@@ -4572,6 +4587,7 @@ pub(crate) struct SemanticFunctionHeader {
     name: String,
     return_type: Option<String>,
     residual_return_type: Option<String>,
+    return_is_result: bool,
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
@@ -4711,6 +4727,13 @@ impl SemanticFunctionHeader {
             raw_alloc_flavor_structs,
         );
         let residual_return_type = signature_token.clone();
+        let return_is_result = crate::front::result_exc::tyref_is_result(&signature.output, llbc)
+            && crate::front::result_exc::result_exc_projected_ok(
+                &signature.output,
+                llbc,
+                error_carrier,
+            )
+            .is_none();
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
         let return_container_root = dont_look_inside_return_container_root(
             &signature.output,
@@ -4782,6 +4805,7 @@ impl SemanticFunctionHeader {
             name,
             return_type,
             residual_return_type,
+            return_is_result,
             return_class_root,
             return_is_str,
             return_container_root,
@@ -4842,6 +4866,7 @@ impl SemanticFunctionHeader {
             hints: self.hints.clone(),
             return_type: self.return_type.clone(),
             residual_return_type: self.residual_return_type.clone(),
+            return_is_result: self.return_is_result,
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
             return_container_root: self.return_container_root.clone(),
@@ -4928,6 +4953,7 @@ pub(crate) struct GraphStamp {
     /// carry it so `declared_result_type_for_*` can read Void for `()`.
     return_type: Option<String>,
     residual_return_type: Option<String>,
+    return_is_result: bool,
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
@@ -4951,6 +4977,7 @@ impl GraphStamp {
             graph.return_type = Some(rt.clone());
         }
         graph.residual_return_type = self.residual_return_type.clone();
+        graph.return_is_result = self.return_is_result;
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
         graph.return_container_root = self.return_container_root.clone();
@@ -8913,6 +8940,11 @@ pub struct LowerContext<'a> {
     /// (`GraphAnalyzer._analyzed_calls`). `Mutex` keeps this context `Sync`
     /// for the `OnceLock` test share.
     gc_root_effects: gc_root_registration::EffectMemo,
+    /// Enum `discriminant → variant` tables from this artefact
+    /// (`derive_program_metadata`). Dual-gate tests seed the bookkeeper
+    /// with the same map production `CallControl` carries.
+    enum_variant_by_discriminant:
+        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
 }
 
 impl<'a> LowerContext<'a> {
@@ -8946,13 +8978,14 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
-            llbc,
-            &gc_struct_ids,
-            &immutable_fields,
-            &raw_alloc_flavor_structs,
-            llbc_exception_class_hints(llbc),
-        );
+        let (_, _, struct_fields, enum_variant_by_discriminant, _, struct_field_attrs, _, _) =
+            derive_program_metadata(
+                llbc,
+                &gc_struct_ids,
+                &immutable_fields,
+                &raw_alloc_flavor_structs,
+                llbc_exception_class_hints(llbc),
+            );
         Self {
             llbc,
             struct_field_attrs,
@@ -8966,6 +8999,7 @@ impl<'a> LowerContext<'a> {
             raw_alloc_flavor_structs,
             immutable_fields,
             gc_root_effects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            enum_variant_by_discriminant,
         }
     }
 
@@ -8995,6 +9029,30 @@ impl<'a> LowerContext<'a> {
         let mut registry = struct_field_registry_from_rows(&self.struct_fields);
         registry.gc_struct_ids = self.gc_struct_ids.clone();
         registry
+    }
+
+    /// `FORCE_ATTRIBUTES_INTO_CLASSES` from this artefact's field tables
+    /// (`classdesc.py`, `analyze_pipeline` Tier-3). Dual-gate tests that
+    /// look inside a lowered body need the same seed as the production
+    /// annotator so `getattr` of a struct field is not blocked.
+    pub fn seed_force_attributes(&self) {
+        let mut entries: Vec<_> = self.struct_field_attrs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (qualified, fields) in entries {
+            let layout_pairs = self.struct_fields.get(qualified).cloned();
+            crate::annotator::classdesc::register_struct_fields_with_layout(
+                qualified,
+                fields,
+                layout_pairs.as_deref(),
+            );
+        }
+    }
+
+    /// Harvested enum `discriminant → variant` table for this artefact.
+    pub fn enum_variant_by_discriminant(
+        &self,
+    ) -> &std::collections::HashMap<String, std::collections::HashMap<i64, String>> {
+        &self.enum_variant_by_discriminant
     }
 }
 
@@ -9142,12 +9200,15 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     gc_root_effects: &gc_root_registration::EffectMemo,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<FunctionGraph, LowerError> {
-    let mut u = fd.unstructured().ok_or_else(|| {
-        LowerError::Unsupported(format!(
-            "{}: no Unstructured body (extracted with --ullbc?)",
-            fd.item_meta.name_path_str()
-        ))
-    })?;
+    let mut u =
+        maybe_oparg_arg_get_identity_body(llbc, fd, &fd.signature.inputs, &fd.signature.output)
+            .or_else(|| fd.unstructured())
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "{}: no Unstructured body (extracted with --ullbc?)",
+                    fd.item_meta.name_path_str()
+                ))
+            })?;
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
     elaborate_vec_drops(llbc, &mut u);
     let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
@@ -9377,11 +9438,12 @@ pub(crate) use self::lltype::{
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
     fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
-    host_rthread_threadlocalref_llop, impl_method_owner_for_fundecl, impl_owner_from_item_meta,
-    is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
-    is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
-    is_rstr_str_family_spelling, is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling,
-    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    harvest_freeze_classes_from_llbcs, host_rthread_threadlocalref_llop,
+    impl_method_owner_for_fundecl, impl_owner_from_item_meta, is_cow_str_family_class_root,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
+    is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
@@ -9789,6 +9851,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             Vec::new()
         };
+        let iterator_find_synthesized = if !lo.iterator_find_sites.is_empty() {
+            crate::front::iter_adapter::rewire_iterator_find_sites(
+                &mut lo.graph,
+                &lo.iterator_find_sites,
+            )
+        } else {
+            Vec::new()
+        };
         let residual_slice_iter_next =
             crate::front::iter_next::graph_has_residual_slice_iter_next(&lo.graph);
         if !lo.result_exc_call_results.is_empty()
@@ -9827,6 +9897,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         lo.next_call_results.extend(map_collect_synthesized);
         lo.next_call_results.extend(iterator_any_synthesized);
+        lo.next_call_results.extend(iterator_find_synthesized);
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangefrom_sites(

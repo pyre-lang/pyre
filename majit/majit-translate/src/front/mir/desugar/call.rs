@@ -8685,6 +8685,68 @@ impl<'a> Lowering<'a> {
                     });
             }
         }
+        // Capture `Iterator::find(it, f)` / `position(it, f)` at the
+        // construction site. Dest is `Option`, not `bool`. A miss —
+        // dest that is not Option, or env that is not a closure ADT —
+        // leaves the residual.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let Some(find_kind) =
+                crate::front::iter_adapter::is_iterator_find_or_position_target(target)
+            && let Some((option_owner, some_owner, dest_payload_ty)) =
+                self.resolve_option_consumer_owners(&call.dest.ty)
+            && let Some(recv_ty) = first_arg_ty.as_ref()
+            && let Some(pred_ty) = second_arg_ty.as_ref()
+            && let Some(env_def_id) = self
+                .tyref_adt_def_id(pred_ty)
+                .or_else(|| self.tyref_ref_adt_def_id(pred_ty))
+            && let Some(env_td) = self.llbc.type_by_id(env_def_id)
+            && type_decl_is_closure_env(env_td)
+        {
+            let call_once_owner = closure_env_call_once_owner(env_td);
+            if !call_once_owner.is_empty() {
+                let iter_ty = match self.tyref_peel_ref_to_pointee(recv_ty) {
+                    Some(ty) => ty,
+                    None => recv_ty.clone(),
+                };
+                let item_tyref = self
+                    .tyref_adt_type_arg(&iter_ty, 0)
+                    .unwrap_or_else(|| clone_tyref(&iter_ty));
+                let payload_ty = tyref_to_value_type_with(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                let payload_class_root = enum_payload_instance_class_root(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                );
+                let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
+                let niche = self.tyref_is_niche_option_ptr(&call.dest.ty);
+                let payload_narrow_root = niche
+                    .then(|| self.option_niche_payload_class_root(&call.dest.ty))
+                    .flatten();
+                self.iterator_find_sites
+                    .push(crate::front::iter_adapter::IteratorFindSite {
+                        result_var: result_var.clone(),
+                        kind: find_kind,
+                        call_once_owner,
+                        payload_ty: payload_ty.clone(),
+                        payload_class_root,
+                        args_tuple_suffix,
+                        inner_item_ty: payload_ty,
+                        option_owner,
+                        some_owner,
+                        dest_payload_ty,
+                        niche,
+                        niche_null_cast: self.option_niche_null_cast(&call.dest.ty),
+                        payload_narrow_root,
+                    });
+            }
+        }
         // Transparent std wrappers (`Cell::{new,get}`, `Atomic*::new`,
         // `Box::as_ref`, `Ref`/`MutexGuard` deref) are operations, not
         // residual calls.  Rewrite the Call before the capture gates
@@ -9092,6 +9154,27 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "last"])
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            site.access = crate::front::slice_first::SliceAccess::Last;
+            self.annotate_slice_first_site(
+                &mut site,
+                &arg_locals,
+                first_arg_ty.as_ref(),
+                slice_first_element.clone(),
+            );
+            site.object_array_type_id = slice_object_array_type_id.clone();
+            self.slice_first_sites.push(site);
+        }
+        // `<[T]>::last_mut(slice)` is `last` for a GC-ref element: the
+        // `ArrayRead` yields the pointer, and field writes go through it.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "last_mut"])
             && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
             site.access = crate::front::slice_first::SliceAccess::Last;

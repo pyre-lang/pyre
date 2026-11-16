@@ -244,6 +244,7 @@ fn build_semantic_program_via_active_frontend(
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
+            let mut freeze_classes = std::collections::HashSet::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
@@ -370,6 +371,9 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                freeze_classes.extend(front::mir::harvest_freeze_classes_from_llbcs(
+                    std::slice::from_ref(&llbc),
+                ));
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -494,6 +498,7 @@ fn build_semantic_program_via_active_frontend(
                 known_trait_names: std::collections::HashSet::new(),
                 struct_fields: front::semantic::StructFieldRegistry::default(),
                 immutable_fields: std::collections::HashMap::new(),
+                freeze_classes: std::collections::HashSet::new(),
                 raw_alloc_flavor_structs: std::collections::HashSet::new(),
                 exception_class_hints: Vec::new(),
                 enum_variant_by_discriminant: std::collections::HashMap::new(),
@@ -515,6 +520,7 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.freeze_classes = freeze_classes;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
@@ -767,6 +773,14 @@ pub struct HostStaticAddrs<'a> {
     /// Empty (the `Default`) declares none, which leaves every call to be
     /// lowered by descending into its callee as usual.
     pub scalar_field_stores: &'a [ScalarFieldStore<'a>],
+    /// Driver-supplied `specialize:memo` evaluator (`specialize.py memo`
+    /// `func(*args)`). `majit-translate` does not import the interpreter;
+    /// `pyre-jit-trace` prepass fills this from the live host.
+    pub memo_host_call: Option<&'a crate::flowspace::model::HostCall>,
+    /// Live pointer of a freeze nested field, `(parent, attr, child)`
+    /// (`description.py` `FrozenDesc` `getattr(pyobj, attr)`). Empty
+    /// (the `Default`) intern no nested field eagerly.
+    pub ptr_fields: &'a [(i64, &'a str, i64)],
 }
 
 /// Multi-file analysis with explicit per-source module paths.
@@ -1031,7 +1045,12 @@ fn apply_harvested_funcobj_hints(
 ) {
     use crate::codewriter::call::DecoratorAttr;
     for (path_str, hints) in harvested_hints {
-        if hints.iter().all(|h| DecoratorAttr::from_hint(h).is_none()) {
+        // `specialize:memo` is annotator policy (`func._annspecialcase_`),
+        // not a JIT `DecoratorAttr`. Body-less funcobjs still need
+        // `GraphFunc.annspecialcase` (`Bookkeeper.newfuncdesc`).
+        let has_decorator = hints.iter().any(|h| DecoratorAttr::from_hint(h).is_some());
+        let has_memo = hints.iter().any(|h| h == "specialize:memo");
+        if !has_decorator && !has_memo {
             continue;
         }
         let segs: Vec<&str> = path_str.split("::").collect();
@@ -1063,7 +1082,12 @@ fn apply_harvested_funcobj_hints(
             )
         };
         for p in &paths {
-            call_control.mark_decorator_hints(p, hints);
+            if has_decorator {
+                call_control.mark_decorator_hints(p, hints);
+            }
+            if has_memo {
+                call_control.mark_specialize_memo(p);
+            }
         }
     }
 }
@@ -1967,6 +1991,16 @@ fn analyze_pipeline_from_module_paths(
             .map(|path| crate::parse::CallPath::from_segments(path.split("::")))
             .collect(),
     );
+    if let Some(hook) = static_addrs.memo_host_call {
+        call_control.set_memo_host_call(Some(hook.clone()));
+    }
+    call_control.set_prebuilt_ptr_fields(
+        static_addrs
+            .ptr_fields
+            .iter()
+            .map(|(parent, field, child)| (*parent, (*field).to_string(), *child))
+            .collect(),
+    );
     call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
@@ -2009,6 +2043,7 @@ fn analyze_pipeline_from_module_paths(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
+    call_control.freeze_classes = program.freeze_classes.clone();
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
@@ -6313,6 +6348,70 @@ mod harvested_funcobj_hints_tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
+    }
+
+    /// `#[specialize_memo]` on `Cache::getorbuild` harvests as
+    /// `specialize:memo` (`cache.py` `Cache.getorbuild._annspecialcase_`).
+    #[test]
+    fn harvested_cache_getorbuild_is_specialize_memo() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/llbc/majit-rlib.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = crate::test_support::load_ullbc(path);
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+        let hits: Vec<_> = harvested
+            .iter()
+            .filter(|(key, hints)| {
+                key.contains("getorbuild") && hints.iter().any(|hint| hint == "specialize:memo")
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "Cache::getorbuild specialize:memo missing; getorbuild keys: {:?}",
+            harvested
+                .keys()
+                .filter(|key| key.contains("getorbuild"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Body-less `specialize:memo` is annotator policy
+    /// (`func._annspecialcase_`), not a JIT `DecoratorAttr`. Harvest still
+    /// stamps the token so `source_graph_func` copies it onto
+    /// `GraphFunc.annspecialcase` (`Bookkeeper.newfuncdesc`).
+    #[test]
+    fn harvested_specialize_memo_stamps_without_decorator_attr() {
+        use crate::codewriter::call::DecoratorAttr;
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let path = CallPath::from_segments(["cache", "Cache", "getorbuild"]);
+            cc.register_function_graph(path.clone(), FunctionGraph::new("getorbuild"));
+            let mut harvested = std::collections::HashMap::new();
+            harvested.insert(
+                "cache::Cache::getorbuild".to_string(),
+                vec!["specialize:memo".to_string()],
+            );
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+            let graph = cc
+                .function_graphs()
+                .get(&path)
+                .expect("registered getorbuild graph");
+            assert!(
+                graph.hints.iter().any(|h| h == "specialize:memo"),
+                "harvested specialize:memo must land on the registered graph: {:?}",
+                graph.hints
+            );
+            assert!(
+                DecoratorAttr::from_hint("specialize:memo").is_none(),
+                "specialize:memo is not a JIT DecoratorAttr"
+            );
+        });
     }
 
     /// The same fallback still stamps `oopspec` that the previous skip

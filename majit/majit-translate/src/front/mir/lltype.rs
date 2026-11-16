@@ -124,6 +124,36 @@ pub(crate) fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option
     Some((owner_qualified, leaf))
 }
 
+/// Classes whose inherent `_freeze_` returns True
+/// (`bookkeeper.py` `immutablevalue` `hasattr(x, '_freeze_')`).
+///
+/// The owner is [`impl_method_owner_for_fundecl`] of each FunDecl whose
+/// impl leaf is `_freeze_` (`Cache._freeze_`, `ObjSpace._freeze_`,
+/// `InternalSpaceCache._freeze_`). Both the crate-stripped owner path
+/// and its leaf are inserted so intern-key lookup matches either
+/// spelling (`lookup_immutable_fields_entries`).
+pub(crate) fn harvest_freeze_classes_from_llbcs<L: std::borrow::Borrow<Llbc>>(
+    llbcs: &[L],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for llbc in llbcs {
+        let llbc = llbc.borrow();
+        for fd in llbc.iter_local_fns() {
+            let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+                continue;
+            };
+            if leaf != "_freeze_" || owner.is_empty() {
+                continue;
+            }
+            if let Some((_, ty_leaf)) = owner.rsplit_once("::") {
+                out.insert(ty_leaf.to_string());
+            }
+            out.insert(owner);
+        }
+    }
+    out
+}
+
 /// The call path of a provided trait method (`src: {"TraitDefault": ..}`)
 /// called at a concrete `Self`: `[owner(Self), leaf]`, qualified like an
 /// impl owner.  The default body is generic over `Self`, so the call site's
@@ -9251,12 +9281,49 @@ pub(in crate::front::mir) fn tyref_is_std_cell(ty: &TyRef, llbc: &Llbc) -> bool 
 /// (PhantomData<T>)`, instruction.rs).  The external decl is
 /// Opaque in the LLBC, so a payload row spelled through it would
 /// project to an attr the annotator cannot type; the lifted model
-/// carries the marker as a plain integer instead.  Its consumer
-/// `Arg::get` keeps its ordinary (residual) call lowering — the ZST
-/// marker is never dereferenced.
+/// carries the marker as a plain integer instead.  `Arg::get` is the
+/// identity of its `OpArg` argument (`oparg_arg_get_alias` at call
+/// sites; [`maybe_oparg_arg_get_identity_body`] of the FunDecl).
 pub(in crate::front::mir) fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
+}
+
+/// `Arg::<T>::get(self, arg: OpArg) -> T` (`instruction.rs`).
+///
+/// The same structural test as `oparg_arg_get_alias`: the leaf is
+/// `get` and `inputs[1]` is `oparg::OpArg`. No other `.get` (slice /
+/// `Vec` / map) takes an `OpArg`. `try_get` shares the inputs and
+/// keeps its `Result` body.
+pub(in crate::front::mir) fn fun_decl_is_oparg_arg_get(llbc: &Llbc, fd: &FunDecl) -> bool {
+    if fd.item_meta.name_path_str().rsplit("::").next() != Some("get") {
+        return false;
+    }
+    let inputs = &fd.signature.inputs;
+    if inputs.len() != 2 {
+        return false;
+    }
+    tyref_is_bytecode_arg_marker(&inputs[0], llbc)
+        && adt_path_of_tyref(&inputs[1], llbc).is_some_and(|p| p.ends_with("oparg::OpArg"))
+}
+
+/// Identity Unstructured of `Arg::get`: copy the `OpArg` argument onto
+/// the return local. `None` when T is a fieldless enum — those keep the
+/// `Ref` enum shape so a downstream `Discriminant` still reads a tag
+/// (`oparg_arg_get_alias`).
+pub(in crate::front::mir) fn maybe_oparg_arg_get_identity_body(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    inputs: &[TyRef],
+    output: &TyRef,
+) -> Option<Unstructured> {
+    if !fun_decl_is_oparg_arg_get(llbc, fd) {
+        return None;
+    }
+    if tyref_is_fieldless_enum_free(output, llbc) {
+        return None;
+    }
+    crate::front::clause_spec::identity_unstructured_copying_input(1, inputs, output)
 }
 
 /// An instance of a class with no fields is still an instance.

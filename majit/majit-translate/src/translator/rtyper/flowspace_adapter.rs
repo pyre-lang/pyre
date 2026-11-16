@@ -68,7 +68,7 @@ use crate::flowspace::model::{
     FunctionGraph as FlowspaceGraph, HOST_ENV, Hlvalue, HostObject, Link as FlowspaceLink,
     SpaceOperation as FlowspaceOp, Variable, c_last_exception,
 };
-use crate::front::slice_index::vec_inherent_index_segments;
+use crate::front::slice_index::{vec_inherent_index_mut_segments, vec_inherent_index_segments};
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::llannotation::{ann_malloc_result_annotation, lltype_to_annotation};
@@ -664,7 +664,7 @@ pub fn build_value_to_hlvalue_map(
 /// `llmemory.Address` is int-kinded.  `cast_int_to_ptr` is not usable
 /// here — it asserts odd (tagged) integers (lltype.py) and
 /// host addresses are even — so the `_ptr` is built directly.
-fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
+pub(crate) fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GCREF, LowLevelType};
     let LowLevelType::Ptr(gcref_t) = GCREF.clone() else {
         panic!("GCREF must be a Ptr lowleveltype");
@@ -1977,7 +1977,9 @@ fn vec_truncate_delslice(
 // `CallTarget::FunctionPath` (`front::mir::impl_method_owner` returns
 // `None`). Every `Index<I>` shares this path; a Range index is rewritten
 // by `front::slice_index` into `__getslice_*` markers before it reaches
-// here. This arm is `lst[i]`. The callee-spelling predicate lives in
+// here. Residual `index_mut` that survived the write-lift is the same
+// `lst[i]` read (`vec_inherent_index_mut_segments`). This arm is `lst[i]`.
+// The callee-spelling predicate lives in
 // `front::slice_index::vec_inherent_index_segments`.
 
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
@@ -2101,15 +2103,20 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             ..
         } if is_vec_truncate_segments(segments) || is_delslice_range_marker(segments) => false,
-        // `Vec::index` lowers (in `translate_op`) to `getitem`, whose
-        // `canraise` is `[IndexError, KeyError, Exception]` (`operation.py`).
-        // `RustVecRepr.rtype_getitem` then `exception_cannot_occur`.
-        // Matched before the general `Call` arm.
+        // `Vec::index` / residual `Vec::index_mut` lower (in `translate_op`)
+        // to `getitem`, whose `canraise` is `[IndexError, KeyError, Exception]`
+        // (`operation.py`). `RustVecRepr.rtype_getitem` then
+        // `exception_cannot_occur`. Matched before the general `Call` arm.
         OpKind::Call {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if args.len() == 2 && vec_inherent_index_segments(segments) => true,
+        } if args.len() == 2
+            && (vec_inherent_index_segments(segments)
+                || vec_inherent_index_mut_segments(segments)) =>
+        {
+            true
+        }
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -3045,7 +3052,7 @@ fn function_path_high_level_kind<'a>(
     if is_delslice_range_marker(segments) && nargs == 3 {
         return Some(FunctionPathHighLevel::DelsliceRange);
     }
-    if vec_inherent_index_segments(segments) {
+    if vec_inherent_index_segments(segments) || vec_inherent_index_mut_segments(segments) {
         return Some(FunctionPathHighLevel::VecIndex);
     }
     if is_vec_extend_from_slice_segments(segments) {
@@ -3502,7 +3509,7 @@ fn emit_function_path_high_level_op(
         FunctionPathHighLevel::VecIndex => {
             if arg_hls.len() != 2 {
                 return Err(TyperError::message(format!(
-                    "Vec::index requires exactly two args (receiver, index), got {}",
+                    "Vec::index / index_mut require exactly two args (receiver, index), got {}",
                     arg_hls.len()
                 )));
             }
@@ -6573,6 +6580,17 @@ pub(crate) fn derive_subject_inputcells(
                                 ))
                             })?,
                         };
+                        // A leftover MixLevel helper of a freeze-class
+                        // method (`annlowlevel.py` `MixLevelHelperAnnotator`)
+                        // still takes a declared seed. When the class has
+                        // exactly one interned prebuilt (`bookkeeper.py`
+                        // `descs` / `immutablevalue` `_freeze_`), that PBC
+                        // is the seed so `specialize.py` `all_values` sees
+                        // a frozen PBC rather than a generic SomeInstance.
+                        if let Ok(Some(s)) = bk.unique_interned_prebuilt(&cd) {
+                            cells.push(s);
+                            continue;
+                        }
                         cells.push(crate::annotator::model::SomeValue::Instance(
                             crate::annotator::model::SomeInstance::new(
                                 Some(cd),

@@ -29,8 +29,8 @@ use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::argument::{ArgumentsForTranslation, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
@@ -49,7 +49,10 @@ use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
-use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
+use crate::flowspace::model::{
+    BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostGetAttrError, HostObject,
+    NativeInstanceDict,
+};
 use crate::model::IndirectFamilyKey;
 use crate::tool::algo::unionfind::UnionFind;
 
@@ -573,6 +576,19 @@ pub struct Bookkeeper {
     /// `classdesc.py ClassDesc.__init__` reads `cls.__dict__['_immutable_fields_']`;
     /// intern stamps that list onto matching hosts.
     immutable_fields_structs: RefCell<HashMap<String, Vec<(String, crate::model::ImmutableRank)>>>,
+    /// Classes whose inherent `_freeze_` returns True
+    /// (`bookkeeper.py` `immutablevalue` `hasattr(x, '_freeze_')`).
+    freeze_classes: RefCell<HashSet<String>>,
+    /// Prebuilt instances interned by live address and class intern key
+    /// (`bookkeeper.py` `descs` keyed by `Constant(pyobj)`). The parent
+    /// is inserted before nested fields so a self-typed pointer
+    /// terminates (`description.py` `FrozenDesc`).
+    interned_prebuilts: RefCell<IndexMap<(i64, String), HostObject>>,
+    /// Live pointer of a freeze field, keyed by parent address and
+    /// field name (`description.py` `FrozenDesc` `getattr(pyobj, attr)`).
+    /// Intern walks only these real child addresses; a missing note
+    /// leaves the field to `s_read_attribute` on demand.
+    prebuilt_ptr_fields: RefCell<IndexMap<(i64, String), i64>>,
     /// Hierarchies minted from `_exception_class_<Enum>`. A `Vec`: a
     /// program declares a handful, and lookup walks it. Lives on the
     /// bookkeeper next to `exception_carrier`.
@@ -1564,7 +1580,7 @@ fn is_string_spelling(spelling: &str) -> bool {
 
 /// One pointer word: `&T` / `&mut T` / `*const T` / `*mut T` / `Box<T>` /
 /// `NonNull<T>`, plus `Option` of one of those (the null niche).
-fn peel_one_pointer(spelling: &str) -> Option<String> {
+pub(crate) fn peel_one_pointer(spelling: &str) -> Option<String> {
     let t = spelling.trim();
     if crate::fat_ptr_layout::spelling_is_fat_ptr(t) {
         return None;
@@ -1601,6 +1617,17 @@ fn peel_one_pointer(spelling: &str) -> Option<String> {
         return peel_one_pointer(&inner);
     }
     None
+}
+
+/// Class-root of a `Ref` spelling plus whether it is the Option null
+/// niche (`llannotation.py` `lltype_to_annotation` of `Ptr`; `model.py`
+/// `SomeObject.noneify`). `Box<T>` / `&T` / `Option<Box<T>>` annotate
+/// as `T`; only the `Option<…>` spelling is `can_be_None`.
+pub(crate) fn peel_ref_instance_root(spelling: &str) -> (String, bool) {
+    let t = spelling.trim();
+    let can_be_none = angle_wrapper_inner(t, &["Option"]).is_some();
+    let peeled = peel_one_pointer(t).unwrap_or_else(|| t.to_string());
+    (peeled, can_be_none)
 }
 
 /// Payload of `Option<P>` that is itself one pointer word (`&T` /
@@ -1876,6 +1903,125 @@ fn flexible_gcarray_block_annotation(items_ty: &str) -> Option<SomeValue> {
     )
 }
 
+struct InternedPrebuilt {
+    addr: i64,
+    /// Filled after the parent is in `interned_prebuilts` so a
+    /// self-typed field can point at the same `HostObject`
+    /// (`description.py` `FrozenDesc._read_attribute`).
+    fields: Mutex<IndexMap<String, ConstValue>>,
+}
+
+impl NativeInstanceDict for InternedPrebuilt {
+    fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
+        self.fields
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+            .ok_or(HostGetAttrError::Missing)
+    }
+    fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+        Ok(self
+            .fields
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect())
+    }
+    fn live_addr(&self) -> Option<i64> {
+        Some(self.addr)
+    }
+}
+
+fn peel_pointer_and_generics(ty: &str) -> &str {
+    let mut t = ty.trim();
+    loop {
+        let next = t
+            .strip_prefix('&')
+            .or_else(|| t.strip_prefix("*mut "))
+            .or_else(|| t.strip_prefix("*const "))
+            .map(str::trim);
+        match next {
+            Some(n) if n != t => t = n,
+            _ => break,
+        }
+    }
+    t.split('<').next().unwrap_or(t).trim()
+}
+
+fn freeze_spelling_matches(set: &HashSet<String>, spelling: &str) -> bool {
+    if set.contains(spelling) {
+        return true;
+    }
+    let peeled = peel_pointer_and_generics(spelling);
+    if peeled != spelling && set.contains(peeled) {
+        return true;
+    }
+    let identity = majit_ir::descr::canonical_struct_name(peeled);
+    if identity != peeled && set.contains(&identity) {
+        return true;
+    }
+    let stripped = crate::front::mir::strip_crate_prefix(peeled);
+    if stripped != peeled && set.contains(&stripped) {
+        return true;
+    }
+    let stripped_identity = majit_ir::descr::canonical_struct_name(&stripped);
+    if stripped_identity != stripped && set.contains(&stripped_identity) {
+        return true;
+    }
+    let leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_str());
+    leaf != stripped && set.contains(leaf)
+}
+
+fn somevalue_live_addr(s: &SomeValue) -> Option<i64> {
+    const_value_live_addr(s.const_()?)
+}
+
+fn pbc_freeze_instance_class(pbc: &SomePBC) -> Option<String> {
+    if pbc.descriptions.len() != 1 {
+        return None;
+    }
+    let desc = pbc.descriptions.values().next()?;
+    let frozen = desc.as_frozen()?;
+    let pyobj = frozen.borrow().base.pyobj.clone()?;
+    pyobj
+        .instance_class()
+        .map(|cls| cls.qualname().to_string())
+        .or_else(|| Some(pyobj.qualname().to_string()))
+}
+
+/// rustc encoding of `Result` / `Option` when the harvested
+/// `enum_variant_by_discriminant` table has no row (core/std ADTs).
+fn rust_std_enum_variant_tag(parent: &str, leaf: &str) -> Option<i64> {
+    let parent = majit_ir::descr::strip_generic_args(parent);
+    let parent_leaf = parent.rsplit("::").next().unwrap_or(parent.as_ref());
+    match (parent_leaf, leaf) {
+        ("Result", "Ok") => Some(0),
+        ("Result", "Err") => Some(1),
+        ("Option", "None") => Some(0),
+        ("Option", "Some") => Some(1),
+        _ => None,
+    }
+}
+
+fn const_value_live_addr(v: &ConstValue) -> Option<i64> {
+    match v {
+        ConstValue::HostObject(h) => h.live_ref_addr(),
+        ConstValue::LLPtr(p) => match p._obj0_value() {
+            Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(n))) => {
+                Some(n)
+            }
+            _ => None,
+        },
+        ConstValue::LLAddress(
+            crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n),
+        ) => Some(*n),
+        ConstValue::Int(n) => Some(*n),
+        _ => None,
+    }
+}
+
 /// Resolve harvested `_immutable_fields_` for an intern key.
 ///
 /// Exact key wins when other spellings resolve to different lists. Remaining
@@ -1974,6 +2120,9 @@ impl Bookkeeper {
             struct_roots_projected: RefCell::new(std::collections::BTreeSet::new()),
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
             immutable_fields_structs: RefCell::new(HashMap::new()),
+            freeze_classes: RefCell::new(HashSet::new()),
+            interned_prebuilts: RefCell::new(IndexMap::new()),
+            prebuilt_ptr_fields: RefCell::new(IndexMap::new()),
             exception_class_hierarchies: RefCell::new(Vec::new()),
             profilefunc_family: RefCell::new(Vec::new()),
             profilefunc_paths: RefCell::new(Vec::new()),
@@ -2089,6 +2238,466 @@ impl Bookkeeper {
             .map(|(field, rank)| ConstValue::byte_str(format!("{field}{}", rank.suffix())))
             .collect();
         host.class_set("_immutable_fields_", ConstValue::List(Arc::new(items)));
+    }
+
+    /// Thread harvested `_freeze_` classes and stamp already interned hosts
+    /// (`bookkeeper.py` `immutablevalue` `hasattr(x, '_freeze_')`).
+    pub fn set_freeze_classes(&self, names: HashSet<String>) {
+        *self.freeze_classes.borrow_mut() = names;
+        let hosts: Vec<(String, HostObject)> = self
+            .struct_root_classes
+            .borrow()
+            .iter()
+            .map(|(k, h)| (k.clone(), h.clone()))
+            .collect();
+        for (key, host) in hosts {
+            self.stamp_freeze_method(&host, &key);
+        }
+    }
+
+    fn freeze_spelling_matches(&self, spelling: &str) -> bool {
+        freeze_spelling_matches(&self.freeze_classes.borrow(), spelling)
+    }
+
+    fn stamp_freeze_method(&self, host: &HostObject, key: &str) {
+        if !self.freeze_spelling_matches(key) {
+            return;
+        }
+        // A later FunDecl registration can overwrite the NativeCallable
+        // with the user `_freeze_` graph (`UserFunction`). That body
+        // cannot run host-side (`HostCallError::RequiresFlowEvaluator`);
+        // replace it so `bookkeeper.py` `immutablevalue` `x._freeze_()`
+        // stays host-executable.
+        if let Some(ConstValue::HostObject(existing)) = host.class_get("_freeze_")
+            && existing.is_host_executable()
+        {
+            return;
+        }
+        host.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                format!("{key}._freeze_"),
+                Arc::new(|_| Ok(ConstValue::Bool(true))),
+            )),
+        );
+    }
+
+    fn host_is_harvested_freeze(&self, obj: &HostObject) -> bool {
+        let class = obj.instance_class().unwrap_or(obj);
+        self.freeze_spelling_matches(class.qualname())
+            || self.freeze_spelling_matches(class.simple_name())
+    }
+
+    fn restamp_harvested_freeze(&self, obj: &HostObject) {
+        let class = obj.instance_class().cloned().unwrap_or_else(|| obj.clone());
+        for key in [class.qualname(), class.simple_name()] {
+            if self.freeze_spelling_matches(key) {
+                self.stamp_freeze_method(&class, key);
+                return;
+            }
+        }
+    }
+
+    /// RPython `hasattr(x, '_freeze_'); assert x._freeze_() is True`
+    /// (bookkeeper.py).
+    ///
+    /// Returns `Ok(true)` when `_freeze_` is present and returns `True`;
+    /// `Ok(false)` when `_freeze_` is absent (caller falls through to the
+    /// instance / fallback branch); `Err` when `_freeze_` is present but
+    /// the invocation fails or returns something other than `True`
+    /// (mirrors the Python `assert x._freeze_() is True` AssertionError).
+    ///
+    /// Upstream RPython runs the `_freeze_` body through real Python. The
+    /// Rust port routes through [`HostObject::call_host`], which handles
+    /// `NativeCallable` directly and returns
+    /// [`crate::flowspace::model::HostCallError::RequiresFlowEvaluator`]
+    /// for a `UserFunction` body. Harvested freeze classes
+    /// (`harvest_freeze_classes_from_llbcs`) already proved the inherent
+    /// `_freeze_` returns True (`Cache._freeze_`, `ObjSpace._freeze_`,
+    /// `InternalSpaceCache._freeze_`); that census is the host-side
+    /// substitute for executing the graph.
+    fn call_freeze_method(&self, obj: &HostObject) -> Result<bool, AnnotatorError> {
+        let method = match lookup_zero_arg_method(obj, "_freeze_")? {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+        match method.call_host(&[]) {
+            Ok(ConstValue::Bool(true)) => Ok(true),
+            Ok(other) => Err(AnnotatorError::new(format!(
+                "_freeze_() must return True, got {other:?}"
+            ))),
+            Err(crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q)) => {
+                if self.host_is_harvested_freeze(obj) {
+                    self.restamp_harvested_freeze(obj);
+                    return Ok(true);
+                }
+                Err(AnnotatorError::new(format!(
+                    "_freeze_() on {q:?} requires the host-graph evaluator \
+                     (user function body cannot be executed host-side yet)"
+                )))
+            }
+            Err(other) => Err(AnnotatorError::new(format!(
+                "_freeze_() call failed: {other}"
+            ))),
+        }
+    }
+
+    pub(crate) fn classdef_is_freeze(&self, classdef: &Rc<RefCell<ClassDef>>) -> bool {
+        let cd = classdef.borrow();
+        if cd.classdesc.borrow().pyobj.class_has("_freeze_") {
+            return true;
+        }
+        self.freeze_spelling_matches(&cd.name)
+    }
+
+    /// True when `dest` and `src` name one freeze class under intern
+    /// spelling (`bookkeeper.py` `getdesc` identity). Crate-prefixed
+    /// `majit_rlib::cache::Cache` and crate-stripped `cache::Cache` are
+    /// the same class; `cache::Cache` and `typeobject::TypeCache` are not.
+    fn same_freeze_class(&self, dest: &str, src: &str) -> bool {
+        let dest_key = self.intern_class_key(dest);
+        let src_key = self.intern_class_key(src);
+        if dest_key == src_key {
+            return true;
+        }
+        let dest_peeled = peel_pointer_and_generics(&dest_key);
+        let src_peeled = peel_pointer_and_generics(&src_key);
+        if dest_peeled == src_peeled {
+            return true;
+        }
+        let dest_stripped = crate::front::mir::strip_crate_prefix(dest_peeled);
+        let src_stripped = crate::front::mir::strip_crate_prefix(src_peeled);
+        dest_peeled == src_stripped
+            || src_peeled == dest_stripped
+            || (dest_stripped == src_stripped && dest_stripped.contains("::"))
+    }
+
+    /// Intern a ConstRefAddr / live prebuilt of a `_freeze_` class as
+    /// SomePBC (`bookkeeper.py` `immutablevalue`). Nested freeze fields
+    /// intern from the child's live pointer (`description.py`
+    /// `FrozenDesc` `getattr(pyobj, attr)`).
+    ///
+    /// An operand that is already a freeze PBC of this class is identity
+    /// (`rclass.py` `InstanceRepr.convert_from_to` same classdef). A PBC
+    /// of a different freeze class is not interned as `classdef`.
+    pub(crate) fn try_intern_freeze_cast(
+        self: &Rc<Self>,
+        classdef: &Rc<RefCell<ClassDef>>,
+        operand: &SomeValue,
+    ) -> Result<Option<SomeValue>, AnnotatorError> {
+        if !self.classdef_is_freeze(classdef) {
+            return Ok(None);
+        }
+        if let SomeValue::PBC(pbc) = operand {
+            let dest_name = classdef.borrow().name.clone();
+            if let Some(src_name) = pbc_freeze_instance_class(pbc)
+                && self.same_freeze_class(&dest_name, &src_name)
+            {
+                return Ok(Some(operand.clone()));
+            }
+            return Ok(None);
+        }
+        let Some(addr) = somevalue_live_addr(operand) else {
+            return Ok(None);
+        };
+        if addr == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.intern_prebuilt_instance(addr, classdef)?))
+    }
+
+    pub(crate) fn intern_prebuilt_instance(
+        self: &Rc<Self>,
+        addr: i64,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        let host = self.intern_prebuilt_host(addr, classdef)?;
+        self.immutablevalue(&ConstValue::HostObject(host))
+    }
+
+    /// Record the live pointer of a freeze field
+    /// (`description.py` `FrozenDesc` `getattr(pyobj, attr)`).
+    pub(crate) fn note_prebuilt_ptr_field(&self, parent_addr: i64, field: &str, child_addr: i64) {
+        self.prebuilt_ptr_fields
+            .borrow_mut()
+            .insert((parent_addr, field.to_string()), child_addr);
+    }
+
+    fn live_ptr_field(&self, parent_addr: i64, field: &str) -> Option<i64> {
+        self.prebuilt_ptr_fields
+            .borrow()
+            .get(&(parent_addr, field.to_string()))
+            .copied()
+            .filter(|&addr| addr != 0)
+    }
+
+    fn intern_prebuilt_host(
+        self: &Rc<Self>,
+        addr: i64,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> Result<HostObject, AnnotatorError> {
+        let class_name = classdef.borrow().name.clone();
+        let intern_key = self.intern_class_key(&class_name);
+        let cache_key = (addr, intern_key.clone());
+        if let Some(existing) = self.interned_prebuilts.borrow().get(&cache_key) {
+            return Ok(existing.clone());
+        }
+        let class_obj = classdef.borrow().classdesc.borrow().pyobj.clone();
+        // Insert the parent before visiting children so a self-typed
+        // pointer terminates (`bookkeeper.py` `descs` keyed by
+        // `Constant(pyobj)`). `FrozenDesc._read_attribute` is
+        // `getattr(pyobj, attr)` (`description.py`): intern a nested
+        // field only from its live pointer. A missing note leaves the
+        // field to `s_read_attribute` on demand.
+        let prebuilt = Arc::new(InternedPrebuilt {
+            addr,
+            fields: Mutex::new(IndexMap::new()),
+        });
+        let host = HostObject::new_native_instance(class_obj, prebuilt.clone());
+        self.interned_prebuilts
+            .borrow_mut()
+            .insert(cache_key, host.clone());
+        if !self.classdef_is_freeze(classdef) {
+            return Ok(host);
+        }
+        let field_rows: Vec<(String, String)> = {
+            let guard = self.struct_fields.borrow();
+            let Some(reg) = guard.as_ref() else {
+                return Ok(host);
+            };
+            reg.field_rows(&class_name)
+                .or_else(|| reg.field_rows(&intern_key))
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| (row.name.clone(), row.ty.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (name, ty) in field_rows {
+            // A fn-pointer / vtable slot is not a nested instance
+            // (`history.getkind` of `Ptr(FuncType)` is `'int'`). Intern
+            // as HostObject would make FrozenDesc.s_read_attribute a
+            // Ref instance and ClassDef.s_getattr Integer ∪ PBC fail.
+            // A fat `&dyn Trait` is two words (`imp.len` Signed);
+            // intern of one live address as a classed instance is the
+            // data word, not the field.
+            if !self.freeze_nested_field_is_instance_ptr(&class_name, &intern_key, &name, &ty) {
+                continue;
+            }
+            let Some(child_addr) = self.live_ptr_field(addr, &name) else {
+                continue;
+            };
+            // Field rows keep the layout spelling (`&Cache<K,V>`, `*mut T`).
+            // `getuniqueclassdef_for_struct_root` keys ClassDef identity on
+            // the class object (`bookkeeper.py` `getdesc`); a pointer prefix
+            // would mint a different class than the freeze harvest named.
+            // Freeze nested fields become SomePBC at `immutablevalue`; a
+            // non-freeze nested field (`SpaceAttr`, `SysState`) hits the
+            // early return above and intern as SomeInstance.
+            let peeled = peel_pointer_and_generics(&ty);
+            if peeled.is_empty() {
+                continue;
+            }
+            let Ok(nested_cd) = self.getuniqueclassdef_for_struct_root(peeled) else {
+                continue;
+            };
+            let Ok(nested) = self.intern_prebuilt_host(child_addr, &nested_cd) else {
+                continue;
+            };
+            prebuilt
+                .fields
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name, ConstValue::HostObject(nested));
+        }
+        Ok(host)
+    }
+
+    /// Nested freeze intern is `getattr(pyobj, attr)` of a live instance
+    /// pointer (`description.py` `FrozenDesc`). A fn-pointer / vtable
+    /// slot and a fat `&dyn Trait` field are not that.
+    fn freeze_nested_field_is_instance_ptr(
+        &self,
+        owner: &str,
+        intern_key: &str,
+        name: &str,
+        ty: &str,
+    ) -> bool {
+        if self.is_fnptr_family_field(owner, name) || self.is_fnptr_family_field(intern_key, name) {
+            return false;
+        }
+        if fn_ptr_somevalue_for_spelling_in(ty, Some(self)).is_some() {
+            return false;
+        }
+        if crate::fat_ptr_layout::spelling_is_fat_ptr(ty) {
+            return false;
+        }
+        true
+    }
+
+    /// Recast a constant payload to a harvested field classdef
+    /// (`rclass.py` `InstanceRepr.convert_from_to`). `wrap_memo` /
+    /// `try_wrap_constant_enum_cast` store V in `Result::Ok` /
+    /// `SpaceCacheInstance::ClassDictStrategy` `const_box`; a tuple
+    /// variant's `__pos_0` field type is the payload layout
+    /// (`RetainedSpaceCache`), not V. Intern at the payload's live
+    /// address (`bookkeeper.py` `immutablevalue` of `getattr(pyobj,
+    /// attr)`). Same classdef is identity. A freeze field uses
+    /// [`Self::try_intern_freeze_cast`]. Cache key is `(addr,
+    /// intern_key)`, so two classdefs intern at one live address.
+    pub(crate) fn recast_constant_payload_to_field(
+        self: &Rc<Self>,
+        payload: &SomeValue,
+        field: &SomeValue,
+    ) -> Result<Option<SomeValue>, AnnotatorError> {
+        let SomeValue::Instance(field_inst) = field else {
+            return Ok(None);
+        };
+        let Some(field_cd) = field_inst.classdef.as_ref() else {
+            return Ok(None);
+        };
+        if let SomeValue::Instance(p) = payload
+            && let Some(payload_cd) = p.classdef.as_ref()
+            && Rc::ptr_eq(payload_cd, field_cd)
+        {
+            return Ok(Some(payload.clone()));
+        }
+        if self.classdef_is_freeze(field_cd) {
+            return self.try_intern_freeze_cast(field_cd, payload);
+        }
+        let Some(addr) = somevalue_live_addr(payload) else {
+            return Ok(None);
+        };
+        if addr == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.intern_prebuilt_instance(addr, field_cd)?))
+    }
+
+    /// The unique interned prebuilt of a `_freeze_` class, when exactly
+    /// one live address is in `interned_prebuilts` (`bookkeeper.py`
+    /// `descs` keyed by `Constant(pyobj)`). Leftover MixLevel helpers of
+    /// a freeze-class method (`annlowlevel.py` `MixLevelHelperAnnotator`)
+    /// seed that PBC so `specialize.py` `all_values` sees a frozen PBC
+    /// rather than a generic `SomeInstance`.
+    pub(crate) fn unique_interned_prebuilt(
+        self: &Rc<Self>,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> Result<Option<SomeValue>, AnnotatorError> {
+        if !self.classdef_is_freeze(classdef) {
+            return Ok(None);
+        }
+        let intern_key = self.intern_class_key(&classdef.borrow().name);
+        let addrs: Vec<i64> = {
+            let cache = self.interned_prebuilts.borrow();
+            let mut addrs: Vec<i64> = cache
+                .keys()
+                .filter(|(_, key)| self.same_freeze_class(key, &intern_key))
+                .map(|(addr, _)| *addr)
+                .collect();
+            addrs.sort_unstable();
+            addrs.dedup();
+            addrs
+        };
+        match addrs.as_slice() {
+            [addr] => Ok(Some(self.intern_prebuilt_instance(*addr, classdef)?)),
+            [] => match self.unique_ptr_field_addr_for_classdef(classdef) {
+                Some(addr) => Ok(Some(self.intern_prebuilt_instance(addr, classdef)?)),
+                None => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Live addresses in `interned_prebuilts` (`bookkeeper.py` `descs`
+    /// keyed by `Constant(pyobj)`).
+    #[cfg(test)]
+    pub(crate) fn interned_prebuilt_live_addrs(&self) -> Vec<i64> {
+        let mut addrs: Vec<i64> = self
+            .interned_prebuilts
+            .borrow()
+            .keys()
+            .map(|(addr, _)| *addr)
+            .collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        addrs
+    }
+
+    /// Unique live address of a freeze class from `prebuilt_ptr_fields`
+    /// (`description.py` `FrozenDesc` `getattr(pyobj, attr)`). Leftover
+    /// MixLevel of a freeze-class method (`annlowlevel.py`
+    /// `MixLevelHelperAnnotator`) may run before a ConstRefAddr interned
+    /// the parent; the live pointer notes still name the unique instance.
+    fn unique_ptr_field_addr_for_classdef(&self, classdef: &Rc<RefCell<ClassDef>>) -> Option<i64> {
+        let class_name = classdef.borrow().name.clone();
+        let intern_key = self.intern_class_key(&class_name);
+        let notes: Vec<(i64, String, i64)> = self
+            .prebuilt_ptr_fields
+            .borrow()
+            .iter()
+            .map(|((parent, field), child)| (*parent, field.clone(), *child))
+            .collect();
+        if notes.is_empty() {
+            return None;
+        }
+        let (own_field_names, typed_rows): (HashSet<String>, Vec<(String, String)>) = {
+            let guard = self.struct_fields.borrow();
+            let reg = guard.as_ref()?;
+            let mut own = HashSet::new();
+            if let Some(rows) = reg
+                .field_rows(&class_name)
+                .or_else(|| reg.field_rows(&intern_key))
+            {
+                for row in rows {
+                    own.insert(row.name.clone());
+                }
+            }
+            let typed = reg
+                .fields
+                .iter()
+                .flat_map(|(_, rows)| rows.iter().map(|row| (row.name.clone(), row.ty.clone())))
+                .collect();
+            (own, typed)
+        };
+        let mut matching_field_names: HashSet<String> = HashSet::new();
+        for (name, ty) in typed_rows {
+            if fn_ptr_somevalue_for_spelling_in(&ty, Some(self)).is_some()
+                || crate::fat_ptr_layout::spelling_is_fat_ptr(&ty)
+            {
+                continue;
+            }
+            let peeled = peel_pointer_and_generics(&ty);
+            if peeled.is_empty() {
+                continue;
+            }
+            if self.same_freeze_class(peeled, &intern_key)
+                || self.same_freeze_class(peeled, &class_name)
+            {
+                matching_field_names.insert(name);
+            }
+        }
+        let mut child_addrs: Vec<i64> = notes
+            .iter()
+            .filter(|(_, field, _)| matching_field_names.contains(field))
+            .map(|(_, _, child)| *child)
+            .collect();
+        child_addrs.sort_unstable();
+        child_addrs.dedup();
+        let mut parent_addrs: Vec<i64> = notes
+            .iter()
+            .filter(|(_, field, _)| own_field_names.contains(field))
+            .map(|(parent, _, _)| *parent)
+            .collect();
+        parent_addrs.sort_unstable();
+        parent_addrs.dedup();
+        match (child_addrs.as_slice(), parent_addrs.as_slice()) {
+            ([a], [b]) if a == b => Some(*a),
+            ([a], []) => Some(*a),
+            ([], [b]) => Some(*b),
+            _ => None,
+        }
     }
 
     /// Install the closed `ProfileFunc` family (`setllprofile` /
@@ -2647,6 +3256,52 @@ impl Bookkeeper {
         stripped.dedup();
         *self.enum_variant_stripped_keys.borrow_mut() = stripped;
         *self.enum_variant_by_discriminant.borrow_mut() = Some(map);
+    }
+
+    /// Discriminant tag of a variant ClassDef (`Result::Ok` → 0).
+    /// Looks up the harvested `enum_variant_by_discriminant` table, then
+    /// the rustc encoding of `Result` / `Option`.
+    pub fn discriminant_of_variant_classdef(
+        &self,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> Option<i64> {
+        let name = classdef.borrow().name.clone();
+        self.discriminant_of_variant_name(&name)
+    }
+
+    pub fn discriminant_of_variant_name(&self, name: &str) -> Option<i64> {
+        let (parent, leaf) = name.rsplit_once("::")?;
+        let leaf = leaf.split('<').next().unwrap_or(leaf);
+        if let Some(tag) = self.lookup_variant_tag(parent, leaf) {
+            return Some(tag);
+        }
+        rust_std_enum_variant_tag(parent, leaf)
+    }
+
+    fn lookup_variant_tag(&self, parent: &str, leaf: &str) -> Option<i64> {
+        let lookup_root = majit_ir::descr::strip_instantiation_suffix(parent);
+        let guard = self.enum_variant_by_discriminant.borrow();
+        let map = guard.as_ref()?;
+        let mut cursor = lookup_root;
+        loop {
+            if let Some(by_discr) = map.get(cursor) {
+                return by_discr
+                    .iter()
+                    .find_map(|(tag, variant)| (variant.as_str() == leaf).then_some(*tag));
+            }
+            if let Some(pl) = cursor.rsplit("::").next()
+                && pl != cursor
+                && let Some(by_discr) = map.get(pl)
+            {
+                return by_discr
+                    .iter()
+                    .find_map(|(tag, variant)| (variant.as_str() == leaf).then_some(*tag));
+            }
+            let Some((next, _)) = cursor.rsplit_once("::") else {
+                return None;
+            };
+            cursor = next;
+        }
     }
 
     /// True when `ty` is a harvested enum whose TypeDecl has zero
@@ -3596,7 +4251,7 @@ impl Bookkeeper {
             if self_obj.is_instance() {
                 call_cleanup_method(self_obj)?;
             }
-            if self_obj.is_instance() && call_freeze_method(self_obj)? {
+            if self_obj.is_instance() && self.call_freeze_method(self_obj)? {
                 let frozendesc = self.getdesc(self_obj)?.as_frozen().ok_or_else(|| {
                     AnnotatorError::new(
                         "Bookkeeper.getdesc(bound method): frozen self did not produce FrozenDesc",
@@ -4897,19 +5552,17 @@ impl Bookkeeper {
                 // (`*mut T` / `ty_is_raw_address`) and `Ptr(FuncType)` as
                 // Int, so FORCE shells `SomeInteger`. Intern is SomePtr
                 // (`raw_struct_ptr_annotation` / `history.getkind` of
-                // `Ptr`). Replace ONLY that exact FORCE shell: leaving it
-                // unions `Integer ∪ Ptr(T)` at setattr of a capture of
-                // the same field. A scalar Int field intern is Integer
-                // and stays. A `fn` / `Option<fn>` field projects
-                // `Impossible` (no declared field seed; setattr unions), so
-                // the Int FORCE shell of a function-pointer spelling is
-                // replaced too.
+                // `Ptr`). FORCE of `Ptr(FuncType)` is SomeInteger, not
+                // always the exact `valuetype_to_someshell(Int)` shell
+                // (`immutable` / knowntype flags). Leaving any Integer
+                // unions `Integer ∪ Ptr(T)` / `Integer ∪ Function-PBC`
+                // and `s_getattr` stays Integer. A scalar Int field
+                // intern is Integer and stays (`s_value` is not Ptr /
+                // fn spelling). A `fn` / `Option<fn>` field projects
+                // `Impossible` (no declared field seed; setattr unions).
                 let is_ptr_integer_force_shell = (matches!(&s_value, SomeValue::Ptr(_))
                     || fn_ptr_somevalue_for_spelling_in(&row.ty, Some(self)).is_some())
-                    && crate::codewriter::annotation_state::valuetype_to_someshell(
-                        &crate::model::ValueType::Int,
-                    )
-                    .is_some_and(|shell| shell == attr.s_value);
+                    && matches!(&attr.s_value, SomeValue::Integer(_));
                 // `ProfileFunc` / `Option<ProfileFunc>` may still FORCE as
                 // the Int-bank shell (`Ptr(FuncType)` getkind) or the
                 // untyped instance shell. Replace with the PBC projection.
@@ -4959,12 +5612,13 @@ impl Bookkeeper {
                 // Drop only the FORCE Int-bank / untyped `SomePtr(FuncType)`
                 // shell of a `fn` spelling — not a real annotation.
                 if self.is_fnptr_family_field(n, &row.name) {
-                    let is_int_force_shell =
-                        crate::codewriter::annotation_state::valuetype_to_someshell(
-                            &crate::model::ValueType::Int,
-                        )
-                        .is_some_and(|shell| shell == attr.s_value);
-                    if is_int_force_shell || is_fnptr_type_intern(&attr.s_value) {
+                    // FORCE of `Ptr(FuncType)` is SomeInteger, not always
+                    // the exact `valuetype_to_someshell(Int)` shell.
+                    // Any Integer / untyped FuncType intern is still
+                    // FORCE; leave a real SomePBC source in place.
+                    if matches!(&attr.s_value, SomeValue::Integer(_) | SomeValue::Impossible)
+                        || is_fnptr_type_intern(&attr.s_value)
+                    {
                         attr.s_value = SomeValue::Impossible;
                     }
                 } else if matches!(attr.s_value, SomeValue::Impossible)
@@ -5380,6 +6034,7 @@ impl Bookkeeper {
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.stamp_raw_alloc_flavor(&host, &key);
             self.stamp_immutable_fields(&host, &key);
+            self.stamp_freeze_method(&host, &key);
             self.insert_struct_root_class(key, host.clone());
             base_host = Some(host);
         }
@@ -5428,6 +6083,7 @@ impl Bookkeeper {
         crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
         self.stamp_raw_alloc_flavor(&host, &key);
         self.stamp_immutable_fields(&host, &key);
+        self.stamp_freeze_method(&host, &key);
         self.insert_struct_root_class(key, host.clone());
         host
     }
@@ -5571,6 +6227,7 @@ impl Bookkeeper {
         crate::virtualizable_decl::stamp_host_virtualizable(host, &key);
         self.stamp_raw_alloc_flavor(host, &key);
         self.stamp_immutable_fields(host, &key);
+        self.stamp_freeze_method(host, &key);
         self.insert_struct_root_class(key, host.clone());
         host.clone()
     }
@@ -7654,7 +8311,7 @@ impl Bookkeeper {
         // a `_freeze_` member routes to the frozen-PBC path regardless
         // of its kind (Instance / Module / Opaque all surface their
         // attribute dict the same way).
-        if call_freeze_method(obj)? {
+        if self.call_freeze_method(obj)? {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
@@ -9080,47 +9737,6 @@ fn split_generic_args(input: &str) -> Vec<&str> {
     out
 }
 
-/// RPython `hasattr(x, '_freeze_'); assert x._freeze_() is True`
-/// (bookkeeper.py:332-333).
-///
-/// Returns `Ok(true)` when `_freeze_` is present and returns `True`;
-/// `Ok(false)` when `_freeze_` is absent (caller falls through to the
-/// instance / fallback branch); `Err` when `_freeze_` is present but
-/// the invocation fails or returns something other than `True`
-/// (mirrors the Python `assert x._freeze_() is True` AssertionError).
-///
-/// Upstream RPython runs the `_freeze_` body through real Python. The
-/// Rust port routes through [`HostObject::call_host`], which handles
-/// `NativeCallable` (test fixtures / bootstrap builtins register
-/// these) directly and returns
-/// [`HostCallError::RequiresFlowEvaluator`] for a `UserFunction`
-/// body. The latter surfaces as an explicit
-/// "host-graph evaluator not yet landed" `AnnotatorError`
-/// rather than a generic call failure — this keeps the boundary
-/// between host-executable and flowspace-required callables
-/// discoverable at the callsite.
-fn call_freeze_method(obj: &HostObject) -> Result<bool, AnnotatorError> {
-    let method = match lookup_zero_arg_method(obj, "_freeze_")? {
-        Some(m) => m,
-        None => return Ok(false),
-    };
-    let result = method.call_host(&[]).map_err(|err| {
-        AnnotatorError::new(match err {
-            crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q) => format!(
-                "_freeze_() on {q:?} requires the host-graph evaluator \
-                 (user function body cannot be executed host-side yet)"
-            ),
-            other => format!("_freeze_() call failed: {other}"),
-        })
-    })?;
-    match result {
-        ConstValue::Bool(true) => Ok(true),
-        other => Err(AnnotatorError::new(format!(
-            "_freeze_() must return True, got {other:?}"
-        ))),
-    }
-}
-
 /// RPython `if hasattr(x, '_cleanup_'): x._cleanup_()` (bookkeeper.py:341-342).
 ///
 /// Fires the cleanup method for side-effects and ignores the return
@@ -9730,6 +10346,487 @@ mod tests {
             desc.borrow().immutable_fields.contains("name?"),
             "ClassDesc.immutable_fields={:?}",
             desc.borrow().immutable_fields
+        );
+    }
+
+    #[test]
+    fn set_freeze_classes_stamps_interned_and_later_hosts() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let interned = bk.intern_class_by_qualname("Q2FreezeHost");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeHost".to_string());
+        names.insert("Q2FreezeHostLater".to_string());
+        bk.set_freeze_classes(names);
+        assert!(interned.class_has("_freeze_"));
+        let later = bk.intern_class_by_qualname("Q2FreezeHostLater");
+        assert!(later.class_has("_freeze_"));
+        let other = bk.intern_class_by_qualname("Q2NotFrozen");
+        assert!(!other.class_has("_freeze_"));
+
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeHost".to_string(),
+            vec![
+                ("child".to_string(), "Q2FreezeHostLater".to_string()),
+                ("base".to_string(), "&Q2FreezeHostLater".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "Q2FreezeHostLater".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.note_prebuilt_ptr_field(0x1000, "child", 0x1100);
+        bk.note_prebuilt_ptr_field(0x1000, "base", 0x1200);
+
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        let s = bk
+            .intern_prebuilt_instance(0x1000, &classdef)
+            .expect("intern");
+        let SomeValue::PBC(pbc) = &s else {
+            panic!("intern_prebuilt_instance must be SomePBC, got {s:?}");
+        };
+        assert!(s.is_constant());
+        let s_child = bk
+            .immutablevalue(&ConstValue::byte_str("child"))
+            .expect("attr name");
+        let child = bk.pbc_getattr(pbc, &s_child).expect("child getattr");
+        assert!(
+            child.is_constant() && matches!(child, SomeValue::PBC(_)),
+            "nested freeze field must intern as constant SomePBC, got {child:?}"
+        );
+        let s_base = bk
+            .immutablevalue(&ConstValue::byte_str("base"))
+            .expect("attr name");
+        let base = bk.pbc_getattr(pbc, &s_base).expect("base getattr");
+        assert!(
+            base.is_constant() && matches!(base, SomeValue::PBC(_)),
+            "pointer-spelled freeze field must intern as constant SomePBC, got {base:?}"
+        );
+        let dest = bk.getuniqueclassdef(&interned).expect("dest classdef");
+        let folded = bk.try_intern_freeze_cast(&dest, &s).expect("identity cast");
+        assert!(
+            matches!(folded, Some(SomeValue::PBC(_))),
+            "freeze PBC recast to its class is identity, got {folded:?}"
+        );
+        let unique = bk
+            .unique_interned_prebuilt(&classdef)
+            .expect("unique interned");
+        assert!(
+            matches!(unique, Some(SomeValue::PBC(_))),
+            "one interned freeze prebuilt is unique, got {unique:?}"
+        );
+        let later_cd = bk.getuniqueclassdef(&later).expect("later classdef");
+        let recast = bk
+            .try_intern_freeze_cast(&later_cd, &s)
+            .expect("other freeze dest");
+        assert!(
+            recast.is_none(),
+            "freeze PBC must not intern as a different freeze class, got {recast:?}"
+        );
+        bk.intern_prebuilt_instance(0x2000, &classdef)
+            .expect("second intern");
+        let unique_two = bk
+            .unique_interned_prebuilt(&classdef)
+            .expect("two interned");
+        assert!(
+            unique_two.is_none(),
+            "two interned freeze addrs are not unique, got {unique_two:?}"
+        );
+    }
+
+    #[test]
+    fn intern_prebuilt_non_freeze_field_is_someinstance() {
+        // `FrozenDesc.s_read_attribute` is `getattr(pyobj, attr)` then
+        // `immutablevalue` (`description.py`). A non-freeze nested field
+        // (`SpaceAttr`, `SysState`) has no `_freeze_`, so it is
+        // SomeInstance, not Impossible.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let interned = bk.intern_class_by_qualname("Q2FreezeHostAttr");
+        let attr_cls = bk.intern_class_by_qualname("Q2SpaceAttr");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeHostAttr".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeHostAttr".to_string(),
+            vec![("attr".to_string(), "Q2SpaceAttr".to_string())],
+        );
+        reg.fields
+            .insert("Q2SpaceAttr".to_string(), Vec::<(String, String)>::new());
+        bk.set_struct_fields(Rc::new(reg));
+        bk.note_prebuilt_ptr_field(0x3000, "attr", 0x3100);
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        let s = bk
+            .intern_prebuilt_instance(0x3000, &classdef)
+            .expect("intern");
+        let SomeValue::PBC(pbc) = &s else {
+            panic!("intern_prebuilt_instance must be SomePBC, got {s:?}");
+        };
+        let s_attr = bk
+            .immutablevalue(&ConstValue::byte_str("attr"))
+            .expect("attr name");
+        let attr = bk.pbc_getattr(pbc, &s_attr).expect("attr getattr");
+        assert!(
+            matches!(attr, SomeValue::Instance(_)),
+            "non-freeze nested field must intern as SomeInstance, got {attr:?}"
+        );
+        let _ = attr_cls;
+    }
+
+    #[test]
+    fn intern_prebuilt_nested_fields_use_live_addrs() {
+        // `FrozenDesc._read_attribute` is `getattr(pyobj, attr)`
+        // (`description.py`). Two same-typed fields intern at distinct
+        // live addresses; a self-typed pointer hits the parent already
+        // in `descs` and terminates.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let interned = bk.intern_class_by_qualname("Q2FreezeNest");
+        let leaf = bk.intern_class_by_qualname("Q2FreezeLeaf");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeNest".to_string());
+        names.insert("Q2FreezeLeaf".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeNest".to_string(),
+            vec![
+                ("a".to_string(), "Q2FreezeLeaf".to_string()),
+                ("b".to_string(), "Q2FreezeLeaf".to_string()),
+                ("inner".to_string(), "Q2FreezeNest".to_string()),
+            ],
+        );
+        reg.fields
+            .insert("Q2FreezeLeaf".to_string(), Vec::<(String, String)>::new());
+        bk.set_struct_fields(Rc::new(reg));
+        bk.note_prebuilt_ptr_field(0x1000, "a", 0x1100);
+        bk.note_prebuilt_ptr_field(0x1000, "b", 0x1200);
+        bk.note_prebuilt_ptr_field(0x1000, "inner", 0x1000);
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        let s = bk
+            .intern_prebuilt_instance(0x1000, &classdef)
+            .expect("intern");
+        let SomeValue::PBC(pbc) = &s else {
+            panic!("intern_prebuilt_instance must be SomePBC, got {s:?}");
+        };
+        let parent = pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("parent pyobj");
+        let s_a = bk
+            .immutablevalue(&ConstValue::byte_str("a"))
+            .expect("attr a");
+        let a = bk.pbc_getattr(pbc, &s_a).expect("getattr a");
+        let s_b = bk
+            .immutablevalue(&ConstValue::byte_str("b"))
+            .expect("attr b");
+        let b = bk.pbc_getattr(pbc, &s_b).expect("getattr b");
+        let SomeValue::PBC(a_pbc) = &a else {
+            panic!("field a must intern as SomePBC, got {a:?}");
+        };
+        let SomeValue::PBC(b_pbc) = &b else {
+            panic!("field b must intern as SomePBC, got {b:?}");
+        };
+        let a_host = a_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("a pyobj");
+        let b_host = b_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("b pyobj");
+        assert_ne!(
+            a_host, b_host,
+            "same-typed freeze fields intern as distinct HostObjects"
+        );
+        assert_eq!(a_host.live_ref_addr(), Some(0x1100));
+        assert_eq!(b_host.live_ref_addr(), Some(0x1200));
+        let s_inner = bk
+            .immutablevalue(&ConstValue::byte_str("inner"))
+            .expect("attr inner");
+        let inner = bk.pbc_getattr(pbc, &s_inner).expect("getattr inner");
+        let SomeValue::PBC(inner_pbc) = &inner else {
+            panic!("self-typed field must intern as SomePBC, got {inner:?}");
+        };
+        let inner_host = inner_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("inner pyobj");
+        assert_eq!(
+            inner_host, parent,
+            "self-typed field is the parent HostObject"
+        );
+        let _ = leaf;
+    }
+
+    #[test]
+    fn intern_prebuilt_skips_fnptr_field() {
+        // `FrozenDesc._read_attribute` is `getattr(pyobj, attr)`
+        // (`description.py`). A harvested FnPtr-field family is
+        // `SomePBC` of the member functions (`ClassRepr.getclsfield`),
+        // not a nested instance interned at the function address.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let interned = bk.intern_class_by_qualname("Q2FreezeFnHost");
+        let nested = bk.intern_class_by_qualname("Q2FreezeFnCache");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeFnHost".to_string());
+        names.insert("Q2FreezeFnCache".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeFnHost".to_string(),
+            vec![
+                ("fromcache".to_string(), "Q2FreezeFnCache".to_string()),
+                ("getclass".to_string(), "fn(*mut u8) -> *mut u8".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "Q2FreezeFnCache".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.register_fnptr_family_field("Q2FreezeFnHost", "getclass", Vec::new());
+        bk.note_prebuilt_ptr_field(0x6000, "fromcache", 0x6100);
+        bk.note_prebuilt_ptr_field(0x6000, "getclass", 0x6200);
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        let s = bk
+            .intern_prebuilt_instance(0x6000, &classdef)
+            .expect("intern");
+        let SomeValue::PBC(pbc) = &s else {
+            panic!("intern_prebuilt_instance must be SomePBC, got {s:?}");
+        };
+        let s_fn = bk
+            .immutablevalue(&ConstValue::byte_str("getclass"))
+            .expect("attr getclass");
+        let getclass = bk.pbc_getattr(pbc, &s_fn).expect("getattr getclass");
+        assert!(
+            matches!(getclass, SomeValue::Impossible),
+            "fn-pointer field must not intern as a nested instance, got {getclass:?}"
+        );
+        let s_cache = bk
+            .immutablevalue(&ConstValue::byte_str("fromcache"))
+            .expect("attr fromcache");
+        let cache = bk.pbc_getattr(pbc, &s_cache).expect("getattr fromcache");
+        assert!(
+            matches!(cache, SomeValue::PBC(_)),
+            "freeze nested field still interns, got {cache:?}"
+        );
+        let _ = nested;
+    }
+
+    #[test]
+    fn unique_interned_prebuilt_seeds_from_ptr_fields() {
+        // Leftover MixLevel of a freeze-class method
+        // (`annlowlevel.py` `MixLevelHelperAnnotator`) may run before a
+        // ConstRefAddr interned the parent. `FrozenDesc` `getattr` live
+        // pointer notes still name the unique instance.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let parent_cls = bk.intern_class_by_qualname("Q2FreezeSeedParent");
+        let child_cls = bk.intern_class_by_qualname("Q2FreezeSeedChild");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeSeedParent".to_string());
+        names.insert("Q2FreezeSeedChild".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeSeedParent".to_string(),
+            vec![("fromcache".to_string(), "Q2FreezeSeedChild".to_string())],
+        );
+        reg.fields.insert(
+            "Q2FreezeSeedChild".to_string(),
+            vec![("base".to_string(), "Q2FreezeSeedChild".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.note_prebuilt_ptr_field(0x4000, "fromcache", 0x4100);
+        bk.note_prebuilt_ptr_field(0x4100, "base", 0x4100);
+        let parent_cd = bk.getuniqueclassdef(&parent_cls).expect("parent classdef");
+        let child_cd = bk.getuniqueclassdef(&child_cls).expect("child classdef");
+        // Child first: leftover MixLevel of the wrapper intern from the
+        // `fromcache` child address before the parent ConstRefAddr.
+        let child = bk
+            .unique_interned_prebuilt(&child_cd)
+            .expect("child unique")
+            .expect("child SomePBC");
+        let SomeValue::PBC(child_pbc) = &child else {
+            panic!("child unique intern must be SomePBC, got {child:?}");
+        };
+        let child_host = child_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("child pyobj");
+        assert_eq!(child_host.live_ref_addr(), Some(0x4100));
+        let parent = bk
+            .unique_interned_prebuilt(&parent_cd)
+            .expect("parent unique")
+            .expect("parent SomePBC");
+        let SomeValue::PBC(parent_pbc) = &parent else {
+            panic!("parent unique intern must be SomePBC, got {parent:?}");
+        };
+        let parent_host = parent_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("parent pyobj");
+        assert_eq!(parent_host.live_ref_addr(), Some(0x4000));
+        let s_fromcache = bk
+            .immutablevalue(&ConstValue::byte_str("fromcache"))
+            .expect("attr fromcache");
+        let fromcache = bk
+            .pbc_getattr(parent_pbc, &s_fromcache)
+            .expect("getattr fromcache");
+        let SomeValue::PBC(fromcache_pbc) = &fromcache else {
+            panic!("fromcache must intern as SomePBC, got {fromcache:?}");
+        };
+        let fromcache_host = fromcache_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("fromcache pyobj");
+        assert_eq!(fromcache_host, child_host);
+        let s_base = bk
+            .immutablevalue(&ConstValue::byte_str("base"))
+            .expect("attr base");
+        let base = bk.pbc_getattr(child_pbc, &s_base).expect("getattr base");
+        let SomeValue::PBC(base_pbc) = &base else {
+            panic!("base must intern as SomePBC, got {base:?}");
+        };
+        let base_host = base_pbc
+            .descriptions
+            .values()
+            .next()
+            .and_then(DescEntry::pyobj)
+            .expect("base pyobj");
+        assert_eq!(base_host, child_host);
+    }
+
+    #[test]
+    fn recast_constant_payload_to_field_interns_at_live_addr() {
+        // `wrap_memo` / `try_wrap_constant_enum_cast` store V in
+        // `const_box`. A tuple variant's `__pos_0` field type is the
+        // payload layout (`RetainedSpaceCache`), interned at V's live
+        // address (`rclass.py` `InstanceRepr.convert_from_to`).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert("Q2Inner".to_string(), Vec::<(String, String)>::new());
+        reg.fields.insert(
+            "Q2Wrapper".to_string(),
+            vec![("keep_alive".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let inner_cd = bk
+            .getuniqueclassdef_for_struct_root("Q2Inner")
+            .expect("inner classdef");
+        let wrapper_cd = bk
+            .getuniqueclassdef_for_struct_root("Q2Wrapper")
+            .expect("wrapper classdef");
+        let payload = bk
+            .intern_prebuilt_instance(0x5000, &inner_cd)
+            .expect("intern inner");
+        let field = SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            Some(wrapper_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let recast = bk
+            .recast_constant_payload_to_field(&payload, &field)
+            .expect("recast")
+            .expect("Some");
+        let SomeValue::Instance(inst) = &recast else {
+            panic!("recast must be SomeInstance, got {recast:?}");
+        };
+        let recast_cd = inst.classdef.as_ref().expect("recast classdef");
+        assert!(
+            Rc::ptr_eq(recast_cd, &wrapper_cd),
+            "recast classdef must be the field classdef, got {}",
+            recast_cd.borrow().name
+        );
+        let recast_host = recast.const_().expect("recast const");
+        assert_eq!(const_value_live_addr(recast_host), Some(0x5000));
+        let same = bk
+            .recast_constant_payload_to_field(&payload, &payload)
+            .expect("identity")
+            .expect("Some");
+        let SomeValue::Instance(same_inst) = &same else {
+            panic!("same-classdef recast is identity, got {same:?}");
+        };
+        assert!(Rc::ptr_eq(
+            same_inst.classdef.as_ref().expect("same classdef"),
+            &inner_cd
+        ));
+    }
+
+    #[test]
+    fn harvested_freeze_user_function_is_host_true() {
+        let bk = bk();
+        let class = bk.intern_class_by_qualname("Q2FreezeUserFn");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeUserFn".to_string());
+        bk.set_freeze_classes(names);
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(
+            indexmap::IndexMap::new(),
+        )));
+        let gf = GraphFunc::new("pyre_interpreter::baseobjspace::<Impl>::_freeze_", globals);
+        class.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_user_function(gf)),
+        );
+        let inst = HostObject::new_instance(class.clone(), Vec::new());
+        assert!(
+            bk.call_freeze_method(&inst).expect("harvested freeze"),
+            "UserFunction _freeze_ on a harvested freeze class is True"
+        );
+        let existing = class.class_get("_freeze_").expect("restamped");
+        let ConstValue::HostObject(method) = existing else {
+            panic!("_freeze_ must restamp as HostObject, got {existing:?}");
+        };
+        assert!(
+            method.is_host_executable(),
+            "restamp must replace UserFunction with NativeCallable"
+        );
+    }
+
+    #[test]
+    fn discriminant_of_result_option_uses_rustc_encoding() {
+        let bk = bk();
+        assert_eq!(
+            bk.discriminant_of_variant_name("core::result::Result<i32, E>::Ok"),
+            Some(0)
+        );
+        assert_eq!(
+            bk.discriminant_of_variant_name("core::result::Result<i32, E>::Err"),
+            Some(1)
+        );
+        assert_eq!(
+            bk.discriminant_of_variant_name("core::option::Option<i32>::None"),
+            Some(0)
+        );
+        assert_eq!(
+            bk.discriminant_of_variant_name("core::option::Option<i32>::Some"),
+            Some(1)
+        );
+        assert_eq!(
+            bk.discriminant_of_variant_name("baseobjspace::SpaceCacheInstance::ClassDictStrategy"),
+            None
         );
     }
 

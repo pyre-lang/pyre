@@ -24,15 +24,19 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::annotator::annrpython::apply_renaming;
-use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::bookkeeper::{Bookkeeper, peel_ref_instance_root};
+use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::DescEntry;
 use crate::annotator::model::{
     SomeInstance, SomeInteger, SomeNone, SomeObjectTrait, SomePtr, SomeTypeOf, SomeValue, s_uint,
     r#typeof,
 };
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
+use crate::codewriter::type_state::valuetype_to_concrete;
 use crate::flowspace::model::{ConstValue, HostObject, Variable};
-use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType, VecFieldPart};
+use crate::model::{
+    CallTarget, ConcreteType, FunctionGraph, Link, LinkArg, OpKind, ValueType, VecFieldPart,
+};
 use crate::translator::rtyper::error::TyperError;
 
 enum Incoming {
@@ -184,6 +188,9 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| freeze_input_incoming(bookkeeper, &op.kind))
+                        .or_else(|| freeze_fieldread_incoming(bookkeeper, &op.kind))
+                        .or_else(|| someinstance_fieldread_incoming(&op.kind))
                         .or_else(|| fn_const_incoming(bookkeeper, &op.kind))
                         .or_else(|| fn_ptr_annotation_incoming(bookkeeper, result, &op.kind))
                         .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
@@ -322,12 +329,25 @@ fn shell_for(ty: &ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> Option<Some
             // join with `String::new()`.
             Some(crate::annotator::model::s_str())
         }
-        ValueType::Ref(Some(root)) => bookkeeper
-            .and_then(|bk| bk.classdef_for_known_struct_root(root))
-            .map(|classdef| {
-                SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()))
-            })
-            .or_else(|| valuetype_to_someshell(ty)),
+        ValueType::Ref(Some(root)) => {
+            // `Box<T>` / `Option<Box<T>>` are `Ptr` to T
+            // (`llannotation.py` `lltype_to_annotation`). `Option`
+            // is `can_be_None` (`model.py` `SomeObject.noneify`).
+            let (peeled, can_be_none) = peel_ref_instance_root(root);
+            bookkeeper
+                .and_then(|bk| {
+                    bk.classdef_for_known_struct_root(&peeled)
+                        .or_else(|| bk.classdef_for_known_struct_root(root))
+                })
+                .map(|classdef| {
+                    SomeValue::Instance(SomeInstance::new(
+                        Some(classdef),
+                        can_be_none,
+                        Default::default(),
+                    ))
+                })
+                .or_else(|| valuetype_to_someshell(ty))
+        }
         _ => valuetype_to_someshell(ty),
     }
 }
@@ -366,7 +386,11 @@ fn declared_ref_valuetype(ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) ->
             ValueType::Str
         }
         ValueType::Ref(Some(root)) => {
-            if let Some(cd) = bookkeeper.and_then(|bk| bk.classdef_for_known_struct_root(root)) {
+            let (peeled, _) = peel_ref_instance_root(root);
+            if let Some(cd) = bookkeeper.and_then(|bk| {
+                bk.classdef_for_known_struct_root(&peeled)
+                    .or_else(|| bk.classdef_for_known_struct_root(root))
+            }) {
                 ValueType::Ref(Some(cd.borrow().name.clone()))
             } else {
                 ty
@@ -798,6 +822,112 @@ fn type_someobject_incoming(kind: &OpKind) -> Option<Incoming> {
     Some(Incoming::Annotation(Rc::new(r#typeof(&[Rc::new(
         v.clone(),
     )]))))
+}
+
+/// Startblock `Ref` of a `_freeze_` class with exactly one interned
+/// prebuilt (`bookkeeper.py` `descs` / `immutablevalue`). Leftover
+/// MixLevel already seeds that PBC (`annlowlevel.py`
+/// `MixLevelHelperAnnotator` / `unique_interned_prebuilt`); the dual-gate
+/// legacy walker must too so `SingleFrozenPBCRepr.lowleveltype` is Void
+/// on both sides (`rpbc.py` `getFrozenPBCRepr`).
+fn freeze_input_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::Input {
+        ty: ValueType::Ref(ref_root),
+        class_root,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    let root = class_root.as_deref().or(ref_root.as_deref())?;
+    let cd = bk.getuniqueclassdef_for_struct_root(root).ok()?;
+    match bk.unique_interned_prebuilt(&cd) {
+        Ok(Some(s)) if getattr_matches_legacy_kind(&s, kind) => {
+            Some(Incoming::Annotation(Rc::new(s)))
+        }
+        _ => None,
+    }
+}
+
+/// FieldRead of a FrozenPBC SomePBC receiver (`unaryop.py` SomePBC.getattr
+/// / `bookkeeper.py` `pbc_getattr` / `description.py`
+/// `FrozenDesc.s_read_attribute`). Dual-gate leftover MixLevel of leftover
+/// Input unique-interns freeze `self` (`freeze_input_incoming`); FieldRead
+/// of `self.fromcache` must then be `pbc_getattr` so both sides are Void
+/// (`rpbc.py` `getFrozenPBCRepr`), not `infer_op_type` FieldRead.ty GcRef
+/// vs two-phase Void.
+fn freeze_fieldread_incoming(
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+    kind: &OpKind,
+) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::FieldRead { base, field, .. } = kind else {
+        return None;
+    };
+    // FatLen / FatVtable / FatMeta are one word of a two-word fat
+    // pointer (`imp.len` Signed). getattr of `imp` is the pair, not
+    // that word (`rclass.py` field lltype /
+    // `jtransform.py rewrite_op_getfield`).
+    if field.vec_part.is_some() {
+        return None;
+    }
+    let sv = read_binding_some(base)?;
+    let SomeValue::PBC(pbc) = sv.as_ref() else {
+        return None;
+    };
+    let s_attr = bk.immutablevalue(&ConstValue::byte_str(&field.name)).ok()?;
+    let s = bk.pbc_getattr(pbc, &s_attr).ok()?;
+    if !getattr_matches_legacy_kind(&s, kind) {
+        return None;
+    }
+    Some(Incoming::Annotation(Rc::new(s)))
+}
+
+/// FieldRead of a classed `SomeInstance` (`unaryop.py`
+/// `SomeInstance.getattr` / `classdesc.py` `ClassDef.s_getattr`).
+/// `infer_op_type` of `Field.ty` `Ref(Option<Box<T>>)` otherwise
+/// shells classdef-less (`valuetype_to_someshell` `Ref` fallback)
+/// and a later `getattr` of `T`'s fields panics.
+fn someinstance_fieldread_incoming(kind: &OpKind) -> Option<Incoming> {
+    let OpKind::FieldRead { base, field, .. } = kind else {
+        return None;
+    };
+    // FatLen / FatVtable / FatMeta are one word of a two-word fat
+    // pointer (`imp.len` Signed vs `imp.vtable` Address). getattr of
+    // `imp` is the pair, not that word.
+    if field.vec_part.is_some() {
+        return None;
+    }
+    let sv = read_binding_some(base)?;
+    let SomeValue::Instance(inst) = sv.as_ref() else {
+        return None;
+    };
+    let classdef = inst.classdef.as_ref()?;
+    let s = ClassDef::s_getattr(classdef, &field.name, &inst.flags).ok()?;
+    if matches!(s, SomeValue::Impossible) {
+        return None;
+    }
+    // `rewrite_op_getfield` kind is the field's lltype
+    // (`rclass.py` / `jtransform.py`). getattr of a raw handle
+    // (`*mut c_void` / HKEY) is a classdef-less Instance; overlaying
+    // that Ref onto an Int dest is `Ref(None) ∪ Int`
+    // (`llannotation.py` `pairtype(SomePtr, SomeObject).union`).
+    if !getattr_matches_legacy_kind(&s, kind) {
+        return None;
+    }
+    Some(Incoming::Annotation(Rc::new(s)))
+}
+
+/// Incoming getattr is used only when its `history.getkind` matches
+/// `infer_op_type` of the op (`FieldRead.ty` / Input ty). A Ref
+/// getattr must not replace an Int dest.
+fn getattr_matches_legacy_kind(s: &SomeValue, kind: &OpKind) -> bool {
+    let legacy = infer_op_type(kind);
+    let annotated = somevalue_to_valuetype(s);
+    let dest = valuetype_to_concrete(&legacy);
+    let got = valuetype_to_concrete(&annotated);
+    dest != ConcreteType::Unknown && got != ConcreteType::Unknown && dest == got
 }
 
 /// Typed `null_fn` (`model.rs push_null_fn_ptr_with_spelling`). A spelled
@@ -2401,6 +2531,316 @@ mod tests {
             crate::translator::rtyper::rint::signed_repr(),
         ));
         assert_eq!(const_value_type(&repr), ValueType::Void);
+    }
+
+    #[test]
+    fn freeze_input_unique_interned_is_void_some_pbc() {
+        // Dual-gate leftover MixLevel of a freeze-class method
+        // (`annlowlevel.py` `MixLevelHelperAnnotator`) seeds the unique
+        // interned PBC. `getFrozenPBCRepr` → `SingleFrozenPBCRepr`
+        // (`rpbc.py`) is Void.
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashSet;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let interned = bk.intern_class_by_qualname("Q2FreezeInputHost");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeInputHost".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeInputHost".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        bk.intern_prebuilt_instance(0x4000, &classdef)
+            .expect("intern");
+
+        let mut graph = FunctionGraph::new("freeze_input");
+        let entry = graph.startblock;
+        let self_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref(Some("Q2FreezeInputHost".into())),
+                    class_root: Some("Q2FreezeInputHost".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(self_var.clone()));
+        annotate_with_bookkeeper(&graph, Some(&bk));
+        match read_binding_some(&self_var).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(pbc.is_constant());
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("expected unique interned SomePBC, got {other:?}"),
+        }
+        assert_eq!(read_binding(&self_var), ValueType::Void);
+    }
+
+    #[test]
+    fn freeze_fieldread_unique_interned_is_void_some_pbc() {
+        // Dual-gate FieldRead of a freeze nested field
+        // (`unaryop.py` SomePBC.getattr / `pbc_getattr` /
+        // `FrozenDesc.s_read_attribute`). `getFrozenPBCRepr` →
+        // `SingleFrozenPBCRepr` (`rpbc.py`) is Void.
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::front::StructFieldRegistry;
+        use crate::model::FieldDescriptor;
+        use std::collections::HashSet;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let interned = bk.intern_class_by_qualname("Q2FreezeFieldHost");
+        let _nested = bk.intern_class_by_qualname("Q2FreezeFieldCache");
+        let mut names = HashSet::new();
+        names.insert("Q2FreezeFieldHost".to_string());
+        names.insert("Q2FreezeFieldCache".to_string());
+        bk.set_freeze_classes(names);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2FreezeFieldHost".to_string(),
+            vec![("fromcache".to_string(), "Q2FreezeFieldCache".to_string())],
+        );
+        reg.fields.insert(
+            "Q2FreezeFieldCache".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.note_prebuilt_ptr_field(0x4000, "fromcache", 0x4100);
+        let classdef = bk.getuniqueclassdef(&interned).expect("classdef");
+        bk.intern_prebuilt_instance(0x4000, &classdef)
+            .expect("intern");
+
+        let mut graph = FunctionGraph::new("freeze_fieldread");
+        let entry = graph.startblock;
+        let self_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref(Some("Q2FreezeFieldHost".into())),
+                    class_root: Some("Q2FreezeFieldHost".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let field_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: self_var,
+                    field: FieldDescriptor::new("fromcache", Some("Q2FreezeFieldHost".into())),
+                    ty: ValueType::Ref(Some("Q2FreezeFieldCache".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(field_var.clone()));
+        annotate_with_bookkeeper(&graph, Some(&bk));
+        match read_binding_some(&field_var).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert!(pbc.is_constant());
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("expected unique interned SomePBC field, got {other:?}"),
+        }
+        assert_eq!(read_binding(&field_var), ValueType::Void);
+    }
+
+    #[test]
+    fn option_box_fieldread_dest_has_pointee_classdef() {
+        // `Option<Box<T>>` is `Ptr` to T (`llannotation.py`
+        // `lltype_to_annotation` / `model.py` `SomeObject.noneify`).
+        // FieldRead dest must carry T's ClassDef so a later getattr of
+        // T's fields (`_lsprof` `ProfilerContext.previous`) is
+        // `SomeInstance.getattr`, not classdef-less.
+        use crate::front::StructFieldRegistry;
+        use crate::model::FieldDescriptor;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let host = bk.intern_class_by_qualname("Q2BoxHost");
+        let ctx = bk.intern_class_by_qualname("Q2BoxCtx");
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2BoxHost".to_string(),
+            vec![("ctx".to_string(), "Option<Box<Q2BoxCtx>>".to_string())],
+        );
+        reg.fields.insert(
+            "Q2BoxCtx".to_string(),
+            vec![("previous".to_string(), "Option<Box<Q2BoxCtx>>".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let _ = bk.getuniqueclassdef(&host).expect("host classdef");
+        let _ = bk.getuniqueclassdef(&ctx).expect("ctx classdef");
+
+        let mut graph = FunctionGraph::new("option_box_fieldread");
+        let entry = graph.startblock;
+        let self_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref(Some("Q2BoxHost".into())),
+                    class_root: Some("Q2BoxHost".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let ctx_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: self_var,
+                    field: FieldDescriptor::new("ctx", Some("Q2BoxHost".into())),
+                    ty: ValueType::Ref(Some("Option<Box<Q2BoxCtx>>".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let prev_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: ctx_var.clone(),
+                    field: FieldDescriptor::new("previous", Some("Q2BoxCtx".into())),
+                    ty: ValueType::Ref(Some("Option<Box<Q2BoxCtx>>".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(prev_var.clone()));
+        annotate_with_bookkeeper(&graph, Some(&bk));
+        match read_binding_some(&ctx_var).as_deref() {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(inst.classdef.is_some(), "ctx dest must have classdef");
+                assert!(inst.can_be_none, "Option<Box<T>> is can_be_None");
+            }
+            other => panic!("expected SomeInstance(Q2BoxCtx), got {other:?}"),
+        }
+        match read_binding_some(&prev_var).as_deref() {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(
+                    inst.classdef.is_some(),
+                    "previous dest must have classdef, got classdef-less"
+                );
+            }
+            other => panic!("expected SomeInstance previous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classed_instance_integer_fieldread_stays_int() {
+        // FieldRead of an integer field of a classed instance stays Int
+        // (`rclass.py` / `jtransform.py rewrite_op_getfield` kind comes
+        // from the field's lltype). `W_HKEY.hkey` is `*mut c_void`
+        // (`type HKEY = *mut c_void`); `history.getkind` of that raw
+        // Ptr is `'int'`. An unregistered pointee (`*mut TlsConnection`)
+        // projects a classdef-less SomeInstance (`project_struct_field_
+        // type_raw_ptr_to_unregistered_pointee_is_classdef_less`). Incoming
+        // getattr must not introduce Ref where the legacy walker had Int
+        // (`as_hkey` UnionError Ref(None) ∪ Int).
+        use crate::annotator::classdesc::Attribute;
+        use crate::annotator::model::SomeInstance;
+        use crate::front::StructFieldRegistry;
+        use crate::model::FieldDescriptor;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Q2HkeyHost".to_string(),
+            vec![
+                ("n".to_string(), "i64".to_string()),
+                ("hkey".to_string(), "*mut UndeclaredHandle".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("Q2HkeyHost")
+            .expect("host classdef");
+        let s_hkey = ClassDef::s_getattr(&cd, "hkey", &Default::default()).ok();
+        if !matches!(
+            s_hkey.as_ref(),
+            Some(SomeValue::Instance(_)) | Some(SomeValue::Ptr(_))
+        ) {
+            // FORCE / intern of a raw handle can land Integer; the
+            // as_hkey overlay is a classdef-less Instance (`llannotation.py`
+            // `pairtype(SomePtr, SomeObject).union`).
+            let mut cd_mut = cd.borrow_mut();
+            let attr = cd_mut
+                .attrs
+                .entry("hkey".to_string())
+                .or_insert_with(|| Attribute::new("hkey"));
+            attr.s_value = SomeValue::Instance(SomeInstance::new(
+                None,
+                true,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+        let s_hkey = ClassDef::s_getattr(&cd, "hkey", &Default::default())
+            .expect("getattr of raw handle field");
+        assert!(
+            matches!(s_hkey, SomeValue::Instance(_) | SomeValue::Ptr(_)),
+            "s_getattr of raw handle is Ref-kind, got {s_hkey:?}"
+        );
+
+        let mut graph = FunctionGraph::new("integer_fieldread");
+        let entry = graph.startblock;
+        let self_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref(Some("Q2HkeyHost".into())),
+                    class_root: Some("Q2HkeyHost".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let n_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: self_var.clone(),
+                    field: FieldDescriptor::new("n", Some("Q2HkeyHost".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let hkey_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: self_var,
+                    field: FieldDescriptor::new("hkey", Some("Q2HkeyHost".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(hkey_var.clone()));
+        annotate_with_bookkeeper(&graph, Some(&bk));
+        assert_eq!(
+            read_binding(&n_var),
+            ValueType::Int,
+            "i64 FieldRead dest must stay Int"
+        );
+        assert_eq!(
+            read_binding(&hkey_var),
+            ValueType::Int,
+            "raw handle FieldRead dest must stay Int, got {:?}",
+            read_binding_some(&hkey_var)
+        );
     }
 
     fn repr_const(

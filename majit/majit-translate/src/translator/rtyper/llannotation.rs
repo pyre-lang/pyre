@@ -302,7 +302,12 @@ impl SomePtr {
                     // receiver is already the nullable pointer word
                     // (`raw_struct_ptr_annotation`). Identity, same as
                     // `front::mir` `is_raw_ptr_as_ref`.
-                    Err(_) if attr == "as_ref" || attr == "as_mut" => {
+                    Err(_)
+                        if attr == "as_ref"
+                            || attr == "as_mut"
+                            || attr == "deref"
+                            || attr == "deref_mut" =>
+                    {
                         Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
                             "ptr_method_as_ref",
                             SomeValue::Ptr(self.clone()),

@@ -271,8 +271,7 @@ pub fn lower_named_with_static_addrs(
     static_addrs: HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
     with_shared_lowering(llbc, |ctx| {
-        let fd = llbc
-            .local_fn(function_name)
+        let fd = majit_translate::front::llbc_hints::fun_decl_for_name(llbc, function_name)
             .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
         lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
     })
@@ -289,8 +288,7 @@ pub fn lower_function_with_static_addrs(
 ) -> Result<FunctionGraph, LowerError> {
     if let Some(shared) = as_production_llbc(llbc) {
         with_shared_lowering(shared, |ctx| {
-            let fd = shared
-                .local_fn(function_name)
+            let fd = majit_translate::front::llbc_hints::fun_decl_for_name(shared, function_name)
                 .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
             lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
         })

@@ -9914,6 +9914,12 @@ pub struct FunctionGraph {
     /// `return_type` stays unstamped. A funcobj whose body cannot be built
     /// is called through this declared result (`rffi.llexternal`).
     pub residual_return_type: Option<String>,
+    /// Declared rustc return is a non-carrier `Result<T, E>`
+    /// (`tyref_is_result`, not peeled by `result_exc_projected_ok`).
+    /// `Cache.getorbuild` is this shape; `MemoDesc.pycall` wraps a
+    /// constant V as `Result::Ok` only then (`description.py` keeps
+    /// `s_result` when the declared return is V).
+    pub return_is_result: bool,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -10083,6 +10089,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_is_str: graph.return_is_str,
         return_container_root: graph.return_container_root.clone(),
         residual_return_type: graph.residual_return_type.clone(),
+        return_is_result: graph.return_is_result,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         specialization: graph.specialization,
@@ -10237,6 +10244,7 @@ impl FunctionGraph {
             return_is_str: false,
             return_container_root: None,
             residual_return_type: None,
+            return_is_result: false,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,
@@ -10286,6 +10294,13 @@ impl FunctionGraph {
         if !self.hints.iter().any(|h| h == &hint) {
             self.hints.push(hint);
         }
+    }
+
+    /// Harvested `func._annspecialcase_ == "specialize:memo"`
+    /// (`specialize.py memo`). The original body is never a translator
+    /// graph (`MemoDesc.pycall` does not `recursivecall`).
+    pub fn has_specialize_memo_hint(&self) -> bool {
+        self.hints.iter().any(|h| h == "specialize:memo")
     }
 
     /// Project every token already in [`Self::hints`] onto `func`.

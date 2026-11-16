@@ -574,6 +574,11 @@ fn dispatch_convert_from_to(
             &LowLevelType::Void,
             &ConstValue::None,
         )?))),
+        // rustc never-return Err arm (panic) still has a CFG edge to
+        // return with Impossible (`VoidRepr`). RPython raise does not.
+        // `rnone.py` `pairtype(NoneRepr, Repr)` converts None to dest
+        // via `inputconst(r_to, None)` (`null_instance` for instances).
+        (VoidRepr, Repr) => super::rnone::pair_none_any_convert_from_to(r_from, r_to, v, llops),
         // rnone.py — `pairtype(Repr, NoneRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, NoneRepr) => super::rnone::pair_any_none_convert_from_to(r_from, r_to, v, llops),

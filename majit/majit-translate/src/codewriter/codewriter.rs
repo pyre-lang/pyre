@@ -170,7 +170,10 @@ impl CodeWriter {
             .as_ref()
             .map(|existing| (existing.clone(), existing.bookkeeper().clone()))
         {
-            callcontrol.set_bookkeeper(bk);
+            callcontrol.set_bookkeeper(bk.clone());
+            for (parent, field, child) in callcontrol.prebuilt_ptr_fields() {
+                bk.note_prebuilt_ptr_field(*parent, field, *child);
+            }
             return registry;
         }
         // One bookkeeper per translation (`rtyper.annotator.bookkeeper`).
@@ -188,6 +191,10 @@ impl CodeWriter {
         let registry = std::rc::Rc::new(
             crate::translator::rtyper::call_registry::CallRegistry::new(bk),
         );
+        // Driver `specialize:memo` evaluator (`specialize.py memo`
+        // `func(*args)`). Attach before populate so
+        // `get_or_register_with_func` copies it onto memo GraphFuncs.
+        registry.set_memo_host_call(callcontrol.memo_host_call().cloned());
         // Thread the program-wide struct field shapes into the shared
         // bookkeeper so
         // `getuniqueclassdef_for_struct_root` / `project_struct_field_type`
@@ -200,6 +207,14 @@ impl CodeWriter {
         registry
             .bookkeeper()
             .set_immutable_fields_structs(callcontrol.immutable_fields_by_struct.clone());
+        registry
+            .bookkeeper()
+            .set_freeze_classes(callcontrol.freeze_classes.clone());
+        for (parent, field, child) in callcontrol.prebuilt_ptr_fields() {
+            registry
+                .bookkeeper()
+                .note_prebuilt_ptr_field(*parent, field, *child);
+        }
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.
@@ -725,6 +740,8 @@ impl CodeWriter {
             crate::translator::rtyper::cutover::apply_rtyper_const_results(
                 &mut graph_owned,
                 const_results,
+                Some(callcontrol.function_graphs()),
+                Some(self.dual_gate_registry(callcontrol).as_ref()),
             );
         }
         let real_value_to_var = published.map(|(value_to_var, _)| value_to_var);

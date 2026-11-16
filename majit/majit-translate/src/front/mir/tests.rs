@@ -33600,55 +33600,576 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
 }
 
 /// `space.fromcache(ClassDictStrategy)` holder (`classdict.py`). The
-/// accessor is the same OnceLock+immortal malloc as `w_none`; the refs
-/// row is the GC object, so `get_or_init` is `Bookkeeper.immutablevalue`.
+/// PREBUILT fromcache instance owns the immortal holder; there is no
+/// process-wide OnceLock static. The refs row is that holder, captured
+/// through `class_dict_strategy_ref` (`baseobjspace.py ObjSpace.fromcache`,
+/// `cache.py Cache.getorbuild` specialize:memo).
+///
+/// Lowering with production-shaped refs plus the driver memo host_call
+/// must fold to `ConstRefAddr` of the PREBUILT instance or of its holder
+/// (`rclass.py InstanceRepr.convert_const_exact`).
 #[test]
-#[ignore = "requires the extracted pyre-interpreter LLBC"]
-fn class_dict_strategy_ref_get_or_init_folds_to_prebuilt() {
-    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
-    let addr = 0x1234_5678i64;
-    let refs = [("objspace::std::classdict::CLASS_DICT_STRATEGY_REF", addr)];
-    let graph = crate::test_support::lower_function_with_static_addrs(
+fn class_dict_strategy_ref_has_no_process_wide_oncelock() {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::flowspace::model::{
+        ConstValue, HostCall, HostGetAttrError, HostObject, NativeInstanceDict,
+    };
+    use crate::parse::CallPath;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::cutover::{
+        DualGateOutcome, apply_rtyper_const_results, dual_gate_check_with_registry,
+        populate_call_registry_from_call_graphs, specialize_test_lock,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    const HOLDER: i64 = 0x1234_5678;
+    const INSTANCE: i64 = 0x1234_9abc;
+    const SPACE: i64 = 0x1000_0000;
+    const CACHE: i64 = 0x1000_1000;
+    let refs = [
+        ("objspace::std::classdict::CLASS_DICT_STRATEGY_REF", HOLDER),
+        ("objspace::std::classdict::ClassDictStrategy", INSTANCE),
+        ("baseobjspace::OBJECT_SPACE", SPACE),
+    ];
+
+    struct LiveRef {
+        addr: i64,
+        fields: HashMap<String, ConstValue>,
+    }
+    impl NativeInstanceDict for LiveRef {
+        fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
+            self.fields
+                .get(name)
+                .cloned()
+                .ok_or(HostGetAttrError::Missing)
+        }
+        fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+            Ok(self.fields.keys().cloned().collect())
+        }
+        fn live_addr(&self) -> Option<i64> {
+            Some(self.addr)
+        }
+    }
+
+    let prebuilt = [SPACE, CACHE, INSTANCE, HOLDER];
+    // Production `specialize_memo_host_call` matches
+    // `SpaceCacheClass::from_discriminant` / `jit_ref_name` / `type_leaf`
+    // and interns by live address (`bookkeeper.py immutablevalue`).
+    const CLASS_DICT_JIT_REF: &str = "objspace::std::classdict::ClassDictStrategy";
+    const CLASS_DICT_LEAF: &str = "ClassDictStrategy";
+    let intern = std::sync::Mutex::new(HashMap::<i64, HostObject>::new());
+    let memo_host_call = HostCall(Arc::new(move |args: &[ConstValue]| {
+        let has_prebuilt = args.iter().any(|arg| match arg {
+            ConstValue::HostObject(h) => h.live_ref_addr().is_some_and(|a| prebuilt.contains(&a)),
+            ConstValue::LLPtr(p) => matches!(
+                p._obj0_value(),
+                Ok(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(n)
+                )) if prebuilt.contains(&n)
+            ),
+            ConstValue::Int(n) => prebuilt.contains(n),
+            _ => false,
+        });
+        if !has_prebuilt {
+            return Err("specialize:memo host_call: no PREBUILT receiver".into());
+        }
+        let key_is_class_dict = args.iter().any(|arg| match arg {
+            ConstValue::Int(n) => *n == 0,
+            ConstValue::HostObject(h) => {
+                h.qualname() == CLASS_DICT_JIT_REF || h.simple_name() == CLASS_DICT_LEAF
+            }
+            _ => false,
+        });
+        if !key_is_class_dict {
+            return Err("specialize:memo host_call: no fromcache key".into());
+        }
+        if let Some(existing) = intern.lock().expect("memo intern").get(&INSTANCE).cloned() {
+            return Ok(ConstValue::HostObject(existing));
+        }
+        let class = HostObject::new_class(CLASS_DICT_JIT_REF, Vec::new());
+        let holder_class = HostObject::new_class(
+            "objspace::std::classdict::ClassDictStrategy::holder",
+            Vec::new(),
+        );
+        let holder = HostObject::new_native_instance(
+            holder_class,
+            Arc::new(LiveRef {
+                addr: HOLDER,
+                fields: HashMap::new(),
+            }),
+        );
+        let mut fields = HashMap::new();
+        fields.insert("holder".to_string(), ConstValue::HostObject(holder));
+        let host = HostObject::new_native_instance(
+            class,
+            Arc::new(LiveRef {
+                addr: INSTANCE,
+                fields,
+            }),
+        );
+        let stored = intern
+            .lock()
+            .expect("memo intern")
+            .entry(INSTANCE)
+            .or_insert(host)
+            .clone();
+        Ok(ConstValue::HostObject(stored))
+    }));
+
+    let ptr_fields = [
+        (SPACE, "fromcache", CACHE),
+        (CACHE, "base", CACHE),
+        (INSTANCE, "holder", HOLDER),
+    ];
+    let static_addrs = crate::HostStaticAddrs {
+        refs: &refs,
+        memo_host_call: Some(&memo_host_call),
+        ptr_fields: &ptr_fields,
+        ..Default::default()
+    };
+    let mut graph = crate::test_support::lower_function_with_static_addrs(
         llbc,
         "pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref",
-        crate::HostStaticAddrs {
-            refs: &refs,
-            ..Default::default()
-        },
+        static_addrs,
     )
     .expect("lower class_dict_strategy_ref");
-    let residual: Vec<Vec<String>> = graph
-        .blocks
+
+    let Some(rlib) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC,
+    ) else {
+        return;
+    };
+    let harvested = crate::front::llbc_hints::harvest_hints_from_llbcs(&[llbc, rlib]);
+    let memo_paths: Vec<String> = harvested
         .iter()
-        .flat_map(|block| &block.operations)
+        .filter(|(_, hints)| hints.iter().any(|hint| hint == "specialize:memo"))
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    fn call_targets(graph: &FunctionGraph) -> Vec<(String, Option<u64>)> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } => Some((segments.join("::"), *fun_decl_id)),
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            resolved_path: Some(path),
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } => Some((path.segments.join("::"), *fun_decl_id)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn fundecl_name_matches(fd: &majit_charon_reader::FunDecl, name: &str) -> bool {
+        let path = fd.item_meta.name_path();
+        path == name || name.ends_with(&path) || path.ends_with(name)
+    }
+    fn try_lower(
+        interpreter: &majit_charon_reader::Llbc,
+        rlib: &majit_charon_reader::Llbc,
+        name: &str,
+        fun_decl_id: Option<u64>,
+        static_addrs: crate::HostStaticAddrs<'_>,
+    ) -> Option<FunctionGraph> {
+        if let Some(id) = fun_decl_id {
+            for llbc in [interpreter, rlib] {
+                let Some(fd) = llbc.fn_by_id(id) else {
+                    continue;
+                };
+                if !fundecl_name_matches(fd, name) {
+                    continue;
+                }
+                if let Ok(graph) =
+                    crate::test_support::lower_fun_decl_id_with_static_addrs(llbc, id, static_addrs)
+                {
+                    return Some(graph);
+                }
+            }
+        }
+        crate::test_support::lower_function_with_static_addrs(interpreter, name, static_addrs)
+            .ok()
+            .or_else(|| {
+                crate::test_support::lower_function_with_static_addrs(rlib, name, static_addrs).ok()
+            })
+    }
+    fn skip_lower(path: &str) -> bool {
+        path.is_empty()
+            || path.contains("__cast_instance_intrinsic")
+            || path.starts_with("core::")
+            || path.starts_with("std::")
+            || path.starts_with("alloc::")
+    }
+    fn follow_callee(path: &str) -> bool {
+        [
+            "baseobjspace",
+            "classdict",
+            "cache::",
+            "getorbuild",
+            "fromcache",
+            "object_space",
+            "strategy_ref",
+            "RetainedSpaceCache",
+            "SpaceCache",
+        ]
+        .iter()
+        .any(|needle| path.contains(needle))
+    }
+    fn strip_instantiation(path: &str) -> String {
+        let mut segs: Vec<&str> = path.split("::").collect();
+        if let Some(leaf) = segs.last_mut()
+            && let Some(idx) = leaf.find("::<")
+        {
+            *leaf = &leaf[..idx];
+        }
+        segs.join("::")
+    }
+    fn path_is_memo(
+        path: &str,
+        memo_paths: &[String],
+        interpreter: &majit_charon_reader::Llbc,
+        rlib: &majit_charon_reader::Llbc,
+        fun_decl_id: Option<u64>,
+    ) -> bool {
+        // Harvested memo paths are already crate-stripped
+        // (`llbc_hints`). `strip_crate_prefix` of `cache::<Impl>::getorbuild`
+        // would peel `cache` and leave `<Impl>::getorbuild`, which then
+        // matches every inherent `getorbuild`. Compare the instantiated
+        // path and one crate-prefix peel against the harvested key, and
+        // the owner-qualified `{owner}::{leaf}` harvest spelling.
+        let path_g = strip_instantiation(path);
+        let path_stripped = strip_instantiation(&crate::front::mir::strip_crate_prefix(path));
+        if memo_paths.iter().any(|memo| {
+            let memo_g = strip_instantiation(memo);
+            path_g == memo_g || path_stripped == memo_g
+        }) {
+            return true;
+        }
+        if let Some((owner, leaf)) = impl_owner_for(interpreter, rlib, path, fun_decl_id) {
+            let owner_key = format!("{owner}::{leaf}");
+            return memo_paths
+                .iter()
+                .any(|memo| strip_instantiation(memo) == owner_key);
+        }
+        false
+    }
+    fn impl_owner_for(
+        interpreter: &majit_charon_reader::Llbc,
+        rlib: &majit_charon_reader::Llbc,
+        path: &str,
+        fun_decl_id: Option<u64>,
+    ) -> Option<(String, String)> {
+        if let Some(id) = fun_decl_id {
+            for artefact in [interpreter, rlib] {
+                if let Some(fd) = artefact.fn_by_id(id) {
+                    if let Some(pair) = super::impl_method_owner_for_fundecl(artefact, fd) {
+                        return Some(pair);
+                    }
+                }
+            }
+        }
+        for artefact in [interpreter, rlib] {
+            if let Some(fd) = crate::front::llbc_hints::fun_decl_for_name(artefact, path) {
+                if let Some(pair) = super::impl_method_owner_for_fundecl(artefact, fd) {
+                    return Some(pair);
+                }
+            }
+        }
+        None
+    }
+    fn memo_host_graph(
+        name: &str,
+        interpreter: &majit_charon_reader::Llbc,
+        rlib: &majit_charon_reader::Llbc,
+    ) -> FunctionGraph {
+        // `description.py` `FunctionDesc.signature` is the code object's
+        // formals; `MemoDesc.pycall` / `specialize.py` `memo` never flow
+        // the original body. Stamp startblock inputargs from the FunDecl
+        // harvest resolves, not `FunctionGraph::new`'s empty block.
+        let n_args = [rlib, interpreter]
+            .into_iter()
+            .find_map(|artefact| {
+                crate::front::llbc_hints::fun_decl_for_name(artefact, name)
+                    .map(|fd| fd.signature.inputs.len())
+            })
+            .unwrap_or(0);
+        let mut stub = FunctionGraph::new(name.rsplit("::").next().unwrap_or(name).to_string());
+        stub.source_identity = Some(name.to_string());
+        stub.hints.push("specialize:memo".into());
+        stub.block_mut(stub.startblock).inputargs = (0..n_args)
+            .map(|_| crate::flowspace::model::Variable::new())
+            .collect();
+        stub
+    }
+    fn insert_graph_aliases(
+        graphs: &mut crate::codewriter::call::GraphStore,
+        path: &str,
+        graph: FunctionGraph,
+        interpreter: &majit_charon_reader::Llbc,
+        rlib: &majit_charon_reader::Llbc,
+        fun_decl_id: Option<u64>,
+    ) {
+        graphs.insert(CallPath::from_segments(path.split("::")), graph.clone());
+        for prefix in ["pyre_interpreter::", "majit_rlib::", "pyre_object::"] {
+            if let Some(stripped) = path.strip_prefix(prefix) {
+                graphs.insert(CallPath::from_segments(stripped.split("::")), graph.clone());
+            } else if !path.starts_with("core::") && !path.starts_with("std::") {
+                let mut segs = vec![prefix.trim_end_matches("::").to_string()];
+                segs.extend(path.split("::").map(str::to_string));
+                graphs.insert(CallPath::from_segments(segs), graph.clone());
+            }
+        }
+        // Production keys inherent methods as `[owner, leaf]`
+        // (`CallPath::for_impl_method`). Charon's `<Impl>` token collides
+        // every inherent impl in a module (`InternalSpaceCache::getorbuild`
+        // vs `SpaceCache::getorbuild` vs `Cache::getorbuild`).
+        if let Some((owner, leaf)) = impl_owner_for(interpreter, rlib, path, fun_decl_id) {
+            let key = CallPath::for_impl_method(&owner, &leaf);
+            let incoming_memo = graph.hints.iter().any(|hint| hint == "specialize:memo");
+            let keep_existing_memo = graphs.get(&key).is_some_and(|existing| {
+                existing.hints.iter().any(|hint| hint == "specialize:memo") && !incoming_memo
+            });
+            if !keep_existing_memo {
+                graphs.insert(key, graph.clone());
+            }
+        }
+    }
+
+    let mut graphs = crate::codewriter::call::GraphStore::default();
+    let mut pending: Vec<(String, Option<u64>)> = call_targets(&graph);
+    pending.extend(memo_paths.iter().cloned().map(|path| (path, None)));
+    for artefact in [llbc, rlib] {
+        for fd in artefact.iter_local_fns() {
+            let path = fd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or("");
+            if !matches!(
+                leaf,
+                "getorbuild"
+                    | "fromcache"
+                    | "strategy_ref"
+                    | "object_space"
+                    | "class_dict_strategy_from_space"
+                    | "class_dict_strategy_ref"
+                    | "retain_owner"
+            ) {
+                continue;
+            }
+            if leaf != "getorbuild" && !follow_callee(&path) {
+                continue;
+            }
+            pending.push((path.to_string(), Some(fd.def_id)));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some((name, fun_decl_id)) = pending.pop() {
+        let seen_key = fun_decl_id
+            .map(|id| format!("id:{id}:{name}"))
+            .unwrap_or_else(|| name.clone());
+        if !seen.insert(seen_key) || skip_lower(&name) {
+            continue;
+        }
+        let Some(mut callee) = try_lower(llbc, rlib, &name, fun_decl_id, static_addrs) else {
+            if path_is_memo(&name, &memo_paths, llbc, rlib, fun_decl_id) {
+                let key = CallPath::from_segments(name.split("::"));
+                if graphs.get(&key).is_none() {
+                    let stub = memo_host_graph(&name, llbc, rlib);
+                    insert_graph_aliases(&mut graphs, &name, stub, llbc, rlib, fun_decl_id);
+                }
+            }
+            continue;
+        };
+        if path_is_memo(&name, &memo_paths, llbc, rlib, fun_decl_id)
+            || callee.hints.iter().any(|hint| hint == "specialize:memo")
+            || callee
+                .source_identity
+                .as_deref()
+                .is_some_and(|id| path_is_memo(id, &memo_paths, llbc, rlib, fun_decl_id))
+        {
+            if !callee.hints.iter().any(|hint| hint == "specialize:memo") {
+                callee.hints.push("specialize:memo".into());
+            }
+        }
+        pending.extend(
+            call_targets(&callee)
+                .into_iter()
+                .filter(|(path, _)| follow_callee(path)),
+        );
+        insert_graph_aliases(&mut graphs, &name, callee, llbc, rlib, fun_decl_id);
+    }
+    for path in &memo_paths {
+        let key = CallPath::from_segments(path.split("::"));
+        if graphs.get(&key).is_some() {
+            continue;
+        }
+        let stub = memo_host_graph(path, llbc, rlib);
+        insert_graph_aliases(&mut graphs, path, stub, llbc, rlib, None);
+    }
+
+    let is_rlib_cache_getorbuild = |key: &str| {
+        key.contains("cache::<Impl>::getorbuild") || key.contains("cache::Cache::getorbuild")
+    };
+    let wrongly_memo: Vec<String> = graphs
+        .iter_declared()
+        .into_iter()
+        .filter(|(path, g)| {
+            g.hints.iter().any(|hint| hint == "specialize:memo")
+                && path.segments.iter().any(|seg| seg.contains("getorbuild"))
+                && !is_rlib_cache_getorbuild(&path.canonical_key())
+        })
+        .map(|(path, _)| path.canonical_key())
+        .collect();
+    assert!(
+        wrongly_memo.is_empty(),
+        "only Cache::getorbuild is specialize:memo, got {wrongly_memo:?}; memo paths {memo_paths:?}"
+    );
+    assert!(
+        graphs.iter_declared().into_iter().any(|(path, g)| {
+            is_rlib_cache_getorbuild(&path.canonical_key())
+                && g.hints.iter().any(|hint| hint == "specialize:memo")
+        }),
+        "Cache::getorbuild must carry specialize:memo; memo paths {memo_paths:?}"
+    );
+
+    let _lock = specialize_test_lock();
+    let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+    let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+    let field_ctx = crate::front::mir::LowerContext::new(llbc);
+    field_ctx.seed_force_attributes();
+    let struct_fields = std::rc::Rc::new(field_ctx.struct_field_registry());
+    ann.bookkeeper.set_struct_fields(struct_fields.clone());
+    ann.bookkeeper
+        .set_freeze_classes(crate::front::mir::harvest_freeze_classes_from_llbcs(&[
+            llbc, rlib,
+        ]));
+    let enum_map = std::rc::Rc::new(field_ctx.enum_variant_by_discriminant().clone());
+    ann.bookkeeper
+        .set_enum_variant_by_discriminant(enum_map.clone());
+    registry.set_struct_fields(struct_fields);
+    registry.set_enum_variant_by_discriminant(enum_map);
+    registry.set_memo_host_call(Some(memo_host_call.clone()));
+    // Live `fromcache` / `base` / `holder` pointers (`FrozenDesc` `getattr`).
+    ann.bookkeeper
+        .note_prebuilt_ptr_field(SPACE, "fromcache", CACHE);
+    ann.bookkeeper.note_prebuilt_ptr_field(CACHE, "base", CACHE);
+    ann.bookkeeper
+        .note_prebuilt_ptr_field(INSTANCE, "holder", HOLDER);
+    populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+        .expect("populate CallRegistry");
+    let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+    let DualGateOutcome::Match {
+        const_results,
+        real_value_to_var,
+        ..
+    } = outcome
+    else {
+        let DualGateOutcome::Skip(reason) = outcome else {
+            unreachable!("dual-gate Match or Skip");
+        };
+        panic!(
+            "class_dict_strategy_ref dual-gate Skip ({reason}); memo paths: {memo_paths:?}; \
+             callees: {:?}",
+            call_targets(&graph),
+        );
+    };
+    apply_rtyper_const_results(&mut graph, &const_results, Some(&graphs), Some(&registry));
+
+    let ops = || graph.blocks.iter().flat_map(|block| &block.operations);
+    // `rpbc.py` `FunctionReprBase.call` keeps a non-memo wrapper Call
+    // (`rtyper_const_replaces_call`). The memo fold is `hop.s_result`
+    // constant; `rclass.py` `InstanceRepr.convert_const_exact` of that
+    // live addr is ConstRefAddr. Overlay the memo Call dest when this
+    // graph names `Cache.getorbuild`; otherwise the constant lives on
+    // the caller's annotated dest / interned descs.
+    fn const_live_addr(cv: &ConstValue) -> Option<i64> {
+        match cv {
+            ConstValue::HostObject(h) => h.live_ref_addr(),
+            ConstValue::LLPtr(p) => match p._obj0_value() {
+                Ok(Some(crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::IntCast(n))) => {
+                    Some(n)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let mut folded: Vec<i64> = Vec::new();
+    if ops().any(|op| {
+        matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == HOLDER || *value == INSTANCE)
+    }) {
+        folded.extend([HOLDER, INSTANCE]);
+    }
+    for c in const_results.values() {
+        if let Some(addr) = const_live_addr(&c.value) {
+            folded.push(addr);
+        }
+    }
+    for typed in real_value_to_var.values() {
+        let ann = typed.annotation.borrow();
+        let Some(s) = ann.as_ref() else {
+            continue;
+        };
+        if !s.is_constant() {
+            continue;
+        }
+        if let Some(addr) = s.const_().and_then(const_live_addr) {
+            folded.push(addr);
+        }
+    }
+    folded.extend(ann.bookkeeper.interned_prebuilt_live_addrs());
+    assert!(
+        folded
+            .iter()
+            .any(|addr| *addr == HOLDER || *addr == INSTANCE),
+        "specialize:memo must intern ConstRefAddr of the PREBUILT instance or holder; \
+         folded={folded:?}; interned={:?}; ops: {:?}",
+        ann.bookkeeper.interned_prebuilt_live_addrs(),
+        ops().map(|op| format!("{:?}", op.kind)).collect::<Vec<_>>()
+    );
+    let residual: Vec<Vec<String>> = ops()
         .filter_map(|op| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } if segments.iter().any(|s| s == "get_or_init") => Some(segments.clone()),
+            } if segments.iter().any(|s| {
+                matches!(
+                    s.as_str(),
+                    "getorbuild" | "fromcache" | "get_or_init" | "LOCK"
+                ) || s.contains("getorbuild")
+                    || s.contains("OnceLock")
+            }) =>
+            {
+                Some(segments.clone())
+            }
             _ => None,
         })
         .collect();
     assert!(
         residual.is_empty(),
-        "get_or_init survived lowering: {residual:?}"
+        "getorbuild/fromcache/LOCK survived lowering: {residual:?}"
     );
     assert!(
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr)),
-        "refs row must fold to ConstRefAddr"
-    );
-    assert!(
-        !graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| matches!(&op.kind,
-                OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
-                    if owner.contains("OnceLock"))),
+        !ops().any(|op| matches!(&op.kind,
+            OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
+                if owner.contains("OnceLock"))),
         "OnceLock cell is not a class instance"
     );
 }
@@ -43322,4 +43843,106 @@ fn declared_gc_path_spelling_does_not_borrow_a_colliding_gc_leaf() {
         "pyre_x::counter::Entry"
     ));
     assert!(super::spelling_path_is_declared_gc(&ids, "Entry"));
+}
+
+/// `Arg::<T>::get(self, arg: OpArg) -> T` (`instruction.rs`). Identified
+/// by the `get` leaf plus `inputs[1]` being `oparg::OpArg` — the same
+/// structural test as `oparg_arg_get_alias`. `try_get` shares those
+/// inputs and is not this method.
+#[test]
+fn fun_decl_is_oparg_arg_get_matches_arg_get_not_try_get() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let gets: Vec<_> = llbc
+        .iter_fun_decls()
+        .filter(|fd| super::fun_decl_is_oparg_arg_get(&llbc, fd))
+        .map(|fd| fd.item_meta.name_path_str())
+        .collect();
+    assert!(
+        gets.iter()
+            .any(|p| p.contains("bytecode::instruction") && p.ends_with("::get")),
+        "Arg::get FunDecl is identified; got {gets:?}"
+    );
+    assert!(
+        gets.iter().all(|p| p.rsplit("::").next() == Some("get")),
+        "try_get is not Arg::get; got {gets:?}"
+    );
+}
+
+/// The FunDecl body of `Arg::get` is identity of the `OpArg` argument
+/// (`identity_unstructured` of input 1). Leftover MixLevel and two-phase
+/// then both type the dest Signed (`tyref_is_oparg` of LoadAttr).
+#[test]
+fn oparg_arg_get_identity_body_copies_the_oparg_argument() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| super::fun_decl_is_oparg_arg_get(&llbc, fd))
+        .expect("Arg::get FunDecl");
+    let body = super::maybe_oparg_arg_get_identity_body(
+        &llbc,
+        fd,
+        &fd.signature.inputs,
+        &fd.signature.output,
+    )
+    .expect("Arg::get identity body");
+    assert_eq!(body.locals.arg_count, 2);
+    assert_eq!(body.locals.locals.len(), 3);
+    let kind = body.body[0].statements[0].kind_value();
+    let src = kind
+        .pointer("/Assign/1/Use/0/Read/kind/Local")
+        .and_then(serde_json::Value::as_u64);
+    assert_eq!(src, Some(2), "copies local 2 (OpArg); kind={kind}");
+}
+
+/// Lowered `Arg::get` has no residual `try_get` / `unwrap` Call: the
+/// body is the identity of the operand, matching `oparg_arg_get_alias`.
+#[test]
+fn oparg_arg_get_lowers_without_try_get_unwrap() {
+    use crate::model::{CallTarget, OpKind};
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(
+        crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+    ) else {
+        return;
+    };
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| super::fun_decl_is_oparg_arg_get(&llbc, fd))
+        .expect("Arg::get FunDecl");
+    let ctx = crate::front::mir::LowerContext::new(llbc);
+    let graph = crate::front::mir::lower_fun_decl_with_static_addrs(
+        &ctx,
+        fd,
+        crate::HostStaticAddrs::default(),
+    )
+    .expect("lower Arg::get identity");
+    let residual: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if matches!(
+                segments.last().map(String::as_str),
+                Some("try_get" | "unwrap" | "try_from" | "map_err")
+            ) =>
+            {
+                Some(segments.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "Arg::get identity must not residualize try_get/unwrap: {residual:?}"
+    );
 }
