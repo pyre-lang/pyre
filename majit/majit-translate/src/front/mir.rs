@@ -5428,6 +5428,7 @@ fn published_struct_field_layout(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> String {
     let leaf = type_path.rsplit("::").next().unwrap_or(type_path);
     let is_rbigint = type_path == "rbigint::RBigInt" || type_path.ends_with("::rbigint::RBigInt");
@@ -5457,7 +5458,13 @@ fn published_struct_field_layout(
         // but Rust shares one `TypedItemsBlock` word type). Publishing
         // `[f64]` here made the field `SomeList` and `setattr("block")`
         // saw `List ∪ Ptr`.
-        annotation_struct_field_type(field_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        annotation_struct_field_type(
+            field_ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            ambiguous_leaves,
+        )
     }
 }
 
@@ -5473,6 +5480,7 @@ fn annotation_struct_field_type(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
         Some(majit_ir::rvec::VecItemKind::Int) => {
@@ -5483,8 +5491,17 @@ fn annotation_struct_field_type(
         Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => {
-            let layout =
-                tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
+            // `bookkeeper.py` `getuniqueclassdef` is one ClassDef per class,
+            // not per leaf. A leaf in `ambiguous_leaves` is painted with the
+            // qualified identity `adt_ast_head` / `tombstoned_owner_spelling`
+            // already use; a unique leaf stays the TypeDecl leaf.
+            let layout = tyref_to_field_layout_string_with(
+                ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                ambiguous_leaves,
+            );
             field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
         }
     }
@@ -6283,6 +6300,7 @@ fn exception_class_declared_attr(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
     bk: &std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
 ) -> ExceptionClassAttrDecl {
     let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
@@ -6296,6 +6314,7 @@ fn exception_class_declared_attr(
             no_tombstoned_leaves(),
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            ambiguous_leaves,
         )
     };
     let kind = if by_value_string {
@@ -6341,7 +6360,13 @@ fn exception_class_declared_attr(
         )
     } else {
         (
-            annotation_struct_field_type(&field.ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
+            annotation_struct_field_type(
+                &field.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                ambiguous_leaves,
+            ),
             tyref_to_attr_value_type_with(
                 &field.ty,
                 llbc,
@@ -6664,6 +6689,7 @@ fn register_exception_class_variant_fields(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) {
@@ -6714,6 +6740,7 @@ fn register_exception_class_variant_fields(
                 llbc,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                ambiguous_leaves,
                 &bk,
             );
             if let Some(group) = groups
@@ -6939,6 +6966,7 @@ fn derive_program_metadata(
                                 llbc,
                                 gc_struct_ids,
                                 raw_alloc_flavor_structs,
+                                &ambiguous_leaves,
                             ),
                         };
                         let field_ty =
@@ -7121,6 +7149,7 @@ fn derive_program_metadata(
                         llbc,
                         gc_struct_ids,
                         raw_alloc_flavor_structs,
+                        &ambiguous_leaves,
                         &mut struct_fields,
                         &mut struct_field_attrs,
                     );
@@ -7457,6 +7486,7 @@ fn derive_program_metadata(
                                         llbc,
                                         gc_struct_ids,
                                         raw_alloc_flavor_structs,
+                                        &ambiguous_leaves,
                                     ),
                                     tyref_to_attr_value_type_with(
                                         &f.ty,
@@ -9345,7 +9375,8 @@ pub(crate) use self::lltype::{
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation,
+    entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
+    fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,
     host_rthread_threadlocalref_llop, impl_method_owner_for_fundecl, impl_owner_from_item_meta,
     is_cow_str_family_class_root, is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,

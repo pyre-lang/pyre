@@ -850,73 +850,43 @@ impl<'a> Lowering<'a> {
     }
 
     /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
-    /// `cast_int_to_ptr` + `cast_instance`. The integer is not recorded
-    /// in `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
-    /// Offset 0 is the header itself (`GcArray` items at byte 0).
+    /// `cast_int_to_ptr`. The integer is not recorded in
+    /// `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
+    ///
+    /// A non-GC `Struct` inlined in `GcArray` (`rordereddict.py`
+    /// `DICTENTRY`, `lltype.py` `direct_arrayitems`) is `lltype.Ptr(ITEM)`.
+    /// `ann_cast_int_to_ptr` answers `SomePtr(PtrT.const)` for that
+    /// constant `Ptr` and `SomePtr(GCREF)` for the 1-arg form. The 2-arg
+    /// cast names the instantiated item from `item_ty`; an unbound
+    /// `??TypeVar` keeps the template name
+    /// (`raw_struct_array_item_lltype_inner`). Offset 0 still casts the
+    /// header to an int so the typed cast has an int operand. When that
+    /// `Ptr` cannot be built, the 1-arg cast stays. A root that is not
+    /// the inlined item still takes `cast_instance`. Offset 0 of that
+    /// root is the header itself (`GcArray` items at byte 0).
     pub(in crate::front::mir) fn emit_array_tail_item_ptr(
         &mut self,
         bb_id: BlockId,
         base: Variable,
         offset: u64,
         root: &str,
+        item_ty: &TyRef,
     ) -> Variable {
-        let raw = if offset == 0 {
-            base
-        } else {
+        let (is_item, item_ptr_ty) = self.array_tail_gcarray_item_ptr_lltype(root, item_ty);
+        // Offset 0 of a non-item root is the header. A typed item cast
+        // still needs `cast_ptr_to_int` so `ann_cast_int_to_ptr` has an
+        // int operand (`direct_arrayitems`).
+        let raw = if item_ptr_ty.is_some() || offset != 0 {
             let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, base);
-            let off = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-            let off_n = i64::try_from(offset).expect("array field offset fits in Signed");
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(off.clone()),
-                kind: OpKind::ConstInt(off_n),
-            });
-            let sum = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(sum.clone()),
-                kind: OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: addr,
-                    rhs: off,
-                    result_ty: ValueType::Int,
-                },
-            });
-            let raw = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(raw.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: [
-                            "rpython",
-                            "rtyper",
-                            "lltypesystem",
-                            "lltype",
-                            "cast_int_to_ptr",
-                        ]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![sum]),
-                    result_ty: ValueType::Ref(None),
-                },
-            });
-            raw
+            let sum = self.array_items_int_operand(bb_id, addr, offset);
+            if let Some(ptr_ty) = item_ptr_ty {
+                return emit_dest_typed_cast_int_to_ptr(&mut self.graph, bb_id, sum, ptr_ty);
+            }
+            self.emit_untyped_cast_int_to_ptr(bb_id, sum)
+        } else {
+            base
         };
-        // `rordereddict.py` `DICTENTRY` is `lltype.Struct` inlined in
-        // `GcArray`. `direct_arrayitems` is that interior pointer
-        // (`lltype.py`); a classdef recast is Instance ∪ Ptr at
-        // `RDict::entry_at`.
-        if self.struct_fields.is_some_and(|reg| {
-            crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, root)
-        }) {
+        if is_item {
             return raw;
         }
         let res = self
@@ -927,6 +897,91 @@ impl<'a> Lowering<'a> {
             kind: crate::model::cast_instance_call(root, raw),
         });
         res
+    }
+
+    /// `Ptr(ITEM)` for a gcarray item dest, or `None` when `root` is not
+    /// that item or the struct cannot be built. The bool is the item
+    /// test alone: a failed build keeps the 1-arg cast.
+    fn array_tail_gcarray_item_ptr_lltype(
+        &self,
+        root: &str,
+        item_ty: &TyRef,
+    ) -> (
+        bool,
+        Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+    ) {
+        let Some(reg) = self.struct_fields else {
+            return (false, None);
+        };
+        if !crate::annotator::bookkeeper::struct_root_template_is_gcarray_item(reg, root) {
+            return (false, None);
+        }
+        let ptr_ty =
+            match instantiated_struct_item_spelling(item_ty, self.llbc, self.tombstoned_leaves) {
+                Some(spelling) => gcarray_item_struct_ptr_lltype(reg, &spelling),
+                None => gcarray_item_struct_ptr_lltype(reg, root),
+            };
+        (true, ptr_ty)
+    }
+
+    /// Integer operand of `cast_int_to_ptr`. Offset 0 is `addr` itself
+    /// (`direct_arrayitems` of a zero items base). A nonzero offset is
+    /// `addr + offset`; that add is not folded back through
+    /// `cast_ptr_to_int_src`.
+    fn array_items_int_operand(&mut self, bb_id: BlockId, addr: Variable, offset: u64) -> Variable {
+        if offset == 0 {
+            return addr;
+        }
+        let off = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let off_n = i64::try_from(offset).expect("array field offset fits in Signed");
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(off.clone()),
+            kind: OpKind::ConstInt(off_n),
+        });
+        let sum = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: off,
+                result_ty: ValueType::Int,
+            },
+        });
+        sum
+    }
+
+    /// 1-arg `lltype.cast_int_to_ptr` (`ann_cast_int_to_ptr` → `SomePtr(GCREF)`).
+    fn emit_untyped_cast_int_to_ptr(&mut self, bb_id: BlockId, sum: Variable) -> Variable {
+        let raw = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(raw.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: [
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![sum]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        raw
     }
 
     /// True when `*mut u8 as *mut i64` (or `*mut f64`) must be `rffi.cast`
@@ -7538,6 +7593,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                no_tombstoned_leaves(),
             )
         } else {
             tyref_to_field_layout_string(

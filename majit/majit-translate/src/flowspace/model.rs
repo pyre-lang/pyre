@@ -2612,6 +2612,10 @@ impl HostEnv {
         // `core::ptr::mut_ptr::<Impl>::write` is the method form of
         // `ptr::write`. `host_env_callable` joins `segments[..-1]`, so
         // the five-segment residual resolves only when this module exists.
+        // rustc's `<*T>::add` is `lltype.direct_ptradd`.
+        let direct_ptradd = lltype
+            .module_get("direct_ptradd")
+            .expect("lltype.direct_ptradd bound above");
         let core_ptr_mut_ptr_impl = HostObject::new_module("core.ptr.mut_ptr.<Impl>");
         core_ptr_mut_ptr_impl.module_set(
             "write",
@@ -2626,6 +2630,17 @@ impl HostEnv {
                 .module_get("write")
                 .expect("std.ptr.write bound above"),
         );
+        let core_ptr_const_ptr_impl = HostObject::new_module("core.ptr.const_ptr.<Impl>");
+        let std_ptr_const_ptr_impl = HostObject::new_module("std.ptr.const_ptr.<Impl>");
+        for module in [
+            &core_ptr_mut_ptr_impl,
+            &std_ptr_mut_ptr_impl,
+            &core_ptr_const_ptr_impl,
+            &std_ptr_const_ptr_impl,
+        ] {
+            module.module_set("add", direct_ptradd.clone());
+            module.module_set("wrapping_add", direct_ptradd.clone());
+        }
 
         // `std::mem::size_of` / `align_of` re-export `core::mem::*`;
         // monomorphised LLBC spells the canonical `["core", "mem", _]`
@@ -2885,6 +2900,8 @@ impl HostEnv {
         mods.insert("core.ptr".into(), core_ptr);
         mods.insert("core.ptr.mut_ptr.<Impl>".into(), core_ptr_mut_ptr_impl);
         mods.insert("std.ptr.mut_ptr.<Impl>".into(), std_ptr_mut_ptr_impl);
+        mods.insert("core.ptr.const_ptr.<Impl>".into(), core_ptr_const_ptr_impl);
+        mods.insert("std.ptr.const_ptr.<Impl>".into(), std_ptr_const_ptr_impl);
         mods.insert("core.mem".into(), core_mem);
         mods.insert("vec.Vec".into(), vec_crate);
         mods.insert("bigint.BigInt".into(), bigint_crate);
@@ -8578,6 +8595,31 @@ mod tests {
 
         let block_repr = format!("{:?}", blk.borrow());
         assert!(block_repr.contains("with 1 exits"), "got: {block_repr}");
+    }
+
+    #[test]
+    fn host_env_mut_ptr_add_and_const_ptr_wrapping_add_are_lltype_direct_ptradd() {
+        let direct_ptradd = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("direct_ptradd"))
+            .expect("HOST_ENV missing lltype.direct_ptradd");
+        assert_eq!(direct_ptradd.qualname(), "lltype.direct_ptradd");
+        for segments in [
+            ["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            ["core", "ptr", "mut_ptr", "<Impl>", "wrapping_add"],
+            ["std", "ptr", "mut_ptr", "<Impl>", "add"],
+            ["std", "ptr", "mut_ptr", "<Impl>", "wrapping_add"],
+            ["core", "ptr", "const_ptr", "<Impl>", "add"],
+            ["core", "ptr", "const_ptr", "<Impl>", "wrapping_add"],
+            ["std", "ptr", "const_ptr", "<Impl>", "add"],
+            ["std", "ptr", "const_ptr", "<Impl>", "wrapping_add"],
+        ] {
+            let segs = segments.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let host = host_env_callable(&segs)
+                .unwrap_or_else(|| panic!("{segments:?} resolves in HOST_ENV"));
+            assert_eq!(host, direct_ptradd, "{segments:?}");
+            assert_eq!(host.qualname(), "lltype.direct_ptradd");
+        }
     }
 
     #[test]

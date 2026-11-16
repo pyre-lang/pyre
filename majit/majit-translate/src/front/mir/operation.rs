@@ -1709,6 +1709,7 @@ impl<'a> Lowering<'a> {
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
                                     &self.raw_alloc_flavor_structs,
+                                    no_tombstoned_leaves(),
                                 )
                                 .expect("raw-owned exception attr has a pointer row");
                                 ValueType::Unsigned
@@ -6709,9 +6710,12 @@ impl<'a> Lowering<'a> {
     /// A field whose declared type is a GC class is an interior pointer
     /// into the allocation — the same `cast_ptr_to_int` + add +
     /// `cast_int_to_ptr` + `cast_instance` sequence
-    /// [`Self::emit_array_tail_item_ptr`] already emits for a class
-    /// living at a byte offset. A classdef-less field stays in the int
-    /// bank (`rewrite_raw_substruct_address`,
+    /// [`Self::emit_array_tail_item_ptr`] emits for a class living at a
+    /// byte offset. An inlined `GcArray` item (`lltype.py`
+    /// `direct_arrayitems`, `rordereddict.py` `DICTENTRY`) is that
+    /// function's 2-arg `ann_cast_int_to_ptr` of `Ptr(ITEM)`. A
+    /// classdef-less field stays in the int bank
+    /// (`rewrite_raw_substruct_address`,
     /// [`Self::items_block_item_address`]).
     pub(in crate::front::mir) fn emit_raw_substruct_address(
         &mut self,
@@ -6722,7 +6726,7 @@ impl<'a> Lowering<'a> {
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
         if let Some(root) = tyref_class_root_with(field_ty, self.llbc, self.tombstoned_leaves) {
-            return self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+            return self.emit_array_tail_item_ptr(bb_id, base, offset, &root, field_ty);
         }
         let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, base);
         let off = self
@@ -7748,6 +7752,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            no_tombstoned_leaves(),
                         )
                         .expect("raw-owned exception attr has a pointer row");
                         ty = ValueType::Ref(Some(raw.class_root));
@@ -9377,6 +9382,7 @@ impl<'a> Lowering<'a> {
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
                                 &self.raw_alloc_flavor_structs,
+                                no_tombstoned_leaves(),
                             )
                             .map(|raw| raw.class_root)
                         })

@@ -6694,8 +6694,7 @@ pub(crate) fn derive_subject_inputcells(
 
 /// Exact registry key, or template rows of a split struct whose harvest
 /// registered only the unsuffixed decl (the same set as
-/// `struct_instantiation_suffix`: Entry, plus a generic struct in a
-/// harvested foreign-body crate).
+/// `struct_root_rows_known` / `struct_instantiation_suffix`).
 fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
     // A generic enum instantiation whose arguments are type parameters
     // (`option::Option<v0>`) is the template declaration

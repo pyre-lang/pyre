@@ -3898,14 +3898,17 @@ impl<'a> Lowering<'a> {
                     // genuine `cast_pointer` (ptr→ptr).
                     //
                     // `addr_of_mut!((*header).items).cast::<Entry>()` is
-                    // `lltype.py direct_arrayitems`: the address of a
+                    // `lltype.py` `direct_arrayitems`: the address of a
                     // `[T; N]` field, `array_items_base` past the header
-                    // (`rordereddict.py get_ll_dict`, `DICTENTRYARRAY`).
+                    // (`rordereddict.py` `get_ll_dict`, `DICTENTRYARRAY`).
                     // The field read is the array value (`SomeList`), and
                     // casting that list to the element root is not a
                     // pointer cast. Recover the header and add the field
-                    // offset, then `cast_int_to_ptr`. `direct_ptradd` is
-                    // the wrong op here: the header is `SomeInstance`,
+                    // offset, then `cast_int_to_ptr`. An inlined non-GC
+                    // item (`rordereddict.py` `DICTENTRY`, `lltype.py`
+                    // `Struct`) is the 2-arg form whose constant is
+                    // `Ptr(ITEM)` (`ann_cast_int_to_ptr`). `direct_ptradd`
+                    // is the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
                     let dest_kind = self.value_type_of(&call.dest.ty);
@@ -3963,13 +3966,20 @@ impl<'a> Lowering<'a> {
                             tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
                     {
                         // `addr_of_mut!((*header).items).cast()` is
-                        // `direct_arrayitems` even when dest is the
-                        // inlined ITEM (`lltype.py` `Struct` in
-                        // `GcArray`) and `instance_narrow_for_type`
-                        // declines the classdef recast. A same-root
-                        // `.cast()` used to alias the FieldRead and
-                        // leave getattr `items` on the array pointer.
-                        let res = self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+                        // `direct_arrayitems` (`lltype.py`). The inlined
+                        // ITEM (`rordereddict.py` `DICTENTRY`) is
+                        // `Ptr(ITEM)` via the 2-arg `ann_cast_int_to_ptr`,
+                        // even when `instance_narrow_for_type` declines
+                        // the classdef recast. A same-root `.cast()` used
+                        // to alias the FieldRead and leave getattr
+                        // `items` on the array pointer.
+                        let res = self.emit_array_tail_item_ptr(
+                            bb_id,
+                            base,
+                            offset,
+                            &root,
+                            &call.dest.ty,
+                        );
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(

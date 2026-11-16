@@ -9346,6 +9346,75 @@ mod tests {
         assert_eq!(added, out);
     }
 
+    /// `direct_arrayitems` of a non-GC struct inlined in `GcArray`
+    /// (`lltype.py` `direct_arrayitems` / `ann_cast_int_to_ptr`,
+    /// `rordereddict.py` `DICTENTRY`) is `Ptr(ITEM)`. `ann_direct_ptradd`
+    /// keeps that pointer, and `getattr` of a primitive field is the
+    /// field annotation.
+    #[test]
+    fn ann_direct_ptradd_of_gcarray_item_ptr_getattr_is_field() {
+        use crate::annotator::model::SomeString;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::Slot".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar#0".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "??TypeVar#1".to_string()),
+            ],
+        );
+        let spelling = "storage::Slot<i64,*mut u8>";
+        let ptr_ty = crate::front::mir::gcarray_item_struct_ptr_lltype(&reg, spelling)
+            .expect("instantiated item is Ptr(Struct)");
+        let LowLevelType::Ptr(built) = &ptr_ty else {
+            panic!("item pointer is Ptr, got {ptr_ty:?}");
+        };
+        let PtrTarget::Struct(st) = &built.TO else {
+            panic!("item pointer targets a Struct, got {:?}", built.TO);
+        };
+        assert_eq!(st._name, spelling);
+        assert!(
+            st._name.contains("<i64,*mut u8>"),
+            "template-only build would drop the instantiation, got {}",
+            st._name
+        );
+
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(ptr_ty))));
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let cast = lltype_cast_int_to_ptr(&bk(), &[Some(s_ptrt), Some(s_int.clone())], &no_kwds())
+            .expect("2-arg ann_cast_int_to_ptr of Ptr(ITEM)");
+        let SomeValue::Ptr(cast_ptr) = &cast else {
+            panic!("typed cast is SomePtr, got {cast:?}");
+        };
+        assert!(
+            matches!(
+                &cast_ptr.ll_ptrtype.TO,
+                PtrTarget::Struct(st) if st._name == spelling
+            ),
+            "cast keeps the instantiated struct, got {:?}",
+            cast_ptr.ll_ptrtype
+        );
+        let added = lltype_direct_ptradd(&bk(), &[Some(cast.clone()), Some(s_int)], &no_kwds())
+            .expect("ann_direct_ptradd of the typed item pointer");
+        assert_eq!(added, cast);
+        let SomeValue::Ptr(p) = &added else {
+            panic!("direct_ptradd keeps SomePtr, got {added:?}");
+        };
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f_valid")));
+        let field = p
+            .getattr(&SomeValue::String(s_attr))
+            .expect("getattr f_valid");
+        assert!(
+            matches!(field, SomeValue::Bool(_)),
+            "f_valid annotates as SomeBool, got {field:?}"
+        );
+    }
+
     #[test]
     fn ann_cast_int_to_ptr_two_arg_strptr_is_someptr() {
         use crate::flowspace::model::{ConstValue, Constant};

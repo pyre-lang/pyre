@@ -5599,6 +5599,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
         llbc,
         gc_struct_ids,
         &std::collections::HashSet::<String>::new(),
+        no_tombstoned_leaves(),
     );
     if majit_ir::descr::is_shared_u8_slice_spelling(&spelling)
         || majit_ir::descr::is_option_of_u8_window_spelling(&spelling)
@@ -7242,6 +7243,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<ExceptionClassRawOwnedAttr> {
     if !tyref_is_by_value_raw_flavor_struct(ty, llbc, raw_alloc_flavor_structs) {
         return None;
@@ -7257,6 +7259,7 @@ pub(in crate::front::mir) fn exception_class_raw_owned_attr(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        ambiguous_leaves,
     );
     let class_root =
         flavor_raw_pointer_class_root(&pointer, llbc, tombstoned, raw_alloc_flavor_structs)
@@ -9744,6 +9747,21 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
     Some(leaf)
 }
 
+/// Declaration path of `DICTENTRY` (`get_ll_dict`).
+pub(crate) fn entry_family_is_entry_path(name_path: &str) -> bool {
+    name_path.ends_with("::rordereddict_entries::Entry")
+}
+
+/// Declaration path of `DICTENTRYARRAY` (`get_ll_dict`).
+fn entry_family_is_gc_entries_path(name_path: &str) -> bool {
+    name_path.ends_with("::rordereddict_entries::GcEntries")
+}
+
+/// `DICTENTRY` or `DICTENTRYARRAY` (`get_ll_dict`).
+pub(crate) fn entry_family_name_path(name_path: &str) -> bool {
+    entry_family_is_entry_path(name_path) || entry_family_is_gc_entries_path(name_path)
+}
+
 /// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
 /// serves every monomorphization; the bare `Entry` class would union `key`.
 pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
@@ -9752,7 +9770,7 @@ pub(in crate::front::mir) fn entry_struct_instantiation_suffix(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if !name_path.ends_with("::rordereddict_entries::Entry") {
+    if !entry_family_is_entry_path(name_path) {
         return None;
     }
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
@@ -9767,7 +9785,7 @@ pub(in crate::front::mir) fn gc_entries_struct_instantiation_suffix(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if !name_path.ends_with("::rordereddict_entries::GcEntries") {
+    if !entry_family_is_gc_entries_path(name_path) {
         return None;
     }
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
@@ -9858,6 +9876,95 @@ pub(in crate::front::mir) fn foreign_body_generic_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc, tombstoned)
 }
 
+/// `<…>` suffix for a struct whose template field type names the split
+/// entry family (`DICTENTRY` / `DICTENTRYARRAY`) parametrized by that
+/// struct's own type variables.
+///
+/// `get_ll_dict` builds one `DICT` per key/value, and that struct holds
+/// `("entries", Ptr(DICTENTRYARRAY))`. `bookkeeper.py` `getuniqueclassdef`
+/// is one class object per such struct. The predicate is those template
+/// field types, not the struct's name.
+pub(in crate::front::mir) fn entry_family_holder_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let _ = name_path;
+    let td = llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    if !fields
+        .iter()
+        .any(|field| field_ty_names_entry_family_typevar(&field.ty, llbc))
+    {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc, tombstoned)
+}
+
+/// Pointer / `Box` / `NonNull` / by-value field whose pointee ADT is the
+/// entry family and whose type arguments mention a type variable.
+/// Arrays and slices stay out: `DICTENTRYARRAY` is the array of
+/// `DICTENTRY`, not another struct that holds one.
+fn field_ty_names_entry_family_typevar(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    for _ in 0..8 {
+        let Some(stripped) = strip_ty_indirections(node, llbc) else {
+            return false;
+        };
+        let Some(peeled) = type_node_peel_aliases(stripped, llbc) else {
+            return false;
+        };
+        if type_node_is_array_or_slice(peeled) {
+            return false;
+        }
+        if let Some(pointee) = one_level_pointer_pointee(peeled, llbc) {
+            node = pointee;
+            continue;
+        }
+        // `one_level_pointer_pointee` peels a thin `Box` only. A `Box`
+        // whose pointee has no recorded layout is still `Box<T>`.
+        if let Some(pointee) = type_node_box_pointee(peeled, llbc) {
+            node = pointee;
+            continue;
+        }
+        return adt_node_is_entry_family_of_typevar(peeled, llbc);
+    }
+    false
+}
+
+fn type_node_is_array_or_slice(node: &serde_json::Value) -> bool {
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if obj.contains_key("Array") || obj.contains_key("Slice") {
+        return true;
+    }
+    matches!(
+        obj.get("Adt").and_then(type_decl_ref_builtin),
+        Some("Array" | "Slice")
+    )
+}
+
+fn adt_node_is_entry_family_of_typevar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    if !entry_family_name_path(td.item_meta.name_path_str()) {
+        return false;
+    }
+    adt_node_type_subst(node, llbc)
+        .iter()
+        .any(|arg| super::json_mentions_typevar(arg, llbc, 0))
+}
+
 pub(in crate::front::mir) fn struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -9870,6 +9977,9 @@ pub(in crate::front::mir) fn struct_instantiation_suffix(
         .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc, tombstoned))
         .or_else(|| {
             foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc, tombstoned)
+        })
+        .or_else(|| {
+            entry_family_holder_struct_instantiation_suffix(name_path, adt, llbc, tombstoned)
         })
 }
 
@@ -13747,13 +13857,21 @@ pub(in crate::front::mir) fn json_ty_is_objectptr(node: &serde_json::Value, llbc
 /// marker that surfaces them for a follow-up widening rather than silently
 /// mislabelling a field.
 pub(in crate::front::mir) fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
+    tyref_to_ast_string_with(ty, llbc, no_tombstoned_leaves())
+}
+
+fn tyref_to_ast_string_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    ambiguous_leaves: &std::collections::HashSet<String>,
+) -> String {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => Some(v.as_ref()),
         TyRef::Other(v) => Some(v.as_ref()),
         TyRef::Dedup { id } => llbc.dedup_body(*id),
     };
     match body {
-        Some(v) => charon_type_value_to_ast_string(v, llbc, 0),
+        Some(v) => charon_type_value_to_ast_string_with(v, llbc, 0, ambiguous_leaves),
         None => match ty {
             TyRef::Dedup { id } => format!("??unresolved_dedup#{id}"),
             _ => "??no_body".to_string(),
@@ -13773,6 +13891,7 @@ fn borrowed_transparent_scalar_field_layout_spelling(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if !tyref_is_borrowed_transparent_scalar(
         ty,
@@ -13790,11 +13909,12 @@ fn borrowed_transparent_scalar_field_layout_spelling(
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
     {
-        return Some(tyref_to_field_layout_string(
+        return Some(tyref_to_field_layout_string_with(
             &field.ty,
             llbc,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            ambiguous_leaves,
         ));
     }
     transparent_scalar_kind_layout_spelling(decl, llbc)
@@ -13813,6 +13933,22 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> String {
+    tyref_to_field_layout_string_with(
+        ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+        no_tombstoned_leaves(),
+    )
+}
+
+pub(in crate::front::mir) fn tyref_to_field_layout_string_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> String {
     // A `FrameAnchor` / `&FrameAnchor` field is the frame pointer
     // (`tyref_to_ast_string` of a `RawPtr` to an ADT uses the TypeDecl
@@ -13845,6 +13981,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        ambiguous_leaves,
     ) {
         return spelling;
     }
@@ -13860,7 +13997,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     // `&Handle` as `*mut {Deref::Target}`. The capture's declared type is
     // the handle, whose class the live `self` already carries
     // (`ClassDef.generalize_attr` with the value's `s_value`).
-    if let Some(reference) = tyref_reference_layout_string(ty, llbc) {
+    if let Some(reference) = tyref_reference_layout_string_with(ty, llbc, ambiguous_leaves) {
         return reference;
     }
     // A transparent GC handle is one pointer to its `Deref::Target`.
@@ -13899,7 +14036,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         // annotator's field projection answer `Instance(PyObject)` for it.
         return tyref_atomic_arg(ty, llbc)
             .and_then(|arg| serde_json::from_value::<TyRef>(arg.clone()).ok())
-            .map(|arg| tyref_to_ast_string(&arg, llbc))
+            .map(|arg| tyref_to_ast_string_with(&arg, llbc, ambiguous_leaves))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
     // A `Vec` of one-word items is the header address (`RustVecRepr`,
@@ -13916,13 +14053,13 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         return niche.storage_ty.to_string();
     }
     let Some(node) = tyref_node(ty, llbc) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     let Some(id) = adt_node_def_id(node) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     let Some(decl) = llbc.type_by_id(id) else {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     };
     // A by-value integer newtype is the inner scalar in the containing
     // struct's descriptor (`history.getkind`). Spelling the wrapper leaf
@@ -13932,7 +14069,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         && !decl.published_struct_copy
         && let Some(inner) = integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids)
     {
-        return tyref_to_ast_string(inner, llbc);
+        return tyref_to_ast_string_with(inner, llbc, ambiguous_leaves);
     }
     // Foreign Opaque / `published_struct_copy`: `repr.transparent` is
     // false (`tyref_transparent_inner_value_type`). The linked kind is
@@ -13942,7 +14079,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         return transparent_scalar_kind_spelling(kind, transparent_scalar_decl_size(decl, llbc));
     }
     if !decl.is_repr_transparent() {
-        return tyref_to_ast_string(ty, llbc);
+        return tyref_to_ast_string_with(ty, llbc, ambiguous_leaves);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
         && !decl.published_struct_copy
@@ -13958,10 +14095,10 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
                 | ValueType::Unknown
         )
     {
-        return tyref_to_ast_string(&field.ty, llbc);
+        return tyref_to_ast_string_with(&field.ty, llbc, ambiguous_leaves);
     }
     transparent_scalar_kind_layout_spelling(decl, llbc)
-        .unwrap_or_else(|| tyref_to_ast_string(ty, llbc))
+        .unwrap_or_else(|| tyref_to_ast_string_with(ty, llbc, ambiguous_leaves))
 }
 
 fn transparent_scalar_decl_size(decl: &TypeDecl, llbc: &Llbc) -> u64 {
@@ -13973,25 +14110,36 @@ fn transparent_scalar_decl_size(decl: &TypeDecl, llbc: &Llbc) -> u64 {
 }
 
 /// The physical type spelling of a top-level Rust reference field.
-pub(in crate::front::mir) fn tyref_reference_layout_string(
+fn tyref_reference_layout_string_with(
     ty: &TyRef,
     llbc: &Llbc,
+    ambiguous_leaves: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    fn visit(value: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<String> {
+    fn visit(
+        value: &serde_json::Value,
+        llbc: &Llbc,
+        depth: usize,
+        ambiguous_leaves: &std::collections::HashSet<String>,
+    ) -> Option<String> {
         if depth > 24 {
             return None;
         }
         let obj = value.as_object()?;
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            return visit(llbc.dedup_body(id)?, llbc, depth + 1);
+            return visit(llbc.dedup_body(id)?, llbc, depth + 1, ambiguous_leaves);
         }
         if let Some(pair) = obj.get("Value").and_then(serde_json::Value::as_array)
             && pair.len() == 2
         {
-            return visit(&pair[1], llbc, depth + 1);
+            return visit(&pair[1], llbc, depth + 1, ambiguous_leaves);
         }
         let reference = obj.get("Ref")?.as_array()?;
-        let inner = charon_type_value_to_ast_string(reference.get(1)?, llbc, depth + 1);
+        let inner = charon_type_value_to_ast_string_with(
+            reference.get(1)?,
+            llbc,
+            depth + 1,
+            ambiguous_leaves,
+        );
         let mutable = reference
             .get(2)
             .and_then(serde_json::Value::as_str)
@@ -14007,7 +14155,7 @@ pub(in crate::front::mir) fn tyref_reference_layout_string(
         TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
-    visit(value, llbc, 0)
+    visit(value, llbc, 0, ambiguous_leaves)
 }
 
 pub(in crate::front::mir) fn peel_ref_prefix(spelling: &str) -> &str {
@@ -14388,7 +14536,7 @@ fn charon_type_value_to_ast_string_with(
         }
         let inner = items
             .iter()
-            .map(|ty| charon_type_value_to_ast_string(ty, llbc, depth + 1))
+            .map(|ty| charon_type_value_to_ast_string_with(ty, llbc, depth + 1, tombstoned))
             .collect::<Vec<_>>()
             .join(",");
         return format!("({inner})");
@@ -16459,15 +16607,51 @@ fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
     out
 }
 
+/// Instantiated item spelling of a cast dest (`lltype.py`
+/// `direct_arrayitems`). One pointer or reference is peeled so
+/// `*mut ITEM<…>`, `&mut ITEM<…>`, and a by-value `ITEM<…>` name the
+/// same struct. The head is the crate-stripped declaration
+/// (`class_identity_spelling`); type arguments are the same AST strings
+/// [`render_adt_type_args`] gives the field rows. An empty argument
+/// list is the template. A span that still contains `??` is left for
+/// [`raw_struct_array_item_lltype_inner`], which keeps the template name.
+pub(in crate::front::mir) fn instantiated_struct_item_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(node, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    let struct_node = match one_level_pointer_pointee(node, llbc) {
+        Some(pointee) => {
+            let pointee = strip_ty_wrappers(pointee, llbc)?;
+            type_node_peel_aliases(pointee, llbc)?
+        }
+        None => node,
+    };
+    let def_id = adt_node_def_id(struct_node)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let adt = struct_node.as_object()?.get("Adt")?.as_object()?;
+    let identity = class_identity_spelling(td.item_meta.name_path_str(), tombstoned);
+    let args = render_adt_type_args(adt, llbc, 0, tombstoned);
+    if args.is_empty() {
+        Some(identity)
+    } else {
+        Some(format!("{identity}<{}>", args.join(",")))
+    }
+}
+
 /// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
 /// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
-/// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
 /// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`).
-pub(crate) fn gcarray_item_struct_ptr_annotation(
+pub(crate) fn gcarray_item_struct_ptr_lltype(
     reg: &crate::front::StructFieldRegistry,
     item: &str,
-) -> Option<crate::annotator::model::SomeValue> {
-    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
 
     let item = crate::front::typestr::peel_pointer_prefix(item).unwrap_or(item);
@@ -16480,9 +16664,22 @@ pub(crate) fn gcarray_item_struct_ptr_annotation(
     let LowLevelType::Struct(st) = entry else {
         return None;
     };
-    Some(lltype_to_annotation(Ptr {
+    Some(LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Struct(*st),
-    }))
+    })))
+}
+
+/// `lltype.Ptr(STRUCT)` of a non-GC `GcArray` ITEM (`rordereddict.py`
+/// `DICTENTRY` inlined in `GcArray`; `lltype.py` `Struct`).
+/// `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
+/// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`).
+pub(crate) fn gcarray_item_struct_ptr_annotation(
+    reg: &crate::front::StructFieldRegistry,
+    item: &str,
+) -> Option<crate::annotator::model::SomeValue> {
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+
+    gcarray_item_struct_ptr_lltype(reg, item).map(lltype_to_annotation)
 }
 
 fn spelling_is_unsubstituted_typevar(ty: &str) -> bool {

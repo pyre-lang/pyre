@@ -39585,6 +39585,15 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
         "ops={ops:?}"
     );
+    // The callee stays residual (`interior_opaque`). The 2-arg
+    // `cast_int_to_ptr(Ptr(ITEM), …)` is asserted on the substituted
+    // body (`entries_item_ptr_gcentries_i64_gcref_items_offset_is_8`).
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "cast_int_to_ptr"),
+        "ops={ops:?}"
+    );
 }
 
 #[test]

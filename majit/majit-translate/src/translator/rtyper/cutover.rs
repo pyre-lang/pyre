@@ -2592,6 +2592,14 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if is_ptr_write(canonical_strip) {
         return Some(SKIP_PTR_WRITE);
     }
+    // `<*T>::add` / `wrapping_add` is one opaque foreign decl. Layer-1
+    // `call_registry.lookup` would mint one empty body whose
+    // `mergeinputargs` unions every pointee. The callsite is
+    // `lltype.direct_ptradd` (rustc's `<*T>::add`). The `add` leaf is
+    // shared; decline only the pointer-method path.
+    if is_ptr_add(canonical_strip) {
+        return Some(SKIP_PTR_ADD);
+    }
     // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
     // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
     // (`init_gc_object_immortal`), not graphs. Their bodies walk
@@ -2644,6 +2652,30 @@ const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 
 /// [`registration_decline`] reason for `ptr::write`.
 const SKIP_PTR_WRITE: &str = "skip-ptr-write";
+
+/// [`registration_decline`] reason for `<*T>::add` / `wrapping_add`.
+const SKIP_PTR_ADD: &str = "skip-ptr-add";
+
+/// `core::ptr::{mut_ptr,const_ptr}::<Impl>::{add,wrapping_add}` and the
+/// `std::ptr` re-export. rustc's `<*T>::add` is `lltype.direct_ptradd`.
+fn is_ptr_add(canonical_strip: &[String]) -> bool {
+    let leaf_is_ptr_add = |leaf: &str| {
+        let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
+        leaf == "add" || leaf == "wrapping_add"
+    };
+    match canonical_strip {
+        [crate_or_std, module, owner, impl_seg, leaf]
+            if (crate_or_std == "core" || crate_or_std == "std")
+                && module == "ptr"
+                && (owner == "mut_ptr" || owner == "const_ptr")
+                && impl_seg == "<Impl>"
+                && leaf_is_ptr_add(leaf) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 /// `core::ptr::write` / `std::ptr::write` and the method form
 /// `core::ptr::mut_ptr::<Impl>::write`. The `write` leaf is not unique.
@@ -4596,6 +4628,7 @@ pub(crate) fn register_unsafe_fn_stubs(
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING
                 || reason == SKIP_STD_ALLOC_RAW
                 || reason == SKIP_PTR_WRITE
+                || reason == SKIP_PTR_ADD
                 || reason == SKIP_JIT_LL_ARRAYCOPY)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
@@ -10377,6 +10410,114 @@ mod tests {
                 "unsafe stub still registered for {segments:?}"
             );
         }
+    }
+
+    #[test]
+    fn ptr_add_is_declined_and_unregistered() {
+        for segments in [
+            ["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            ["std", "ptr", "mut_ptr", "<Impl>", "wrapping_add"],
+            ["core", "ptr", "const_ptr", "<Impl>", "wrapping_add"],
+            ["std", "ptr", "const_ptr", "<Impl>", "add"],
+        ] {
+            let owned: Vec<String> = segments.iter().copied().map(str::to_string).collect();
+            assert_eq!(
+                registration_decline(&owned),
+                Some(SKIP_PTR_ADD),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["add".into()]),
+            None,
+            "the add leaf is shared with other functions"
+        );
+        assert_eq!(
+            registration_decline(&[
+                "core".into(),
+                "ptr".into(),
+                "mut_ptr".into(),
+                "<Impl>".into(),
+                "sub".into(),
+            ]),
+            None
+        );
+        let mut origin = LegacyGraph::new("add");
+        origin.source_identity = Some("core::ptr::mut_ptr::<Impl>::add".into());
+        assert_eq!(
+            registration_decline_graph_origin(&origin, &[]),
+            Some(SKIP_PTR_ADD)
+        );
+        let mut foreign_origin = LegacyGraph::new("add");
+        foreign_origin.source_identity = Some("user_mod::add".into());
+        assert_eq!(
+            registration_decline_graph_origin(&foreign_origin, &[]),
+            None
+        );
+
+        let direct_ptradd = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.mut_ptr.<Impl>.add resolves in HOST_ENV");
+        let wrapping_add = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "const_ptr", "<Impl>", "wrapping_add"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.const_ptr.<Impl>.wrapping_add resolves in HOST_ENV");
+        assert_eq!(direct_ptradd, wrapping_add);
+        assert_eq!(direct_ptradd.qualname(), "lltype.direct_ptradd");
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let specs = vec![
+            (
+                vec!["pyobject".to_string(), "is_none".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                Some("bool".to_string()),
+                None,
+                None,
+            ),
+            (
+                ["core", "ptr", "mut_ptr", "<Impl>", "add"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                Signature::new(vec!["arg0".to_string(), "arg1".to_string()], None, None),
+                None,
+                None,
+                None,
+            ),
+            (
+                ["core", "ptr", "const_ptr", "<Impl>", "wrapping_add"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                Signature::new(vec!["arg0".to_string(), "arg1".to_string()], None, None),
+                None,
+                None,
+                None,
+            ),
+        ];
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined ptr add specs must not be registered"
+        );
+        assert!(
+            stub_registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
     }
 
     #[test]

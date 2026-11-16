@@ -191,7 +191,27 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     )
     .expect("substituted entries_item_ptr body");
     crate::test_support::with_lowering(llbc, |context| {
-        let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+        // Rows alone leave `gc_struct_ids` empty, so the header is not a
+        // declared `GcArray` and the item arm never runs. The lowering
+        // context's registry carries that set. It does not carry
+        // `class_identity`: `*mut PyObject` is `OBJECTPTR` only when that
+        // table names the pointee (`field_row_lltype`). Without it the
+        // item `Struct` is not built and the cast stays the 1-arg form.
+        let mut struct_fields = context.struct_field_registry();
+        let pointee_root = "pyobject::PyObject";
+        let identity = crate::front::semantic::ClassIdentity {
+            id: majit_ir::descr::StructId::from_canonical(pointee_root),
+            spelling: pointee_root.to_string(),
+        };
+        for key in [
+            "PyObject",
+            "pyobject::PyObject",
+            "pyre_object::pyobject::PyObject",
+        ] {
+            struct_fields
+                .class_identity
+                .insert(key.to_string(), Some(identity.clone()));
+        }
         let accum = super::AccumulatorFacts::build(llbc, &body);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -224,10 +244,14 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
 
         // `emit_array_tail_item_ptr` is `cast_ptr_to_int` + ConstInt(offset)
-        // + add + `cast_int_to_ptr`. The address-taken `items` FieldRead is
-        // unused after that rewrite and may be dropped.
+        // + add + 2-arg `cast_int_to_ptr(Ptr(ITEM), sum)`. The address-taken
+        // `items` FieldRead is unused after that rewrite and may be dropped.
+        use crate::flowspace::model::ConstValue;
+        use crate::model::LinkArg;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
         let mut offset = None;
-        let mut saw_cast_int_to_ptr = false;
+        let mut item_ptr = None;
+        let mut saw_one_arg = false;
         for block in &graph.blocks {
             for (i, op) in block.operations.iter().enumerate() {
                 if let OpKind::ConstInt(n) = op.kind {
@@ -239,19 +263,47 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
                         offset = Some(n);
                     }
                 }
-                if let OpKind::Call {
+                let OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
+                    args,
                     ..
                 } = &op.kind
-                    && segments.last().is_some_and(|s| s == "cast_int_to_ptr")
-                {
-                    saw_cast_int_to_ptr = true;
+                else {
+                    continue;
+                };
+                if segments.last().is_none_or(|s| s != "cast_int_to_ptr") {
+                    continue;
                 }
+                if args.len() == 1 {
+                    saw_one_arg = true;
+                    continue;
+                }
+                assert_eq!(args.len(), 2, "item pointer is a 2-arg cast_int_to_ptr");
+                let LinkArg::Const(c) = &args[0] else {
+                    panic!("cast_int_to_ptr PtrT is a Constant, got {:?}", args[0]);
+                };
+                let ConstValue::LowLevelType(ptr_ty) = &c.value else {
+                    panic!("cast_int_to_ptr PtrT is a LowLevelType, got {:?}", c.value);
+                };
+                item_ptr = Some((**ptr_ty).clone());
             }
         }
         assert!(
-            saw_cast_int_to_ptr,
-            "substituted entries_item_ptr must emit direct_arrayitems (cast_int_to_ptr)"
+            !saw_one_arg,
+            "gcarray item pointer is not the 1-arg GCREF cast"
+        );
+        let ptr_ty = item_ptr.expect(
+            "substituted entries_item_ptr must emit direct_arrayitems as 2-arg cast_int_to_ptr",
+        );
+        let LowLevelType::Ptr(ptr) = &ptr_ty else {
+            panic!("item pointer is Ptr, got {ptr_ty:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("item pointer targets a Struct, got {:?}", ptr.TO);
+        };
+        assert_eq!(
+            st._name, "rordereddict_entries::Entry<i64,*mut PyObject>",
+            "Ptr(ITEM) names the instantiated item"
         );
         assert_eq!(
             offset,

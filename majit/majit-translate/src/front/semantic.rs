@@ -746,6 +746,55 @@ impl<'a> FieldRowsEntry<'a> {
     }
 }
 
+/// `get_ll_dict`'s `DICTENTRY` / `DICTENTRYARRAY` path, including the
+/// crate-stripped spelling that drops the leading crate segment.
+fn entry_family_path_spelling(path: &str) -> bool {
+    crate::front::mir::entry_family_name_path(path)
+        || crate::front::mir::entry_family_name_path(&format!("::{path}"))
+}
+
+/// One `*const ` / `*mut ` / `&` / `&mut ` / `Box` / `NonNull` layer.
+/// Arrays, slices, `Arc`, and `Rc` stay put.
+fn peel_one_row_indirection(spelling: &str) -> Option<&str> {
+    if let Some(inner) = crate::front::typestr::peel_pointer_prefix(spelling) {
+        return Some(inner);
+    }
+    let start = spelling.find('<')?;
+    let span = majit_ir::descr::generic_args_span(spelling)?;
+    let end = start + span.len();
+    if !spelling[end..].trim().is_empty() {
+        return None;
+    }
+    let head = spelling[..start].trim();
+    if !is_box_or_nonnull_head(head) {
+        return None;
+    }
+    let inner = span.strip_prefix('<')?.strip_suffix('>')?;
+    crate::front::mir::split_top_level_type_args(inner)
+        .into_iter()
+        .next()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+}
+
+fn is_box_or_nonnull_head(head: &str) -> bool {
+    // Builtin `Box` is the same tag `type_node_box_pointee` checks.
+    // `NonNull` is only the `core::ptr::non_null::NonNull` path
+    // `one_level_pointer_pointee` peels.
+    head == "Box" || head.ends_with("::boxed::Box") || head.ends_with("::non_null::NonNull")
+}
+
+fn peel_row_pointer_indirections(spelling: &str) -> &str {
+    let mut cur = spelling.trim();
+    for _ in 0..8 {
+        let Some(inner) = peel_one_row_indirection(cur) else {
+            break;
+        };
+        cur = inner.trim();
+    }
+    cur
+}
+
 impl StructFieldRegistry {
     /// Inner word of a harvested transparent scalar, or `None`.
     ///
@@ -884,10 +933,11 @@ impl StructFieldRegistry {
 
     /// Internable struct-root spelling: an unsuffixed harvest hit
     /// (exact or crate-prefixed), or the split-struct template set
-    /// (`struct_instantiation_suffix`: Entry, plus a generic struct in a
-    /// harvested foreign-body crate). A broad `field_rows` knownness
-    /// seeds every suffixed closure / Option and union-fails their
-    /// `call_once`.
+    /// (`struct_instantiation_suffix`: the entry family, a struct whose
+    /// template field names that family parametrized by its own type
+    /// variables, plus a generic struct in a harvested foreign-body
+    /// crate). A broad `field_rows` knownness seeds every suffixed
+    /// closure / Option and union-fails their `call_once`.
     pub(crate) fn struct_root_rows_known(&self, root: &str) -> bool {
         if self.intern_field_rows(root).is_none() {
             return false;
@@ -899,7 +949,59 @@ impl StructFieldRegistry {
             return true;
         }
         let stripped = majit_ir::descr::strip_instantiation_suffix(root);
-        stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
+        crate::front::mir::entry_family_is_entry_path(stripped)
+            || stripped == "Entry"
+            || self.template_holds_split_entry_family(stripped)
+    }
+
+    /// Template field rows name the split entry family (`get_ll_dict`'s
+    /// `DICTENTRY` / `DICTENTRYARRAY`) with this struct's own type
+    /// variables. That struct is one class per instantiation
+    /// (`bookkeeper.py` `getuniqueclassdef`), the same rule as
+    /// `entry_family_holder_struct_instantiation_suffix`. Rows stay on
+    /// the bare template; `??TypeVar` is substituted later.
+    pub(crate) fn template_holds_split_entry_family(&self, root: &str) -> bool {
+        let template = majit_ir::descr::strip_instantiation_suffix(root);
+        let spellings: Vec<String> = {
+            let Some(rows) = self.lookup_fields(template) else {
+                return false;
+            };
+            rows.iter().map(|row| row.ty.clone()).collect()
+        };
+        spellings
+            .iter()
+            .any(|spelling| self.row_spelling_holds_split_entry_family(spelling))
+    }
+
+    fn row_spelling_holds_split_entry_family(&self, spelling: &str) -> bool {
+        let peeled = peel_row_pointer_indirections(spelling);
+        if peeled.starts_with('[') || peeled.starts_with('(') {
+            return false;
+        }
+        let Some(span) = majit_ir::descr::generic_args_span(peeled) else {
+            return false;
+        };
+        if !span.contains("??TypeVar") {
+            return false;
+        }
+        let Some(head_end) = peeled.find('<') else {
+            return false;
+        };
+        let head = peeled[..head_end].trim();
+        if head.is_empty() || head.contains('[') || head.contains('(') {
+            return false;
+        }
+        if entry_family_path_spelling(head) {
+            return true;
+        }
+        let leaf = head.rsplit("::").next().unwrap_or(head);
+        self.with_keys_by_last_segment(leaf, |keys| {
+            keys.iter().any(|key| {
+                let bare = majit_ir::descr::strip_instantiation_suffix(key);
+                let bare = majit_ir::descr::strip_generic_args(bare);
+                entry_family_path_spelling(bare.as_ref())
+            })
+        })
     }
 
     fn owner_set_contains(set: &std::collections::HashSet<String>, root: &str) -> bool {
@@ -1881,6 +1983,119 @@ mod tests {
             !reg.struct_root_rows_known("Foo<i64>"),
             "nonsplit template rows must not intern a suffixed local struct"
         );
+    }
+
+    /// A struct whose template field names the split entry family with
+    /// its own type variables is one class per instantiation
+    /// (`get_ll_dict`, `bookkeeper.py` `getuniqueclassdef`). A local
+    /// generic without that field stays unknown when suffixed.
+    #[test]
+    fn entry_family_holder_suffixed_root_is_known() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "fixture::QualTable".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut pyre_object::rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>"
+                    .to_string(),
+            )],
+        );
+        assert!(
+            reg.struct_root_rows_known("fixture::QualTable<u64,i64>"),
+            "a qualified entry-family field splits the holder"
+        );
+        reg.fields.insert(
+            "pyre_object::rordereddict_entries::GcEntries".to_string(),
+            vec![(
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "pyre_object::rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar#0".to_string()),
+                ("value".to_string(), "??TypeVar#1".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "fixture::LeafTable".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+            )],
+        );
+        assert!(reg.struct_root_rows_known("fixture::LeafTable<u64,i64>"));
+        for (owner, ty) in [
+            (
+                "fixture::BoxTable",
+                "Box<pyre_object::rordereddict_entries::GcEntries<??TypeVar#0,??TypeVar#1>>",
+            ),
+            (
+                "fixture::NonNullTable",
+                "core::ptr::non_null::NonNull<GcEntries<??TypeVar#0,??TypeVar#1>>",
+            ),
+            (
+                "fixture::RefTable",
+                "&mut GcEntries<??TypeVar#0,??TypeVar#1>",
+            ),
+            ("fixture::ValueTable", "GcEntries<??TypeVar#0,??TypeVar#1>"),
+        ] {
+            reg.fields.insert(
+                owner.to_string(),
+                vec![("entries".to_string(), ty.to_string())],
+            );
+            assert!(
+                reg.struct_root_rows_known(&format!("{owner}<u64,i64>")),
+                "{owner} must be known"
+            );
+        }
+        assert!(
+            !reg.struct_root_rows_known("pyre_object::rordereddict_entries::GcEntries<u64,i64>"),
+            "an array of the entry family is not a holder field"
+        );
+        assert!(reg.struct_root_rows_known("pyre_object::rordereddict_entries::Entry<u64,i64>"));
+        reg.fields.insert(
+            "Foo".to_string(),
+            vec![("x".to_string(), "??TypeVar#0".to_string())],
+        );
+        assert!(!reg.struct_root_rows_known("Foo<i64>"));
+        reg.fields.insert(
+            "fixture::Fixed".to_string(),
+            vec![("entries".to_string(), "*mut GcEntries<u64,i64>".to_string())],
+        );
+        assert!(!reg.struct_root_rows_known("fixture::Fixed<u64,i64>"));
+        reg.fields.insert(
+            "fixture::ArrayTable".to_string(),
+            vec![(
+                "entries".to_string(),
+                "[GcEntries<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        assert!(!reg.struct_root_rows_known("fixture::ArrayTable<u64,i64>"));
+        reg.fields.insert(
+            "fixture::PtrArrayTable".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut [GcEntries<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        assert!(!reg.struct_root_rows_known("fixture::PtrArrayTable<u64,i64>"));
+
+        let mut other = StructFieldRegistry::default();
+        other.fields.insert(
+            "counter::Entry".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        other.fields.insert(
+            "fixture::Bucket".to_string(),
+            vec![("slot".to_string(), "*mut Entry<??TypeVar#0>".to_string())],
+        );
+        assert!(
+            !other.struct_root_rows_known("fixture::Bucket<i64>"),
+            "a leaf that only shares the entry family's last segment is not that family"
+        );
+        assert!(!other.struct_root_rows_known("counter::Entry<i64>"));
     }
 
     fn free_fn(name: &str) -> SemanticFunction {

@@ -6571,15 +6571,34 @@ impl Bookkeeper {
         // first-sight struct so the enclosing struct_root call's
         // pending drain projects its rows before any subject flow can
         // read the class's untyped FORCE shells.
+        //
+        // A struct whose template field names the split entry family
+        // parametrized by its own type variables is one class per
+        // instantiation (`get_ll_dict` builds one `DICT` per key/value
+        // holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
+        // `getuniqueclassdef`). Keep the substituted spelling so the
+        // field resolves to that classdef. Every other registered
+        // struct still interns the bare template.
+        let class_spelling = if stripped.contains('<')
+            && self
+                .struct_fields
+                .borrow()
+                .as_ref()
+                .is_some_and(|reg| reg.template_holds_split_entry_family(stripped))
         {
-            let intern_key = self.intern_class_key(named_root.as_ref());
+            std::borrow::Cow::Borrowed(stripped)
+        } else {
+            named_root
+        };
+        {
+            let intern_key = self.intern_class_key(class_spelling.as_ref());
             if !self.projected_struct_rows.borrow().contains(&intern_key) {
                 self.pending_struct_row_projection
                     .borrow_mut()
                     .push(intern_key);
             }
         }
-        let host = self.intern_class_by_qualname(named_root.as_ref());
+        let host = self.intern_class_by_qualname(class_spelling.as_ref());
         match self.getuniqueclassdef(&host) {
             Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
                 Some(classdef),
@@ -12463,6 +12482,71 @@ mod tests {
             .expect("RDict intern");
         let interned = ClassDef::about_attribute(&classdef, "entries").expect("entries intern");
         assert_struct_item_gcarray_ptr(&interned, "RDict.entries intern");
+    }
+
+    #[test]
+    fn entry_family_holder_projects_per_instantiation_class() {
+        // `get_ll_dict` one `DICT` per key/value; `getuniqueclassdef`
+        // one class object. A field typed as that struct keeps the
+        // instantiated spelling. A local generic without the entry
+        // family stays the bare template.
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyre_object::rordereddict_entries::GcEntries".to_string(),
+            vec![(
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "fixture::Table".to_string(),
+            vec![(
+                "entries".to_string(),
+                "*mut GcEntries<??TypeVar#0,??TypeVar#1>".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "Foo".to_string(),
+            vec![("x".to_string(), "??TypeVar#0".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let classdef = |spelling: &str| {
+            let value = bk.project_struct_field_type(spelling);
+            let SomeValue::Instance(inst) = &value else {
+                panic!("{spelling} must project to Instance, got {value:?}");
+            };
+            inst.classdef
+                .clone()
+                .unwrap_or_else(|| panic!("{spelling} has no classdef"))
+        };
+        let a = classdef("fixture::Table<u64,i64>");
+        let b = classdef("fixture::Table<i64,i64>");
+        assert!(
+            !Rc::ptr_eq(&a, &b),
+            "holder instantiations must not share one class"
+        );
+        assert!(
+            a.borrow().name.contains("<u64,i64>"),
+            "got {}",
+            a.borrow().name
+        );
+        assert!(
+            b.borrow().name.contains("<i64,i64>"),
+            "got {}",
+            b.borrow().name
+        );
+        let foo_a = classdef("Foo<i64>");
+        let foo_b = classdef("Foo<u64>");
+        assert!(Rc::ptr_eq(&foo_a, &foo_b));
+        assert!(
+            !foo_a.borrow().name.contains('<'),
+            "got {}",
+            foo_a.borrow().name
+        );
     }
 
     #[test]
