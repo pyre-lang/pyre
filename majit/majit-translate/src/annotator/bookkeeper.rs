@@ -8391,6 +8391,13 @@ fn synthetic_interior_ptr_index_field(
     if !field_ty_is_pointer_word(&ptr.ty) || !field_ty_is_integer_word(&index.ty) {
         return None;
     }
+    let leaf = majit_ir::descr::strip_generic_args(root.rsplit("::").next().unwrap_or(root));
+    if leaf.as_ref() != "Interior" {
+        return None;
+    }
+    if ptr.name != "ptr" || index.name != "index" {
+        return None;
+    }
     Some(index.name.clone())
 }
 
@@ -10587,6 +10594,46 @@ mod tests {
         }
         super::super::model::union(&s_index, &super::super::model::s_uint())
             .expect("usize writer unifies with nonneg Signed");
+    }
+
+    #[test]
+    fn synthetic_interior_ptr_index_field_requires_interior_leaf_and_ptr_index_names() {
+        use crate::front::StructFieldRegistry;
+        let ptr_index = vec![
+            ("ptr".to_string(), "&()".to_string()),
+            ("index".to_string(), "i64".to_string()),
+        ];
+        let mut interior = StructFieldRegistry::default();
+        interior
+            .fields
+            .insert("Interior".to_string(), ptr_index.clone());
+        assert_eq!(
+            synthetic_interior_ptr_index_field("Interior", &interior).as_deref(),
+            Some("index")
+        );
+        let mut qualified = StructFieldRegistry::default();
+        qualified
+            .fields
+            .insert("crate::foo::Interior<K, V>".to_string(), ptr_index.clone());
+        assert_eq!(
+            synthetic_interior_ptr_index_field("crate::foo::Interior<K, V>", &qualified).as_deref(),
+            Some("index")
+        );
+        let mut entry = StructFieldRegistry::default();
+        entry.fields.insert("Entry".to_string(), ptr_index);
+        assert_eq!(synthetic_interior_ptr_index_field("Entry", &entry), None);
+        let mut renamed = StructFieldRegistry::default();
+        renamed.fields.insert(
+            "Interior".to_string(),
+            vec![
+                ("base".to_string(), "&()".to_string()),
+                ("offset".to_string(), "i64".to_string()),
+            ],
+        );
+        assert_eq!(
+            synthetic_interior_ptr_index_field("Interior", &renamed),
+            None
+        );
     }
 
     #[test]
