@@ -55,7 +55,7 @@ use super::classdesc::{ClassDef, ClassDesc};
 use super::description::DescEntry;
 use super::model::{
     AnnotatorError, SomeAddress, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat,
-    SomeInstance, SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple,
+    SomeInstance, SomeInteger, SomeIterator, SomeObjectTrait, SomeRustVec, SomeString, SomeTuple,
     SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none,
     union, unionof,
 };
@@ -1567,6 +1567,12 @@ pub fn builtin_list(
     if let SomeValue::List(s_list) = s_iterable {
         // upstream: `s_iterable.listdef.offspring(bk)`.
         return Ok(SomeValue::List(s_list.listdef.offspring(bk, &[])?));
+    }
+    if let SomeValue::RustVec(s) = s_iterable {
+        // SomeRustVec has a fixed s_item and no listdef, so the offspring
+        // analog is a fresh SomeRustVec of the same item
+        // (`unaryop.rs` rustvec.getslice).
+        return Ok(SomeValue::RustVec(SomeRustVec::new((*s.s_item).clone())));
     }
     // upstream: `s_iter = s_iterable.iter(); return bk.newlist(s_iter.next())`.
     let s_iter = SomeIterator::new(s_iterable.clone(), vec![]);
@@ -5931,6 +5937,18 @@ mod tests {
         let s = SomeValue::List(super::super::model::SomeList::new(listdef));
         let out = builtin_list(&bk, &[Some(s)], &no_kwds()).unwrap();
         assert!(matches!(out, SomeValue::List(_)));
+    }
+
+    #[test]
+    fn builtin_list_on_somerustvec_returns_somerustvec_of_same_item() {
+        let bk = bk();
+        let s_item = SomeValue::Integer(SomeInteger::new(true, false));
+        let s = SomeValue::RustVec(SomeRustVec::new(s_item.clone()));
+        let out = builtin_list(&bk, &[Some(s)], &no_kwds()).unwrap();
+        match out {
+            SomeValue::RustVec(s_vec) => assert_eq!(*s_vec.s_item, s_item),
+            other => panic!("list(SomeRustVec) must stay SomeRustVec, got {other:?}"),
+        }
     }
 
     #[test]

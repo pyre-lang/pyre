@@ -7849,54 +7849,18 @@ fn run_two_phase_prepass_inner(
     // the other explicit stand-ins for the deferred complete().
     annotator.seed_all_annotated_return_vars();
 
-    // Builtin-wrapper PBC family + call-family normalization. Must run
-    // after the Impossible seed (`force_return_var_annotation`) and
-    // before Phase B: `normalizecalls.py` `normalize_calltable_row_annotation`
-    // does `annotator.setbinding(graph.getreturnvar(), generalizedresult)`
-    // with `unionof(s_ImpossibleValue, X) == X`. Two-phase
-    // `run_annotator_simplify_isolated` always passes a `block_subset`,
-    // so it never reaches `perform_normalizations`. Only
-    // `normalize_call_familes` is hoisted; `assign_inheritance_ids`
-    // already ran, and `normalize_call_familes` does not require the
-    // other `perform_normalizations` passes.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        consider_builtin_wrapper_call_site(
-            call_registry,
-            &annotator,
-            builtin_wrapper_graphs,
-            function_graphs,
-        )
-    })) {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            rtype_skip_wrapper_subjects(call_registry, builtin_wrapper_graphs, &format!("{err}"));
-        }
-        Err(payload) => {
-            let msg = crate::annotator::model::panic_payload_text(&*payload)
-                .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-            rtype_skip_wrapper_subjects(
-                call_registry,
-                builtin_wrapper_graphs,
-                &format!("panicked: {msg}"),
-            );
-        }
-    }
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Err(err) =
-            crate::translator::rtyper::normalizecalls::normalize_call_familes(&annotator)
-        {
-            eprintln!("[PREPASS normalize_call_familes] {err}");
-        }
-    })) {
-        let msg = crate::annotator::model::panic_payload_text(&*payload)
-            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        eprintln!("[PREPASS normalize_call_familes] panicked: {msg}");
-    }
-
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
-    // progress survives even if this call is cut short.
-    run_phase_b_rtype_isolated(call_registry, determinism_trace, &paths, function_graphs);
+    // progress survives even if this call is cut short. Call-family
+    // normalization runs at the tail of the isolated simplify inside
+    // `run_phase_b_rtype_isolated`.
+    run_phase_b_rtype_isolated(
+        call_registry,
+        determinism_trace,
+        &paths,
+        function_graphs,
+        builtin_wrapper_graphs,
+    );
 }
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
@@ -7915,6 +7879,7 @@ fn run_phase_b_rtype_isolated(
     determinism_trace: bool,
     paths: &[&crate::parse::CallPath],
     function_graphs: &crate::codewriter::call::GraphStore,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
 ) {
     use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
@@ -7952,6 +7917,52 @@ fn run_phase_b_rtype_isolated(
     record_tdc_cuts_for_subjects(&annotator, call_registry, function_graphs);
     let callsite_callees = snapshot_callsite_callees(&annotator, call_registry);
     run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
+    // Call-family normalization at the tail of this isolated simplify.
+    // Upstream `annrpython.py` `RPythonAnnotator.simplify` runs
+    // `perform_normalizations` after `compute_at_fixpoint` when
+    // `block_subset is None`. `rtyper.py` `RPythonTyper.specialize`
+    // calls `simplify` once. Two-phase `run_annotator_simplify_isolated`
+    // always passes a per-graph `block_subset`, so it never reaches
+    // `perform_normalizations`; the call-family half runs here, after
+    // that isolated simplify (and its one `compute_at_fixpoint`) and
+    // before rtyping. `assign_inheritance_ids` already ran;
+    // `seed_all_annotated_return_vars` still precedes this rewrite so
+    // `normalize_calltable_row_annotation` can
+    // `setbinding(graph.getreturnvar(), generalizedresult)` with
+    // `unionof(s_ImpossibleValue, X) == X`.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consider_builtin_wrapper_call_site(
+            call_registry,
+            &annotator,
+            builtin_wrapper_graphs,
+            function_graphs,
+        )
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            rtype_skip_wrapper_subjects(call_registry, builtin_wrapper_graphs, &format!("{err}"));
+        }
+        Err(payload) => {
+            let msg = crate::annotator::model::panic_payload_text(&*payload)
+                .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+            rtype_skip_wrapper_subjects(
+                call_registry,
+                builtin_wrapper_graphs,
+                &format!("panicked: {msg}"),
+            );
+        }
+    }
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(err) =
+            crate::translator::rtyper::normalizecalls::normalize_call_familes(&annotator)
+        {
+            eprintln!("[PREPASS normalize_call_familes] {err}");
+        }
+    })) {
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+        eprintln!("[PREPASS normalize_call_familes] panicked: {msg}");
+    }
     mark_callers_of_incomplete_callees_rtype_skipped(&annotator, call_registry, &callsite_callees);
     apply_tdc_cuts_to_graphstore(call_registry, function_graphs);
 

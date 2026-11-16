@@ -9655,6 +9655,31 @@ fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
 }
 
 #[test]
+fn vec_i64_impl_clone_is_list_builtin() {
+    let vec_ty = vec_of(i64_ty());
+    let recv_ty = serde_json::json!({"Ref": ["_", vec_ty.clone(), "Shared"]});
+    let llbc = std_extern_call_fixture_with_types(
+        "clone_vec_i64_impl",
+        &["alloc", "vec", "<Impl>", "clone"],
+        &[recv_ty],
+        vec_ty,
+        vec_type_decls(),
+    );
+    let graph = crate::test_support::lower_function(&llbc, "clone_vec_i64_impl")
+        .expect("lower alloc::vec::<Impl>::clone of Vec<i64>");
+    let ops = graph_ops(&graph);
+    let leaves = call_leafs(&ops);
+    assert!(
+        leaves.iter().any(|leaf| *leaf == "list"),
+        "FunDecl Vec<i64>::clone must become the list builtin; ops={ops:?}"
+    );
+    assert!(
+        !leaves.iter().any(|leaf| *leaf == "clone"),
+        "FunDecl Vec<i64>::clone must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn trait_clone_of_user_struct_stays_residual() {
     let user = named_adt(0, vec![]);
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
@@ -12446,6 +12471,65 @@ fn one_word_item_vec_set_len_writes_the_len_word() {
         )),
         "Vec::set_len must not remain a FunctionPath; ops={ops:?}"
     );
+}
+
+#[test]
+fn vec_is_empty_is_container_len_eq_zero() {
+    use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let i64_len: Vec<String> = vec_helper_path(VecOp::Length, VecItemKind::Int)
+        .split("::")
+        .map(str::to_string)
+        .collect();
+    let cases: [(&str, serde_json::Value, Vec<serde_json::Value>, Vec<String>); 2] = [
+        (
+            "vec_i64_is_empty",
+            vec_of(i64_ty()),
+            vec_type_decls(),
+            i64_len,
+        ),
+        (
+            "vec_string_is_empty",
+            vec_of(string_ty()),
+            vec_string_type_decls(),
+            vec!["__len".to_string()],
+        ),
+    ];
+    for (caller, recv, decls, expected_len) in cases {
+        let llbc = std_extern_call_fixture_with_types(
+            caller,
+            &["alloc", "vec", "<Impl>", "is_empty"],
+            &[recv],
+            bool_ty.clone(),
+            decls,
+        );
+        let graph =
+            crate::test_support::lower_function(&llbc, caller).expect("lower Vec::is_empty");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if *segments == expected_len
+            )),
+            "Vec::is_empty must emit the container len op {expected_len:?}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "Vec::is_empty must compare with 0; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
+            "Vec::is_empty must become eq; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "is_empty"),
+            "Vec::is_empty must not residualize; ops={ops:?}"
+        );
+    }
 }
 
 #[test]

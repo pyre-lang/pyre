@@ -6801,6 +6801,15 @@ pub(in crate::front::mir) fn rust_vec_slice_view(path: &str) -> Option<RustVecSl
     }
 }
 
+/// [`rust_vec_std_leaf`] restricted to `clone`.
+///
+/// `path` is a FunDecl `name_path` (`alloc::vec::<Impl>::clone`) or the
+/// joined trait-impl residual (`vec::Vec::<impl Clone<…>>::clone`), the
+/// same spellings [`rust_vec_slice_view`] accepts for `deref`.
+pub(in crate::front::mir) fn rust_vec_clone_path(path: &str) -> bool {
+    rust_vec_std_leaf(&path_segments_respecting_angles(path)) == Some("clone")
+}
+
 /// Split `path` on `::` outside `<...>`.
 fn path_segments_respecting_angles(path: &str) -> Vec<String> {
     let bytes = path.as_bytes();
