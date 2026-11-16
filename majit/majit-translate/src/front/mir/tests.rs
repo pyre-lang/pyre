@@ -38779,6 +38779,7 @@ fn closure_env_cell_address_field_descr_is_int_kinded() {
             &llbc,
             &empty_ids,
             &empty_names,
+            &empty_names,
         );
         let (flag, intern_ty, _) = crate::codewriter::call::get_type_flag(&layout, &empty_names);
         assert_eq!(
