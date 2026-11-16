@@ -444,13 +444,15 @@ fn run_startup_file(
         crate::main_name_for_warnings(canonical),
     );
     let outcome = match compiled {
-        Ok(code) => {
-            let w_code = pyre_interpreter::box_code_object(code);
-            unsafe {
-                pyre_interpreter::set_compilation_unit_filename_bytes(w_code, filename_bytes);
+        Ok(code) => match pyre_interpreter::box_code_object(code) {
+            Ok(w_code) => {
+                unsafe {
+                    pyre_interpreter::set_compilation_unit_filename_bytes(w_code, filename_bytes);
+                }
+                exec_in_main(runtime, w_code)
             }
-            exec_in_main(runtime, w_code)
-        }
+            Err(err) => Err(err),
+        },
         Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(error)) => {
             let mut err = pyre_interpreter::compile_err_to_syntax_error(error, &source, Mode::Exec);
             err.replace_syntax_error_filename(pyre_interpreter::gateway::fsdecode_filename_bytes(
@@ -619,7 +621,10 @@ fn shell_exec(
 ) -> ShellExecResult {
     match compile_repl_input(source, empty_line_given, continuing_block) {
         ShellCompileAction::Execute(code) => {
-            let w_code = pyre_interpreter::pycode::box_code_object(code);
+            let w_code = match pyre_interpreter::pycode::box_code_object(code) {
+                Ok(obj) => obj,
+                Err(err) => return ShellExecResult::RuntimeErr(err),
+            };
             let _roots = pyre_object::gc_roots::push_roots();
             let w_code = pyre_object::gc_roots::pin_root(w_code);
             let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

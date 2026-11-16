@@ -8354,7 +8354,7 @@ mod tests_bh_load_global {
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.base();
         let code = pyre_interpreter::compile_exec("issue2506_global").unwrap();
-        let _ = roots.pin_root(pyre_interpreter::box_code_object(code));
+        let _ = roots.pin_root(pyre_interpreter::box_code_object(code).unwrap());
         let _ = roots.pin_root(pyre_object::w_dict_new());
         unsafe {
             pyre_interpreter::w_code_set_w_globals(roots.get(base), roots.get(base + 1));

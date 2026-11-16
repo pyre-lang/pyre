@@ -533,6 +533,13 @@ pub unsafe fn walk_enrolled_code_roots(
         visitor(&mut *(&mut code.w_filename as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `PyCode._signature` is the host box from `make_signature`, freed
         // by `pycode_destructor`. It is not a GC reference.
+        // `pycode.py _immutable_fields_ cell_families[*]`. The array's own
+        // trace names the GC `CellFamily` objects; each cell also traces
+        // `Cell.family`, so a family survives after this wrapper is gone.
+        visitor(
+            &mut *(&mut code.cell_families as *mut *mut pyre_object::FixedObjectArray
+                as *mut majit_ir::GcRef),
+        );
         // `PyCode.co_consts_w` is a GCREF to a `GcArray(OBJECTPTR)` whose
         // own trace names the items. An item store barriers the array
         // (`FixedObjectArray::set_ref`), so an old array holding a young
@@ -4273,7 +4280,7 @@ impl ConstantOpcodeHandler for PyFrame {
         // today, though `opcode_load_const` is registered as a JIT call target.
         // So the copy this makes is not on a measured path; see
         // `box_code_constant` for why removing it is not worth its price.
-        Ok(crate::pycode::box_code_constant(code))
+        crate::pycode::box_code_constant(code)
     }
 
     fn constant_at(

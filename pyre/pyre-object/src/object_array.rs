@@ -57,11 +57,10 @@ pub(crate) fn ll_chars_strcmp(left: &[u8], right: &[u8]) -> isize {
 pub use majit_rlib::lltypesystem::rlist::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock,
     alloc_typed_items_block_immortal, alloc_typed_items_block_nursery, gc_float_array_gc_type_id,
-    gc_int_array_gc_type_id, gc_object_items_array_gc_type_id, itemsblock_gc_enabled,
-    set_gc_float_array_gc_type_id, set_gc_int_array_gc_type_id,
-    set_gc_object_items_array_gc_type_id, try_alloc_typed_items_block_nursery,
-    try_typed_items_block_layout, typed_items_block_capacity, typed_items_block_clear,
-    typed_items_block_items_base, typed_items_block_layout,
+    gc_int_array_gc_type_id, gc_object_items_array_gc_type_id, set_gc_float_array_gc_type_id,
+    set_gc_int_array_gc_type_id, set_gc_object_items_array_gc_type_id,
+    try_alloc_typed_items_block_nursery, try_typed_items_block_layout, typed_items_block_capacity,
+    typed_items_block_clear, typed_items_block_items_base, typed_items_block_layout,
 };
 
 /// GC type id for the variable-length backing block of
@@ -143,8 +142,8 @@ pub struct ArrayToken {
 /// offset 8 = items[0..capacity]. Total allocation size =
 /// `ITEMS_BLOCK_ITEMS_OFFSET + capacity * sizeof(PyObjectRef)`.
 ///
-/// The header layout matches upstream and, by default, the allocator
-/// now routes object-strategy blocks through the moving nursery
+/// The header layout matches upstream and the allocator routes
+/// object-strategy blocks through the moving nursery
 /// (`alloc_list_items_block_gc` / `alloc_tuple_items_block_gc` /
 /// `grow_list_items_block_gc` → `try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID,
 /// cap)`), so `PY_OBJECT_ARRAY_GC_TYPE_ID` and the list/tuple custom
@@ -152,10 +151,9 @@ pub struct ArrayToken {
 /// `list_object_custom_trace` / `tuple_object_custom_trace`) are live at
 /// collection time. `W_ListObject` / `W_TupleObject` hold
 /// `{length: usize, items: *mut ItemsBlock}` fields directly (no
-/// `PyObjectArray` fat wrapper for list/tuple). The `std::alloc`
-/// `alloc_items_block` / `grow_items_block` below are the
-/// `MAJIT_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
-/// behaviour).
+/// `PyObjectArray` fat wrapper for list/tuple). `alloc_items_block` /
+/// `grow_items_block` are the no-hook `std::alloc` constructors (bare
+/// unit tests and the pre-`init_gc_subsystem` bootstrap).
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("capacity")]
 pub struct ItemsBlock {
@@ -184,10 +182,6 @@ impl crate::lltype::GcType for ItemsBlock {
 impl crate::lltype::GcArrayType for ItemsBlock {
     fn type_id() -> u32 {
         PY_OBJECT_ARRAY_GC_TYPE_ID
-    }
-
-    fn gc_enabled() -> bool {
-        itemsblock_gc_enabled()
     }
 
     fn payload_layout(n: i64) -> Option<Layout> {
@@ -861,9 +855,9 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// its length from the offset-0 `capacity` header and forwards
 /// items[0..capacity], so the caller MUST write every slot (value or
 /// NULL) before a collection can observe the block. Falls back to the
-/// `std::alloc` [`alloc_items_block`] when the gate is off or no GC hook
-/// is installed (pure interpreter / early startup). Items are left
-/// uninitialised either way. The bool is whether the block is GC-owned.
+/// `std::alloc` [`alloc_items_block`] when no GC hook is installed
+/// (pure interpreter / early startup). Items are left uninitialised
+/// either way. The bool is whether the block is GC-owned.
 ///
 /// # Why `try_gc_alloc` and not the collecting hook
 ///
@@ -913,15 +907,11 @@ unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)
 /// relocated shadow-stack slots — the `pop_roots` read-back of
 /// `w_tuple_new_array_backed` — because the local `values` slice still
 /// holds pre-collection addresses. Capacity is `len.max(1)`
-/// (overallocation policy); spare slots are NULL. Degrades to the
-/// `std::alloc` [`alloc_list_items_block`] when the gate is off.
+/// (overallocation policy); spare slots are NULL.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
-    if !itemsblock_gc_enabled() {
-        return unsafe { alloc_list_items_block(values) };
-    }
     let len = values.len();
     let cap = len.max(1);
     let _roots = crate::gc_roots::push_roots();
@@ -971,8 +961,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
 /// through its write barrier and then hands the old block to
 /// [`dealloc_list_items_block`] (which no-ops on a GC-managed block — the
 /// collector reclaims it). `old` may be null with `live_len == 0` (fresh
-/// allocation). Degrades to the `std::alloc` [`grow_list_items_block`] when the
-/// gate is off.
+/// allocation).
 ///
 /// The block itself is the root, not its items. A block is a traced GC array of
 /// GC pointers (`PY_OBJECT_ARRAY_GC_TYPE_ID` is registered `TypeInfo::varsize`
@@ -1057,9 +1046,6 @@ pub unsafe fn try_grow_list_items_block_gc(
     new_cap: usize,
     live_len: usize,
 ) -> Option<*mut ItemsBlock> {
-    if !itemsblock_gc_enabled() {
-        return unsafe { try_grow_items_block(old, new_cap, live_len) };
-    }
     let _roots = crate::gc_roots::push_roots();
     let old_slot = {
         // Publish the old block before *any* GC hook.  In particular,
@@ -1118,23 +1104,11 @@ pub unsafe fn try_grow_list_items_block_gc(
 /// `save_point`, which the caller must keep live across this call: a
 /// collection during the block malloc rewrites those slots in place, and
 /// the fill reads them back afterwards. A `Vec` of the same words would
-/// still hold pre-move addresses. Degrades to `std::alloc` when the gate
-/// is off, still filling from the slots.
+/// still hold pre-move addresses.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut ItemsBlock {
-    if !itemsblock_gc_enabled() {
-        let block = unsafe { alloc_items_block(cap) };
-        if crate::gc_hook::gc_alloc_failed_pending() && block.is_null() {
-            return block;
-        }
-        if cap > 0 {
-            let dst = unsafe { std::slice::from_raw_parts_mut(items_block_items_base(block), cap) };
-            crate::gc_roots::shadow_stack_copy_range(save_point, dst);
-        }
-        return block;
-    }
     let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
     let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
@@ -1169,9 +1143,9 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
 
 /// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for
 /// the walker's recording-time materialization of a virtual
-/// `NEW_ARRAY_CLEAR` (BUILD_LIST / BUILD_TUPLE). Returns `None` when the gate
-/// is off or no GC hook is installed, so the caller declines materialization
-/// rather than handing back a `std::alloc` block that would never be freed.
+/// `NEW_ARRAY_CLEAR` (BUILD_LIST / BUILD_TUPLE). Returns `None` when no
+/// GC hook is installed, so the caller declines materialization rather
+/// than handing back a `std::alloc` block that would never be freed.
 /// The block is a `PY_OBJECT_ARRAY_GC_TYPE_ID` varsize array, so its items are
 /// GC-traced and the NULL prefix is benign until the caller fills slots via
 /// `setarrayitem_ref` + a block write barrier. No `std::alloc` fallback here
@@ -1181,9 +1155,6 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
-    if !itemsblock_gc_enabled() {
-        return None;
-    }
     let block = unsafe { crate::lltype::malloc_varsize_clear::<ItemsBlock>(cap as i64) };
     if block.is_null() {
         return None;
@@ -1228,14 +1199,12 @@ pub fn _ll_fixed_alloc_and_set_nonnull_r_trampoline(
 }
 
 /// Allocate a fresh `ItemsBlock` with the given capacity via
-/// `std::alloc::alloc`. This is the `MAJIT_GC_ITEMSBLOCK=0` fallback;
-/// the default path is the moving-nursery `alloc_items_block_gc` above
-/// (`try_gc_alloc`, caller-side root tracking via `gc_roots::pin_root` +
-/// the block write-barrier). An earlier `try_gc_alloc_stable` attempt was
-/// abandoned because old-gen (non-moving) allocation accumulates
-/// per-iteration containers until a major GC; the nursery path avoids that
-/// (minor GC reclaims short-lived blocks) and is perf-neutral on
-/// fannkuch/nbody.
+/// `std::alloc::alloc`. This is the no-hook constructor used when no
+/// collector owns the heap (bare unit tests and the
+/// pre-`init_gc_subsystem` bootstrap). The production path is the
+/// moving-nursery `alloc_items_block_gc` above (`try_gc_alloc`,
+/// caller-side root tracking via `gc_roots::pin_root` + the block
+/// write-barrier).
 ///
 /// The capacity header is initialized; items are left uninitialized —
 /// the caller must write all `capacity` slots before exposing the
@@ -1493,7 +1462,7 @@ const _: () = assert!(
 /// Float/Int strategy `_none_value` (0.0 / 0); `try_gc_alloc_stable` memory is
 /// not guaranteed zeroed, so the items are cleared explicitly. `cap` is clamped
 /// to at least 1 (rlist.py:251 overallocation policy). Falls back to
-/// `std::alloc::alloc_zeroed` when the gate is off or no GC hook is installed
+/// `std::alloc::alloc_zeroed` when no GC hook is installed
 /// (pure interpreter / early startup).
 ///
 /// The block is allocated `stable` (old-gen, mark-sweep, non-moving) — the same
@@ -1529,27 +1498,25 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
     let payload = layout.size();
-    if itemsblock_gc_enabled() {
-        match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(
-            tid, payload,
-        ))
-        .allocated_or_raise()
-        {
-            Some(raw) => {
-                let block = raw as *mut TypedItemsBlock;
-                unsafe {
-                    (*block).capacity = cap;
-                    std::ptr::write_bytes(
-                        typed_items_block_items_base(block),
-                        0,
-                        cap * std::mem::size_of::<u64>(),
-                    );
-                }
-                return Some(block);
+    match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(
+        tid, payload,
+    ))
+    .allocated_or_raise()
+    {
+        Some(raw) => {
+            let block = raw as *mut TypedItemsBlock;
+            unsafe {
+                (*block).capacity = cap;
+                std::ptr::write_bytes(
+                    typed_items_block_items_base(block),
+                    0,
+                    cap * std::mem::size_of::<u64>(),
+                );
             }
-            None if crate::gc_hook::gc_alloc_failed_pending() => return None,
-            None => {}
+            return Some(block);
         }
+        None if crate::gc_hook::gc_alloc_failed_pending() => return None,
+        None => {}
     }
     unsafe {
         let block = std_alloc_gc_array(layout, true)? as *mut TypedItemsBlock;
@@ -1674,10 +1641,10 @@ macro_rules! typed_items_block_grow {
                         live_len as i64,
                     );
                 }
-                // A block outside the collector's heap (no GC installed, or
-                // the items-block gate off) has no other owner to free it.
-                // Traced code allocates its blocks from the collector, so
-                // this arm is the interpreter's alone.
+                // A block outside the collector's heap (no GC installed)
+                // has no other owner to free it. Traced code allocates its
+                // blocks from the collector, so this arm is the
+                // interpreter's alone.
                 if !majit_rlib::jit::we_are_jitted() {
                     dealloc_typed_items_block(roots.get(base) as *mut TypedItemsBlock);
                 }
@@ -1727,10 +1694,10 @@ macro_rules! typed_items_block_grow {
                     );
                 }
                 if !old.is_null() {
-                    // A block outside the collector's heap (no GC installed, or
-                    // the items-block gate off) has no other owner to free it.
-                    // Traced code allocates its blocks from the collector, so
-                    // this arm is the interpreter's alone.
+                    // A block outside the collector's heap (no GC installed)
+                    // has no other owner to free it. Traced code allocates
+                    // its blocks from the collector, so this arm is the
+                    // interpreter's alone.
                     if !majit_rlib::jit::we_are_jitted() {
                         dealloc_typed_items_block(
                             crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
@@ -1762,7 +1729,7 @@ typed_items_block_grow!(
 
 /// Deallocate a `TypedItemsBlock`. No-op on null. A GC-managed block is reclaimed
 /// by the collector and must never be freed here. `try_gc_owns_object` gates the
-/// `std::alloc` free to the gate-off / no-hook fallback blocks
+/// `std::alloc` free to the no-hook fallback blocks
 /// ([`std_alloc_gc_array`]).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

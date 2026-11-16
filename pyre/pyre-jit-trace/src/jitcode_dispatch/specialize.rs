@@ -1751,7 +1751,11 @@ pub(crate) fn walker_guard_apparent_super_class<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     apparent: ApparentSuperClass,
 ) -> Result<OpRef, DispatchError> {
-    walker_guard_mapdict_instance_shape(
+    // Intern the apparent class before the shape guard: that guard's
+    // version-tag pin / map promote append to `Trace._ops` and can
+    // minor-collect (`history.py` `ConstPtr`).
+    let objtype_const = ctx.trace_ctx.const_ref(apparent.objtype as i64);
+    let _shape = walker_guard_mapdict_instance_shape(
         ctx,
         op_pc,
         obj_op,
@@ -1759,7 +1763,6 @@ pub(crate) fn walker_guard_apparent_super_class<Sym: WalkSym>(
         apparent.receiver_type,
         apparent.receiver_map,
     )?;
-    let objtype_const = ctx.trace_ctx.const_ref(apparent.objtype as i64);
     // `_super_check`'s final `issubtype_w(w_type, w_starttype)` is an
     // elidable MRO query on promoted types.  The receiver-type version pin
     // above protects which object `__class__` returns; this second pin
@@ -1881,6 +1884,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // CellFamily is a moving nursery object. Mint ConstPtr boxes before
+    // the self-cell read / GuardValue / GuardClass / family pin so later
+    // uses read the forwarded word (`history.py` `ConstPtr.value`).
+    // `record_guard` / `record_op` append to `opencoder.py` `Trace._ops`;
+    // `_double_ops` can minor-collect.
+    let family_const = ctx.trace_ctx.const_ref(family as i64);
+    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
+    let self_const = ctx.trace_ctx.const_ref(concrete_self as i64);
+    let callable_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
+    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
+    let receiver_type_const =
+        apparent.map(|answer| ctx.trace_ctx.const_ref(answer.receiver_type as i64));
+    let receiver_map_const =
+        apparent.map(|answer| ctx.trace_ctx.const_ref(answer.receiver_map as i64));
+
     // `_get_self_location`'s cellvar arm is the ordinary red-cell LOAD_DEREF
     // shape.  All of that helper's decline conditions were proved above (and
     // the inline-resume condition at entry), so once it emits no later
@@ -1897,15 +1915,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     };
 
     // Which callable `super` names is baked into the emitted body.
+    let concrete_callable =
+        walker_concrete_ref_object(ctx, callable_const).unwrap_or(concrete_callable);
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
+    let family = walker_concrete_ref_object(ctx, family_const)
+        .map(|p| p as *const pyre_object::nestedscope::CellFamily)
+        .unwrap_or(family);
     walker_pin_cell_family_ever_mutated(ctx, op.pc, family)?;
     let cls_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         class_cell_op,
         crate::descr::cell_contents_descr(),
     );
+    let concrete_cls = walker_concrete_ref_object(ctx, cls_const).unwrap_or(concrete_cls);
     if !matches!(
         ctx.trace_ctx.box_value(cls_op),
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
@@ -1915,7 +1939,21 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_cls as usize)),
         );
     }
+    let concrete_self = walker_concrete_ref_object(ctx, self_const).unwrap_or(concrete_self);
+    let objtype = walker_concrete_ref_object(ctx, objtype_const).unwrap_or(objtype);
     let proxy_op = if let Some(apparent) = apparent {
+        let apparent = ApparentSuperClass {
+            objtype,
+            receiver_type: receiver_type_const
+                .and_then(|c| walker_concrete_ref_object(ctx, c))
+                .unwrap_or(apparent.receiver_type),
+            receiver_map: receiver_map_const
+                .and_then(|c| {
+                    walker_concrete_ref_object(ctx, c)
+                        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+                })
+                .unwrap_or(apparent.receiver_map),
+        };
         walker_emit_apparent_super_proxy(
             ctx,
             op.pc,
@@ -2229,7 +2267,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     if let Some((w_type, _, map, storageindex, attr)) =
         unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name) }
     {
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        // Mint before the shape guard (`history.py` `ConstPtr`); that guard
+        // can minor-collect. `const_ref` only interns.
+        let attr_const = ctx.trace_ctx.const_ref(attr as i64);
+        let shape =
+            walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        let concrete_obj = shape.concrete_obj;
+        let attr = walker_concrete_ref_object(ctx, attr_const)
+            .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+            .unwrap_or(attr);
 
         // mapdict.py `PlainAttribute._pure_direct_read`, the `@jit.elidable`
         // read `AbstractAttribute.read` picks when the attribute has never been
@@ -2292,7 +2338,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     {
         // The shape guard can minor-collect: box `w_type` before it.
         let value = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        let _shape =
+            walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2315,7 +2362,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // The raw `w_value` is not one of those holders: box it before the
         // shape guard, which can minor-collect.
         let value = ctx.trace_ctx.const_ref(w_value as i64);
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        let _shape =
+            walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2369,6 +2417,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     {
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
+        // Mint before the class pin (`history.py` `ConstPtr`); that pin
+        // can minor-collect. `const_ref` only interns.
+        let map_const = ctx.trace_ctx.const_ref(map as i64);
         let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?
         else {
             return Ok(None);
@@ -2418,6 +2469,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             carrier_op,
             majit_ir::Value::Ref(majit_ir::GcRef(carrier as usize)),
         );
+        let map = walker_concrete_ref_object(ctx, map_const)
+            .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+            .unwrap_or(map);
         walker_promote_instance_map(ctx, op_pc, carrier_op, carrier, map)?;
 
         // The map guard above can minor-collect. `carrier` is the copy;
@@ -2693,9 +2747,24 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+    // Mint before the shape guard (`history.py` `ConstPtr`); that guard
+    // can minor-collect. `const_ref` only interns.
+    let attr_const = ctx.trace_ctx.const_ref(attr as i64);
+    let shape = walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+    let concrete_obj = shape.concrete_obj;
+    let map = shape.map;
+    let attr = walker_concrete_ref_object(ctx, attr_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(attr);
     let term = unsafe { pyre_object::mapdict::map_terminator(map) };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
+    // The terminator pin records `QUASIIMMUT_FIELD` and can minor-collect
+    // (`opencoder.py` `Trace._double_ops`). Re-read `attr` off the ConstPtr
+    // minted before the shape guard (`history.py` `ConstPtr.value`;
+    // `mapdict.py` `UnboxedPlainAttribute._pure_direct_read`).
+    let attr = walker_concrete_ref_object(ctx, attr_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(attr);
 
     // mapdict.py `UnboxedPlainAttribute._pure_direct_read`:
     // `self._box(self._pure_unboxed_read(obj))` — only the raw longlong read is
@@ -2877,8 +2946,14 @@ where
 {
     // GuardClass (and the version-tag pin) can minor-collect. `concrete_obj`
     // is a copy; the receiver box is `obj` (`RefFrontendOp` / `getref_base`).
+    // Mint the map ConstPtr before getfield (`history.py` `ConstPtr`);
+    // that record can collect. `const_ref` only interns.
+    let map_const = ctx.trace_ctx.const_ref(map as i64);
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     let descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
+    let map = walker_concrete_ref_object(ctx, map_const)
+        .map(|p| p as pyre_object::mapdict::MapRef)
+        .unwrap_or(map);
     if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr.index())
         && cached.is_constant()
         && matches!(
@@ -2891,15 +2966,14 @@ where
     // `MapdictStorageMixin.map` is a GCREF. Record `getfield_gc_r` and
     // `GuardValue` against a `ConstPtr` (`jit.promote(self.map)`).
     let slot_op = walker_record_getfield_gc_r_uncached(ctx, obj, descr.clone());
-    let slot_const = ctx.trace_ctx.const_ref(map as i64);
-    emit_guard(ctx, OpCode::GuardValue, &[slot_op, slot_const])?;
+    emit_guard(ctx, OpCode::GuardValue, &[slot_op, map_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
-        .replace_box(slot_op, slot_const);
+        .replace_box(slot_op, map_const);
     // So a later promote of the same descr sees a ConstPtr and skips, matching
     // `implement_guard_value` returning early on a Const.
     ctx.trace_ctx
-        .heapcache_getfield_now_known(obj, descr.index(), slot_const);
+        .heapcache_getfield_now_known(obj, descr.index(), map_const);
     Ok(())
 }
 
@@ -3019,10 +3093,23 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // elided once the box is a ConstPtr (`pyjitpl.py implement_guard_value`).
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
-    // The guards can minor-collect: box `w_descr` before them.
+    // The guards can minor-collect: box `w_descr` and the shadow map before them.
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    let shadow_map_const = match shadow {
+        ShadowGuard::InstanceMap(map) => Some(ctx.trace_ctx.const_ref(map as i64)),
+        ShadowGuard::ExceptionDictIsNull(_) => None,
+    };
     let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)? else {
         return Ok(None);
+    };
+    let shadow = match (shadow, shadow_map_const) {
+        (ShadowGuard::InstanceMap(map), Some(map_const)) => {
+            let map = walker_concrete_ref_object(ctx, map_const)
+                .map(|p| p as pyre_object::mapdict::MapRef)
+                .unwrap_or(map);
+            ShadowGuard::InstanceMap(map)
+        }
+        (other, _) => other,
     };
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
@@ -3058,10 +3145,23 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
         return Ok(None);
     };
-    // The guards can minor-collect: box the cell before them.
+    // The guards can minor-collect: box the cell and the shadow map before them.
     let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    let shadow_map_const = match shadow {
+        ShadowGuard::InstanceMap(map) => Some(ctx.trace_ctx.const_ref(map as i64)),
+        ShadowGuard::ExceptionDictIsNull(_) => None,
+    };
     let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)? else {
         return Ok(None);
+    };
+    let shadow = match (shadow, shadow_map_const) {
+        (ShadowGuard::InstanceMap(map), Some(map_const)) => {
+            let map = walker_concrete_ref_object(ctx, map_const)
+                .map(|p| p as pyre_object::mapdict::MapRef)
+                .unwrap_or(map);
+            ShadowGuard::InstanceMap(map)
+        }
+        (other, _) => other,
     };
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
@@ -3692,6 +3792,10 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
             ctx.trace_ctx.const_ref(expected as i64),
         )
     });
+    let shadow_map_const = match &shadow {
+        Some(ShadowGuard::InstanceMap(map)) => Some(ctx.trace_ctx.const_ref(*map as i64)),
+        _ => None,
+    };
     let Some(w_type_const) =
         walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?
     else {
@@ -3706,6 +3810,15 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     }
 
     if let Some(shadow) = shadow {
+        let shadow = match (shadow, shadow_map_const) {
+            (ShadowGuard::InstanceMap(map), Some(map_const)) => {
+                let map = walker_concrete_ref_object(ctx, map_const)
+                    .map(|p| p as pyre_object::mapdict::MapRef)
+                    .unwrap_or(map);
+                ShadowGuard::InstanceMap(map)
+            }
+            (other, _) => other,
+        };
         walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     }
 
@@ -4857,7 +4970,15 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             }
         }
 
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        // Mint before the shape guard (`history.py` `ConstPtr`); that guard
+        // can minor-collect. `const_ref` only interns.
+        let attr_const = ctx.trace_ctx.const_ref(attr as i64);
+        let shape =
+            walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+        let concrete_obj = shape.concrete_obj;
+        let attr = walker_concrete_ref_object(ctx, attr_const)
+            .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+            .unwrap_or(attr);
         unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
         let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
         let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
@@ -5115,23 +5236,61 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         }
         && let Some(value_pin) = store_attr_add_value_pin(&add, concrete_value)
     {
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, add.w_type, add.map())?;
-        walker_pin_holder_typ(ctx, op_pc, add.holder())?;
+        // Mint before the shape guard (`history.py` `ConstPtr`); that guard
+        // can minor-collect. `const_ref` only interns. Integers
+        // (`storageindex`, `picked_unbox`) need nothing.
+        let map_const = ctx.trace_ctx.const_ref(add.map() as i64);
+        let holder_const = ctx.trace_ctx.const_ref(add.holder() as i64);
+        let new_map_const = ctx.trace_ctx.const_ref(add.new_map() as i64);
+        let shape = walker_guard_mapdict_instance_shape(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            add.w_type,
+            add.map(),
+        )?;
+        let concrete_obj = shape.concrete_obj;
+        let map = walker_concrete_ref_object(ctx, map_const)
+            .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+            .unwrap_or(shape.map);
+        let holder = walker_concrete_ref_object(ctx, holder_const)
+            .map(|p| p as *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder)
+            .unwrap_or(add.holder());
+        walker_pin_holder_typ(ctx, op_pc, holder)?;
         // This marker is not redundant with the instance-map GuardValue. The
-        // fold bakes `add.new_map()`, the transition target, as a green
-        // `const_ref`, while the guard pins `add.map()`, the instance map
-        // before the transition. `holder_pick_attr` can replace `holder.attr`
-        // with a fresh `PlainAttribute` without changing any instance's
-        // current map; this marker protects the baked target.
-        walker_pin_holder_attr(ctx, op_pc, add.holder())?;
+        // fold bakes the `new_map` ConstPtr minted before the shape guard,
+        // while that guard pins `add.map()`, the instance map before the
+        // transition. `holder_pick_attr` can replace `holder.attr` with a
+        // fresh `PlainAttribute` without changing any instance's current
+        // map; this marker protects the baked target. The typ pin can
+        // collect; re-read the holder off the ConstPtr minted above.
+        let holder = walker_concrete_ref_object(ctx, holder_const)
+            .map(|p| p as *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder)
+            .unwrap_or(holder);
+        walker_pin_holder_attr(ctx, op_pc, holder)?;
         // General rule: plant the `allow_unboxing` marker only where the fold
         // read the flag as true. Marking a false read re-arms a permanently
         // dead field and lets later writes invalidate without bound.
+        // Holder pins append to `Trace._ops` and can collect again; re-read
+        // the map off the ConstPtr minted from the forwarded shape.
+        let map = walker_concrete_ref_object(ctx, map_const)
+            .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+            .unwrap_or(map);
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        // Intern the receiver before the terminator pin (`history.py`
+        // `ConstPtr`). A New-op box's recorder concrete is a raw snapshot;
+        // the interned slot is what a minor updates. `const_ref` only interns.
+        let obj_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
         if add.picked_unbox.is_some() {
-            let term = unsafe { pyre_object::mapdict::map_terminator(add.map()) };
+            let term = unsafe { pyre_object::mapdict::map_terminator(map) };
             walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
         }
-        let new_map_const = ctx.trace_ctx.const_ref(add.new_map() as i64);
+        // The terminator pin can minor-collect. Re-read before descr
+        // selection (`mapdict.py` `_get_mapdict_map`; `history.py`
+        // `ConstPtr.value`).
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
         let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete_obj) };
         let unboxed_raw = match value_pin {
@@ -5169,7 +5328,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // the GETFIELD recording may trigger.
         let old_block = (add.storageindex > 0)
             .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
+        // Unbox / GETFIELD recording can collect again. Re-read before commit.
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         let concrete_value = live_box_ref(ctx, value, concrete_value);
         let committed = unsafe {
             pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
@@ -5185,6 +5346,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             drop(pyre_interpreter::runtime_ops::fetch_memory_error());
             return Ok(None);
         }
+        // Contended `instance_lock` in `store_attr_add_commit` can collect.
+        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = walker_concrete_ref_object(ctx, obj_const).unwrap_or(concrete_obj);
         // `MetaInterp.execute_and_record` / `History.record` / `_make_op(..., value)`:
         // the recorded `NewArrayClear` is born with the block commit installed.
         let (new_block_value, new_block_ptr) = match ctx.trace_ctx.field_sanity_load(
@@ -5260,7 +5424,14 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+    // Mint before the shape guard (`history.py` `ConstPtr`); that guard
+    // can minor-collect. `const_ref` only interns.
+    let attr_const = ctx.trace_ctx.const_ref(attr as i64);
+    let shape = walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
+    let concrete_obj = shape.concrete_obj;
+    let attr = walker_concrete_ref_object(ctx, attr_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(attr);
     unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
     // The shape guard can minor-collect. `concrete_obj` is a copy of `obj`.
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
@@ -14764,11 +14935,16 @@ where
     }
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
     // Every record below appends to `opencoder.py Trace._ops` and can
-    // minor-collect. Box `w_type` before the first one; `w_type` is a copy.
+    // minor-collect. Box `w_type` and the map before the first one;
+    // both copies are stale after GuardClass (`history.py` `ConstPtr`).
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let map_const = (has_mapdict && !map.is_null()).then(|| ctx.trace_ctx.const_ref(map as i64));
     walker_guard_stamped_class_with_guard(ctx, obj, phys_type, &mut emit_guard)?;
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-    if has_mapdict && !map.is_null() {
+    if let Some(map_const) = map_const {
+        let map = walker_concrete_ref_object(ctx, map_const)
+            .map(|p| p as pyre_object::mapdict::MapRef)
+            .unwrap_or(map);
         walker_promote_instance_map_with_guard(ctx, obj, concrete_obj, map, &mut emit_guard)?;
         walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut emit_guard)?;
         return Ok(Some(w_type_const));

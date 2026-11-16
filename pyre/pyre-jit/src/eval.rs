@@ -2285,15 +2285,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // item slot as a Ref; NULL-initialized spare slots past the
     // live length are benign.
     //
-    // This typeid governs blocks allocated *through the GC*, which is
-    // the default path (`object_array::alloc_*_block_gc` →
-    // `try_gc_alloc`); the nursery walker traces each item slot of such
-    // a block, and the list/tuple custom traces forward the block
-    // pointer. Under the `MAJIT_GC_ITEMSBLOCK=0` fallback the blocks come
-    // from `std::alloc` instead and no allocation carries this typeid.
-    // See comments on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID`
-    // and `pyre_object::object_array::ItemsBlock` for the companion
-    // notices.
+    // This typeid governs blocks allocated *through the GC*
+    // (`object_array::alloc_*_block_gc` → `try_gc_alloc`); the nursery
+    // walker traces each item slot of such a block, and the list/tuple
+    // custom traces forward the block pointer. See comments on
+    // `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
+    // `pyre_object::object_array::ItemsBlock` for the companion notices.
     let items_token = &pyre_object::object_array::ITEMS_BLOCK_TOKEN;
     let py_object_array_tid = gc.get_type_id(
         GcTypeKey::of(&pyre_object::object_array::PY_OBJECT_ARRAY_GC_TYPE_ID_CELL),
@@ -6087,6 +6084,22 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::mapdict::cached_attribute_holder_destructor,
         |tid| pyre_object::mapdict::CACHED_ATTRIBUTE_HOLDER_GC_TYPE_ID.set(tid),
     );
+    // nestedscope.py `CellFamily` — ordinary GC instance (`lltype.malloc`).
+    // Appended after every existing registration so no hardcoded tid moves.
+    // Headerless, no GC pointers; the destructor drops `name` and reclaims
+    // the `ever_mutated?` qmut words. `dummy_family` is born immortal with
+    // this tid (`malloc_typed_immortal`, the same birth as `space.w_None`).
+    let cell_family_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::nestedscope::CELL_FAMILY_GC_TYPE_ID),
+        || {
+            TypeInfo::with_destructor(
+                std::mem::size_of::<pyre_object::nestedscope::CellFamily>(),
+                pyre_object::nestedscope::cell_family_destructor,
+            )
+        },
+    );
+    pyre_object::nestedscope::CELL_FAMILY_GC_TYPE_ID.set(cell_family_tid);
+    let _ = pyre_object::nestedscope::dummy_family();
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
@@ -19634,7 +19647,7 @@ mod tests {
         // enter this worker through the same per-thread runtime/GIL bootstrap
         // as production before allocating.
         init_gc_subsystem();
-        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null()).unwrap();
         assert!(!w_code.is_null());
 
         let hash =

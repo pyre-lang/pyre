@@ -97,7 +97,7 @@ pub fn compile_source_named_by_bytes(
     })?;
     // The bytes land on the wrapper the compile produced, before anything can
     // allocate, exactly as `builtin_compile` lands them.
-    let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+    let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ())?;
     let roots = pyre_object::gc_roots::push_roots();
     let code_slot = roots.base();
     let _ = roots.pin_root(w_code);

@@ -12734,7 +12734,13 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
-    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)
+    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)?;
+    // `record_guard` appends to `opencoder.py` `Trace._ops`; `_double_ops`
+    // can minor-collect. Tests rewrite minted `ConstPtr` slots here the
+    // way that minor would (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_fold_guard();
+    Ok(())
 }
 
 /// [`walker_emit_fold_guard_with_snapshot`] for a fold inside a Python opcode
@@ -12988,6 +12994,106 @@ fn walker_guard_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// Post-guard mapdict instance identity.
+///
+/// `mapdict.py MapdictStorageMixin._get_mapdict_map` `jit.promote(self.map)`
+/// yields a `history.py` `ConstPtr`; the collector updates that box. Callers
+/// use these forwarded words rather than the raw copies taken before the
+/// guard. A heap `W_TypeObject` is nursery-born (`typeobject.py`), so `w_type`
+/// moves too.
+#[derive(Clone, Copy)]
+struct MapdictInstanceShape {
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    map: pyre_interpreter::objspace::std::mapdict::MapRef,
+}
+
+/// Test-only writeback at the helper's collecting calls.
+///
+/// Production collection is `record_guard` / `record_op` → `record_bytes` →
+/// `opencoder.py` `Trace._double_ops` → `alloc_fast_nursery_collecting_typed_rooted`.
+/// `TraceCtx::for_test_types` records into a host buffer, so tests install a
+/// hook that rewrites the minted `ConstPtr` slots the way that minor would.
+#[cfg(test)]
+pub(crate) mod mapdict_shape_collect_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    pub fn set(hook: Option<fn()>) {
+        HOOK.with(|slot| slot.set(hook));
+    }
+
+    pub fn run() {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub struct ClearOnDrop;
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set(None);
+        }
+    }
+}
+
+/// Test-only writeback at collecting calls after the instance shape guard.
+///
+/// `mapdict_shape_collect_hook` fires at the end of
+/// `walker_guard_mapdict_instance_shape`. A later `GuardClass` /
+/// `walker_pin_terminator_allow_unboxing` / `walker_pin_cell_family_ever_mutated`
+/// can collect again (`opencoder.py` `Trace._double_ops`); tests that
+/// rewrite at the shape guard cannot see a stale use after those calls.
+/// Install only the site under test so an earlier fire cannot hide it.
+#[cfg(test)]
+pub(crate) mod later_collect_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER_FOLD_GUARD: Cell<Option<fn()>> = const { Cell::new(None) };
+        static AFTER_PIN: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    pub fn set_after_fold_guard(hook: Option<fn()>) {
+        AFTER_FOLD_GUARD.with(|slot| slot.set(hook));
+    }
+
+    pub fn set_after_pin(hook: Option<fn()>) {
+        AFTER_PIN.with(|slot| slot.set(hook));
+    }
+
+    pub fn run_after_fold_guard() {
+        AFTER_FOLD_GUARD.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub fn run_after_pin() {
+        AFTER_PIN.with(|slot| {
+            if let Some(hook) = slot.get() {
+                hook();
+            }
+        });
+    }
+
+    pub struct ClearOnDrop;
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_after_fold_guard(None);
+            set_after_pin(None);
+        }
+    }
+}
+
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
 /// live version tag, and the exact map shape used by the mapdict attribute
 /// folds.  The layout guard proves that a later receiver still has the wide
@@ -13003,7 +13109,7 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
-) -> Result<(), DispatchError> {
+) -> Result<MapdictInstanceShape, DispatchError> {
     // `load/store_attr_*_fast_path` accepted this receiver only after
     // `has_mapdict_storage` proved its prefix. Preserve the concrete layout
     // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
@@ -13018,10 +13124,12 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
     // Mint ConstPtr boxes for live GC refs so later uses read the forwarded
-    // word (`history.py` `ConstPtr.value`). Guard/snapshot emission writes a
-    // Rust `TraceRecordBuffer` and does not collect; the contended
-    // `instance_lock` (`before_external_block`) on the store-add commit path
-    // is the safepoint that can minor-collect nursery maps.
+    // word (`history.py` `ConstPtr.value`). GuardClass, the version-tag pin
+    // (`walker_pin_type_version_tag` → `record_quasiimmut_field` → `record_op`),
+    // and the map promote each append to `opencoder.py Trace._ops`;
+    // `Trace._double_ops` grows that buffer with
+    // `alloc_fast_nursery_collecting_typed_rooted` and can minor-collect
+    // nursery maps (`mapdict.py` `_get_mapdict_map`).
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     let map_const = ctx.trace_ctx.const_ref(map as i64);
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -13072,7 +13180,21 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
         .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
         .unwrap_or(map);
     specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map)?;
-    Ok(())
+    // Promote records getfield + GuardValue and can collect again. Reload
+    // every live GC ref off its ConstPtr / receiver box after that
+    // (`history.py` `ConstPtr.value`; `mapdict.py` `_get_mapdict_map`).
+    #[cfg(test)]
+    mapdict_shape_collect_hook::run();
+    let concrete_obj = specialize::live_box_ref(ctx, obj, concrete_obj);
+    let map = walker_concrete_ref_object(ctx, map_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(map);
+    let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
+    Ok(MapdictInstanceShape {
+        concrete_obj,
+        w_type,
+        map,
+    })
 }
 
 /// True when the payload `ob_type` already determines the Python-visible
@@ -13630,7 +13752,14 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
         .expect("CellFamily.ever_mutated has mutate_ever_mutated");
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, descr, Some(&mutate));
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    // `record_quasiimmut_field` → `record_op` can minor-collect
+    // (`opencoder.py` `Trace._double_ops`; `pyjitpl.py`
+    // `opimpl_record_quasiimmut_field`). Tests rewrite minted `ConstPtr`
+    // slots here (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_pin();
+    Ok(())
 }
 
 /// Pin one `executioncontext.py` `?` field on a boxed EC.
@@ -13662,7 +13791,13 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
         op_pc,
         term as i64,
         crate::descr::terminator_allow_unboxing_descr(),
-    )
+    )?;
+    // The pin records `QUASIIMMUT_FIELD` and can minor-collect. Tests
+    // rewrite minted `ConstPtr` slots here so a later read of `attr` /
+    // the receiver sees the forwarded word (`history.py` `ConstPtr.value`).
+    #[cfg(test)]
+    later_collect_hook::run_after_pin();
+    Ok(())
 }
 
 /// Pin `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']`, the read
@@ -16380,15 +16515,15 @@ fn handle<Sym: WalkSym>(
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // Headerless owner: assembler `lookup_reg_with_kind_var` puts the
-        // raw pointer in the int bank (`getfield_raw_*` `i` base), so
+        // Headerless raw owner: assembler `lookup_reg_with_kind_var` puts
+        // the pointer in the int bank (`getfield_raw_*` `i` base), so
         // `rewrite_op_getfield` keys `record_quasiimmut_field/idd`.
         // Keep that Int box. `const_ref` of a data-segment static
-        // (`gil.py GILThreadLocals.gil_ready` as `GIL_READY_STATE`) or a
-        // raw `CellFamily` would enter the GC const_ptr table
-        // (`trace_ctx.rs const_ref` / `hold_live_const_ptr`).
-        // `concrete_gc_ptr` reads the Int address for
-        // `quasiimmut.py get_current_qmut_instance`.
+        // (`gil.py GILThreadLocals.gil_ready` as `GIL_READY_STATE`) would
+        // enter the GC const_ptr table (`trace_ctx.rs const_ref` /
+        // `hold_live_const_ptr`). A GC `CellFamily` is interned with
+        // `const_ref` and takes `/rdd`. `concrete_gc_ptr` reads the Int
+        // address for `quasiimmut.py get_current_qmut_instance`.
         "record_quasiimmut_field/idd" => {
             let obj = read_int_reg(code, op, 0, ctx)?;
             match read_int_reg_concrete(code, op, 0, ctx) {

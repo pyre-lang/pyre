@@ -19732,7 +19732,7 @@ mod tests {
             "if n > want: jumps to the drain-prefix, not past it"
         );
 
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -19942,7 +19942,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(n):\n    acc = 0\n    while acc < n:\n        acc += 1\n    return acc\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -19964,7 +19964,7 @@ mod tests {
              w = mk(first, k=3)\n    try:\n        for x in it:\n            yield x\n    finally:\n        pass\n",
             "g",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         writer.transform_graph_to_jitcode(code).unwrap();
@@ -19978,7 +19978,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(n):\n    acc = 0\n    for i in range(n):\n        if i:\n            acc += 1\n    return acc\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20021,7 +20021,7 @@ mod tests {
                 CodeUnit::new(instruction, OpArgByte::new(0)),
                 CodeUnit::new(Instruction::ReturnValue, OpArgByte::new(0)),
             ]);
-            let w_code = pyre_interpreter::box_code_constant(&code);
+            let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
             let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
             let writer = CodeWriter::new();
             // No setup_jitdriver: this is a callee graph that still declares
@@ -20068,7 +20068,7 @@ mod tests {
         ];
         for source in sources {
             let code = first_nested_function_code(source);
-            let w_code = pyre_interpreter::box_code_constant(&code);
+            let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
             let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
             let writer = CodeWriter::new();
             let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20149,7 +20149,7 @@ mod tests {
         let restore_ptr = crate::call_jit::bh_restore_exc_info as *const () as i64;
         for source in sources {
             let code = first_nested_function_code(source);
-            let w_code = pyre_interpreter::box_code_constant(&code);
+            let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
             let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
             let writer = CodeWriter::new();
             let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20233,7 +20233,7 @@ mod tests {
                 )
             })
             .expect("handler starts at PUSH_EXC_INFO");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20269,7 +20269,7 @@ mod tests {
     #[test]
     fn non_portal_load_global_residual_reads_this_graph_frame() {
         let code = first_nested_function_code("def f():\n    return x\n");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20297,7 +20297,7 @@ mod tests {
     fn make_function_reads_globals_from_this_graph_frame() {
         let code =
             first_nested_function_code("def f():\n    def g():\n        pass\n    return g\n");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
@@ -20323,7 +20323,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(it):\n    count = 0\n    for _ in it:\n        count += 1\n    return count\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -20430,7 +20430,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(n):\n    total = 0\n    try:\n        for value in range(n):\n            total += value\n    except ValueError:\n        return -1\n    return total\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -20506,7 +20506,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(i):\n    try:\n        if i == 0:\n            raise ValueError(\"v\")\n        return 1\n    except ValueError:\n        return 2\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -21180,7 +21180,7 @@ mod tests {
         // `co_consts_w` wrapper (not a fresh box) so the graph shadow shares
         // the interpreter's `PyCode` and `__code__` identity is stable.
         let code = compile_exec("def inner():\n    return 42\n").expect("compile failed");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let idx = code
             .constants
             .iter()
@@ -21212,7 +21212,7 @@ mod tests {
         let code =
             compile_exec("x = 123456789012345678901234567890123456789012345678901234567890\n")
                 .expect("compile failed");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let idx = code
             .constants
             .iter()
@@ -21715,7 +21715,7 @@ mod tests {
     fn get_jitcode_queues_canonical_raw_graph_only() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
 
@@ -21737,7 +21737,7 @@ mod tests {
         // identity and does not re-queue the portal for the drain.
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
 
@@ -21759,7 +21759,7 @@ mod tests {
     fn drain_unfinished_graphs_preserves_unique_pyjitcode_identity() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
         let key = raw_code as usize;
@@ -22026,7 +22026,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -22092,7 +22092,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -22215,7 +22215,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(n):\n    while n > 0:\n        n -= 1\n    return n\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
         };
@@ -22268,7 +22268,7 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
         };
@@ -22496,7 +22496,7 @@ mod tests {
         let code = first_nested_function_code(
             "def rec(n):\n    if n <= 1:\n        return n\n    return rec(n - 1) + n\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -22554,7 +22554,7 @@ mod tests {
             .find(|&py| is_python_instruction_start(&code, py))
             .expect("body after RESUME");
         assert_ne!(header, first_nonzero);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -22626,7 +22626,7 @@ mod tests {
             "first-resume pc must not be a loop header, got {headers:?}"
         );
 
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         // Callee graph, matching a generator body under `get_jitcode`:
@@ -22677,7 +22677,7 @@ mod tests {
             code.instructions
         );
 
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
         let writer = CodeWriter::new();
         let pyjit = writer
@@ -22933,7 +22933,7 @@ mod tests {
     fn callcontrol_compiled_lookup_ignores_skeleton_pyjitcode() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code_ref = unsafe { &*raw_code };
 
@@ -22961,7 +22961,7 @@ mod tests {
     fn grab_initial_jitcodes_binds_mainjitcode_immediately() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 4\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
@@ -23025,7 +23025,7 @@ def run(iters):
     return caught, swallowed
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23064,7 +23064,7 @@ def f(n):
     return i
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23107,7 +23107,7 @@ def f(n):
     return acc
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23153,7 +23153,7 @@ def f():
     return i
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23188,7 +23188,7 @@ def f(n):
     return acc
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23236,7 +23236,7 @@ def f(n):
                 .any(|unit| matches!(unit.op, Instruction::LoadFastCheck { .. })),
             "the read after with must be LOAD_FAST_CHECK"
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23283,7 +23283,7 @@ def f(i):
         return 100
 ";
         let code = first_nested_function_code(source);
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23336,7 +23336,7 @@ def f(g):
             .map(|entry| entry.target as usize / 2)
             .collect();
 
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -23371,7 +23371,7 @@ def f(g):
     fn make_jitcodes_fills_mainjitcode_payload_in_place() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 5\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
@@ -23430,7 +23430,7 @@ def f(g):
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\nwhile x:\n    x = 0\n")
             .expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         assert_eq!(
             entry_arg_slots(unsafe { &*code_ptr }),
@@ -23804,7 +23804,7 @@ def f(g):
     fn setup_jitdriver_dedups_by_runtime_code_identity() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
-        let w_code = pyre_interpreter::box_code_constant(&code);
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
 
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {

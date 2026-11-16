@@ -5033,7 +5033,7 @@ mod tests {
     fn from_mutate_field_name_round_trips_every_slot() {
         crate::test_hooks::install_hash_hook();
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = crate::w_code_new(raw_code);
+        let w_code = crate::w_code_new(raw_code).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         let names = [
@@ -5079,7 +5079,7 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         // Function.code now stores a Code-level wrapper (PyCode).
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = crate::w_code_new(raw_code);
+        let w_code = crate::w_code_new(raw_code).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         unsafe {
@@ -5096,7 +5096,7 @@ mod tests {
     fn function_qualname_getter_preserves_the_stored_object() {
         crate::test_hooks::install_hash_hook();
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = crate::w_code_new(raw_code);
+        let w_code = crate::w_code_new(raw_code).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         let w_qualname = pyre_object::w_str_new("pkg.myfunc");
@@ -5112,7 +5112,7 @@ mod tests {
     fn function_name_getter_preserves_the_stored_object() {
         crate::test_hooks::install_hash_hook();
         let raw_code = 0xDEAD_BEEF as *const ();
-        let w_code = crate::w_code_new(raw_code);
+        let w_code = crate::w_code_new(raw_code).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         let w_name = pyre_object::w_str_new("renamed");
@@ -5132,7 +5132,7 @@ mod tests {
     #[test]
     fn function_name_slot_is_header_bearing_str() {
         crate::test_hooks::install_hash_hook();
-        let w_code = crate::w_code_new(0xDEAD_BEEF as *const ());
+        let w_code = crate::w_code_new(0xDEAD_BEEF as *const ()).unwrap();
         let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         unsafe {

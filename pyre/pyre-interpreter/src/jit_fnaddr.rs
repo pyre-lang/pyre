@@ -3919,12 +3919,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::gc_interp::note_eval_activation_exit,
     );
     // The dispatch-loop safepoint's five toucher residuals plus the frame-entry
-    // odometer bump and the items-block strategy gate: each reads a
-    // runtime-mutable global (`COLLECT_STATE` atomic, `EVAL_NESTING` / `POLL_TICK`
-    // TLS, the two GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the
-    // `MAJIT_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
-    // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
-    // qualified path (siblings of `gc_interp::enabled`).
+    // odometer bump: each reads a runtime-mutable global (`COLLECT_STATE`
+    // atomic, `EVAL_NESTING` / `POLL_TICK` TLS, the two GC hook fn-pointer
+    // cells, `FRAME_ENTRY_COUNT` TLS) — none a build-time constant — so all
+    // carry `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn`
+    // directly by qualified path (siblings of `gc_interp::enabled`).
     pa0!(
         &mut entries,
         "pyre_object::gc_interp::collect_enabled",
@@ -3982,12 +3981,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::register_finalizer",
         "pyre_interpreter::register_finalizer",
         crate::executioncontext::register_finalizer,
-    );
-    pa0!(
-        &mut entries,
-        "pyre_object::object_array::itemsblock_gc_enabled",
-        "pyre_object::itemsblock_gc_enabled",
-        pyre_object::object_array::itemsblock_gc_enabled,
     );
     p0!(
         &mut entries,
@@ -10132,16 +10125,6 @@ mod tests {
             bindings["pyre_object::try_gc_collect_oldgen"],
             collect_oldgen
         );
-
-        let itemsblock = occupied_published_addr(
-            "pyre_object::object_array::itemsblock_gc_enabled",
-            pyre_object::object_array::itemsblock_gc_enabled as *const () as usize as i64,
-        );
-        assert_eq!(
-            bindings["pyre_object::object_array::itemsblock_gc_enabled"],
-            itemsblock
-        );
-        assert_eq!(bindings["pyre_object::itemsblock_gc_enabled"], itemsblock);
 
         let bump = occupied_published_addr(
             "pyre_interpreter::call::bump_frame_entry_count",

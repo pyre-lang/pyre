@@ -3101,12 +3101,8 @@ pub fn int_mutable_cell_value_descr() -> DescrRef {
 /// write has EVER happened; it says nothing about a given read, so this field
 /// carries no immutability of its own.
 ///
-/// `family` is `nestedscope.py Cell._immutable_fields_ = ['family']`, and it is
-/// declared `Int` rather than `Ref` because the families are leaked rather than
-/// GC-managed — the word is absent from this layout's traced pointer offsets.
-/// Nothing reads it through this group; the census is COMPLETE because a field
-/// the struct declares but a group omits has no `index_in_parent` to rederive,
-/// and the two sides that mint its descr then disagree on the number.
+/// `family` is `nestedscope.py Cell._immutable_fields_ = ['family']`, a
+/// traced GC pointer to the headerless [`pyre_object::nestedscope::CellFamily`].
 static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::nestedscope::{Cell, W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE};
     build_object_descr_group_with_def_path(
@@ -3126,8 +3122,8 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "family",
                 core::mem::offset_of!(Cell, family),
-                8,
-                Type::Int,
+                WORD,
+                Type::Ref,
                 false,
                 true,
                 false,
@@ -4754,10 +4750,15 @@ pub fn cell_contents_descr() -> DescrRef {
     field_descr_from_group(&W_CELL_DESCR_GROUP, 0)
 }
 
-/// `nestedscope.py Cell.family` — the [`pyre_object::nestedscope::CellFamily`]
-/// every cell of one cellvar shares.  Immutable per
-/// `_immutable_fields_ = ['family']`, and a leaked (untraced) address rather
-/// than a managed reference, so the descriptor spells it `Type::Int`.
+/// `nestedscope.py Cell.family` — the GC [`pyre_object::nestedscope::CellFamily`]
+/// every cell of one cellvar shares. Immutable per
+/// `_immutable_fields_ = ['family']`. A managed reference (`Type::Ref`): the
+/// recorder's `quasi_immut_descr` read of `ever_mutated?` uses
+/// `quasiimmut.py get_current_qmut_instance` / `QuasiImmutDescr.__init__`
+/// (`pyjitpl.py opimpl_record_quasiimmut_field`) on `box.getref_base()`, and
+/// a family interned with `const_ref` lives in the trace's const-ptr table
+/// (`rewrite.py remove_constptrs_in` / `gcreftracer.py`) so a moving
+/// collection rewrites that slot.
 pub fn cell_family_descr() -> DescrRef {
     field_descr_from_group(&W_CELL_DESCR_GROUP, 1)
 }
@@ -5584,9 +5585,9 @@ fn dict_strategy_ref_field_descr(field_key: &str) -> DescrRef {
 /// crate-stripped STRUCT spelling `canonical_struct_name` yields for
 /// `pyre_object::mapdict::<Struct>` (`mapdict::Terminator` and siblings).
 /// SizeDescr is headerless (no vtable). `Terminator` / `PlainAttribute` /
-/// `UnboxedPlainAttribute` / `CachedAttributeHolder` are GC objects
-/// (`mapdict.py`); walker pins intern the object start. `CellFamily` remains
-/// a headerless leak.
+/// `UnboxedPlainAttribute` / `CachedAttributeHolder` / `CellFamily` are GC
+/// objects (`mapdict.py` / `nestedscope.py`); walker pins intern the object
+/// start.
 fn make_mapdict_quasi_descr_group(
     struct_name: &str,
     cache_path: &str,
@@ -5757,9 +5758,9 @@ pub fn unboxed_plain_attribute_mutate_ever_mutated_descr() -> DescrRef {
 }
 
 /// `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
-/// Walker arg0 is `*const CellFamily` (`Box::into_raw` leak, no header).
-/// Cache key `nestedscope::CellFamily` is the crate-stripped def_path
-/// `canonical_struct_name` yields.
+/// Walker arg0 is a GC `*const CellFamily` (headerless payload, like a
+/// mapdict node). Cache key `nestedscope::CellFamily` is the crate-stripped
+/// def_path `canonical_struct_name` yields.
 static CELL_FAMILY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use pyre_object::nestedscope::CellFamily;
     make_mapdict_quasi_descr_group(
@@ -8489,10 +8490,11 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 true,
             ),
-            word_int(
+            word_ref(
                 "cell_families",
                 std::mem::offset_of!(PyCode, cell_families),
                 true,
+                false,
             ),
             word_int(
                 "globals_caches",
@@ -10325,15 +10327,17 @@ mod tests {
         }
     }
 
-    /// The same recycled-nursery-bytes rule, for the cell the inline frame
-    /// builder allocates per pure cellvar: `family` is a `Type::Int` slot
-    /// `clear_gc_fields` does not reach, and a cell born with a recycled word
-    /// there hands `try_walker_specialize_load_deref` a `CellFamily` address
-    /// to dereference that no `CellFamily` ever occupied.
+    /// The cell the inline frame builder allocates per pure cellvar stores
+    /// `family` (`nestedscope.py Cell._immutable_fields_ = ['family']`) and
+    /// the inherited header `w_class`. `contents` is left unwritten: the
+    /// constructor this mirrors passes `PY_NULL`, and a virtual reads an
+    /// unwritten reference field as null. `family` is a `Type::Ref` to the
+    /// GC `CellFamily`; `clear_gc_fields` would zero it if the emit omitted
+    /// the store, so the constructor value must be written.
     #[test]
     fn inline_cell_emitter_stores_every_scalar_cell_field() {
         let mut ctx = majit_metainterp::TraceCtx::for_test(0);
-        let family = ctx.const_int(0);
+        let family = ctx.const_ref(0);
         let header_w_class = ctx.const_ref(0);
         crate::helpers::emit_new_cell_inline(&mut ctx, family, header_w_class);
         let stored: std::collections::BTreeSet<usize> = ctx
@@ -10346,21 +10350,16 @@ mod tests {
                 descr.as_ref()?.as_field_descr().map(FieldDescr::offset)
             })
             .collect();
-        let scalars: Vec<(&str, usize)> = W_CELL_DESCR_GROUP
-            .field_descrs
-            .iter()
-            .filter(|d| d.field_type() != Type::Ref)
-            .map(|d| (d.field_name(), d.offset()))
-            .collect();
-        // `family`: a census that found none is reading the wrong group.
-        assert!(!scalars.is_empty(), "scalar field census is vacuous");
-        for (name, offset) in &scalars {
-            assert!(
-                stored.contains(offset),
-                "emit_new_cell_inline stores no {name} (offset {offset}), so the field \
-                 is born holding recycled nursery bytes",
-            );
-        }
+        let family_off = core::mem::offset_of!(pyre_object::nestedscope::Cell, family);
+        let w_class_off = pyre_object::pyobject::W_CLASS_OFFSET;
+        assert!(
+            stored.contains(&family_off),
+            "emit_new_cell_inline stores no family (offset {family_off})"
+        );
+        assert!(
+            stored.contains(&w_class_off),
+            "emit_new_cell_inline stores no w_class (offset {w_class_off})"
+        );
     }
 
     /// Every group that stays out of both name registries still needs a

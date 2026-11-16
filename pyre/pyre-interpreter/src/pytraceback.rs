@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn last_instr_sentinel_stays_minus_one() {
         let code = crate::compile_exec("pass\n").expect("compile");
-        let w_code = crate::pycode::box_code_constant(&code);
+        let w_code = crate::pycode::box_code_constant(&code).unwrap();
         let globals = pyre_object::w_dict_new();
         let mut frame =
             crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)

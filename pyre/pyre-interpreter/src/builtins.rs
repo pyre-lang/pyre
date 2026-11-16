@@ -20632,7 +20632,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
     })?;
-    let mut result = crate::box_code_object(code);
+    let mut result = crate::box_code_object(code)?;
     pyre_object::with_roots!(result => {
         unsafe { crate::pycode::set_compilation_unit_filename_bytes(result, filename_bytes) };
     });
@@ -20809,7 +20809,7 @@ pub fn exec_or_eval(
                 }
                 crate::syntax_warnings::SourceCompileError::Warning(error) => error,
             })?;
-            (crate::box_code_object(code), false)
+            (crate::box_code_object(code)?, false)
         }
     };
     // A compiled source has just been boxed, and this local is its only

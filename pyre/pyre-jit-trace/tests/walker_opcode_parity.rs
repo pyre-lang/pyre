@@ -425,11 +425,12 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// / `wire_bhimpl_handlers` bind the handler. `insns.rs` has no `BC_*`.
 ///
 /// `record_quasiimmut_field/idd` is numbered the same way. A headerless
-/// owner (`CellFamily`, `AuditHolder`, `GilReadyState`) puts the raw
-/// pointer in the int bank, so `jtransform.py rewrite_op_getfield` keys
+/// raw owner (`AuditHolder`, `GilReadyState`) puts the pointer in the
+/// int bank, so `jtransform.py rewrite_op_getfield` keys
 /// `record_quasiimmut_field/idd`; `blackhole.rs wire_bhimpl_handlers`
 /// binds `handler_record_quasiimmut_field` next to `/rdd` (`blackhole.py
-/// bhimpl_record_quasiimmut_field`). `insns.rs` has no `BC_*`.
+/// bhimpl_record_quasiimmut_field`). A GC `CellFamily` is interned with
+/// `const_ref` and takes `/rdd`. `insns.rs` has no `BC_*`.
 ///
 /// `current_trace_length/>i` is numbered the same way. `_get_adapted_tick_counter`
 /// (`interp_jit.py`) calls `jit.current_trace_length`, which `jtransform.py`

@@ -4572,7 +4572,7 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// wrong address. So the no-collector case takes the latter.
 #[inline]
 unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
-    if crate::object_array::itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+    if majit_gc::gc_allocator_installed() {
         alloc_typed_items_block_nursery(count, tid)
     } else {
         alloc_typed_items_block(count, tid)
@@ -6119,7 +6119,7 @@ pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
 ///
 /// The tracer uses this to decide whether the recorded trace needs
 /// `list_write_barrier` at all — see `FbwWalkMode::append_inplace_wb_covered`.
-/// A `std::alloc` block (`MAJIT_GC_ITEMSBLOCK=0`) answers false: it has no GC
+/// A `std::alloc` block (no collector installed) answers false: it has no GC
 /// header for an array barrier to mark, so the barrier on the enclosing
 /// `W_ListObject` is the only thing keeping the block's slots reachable.
 ///
