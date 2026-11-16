@@ -11110,10 +11110,14 @@ fn jump_label_ordinal(ops: &[Op], jump: &Op) -> Option<usize> {
 /// JUMP args that can occupy their LABEL-arg wasm local and Ref home.
 ///
 /// x86 `RegisterManager` colors a loop-closing def into the LABEL
-/// register; wasm otherwise mints a fresh local, then parallel-moves
-/// and re-homes at every back-edge. When the def and the LABEL slot
-/// do not interfere (`HomeLiveness::live_across`), share the location
-/// so the JUMP is an identity self-move.
+/// register only when that location is free (`llsupport/regalloc.py`
+/// `RegisterManager` / `FrameManager`, `x86/regalloc.py`
+/// `consider_jump`, `_compute_hint_locations_from_descr`). Two values
+/// interfere if either is live at the other's definition, so refuse
+/// both directions of `HomeLiveness::live_across`. A non-label-arg JUMP
+/// arg defined before the LABEL and read after it (the JUMP, or a
+/// failarg) has `def_j < def_l` and `last_use_j > def_l`, which is
+/// `live_across(jid, def_l)`.
 fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
     let liveness = HomeLiveness::collect_with_regions(&[], ops, &[]);
     let mut pairs = Vec::new();
@@ -11163,7 +11167,11 @@ fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
             if def_j == i32::MAX || def_j < 0 {
                 continue;
             }
+            let def_l = liveness.defined_at(lid);
             if liveness.live_across(lid, def_j as usize) {
+                continue;
+            }
+            if def_l >= 0 && liveness.live_across(jid, def_l as usize) {
                 continue;
             }
             pairs.push((jid, lid));
@@ -13688,6 +13696,44 @@ mod tests {
             locals.local(0),
             locals.local(3),
             "a body result must not reuse a loop invariant's local"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_jump_arg_defined_before_label() {
+        let _cpu = cpu();
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let label = Op::new(OpCode::Label, &[rb(p0)]);
+        label.setdescr(descr.clone());
+        let keep = Op::new(OpCode::GuardNonnull, &[rb(p0)]);
+        keep.setfailargs(vec![rb(OpRef::ref_op(10)), rb(p0)].into());
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::ref_op(10))]);
+        jump.setdescr(descr);
+        let ops = vec![new, label, keep, jump];
+        let liveness = HomeLiveness::collect_with_regions(&[], &ops, &[]);
+        let def_j = liveness.defined_at(10);
+        let def_l = liveness.defined_at(0);
+        assert!(
+            def_j <= def_l,
+            "JUMP arg defined at {def_j} must precede LABEL arg at {def_l}"
+        );
+        assert!(
+            !liveness.live_across(0, def_j as usize),
+            "one-way live_across(lid, def_j) misses a JUMP arg defined before the LABEL"
+        );
+        assert!(
+            def_l >= 0 && liveness.live_across(10, def_l as usize),
+            "JUMP arg defined before LABEL and read after it is live_across the LABEL"
+        );
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "JUMP arg defined before LABEL must not share the LABEL home"
         );
     }
 
