@@ -1023,12 +1023,12 @@ fn reverse_unlocked(self_obj: PyObjectRef) {
     let mut lb = deque.leftblock;
     let mut ri = deque.rightindex;
     let mut rb = deque.rightblock;
-    // The block `data` is a list whose setitem the GC analysis treats as
-    // collecting, so the cursor blocks and the pending value are rooted
-    // across it.
+    // The block `data` is a list whose getitem and setitem the GC analysis
+    // treats as collecting, so the cursor blocks and the pending value are
+    // rooted across each access.
     for _ in 0..(deque.len >> 1) {
-        let mut left = block_get(lb, li);
-        let right = block_get(rb, ri);
+        let mut left = pyre_object::with_roots!(lb, rb => block_get(lb, li));
+        let right = pyre_object::with_roots!(lb, left, rb => block_get(rb, ri));
         pyre_object::with_roots!(lb, left, rb => block_set(lb, li, right));
         pyre_object::with_roots!(lb, rb => block_set(rb, ri, left));
         li += 1;
