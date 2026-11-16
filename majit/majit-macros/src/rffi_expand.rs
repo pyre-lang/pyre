@@ -1,4 +1,5 @@
-//! Expansion of `llexternal` and `external_compilation_info`.
+//! Expansion of `llexternal`, `cextern_variable`, `copaque_ptr`,
+//! `llexternal_use_eci`, and `external_compilation_info`.
 //!
 //! `llexternal` (`rffi.py`) builds the funcptr, then `call_external_function`,
 //! then the forwarding wrapper. The derivations below follow that function's
@@ -18,6 +19,119 @@ use syn::{
 pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
     let parsed: LlexternalInput = syn::parse2(input)?;
     Ok(parsed.expand())
+}
+
+pub fn expand_copaque_ptr(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::COpaquePtrHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let vis = &head.vis;
+    let name = &head.name;
+    let to_name = format_ident!("{}_TO", name);
+    let marker_ident = format_ident!("_alloc_flavor_{}_TO", name);
+    let c_name = &head.c_name;
+    let doc = format!("c_name: {c_name}");
+    let include_rel = format!("/majit_copaque/{}.rs", head.size_key());
+    Ok(quote! {
+        #(#attrs)*
+        #[doc = #doc]
+        #[repr(C)]
+        #[allow(non_camel_case_types)]
+        #vis struct #to_name {
+            _opaque: [u8; 0],
+        }
+        #(#attrs)*
+        /// `rffi.COpaque` is `lltype.OpaqueType` with `hints['external'] = 'C'`: raw, non-GC storage
+        /// (`rclass.py getgcflavor` reads `_alloc_flavor_`).
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #marker_ident: &str = "raw";
+        #(#attrs)*
+        impl ::majit_rlib::rffi::COpaque for #to_name {
+            const C_NAME: &'static str = #c_name;
+            const GETSIZE: usize = include!(concat!(env!("OUT_DIR"), #include_rel));
+        }
+        #(#attrs)*
+        #[allow(non_camel_case_types)]
+        #vis type #name = *mut #to_name;
+        #(#attrs)*
+        #[cfg(not(majit_eci_build))]
+        compile_error!("`copaque_ptr!` needs `majit_eci::build::compile_crate_ecis` in this crate's build.rs");
+    })
+}
+
+/// `rffi.llexternal_use_eci`: the `PYPY_NO_OP` dummy. `compile_crate_ecis`
+/// collects this macro and resolves `compilation_info` to an
+/// `external_compilation_info!` const, so that ECI is in the compiled set.
+pub fn expand_llexternal_use_eci(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::LlexternalUseEciHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let vis = &head.vis;
+    let name = &head.name;
+    let eci = &head.compilation_info;
+    let eci_doc = quote!(#eci).to_string().replace(" :: ", "::");
+    let doc = format!("`rffi.llexternal_use_eci({eci_doc})`: the `PYPY_NO_OP` dummy.");
+    Ok(quote! {
+        #(#attrs)*
+        #[inline(always)]
+        #[doc = #doc]
+        #vis fn #name() {
+            let _: &::majit_rlib::rffi::ExternalCompilationInfo = &#eci;
+        }
+    })
+}
+
+pub fn expand_cextern_variable(input: TokenStream) -> syn::Result<TokenStream> {
+    let head: majit_eci::parse::CExternVariableHead = syn::parse2(input)?;
+    let attrs = &head.attrs;
+    let getter_vis = &head.getter.0;
+    let getter = &head.getter.1;
+    let getter_c = format!("get_{}", head.name);
+    let ty = &head.ty;
+    let eci = &head.compilation_info;
+    let sandboxsafe = head
+        .sandboxsafe
+        .as_ref()
+        .map(|expr| quote! { , sandboxsafe = #expr });
+    let nowrapper = head
+        .nowrapper
+        .as_ref()
+        .map(|expr| quote! { , _nowrapper = #expr });
+    let getter_item = quote! {
+        #(#attrs)*
+        ::majit_rlib::rffi::llexternal!(
+            #getter_vis #getter = #getter_c,
+            [],
+            #ty,
+            compilation_info = #eci
+            #sandboxsafe
+            #nowrapper
+        );
+    };
+    if head.getter_only {
+        return Ok(getter_item);
+    }
+    let (setter_vis, setter) = head.setter.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            getter.span(),
+            "cextern_variable with two names needs a setter",
+        )
+    })?;
+    let setter_c = format!("set_{}", head.name);
+    let setter_item = quote! {
+        #(#attrs)*
+        ::majit_rlib::rffi::llexternal!(
+            #setter_vis #setter = #setter_c,
+            [#ty],
+            (),
+            compilation_info = #eci
+            #sandboxsafe
+            #nowrapper
+        );
+    };
+    Ok(quote! {
+        #getter_item
+        #setter_item
+    })
 }
 
 pub fn expand_external_compilation_info(input: TokenStream) -> syn::Result<TokenStream> {

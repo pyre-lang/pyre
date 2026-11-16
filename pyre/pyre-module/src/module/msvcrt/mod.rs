@@ -181,7 +181,7 @@ pyre_interpreter::py_module! {
             let result = unsafe { rustpython_host_env::suppress_iph!(crt_ungetwch(ch)) };
             if result == u16::MAX {
                 return Err(pyre_interpreter::PyError::os_error_syscall(
-                    majit_rlib::rposix::_get_errno(), pyre_object::PY_NULL,
+                    unsafe { majit_rlib::rposix::_get_errno() }, pyre_object::PY_NULL,
                 ));
             }
             Ok(())
@@ -220,7 +220,7 @@ pyre_interpreter::py_module! {
             let previous = unsafe { rustpython_host_env::suppress_iph!(crt_setmode(fd, flags)) };
             if previous == -1 {
                 return Err(pyre_interpreter::PyError::os_error_syscall(
-                    majit_rlib::rposix::_get_errno(), pyre_object::PY_NULL,
+                    unsafe { majit_rlib::rposix::_get_errno() }, pyre_object::PY_NULL,
                 ));
             }
             Ok(previous)

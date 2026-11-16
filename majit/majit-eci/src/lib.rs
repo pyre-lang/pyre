@@ -45,6 +45,42 @@ pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result:
     }
 }
 
+/// `rffi.CExternVariable`'s generated getter/setter source and prototypes.
+pub fn generate_cextern_variable(
+    name: &str,
+    c_type: &str,
+    getter_only: bool,
+    declare_as_extern: bool,
+    includes: &[String],
+) -> ExternalCompilationInfo {
+    let getter_name = format!("get_{name}");
+    let setter_name = format!("set_{name}");
+    let getter_prototype = format!("RPY_EXTERN {c_type} {getter_name} (void);");
+    let setter_prototype = format!("RPY_EXTERN void {setter_name} ({c_type} v);");
+    let c_getter = format!("{c_type} {getter_name} () {{ return {name}; }}");
+    let c_setter = format!("void {setter_name} ({c_type} v) {{ {name} = v; }}");
+    let mut lines: Vec<String> = includes
+        .iter()
+        .map(|include| format!("#include <{include}>"))
+        .collect();
+    if declare_as_extern {
+        lines.push(format!("extern {c_type} {name};"));
+    }
+    lines.push(c_getter);
+    if !getter_only {
+        lines.push(c_setter);
+    }
+    let mut prototypes = vec![getter_prototype];
+    if !getter_only {
+        prototypes.push(setter_prototype);
+    }
+    ExternalCompilationInfo {
+        separate_module_sources: vec![lines.join("\n")],
+        post_include_bits: prototypes,
+        ..ExternalCompilationInfo::default()
+    }
+}
+
 /// `cbuild.py` `from_pkg_config` / `from_config_tool` `ImportError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportError {
@@ -295,6 +331,32 @@ impl ExternalCompilationInfo {
             }
         }
         out.platform = self.platform.clone();
+        out
+    }
+
+    /// `ExternalCompilationInfo.copy_without`: clone `self` and reset each
+    /// named attribute to the constructor default (empty list / `false` /
+    /// `None`). `_ATTRIBUTES` fields become `Vec::new()`, `use_cpp_linker`
+    /// becomes `false`, and `platform` becomes `None`. An unknown name
+    /// panics (`KeyError`).
+    pub fn copy_without(&self, names: &[&str]) -> ExternalCompilationInfo {
+        let mut out = self.clone();
+        let mut removed: Vec<&str> = Vec::new();
+        for name in names {
+            if removed.contains(name) {
+                panic!("copy_without: attribute {name:?} already removed");
+            }
+            if _ATTRIBUTES.contains(name) {
+                *out.field_mut(name) = Vec::new();
+            } else if *name == "use_cpp_linker" {
+                out.use_cpp_linker = false;
+            } else if *name == "platform" {
+                out.platform = None;
+            } else {
+                panic!("copy_without: unknown attribute {name:?}");
+            }
+            removed.push(*name);
+        }
         out
     }
 
@@ -1038,6 +1100,30 @@ mod tests {
     }
 
     #[test]
+    fn copy_without_empties_includes() {
+        let eci = ExternalCompilationInfo {
+            includes: vec!["stdio.h".into()],
+            post_include_bits: vec!["typedef int X;".into()],
+            libraries: vec!["foo".into()],
+            ..ExternalCompilationInfo::default()
+        };
+        let out = eci.copy_without(&["includes"]);
+        assert!(out.includes.is_empty());
+        assert_eq!(out.post_include_bits, vec!["typedef int X;".to_string()]);
+        assert_eq!(out.libraries, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "copy_without: attribute \"includes\" already removed")]
+    fn copy_without_name_twice() {
+        let eci = ExternalCompilationInfo {
+            includes: vec!["stdio.h".into()],
+            ..ExternalCompilationInfo::default()
+        };
+        let _ = eci.copy_without(&["includes", "includes"]);
+    }
+
+    #[test]
     #[should_panic(expected = "Mixing ECI for different platforms")]
     fn merge_rejects_mixed_platforms() {
         let left = ExternalCompilationInfo {
@@ -1068,5 +1154,143 @@ mod tests {
         assert_eq!(value.1, &["stdio.h".to_string()][..]);
         assert!(value.13);
         assert_eq!(value.14, Some("host"));
+    }
+
+    #[test]
+    fn cextern_variable_errno_source_and_prototypes() {
+        let eci = generate_cextern_variable(
+            "errno",
+            "int",
+            false,
+            false,
+            &["errno.h".into(), "stdio.h".into()],
+        );
+        assert_eq!(
+            eci.separate_module_sources,
+            [
+                "#include <errno.h>\n#include <stdio.h>\nint get_errno () { return errno; }\nvoid set_errno (int v) { errno = v; }"
+            ]
+        );
+        assert_eq!(
+            eci.post_include_bits,
+            [
+                "RPY_EXTERN int get_errno (void);".to_string(),
+                "RPY_EXTERN void set_errno (int v);".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cextern_variable_getter_only_declare_as_extern() {
+        let eci = generate_cextern_variable("stdin", "FILE*", true, true, &["stdio.h".into()]);
+        assert_eq!(eci.separate_module_sources.len(), 1);
+        let source = &eci.separate_module_sources[0];
+        assert!(source.contains("extern FILE* stdin;"), "{source}");
+        assert!(
+            source.contains("FILE* get_stdin () { return stdin; }"),
+            "{source}"
+        );
+        assert!(!source.contains("set_stdin"), "{source}");
+        assert_eq!(
+            eci.post_include_bits,
+            ["RPY_EXTERN FILE* get_stdin (void);".to_string()]
+        );
+    }
+
+    #[test]
+    fn cextern_variable_head_parses_getter_and_setter() {
+        let head: crate::parse::CExternVariableHead = syn::parse_str(
+            r#"pub _get_errno, pub _set_errno = "errno", crate::rffi::INT, compilation_info = ERRNO_ECI, sandboxsafe = true, _nowrapper = true, c_type = "int", declare_as_extern = false"#,
+        )
+        .unwrap();
+        assert_eq!(head.getter.1.to_string(), "_get_errno");
+        assert_eq!(
+            head.setter
+                .as_ref()
+                .map(|(_, name)| name.to_string())
+                .as_deref(),
+            Some("_set_errno")
+        );
+        assert_eq!(head.name, "errno");
+        assert!(!head.getter_only);
+        assert_eq!(head.c_type.as_deref(), Some("int"));
+        assert_eq!(head.declare_as_extern, Some(false));
+    }
+
+    #[test]
+    fn cextern_variable_head_parses_getter_only() {
+        let head: crate::parse::CExternVariableHead = syn::parse_str(
+            r#"pub c_stdin = "stdin", FILEP, compilation_info = ECI, c_type = "FILE*", getter_only = true, declare_as_extern = false"#,
+        )
+        .unwrap();
+        assert_eq!(head.getter.1.to_string(), "c_stdin");
+        assert!(head.setter.is_none());
+        assert_eq!(head.name, "stdin");
+        assert!(head.getter_only);
+        assert_eq!(head.c_type.as_deref(), Some("FILE*"));
+        assert_eq!(head.declare_as_extern, Some(false));
+    }
+
+    #[test]
+    fn copaque_ptr_head_parses_with_compilation_info() {
+        let head: crate::parse::COpaquePtrHead =
+            syn::parse_str(r#"pub fd_set = "fd_set", compilation_info = ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "fd_set");
+        assert_eq!(head.c_name, "fd_set");
+        assert!(head.compilation_info.is_some());
+        assert_eq!(head.size_key(), "fd_5fset__fd_set");
+    }
+
+    #[test]
+    fn copaque_ptr_head_parses_without_compilation_info() {
+        let head: crate::parse::COpaquePtrHead = syn::parse_str(r#"pub DIRP = "DIR""#).unwrap();
+        assert_eq!(head.name.to_string(), "DIRP");
+        assert_eq!(head.c_name, "DIR");
+        assert!(head.compilation_info.is_none());
+        assert_eq!(head.size_key(), "DIR__DIRP");
+        assert_eq!(
+            crate::parse::copaque_size_key("struct RPyOpaque_ThreadLock", "RLock"),
+            "struct_20RPyOpaque_5fThreadLock__RLock"
+        );
+        assert_eq!(
+            crate::parse::copaque_size_key("struct X", "Foo"),
+            "struct_20X__Foo"
+        );
+        assert_eq!(
+            crate::parse::copaque_size_key("struct_X", "Foo"),
+            "struct_5fX__Foo"
+        );
+    }
+
+    #[test]
+    fn copaque_ptr_head_rejects_typedef() {
+        let err = match syn::parse_str::<crate::parse::COpaquePtrHead>(
+            r#"pub HANDLE = "HANDLE", typedef = "HANDLE""#,
+        ) {
+            Ok(_) => panic!("expected typedef to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("typedef"),
+            "error names typedef: {err}"
+        );
+    }
+
+    #[test]
+    fn llexternal_use_eci_head_parses_vis_and_fn() {
+        let head: crate::parse::LlexternalUseEciHead =
+            syn::parse_str(r#"pub do_use_eci = ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "do_use_eci");
+        assert!(matches!(head.vis, syn::Visibility::Public(_)));
+        let eci = &head.compilation_info;
+        assert_eq!(quote::quote!(#eci).to_string(), "ECI");
+        assert!(head.attrs.is_empty());
+
+        let head: crate::parse::LlexternalUseEciHead =
+            syn::parse_str(r#"fn do_use_test_eci = TEST_ECI"#).unwrap();
+        assert_eq!(head.name.to_string(), "do_use_test_eci");
+        assert!(matches!(head.vis, syn::Visibility::Inherited));
+        let eci = &head.compilation_info;
+        assert_eq!(quote::quote!(#eci).to_string(), "TEST_ECI");
     }
 }

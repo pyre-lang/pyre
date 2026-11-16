@@ -56,8 +56,8 @@ mod posix {
         };
     }
 
-    /// `fd_set` (`COpaquePtr`). Callers pass a pointer at the struct.
-    pub type fd_set = *mut libc::fd_set;
+    // `_rsocket_rffi.fd_set` is `rffi.COpaquePtr('fd_set', compilation_info=eci)`.
+    crate::rffi::copaque_ptr!(pub fd_set = "fd_set", compilation_info = ECI);
 
     pub const FD_SETSIZE: usize = libc::FD_SETSIZE;
     /// `MAX_FD_SIZE`. POSIX `select` indexes a bitmap by descriptor.

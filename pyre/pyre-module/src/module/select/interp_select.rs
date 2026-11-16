@@ -305,36 +305,91 @@ fn selectable_fd(fd: i32, index: usize) -> Result<i32, pyre_interpreter::PyError
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-type OsFdSet = libc::fd_set;
-#[cfg(all(windows, feature = "host_env"))]
-type OsFdSet = majit_rlib::_rsocket_rffi::fd_set;
-
-#[cfg(all(unix, feature = "host_env"))]
 type OsTimeval = libc::timeval;
 #[cfg(all(windows, feature = "host_env"))]
 type OsTimeval = majit_rlib::_rsocket_rffi::timeval;
 
+/// `lltype.malloc(_c.fd_set.TO, flavor='raw')` (`interp_select.select`).
+#[cfg(all(unix, feature = "host_env"))]
+struct PreparedFdSet {
+    ptr: majit_rlib::_rsocket_rffi::fd_set,
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+impl Drop for PreparedFdSet {
+    fn drop(&mut self) {
+        unsafe { majit_rlib::rffi::free_opaque(self.ptr) };
+    }
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+impl PreparedFdSet {
+    fn as_select_ptr(&self) -> majit_rlib::_rsocket_rffi::fd_set {
+        self.ptr
+    }
+}
+
+/// WinSock `fd_set` is a counted SOCKET array, not `rffi.COpaquePtr`.
+#[cfg(all(windows, feature = "host_env"))]
+struct PreparedFdSet {
+    inner: Box<majit_rlib::_rsocket_rffi::fd_set>,
+}
+
+#[cfg(all(windows, feature = "host_env"))]
+impl PreparedFdSet {
+    fn as_select_ptr(&mut self) -> *mut majit_rlib::_rsocket_rffi::fd_set {
+        &mut *self.inner
+    }
+}
+
 /// `select` allocates an `fd_set` only for a non-empty list (`ll_inl` stays
 /// a null pointer when `iwtd_w` is empty).
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn prepare_fd_set(fds: &[(usize, i32)]) -> Option<Box<OsFdSet>> {
+fn prepare_fd_set(
+    fds: &[(usize, i32)],
+) -> Result<Option<PreparedFdSet>, pyre_interpreter::PyError> {
     if fds.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut set = Box::new(unsafe { core::mem::zeroed::<OsFdSet>() });
-    unsafe {
-        majit_rlib::_rsocket_rffi::FD_ZERO(set.as_mut() as *mut OsFdSet);
-        for &(_, fd) in fds {
-            majit_rlib::_rsocket_rffi::FD_SET(fd, set.as_mut() as *mut OsFdSet);
+    #[cfg(unix)]
+    {
+        let ptr = majit_rlib::rffi::malloc_opaque::<majit_rlib::_rsocket_rffi::fd_set>().map_err(
+            |e| pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e),
+        )?;
+        unsafe {
+            majit_rlib::_rsocket_rffi::FD_ZERO(ptr);
+            for &(_, fd) in fds {
+                majit_rlib::_rsocket_rffi::FD_SET(fd, ptr);
+            }
         }
+        Ok(Some(PreparedFdSet { ptr }))
     }
-    Some(set)
+    #[cfg(windows)]
+    {
+        let mut set =
+            Box::new(unsafe { core::mem::zeroed::<majit_rlib::_rsocket_rffi::fd_set>() });
+        unsafe {
+            majit_rlib::_rsocket_rffi::FD_ZERO(&mut *set);
+            for &(_, fd) in fds {
+                majit_rlib::_rsocket_rffi::FD_SET(fd, &mut *set);
+            }
+        }
+        Ok(Some(PreparedFdSet { inner: set }))
+    }
 }
 
-#[cfg(all(any(unix, windows), feature = "host_env"))]
-fn fd_set_ptr(set: &mut Option<Box<OsFdSet>>) -> *mut OsFdSet {
+#[cfg(all(unix, feature = "host_env"))]
+fn fd_set_ptr(set: &Option<PreparedFdSet>) -> majit_rlib::_rsocket_rffi::fd_set {
     match set {
-        Some(set) => set.as_mut() as *mut OsFdSet,
+        Some(set) => set.as_select_ptr(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[cfg(all(windows, feature = "host_env"))]
+fn fd_set_ptr(set: &mut Option<PreparedFdSet>) -> *mut majit_rlib::_rsocket_rffi::fd_set {
+    match set {
+        Some(set) => set.as_select_ptr(),
         None => std::ptr::null_mut(),
     }
 }
@@ -519,9 +574,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         } else {
                             None
                         };
-                        let mut rset = prepare_fd_set(&rfds);
-                        let mut wset = prepare_fd_set(&wfds);
-                        let mut xset = prepare_fd_set(&xfds);
+                        let mut rset = prepare_fd_set(&rfds)?;
+                        let mut wset = prepare_fd_set(&wfds)?;
+                        let mut xset = prepare_fd_set(&xfds)?;
                         let mut tv = OsTimeval {
                             tv_sec: 0,
                             tv_usec: 0,
@@ -566,7 +621,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         };
 
                         fn build_ready(
-                            set: &mut Option<Box<OsFdSet>>,
+                            set: &mut Option<PreparedFdSet>,
                             inputs: &[(usize, i32)],
                         ) -> pyre_object::PyObjectRef {
                             // `_unbuild_fd_set` runs only when `res > 0`. A timeout
@@ -577,10 +632,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             let items: Vec<_> = inputs
                                 .iter()
                                 .filter(|&&(_, fd)| unsafe {
-                                    majit_rlib::_rsocket_rffi::FD_ISSET(
-                                        fd,
-                                        set.as_mut() as *mut OsFdSet,
-                                    ) != 0
+                                    majit_rlib::_rsocket_rffi::FD_ISSET(fd, set.as_select_ptr())
+                                        != 0
                                 })
                                 .map(|&(slot, _)| pyre_object::gc_roots::shadow_stack_get(slot))
                                 .collect();

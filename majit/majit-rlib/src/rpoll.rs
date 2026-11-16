@@ -61,35 +61,54 @@ pub fn poll(fddict: &HashMap<i32, i16>, timeout: i32) -> Result<Vec<(i32, i32)>,
     Ok(retval)
 }
 
-fn prepare_set(fds: &[i32], nfds: &mut i32) -> Option<Box<libc::fd_set>> {
-    if fds.is_empty() {
-        return None;
+/// `lltype.malloc(_c.fd_set.TO, flavor='raw')` / `lltype.free` (`rpoll.select`).
+struct FdSet(_c::fd_set);
+
+impl FdSet {
+    fn malloc() -> Result<Self, crate::rffi::MemoryError> {
+        Ok(Self(crate::rffi::malloc_opaque::<_c::fd_set>()?))
     }
-    let mut set = Box::new(unsafe { core::mem::zeroed::<libc::fd_set>() });
-    unsafe { _c::FD_ZERO(set.as_mut() as *mut libc::fd_set) };
+
+    fn as_ptr(&self) -> _c::fd_set {
+        self.0
+    }
+}
+
+impl Drop for FdSet {
+    fn drop(&mut self) {
+        unsafe { crate::rffi::free_opaque(self.0) };
+    }
+}
+
+fn prepare_set(fds: &[i32], nfds: &mut i32) -> Result<Option<FdSet>, crate::rffi::MemoryError> {
+    if fds.is_empty() {
+        return Ok(None);
+    }
+    let set = FdSet::malloc()?;
+    unsafe { _c::FD_ZERO(set.as_ptr()) };
     for &fd in fds {
-        unsafe { _c::FD_SET(fd, set.as_mut() as *mut libc::fd_set) };
+        unsafe { _c::FD_SET(fd, set.as_ptr()) };
         if fd > *nfds {
             *nfds = fd;
         }
     }
-    Some(set)
+    Ok(Some(set))
 }
 
-fn set_ptr(set: &mut Option<Box<libc::fd_set>>) -> _c::fd_set {
+fn set_ptr(set: &Option<FdSet>) -> _c::fd_set {
     match set {
-        Some(set) => set.as_mut() as *mut libc::fd_set,
+        Some(set) => set.as_ptr(),
         None => core::ptr::null_mut(),
     }
 }
 
-fn collect_ready(fds: &[i32], set: &mut Option<Box<libc::fd_set>>) -> Vec<i32> {
+fn collect_ready(fds: &[i32], set: &Option<FdSet>) -> Vec<i32> {
     let Some(set) = set else {
         return Vec::new();
     };
     fds.iter()
         .copied()
-        .filter(|&fd| unsafe { _c::FD_ISSET(fd, set.as_mut() as *mut libc::fd_set) } != 0)
+        .filter(|&fd| unsafe { _c::FD_ISSET(fd, set.as_ptr()) } != 0)
         .collect()
 }
 
@@ -101,11 +120,11 @@ pub fn select(
     excl: &[i32],
     timeout: f64,
     handle_eintr: bool,
-) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), SelectError> {
+) -> Result<Result<(Vec<i32>, Vec<i32>, Vec<i32>), SelectError>, crate::rffi::MemoryError> {
     let mut nfds = 0;
-    let mut ll_inl = prepare_set(inl, &mut nfds);
-    let mut ll_outl = prepare_set(outl, &mut nfds);
-    let mut ll_excl = prepare_set(excl, &mut nfds);
+    let ll_inl = prepare_set(inl, &mut nfds)?;
+    let ll_outl = prepare_set(outl, &mut nfds)?;
+    let ll_excl = prepare_set(excl, &mut nfds)?;
 
     let res = if timeout < 0.0 {
         let mut res;
@@ -113,9 +132,9 @@ pub fn select(
             res = unsafe {
                 _c::select(
                     nfds + 1,
-                    set_ptr(&mut ll_inl),
-                    set_ptr(&mut ll_outl),
-                    set_ptr(&mut ll_excl),
+                    set_ptr(&ll_inl),
+                    set_ptr(&ll_outl),
+                    set_ptr(&ll_excl),
                     core::ptr::null_mut(),
                 )
             };
@@ -134,9 +153,9 @@ pub fn select(
         let res = unsafe {
             _c::select(
                 nfds + 1,
-                set_ptr(&mut ll_inl),
-                set_ptr(&mut ll_outl),
-                set_ptr(&mut ll_excl),
+                set_ptr(&ll_inl),
+                set_ptr(&ll_outl),
+                set_ptr(&ll_excl),
                 &raw mut ll_timeval,
             )
         };
@@ -148,18 +167,18 @@ pub fn select(
     };
 
     if res == -1 {
-        return Err(SelectError {
+        return Ok(Err(SelectError {
             errno: _c::geterrno(),
-        });
+        }));
     }
     if res == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok(Ok((Vec::new(), Vec::new(), Vec::new())));
     }
-    Ok((
-        collect_ready(inl, &mut ll_inl),
-        collect_ready(outl, &mut ll_outl),
-        collect_ready(excl, &mut ll_excl),
-    ))
+    Ok(Ok((
+        collect_ready(inl, &ll_inl),
+        collect_ready(outl, &ll_outl),
+        collect_ready(excl, &ll_excl),
+    )))
 }
 
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
@@ -208,13 +227,16 @@ mod tests {
     fn select_reports_the_pipe_ends() {
         let _table = fd_table();
         let fds = pipe();
-        let (readable, writable, exceptional) =
-            select(&[fds.0[0]], &[fds.0[1]], &[], 0.0, false).expect("select");
+        let (readable, writable, exceptional) = select(&[fds.0[0]], &[fds.0[1]], &[], 0.0, false)
+            .expect("select malloc")
+            .expect("select");
         assert!(readable.is_empty());
         assert_eq!(writable, vec![fds.0[1]]);
         assert!(exceptional.is_empty());
         assert_eq!(unsafe { libc::write(fds.0[1], b"x".as_ptr().cast(), 1) }, 1);
-        let (readable, _, _) = select(&[fds.0[0]], &[], &[], 1.0, false).expect("select");
+        let (readable, _, _) = select(&[fds.0[0]], &[], &[], 1.0, false)
+            .expect("select malloc")
+            .expect("select");
         assert_eq!(readable, vec![fds.0[0]]);
     }
 
@@ -228,7 +250,7 @@ mod tests {
             let mut raw = [0; 2];
             assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
             unsafe { libc::close(raw[0]) };
-            let err = select(&[raw[0]], &[], &[], 0.0, false);
+            let err = select(&[raw[0]], &[], &[], 0.0, false).expect("select malloc");
             unsafe { libc::close(raw[1]) };
             if let Err(err) = err {
                 assert_eq!(err.errno, libc::EBADF);

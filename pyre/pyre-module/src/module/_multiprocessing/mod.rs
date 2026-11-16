@@ -44,6 +44,9 @@ mod ll {
         };
     }
 
+    // `interp_semaphore.SEM_T` is `rffi.COpaquePtr('sem_t', compilation_info=eci)`.
+    majit_rlib::rffi::copaque_ptr!(pub SEM_T = "sem_t", compilation_info = ECI);
+
     // libc private build-script cfgs (`gnu_time_bits64`, `musl_redir_time64`)
     // select 32-bit redirects (`__sem_timedwait64`, `__gettimeofday64`).
     // Native targets are 64-bit, so those `link_name`s are not copied.
@@ -56,21 +59,21 @@ mod ll {
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_open = "sem_open",
         [*const libc::c_char, INT, INT, UINT],
-        *mut libc::sem_t,
+        SEM_T,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO,
         natural_arity = 2
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_close_no_errno = "sem_close",
-        [*mut libc::sem_t],
+        [SEM_T],
         INT,
         compilation_info = ECI,
         releasegil = false
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_close = "sem_close",
-        [*mut libc::sem_t],
+        [SEM_T],
         INT,
         compilation_info = ECI,
         releasegil = false,
@@ -89,21 +92,21 @@ mod ll {
             link_name = "sem_wait$UNIX2003"
         )]
         pub(super) _sem_wait = "sem_wait",
-        [*mut libc::sem_t],
+        [SEM_T],
         INT,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_trywait = "sem_trywait",
-        [*mut libc::sem_t],
+        [SEM_T],
         INT,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_post = "sem_post",
-        [*mut libc::sem_t],
+        [SEM_T],
         INT,
         compilation_info = ECI,
         releasegil = false,
@@ -113,7 +116,7 @@ mod ll {
     #[cfg(not(target_vendor = "apple"))]
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_getvalue = "sem_getvalue",
-        [*mut libc::sem_t, *mut INT],
+        [SEM_T, *mut INT],
         INT,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
@@ -122,7 +125,7 @@ mod ll {
     #[cfg(not(target_vendor = "apple"))]
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_timedwait = "sem_timedwait",
-        [*mut libc::sem_t, *const libc::timespec],
+        [SEM_T, *const libc::timespec],
         INT,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
@@ -171,10 +174,7 @@ mod ll {
     /// The deadline's nanoseconds are compared with `gettimeofday`'s
     /// microseconds, and the difference mixes those units; both are upstream.
     #[cfg(target_vendor = "apple")]
-    pub(super) unsafe fn _sem_timedwait_save(
-        sem: *mut libc::sem_t,
-        deadline: libc::timespec,
-    ) -> INT {
+    pub(super) unsafe fn _sem_timedwait_save(sem: SEM_T, deadline: libc::timespec) -> INT {
         let mut delay: i64 = 0;
         loop {
             if unsafe { _sem_trywait(sem) } == 0 {
@@ -234,11 +234,11 @@ mod ll {
         fn sem_open_trywait_post_close_unlink() {
             let name =
                 std::ffi::CString::new(format!("/pyre-rffi-{}", std::process::id())).unwrap();
-            struct Cleanup(std::ffi::CString, *mut libc::sem_t);
+            struct Cleanup(std::ffi::CString, SEM_T);
             impl Drop for Cleanup {
                 fn drop(&mut self) {
                     unsafe {
-                        if !self.1.is_null() && self.1 != libc::SEM_FAILED {
+                        if !self.1.is_null() && self.1 != libc::SEM_FAILED as SEM_T {
                             _sem_close_no_errno(self.1);
                         }
                         _sem_unlink(self.0.as_ptr());
@@ -250,7 +250,7 @@ mod ll {
             let mut cleanup = Cleanup(name, sem);
             assert_ne!(
                 sem,
-                libc::SEM_FAILED,
+                libc::SEM_FAILED as SEM_T,
                 "sem_open errno {}",
                 majit_rlib::rposix::get_saved_errno()
             );
@@ -268,7 +268,7 @@ mod ll {
 /// that `_rebuild` takes back.  Both spellings are raw pointers, so the
 /// round trip through `usize` is the same on either.
 #[cfg(all(unix, feature = "host_env"))]
-type SemRaw = *mut libc::sem_t;
+type SemRaw = ll::SEM_T;
 #[cfg(all(windows, feature = "host_env"))]
 type SemRaw = host_mp::RawHandle;
 
@@ -553,7 +553,7 @@ fn semlock_create(
             value as libc::c_uint,
         )
     };
-    if handle == libc::SEM_FAILED {
+    if handle == libc::SEM_FAILED as ll::SEM_T {
         return Err(sem_oserror("sem_open failed"));
     }
     if unlink && unsafe { ll::_sem_unlink(c_name.as_ptr()) } < 0 {
@@ -600,7 +600,7 @@ fn semlock_rebuild_raw(
         Some(name) => {
             let c_name = sem_c_name(name)?;
             let handle = unsafe { ll::_sem_open(c_name.as_ptr(), 0, 0o600, 0) };
-            if handle == libc::SEM_FAILED {
+            if handle == libc::SEM_FAILED as ll::SEM_T {
                 return Err(sem_oserror("sem_open failed"));
             }
             Ok(handle)

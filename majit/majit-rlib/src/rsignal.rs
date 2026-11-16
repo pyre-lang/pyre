@@ -21,10 +21,6 @@ pub type itimerval = libc::itimerval;
 #[cfg(unix)]
 #[allow(non_camel_case_types)]
 pub type itimervalP = *mut itimerval;
-/// `rsignal.c_sigset_t`.
-#[cfg(unix)]
-#[allow(non_camel_case_types)]
-pub type c_sigset_t = *mut libc::sigset_t;
 
 /// `rsignal.SIG_DFL`.
 #[cfg(unix)]
@@ -56,6 +52,10 @@ crate::rffi::external_compilation_info! {
         ],
     };
 }
+
+// `rsignal.c_sigset_t` is `rffi.COpaquePtr('sigset_t', compilation_info=eci)`.
+#[cfg(unix)]
+crate::rffi::copaque_ptr!(pub c_sigset_t = "sigset_t", compilation_info = SIGNAL_ECI);
 
 // `rsignal.c_raise`.
 #[cfg(unix)]
@@ -261,10 +261,11 @@ mod tests {
 
     #[test]
     fn c_sigemptyset() {
-        let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-        assert_eq!(unsafe { super::c_sigemptyset(&mut set) }, 0);
-        assert_eq!(unsafe { super::c_sigaddset(&mut set, libc::SIGINT) }, 0);
-        assert_eq!(unsafe { super::c_sigismember(&mut set, libc::SIGINT) }, 1);
+        let set = crate::rffi::malloc_opaque::<super::c_sigset_t>().expect("malloc_opaque");
+        assert_eq!(unsafe { super::c_sigemptyset(set) }, 0);
+        assert_eq!(unsafe { super::c_sigaddset(set, libc::SIGINT) }, 0);
+        assert_eq!(unsafe { super::c_sigismember(set, libc::SIGINT) }, 1);
+        unsafe { crate::rffi::free_opaque(set) };
     }
 }
 

@@ -715,10 +715,10 @@ fn compile_wrapper(eci: &majit_eci::ExternalCompilationInfo) -> bool {
         .map(|incl| format!("#include <{incl}>"))
         .collect::<Vec<_>>()
         .join("\n");
-    // `copy_without('includes')`: `term.h` defines lower-case macros such as
-    // `lines`, so its includes stay in this one source.
-    let mut eci = eci.clone();
-    eci.includes.clear();
+    // `fficurses.py`'s `eci.copy_without('includes')`: `term.h` defines
+    // lower-case macros such as `lines`, so its includes stay in this one
+    // source.
+    let eci = eci.copy_without(&["includes"]);
     let ints = out_dir().join("curses_ints.c");
     let Some(ints) = ints.to_str() else {
         return false;

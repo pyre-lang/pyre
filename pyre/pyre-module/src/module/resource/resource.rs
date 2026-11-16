@@ -242,7 +242,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ll::c_getrusage(who, &mut ru)
                 });
                 if ret == -1 {
-                    let errno = majit_rlib::rposix::_get_errno();
+                    let errno = unsafe { majit_rlib::rposix::_get_errno() };
                     // `lib_pypy/resource.py getrusage` raises ValueError for
                     // an invalid `who`; only other errno values are
                     // surfaced as OSError.
@@ -283,7 +283,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ll::c_getrlimit(res as majit_rlib::rffi::INT, &mut rl)
                 });
                 if ret == -1 {
-                    let errno = majit_rlib::rposix::_get_errno();
+                    let errno = unsafe { majit_rlib::rposix::_get_errno() };
                     let e = std::io::Error::from_raw_os_error(errno);
                     Err(pyre_interpreter::PyError::os_error_with_errno(
                         errno,
@@ -341,7 +341,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // EPERM both surface as ValueError with
                     // distinct messages; all other errnos stay
                     // as OSError.
-                    let errno = majit_rlib::rposix::_get_errno();
+                    let errno = unsafe { majit_rlib::rposix::_get_errno() };
                     if errno == libc::EINVAL {
                         return Err(pyre_interpreter::PyError::value_error(
                             "current limit exceeds maximum limit",

@@ -11,7 +11,8 @@ pub use majit_jitcode::rffi::{
     RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
 };
 pub use majit_macros::{
-    call_aroundstate_target, external_compilation_info, jit_close_stack, llexternal,
+    call_aroundstate_target, cextern_variable, copaque_ptr, external_compilation_info,
+    jit_close_stack, llexternal, llexternal_use_eci,
 };
 
 /// `rffi.CHAR` (`lltype.Char`, 0..=255; `size_and_sign` reports it unsigned).
@@ -70,6 +71,7 @@ pub type CWCHARPP = *mut CWCHARP;
 mod buffer;
 mod callback;
 mod convert;
+mod opaque;
 
 pub use crate::getintfield;
 pub use crate::offsetof;
@@ -77,6 +79,7 @@ pub use crate::setintfield;
 pub use buffer::*;
 pub use callback::*;
 pub use convert::*;
+pub use opaque::*;
 
 use std::sync::OnceLock;
 
@@ -172,11 +175,124 @@ impl ExternalCompilationInfo {
     pub const fn new() -> Self {
         Self::DEFAULT
     }
+
+    /// `ExternalCompilationInfo.copy_without`: reset each named attribute
+    /// to the constructor default (empty slice / `false`). `"platform"` is
+    /// accepted and ignored: the runtime bag has no `platform`. An unknown
+    /// name panics (`KeyError`).
+    pub const fn copy_without(self, names: &[&str]) -> Self {
+        const fn str_eq(a: &str, b: &str) -> bool {
+            let a = a.as_bytes();
+            let b = b.as_bytes();
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        let mut out = self;
+        let mut i = 0;
+        while i < names.len() {
+            let name = names[i];
+            let mut j = 0;
+            while j < i {
+                if str_eq(names[j], name) {
+                    panic!("copy_without: attribute already removed");
+                }
+                j += 1;
+            }
+            if str_eq(name, "pre_include_bits") {
+                out.pre_include_bits = &[];
+            } else if str_eq(name, "includes") {
+                out.includes = &[];
+            } else if str_eq(name, "include_dirs") {
+                out.include_dirs = &[];
+            } else if str_eq(name, "post_include_bits") {
+                out.post_include_bits = &[];
+            } else if str_eq(name, "libraries") {
+                out.libraries = &[];
+            } else if str_eq(name, "library_dirs") {
+                out.library_dirs = &[];
+            } else if str_eq(name, "separate_module_sources") {
+                out.separate_module_sources = &[];
+            } else if str_eq(name, "separate_module_files") {
+                out.separate_module_files = &[];
+            } else if str_eq(name, "compile_extra") {
+                out.compile_extra = &[];
+            } else if str_eq(name, "link_extra") {
+                out.link_extra = &[];
+            } else if str_eq(name, "frameworks") {
+                out.frameworks = &[];
+            } else if str_eq(name, "link_files") {
+                out.link_files = &[];
+            } else if str_eq(name, "testonly_libraries") {
+                out.testonly_libraries = &[];
+            } else if str_eq(name, "use_cpp_linker") {
+                out.use_cpp_linker = false;
+            } else if str_eq(name, "platform") {
+                // The runtime bag has no `platform`.
+            } else {
+                panic!("copy_without: unknown attribute");
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 impl Default for ExternalCompilationInfo {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+#[cfg(test)]
+mod copy_without_tests {
+    use super::ExternalCompilationInfo;
+
+    const _: ExternalCompilationInfo = ExternalCompilationInfo::DEFAULT.copy_without(&["includes"]);
+
+    #[test]
+    fn copy_without_empties_includes() {
+        let eci = ExternalCompilationInfo {
+            includes: &["a.h"],
+            post_include_bits: &["x"],
+            ..ExternalCompilationInfo::DEFAULT
+        };
+        let out = eci.copy_without(&["includes"]);
+        assert!(out.includes.is_empty());
+        assert_eq!(out.post_include_bits, &["x"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "copy_without: attribute already removed")]
+    fn copy_without_name_twice() {
+        let _ = ExternalCompilationInfo::DEFAULT.copy_without(&["includes", "includes"]);
+    }
+}
+
+#[cfg(test)]
+mod use_eci_tests {
+    use super::*;
+
+    external_compilation_info! {
+        const TEST_ECI = {
+            includes: ["stdio.h"],
+        };
+    }
+
+    llexternal_use_eci!(fn do_use_test_eci = TEST_ECI);
+
+    #[test]
+    fn use_eci_calls_the_dummy() {
+        do_use_test_eci();
+        assert_eq!(TEST_ECI.includes, ["stdio.h"]);
     }
 }
 

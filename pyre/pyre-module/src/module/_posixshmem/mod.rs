@@ -84,7 +84,7 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             ll::c_shm_open(c_name.as_ptr() as majit_rlib::rffi::CCHARP, flags, mode)
         });
         if fd < 0 {
-            let errno = majit_rlib::rposix::_get_errno();
+            let errno = unsafe { majit_rlib::rposix::_get_errno() };
             if errno == libc::EINTR {
                 continue;
             }
@@ -124,7 +124,7 @@ fn shm_unlink(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
             ll::c_shm_unlink(c_name.as_ptr() as majit_rlib::rffi::CCHARP)
         });
         if rv < 0 {
-            let errno = majit_rlib::rposix::_get_errno();
+            let errno = unsafe { majit_rlib::rposix::_get_errno() };
             if errno == libc::EINTR {
                 continue;
             }

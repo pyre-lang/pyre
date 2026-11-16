@@ -34,28 +34,21 @@ crate::rffi::llexternal!(
     releasegil = false
 );
 
-/// `rposix_environ.os_get_environ`. Darwin is `_NSGetEnviron()[0]`; other
-/// Unix is the C `environ` pointer (`rffi.CExternVariable`).
-pub fn os_get_environ() -> CCHARPP {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    unsafe {
-        *_os_NSGetEnviron()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    unsafe {
-        // Runtime `CExternVariable` of `environ`; not a translator helper.
-        // Nested so `envkeys_llimpl` / `envitems_llimpl` can keep the local
-        // name `environ` (`rposix_environ.envkeys_llimpl`).
-        core::ptr::addr_of!(c_environ::environ).read()
-    }
+/// `rposix_environ.os_get_environ`. Darwin is `_NSGetEnviron()[0]`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn os_get_environ() -> CCHARPP {
+    unsafe { *_os_NSGetEnviron() }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-mod c_environ {
-    unsafe extern "C" {
-        pub static mut environ: super::CCHARPP;
-    }
-}
+crate::rffi::external_compilation_info! { const ENVIRON_ECI = {}; }
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+crate::rffi::cextern_variable!(
+    pub os_get_environ,
+    pub _os_set_environ = "environ",
+    CCHARPP,
+    compilation_info = ENVIRON_ECI
+);
 
 crate::rffi::llexternal!(
     pub os_getenv = "getenv",
@@ -117,7 +110,7 @@ pub fn envkeys_llimpl() -> Result<Vec<Vec<u8>>, rffi::MemoryError> {
     // so a 3.14t `putenv_llimpl` cannot free a string this copy still
     // reads. No null guard: `envkeys_llimpl` has none.
     let _keepalive = byname();
-    let environ = os_get_environ();
+    let environ = unsafe { os_get_environ() };
     let mut result = Vec::new();
     let mut i = 0usize;
     unsafe {
@@ -137,7 +130,7 @@ pub fn envkeys_llimpl() -> Result<Vec<Vec<u8>>, rffi::MemoryError> {
 #[majit_macros::replace_os_function("envitems")]
 pub fn envitems_llimpl() -> Result<Vec<(Vec<u8>, Vec<u8>)>, rffi::MemoryError> {
     let _keepalive = byname();
-    let environ = os_get_environ();
+    let environ = unsafe { os_get_environ() };
     let mut result = Vec::new();
     if environ.is_null() {
         return Ok(result);

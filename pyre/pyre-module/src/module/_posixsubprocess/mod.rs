@@ -295,10 +295,10 @@ mod imp {
         }
         let fd_used_by_opendir = unsafe { libc::dirfd(proc_fd_dir) };
         loop {
-            majit_rlib::rposix::_set_errno(0);
+            unsafe { majit_rlib::rposix::_set_errno(0) };
             let entry = unsafe { libc::readdir(proc_fd_dir) };
             if entry.is_null() {
-                if majit_rlib::rposix::_get_errno() != 0 {
+                if unsafe { majit_rlib::rposix::_get_errno() } != 0 {
                     close_fds_brute_force(start_fd, keep);
                 }
                 break;
