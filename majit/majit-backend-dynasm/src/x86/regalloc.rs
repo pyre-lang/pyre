@@ -662,10 +662,14 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py walk_operations (`oplist[op.getopnum()](self, op)`).
-    pub(crate) fn _dispatch_op(&mut self, op: &OpRc, i: usize, asm: &mut dyn RegAllocAssembler) {
-        let result = Operand::from_bound_op(op);
+    pub(crate) fn _dispatch_op(
+        &mut self,
+        op: &OpRc,
+        dst: &Operand,
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
         let args = op.args_slice();
-        let dst = &result;
         match op.opcode {
             OpCode::Label => {
                 self.consider_label(&args, op, i, asm);

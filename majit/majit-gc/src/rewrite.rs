@@ -829,9 +829,11 @@ impl RewriteState {
             return;
         }
         for i in 0..op.num_args() {
-            if let Some(Value::Ref(gcref)) = op.arg(i).const_value()
-                && !gcref.is_null()
-            {
+            let gcref = match op.arg_ref(i).const_value() {
+                Some(Value::Ref(gcref)) if !gcref.is_null() => Some(gcref),
+                _ => None,
+            };
+            if let Some(gcref) = gcref {
                 let load = self.remove_constptr(gcref);
                 op.setarg(i, load);
             }
@@ -906,30 +908,45 @@ impl RewriteState {
     fn replace_args_in_place(&mut self, out: &OpRc, keep_constptrs: bool) -> bool {
         let mut replaced = false;
         for i in 0..out.num_args() {
-            let mut arg = self.get_box_replacement(out.arg_ref(i));
-            if !keep_constptrs
-                && let Some(Value::Ref(gcref)) = arg.const_value()
-                && !gcref.is_null()
-            {
-                arg = self.remove_constptr(gcref);
-            }
-            if arg != *out.arg_ref(i) {
-                // The op IS the box (resoperation.py). setarg writes the
-                // replacement on this ResOperation; a second cls() would
-                // only mint an identical identity for get_box_replacement
-                // to find via _forwarded.
-                out.setarg(i, arg);
+            // Intern a non-null ConstPtr terminal before the packed-identity
+            // check (`rewrite.py` emit_op `not_const=False` walk). Copy the
+            // gcref out so `arg_ref` is not held across `setarg`.
+            let intern_gcref = if keep_constptrs {
+                None
+            } else {
+                let src = out.arg_ref(i);
+                src.with_box_replacement(|r| match r.const_value() {
+                    Some(Value::Ref(g)) if !g.is_null() => Some(g),
+                    _ => None,
+                })
+            };
+            if let Some(g) = intern_gcref {
+                out.setarg(i, self.remove_constptr(g));
                 replaced = true;
+            } else {
+                let replacement = {
+                    let src = out.arg_ref(i);
+                    src.with_box_replacement(|r| (r != src).then(|| r.clone()))
+                };
+                if let Some(resolved) = replacement {
+                    // The op IS the box (resoperation.py). setarg writes the
+                    // replacement on this ResOperation; a second cls() would
+                    // only mint an identical identity for get_box_replacement
+                    // to find via _forwarded.
+                    out.setarg(i, resolved);
+                    replaced = true;
+                }
             }
         }
         if out.opcode.is_guard() {
-            let failargs_changed = out
-                .guard_fail_args()
-                .is_some_and(|fa| fa.iter().any(|a| self.get_box_replacement(a) != *a));
+            let mut failargs_changed = false;
+            out.map_failargs_in_place(|a| {
+                if let Some(r) = a.with_box_replacement(|r| (*r != *a).then(|| r.clone())) {
+                    *a = r;
+                    failargs_changed = true;
+                }
+            });
             if failargs_changed {
-                out.map_failargs_in_place(|a| {
-                    *a = self.get_box_replacement(a);
-                });
                 replaced = true;
             }
         }
@@ -2282,8 +2299,10 @@ impl GcRewriterImpl {
     /// `transform_to_gc_load` forwarded it, or the original SETFIELD_GC
     /// when an ordered descr (`store_is_release`) kept the op.
     fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
-        let obj = st.get_box_replacement(op.arg_ref(0));
-        if st.wb_already_applied(&obj) {
+        if op
+            .arg_ref(0)
+            .with_box_replacement(|obj| st.wb_already_applied(obj))
+        {
             return;
         }
         // rewrite.py:930-931: check the stored VALUE's type.
@@ -2300,20 +2319,22 @@ impl GcRewriterImpl {
             .getdescr()
             .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
             .unwrap_or(false);
-        let val = st.get_box_replacement(op.arg_ref(1));
-        let val_is_ref = if field_is_ptr {
-            match st.result_type_of(&val) {
-                Some(tp) => tp == Type::Ref,
-                // `result_type_of` is None only for the OpRef::None /
-                // virtual-object marker (history.py Box.type has no analog
-                // for it). Stored into a pointer field it is a GCREF slot,
-                // so it needs a barrier — assume Ref.
-                None => true,
-            }
-        } else {
-            false
-        };
-        if !val_is_ref || st.is_null_constant(&val) {
+        let needs = op.arg_ref(1).with_box_replacement(|val| {
+            let val_is_ref = if field_is_ptr {
+                match st.result_type_of(val) {
+                    Some(tp) => tp == Type::Ref,
+                    // `result_type_of` is None only for the OpRef::None /
+                    // virtual-object marker (history.py Box.type has no analog
+                    // for it). Stored into a pointer field it is a GCREF slot,
+                    // so it needs a barrier — assume Ref.
+                    None => true,
+                }
+            } else {
+                false
+            };
+            val_is_ref && !st.is_null_constant(val)
+        });
+        if !needs {
             return;
         }
         // Not a GC object: no header for the barrier to test; its GCREF
@@ -2326,6 +2347,7 @@ impl GcRewriterImpl {
         {
             return;
         }
+        let obj = st.get_box_replacement(op.arg_ref(0));
         self.gen_write_barrier(obj, st);
     }
 
@@ -2392,11 +2414,15 @@ impl GcRewriterImpl {
     /// and then `self.emit_op(op)` follows the forwarding. We do the
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
     fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let val = st.get_box_replacement(op.arg_ref(0));
         // rewrite.py:938-942
-        if !st.wb_already_applied(&val) {
-            let v = st.get_box_replacement(op.arg_ref(2));
-            let val_is_ref = match st.result_type_of(&v) {
+        if op
+            .arg_ref(0)
+            .with_box_replacement(|val| st.wb_already_applied(val))
+        {
+            return;
+        }
+        let needs = op.arg_ref(2).with_box_replacement(|v| {
+            let val_is_ref = match st.result_type_of(v) {
                 Some(tp) => tp == Type::Ref,
                 // None only for the OpRef::None / virtual marker (no type
                 // tag); route the barrier decision through the array
@@ -2406,10 +2432,14 @@ impl GcRewriterImpl {
                     .and_then(|d| d.as_array_descr().map(|ad| ad.is_array_of_pointers()))
                     .unwrap_or(false),
             };
-            if val_is_ref && !st.is_null_constant(&v) {
-                self.gen_write_barrier_array(val, st.get_box_replacement(op.arg_ref(1)), st);
-            }
+            val_is_ref && !st.is_null_constant(v)
+        });
+        if !needs {
+            return;
         }
+        let val = st.get_box_replacement(op.arg_ref(0));
+        let index = st.get_box_replacement(op.arg_ref(1));
+        self.gen_write_barrier_array(val, index, st);
     }
 
     /// rewrite.py handle_setarrayitem.

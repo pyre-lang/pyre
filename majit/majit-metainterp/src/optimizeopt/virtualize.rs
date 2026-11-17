@@ -522,7 +522,6 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(op.arg_ref(0));
-        let value_ref = ctx.resolve_operand_operand(op.arg_ref(1));
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -542,7 +541,7 @@ impl OptVirtualize {
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
         let value_as_constant: Option<usize> =
-            ctx.get_constant_box(&value_ref).and_then(|v| match v {
+            ctx.get_constant_box(op.arg_ref(1)).and_then(|v| match v {
                 majit_ir::Value::Int(i) => Some(i as usize),
                 majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
                 _ => None,
@@ -556,7 +555,10 @@ impl OptVirtualize {
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        let value_op = value_ref.clone();
+        // Resolved only for a virtual struct box: the arms below that store it match the same info.
+        let value_op = owner
+            .as_ref()
+            .map(|_| ctx.resolve_operand_operand(op.arg_ref(1)));
         let early = struct_box
             .as_ref()
             .and_then(|b| ctx.with_ptr_info_mut(b, |info| {
@@ -627,6 +629,9 @@ impl OptVirtualize {
                                 .as_size_descr()
                                 .and_then(|size| size.class_word_index_in_parent())
                             {
+                                let value_op = value_op
+                                    .as_ref()
+                                    .expect("optimize_setfield_gc: virtual info without a resolved value");
                                 set_field(&mut vinfo.fields, slot as u32, value_op.clone());
                                 return Some(OptimizationResult::Remove);
                             }
@@ -645,6 +650,9 @@ impl OptVirtualize {
                                 OptimizationResult::PassOn
                             });
                         }
+                        let value_op = value_op
+                            .as_ref()
+                            .expect("optimize_setfield_gc: virtual info without a resolved value");
                         Some(store_virtual_field_or_emit(
                             &vinfo.descr,
                             &mut vinfo.fields,
@@ -662,6 +670,9 @@ impl OptVirtualize {
                         // this arm is emitted on the forced object
                         // (`store_virtual_field_or_emit` PassOn when the
                         // listed slots do not hold it).
+                        let value_op = value_op
+                            .as_ref()
+                            .expect("optimize_setfield_gc: virtual info without a resolved value");
                         Some(store_virtual_field_or_emit(
                             &vinfo.descr,
                             &mut vinfo.fields,

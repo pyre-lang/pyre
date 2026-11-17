@@ -132,3 +132,11 @@ fn list_root_guard_indexes_null_slots() {
     assert_ne!(guard.get(2).0, 0);
     assert_ne!(guard.get(2).0, stale_c.0);
 }
+
+#[test]
+#[should_panic(expected = "LIFO")]
+fn list_root_guard_drop_out_of_lifo_order_panics() {
+    let a = ListRootGuard::push(&[GcRef(1)]);
+    let _b = ListRootGuard::push(&[GcRef(2)]);
+    drop(a);
+}

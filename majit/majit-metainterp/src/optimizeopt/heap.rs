@@ -273,15 +273,16 @@ impl CachedField {
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         // info.py:212-214: return self._fields[fielddescr.get_index()]
-        let struct_box = ctx.resolve_operand_operand(struct_box);
-        if let Some(info) = struct_box.ptr_info()
-            && let Some(entry) = info.getfield(field_idx)
-        {
+        let hit = ctx.with_resolved_operand(struct_box, |b| {
+            b.ptr_info().and_then(|i| i.getfield(field_idx))
+        });
+        if let Some(entry) = hit {
             return Some(entry);
         }
         // info.py ConstPtrInfo.getfield → _get_info(parent_descr, optheap)
+        let owned = ctx.resolve_operand_operand(struct_box);
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
-        if let Some(info) = ctx.get_const_info_mut_box(&struct_box, parent_descr)
+        if let Some(info) = ctx.get_const_info_mut_box(&owned, parent_descr)
             && let Some(entry) = info.getfield(field_idx)
         {
             return Some(entry);
@@ -1187,15 +1188,15 @@ impl OptHeapState {
         if value.is_none() {
             return;
         }
-        let value_box = ctx.resolve_operand_operand(value);
-        let container_box = ctx.resolve_operand_operand(container);
-        if self.is_unescaped(&container_box) && self.is_unescaped(&value_box) {
-            self.heapc_deps
-                .entry(container_box)
-                .or_default()
-                .push(value_box);
+        let both = ctx.with_resolved_operand(container, |c| {
+            ctx.with_resolved_operand(value, |v| self.is_unescaped(c) && self.is_unescaped(v))
+        });
+        if both {
+            let v = ctx.resolve_operand_operand(value);
+            let c = ctx.resolve_operand_operand(container);
+            self.heapc_deps.entry(c).or_default().push(v);
         } else {
-            self.escape_box(&value_box);
+            ctx.with_resolved_operand(value, |v| self.escape_box(v));
         }
     }
 
@@ -1325,7 +1326,13 @@ impl OptHeapState {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
+            let replaced = {
+                let arg = op.arg_ref(i);
+                ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+            };
+            if let Some(resolved) = replaced {
+                op.setarg(i, resolved);
+            }
         }
         // heap.py: emit_extra(op, emit=False) → next_optimization.
         // `_lazy_set` already holds this ResOperation; do not cls() again.
@@ -2011,7 +2018,13 @@ impl OptHeapState {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
+                let replaced = {
+                    let arg = pending_op.arg_ref(i);
+                    ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+                };
+                if let Some(resolved) = replaced {
+                    pending_op.setarg(i, resolved);
+                }
             }
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(1);
@@ -2044,7 +2057,13 @@ impl OptHeapState {
         for (descr_idx, index, _obj, pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
+                let replaced = {
+                    let arg = pending_op.arg_ref(i);
+                    ctx.with_resolved_operand(arg, |t| (!t.same_box(arg)).then(|| t.clone()))
+                };
+                if let Some(resolved) = replaced {
+                    pending_op.setarg(i, resolved);
+                }
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
@@ -2892,10 +2911,10 @@ impl OptHeapState {
                     return;
                 }
                 // heap.py put_field_back_to_info(op, opinfo, optheap)
-                let final_value = lazy_op.arg(1);
-                let lazy_obj_box = ctx.resolve_operand_operand(put_back_op.arg_ref(0));
-                self.cached_fields[pos].2.register_info(&lazy_obj_box);
-                ctx.structinfo_setfield(&put_back_op, field_idx, &final_value);
+                ctx.with_resolved_operand(put_back_op.arg_ref(0), |obj| {
+                    self.cached_fields[pos].2.register_info(obj);
+                });
+                ctx.structinfo_setfield(&put_back_op, field_idx, lazy_op.arg_ref(1));
             }
             None => {
                 // heap.py elif not can_cache: self.invalidate(descr)

@@ -423,10 +423,14 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// aarch64/assembler.py `_walk_operations` (`regalloc_operations[opnum]`).
-    pub(crate) fn _dispatch_op(&mut self, op: &OpRc, i: usize, asm: &mut dyn RegAllocAssembler) {
-        let result = Operand::from_bound_op(op);
+    pub(crate) fn _dispatch_op(
+        &mut self,
+        op: &OpRc,
+        dst: &Operand,
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
         let args = op.args_slice();
-        let dst = &result;
         match op.opcode {
             OpCode::Label => {
                 self.prepare_op_label(&args, op, i, asm);

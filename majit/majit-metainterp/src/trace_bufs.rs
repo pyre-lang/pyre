@@ -818,61 +818,77 @@ fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
 }
 
 /// Roots blackhole argument-list locals (`blackhole.py`
-/// `_get_list_of_values`) off the FrameAnchor index space.
+/// `_get_list_of_values`) as shadow-stack words.
 ///
 /// RPython keeps those lists as GC locals of the blackhole function,
 /// rooted by `framework.py` `push_roots` / `shadowstack.py` `incr_stack`
-/// on that function's root frame. pyre's `FrameAnchor` returns a
-/// `SHADOW_STACK` index that must outlive the caller's `pop_roots`, so
-/// each list is rooted on `OWNER_ROOTS` through
-/// [`majit_gc::shadow_stack::OwnerRootGuard`] instead of `SHADOW_STACK`.
-/// Drop releases the guards in reverse order.
+/// on that function's root frame. Drop pops those words (`gc_pop_roots`).
 ///
-/// `OWNER_ROOTS` holds the livevars. A collection rewrites those slots.
+/// The shadow stack holds the livevars. A collection rewrites those slots.
 /// The `FixedSignedList` copies in `IrfLists` / `IrLists` / `RList` are
 /// not the slots, so a later use reloads through [`Self::get`]
 /// (`gc_pop_roots` writing livevars back). Null slots are kept so
 /// `get(i)` matches `refs[i]`; `walk_stack_root` skips a null content
 /// the same way `if content:` does.
 pub struct ListRootGuard {
-    roots: Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>,
+    /// Shadow-stack depth before the push; the livevars are `base .. base + len`.
+    base: usize,
+    len: usize,
+    /// The shadow stack is per-thread: a depth taken on one thread names a
+    /// different slot on another.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl ListRootGuard {
     #[inline]
     pub fn push(refs: &[GcRef]) -> Self {
-        let mut roots = Vec::with_capacity(refs.len());
+        let base = majit_gc::shadow_stack::depth();
         for &g in refs {
-            // Include nulls so `get(i)` matches `refs[i]`.
-            if g.0 != 0 {
-                roots.push(Some(majit_gc::shadow_stack::OwnerRootGuard::new(g)));
-            } else {
-                roots.push(None);
-            }
+            // Nulls are pushed too so `get(i)` matches `refs[i]`;
+            // `walk_stack_root` skips a null content (`if content:`).
+            majit_gc::shadow_stack::push(g);
         }
-        Self { roots }
+        Self {
+            base,
+            len: refs.len(),
+            _not_send: PhantomData,
+        }
     }
 
     /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`: the
     /// forwarded livevar after a collecting call.
     #[inline]
     pub fn get(&self, i: usize) -> GcRef {
-        self.roots
-            .get(i)
-            .and_then(|root| {
-                root.as_ref()
-                    .map(majit_gc::shadow_stack::OwnerRootGuard::get)
-            })
-            .unwrap_or(GcRef(0))
+        if i < self.len {
+            majit_gc::shadow_stack::get(self.base + i)
+        } else {
+            GcRef(0)
+        }
     }
 }
 
 impl Drop for ListRootGuard {
     #[inline]
     fn drop(&mut self) {
-        while let Some(root) = self.roots.pop() {
-            drop(root);
+        // `gc_pop_roots`: these livevars are the top of the stack again. Root
+        // scopes nest (`push_roots` / `pop_roots` pair up around one call); a
+        // guard dropped under a newer one would unregister that one's roots.
+        let depth = majit_gc::shadow_stack::depth();
+        if depth != self.base + self.len {
+            if std::thread::panicking() {
+                // Unwinding: an inner scope may not have popped. Saturate to
+                // this span's base so a second assert does not hide the
+                // original report.
+                majit_gc::shadow_stack::try_pop_to(self.base);
+                return;
+            }
+            panic!(
+                "ListRootGuard dropped out of LIFO order: depth {depth}, span {}..{}",
+                self.base,
+                self.base + self.len
+            );
         }
+        majit_gc::shadow_stack::try_pop_to(self.base);
     }
 }
 

@@ -8305,14 +8305,16 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: &Operand) {
         let value = self.resolve_operand_operand(value);
-        let arg0 = self.resolve_operand_operand(&op.arg(0));
-        if arg0.const_value().is_some() {
+        let const_arg0 = self.with_resolved_operand(op.arg_ref(0), |a0| {
+            a0.const_value().is_some().then(|| a0.clone())
+        });
+        if let Some(arg0) = const_arg0 {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
             if let Some(info) = self.get_const_info_mut_box(&arg0, parent_descr.clone()) {
                 if let Some(parent) = parent_descr {
                     info.init_fields(parent, field_idx as usize);
                 }
-                info.setfield(field_idx, value.clone());
+                info.setfield(field_idx, value);
             }
             return;
         }
@@ -8367,7 +8369,7 @@ impl OptContext {
                 if !is_header_word && let Some(parent) = parent_descr.clone() {
                     pi.init_fields(parent, field_idx as usize);
                 }
-                pi.setfield(field_idx, value.clone());
+                pi.setfield(field_idx, value);
             }
         });
     }
@@ -8379,12 +8381,14 @@ impl OptContext {
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: &Operand) {
         let value = self.resolve_operand_operand(value);
-        let arg0 = self.resolve_operand_operand(&op.arg(0));
-        if arg0.is_constant() || arg0.const_value().is_some() {
+        let const_arg0 = self.with_resolved_operand(op.arg_ref(0), |a0| {
+            (a0.is_constant() || a0.const_value().is_some()).then(|| a0.clone())
+        });
+        if let Some(arg0) = const_arg0 {
             if let Some(descr) = op.getdescr()
                 && let Some(info) = self.get_const_info_array_mut_box(&arg0, descr)
             {
-                info.setitem(index, value.clone());
+                info.setitem(index, value);
             }
             return;
         }
@@ -8392,7 +8396,7 @@ impl OptContext {
         // stored in the operand's `_forwarded` slot.
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
-                pi.setitem(index, value.clone());
+                pi.setitem(index, value);
             }
         });
     }

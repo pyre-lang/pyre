@@ -26,6 +26,7 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::jump::RegallocMoves;
 use crate::regloc::*;
+use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TempVar, Type};
 #[cfg(test)]
@@ -85,22 +86,37 @@ pub fn visit_boxes_with_frame_loc(
     fm: &FrameManager,
     mut visit: impl FnMut(OpRef, FrameLoc),
 ) {
-    let mut visit_box = |box_: &Operand| {
-        if let Some(lt) = get_lifetime(box_)
+    for iarg in inputargs {
+        if let Some(lt) = iarg.get_lifetime_info()
             && let Some(pos) = lt.current_frame_loc.get()
         {
-            let floc = DynasmFrameLayout::frame_pos(pos as usize, box_.type_(), fm.base_ofs);
-            visit(box_.to_opref(), floc);
+            let tp = iarg.tp.get();
+            visit(
+                OpRef::input_arg_typed(iarg.index, tp),
+                DynasmFrameLayout::frame_pos(pos as usize, tp, fm.base_ofs),
+            );
         }
-    };
-    for iarg in inputargs {
-        visit_box(&Operand::from_bound_inputarg(iarg));
     }
     for op_rc in operations {
-        visit_box(&Operand::from_bound_op(op_rc));
+        if let Some(lt) = op_rc.get_lifetime_info()
+            && let Some(pos) = lt.current_frame_loc.get()
+        {
+            let tp = op_rc.pos().get().ty().unwrap_or(op_rc.result_type());
+            visit(
+                op_rc.pos().get(),
+                DynasmFrameLayout::frame_pos(pos as usize, tp, fm.base_ofs),
+            );
+        }
     }
     for slot in fm.boxes_in_frame.iter().flatten() {
-        visit_box(slot);
+        if let Some(lt) = get_lifetime(slot)
+            && let Some(pos) = lt.current_frame_loc.get()
+        {
+            visit(
+                slot.to_opref(),
+                DynasmFrameLayout::frame_pos(pos as usize, slot.type_(), fm.base_ofs),
+            );
+        }
     }
 }
 
@@ -1730,8 +1746,8 @@ impl<'a> RegAlloc<'a> {
 
             // x86/regalloc.py walk_operations: oplist[op.getopnum()](self, op)
             // then possibly_free_vars_for_op(op).
-            self._dispatch_op(op, i, asm);
-            self.possibly_free_vars_for_op(op, &Operand::from_bound_op(op));
+            self._dispatch_op(op, &result, i, asm);
+            self.possibly_free_vars_for_op(op, &result);
             if let Some(err) = self
                 .xrm
                 .pool_error
@@ -2304,7 +2320,8 @@ mod tests {
         ra.rm.spill_moves.clear();
 
         let mut asm = MockAsm::default();
-        ra._dispatch_op(&ops[0], 0, &mut asm);
+        let dst = Operand::from_bound_op(&ops[0]);
+        ra._dispatch_op(&ops[0], &dst, 0, &mut asm);
         let output = asm.emitted;
 
         assert_eq!(

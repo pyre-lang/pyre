@@ -5286,11 +5286,11 @@ impl Optimizer {
         // optimizer.py `self._emittedoperations[op] = None` — `ctx.emit_rc`
         // records the appended op so `as_operation` can later confirm it
         // is in the emit set.
-        let emitted_box = emitted_box.get_box_replacement(false);
         debug_assert!(
-            Operand::from_bound_op(ctx.new_operations.last().expect("just emitted"))
-                .same_box(&emitted_box)
-                || emitted_box.same_box(&Operand::from_bound_op(&emitted_rc)),
+            emitted_box.with_box_replacement(|b| {
+                Operand::from_bound_op(ctx.new_operations.last().expect("just emitted")).same_box(b)
+                    || b.same_box(&Operand::from_bound_op(&emitted_rc))
+            }),
             "emitted op is not the producer just appended"
         );
         // optimizer.py `_emit_operation` clears the REMOVED
@@ -5311,11 +5311,16 @@ impl Optimizer {
         //       opinfo = op.get_forwarded()  # IntBound
         //       if opinfo is not None and opinfo.is_constant():
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
-        if op_result_type == majit_ir::Type::Int
-            && let Some(bound) = ctx.peek_intbound_box(&emitted_box)
-            && bound.is_constant()
-        {
-            let const_val = bound.get_constant_int();
+        let const_val = emitted_box.with_box_replacement(|b| {
+            (op_result_type == majit_ir::Type::Int)
+                .then(|| {
+                    ctx.peek_intbound_box(b)
+                        .filter(|ib| ib.is_constant())
+                        .map(|ib| ib.get_constant_int())
+                })
+                .flatten()
+        });
+        if let Some(const_val) = const_val {
             ctx.make_constant_box(&emitted_box, majit_ir::Value::Int(const_val));
         }
         if crate::majit_log_enabled()
