@@ -11834,8 +11834,8 @@ impl CallControl {
     /// the most-qualified source identity for the one graph object entered
     /// into the PBC family.  The family is memoised in
     /// `builtin_wrapper_family`; its inputs are frozen before the first
-    /// reader runs.  Members are ordered by wrapper address (the
-    /// `by_address` key), i.e. by the link-time layout of the host binary.
+    /// reader runs.  Members are ordered by path (`display_name`, then
+    /// segments); the address map is used only to merge aliases.
     pub fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
         self.builtin_wrapper_family
             .get_or_init(|| self.compute_builtin_wrapper_indirect_graphs())
@@ -11901,6 +11901,15 @@ impl CallControl {
                 .expect("address bucket holds at least one alias");
             result.push(pick);
         }
+        // The address buckets only merge alias spellings of one function.
+        // Their key is the link-time layout of the host binary, so the
+        // family is put in path order: the jitcode numbering that follows
+        // from it is then the same for every build of one tree.
+        result.sort_by(|a, b| {
+            a.display_name()
+                .cmp(&b.display_name())
+                .then_with(|| a.segments.cmp(&b.segments))
+        });
         result
     }
 

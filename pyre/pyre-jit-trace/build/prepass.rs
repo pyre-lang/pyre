@@ -34,10 +34,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v25";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v26";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
-/// switches between (native/wasm × release/dev) inside 300 MB.
+/// switches between (native/wasm × with/without `pyre-module`, across a few
+/// source states) inside 300 MB.
 ///
 /// A cache shared between worktrees (`PYRE_JIT_TRACE_CACHE_DIR`) has to hold
 /// every checkout's working set at once, so its floor is the number of
@@ -2592,10 +2593,9 @@ fn llbc_layout_sidecars() -> Vec<String> {
 
 /// The cache sits in the machine-wide shared dir (`<shared>/jit-trace-cache`)
 /// so `cargo clean` does not drop it; CI keeps it under `target/`.
-/// `codegen_cache_key` already folds
-/// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the translator sources
-/// and the LLBC content, so an entry is only ever served back to the
-/// configuration that produced it.
+/// `codegen_cache_key` folds HOST, TARGET, the `pyre-module` feature, the
+/// translator sources and the LLBC content, so an entry is only served to a
+/// configuration whose prepass would write the same outputs.
 /// The cache root when several checkouts share one directory, or `None` for the
 /// per-worktree default (`target/pyre-jit-trace-cache`, used when `CI` is set).
 ///
@@ -2950,19 +2950,21 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
     let mut h = CacheHasher::new();
     let repo_root = std::path::Path::new(repo_root);
     h.write_str(CODEGEN_CACHE_VERSION);
-    for key in ["HOST", "TARGET", "PROFILE", "OPT_LEVEL"] {
+    // Only what the prepass reads. HOST and TARGET select the layout
+    // sidecars and the target word size (`CARGO_CFG_TARGET_*` is a function
+    // of TARGET); `pyre-module` selects the LLBC crate set and the sampled
+    // wrappers, and `sandbox` reaches the interpreter this script links.
+    // PROFILE, OPT_LEVEL and the backend features describe the
+    // package compiled after this script and leave its outputs unchanged, so
+    // the profiles and backends of one tree share an entry.
+    for key in [
+        "HOST",
+        "TARGET",
+        "CARGO_FEATURE_PYRE_MODULE",
+        "CARGO_FEATURE_SANDBOX",
+    ] {
         h.write_str(key);
         h.write_os(std::env::var_os(key));
-    }
-    let mut cargo_env: Vec<(String, String)> = std::env::vars()
-        .filter(|(key, _)| {
-            key.starts_with("CARGO_FEATURE_") || key.starts_with("CARGO_CFG_TARGET_")
-        })
-        .collect();
-    cargo_env.sort();
-    for (key, value) in cargo_env {
-        h.write_str(&key);
-        h.write_str(&value);
     }
     h.write_os(std::env::var_os("MAJIT_MIR_FRONTEND_LLBC"));
     for key in LOWERING_GATE_ENV {

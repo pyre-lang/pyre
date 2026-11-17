@@ -496,8 +496,9 @@ def cargo_finished_line(proc):
     the line that names the profile cargo actually produced.
     """
     lines = (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines()
+    plain = (re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in reversed(lines))
     return next(
-        (line.strip() for line in reversed(lines) if line.strip().startswith("Finished")),
+        (line for line in plain if line.startswith("Finished")),
         "cargo build done",
     )
 
