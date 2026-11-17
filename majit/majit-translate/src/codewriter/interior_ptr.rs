@@ -197,8 +197,33 @@ fn is_interior_wrapper_field(field: &FieldDescriptor) -> bool {
     field.owner_root.as_deref() == Some("Interior") && interior_ptr_field(&field.name)
 }
 
+/// `rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`
+/// `hop.inputargs(r_ptr, lltype.Signed)`: an Unsigned index becomes
+/// `cast_uint_to_int` (`rint.py` `IntegerRepr.convert_from_to`).
+fn signed_interior_index(
+    graph: &mut FunctionGraph,
+    index: Variable,
+) -> (Option<SpaceOperation>, Variable) {
+    if !matches!(index.concretetype(), Some(LowLevelType::Unsigned)) {
+        return (None, index);
+    }
+    let signed = graph.alloc_value_var_with_type(ConcreteType::Signed);
+    (
+        Some(SpaceOperation {
+            result: Some(signed.clone()),
+            kind: OpKind::UnaryOp {
+                op: "cast_uint_to_int".to_string(),
+                operand: index,
+                result_ty: ValueType::Int,
+            },
+        }),
+        signed,
+    )
+}
+
 /// `rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`.
 fn interior_getitem_malloc_ops(
+    graph: &mut FunctionGraph,
     result: Variable,
     array: Variable,
     index: Variable,
@@ -210,33 +235,37 @@ fn interior_getitem_malloc_ops(
     result.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Struct(interior_struct),
     }))));
-    vec![
-        SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::New {
-                owner: "Interior".into(),
-                owner_id: None,
-            },
+    let (cast, index) = signed_interior_index(graph, index);
+    let mut ops = Vec::with_capacity(3 + usize::from(cast.is_some()));
+    if let Some(cast) = cast {
+        ops.push(cast);
+    }
+    ops.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::New {
+            owner: "Interior".into(),
+            owner_id: None,
         },
-        SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: result.clone(),
-                field: FieldDescriptor::new("ptr", Some("Interior".into())),
-                value: LinkArg::Value(array),
-                ty: ValueType::Ref(None),
-            },
+    });
+    ops.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: result.clone(),
+            field: FieldDescriptor::new("ptr", Some("Interior".into())),
+            value: LinkArg::Value(array),
+            ty: ValueType::Ref(None),
         },
-        SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: result,
-                field: FieldDescriptor::new("index", Some("Interior".into())),
-                value: LinkArg::Value(index),
-                ty: ValueType::Int,
-            },
+    });
+    ops.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: result,
+            field: FieldDescriptor::new("index", Some("Interior".into())),
+            value: LinkArg::Value(index),
+            ty: ValueType::Int,
         },
-    ]
+    });
+    ops
 }
 
 fn array_read_interior_annotation(
@@ -292,6 +321,7 @@ fn rewrite_interior_getitem_producers(graph: &mut FunctionGraph, value_to_var: &
                         && let Some(item_ty) = interior_getitem_item_type(ip)
                     {
                         new_ops.extend(interior_getitem_malloc_ops(
+                            graph,
                             result.clone(),
                             base.clone(),
                             index.clone(),
@@ -522,6 +552,7 @@ fn reject_container_valued_element_field(
     graph: &FunctionGraph,
     parent: Option<&LowLevelType>,
     field: &FieldDescriptor,
+    struct_is_repr_transparent: &dyn Fn(&str) -> bool,
 ) {
     let Some(parent) = parent else {
         return;
@@ -532,14 +563,19 @@ fn reject_container_valued_element_field(
     let Some(field_ty) = item.getattr_field_type(&field.name) else {
         return;
     };
-    // A by-value one-field newtype (`IdentityKey(PyObjectRef)` as
-    // `Entry.key`) is the word it wraps, the same one leaf
-    // `CallControl::single_leaf_path` resolves its descr through.
+    // A `#[repr(transparent)]` one-field struct stored by value in
+    // ARRAY.OF has that field's layout, so the interior access is a
+    // leaf load of the wrapped word. This is a Rust layout adaptation.
+    // `heaptracker.py all_interiorfielddescrs` raises
+    // `UnsupportedFieldExc("unexpected array(struct(struct))")` for
+    // every other nested struct, including a one-field wrapper that is
+    // not `repr(transparent)`.
     if let LowLevelType::Struct(inner) = &field_ty
         && let [only] = inner._names.as_slice()
         && inner
             .getattr_field_type(only)
             .is_some_and(|leaf| !matches!(leaf, LowLevelType::Struct(_) | LowLevelType::Array(_)))
+        && struct_is_repr_transparent(&inner._name)
     {
         return;
     }
@@ -560,6 +596,7 @@ fn rewrite_one_field_read(
     field: &FieldDescriptor,
     ty: &ValueType,
     interiors: &HashSet<Variable>,
+    struct_is_repr_transparent: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<SpaceOperation>> {
     if is_interior_wrapper_field(field)
         || (!interiors.contains(base) && !concretetype_is_interior_struct(base))
@@ -567,7 +604,12 @@ fn rewrite_one_field_read(
         return None;
     }
     let parent = interior_struct_parent(base);
-    reject_container_valued_element_field(graph, parent.as_ref(), field);
+    reject_container_valued_element_field(
+        graph,
+        parent.as_ref(),
+        field,
+        struct_is_repr_transparent,
+    );
     let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
     let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
     Some(vec![
@@ -612,6 +654,7 @@ fn rewrite_one_field_write(
     value: &LinkArg,
     ty: &ValueType,
     interiors: &HashSet<Variable>,
+    struct_is_repr_transparent: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<SpaceOperation>> {
     if is_interior_wrapper_field(field)
         || (!interiors.contains(base) && !concretetype_is_interior_struct(base))
@@ -619,7 +662,12 @@ fn rewrite_one_field_write(
         return None;
     }
     let parent = interior_struct_parent(base);
-    reject_container_valued_element_field(graph, parent.as_ref(), field);
+    reject_container_valued_element_field(
+        graph,
+        parent.as_ref(),
+        field,
+        struct_is_repr_transparent,
+    );
     let v_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
     let v_index = graph.alloc_value_var_with_type(ConcreteType::Signed);
     Some(vec![
@@ -660,7 +708,11 @@ fn rewrite_one_field_write(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn rewrite_block_stores(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped) {
+fn rewrite_block_stores(
+    graph: &mut FunctionGraph,
+    value_to_var: &LegacyToTyped,
+    struct_is_repr_transparent: &dyn Fn(&str) -> bool,
+) {
     let interiors = interior_malloc_results(graph);
     let block_ids: Vec<_> = graph.iter_blocks().map(|b| b.id).collect();
     for id in block_ids {
@@ -695,6 +747,7 @@ fn rewrite_block_stores(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped)
                         field,
                         ty,
                         &interiors,
+                        struct_is_repr_transparent,
                     ) {
                         new_ops.extend(rewritten);
                     } else {
@@ -707,9 +760,15 @@ fn rewrite_block_stores(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped)
                     value,
                     ty,
                 } => {
-                    if let Some(rewritten) =
-                        rewrite_one_field_write(graph, base, field, value, ty, &interiors)
-                    {
+                    if let Some(rewritten) = rewrite_one_field_write(
+                        graph,
+                        base,
+                        field,
+                        value,
+                        ty,
+                        &interiors,
+                        struct_is_repr_transparent,
+                    ) {
                         new_ops.extend(rewritten);
                     } else {
                         new_ops.push(op);
@@ -1099,9 +1158,13 @@ fn cleanup_virtual_interior_mallocs(graph: &mut FunctionGraph) {
 /// rewrite ARRAY.OF field reads of an Interior object to
 /// `getinteriorfield` (`InteriorPtrRepr.rtype_getattr`), then
 /// identity-rename `InteriorPtrExpose` of an Interior object.
-pub(crate) fn rewrite_store_through_ptr(graph: &mut FunctionGraph, value_to_var: &LegacyToTyped) {
+pub(crate) fn rewrite_store_through_ptr(
+    graph: &mut FunctionGraph,
+    value_to_var: &LegacyToTyped,
+    struct_is_repr_transparent: &dyn Fn(&str) -> bool,
+) {
     rewrite_interior_getitem_producers(graph, value_to_var);
-    rewrite_block_stores(graph, value_to_var);
+    rewrite_block_stores(graph, value_to_var, struct_is_repr_transparent);
     identity_exposes_after_stores(graph);
     reject_leftover_interior_ops(graph);
     cleanup_virtual_interior_mallocs(graph);
@@ -1184,7 +1247,7 @@ mod tests {
         let (mut graph, ptr, _value) = store_through_graph(Some(annotation));
         let mut value_to_var = HashMap::new();
         value_to_var.insert(ptr.clone(), ptr.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
     }
 
     #[test]
@@ -1192,7 +1255,7 @@ mod tests {
         let (mut graph, ptr, _value) = store_through_graph(Some(leaf_interior_ptr_annotation()));
         let mut value_to_var = HashMap::new();
         value_to_var.insert(ptr.clone(), ptr.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
         let writes: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1271,7 +1334,7 @@ mod tests {
             load_through_graph(leaf_interior_ptr_annotation(), signed_word_descr());
         let mut value_to_var = HashMap::new();
         value_to_var.insert(ptr.clone(), ptr.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
         let reads: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1294,7 +1357,7 @@ mod tests {
             load_through_graph(integer_address_annotation_value(), signed_word_descr());
         let mut value_to_var = HashMap::new();
         value_to_var.insert(ptr.clone(), ptr.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
         let loads: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1366,7 +1429,7 @@ mod tests {
         *ptr.annotation.borrow_mut() = Some(Rc::new(integer_address_annotation_value()));
         let mut value_to_var = HashMap::new();
         value_to_var.insert(ptr.clone(), ptr.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
         let stores: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1542,7 +1605,7 @@ mod tests {
         let mut value_to_var = HashMap::new();
         value_to_var.insert(elem.clone(), elem.clone());
         value_to_var.insert(exposed.clone(), exposed.clone());
-        rewrite_store_through_ptr(&mut graph, &value_to_var);
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
 
         let ops: Vec<_> = graph
             .iter_block_ops()
@@ -1586,6 +1649,96 @@ mod tests {
                     | OpKind::New { .. }
             )),
             "no leftover store/expose/Interior malloc; ops={ops:?}"
+        );
+    }
+
+    /// `rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem`
+    /// `hop.inputargs(r_ptr, lltype.Signed)`: an Unsigned index is
+    /// `cast_uint_to_int` before the Interior `index` write.
+    #[test]
+    fn unsigned_array_read_index_casts_to_signed_before_interior_index_write() {
+        use crate::model::ArrayGcKind;
+
+        let mut graph = FunctionGraph::new("unsigned_interior_index");
+        let entry = graph.startblock;
+        let entries = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "entries".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        index.set_concretetype(Some(LowLevelType::Unsigned));
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        let elem = graph
+            .push_op_var(
+                entry,
+                OpKind::ArrayRead {
+                    base: entries.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: None,
+                    array: None,
+                    nolength: false,
+                    gckind: ArrayGcKind::Gc,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(elem.clone()));
+        *elem.annotation.borrow_mut() = Some(Rc::new(container_interior_ptr_annotation()));
+
+        let mut value_to_var = HashMap::new();
+        value_to_var.insert(elem.clone(), elem.clone());
+        rewrite_store_through_ptr(&mut graph, &value_to_var, &|_| false);
+
+        let ops: Vec<_> = graph.iter_block_ops().map(|(_, op)| op).collect();
+        let dump: Vec<_> = ops.iter().map(|op| format!("{:?}", op.kind)).collect();
+        let cast_pos = ops.iter().position(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_uint_to_int"
+            )
+        });
+        let write_pos = ops.iter().position(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "index" && field.owner_root.as_deref() == Some("Interior")
+            )
+        });
+        let (Some(cast_i), Some(write_i)) = (cast_pos, write_pos) else {
+            panic!("cast_uint_to_int before Interior.index write; ops={dump:?}");
+        };
+        assert!(
+            cast_i < write_i,
+            "cast_uint_to_int must precede the index write; ops={dump:?}"
+        );
+        let cast_result = ops[cast_i].result.as_ref().expect("cast result");
+        let OpKind::FieldWrite { value, .. } = &ops[write_i].kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            value.as_variable(),
+            Some(cast_result),
+            "Interior.index stores the signed cast; ops={dump:?}"
         );
     }
 
@@ -1653,7 +1806,7 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(key));
-        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
         let reads: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1734,7 +1887,7 @@ mod tests {
             false,
         );
         graph.set_return(entry, None);
-        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
         let writes: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1824,7 +1977,100 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(inner_read));
-        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
+    }
+
+    fn one_field_key_struct() -> Struct {
+        Struct::new("Key", vec![("inner".into(), GCREF.clone())])
+    }
+
+    fn rewrite_one_field_key_read(
+        struct_is_repr_transparent: &dyn Fn(&str) -> bool,
+    ) -> FunctionGraph {
+        use crate::model::FieldDescriptor;
+
+        let mut graph = FunctionGraph::new("one_field_key");
+        let entry = graph.startblock;
+        let input = |graph: &mut FunctionGraph, name: &str, ty: ValueType| {
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let entries = input(&mut graph, "entries", ValueType::Ref(None));
+        let index = input(&mut graph, "i", ValueType::Int);
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        let interior = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "Interior".into(),
+                    owner_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        let parent = gcarray_of_entry(vec![(
+            "key".into(),
+            LowLevelType::Struct(Box::new(one_field_key_struct())),
+        )]);
+        let item_ty = match &parent {
+            LowLevelType::Array(arr) => arr.OF.clone(),
+            _ => panic!("container parent"),
+        };
+        let ip = SomeInteriorPtr::new(InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(item_ty.clone()),
+            offsets: vec![InteriorOffset::Index(0)],
+        });
+        let parent_ptr =
+            crate::translator::rtyper::rmodel::ptr_from_container_lowleveltype(&ip.ll_ptrtype);
+        let interior_struct = parent_ptr._interior_ptr_type_with_index(&item_ty);
+        interior.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(interior_struct),
+        }))));
+        let key = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: interior,
+                    field: FieldDescriptor::new("key", Some("Entry".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(key));
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), struct_is_repr_transparent);
+        graph
+    }
+
+    #[test]
+    fn transparent_one_field_nested_key_is_getinteriorfield() {
+        let graph = rewrite_one_field_key_read(&|_| true);
+        let reads: Vec<_> = graph
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldRead { field, .. } => Some(field.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec!["key".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected array(struct(struct))")]
+    fn nontransparent_one_field_nested_key_is_rejected() {
+        rewrite_one_field_key_read(&|_| false);
     }
 
     #[test]
@@ -1855,16 +2101,15 @@ mod tests {
         };
         let item_ty = super::interior_getitem_item_type(&ip).expect("container item");
         let interior = graph.alloc_value_var();
-        graph
-            .block_mut(entry)
-            .operations
-            .extend(super::interior_getitem_malloc_ops(
-                interior.clone(),
-                entries.clone(),
-                index.clone(),
-                &item_ty,
-                &ip,
-            ));
+        let malloc_ops = super::interior_getitem_malloc_ops(
+            &mut graph,
+            interior.clone(),
+            entries.clone(),
+            index.clone(),
+            &item_ty,
+            &ip,
+        );
+        graph.block_mut(entry).operations.extend(malloc_ops);
         let read = graph
             .push_op_var(
                 entry,
@@ -1878,7 +2123,7 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(read));
-        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
         let reads: Vec<_> = graph
             .iter_block_ops()
             .filter_map(|(_, op)| match &op.kind {
@@ -1953,7 +2198,7 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(r0));
-        rewrite_store_through_ptr(&mut graph, &HashMap::new());
+        rewrite_store_through_ptr(&mut graph, &HashMap::new(), &|_| false);
         let ops: Vec<_> = graph
             .iter_block_ops()
             .map(|(_, op)| format!("{:?}", op.kind))

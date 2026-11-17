@@ -7822,15 +7822,26 @@ impl CallControl {
         Some((descr as majit_ir::descr::DescrRef, member))
     }
 
-    /// Offset of `field` in the registered layout of `owner`, when one is.
-    /// `field.<leaf>` when `field` of `owner` is a by-value struct with
-    /// exactly one non-`Void` leaf; `None` otherwise.
+    /// `field.<leaf>` when `field` of `owner` is a `#[repr(transparent)]`
+    /// one-field struct whose unique leaf is a non-`Void` scalar or pointer.
+    /// That wrapper's layout is its field's (`TypeDecl::is_repr_transparent`).
+    /// `None` when the nested struct has no layout, is not
+    /// `repr(transparent)`, or has any other shape. `heaptracker.py
+    /// all_interiorfielddescrs` raises `UnsupportedFieldExc` for every
+    /// `array(struct(struct))`; this dotted path is a Rust layout
+    /// adaptation for the transparent wrapper, not that walk.
     fn single_leaf_path(&self, owner: &str, field: &str) -> Option<String> {
         let row = self
             .struct_field_entries(owner)?
             .iter()
             .find(|row| row.name == field)?;
         if !self.is_known_struct(&row.ty) {
+            return None;
+        }
+        if !self
+            .struct_layout_for(&row.ty)
+            .is_some_and(|layout| layout.repr_transparent)
+        {
             return None;
         }
         let entries = self.struct_field_entries(&row.ty)?;
@@ -8076,11 +8087,13 @@ impl CallControl {
             return None;
         }
         let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
-        // A by-value one-field newtype (`IdentityKey(PyObjectRef)` as
-        // `Entry.key`) is the word it wraps
-        // (`tyref_is_identity_field_word`), so its interior field is that
-        // one leaf. `all_interiorfielddescrs` rejects every other
-        // `array(struct(struct))`.
+        // A `#[repr(transparent)]` one-field struct stored by value in
+        // ARRAY.OF has that field's layout, so its interior descr is the
+        // dotted leaf `single_leaf_path` names. This is a Rust layout
+        // adaptation. `heaptracker.py all_interiorfielddescrs` raises
+        // `UnsupportedFieldExc("unexpected array(struct(struct))")` for
+        // every nested struct, including a one-field wrapper that is not
+        // `repr(transparent)`.
         let single_leaf = self.single_leaf_path(&elem_name, field_name);
         let field_name: &str = single_leaf.as_deref().unwrap_or(field_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
@@ -8114,10 +8127,11 @@ impl CallControl {
             if fname == "typeptr" {
                 continue;
             }
-            // Only the one-field newtype leaf named by `single_leaf_path`
-            // resolves through a nested struct; any other nested struct
-            // field is skipped and yields no descr (`UnsupportedFieldExc`
-            // upstream).
+            // Only a `#[repr(transparent)]` one-field leaf named by
+            // `single_leaf_path` resolves through a nested struct; any
+            // other nested struct field is skipped
+            // (`heaptracker.py all_interiorfielddescrs`
+            // `UnsupportedFieldExc`).
             let nested_leaf = if self.is_known_struct(fty) {
                 let leaf = if single_leaf.is_some() {
                     field_name
@@ -21130,12 +21144,25 @@ mod tests {
 
     #[test]
     fn interiorfielddescr_collapses_only_one_field_newtype() {
+        let ident_sid = majit_ir::descr::StructId::from_canonical("IdentityKey");
+        let opaque_sid = majit_ir::descr::StructId::from_canonical("OpaqueKey");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("IdentityKey".to_string(), Some(ident_sid)),
+            ("OpaqueKey".to_string(), Some(opaque_sid)),
+        ]));
         let mut cc = CallControl::new();
         cc.set_known_struct_names(
-            ["EntryTwo", "EntryOne", "TwoRowKey", "IdentityKey"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            [
+                "EntryTwo",
+                "EntryOne",
+                "EntryOpaque",
+                "TwoRowKey",
+                "IdentityKey",
+                "OpaqueKey",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         );
         let mut registry = crate::front::StructFieldRegistry::default();
         registry.fields.insert(
@@ -21145,6 +21172,10 @@ mod tests {
         registry.fields.insert(
             "EntryOne".to_string(),
             vec![("key".to_string(), "IdentityKey".to_string())],
+        );
+        registry.fields.insert(
+            "EntryOpaque".to_string(),
+            vec![("key".to_string(), "OpaqueKey".to_string())],
         );
         registry.fields.insert(
             "TwoRowKey".to_string(),
@@ -21157,11 +21188,64 @@ mod tests {
             "IdentityKey".to_string(),
             vec![("inner".to_string(), "*mut PyObject".to_string())],
         );
+        registry.fields.insert(
+            "OpaqueKey".to_string(),
+            vec![("inner".to_string(), "*mut PyObject".to_string())],
+        );
         cc.set_struct_fields(registry);
+        let empty_known = HashSet::new();
+        let empty_sizes = HashMap::new();
+        let empty_aligns = HashMap::new();
+        let empty_ranks = HashMap::new();
+        let empty_raw = HashSet::new();
+        let mut ident_layout = StructLayout::from_type_strings(
+            &[("inner".into(), "*mut PyObject".into())],
+            &empty_known,
+            &empty_sizes,
+            &empty_aligns,
+            &empty_ranks,
+            &empty_raw,
+        );
+        ident_layout.repr_transparent = true;
+        cc.set_struct_layout(ident_sid, ident_layout);
+        cc.set_struct_layout(
+            opaque_sid,
+            StructLayout::from_type_strings(
+                &[("inner".into(), "*mut PyObject".into())],
+                &empty_known,
+                &empty_sizes,
+                &empty_aligns,
+                &empty_ranks,
+                &empty_raw,
+            ),
+        );
         assert_eq!(cc.single_leaf_path("EntryTwo", "key"), None);
         assert_eq!(
             cc.single_leaf_path("EntryOne", "key"),
             Some("key.inner".to_string())
+        );
+        assert_eq!(cc.single_leaf_path("EntryOpaque", "key"), None);
+        let opaque_arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                "EntryOpaque",
+                vec![(
+                    "key".into(),
+                    LowLevelType::Struct(Box::new(Struct::new(
+                        "OpaqueKey",
+                        vec![("inner".into(), LowLevelType::Address)],
+                    ))),
+                )],
+            ))))
+        };
+        assert!(
+            cc.interiorfielddescrof_keyed(
+                1,
+                &Some("GcArray<EntryOpaque>".into()),
+                &Some(opaque_arr),
+                "key"
+            )
+            .is_none()
         );
     }
 

@@ -47653,6 +47653,32 @@ fn get_slot_mut_option_tuple_store_through_ptr() {
         "helper must getitem the Point ARRAY (InteriorPtr); ops={helper_ops:?}"
     );
     assert!(
+        graph_has_intmask(&helper_graph),
+        "usize index is intmask before Interior getitem; ops={helper_ops:?}"
+    );
+    let intmask_result = helper_ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"] => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let array_read_index = helper_ops.iter().find_map(|op| match &op.kind {
+        OpKind::ArrayRead {
+            index,
+            array_type_id: Some(id),
+            ..
+        } if id.contains("Point") => Some(index.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        array_read_index.as_ref(),
+        intmask_result.as_ref(),
+        "ArrayRead index is the intmask result; ops={helper_ops:?}"
+    );
+    assert!(
         helper_ops
             .iter()
             .any(|op| matches!(&op.kind, OpKind::InteriorFieldRead { .. })),
@@ -47790,6 +47816,32 @@ fn get_slot_mut_direct_mut_ref_store_through_ptr() {
             OpKind::ArrayRead { array_type_id: Some(id), .. } if id.contains("Point")
         )),
         "helper must getitem the Point ARRAY (InteriorPtr); ops={helper_ops:?}"
+    );
+    assert!(
+        graph_has_intmask(&helper_graph),
+        "usize index is intmask before Interior getitem; ops={helper_ops:?}"
+    );
+    let intmask_result = helper_ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"] => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let array_read_index = helper_ops.iter().find_map(|op| match &op.kind {
+        OpKind::ArrayRead {
+            index,
+            array_type_id: Some(id),
+            ..
+        } if id.contains("Point") => Some(index.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        array_read_index.as_ref(),
+        intmask_result.as_ref(),
+        "ArrayRead index is the intmask result; ops={helper_ops:?}"
     );
     let expose = helper_ops
         .iter()

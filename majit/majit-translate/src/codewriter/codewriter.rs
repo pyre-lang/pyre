@@ -811,6 +811,11 @@ impl CodeWriter {
             crate::codewriter::interior_ptr::rewrite_store_through_ptr(
                 &mut graph_owned,
                 value_to_var,
+                &|name| {
+                    callcontrol
+                        .struct_layout_for(name)
+                        .is_some_and(|layout| layout.repr_transparent)
+                },
             );
         } else {
             crate::codewriter::interior_ptr::lower_through_ptr_without_annotation(&mut graph_owned);

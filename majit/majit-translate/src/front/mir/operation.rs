@@ -148,7 +148,23 @@ impl<'a> Lowering<'a> {
             let bb_id = self.emit_bb(mir_bb);
             let array = self.interior_alias_array(&alias);
             let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;
-            let index = self.realias_operand(Some(alias.index_local), alias.index_var.clone());
+            let mut index = self.realias_operand(Some(alias.index_local), alias.index_var.clone());
+            // `hop.inputargs(r_ptr, lltype.Signed)` (`rptr.py`
+            // `pairtype(PtrRepr, IntegerRepr).rtype_getitem`).
+            if self
+                .body
+                .locals
+                .locals
+                .get(alias.index_local)
+                .is_some_and(|loc| matches!(self.value_type_of(&loc.ty), ValueType::Unsigned))
+            {
+                let (kind, signed) = signedness_retype_op(&mut self.graph, index, true);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(signed.clone()),
+                    kind,
+                });
+                index = signed;
+            }
             let res = self.emit_interior_getitem(bb_id, base, index, &alias.array_type_id);
             self.interior_elem_locals.insert(dest_local);
             self.interior_field_alias.insert(dest_local, alias);
@@ -824,6 +840,13 @@ impl<'a> Lowering<'a> {
         let Some(alias) = self.interior_field_alias.get(&(local as usize)).cloned() else {
             return Ok(None);
         };
+        // `jtransform.py rewrite_op_getinteriorfield` drops a getinteriorfield
+        // whose result is Void, as the plain field read below does.
+        if tyref_is_void_zst(place_ty, self.llbc)
+            && !tyref_keeps_empty_class_instance(place_ty, self.llbc, self.tombstoned_leaves)
+        {
+            return Ok(Some(self.emit_unit(self.emit_bb(mir_bb))));
+        }
         let bb_id = self.emit_bb(mir_bb);
         let array = self.interior_alias_array(&alias);
         let base = self.interior_header_base(bb_id, &alias, array.as_ref())?;

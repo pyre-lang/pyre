@@ -4358,6 +4358,56 @@ mod tests {
     }
 
     #[test]
+    fn ptrrepr_rtype_getitem_container_unsigned_index_casts_to_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget, Struct};
+
+        let item = Struct::new("Item", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(item)))),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_unsigned = rtyper.getprimitiverepr(&LowLevelType::Unsigned).unwrap();
+        let r_result: Arc<dyn Repr> = Arc::new(TestRepr::new(
+            LowLevelType::Ptr(Box::new(ptr.clone())),
+            "InteriorPtrRepr",
+        ));
+        let hop = empty_hop(&rtyper, "getitem");
+        let v_array = Variable::new();
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        let v_index = Variable::new();
+        v_index.set_concretetype(Some(LowLevelType::Unsigned));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_array), Hlvalue::Variable(v_index)]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Integer(SomeInteger::new(false, true)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_unsigned)]);
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let result = r_ptr.rtype_getitem(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 4);
+        assert_eq!(ops.ops[0].opname, "cast_uint_to_int");
+        assert_eq!(ops.ops[1].opname, "malloc");
+        assert_eq!(ops.ops[2].opname, "setfield");
+        assert_eq!(ops.ops[3].opname, "setfield");
+        let Hlvalue::Variable(casted) = &ops.ops[0].result else {
+            panic!("cast_uint_to_int result is a Variable");
+        };
+        let Hlvalue::Variable(written) = &ops.ops[3].args[2] else {
+            panic!("Interior.index setfield writes a Variable");
+        };
+        assert_eq!(written, casted);
+    }
+
+    #[test]
     fn ptrrepr_rtype_eq_ne_emit_pointer_comparisons_like_rptr() {
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
 
