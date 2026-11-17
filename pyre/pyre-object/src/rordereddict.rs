@@ -407,6 +407,37 @@ impl<K, V, S: Default> Default for RDict<K, V, S> {
     }
 }
 
+/// `ll_newdict` plus `ll_no_initial_index` (`rordereddict.py`).
+///
+/// Field stores into an already-malloc'd `dicttable`. Empty `indexes` /
+/// `entries` are null, pyre's spelling of `_ll_empty_array` length 0.
+/// Hasher is a ZST for every storage family that uses this helper.
+///
+/// Writes each field of `*d`. A whole-struct `ptr::write` of `RDict` would
+/// pass the 48-byte table by value.
+///
+/// `hash_builder` is `BuildHasherDefault<H>`, Void (`heaptracker.py`
+/// `_names_without_voids`). `ll_newdict` has no hasher field; a
+/// `ptr::write` of `S::default()` keeps `Default::default` as a residual
+/// in the look_inside graph.
+///
+/// `specialize_argtype(0)` (`specialize.py` `specialize_argtype`) without
+/// `dont_look_inside`: Charon extracts with `monomorphize: false`, so a
+/// generic `#[inline(always)]` body stays one FunDecl and the walker
+/// residualizes it. The hint splits a look_inside graph per `*mut RDict`.
+#[majit_macros::specialize_argtype(0)]
+#[inline(always)]
+pub unsafe fn rdict_ll_newdict_in_place<K, V, S: Default>(d: *mut RDict<K, V, S>) {
+    unsafe {
+        (*d).indexes = std::ptr::null_mut();
+        (*d).entries = std::ptr::null_mut();
+        (*d).num_live_items = 0;
+        (*d).num_ever_used_items = 0;
+        (*d).resize_counter = 0;
+        (*d).generation = 0;
+    }
+}
+
 impl<K, V, S> RDict<K, V, S> {
     /// Sized for `capacity` entries without a reindex, which is what
     /// `_ll_dict_resize_to` would have picked once they were all in
@@ -479,7 +510,7 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     #[inline]
-    fn entry_ptr(&self) -> *mut Entry<K, V> {
+    pub(crate) fn entry_ptr(&self) -> *mut Entry<K, V> {
         entries_item_ptr(self.entries)
     }
 
@@ -488,7 +519,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// allocation. An old table that holds a young array is remembered so
     /// the next minor greys `d.entries` (`write_barrier`).
     #[inline]
-    fn barrier_entries(&self) {
+    pub(crate) fn barrier_entries(&self) {
         if !self.entries.is_null() {
             crate::gc_hook::try_gc_write_barrier(self.entries as crate::gc_hook::GCREF);
         }
@@ -730,6 +761,15 @@ impl<K, V, S> RDict<K, V, S> {
     /// Refresh a [`Self::pin_indexes`] slot after a reindex replaced the block.
     pub fn reload_indexes_root(&self, slot: usize) {
         crate::gc_roots::shadow_stack_set(slot, self.indexes as PyObjectRef);
+    }
+
+    /// Read a stack-local dict's `entries` / `indexes` back from the slots
+    /// that hold them across a collection point (`shadowstack.py`
+    /// `expand_pop_roots`). A stack `RDict` is not a GC object, so the
+    /// collector updates only the published slots.
+    pub fn restore_from_roots(&mut self, entries_slot: usize, indexes_slot: usize) {
+        self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
+        self.indexes = crate::gc_roots::shadow_stack_get(indexes_slot) as *mut TypedItemsBlock;
     }
 
     /// `alloc_typed_items_block` returns an old-gen block with no
@@ -974,9 +1014,20 @@ impl<K, V, S> RDict<K, V, S> {
         Some((&e.key, &mut e.value))
     }
 
+    /// `ll_get_value`: `d.entries[i].value`. Same shape as [`Self::entry_valid`].
+    #[inline]
+    pub fn slot_value(&self, slot: usize) -> V
+    where
+        V: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).value }
+    }
+
     /// Overwrite `entries[slot].value`. The caller already proved `slot`.
+    /// Same shape as [`Self::slot_value`]: `d.entries[i].value = value`.
     pub fn set_slot_value(&mut self, slot: usize, value: V) {
-        self.entry_at_mut(slot).value = value;
+        self.barrier_entries();
+        unsafe { (*self.entry_ptr().add(slot)).value = value }
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
@@ -2757,6 +2808,7 @@ mod tests {
         }
         let slot = d.index_of(&30).unwrap();
         assert_eq!(d.get_slot(slot).map(|(k, _)| *k), Some(30));
+        assert_eq!(d.slot_value(slot), 30);
         assert_eq!(d.remove_slot(slot), Some((30, 30)));
         assert_eq!(d.remove_slot(slot), None);
         assert_eq!(d.index_of(&30), None);

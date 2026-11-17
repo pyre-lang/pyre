@@ -2795,10 +2795,19 @@ pub unsafe fn fset_func_kwdefaults(
             function_set_kwdefaults(obj, pyre_object::PY_NULL);
             return Ok(());
         }
-        if !pyre_object::is_dict(value) {
+        // `isinstance_dict_w` walks `__bases__`. Pin both words and read
+        // them back after the call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
+        if !crate::baseobjspace::isinstance_dict_w(pyre_object::gc_roots::shadow_stack_get(
+            base + 1,
+        )) {
             return Err(crate::PyError::type_error("__kwdefaults__ must be a dict"));
         }
-        function_set_kwdefaults(obj, value);
+        function_set_kwdefaults(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
         Ok(())
     }
 }
@@ -4718,15 +4727,46 @@ pub fn funccall_valuestack(
     // `make_arguments` and `dropvalues` do not allocate, and every
     // `function_call_args` branch publishes the positional slice before its
     // first collecting call (`call_function_impl_result`,
-    // `fill_user_function_args`, `user_function_too_many_error`), so only
-    // `func` is kept in a slot.  HOPELESS builtins (`make_builtin_function`,
-    // arity 0x400) always land here because `nargs == 0x400` never matches
-    // `fastcall_N`.
+    // `fill_user_function_args`, `user_function_too_many_error`).  Keyword
+    // names and values live in native Vecs the root walker does not see;
+    // pin them with the positionals and `func` and copy them back before
+    // `function_call_args` (`Arguments::from_owned_vecs`).  HOPELESS
+    // builtins (`make_builtin_function`, arity 0x400) always land here
+    // because `nargs == 0x400` never matches `fastcall_N`.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
     let args = unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
+    let npos = args.arguments_w.len();
+    let names_is_some = args.keyword_names_w.is_some();
+    let nkw = crate::argument::arguments_keyword_count(&args);
+    let jit_few_keywords = args.jit_few_keywords;
+    let methodcall_flag = args.methodcall;
+    let args_base = _roots.pin_roots(&args.arguments_w);
+    let names_base = _roots.pin_roots(args.keyword_names_w.as_deref().unwrap_or(&[]));
+    let values_base = _roots.pin_roots(args.keywords_w.as_deref().unwrap_or(&[]));
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+    let mut arguments_w = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut arguments_w);
+    let mut keyword_names_w = vec![pyre_object::PY_NULL; nkw];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(names_base, &mut keyword_names_w);
+    let mut keywords_w = vec![pyre_object::PY_NULL; nkw];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(values_base, &mut keywords_w);
+    let args = crate::argument::Arguments::from_owned_vecs(
+        arguments_w,
+        if names_is_some {
+            Some(keyword_names_w)
+        } else {
+            None
+        },
+        if names_is_some {
+            Some(keywords_w)
+        } else {
+            None
+        },
+        jit_few_keywords,
+        methodcall_flag,
+    );
     match crate::call::function_call_args(_roots.get(root_base), &args) {
         Ok(v) => v,
         Err(e) => {

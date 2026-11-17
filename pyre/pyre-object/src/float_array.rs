@@ -278,6 +278,8 @@ impl FloatArray {
 
     pub fn remove(&mut self, index: usize) -> f64 {
         assert!(index < self.len_relaxed());
+        // rlist.py `ll_pop_nonneg` / `ll_delitem_nonneg`. Float items have
+        // no GC null to store (`ll_null_item` is None).
         let value = self.as_slice()[index];
         unsafe {
             // rlist.py ll_delitem_nonneg: ll_arraymove(l, index + 1, index, newlength - index)

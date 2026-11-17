@@ -257,6 +257,7 @@ impl BytesArray {
 
     pub fn remove(&mut self, index: usize) -> *const BytesBlock {
         assert!(index < self.len_relaxed());
+        // rlist.py `ll_pop_nonneg`: `ll_getitem_fast` then `ll_delitem_nonneg`.
         let value = self.as_slice()[index];
         let newlength = self.len_relaxed() - 1;
         unsafe {
