@@ -1221,6 +1221,12 @@ pub struct MapAttrCache {
     names: Vec<Option<Wtf8Buf>>,
     indexes: Vec<u16>,
     cached_attrs: Vec<MapRef>,
+    /// Bucket indexes whose `attrs` or `cached_attrs` slot was given a young
+    /// object (`incminimark.py old_objects_pointing_to_young`). Only a minor
+    /// collection drains it (`collect_oldrefs_to_nursery`): a whole-cache
+    /// walk can come from major marking, which does not forward nursery
+    /// objects.
+    young: Vec<usize>,
 }
 
 // Cache slots are GC [`MapRef`]s; the mutex serializes probes. The extra-root
@@ -1235,6 +1241,7 @@ impl MapAttrCache {
             names: vec![None; size],
             indexes: vec![INVALID; size],
             cached_attrs: vec![std::ptr::null(); size],
+            young: Vec::new(),
         }
     }
 
@@ -1252,6 +1259,7 @@ impl MapAttrCache {
         for slot in self.cached_attrs.iter_mut() {
             *slot = std::ptr::null();
         }
+        self.young.clear();
     }
 }
 
@@ -1349,16 +1357,47 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
         }
         cache.indexes[attr_hash] = attrkind;
         cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
+        // incminimark.py remember_young_pointer: a young map stored into this old
+        // cache is the only edge a minor walk must visit.
+        if majit_gc::gc_is_nursery_object(cache.attrs[attr_hash] as usize)
+            || majit_gc::gc_is_nursery_object(cache.cached_attrs[attr_hash] as usize)
+        {
+            cache.young.push(attr_hash);
+        }
     }
     attr
 }
 
 /// Extra-root walk of [`MAP_ATTR_CACHE`] slots (`mapdict.py` `MapAttrCache`).
+/// A minor collection walks only the remembered buckets.
 ///
 /// # Safety
 /// Called from a GC extra-root walker.
 pub unsafe fn walk_map_attr_cache(f: &mut dyn FnMut(*mut PyObjectRef)) {
     let mut cache = MAP_ATTR_CACHE.lock();
+    if majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        let MapAttrCache {
+            attrs,
+            cached_attrs,
+            young,
+            ..
+        } = &mut *cache;
+        // incminimark.py collect_oldrefs_to_nursery: old values do not move
+        // in a minor collection.
+        for i in young.drain(..) {
+            if !attrs[i].is_null() && majit_gc::gc_is_nursery_object(attrs[i] as usize) {
+                f(&mut attrs[i] as *mut MapRef as *mut PyObjectRef);
+            }
+            if !cached_attrs[i].is_null()
+                && majit_gc::gc_is_nursery_object(cached_attrs[i] as usize)
+            {
+                f(&mut cached_attrs[i] as *mut MapRef as *mut PyObjectRef);
+            }
+        }
+        return;
+    }
     for slot in cache.attrs.iter_mut() {
         f(slot as *mut MapRef as *mut PyObjectRef);
     }

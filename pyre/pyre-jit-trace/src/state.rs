@@ -963,6 +963,7 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
 /// PyCode wrappers are ordinary movable GC objects. The visitor therefore
 /// forwards each nursery-resident `LIVE_CODE_WRAPPERS` value in place on
 /// minor collections, from birth, not only after the jitcode is installed.
+/// A minor collection walks only the remembered young entries.
 /// Jitcode-retained wrappers are also marked on majors
 /// (`warmspot.py self.metainterp_sd.jitcodes`). Interpreted-only map
 /// entries are not a major mark set: that kept `w_globals` alive across
@@ -993,12 +994,23 @@ fn walk_jitcode_code_roots_in(
     // forwards it (`framework.py root_walker.walk_roots`; `malloc_fixedsize`).
     // Old-gen entries that no jitcode retains are left to the object graph
     // so a major can reclaim them (`pycode_destructor` unmaps).
+    // `walk_all_live_code_wrappers` visits only the remembered young entries
+    // in a minor collection.
     pyre_interpreter::pycode::walk_all_live_code_wrappers(&mut |wrapper| {
         if !majit_gc::gc_is_nursery_object(*wrapper as usize) {
             return;
         }
         visit_one(wrapper);
     });
+    if majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        // `incminimark.py _minor_collection` consumes
+        // `old_objects_pointing_to_young`: a JitCode-retained wrapper is one
+        // of the table's values, so the remembered entries above cover it,
+        // and old values do not move in a minor collection.
+        return;
+    }
     for jc in sd.jitcodes.iter() {
         pyre_interpreter::pycode::walk_live_code_wrapper(
             jc.payload.code_ptr as *const (),
