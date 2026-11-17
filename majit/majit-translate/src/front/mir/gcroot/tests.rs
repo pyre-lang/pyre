@@ -591,6 +591,7 @@ fn root_scope_drop_is_classified_and_live() {
                 "gc_roots".to_string(),
                 super::ROOT_SCOPE_CLOSE.to_string(),
             ],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },

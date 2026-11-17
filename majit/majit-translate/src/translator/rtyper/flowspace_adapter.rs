@@ -13875,6 +13875,7 @@ mod tests {
                         "lltype".into(),
                         "cast_int_to_ptr".into(),
                     ],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13911,6 +13912,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["vec".into(), "Vec".into(), "deref".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
