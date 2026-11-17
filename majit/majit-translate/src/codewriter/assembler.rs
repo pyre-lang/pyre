@@ -282,6 +282,91 @@ fn exception_instance_spec(
     Some((name, message))
 }
 
+/// Assembler.emit_const keys a GC constant by `value._obj.container`.
+/// InstanceRepr.get_reusable_prebuilt_instance mallocs one dummy instance
+/// and writes only the root `typeptr` (ClassesPBCRepr.redispatch_call's
+/// simple built-in exceptions arm). The vtable `name` slot is
+/// `alloc_array_name(class_shortname)` (ClassRepr.fill_vtable_root).
+fn prebuilt_ll_exception_instance(
+    ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue, normalizeptr};
+    use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
+
+    if !ptr.nonzero() {
+        return None;
+    }
+    let normalized = normalizeptr(ptr, true).ok()??;
+    let obj = normalized._obj0_value().ok()??;
+    let _ptr_obj::Struct(mut current) = obj else {
+        return None;
+    };
+
+    let mut typeptr = None;
+    loop {
+        let fields: Vec<(String, LowLevelValue)> = current._fields.lock().clone();
+        let mut next_super = None;
+        for (name, value) in fields {
+            match name.as_str() {
+                "super" => {
+                    let LowLevelValue::Struct(inner) = value else {
+                        return None;
+                    };
+                    next_super = Some(*inner);
+                }
+                "typeptr" => {
+                    if typeptr.is_some() {
+                        return None;
+                    }
+                    typeptr = Some(value);
+                }
+                _ => {
+                    let field_ty = current.TYPE.getattr_field_type(&name)?;
+                    if !ll_instance_field_is_default(&value, &field_ty) {
+                        return None;
+                    }
+                }
+            }
+        }
+        match next_super {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+
+    let LowLevelValue::Ptr(vtable) = typeptr? else {
+        return None;
+    };
+    if !vtable.nonzero() {
+        return None;
+    }
+    let LowLevelValue::Ptr(name_ptr) = vtable.getattr("name").ok()? else {
+        return None;
+    };
+    let (bytes, _) = prebuilt_str_bytes_and_hash(&name_ptr)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn ll_instance_field_is_default(
+    value: &crate::translator::rtyper::lltypesystem::lltype::LowLevelValue,
+    field_ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelValue;
+    if let LowLevelValue::Ptr(p) = value {
+        return !p.nonzero();
+    }
+    value == &field_ty._defl()
+}
+
+fn ll_container_type_name(ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, normalizeptr};
+    let target = match normalizeptr(ptr, true) {
+        Ok(Some(normalized)) => normalized,
+        _ => ptr.clone(),
+    };
+    LowLevelType::from(target._TYPE.TO.clone()).short_name()
+}
+
 /// Intern key of a minted exception class, recognised by host identity.
 ///
 /// The class object is one of the hosts on
@@ -4646,10 +4731,22 @@ impl AssemblerEncode for Assembler {
             {
                 a
             }
+            ConstValue::LLPtr(ptr)
+                if ptr.nonzero()
+                    && ptr._TYPE._gckind()
+                        == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                    && let Some(class_name) = prebuilt_ll_exception_instance(ptr) =>
+            {
+                return self.emit_exc_instance_const_r(class_name, None, state);
+            }
             ConstValue::HostObject(obj) => host_object_ref_bits(obj, callcontrol),
             ConstValue::LLAddress(
                 crate::translator::rtyper::lltypesystem::lltype::_address::Null,
             ) => 0,
+            ConstValue::LLPtr(ptr) => panic!(
+                "raise/r constant pool does not support {value:?} (container TYPE {})",
+                ll_container_type_name(ptr)
+            ),
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
         self.emit_type_static_or_bits(bits, state)
@@ -16936,6 +17033,101 @@ mod tests {
             .expect("getinstancerepr")
             .get_reusable_prebuilt_instance()
             .expect("get_reusable_prebuilt_instance")
+    }
+
+    fn intern_exception_classdef(
+        ann: &RPythonAnnotator,
+        name: &str,
+    ) -> (crate::flowspace::model::HostObject, Rc<RefCell<ClassDef>>) {
+        let class = HOST_ENV
+            .lookup_exception_class(name)
+            .unwrap_or_else(|| panic!("{name}"));
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef(&class)
+            .unwrap_or_else(|err| panic!("getuniqueclassdef({name}): {err}"));
+        (class, classdef)
+    }
+
+    fn reusable_prebuilt_exception(
+        rtyper: &Rc<RPythonTyper>,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> lltype::_ptr {
+        use crate::translator::rtyper::rmodel::Repr;
+        let inst = getinstancerepr(rtyper, Some(classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("InstanceRepr.setup");
+        let rclass = getclassrepr(rtyper, Some(classdef)).expect("getclassrepr");
+        Repr::setup(rclass.as_ref()).expect("ClassRepr.setup");
+        inst.get_reusable_prebuilt_instance()
+            .expect("get_reusable_prebuilt_instance")
+    }
+
+    #[test]
+    fn emit_const_r_pools_reusable_prebuilt_exception_instance_by_class_name() {
+        let (ann, rtyper) = fresh_exception_typer();
+        let names = ["KeyError", "StopIteration", "ValueError"];
+        let interned: Vec<_> = names
+            .iter()
+            .map(|name| intern_exception_classdef(&ann, name))
+            .collect();
+        assign_inheritance_ids(&ann);
+        let pairs: Vec<(String, String)> = interned
+            .iter()
+            .map(|(class, classdef)| {
+                let ptr = reusable_prebuilt_exception(&rtyper, classdef);
+                let vtable_name = prebuilt_ll_exception_instance(&ptr)
+                    .expect("reusable prebuilt instance must expose vtable.name");
+                (class.simple_name().to_string(), vtable_name)
+            })
+            .collect();
+        for (simple_name, vtable_name) in &pairs {
+            assert_eq!(
+                vtable_name, simple_name,
+                "vtable.name vs HostObject.simple_name: {pairs:?}"
+            );
+        }
+
+        let keyerror = reusable_prebuilt_exception(&rtyper, &interned[0].1);
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let _ = asm.emit_const_r(&ConstValue::LLPtr(Box::new(keyerror)), &mut state, None);
+        assert_eq!(state.exc_instance_consts.len(), 1);
+        assert_eq!(state.exc_instance_consts[0].class_name, "KeyError");
+        assert_eq!(state.exc_instance_consts[0].message, None);
+    }
+
+    #[test]
+    fn emit_const_r_ll_and_host_exception_instances_share_one_descriptor() {
+        let (ann, rtyper) = fresh_exception_typer();
+        let (class, classdef) = intern_exception_classdef(&ann, "KeyError");
+        assign_inheritance_ids(&ann);
+        let ll_inst = reusable_prebuilt_exception(&rtyper, &classdef);
+        let host_inst = HostObject::new_instance(class, Vec::new());
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let host_reg = asm.emit_const_r(&ConstValue::HostObject(host_inst), &mut state, None);
+        let ll_reg = asm.emit_const_r(&ConstValue::LLPtr(Box::new(ll_inst)), &mut state, None);
+        assert_eq!(state.exc_instance_consts.len(), 1);
+        assert_eq!(state.exc_instance_consts[0].class_name, "KeyError");
+        assert_eq!(state.exc_instance_consts[0].message, None);
+        assert_eq!(host_reg, ll_reg);
+    }
+
+    #[test]
+    #[should_panic(expected = "GcStruct NotReusable")]
+    fn emit_const_r_prebuilt_instance_with_fields_still_panics() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, Struct,
+        };
+        let ty = LowLevelType::Struct(Box::new(Struct::gc(
+            "NotReusable",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let mut p = malloc(ty, None, MallocFlavor::Gc, true).expect("malloc");
+        p.setattr("x", LowLevelValue::Signed(1)).expect("setattr");
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let _ = asm.emit_const_r(&ConstValue::LLPtr(Box::new(p)), &mut state, None);
     }
 
     /// `ll_isinstance` reads `typeptr` on the OBJECT super (`rclass.py`).

@@ -4237,6 +4237,37 @@ impl Bookkeeper {
         )
     }
 
+    /// Mark an enum base's `__discriminant` as a mutable instance attribute.
+    ///
+    /// The tag lives in the Rust value, so `InstanceRepr._setup_repr`
+    /// (`rclass.py`) must place it on the instance STRUCT rather than the
+    /// vtable. `Attribute.modified` (`classdesc.py`) must precede that
+    /// setup; pyre pre-mints enum classdefs before any tag write is
+    /// annotated — the same attrs-before-repr ordering
+    /// [`Self::getuniqueclassdef_for_enum_variant`] already applies to
+    /// variant payload rows. A niche `Option<&T>` / nullable-pointer Option
+    /// stores no tag field (`rtype_getattr` `ptr_nonzero`); skip those.
+    fn mark_enum_base_discriminant_instance_attr(
+        classdef: &Rc<RefCell<ClassDef>>,
+        root: &str,
+    ) -> Result<(), AnnotatorError> {
+        let name = classdef.borrow().name.clone();
+        let is_nullable_pointer_option = |spelling: &str| {
+            strip_generic_leaf(spelling, "Option").is_some_and(|inner| {
+                let inner = inner.trim();
+                is_direct_pointer_word_spelling(inner) || is_fn_type_spelling(inner)
+            })
+        };
+        if is_nullable_pointer_option(root) || is_nullable_pointer_option(&name) {
+            return Ok(());
+        }
+        let mut classdef_mut = classdef.borrow_mut();
+        if let Some(attr) = classdef_mut.attrs.get_mut("__discriminant") {
+            attr.modified(Some(classdef))?;
+        }
+        Ok(())
+    }
+
     /// Resolve a struct type-root name to its canonical, bookkeeper-
     /// REGISTERED `ClassDef`, with instance attributes projected from
     /// the threaded `StructFieldRegistry`.
@@ -4438,7 +4469,16 @@ impl Bookkeeper {
                 .insert(root.to_string());
         }
         let host = self.intern_class_by_qualname(root);
-        self.getuniqueclassdef(&host)
+        let classdef = self.getuniqueclassdef(&host)?;
+        if self
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.is_enum_base(root))
+        {
+            Self::mark_enum_base_discriminant_instance_attr(&classdef, root)?;
+        }
+        Ok(classdef)
     }
 
     /// Class object for a generic core enum receiver whose annotation reads
@@ -4472,6 +4512,7 @@ impl Bookkeeper {
         let host = self.intern_class_by_qualname(&identity.spelling);
         let classdef = self.getuniqueclassdef(&host).ok()?;
         self.project_struct_rows(&identity.spelling).ok()?;
+        Self::mark_enum_base_discriminant_instance_attr(&classdef, &identity.spelling).ok()?;
         Some(classdef)
     }
 
@@ -4505,15 +4546,14 @@ impl Bookkeeper {
         // A generic core enum receiver uses the declaration class object
         // (`Bookkeeper.getuniqueclassdef`); its variant still subclasses
         // that object for `ClassRepr.getclsfield` knowntypedata narrowing.
-        if self.getuniqueclassdef_for_struct_root(enum_root).is_err()
-            && self
-                .getuniqueclassdef_for_core_enum_decl_receiver(enum_root)
-                .is_none()
-        {
-            return Err(AnnotatorError::new(format!(
-                "struct root {enum_root} is not a ClassDef intern"
-            )));
-        }
+        let base = self
+            .getuniqueclassdef_for_struct_root(enum_root)
+            .ok()
+            .or_else(|| self.getuniqueclassdef_for_core_enum_decl_receiver(enum_root))
+            .ok_or_else(|| {
+                AnnotatorError::new(format!("struct root {enum_root} is not a ClassDef intern"))
+            })?;
+        Self::mark_enum_base_discriminant_instance_attr(&base, enum_root)?;
         // Variant subclass — interned WITH the base so ClassDesc::new
         // wires basedef. The SAME interning primitive the variant
         // CONSTRUCTOR path uses ([`Self::intern_enum_variant_host`]), so
@@ -4695,7 +4735,34 @@ impl Bookkeeper {
             self.intern_class_by_qualname_with_bases(&canon_root, vec![template_host])
         };
         let variant_path = format!("{canon_root}::{variant_name}");
-        self.intern_class_by_qualname_with_bases(&variant_path, vec![enum_host])
+        let variant_host = self.intern_class_by_qualname_with_bases(&variant_path, vec![enum_host]);
+        // `InstanceRepr.new_instance` (rclass.py) initializes instance
+        // attributes from class-level defaults via
+        // `ClassDesc.read_attribute` (classdesc.py). A payload variant is
+        // interned with an empty class dict, so the tag is skipped unless
+        // it is a class-level default here — the same
+        // `class Some(Option): __discriminant = 1` entry
+        // `unit_variant_fold` stamps on unit variants. Stamp at first
+        // mint, before any `getuniqueclassdef` of the variant.
+        if variant_host.class_get("__discriminant").is_none() {
+            let tag = {
+                let guard = self.enum_variant_by_discriminant.borrow();
+                guard.as_ref().and_then(|map| {
+                    let leaf = template.rsplit("::").next().unwrap_or(template.as_str());
+                    map.get(template.as_str())
+                        .or_else(|| map.get(leaf))
+                        .and_then(|by_discr| {
+                            by_discr.iter().find_map(|(tag, name)| {
+                                (name.as_str() == variant_name).then_some(*tag)
+                            })
+                        })
+                })
+            };
+            if let Some(tag) = tag {
+                variant_host.class_set("__discriminant", ConstValue::Int(tag));
+            }
+        }
+        variant_host
     }
 
     /// Build the discriminant→variant narrowing `knowntypedata` for a
@@ -15136,6 +15203,35 @@ mod tests {
     }
 
     #[test]
+    fn enum_base_discriminant_is_an_instance_attribute_at_mint() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<f64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("option::Option<f64>")
+            .expect("Option<f64> enum base classdef");
+        let disc = classdef.borrow();
+        let attr = disc
+            .attrs
+            .get("__discriminant")
+            .expect("__discriminant projected at mint");
+        assert!(
+            !attr.readonly,
+            "enum base __discriminant is an instance attribute at mint, before any setattr"
+        );
+    }
+
+    #[test]
     fn generic_enum_variant_shares_a_base_with_the_unsuffixed_enum() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::front::StructFieldRegistry;
@@ -15326,6 +15422,86 @@ mod tests {
             cd.borrow().name.contains("<usize>"),
             "ClassDef name must keep the suffix, got {}",
             cd.borrow().name
+        );
+    }
+
+    #[test]
+    fn enum_variant_host_carries_its_discriminant_in_the_class_dict() {
+        use crate::annotator::classdesc::ClassDictEntry;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for base in [
+            "Option",
+            "option::Option",
+            "Option<i64>",
+            "option::Option<i64>",
+        ] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for some in [
+            "Option::Some",
+            "option::Option::Some",
+            "Option<i64>::Some",
+            "option::Option<i64>::Some",
+        ] {
+            reg.fields.insert(
+                some.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        for none in [
+            "Option::None",
+            "option::Option::None",
+            "Option<i64>::None",
+            "option::Option<i64>::None",
+        ] {
+            reg.fields
+                .insert(none.to_string(), Vec::<(String, String)>::new());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "None".to_string());
+        by_discr.insert(1, "Some".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("Option".to_string(), by_discr.clone());
+        map.insert("option::Option".to_string(), by_discr.clone());
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+        let tag_of = |variant: &str| -> i64 {
+            by_discr
+                .iter()
+                .find_map(|(tag, name)| (name.as_str() == variant).then_some(*tag))
+                .expect("registered table carries the variant")
+        };
+        let disc_of = |enum_root: &str, variant: &str| -> i64 {
+            let host = bk.intern_enum_variant_host(enum_root, variant);
+            let classdef = bk.getuniqueclassdef(&host).expect("variant ClassDef");
+            let classdesc = classdef.borrow().classdesc.clone();
+            match ClassDesc::read_attribute(&classdesc, "__discriminant") {
+                Some(ClassDictEntry::Constant(c)) => match c.value {
+                    ConstValue::Int(tag) => tag,
+                    other => panic!("__discriminant is not Int: {other:?}"),
+                },
+                other => panic!("read_attribute(__discriminant) is {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            disc_of("Option<i64>", "Some"),
+            tag_of("Some"),
+            "Option<i64>::Some class dict tag matches the registered table"
+        );
+        assert_eq!(
+            disc_of("Option<i64>", "None"),
+            tag_of("None"),
+            "Option<i64>::None class dict tag matches the registered table"
         );
     }
 

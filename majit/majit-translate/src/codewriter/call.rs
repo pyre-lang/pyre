@@ -5809,12 +5809,14 @@ impl CallControl {
     }
 
     /// The layout stored under `sid`, whose spelling is `name`. A
-    /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) has no layout
-    /// until something asks for it: `TupleRepr` lays out `TUPLE_TYPE` from
-    /// its items on demand (`rtuple.py`) and `symbolic.get_size` /
-    /// `get_field_token` size it when the backend first asks
-    /// (`symbolic.py`). Every item row is a scalar, a pointer or an inline
-    /// array, so the layout depends on the spelling alone.
+    /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) and an rtyper
+    /// tuple (`tuple{n}<s0,s1,…>`, `rtuple.py` `TUPLE_TYPE`) have no
+    /// layout until something asks for it: `TupleRepr` lays out
+    /// `TUPLE_TYPE` from its items on demand (`rtuple.py`) and
+    /// `symbolic.get_size` / `symbolic.get_field_token` size it when the
+    /// backend first asks (`symbolic.py`). Every item row is a scalar, a
+    /// pointer or an inline array, so the layout depends on the spelling
+    /// alone.
     fn layout_of(
         &self,
         sid: majit_ir::descr::StructId,
@@ -5824,18 +5826,24 @@ impl CallControl {
             return Some(layout.clone());
         }
         let mut_ref = name.starts_with("MutRef<");
-        if majit_ir::descr::positional_shape_id(name) != Some(sid) && !mut_ref {
+        let ll_tuple = ll_tuple_shape_rows(name);
+        if majit_ir::descr::positional_shape_id(name) != Some(sid) && !mut_ref && ll_tuple.is_none()
+        {
             return None;
         }
-        let rows = if mut_ref {
+        let pairs: Vec<(String, String)> = if mut_ref {
             crate::front::mir::mut_ref_shape_rows(name)?
+                .iter()
+                .map(|row| (row.name.clone(), row.ty.clone()))
+                .collect()
+        } else if let Some(rows) = ll_tuple {
+            rows
         } else {
             crate::front::mir::positional_shape_rows(name)?
+                .iter()
+                .map(|row| (row.name.clone(), row.ty.clone()))
+                .collect()
         };
-        let pairs: Vec<(String, String)> = rows
-            .iter()
-            .map(|row| (row.name.clone(), row.ty.clone()))
-            .collect();
         let layout = std::rc::Rc::new(StructLayout::from_type_strings(
             &pairs,
             &self.known_struct_names,
@@ -17427,6 +17435,50 @@ pub(crate) fn array_item_size_of_lltype(
     }
 }
 
+/// Owner spelling of an rtyper tuple GcStruct: `tuple{n}<s0,s1,…>`,
+/// each `s_i` the `try_array_item_spelling` of that item lltype.
+/// `None` when `s` is not a `tuple_struct_items` match, or any item has
+/// no spelling.
+pub(crate) fn ll_tuple_owner_spelling(
+    s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
+) -> Option<String> {
+    let items = crate::translator::rtyper::rtuple::tuple_struct_items(s)?;
+    let mut spellings = Vec::with_capacity(items.len());
+    for lt in &items {
+        spellings.push(try_array_item_spelling(lt)?);
+    }
+    Some(format!("tuple{}<{}>", items.len(), spellings.join(",")))
+}
+
+/// Parse `tuple{n}<s0,s1,…>` into `("item{i}", s_i)` rows. Split on
+/// top-level commas only, the same splitter [`crate::front::mir::positional_shape_metadata`]
+/// / [`crate::front::mir::positional_shape_rows`] use. Arity must equal
+/// `n`.
+fn ll_tuple_shape_rows(name: &str) -> Option<Vec<(String, String)>> {
+    let rest = name.strip_prefix("tuple")?;
+    let angle = rest.find('<')?;
+    let digits = &rest[..angle];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let inner = rest[angle..].strip_prefix('<')?.strip_suffix('>')?;
+    let items = crate::front::mir::split_top_level_type_args(inner);
+    if items.len() != n {
+        return None;
+    }
+    Some(
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(i, spelling)| (format!("item{i}"), spelling.to_string()))
+            .collect(),
+    )
+}
+
 /// Element spelling of `ARRAY.OF` after `lltype.build_number` identity.
 /// `descr.py get_type_flag` reads this spelling: a Ptr whose
 /// `TO._gckind == 'gc'` is FLAG_POINTER, independent of the containing
@@ -18890,6 +18942,42 @@ mod tests {
         assert_eq!(size_u32, 2 * word);
         assert_eq!(flag_u32, majit_ir::descr::ArrayFlag::Struct);
         assert_ne!(ty_u32, majit_ir::value::Type::Ref);
+    }
+
+    /// An rtyper `tuple2` of a GC pointer and a Signed is two words,
+    /// `item0` at 0 and `item1` at the word. `TupleRepr` / `symbolic.get_field_token`
+    /// size the STRUCT from the item lltypes; the spelling is that layout.
+    #[test]
+    fn ll_tuple_layout_is_computed_from_item_spellings() {
+        let cc = CallControl::new();
+        let name = "tuple2<GCREF,isize>";
+        let layout = cc
+            .struct_layout_for(name)
+            .expect("tuple2<GCREF,isize> layout is computed on demand");
+        let word = crate::layout::target_word_size();
+        assert_eq!(layout.fields.len(), 2);
+        assert_eq!(layout.fields[0].name, "item0");
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[0].size, word);
+        assert_eq!(layout.fields[1].name, "item1");
+        assert_eq!(layout.fields[1].offset, word);
+        assert_eq!(layout.fields[1].size, word);
+        assert_eq!(layout.size, 2 * word);
+    }
+
+    /// The cache key is the STRUCT (`descr.py` `get_field_descr`). Two
+    /// `tuple2` layouts with different items must not share a StructId.
+    #[test]
+    fn ll_tuples_of_same_arity_and_different_items_get_distinct_struct_ids() {
+        let a = majit_ir::descr::struct_id_for_name("tuple2<GCREF,isize>")
+            .expect("tuple2<GCREF,isize> is a spelling identity");
+        let b = majit_ir::descr::struct_id_for_name("tuple2<isize,GCREF>")
+            .expect("tuple2<isize,GCREF> is a spelling identity");
+        let again = majit_ir::descr::struct_id_for_name("tuple2<GCREF,isize>")
+            .expect("tuple2<GCREF,isize> is stable");
+        assert_ne!(a, b);
+        assert_eq!(a, again);
+        assert!(majit_ir::descr::struct_id_for_name("tuple2").is_none());
     }
 
     /// Nested-struct rows stay on the owner so `getattr(STRUCT, fieldname)`

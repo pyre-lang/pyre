@@ -6302,6 +6302,263 @@ mod tests {
     }
 
     #[test]
+    fn enum_discriminant_read_lowers_to_instance_getfield() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "option::Option<f64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        ann.bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root("option::Option<f64>")
+            .expect("Option<f64> classdef");
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let v_inst = Variable::new();
+        v_inst.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_inst_h = Hlvalue::Variable(v_inst);
+        let v_attr = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::byte_str("__discriminant"),
+            LowLevelType::Void,
+        ));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let spaceop = SpaceOperation::new(
+            "getattr",
+            vec![v_inst_h.clone(), v_attr.clone()],
+            Hlvalue::Variable(v_result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().extend([v_inst_h, v_attr]);
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("__discriminant")));
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+            SomeValue::String(s_attr),
+        ]);
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        hop.args_r.borrow_mut().push(Some(
+            crate::translator::rtyper::rmodel::impossible_repr() as Arc<dyn Repr>
+        ));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+        *hop.r_result.borrow_mut() = Some(signed_repr() as Arc<dyn Repr>);
+
+        let out = repr
+            .rtype_getattr(&hop)
+            .expect("getattr __discriminant")
+            .expect("getfield result");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1, "one getfield, ops={:?}", ops.ops);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        assert_eq!(ops.ops[0].args.len(), 2);
+        let Hlvalue::Constant(cname) = &ops.ops[0].args[1] else {
+            panic!("getfield field name must be a constant");
+        };
+        assert_eq!(
+            cname.value,
+            ConstValue::byte_str("inst___discriminant"),
+            "discriminant read is an instance field, not typeptr or a vtable cls_ field"
+        );
+    }
+
+    fn option_i64_variant_repr(
+        variant: &str,
+    ) -> (
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<RPythonTyper>,
+        Arc<InstanceRepr>,
+        i64,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::normalizecalls::assign_inheritance_ids;
+        use std::collections::HashMap;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let mut fields = StructFieldRegistry::default();
+        for base in [
+            "Option",
+            "option::Option",
+            "Option<i64>",
+            "option::Option<i64>",
+        ] {
+            fields.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for some in [
+            "Option::Some",
+            "option::Option::Some",
+            "Option<i64>::Some",
+            "option::Option<i64>::Some",
+        ] {
+            fields.fields.insert(
+                some.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        for none in [
+            "Option::None",
+            "option::Option::None",
+            "Option<i64>::None",
+            "option::Option<i64>::None",
+        ] {
+            fields
+                .fields
+                .insert(none.to_string(), Vec::<(String, String)>::new());
+        }
+        ann.bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "None".to_string());
+        by_discr.insert(1, "Some".to_string());
+        let tag = by_discr
+            .iter()
+            .find_map(|(t, name)| (name.as_str() == variant).then_some(*t))
+            .expect("registered table carries the variant");
+        let mut variants = HashMap::new();
+        variants.insert("Option".to_string(), by_discr.clone());
+        variants.insert("option::Option".to_string(), by_discr);
+        ann.bookkeeper
+            .set_enum_variant_by_discriminant(Rc::new(variants));
+
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_enum_variant("Option<i64>", variant)
+            .expect("variant classdef");
+        assign_inheritance_ids(&ann);
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup variant repr");
+        (ann, rtyper, repr, tag)
+    }
+
+    fn discriminant_setfields(ops: &[crate::flowspace::model::SpaceOperation]) -> Vec<&ConstValue> {
+        ops.iter()
+            .filter(|op| op.opname == "setfield")
+            .filter_map(|op| {
+                let Hlvalue::Constant(cname) = op.args.get(1)? else {
+                    return None;
+                };
+                if cname.value != ConstValue::byte_str("inst___discriminant") {
+                    return None;
+                }
+                let Hlvalue::Constant(cval) = op.args.get(2)? else {
+                    return None;
+                };
+                Some(&cval.value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn variant_new_instance_writes_the_discriminant_default() {
+        let (_ann, rtyper, repr, tag) = option_i64_variant_repr("Some");
+        assert!(
+            repr.fields().contains_key("__pos_0"),
+            "payload variant carries its payload field"
+        );
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        repr.new_instance(&mut llops, None, false)
+            .expect("new_instance");
+        assert_eq!(llops.ops[0].opname, "malloc");
+        let tags = discriminant_setfields(&llops.ops);
+        assert_eq!(
+            tags.as_slice(),
+            &[&ConstValue::Int(tag)],
+            "malloc then setfield(inst___discriminant, Constant({tag})), ops={:?}",
+            llops.ops
+        );
+        let wrote_payload = llops.ops.iter().any(|op| {
+            op.opname == "setfield"
+                && op.args.get(1).is_some_and(|arg| {
+                    matches!(
+                        arg,
+                        Hlvalue::Constant(c) if c.value == ConstValue::byte_str("inst___pos_0")
+                    )
+                })
+        });
+        assert!(
+            !wrote_payload,
+            "payload field has no class-level default, ops={:?}",
+            llops.ops
+        );
+    }
+
+    #[test]
+    fn payloadless_variant_new_instance_writes_only_the_tag() {
+        let (_ann, rtyper, repr, tag) = option_i64_variant_repr("None");
+        assert!(
+            !repr.fields().contains_key("__pos_0"),
+            "payloadless variant has no payload field"
+        );
+        let mut llops = LowLevelOpList::new(rtyper, None);
+        repr.new_instance(&mut llops, None, false)
+            .expect("new_instance");
+        assert_eq!(llops.ops[0].opname, "malloc");
+        let tags = discriminant_setfields(&llops.ops);
+        assert_eq!(
+            tags.as_slice(),
+            &[&ConstValue::Int(tag)],
+            "payloadless new_instance writes only the tag, ops={:?}",
+            llops.ops
+        );
+        let extra_inst_fields: Vec<_> = llops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "setfield")
+            .filter_map(|op| match op.args.get(1) {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::ByteStr(name)
+                        if name.starts_with(b"inst_")
+                            && name.as_slice() != b"inst___discriminant" =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            extra_inst_fields.is_empty(),
+            "payloadless new_instance wrote extra inst_ fields {extra_inst_fields:?}, ops={:?}",
+            llops.ops
+        );
+    }
+
+    #[test]
     fn instance_repr_pyerror_to_exc_object_emits_residual_direct_call() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInstance, SomeObject, SomeValue};

@@ -785,6 +785,13 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
     if s.starts_with("MutRef<") && s.ends_with('>') && s.len() > "MutRef<>".len() {
         return Some(StructId::from_canonical(s));
     }
+    // An rtyper tuple's identity is the lltype spelling `tuple{n}<s0,s1,…>`
+    // (`rtuple.py` `TUPLE_TYPE` / `TupleRepr`), not the bare `tuple{n}`
+    // leaf, which collides across item types. Upstream keys the descr
+    // cache on the STRUCT object (`descr.py` `get_field_descr`).
+    if is_ll_tuple_name(s) {
+        return Some(StructId::from_canonical(s));
+    }
     let generic_args = generic_args_span(s)?;
     let template = strip_generic_args(s);
     guard
@@ -801,7 +808,7 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
 /// [`struct_id_for_name`] instead.
 pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
     let s = strip_pointer_markers(raw);
-    let template = if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
+    let template = if is_shaped_tuple_name(s) || is_shaped_array_name(s) || is_ll_tuple_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
         strip_generic_args(s)
@@ -817,6 +824,10 @@ pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
             let name = template.as_ref();
             (name.starts_with("MutRef<") && name.ends_with('>') && name.len() > "MutRef<>".len())
                 .then(|| StructId::from_canonical(name))
+        })
+        .or_else(|| {
+            let name = template.as_ref();
+            is_ll_tuple_name(name).then(|| StructId::from_canonical(name))
         })
 }
 
@@ -981,6 +992,69 @@ pub fn class_root_leaf(root: &str) -> &str {
 /// template the way `Result<T>::Ok` does.
 pub fn is_shaped_tuple_name(name: &str) -> bool {
     name != "Tuple" && strip_instantiation_suffix(name) == "Tuple"
+}
+
+/// Is `name` an rtyper-tuple identity (`tuple{n}<s0,s1,…>`) whose
+/// top-level item count equals `n`?
+///
+/// `TUPLE_TYPE` names the GcStruct `tuple{n}` (`rtuple.py`); the cache
+/// key is the STRUCT, so two `tuple2` layouts with different items must
+/// not share an identity. The spelling `tuple{n}<s0,s1,…>` is that
+/// identity. The bare `tuple{n}` leaf is not.
+pub fn is_ll_tuple_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("tuple") else {
+        return false;
+    };
+    let Some(angle) = rest.find('<') else {
+        return false;
+    };
+    let digits = &rest[..angle];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(n) = digits.parse::<usize>() else {
+        return false;
+    };
+    if n == 0 {
+        return false;
+    }
+    let Some(inner) = rest[angle..]
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    top_level_type_arg_count(inner) == n
+}
+
+/// Count items of `A,B<C,D>,[E;2]` split on top-level commas only.
+fn top_level_type_arg_count(input: &str) -> usize {
+    if input.trim().is_empty() {
+        return 0;
+    }
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    let mut start = 0usize;
+    let mut prev = '\0';
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' if prev == '-' => {}
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if !input[start..index].trim().is_empty() {
+                    count += 1;
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    if !input[start..].trim().is_empty() {
+        count += 1;
+    }
+    count
 }
 
 /// Is `name` an array identity carrying both its item type and fixed length

@@ -49,11 +49,11 @@ const UNIT_VARIANT_DISCRIMINANT_ATTR: &str = "__discriminant";
 fn stamp_unit_variant_discriminant(class: &HostObject, tag: i64) {
     match class.class_get(UNIT_VARIANT_DISCRIMINANT_ATTR) {
         None => class.class_set(UNIT_VARIANT_DISCRIMINANT_ATTR, ConstValue::Int(tag)),
-        Some(ConstValue::Int(existing)) => {
-            debug_assert_eq!(
-                existing,
+        Some(ConstValue::Int(t)) => {
+            assert_eq!(
+                t,
                 tag,
-                "unit-variant {} carries two tags",
+                "unit-variant {} __discriminant is {t}, expected {tag}",
                 class.qualname()
             );
         }

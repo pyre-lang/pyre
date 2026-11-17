@@ -80,8 +80,10 @@ use crate::translator::backendopt::constfold::{MALLOC_ZERO_FILLED_TAG_ID, WE_ARE
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
 };
+use crate::translator::rtyper::lltypesystem::rbytearray::BYTEARRAYPTR;
+use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STR, STRPTR, UNICODE, prebuilt_str_bytes_and_hash,
+    STR, STRPTR, UNICODE, UNICODEPTR, prebuilt_str_bytes_and_hash,
 };
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
@@ -586,6 +588,48 @@ fn transduce_op(
                 result,
             );
         }
+        // `bhimpl_float_neg` / `bhimpl_float_abs` via `_add_default_ops`.
+        // Keep the full opname, matching `int_neg`: the assembler passes
+        // already-prefixed unary names through, and the shared Transformer
+        // emits the same `UnaryOp` for a float-kind `neg` / `abs`.
+        name @ ("float_neg" | "float_abs") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `Transformer.rewrite_op_float_is_true`: `float_ne` against
+        // `Constant(0.0, lltype.Float)`, then `rewrite_operation`.
+        "float_is_true" => {
+            let operand = materialize(out, block, &op.args[0]);
+            let zero = materialize(
+                out,
+                block,
+                &Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::Float(0.0_f64.to_bits()),
+                    LowLevelType::Float,
+                )),
+            );
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: "float_ne".to_string(),
+                    lhs: operand,
+                    rhs: zero,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
         // `Transformer`'s generated rename methods.  These old low-level
         // spellings all re-enter `rewrite_operation` under the corresponding
         // signed int-bank opname.  Store the bare rich-graph name because the
@@ -668,6 +712,31 @@ fn transduce_op(
                 block,
                 OpKind::BinOp {
                     op: bare,
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // Float arithmetic and compares that survive as blackhole ops
+        // (`bhimpl_float_*`, `_add_default_ops` `keep_operation_unchanged`).
+        // `rewrite_op_float_add` / `rewrite_op_float_mul` /
+        // `rewrite_op_float_{lt,le,gt,ge}` are `_rewrite_symmetric`;
+        // `float_sub` / `float_truediv` / `float_eq` / `float_ne` have no
+        // rewrite.  Keep the full llop name: the assembler preserves
+        // `float_*` `BinOp` labels, and the shared Transformer emits the
+        // same spelling after its float-kind rewrite.
+        name @ ("float_add" | "float_sub" | "float_mul" | "float_truediv" | "float_lt"
+        | "float_le" | "float_eq" | "float_ne" | "float_gt" | "float_ge") => {
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: name.to_string(),
                     lhs,
                     rhs,
                     result_ty,
@@ -765,23 +834,25 @@ fn transduce_op(
         // `ByteStr` constant (`void_field_const`); the owning struct identity
         // is the pointee-struct leaf of the base pointer's `concretetype`
         // (`Ptr(Struct("stringbuilder"))` → `"stringbuilder"`), which keys the
-        // layout registry the assembler resolves offsets through.  These are
-        // the mutable low-level fields of the builder container
-        // (`current_pos`/`current_end`/`total_size`), so the read is not
-        // `_pure`.
+        // layout registry the assembler resolves offsets through.  An rtyper
+        // tuple's identity is the lltype spelling (`tuple{n}<s0,…>`), not the
+        // bare `tuple{n}` leaf.  `rewrite_op_getfield` sets `_pure` from
+        // `STRUCT._immutable_field(name)`; a struct with the `immutable`
+        // hint (`TUPLE_TYPE`) is `getfield_gc_*_pure`.
         "getfield" => {
             let base = expect_var(&op.args[0]);
             let field_name = field_name_of(&op.args[1]);
             let field = field_descriptor_of(&base, &field_name, "getfield");
             let result = expect_var(&op.result);
             let ty = value_type_of(&result);
+            let pure = owner_struct_of(&base).is_some_and(|s| s._immutable_field(&field_name));
             out.push_op_with_result_var(
                 block,
                 OpKind::FieldRead {
                     base,
                     field,
                     ty,
-                    pure: false,
+                    pure,
                 },
                 result,
             );
@@ -928,6 +999,34 @@ fn transduce_op(
                 block,
                 OpKind::UnaryOp {
                     op: "cast_int_to_float".to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
+        // Float-bank unaries that survive as blackhole ops.  `cast_int_to_float`
+        // / `cast_float_to_int` / `cast_float_to_singlefloat` /
+        // `cast_singlefloat_to_float` have no `rewrite_op_*` and pass through
+        // `_add_default_ops`.  `rewrite_op_convert_float_bytes_to_longlong`
+        // / `rewrite_op_convert_longlong_bytes_to_float` are `_noop_rewrite`.
+        // `rewrite_op_cast_uint_to_float` / `rewrite_op_cast_float_to_uint`
+        // are `_do_builtin_call`; emit the same `UnaryOp` the shared
+        // Transformer residualizes, matching `int_floordiv`.
+        name @ ("cast_int_to_float"
+        | "cast_float_to_int"
+        | "cast_uint_to_float"
+        | "cast_float_to_uint"
+        | "cast_float_to_singlefloat"
+        | "cast_singlefloat_to_float"
+        | "convert_float_bytes_to_longlong"
+        | "convert_longlong_bytes_to_float") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
                     operand,
                     result_ty: value_type_of(&result),
                 },
@@ -1183,6 +1282,162 @@ fn transduce_op(
                     op: "same_as".to_string(),
                     operand,
                     result_ty,
+                },
+                result,
+            );
+        }
+        // `rewrite_op_cast_ptr_to_int` keeps a GC pointer as the llop
+        // and returns None (identity) otherwise. `cast_int_to_ptr` has
+        // no rewrite (`bhimpl_cast_int_to_ptr` / `_add_default_ops`).
+        // `rewrite_op_cast_ptr_to_adr` raises on GC and is identity on
+        // raw; emit the UnaryOp the shared Transformer already accepts.
+        name @ ("cast_ptr_to_int" | "cast_int_to_ptr" | "cast_ptr_to_adr") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let opname = if name == "cast_ptr_to_int" && !lltype_is_gc_ptr(&operand) {
+                "same_as"
+            } else {
+                name
+            };
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: opname.to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
+        // `jtransform.py Transformer.rewrite_op_getinteriorfield` /
+        // `rewrite_op_setinteriorfield` / `rewrite_op_getinteriorarraysize`.
+        "getinteriorfield" => emit_getinteriorfield(out, block, op),
+        "setinteriorfield" => emit_setinteriorfield(out, block, op),
+        "getinteriorarraysize" => emit_getinteriorarraysize(out, block, op),
+        // `jtransform.py Transformer.rewrite_op_raw_load` /
+        // `rewrite_op_raw_store`: `raw_{load,store}_<kind>` plus
+        // `arraydescrof(rffi.CArray(T))`. Kind `'r'` is refused.
+        name @ ("raw_load" | "raw_store") => emit_raw_load_or_store(out, block, op, name),
+        // `jtransform.py Transformer.rewrite_op_direct_ptradd`: CCHARP
+        // is one `int_add`; otherwise scale the shift by
+        // `llmemory.sizeof(TO.OF)` then `int_add`.
+        "direct_ptradd" => emit_direct_ptradd(out, block, op),
+        // `jtransform.py Transformer.rewrite_op_indirect_call`: emit
+        // the same `OpKind::IndirectCall` the shared Transformer
+        // residualizes / `handle_regular_indirect_call`s. Trailing
+        // Void graphs stay `None` here (`transduce_op` has no
+        // CallControl to map `ConstValue::Graphs` ids to CallPath).
+        "indirect_call" => {
+            assert!(
+                !op.args.is_empty(),
+                "jtransform_opname::lower_graph: indirect_call needs a funcptr"
+            );
+            let funcptr = materialize(out, block, &op.args[0]);
+            let args: Vec<FVar> = non_void_args(&op.args[1..])
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::IndirectCall {
+                    funcptr,
+                    args,
+                    graphs: None,
+                    family_key: None,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `jtransform.py Transformer.rewrite_op_jit_force_virtualizable`:
+        // emit the leftover Call the shared Transformer already
+        // dispatches (`is_jit_force_virtualizable_target`). Filing
+        // `vable_flags` / `get_vinfo` needs CallControl.
+        "jit_force_virtualizable" => {
+            let args: Vec<LinkArg> = op.args.iter().map(linkarg_from_hlvalue).collect();
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path(["jit_force_virtualizable"]),
+                    args,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
+        // `jtransform.py Transformer.rewrite_op_jit_force_quasi_immutable`:
+        // `-live-` + `jit_force_quasi_immutable(v_inst, fielddescr)`.
+        // Applied here because the Transformer Call arm needs
+        // `callcontrol.callee_llop`.
+        "jit_force_quasi_immutable" => {
+            assert_eq!(
+                op.args.len(),
+                2,
+                "jtransform_opname::lower_graph: jit_force_quasi_immutable needs v_inst and fieldname"
+            );
+            let field_name = field_name_of(&op.args[1]);
+            let mutate_field =
+                field_descriptor_of_hlvalue(&op.args[0], &field_name, "jit_force_quasi_immutable");
+            out.block_mut(block)
+                .operations
+                .push(crate::model::SpaceOperation {
+                    result: None,
+                    kind: OpKind::live(),
+                });
+            out.push_op_var(
+                block,
+                OpKind::JitForceQuasiImmutable {
+                    base: linkarg_from_hlvalue(&op.args[0]),
+                    mutate_field,
+                },
+                false,
+            );
+        }
+        // `jtransform.py Transformer.rewrite_op_free`: flavor `'raw'`,
+        // leftover flags `UnsupportedMallocFlags`, then `raw_free`.
+        "free" => {
+            assert!(
+                op.args.len() >= 2,
+                "jtransform_opname::lower_graph: free needs ptr and flags"
+            );
+            assert!(
+                crate::codewriter::call::effect_malloc_flavor_is_raw(&op.args[1]),
+                "jtransform_opname::lower_graph: free flavor is not raw"
+            );
+            let extra = free_leftover_flags(&op.args[1]);
+            if !extra.is_empty() {
+                panic!("UnsupportedMallocFlags({extra:?})");
+            }
+            let ptr = materialize(out, block, &op.args[0]);
+            out.push_op_var(block, OpKind::RawFree { ptr }, false);
+        }
+        // `jtransform.py Transformer.rewrite_op_gc_add_memory_pressure
+        // = _do_builtin_call`. Leftover Call so
+        // `rewrite_op_direct_call` residualizes it.
+        "gc_add_memory_pressure" => {
+            emit_leftover_named_call(out, block, op, "gc_add_memory_pressure");
+        }
+        // `jtransform.py Transformer.rewrite_op_threadlocalref_get`:
+        // residual `OS_THREADLOCALREF_GET`. Front / rtyper emit the
+        // 2-arg BinOp (offset, loop-invariant flag) the Transformer
+        // already residualizes.
+        "threadlocalref_get" => {
+            assert!(
+                op.args.len() >= 2,
+                "jtransform_opname::lower_graph: threadlocalref_get needs offset and flag"
+            );
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: "threadlocalref_get".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: value_type_of(&result),
                 },
                 result,
             );
@@ -1936,10 +2191,32 @@ fn owner_struct_of_lltype(ty: &LowLevelType) -> Option<Struct> {
 
 /// The owning struct leaf of a field access — the pointee-struct name of
 /// the base pointer's `concretetype` (`Ptr(Struct("stringbuilder"))` →
-/// `"stringbuilder"`).  `None` when the base is not a pointer-to-struct,
-/// in which case the layout layer falls back to its type-string heuristic.
+/// `"stringbuilder"`).  An rtyper tuple uses the lltype spelling
+/// (`tuple{n}<s0,…>`) rather than the bare `tuple{n}` leaf.  `None` when
+/// the base is not a pointer-to-struct, in which case the layout layer
+/// falls back to its type-string heuristic.
 fn owner_root_of(base: &FVar) -> Option<String> {
-    owner_struct_of(base).map(|s| s._name)
+    owner_struct_of(base).as_ref().map(struct_owner_spelling)
+}
+
+/// STRUCT identity used as a FieldRead/New owner. An rtyper tuple's
+/// identity is `ll_tuple_owner_spelling`; any other struct keeps `_name`.
+/// `tuple_struct_items` matching with no item spelling is a lowering gap.
+fn struct_owner_spelling(s: &Struct) -> String {
+    match crate::translator::rtyper::rtuple::tuple_struct_items(s) {
+        None => s._name.clone(),
+        Some(items) => {
+            if let Some(sp) = crate::codewriter::call::ll_tuple_owner_spelling(s) {
+                return sp;
+            }
+            for lt in &items {
+                if crate::codewriter::call::lltype_item_spelling(lt).is_none() {
+                    panic!("rtyper tuple item lltype {lt:?} has no spelling");
+                }
+            }
+            panic!("rtyper tuple item lltype has no spelling");
+        }
+    }
 }
 
 /// `jtransform.py is_typeptr_getset`: `op.args[0].concretetype.TO._hints.get('typeptr')`.
@@ -1969,8 +2246,13 @@ fn field_descriptor_of(
         .as_ref()
         .map(|s| field_name_for_struct(s, ll_field_name))
         .unwrap_or_else(|| ll_field_name.to_string());
-    crate::model::FieldDescriptor::new(field_name, owner_root_of(base))
+    let owner_root = owner_root_of(base);
+    let owner_id = owner_root
+        .as_deref()
+        .and_then(majit_ir::descr::struct_id_for_name);
+    crate::model::FieldDescriptor::new(field_name, owner_root)
         .with_owner_typeptr_hint(owner_typeptr_hint_of(base))
+        .with_owner_id(owner_id)
 }
 
 fn field_name_for_struct(owner: &Struct, ll_name: &str) -> String {
@@ -1982,6 +2264,480 @@ fn field_name_for_struct(owner: &Struct, ll_name: &str) -> String {
         }
     }
     ll_name.to_string()
+}
+
+fn field_descriptor_of_hlvalue(
+    inst: &Hlvalue,
+    ll_field_name: &str,
+    opname: &str,
+) -> crate::model::FieldDescriptor {
+    match inst {
+        Hlvalue::Variable(v) => field_descriptor_of(v, ll_field_name, opname),
+        Hlvalue::Constant(c) => {
+            let owner = c.concretetype.as_ref().and_then(owner_struct_of_lltype);
+            if matches!(c.concretetype, Some(LowLevelType::Ptr(_))) && owner.is_none() {
+                panic!(
+                    "jtransform_opname::lower_graph: {opname} on {ll_field_name} has no STRUCT owner \
+                     (cpu.fielddescrof(STRUCT, name))"
+                );
+            }
+            let field_name = owner
+                .as_ref()
+                .map(|s| field_name_for_struct(s, ll_field_name))
+                .unwrap_or_else(|| ll_field_name.to_string());
+            let owner_root = owner.as_ref().map(struct_owner_spelling);
+            let owner_id = owner_root
+                .as_deref()
+                .and_then(majit_ir::descr::struct_id_for_name);
+            crate::model::FieldDescriptor::new(field_name, owner_root).with_owner_id(owner_id)
+        }
+    }
+}
+
+fn hlvalue_is_void(hlv: &Hlvalue) -> bool {
+    match hlv {
+        Hlvalue::Variable(v) => matches!(v.concretetype(), Some(LowLevelType::Void)),
+        Hlvalue::Constant(c) => matches!(c.concretetype, Some(LowLevelType::Void)),
+    }
+}
+
+fn var_is_lltype(var: &FVar, ty: &LowLevelType) -> bool {
+    var.concretetype().as_ref() == Some(ty)
+}
+
+fn interior_field_descriptor(array: &Array, field_name: &str) -> crate::model::FieldDescriptor {
+    let LowLevelType::Struct(s) = &array.OF else {
+        panic!(
+            "jtransform_opname::lower_graph: getinteriorfield ARRAY.OF is not a Struct: {:?}",
+            array.OF
+        );
+    };
+    let name = field_name_for_struct(s, field_name);
+    let owner_root = struct_owner_spelling(s);
+    let owner_id = majit_ir::descr::struct_id_for_name(&owner_root);
+    crate::model::FieldDescriptor::new(name, Some(owner_root)).with_owner_id(owner_id)
+}
+
+fn chars_array_of_string_like(ty: &LowLevelType) -> Option<Array> {
+    let s = owner_struct_of_lltype(ty)?;
+    match s.getattr_field_type("chars") {
+        Some(LowLevelType::Array(arr)) => Some(*arr),
+        _ => None,
+    }
+}
+
+fn raw_item_descr(ty: &LowLevelType, opname: &str) -> (ValueType, usize, bool) {
+    let item_ty = value_type_from_lltype(ty);
+    assert!(
+        !matches!(item_ty, ValueType::Ref(_)),
+        "{opname}_r not supported"
+    );
+    let (itemsize, unsigned) = crate::translator::rtyper::lltypesystem::rffi::size_and_sign(ty)
+        .unwrap_or_else(|err| panic!("jtransform_opname::lower_graph: {opname} {err}"));
+    let is_item_signed = !matches!(item_ty, ValueType::Float) && !unsigned;
+    (item_ty, itemsize, is_item_signed)
+}
+
+fn ptradd_item_bytes(ty: &LowLevelType) -> Option<i64> {
+    let of = match ty {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) => arr.OF.clone(),
+            PtrTarget::ForwardReference(fwd) => match fwd.resolved()? {
+                LowLevelType::Array(arr) => arr.OF.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match crate::translator::rtyper::lltypesystem::rffi::sizeof(&of) {
+        Ok(ConstValue::Int(n)) if n >= 0 => Some(n),
+        _ => None,
+    }
+}
+
+fn free_leftover_flags(flags: &Hlvalue) -> Vec<String> {
+    let Hlvalue::Constant(c) = flags else {
+        return Vec::new();
+    };
+    let ConstValue::Dict(map) = &c.value else {
+        return Vec::new();
+    };
+    let mut leftover = Vec::new();
+    for (key, _) in map.iter() {
+        let name = match key {
+            ConstValue::ByteStr(b) => String::from_utf8_lossy(b).into_owned(),
+            ConstValue::UniStr(s) => s.clone(),
+            other => {
+                leftover.push(format!("{other:?}"));
+                continue;
+            }
+        };
+        match name.as_str() {
+            "flavor" | "track_allocation" => {}
+            other => leftover.push(other.to_string()),
+        }
+    }
+    leftover
+}
+
+fn emit_leftover_named_call(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+    name: &'static str,
+) {
+    let args: Vec<FVar> = non_void_args(&op.args)
+        .map(|a| materialize(out, block, a))
+        .collect();
+    let result = expect_var(&op.result);
+    let result_ty = value_type_of(&result);
+    out.push_op_with_result_var(
+        block,
+        OpKind::Call {
+            target: CallTarget::function_path([name]),
+            args: crate::model::call_args(args),
+            result_ty,
+        },
+        result,
+    );
+}
+
+/// `jtransform.py Transformer.rewrite_op_getinteriorfield`.
+fn emit_getinteriorfield(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+) {
+    assert_eq!(
+        op.args.len(),
+        3,
+        "jtransform_opname::lower_graph: getinteriorfield needs 3 args"
+    );
+    let base = expect_var(&op.args[0]);
+    if var_is_lltype(&base, &STRPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let result = expect_var(&op.result);
+        out.push_op_with_result_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "strgetitem".to_string(),
+                args: vec![base.into(), index.into()],
+            },
+            result,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &UNICODEPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let result = expect_var(&op.result);
+        out.push_op_with_result_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "unicodegetitem".to_string(),
+                args: vec![base.into(), index.into()],
+            },
+            result,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &BYTEARRAYPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let result = expect_var(&op.result);
+        let array = chars_array_of_string_like(&BYTEARRAYPTR).expect("BYTEARRAY chars Array");
+        out.push_op_with_result_var(
+            block,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty: value_type_of(&result),
+                array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
+                nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Gc,
+                pure: array._immutable_field(),
+            },
+            result,
+        );
+        return;
+    }
+    if hlvalue_is_void(&op.result) {
+        return;
+    }
+    let Some(array) = gc_array_of_operand(&op.args[0]) else {
+        panic!(
+            "jtransform_opname::lower_graph: getinteriorfield not supported on {:?}",
+            base.concretetype()
+        );
+    };
+    let index = materialize(out, block, &op.args[1]);
+    let field = interior_field_descriptor(&array, &field_name_of(&op.args[2]));
+    let result = expect_var(&op.result);
+    out.push_op_with_result_var(
+        block,
+        OpKind::InteriorFieldRead {
+            base,
+            index,
+            field,
+            item_ty: value_type_of(&result),
+            array_type_id: array_type_id_of(&array),
+            array: Some(array),
+        },
+        result,
+    );
+}
+
+/// `jtransform.py Transformer.rewrite_op_setinteriorfield`.
+fn emit_setinteriorfield(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+) {
+    assert_eq!(
+        op.args.len(),
+        4,
+        "jtransform_opname::lower_graph: setinteriorfield needs 4 args"
+    );
+    let base = expect_var(&op.args[0]);
+    if var_is_lltype(&base, &STRPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let value = materialize(out, block, &op.args[3]);
+        out.push_op_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "strsetitem".to_string(),
+                args: vec![base.into(), index.into(), value.into()],
+            },
+            false,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &UNICODEPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let value = materialize(out, block, &op.args[3]);
+        out.push_op_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "unicodesetitem".to_string(),
+                args: vec![base.into(), index.into(), value.into()],
+            },
+            false,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &BYTEARRAYPTR) {
+        let index = materialize(out, block, &op.args[2]);
+        let value = linkarg_from_hlvalue(&op.args[3]);
+        let array = chars_array_of_string_like(&BYTEARRAYPTR).expect("BYTEARRAY chars Array");
+        out.push_op_var(
+            block,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty: hlvalue_value_type(&op.args[3]),
+                array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
+                nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+            false,
+        );
+        return;
+    }
+    if hlvalue_is_void(&op.args[3]) {
+        return;
+    }
+    let Some(array) = gc_array_of_operand(&op.args[0]) else {
+        panic!(
+            "jtransform_opname::lower_graph: setinteriorfield not supported on {:?}",
+            base.concretetype()
+        );
+    };
+    let index = materialize(out, block, &op.args[1]);
+    let field = interior_field_descriptor(&array, &field_name_of(&op.args[2]));
+    let value = materialize(out, block, &op.args[3]);
+    out.push_op_var(
+        block,
+        OpKind::InteriorFieldWrite {
+            base,
+            index,
+            field,
+            value,
+            item_ty: hlvalue_value_type(&op.args[3]),
+            array_type_id: array_type_id_of(&array),
+            array: Some(array),
+        },
+        false,
+    );
+}
+
+/// `jtransform.py Transformer.rewrite_op_getinteriorarraysize`.
+fn emit_getinteriorarraysize(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+) {
+    assert_eq!(
+        op.args.len(),
+        2,
+        "jtransform_opname::lower_graph: getinteriorarraysize needs 2 args"
+    );
+    assert_eq!(
+        field_name_of(&op.args[1]),
+        "chars",
+        "jtransform_opname::lower_graph: getinteriorarraysize field is not chars"
+    );
+    let base = expect_var(&op.args[0]);
+    let result = expect_var(&op.result);
+    if var_is_lltype(&base, &STRPTR) {
+        out.push_op_with_result_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "strlen".to_string(),
+                args: vec![base.into()],
+            },
+            result,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &UNICODEPTR) {
+        out.push_op_with_result_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: "unicodelen".to_string(),
+                args: vec![base.into()],
+            },
+            result,
+        );
+        return;
+    }
+    if var_is_lltype(&base, &BYTEARRAYPTR) {
+        let array = chars_array_of_string_like(&BYTEARRAYPTR).expect("BYTEARRAY chars Array");
+        out.push_op_with_result_var(
+            block,
+            OpKind::ArrayLen {
+                base,
+                array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
+                nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+            result,
+        );
+        return;
+    }
+    panic!(
+        "jtransform_opname::lower_graph: getinteriorarraysize supported type {:?}",
+        base.concretetype()
+    );
+}
+
+/// `jtransform.py Transformer.rewrite_op_raw_load` / `rewrite_op_raw_store`.
+fn emit_raw_load_or_store(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+    name: &str,
+) {
+    let base = materialize(out, block, &op.args[0]);
+    let offset = materialize(out, block, &op.args[1]);
+    if name == "raw_load" {
+        let result = expect_var(&op.result);
+        let ty = result
+            .concretetype()
+            .expect("raw_load result has concretetype");
+        let (item_ty, itemsize, is_item_signed) = raw_item_descr(&ty, name);
+        out.push_op_with_result_var(
+            block,
+            OpKind::RawLoad {
+                base,
+                offset,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+            result,
+        );
+    } else {
+        let value = materialize(out, block, &op.args[2]);
+        let ty = value
+            .concretetype()
+            .expect("raw_store value has concretetype");
+        let (item_ty, itemsize, is_item_signed) = raw_item_descr(&ty, name);
+        out.push_op_var(
+            block,
+            OpKind::RawStore {
+                base,
+                offset,
+                value,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+            false,
+        );
+    }
+}
+
+/// `jtransform.py Transformer.rewrite_op_direct_ptradd`.
+fn emit_direct_ptradd(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+) {
+    assert!(
+        op.args.len() >= 2,
+        "jtransform_opname::lower_graph: direct_ptradd needs ptr and shift"
+    );
+    let ptr = materialize(out, block, &op.args[0]);
+    let mut shift = materialize(out, block, &op.args[1]);
+    let result = expect_var(&op.result);
+    let ptr_ty = ptr.concretetype();
+    let is_ccharp = ptr_ty.as_ref().is_some_and(|ty| ty == &*CCHARP);
+    if !is_ccharp {
+        let Some(by) = ptr_ty.as_ref().and_then(ptradd_item_bytes) else {
+            let args = vec![ptr, shift];
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path(["lltype", "direct_ptradd"]),
+                    args: crate::model::call_args(args),
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+            return;
+        };
+        let c_by = out
+            .push_op_var(block, OpKind::ConstInt(by), true)
+            .expect("sizeof const produces a result");
+        c_by.set_concretetype(Some(LowLevelType::Signed));
+        let prod = out
+            .push_op_var(
+                block,
+                OpKind::BinOp {
+                    op: "int_mul".to_string(),
+                    lhs: shift,
+                    rhs: c_by,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("int_mul produces a result");
+        prod.set_concretetype(Some(LowLevelType::Signed));
+        shift = prod;
+    }
+    out.push_op_with_result_var(
+        block,
+        OpKind::BinOp {
+            op: "int_add".to_string(),
+            lhs: ptr,
+            rhs: shift,
+            result_ty: ValueType::Int,
+        },
+        result,
+    );
 }
 
 /// Whether an operand is the null pointer constant (`ConstValue::None`),
@@ -2196,7 +2952,8 @@ fn malloc_struct_owner(hlv: &Hlvalue) -> String {
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
             ConstValue::LowLevelType(lltype) => owner_struct_of_lltype(lltype)
-                .map(|s| s._name)
+                .as_ref()
+                .map(struct_owner_spelling)
                 .unwrap_or_else(|| {
                     panic!(
                         "jtransform_opname::lower_graph: malloc type operand is not a Struct: {lltype:?}"
@@ -2265,14 +3022,15 @@ mod tests {
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{
-        Array, ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
+        Array, ForwardReference, LowLevelType, NONGCREF, Ptr, PtrTarget, Struct,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
     };
-    use crate::translator::rtyper::lltypesystem::rffi::{CArray, CArrayPtr};
+    use crate::translator::rtyper::lltypesystem::rbytearray::BYTEARRAYPTR;
+    use crate::translator::rtyper::lltypesystem::rffi::{CArray, CArrayPtr, CCHARP};
     use crate::translator::rtyper::lltypesystem::rstr::{
-        STRPTR, build_ll_mallocstr_helper_graph, build_ll_search_helper_graph,
+        STRPTR, UNICODEPTR, build_ll_mallocstr_helper_graph, build_ll_search_helper_graph,
         chars_array_ptr_lltype_from_strptr, direct_call_funcobjs, graph_ref_for_funcptr_id,
         struct_lltype_from_strptr,
     };
@@ -2952,6 +3710,240 @@ mod tests {
         let body = jitcode
             .try_body()
             .expect("int div/mod graph drains through builtin residual calls");
+        assert!(!body.code.is_empty());
+    }
+
+    #[test]
+    fn lower_graph_float_binop_and_compare_arms() {
+        let lhs = variable_with_lltype("lhs", LowLevelType::Float);
+        let rhs = variable_with_lltype("rhs", LowLevelType::Float);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(lhs.clone()),
+            Hlvalue::Variable(rhs.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            "float_binop_and_compare",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let cases = [
+            ("float_add", LowLevelType::Float),
+            ("float_sub", LowLevelType::Float),
+            ("float_mul", LowLevelType::Float),
+            ("float_truediv", LowLevelType::Float),
+            ("float_lt", LowLevelType::Bool),
+            ("float_eq", LowLevelType::Bool),
+        ];
+        let mut last = None;
+        for (index, (opname, result_ty)) in cases.into_iter().enumerate() {
+            let result = variable_with_lltype(&format!("f_{index}"), result_ty);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![
+                    Hlvalue::Variable(lhs.clone()),
+                    Hlvalue::Variable(rhs.clone()),
+                ],
+                Hlvalue::Variable(result.clone()),
+            ));
+            last = Some(result);
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(last.expect("float family is non-empty"))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let binary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => op.as_str(),
+                other => panic!("float binop/compare must lower to BinOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            binary,
+            vec![
+                "float_add",
+                "float_sub",
+                "float_mul",
+                "float_truediv",
+                "float_lt",
+                "float_eq"
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_graph_int_float_cast_arms() {
+        let signed = variable_with_lltype("signed", LowLevelType::Signed);
+        let float = variable_with_lltype("float", LowLevelType::Float);
+        let unsigned = variable_with_lltype("unsigned", LowLevelType::Unsigned);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(signed.clone()),
+            Hlvalue::Variable(float.clone()),
+            Hlvalue::Variable(unsigned.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Float);
+        let graph = FlowGraph::with_return_var(
+            "int_float_casts",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let cases = [
+            (
+                "cast_int_to_float",
+                Hlvalue::Variable(signed),
+                LowLevelType::Float,
+            ),
+            (
+                "cast_float_to_int",
+                Hlvalue::Variable(float),
+                LowLevelType::Signed,
+            ),
+            (
+                "cast_uint_to_float",
+                Hlvalue::Variable(unsigned),
+                LowLevelType::Float,
+            ),
+        ];
+        let mut last = None;
+        for (index, (opname, operand, result_ty)) in cases.into_iter().enumerate() {
+            let result = variable_with_lltype(&format!("cast_{index}"), result_ty);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![operand],
+                Hlvalue::Variable(result.clone()),
+            ));
+            last = Some(result);
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(last.expect("cast family is non-empty"))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let unary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op.as_str(),
+                other => panic!("int/float cast must lower to UnaryOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            unary,
+            vec![
+                "cast_int_to_float",
+                "cast_float_to_int",
+                "cast_uint_to_float"
+            ]
+        );
+    }
+
+    /// `Transformer.rewrite_op_float_is_true`: `float_ne` against 0.0.
+    #[test]
+    fn lower_graph_rewrites_float_is_true_to_float_ne() {
+        let operand = variable_with_lltype("operand", LowLevelType::Float);
+        let start = Block::shared(vec![Hlvalue::Variable(operand.clone())]);
+        let returned = variable_with_lltype("returned", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            "float_is_true_rewrite",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let truth = variable_with_lltype("truth", LowLevelType::Bool);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "float_is_true",
+            vec![Hlvalue::Variable(operand.clone())],
+            Hlvalue::Variable(truth.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(truth.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert_eq!(ops.len(), 2, "ConstFloat(0.0) then float_ne; ops={ops:?}");
+        match &ops[0].kind {
+            OpKind::ConstFloat(bits) => assert_eq!(*bits, 0.0_f64.to_bits()),
+            other => panic!("float_is_true must materialise 0.0, got {other:?}"),
+        }
+        match &ops[1].kind {
+            OpKind::BinOp { op, lhs, rhs, .. } => {
+                assert_eq!(op, "float_ne");
+                assert_eq!(lhs, &operand);
+                assert_eq!(rhs, ops[0].result.as_ref().expect("zero result"));
+            }
+            other => panic!("float_is_true must lower to float_ne, got {other:?}"),
+        }
+        assert_eq!(ops[1].result.as_ref(), Some(&truth));
+    }
+
+    /// `Transformer.rewrite_op_cast_uint_to_float = _do_builtin_call`.
+    /// Feed the shared Transformer the same `UnaryOp` the front spine
+    /// residualizes; with no helper graph that is the `_ll_1_cast_*`
+    /// residual call.
+    #[test]
+    fn lower_graph_routes_cast_uint_to_float_through_the_builtin_call_rewrite() {
+        let operand = variable_with_lltype("operand", LowLevelType::Unsigned);
+        let start = Block::shared(vec![Hlvalue::Variable(operand.clone())]);
+        let returned = variable_with_lltype("returned", LowLevelType::Float);
+        let graph = FlowGraph::with_return_var(
+            "lowlevel_cast_uint_to_float",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let casted = variable_with_lltype("casted", LowLevelType::Float);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_uint_to_float",
+            vec![Hlvalue::Variable(operand)],
+            Hlvalue::Variable(casted.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(casted)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        assert_eq!(
+            startblock_unops(&model),
+            vec!["cast_uint_to_float".to_string()]
+        );
+
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let path = CallPath::from_segments(["lowlevel_cast_uint_to_float"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let body = jitcode
+            .try_body()
+            .expect("cast_uint_to_float drains through builtin residual call");
         assert!(!body.code.is_empty());
     }
 
@@ -5832,5 +6824,831 @@ mod tests {
         ));
         close_return(&startblock, &graph, result);
         let _ = lower_graph(&graph);
+    }
+
+    /// `TUPLE_TYPE([Ptr(gc), Signed])` mallocs and `getfield(item0)` under
+    /// the lltype spelling `tuple2<GCREF,isize>`, not the bare `tuple2`
+    /// leaf. `rewrite_op_getfield` / `STRUCT._immutable_field` makes the
+    /// read `_pure`.
+    #[test]
+    fn lower_graph_tuple_getfield_owner_is_the_lltype_spelling() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rtuple::TUPLE_TYPE;
+
+        let tuple_ty = TUPLE_TYPE(&[GCREF.clone(), LowLevelType::Signed]);
+        let t = variable_with_lltype("t", tuple_ty.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(t.clone())]);
+        let result = variable_with_lltype("item0", GCREF.clone());
+        let graph = FlowGraph::with_return_var(
+            "tuple_getfield_owner",
+            startblock.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(t),
+                constant_with_lltype(ConstValue::byte_str("item0"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        close_return(&startblock, &graph, result);
+
+        let model = lower_graph(&graph);
+        let (owner, name, pure, owner_id) = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, pure, .. } => Some((
+                    field.owner_root.clone(),
+                    field.name.clone(),
+                    *pure,
+                    field.owner_id,
+                )),
+                _ => None,
+            })
+            .expect("getfield lowers to FieldRead");
+        assert_eq!(owner.as_deref(), Some("tuple2<GCREF,isize>"));
+        assert_eq!(name, "item0");
+        assert!(pure, "TUPLE_TYPE immutable hint is getfield_gc_*_pure");
+        assert_eq!(
+            owner_id,
+            majit_ir::descr::struct_id_for_name("tuple2<GCREF,isize>")
+        );
+    }
+
+    /// `rewrite_op_cast_ptr_to_int` keeps a GC pointer and is identity
+    /// (`same_as`) on raw. `cast_int_to_ptr` has no rewrite (`bhimpl`).
+    /// `rewrite_op_cast_ptr_to_adr` is identity on raw.
+    #[test]
+    fn lower_graph_cast_ptr_int_arms() {
+        let gc = variable_with_lltype("gc", STRPTR.clone());
+        let raw = variable_with_lltype("raw", LowLevelType::Ptr(Box::new(NONGCREF.clone())));
+        let signed = variable_with_lltype("signed", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(gc.clone()),
+            Hlvalue::Variable(raw.clone()),
+            Hlvalue::Variable(signed.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Address);
+        let graph = FlowGraph::with_return_var(
+            "cast_ptr_int_arms",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let gc_int = variable_with_lltype("gc_int", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_ptr_to_int",
+            vec![Hlvalue::Variable(gc)],
+            Hlvalue::Variable(gc_int.clone()),
+        ));
+        let raw_int = variable_with_lltype("raw_int", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_ptr_to_int",
+            vec![Hlvalue::Variable(raw.clone())],
+            Hlvalue::Variable(raw_int),
+        ));
+        let as_ptr = variable_with_lltype("as_ptr", LowLevelType::Ptr(Box::new(NONGCREF.clone())));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_int_to_ptr",
+            vec![Hlvalue::Variable(signed)],
+            Hlvalue::Variable(as_ptr),
+        ));
+        let adr = variable_with_lltype("adr", LowLevelType::Address);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_ptr_to_adr",
+            vec![Hlvalue::Variable(raw)],
+            Hlvalue::Variable(adr.clone()),
+        ));
+        close_return(&start, &graph, adr);
+
+        let model = lower_graph(&graph);
+        let unary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op.as_str(),
+                other => panic!("cast_ptr_* must lower to UnaryOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            unary,
+            vec![
+                "cast_ptr_to_int",
+                "same_as",
+                "cast_int_to_ptr",
+                "cast_ptr_to_adr"
+            ]
+        );
+        assert_eq!(
+            model.block(model.startblock).operations[0].result.as_ref(),
+            Some(&gc_int)
+        );
+    }
+
+    fn entry_gcarray_ptr() -> LowLevelType {
+        let entry = Struct::new(
+            "ENTRY",
+            vec![
+                ("v".into(), LowLevelType::Signed),
+                ("k".into(), LowLevelType::Signed),
+            ],
+        );
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(entry)))),
+        }))
+    }
+
+    fn startblock_kinds(graph: &FlowGraph) -> Vec<OpKind> {
+        let model = lower_graph(graph);
+        model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| op.kind.clone())
+            .collect()
+    }
+
+    /// `rewrite_op_getinteriorfield` / `rewrite_op_setinteriorfield` /
+    /// `rewrite_op_getinteriorarraysize`.
+    #[test]
+    fn lower_graph_interior_field_arms() {
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let ch = variable_with_lltype("ch", LowLevelType::Char);
+        let unich = variable_with_lltype("unich", LowLevelType::UniChar);
+
+        let s = variable_with_lltype("s", STRPTR.clone());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(s.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let got = variable_with_lltype("got", LowLevelType::Char);
+        let graph = FlowGraph::with_return_var(
+            "interior_str_get",
+            start.clone(),
+            Hlvalue::Variable(got.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(s.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+            ],
+            Hlvalue::Variable(got.clone()),
+        ));
+        close_return(&start, &graph, got);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, args }] => {
+                assert_eq!(opname, "strgetitem");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("STR getinteriorfield → strgetitem, got {other:?}"),
+        }
+
+        let u = variable_with_lltype("u", UNICODEPTR.clone());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(u.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let got = variable_with_lltype("got", LowLevelType::UniChar);
+        let graph = FlowGraph::with_return_var(
+            "interior_unicode_get",
+            start.clone(),
+            Hlvalue::Variable(got.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(u.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+            ],
+            Hlvalue::Variable(got.clone()),
+        ));
+        close_return(&start, &graph, got);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, .. }] => {
+                assert_eq!(opname, "unicodegetitem");
+            }
+            other => panic!("UNICODE getinteriorfield → unicodegetitem, got {other:?}"),
+        }
+
+        let ba = variable_with_lltype("ba", BYTEARRAYPTR.clone());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(ba.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let got = variable_with_lltype("got", LowLevelType::Char);
+        let graph = FlowGraph::with_return_var(
+            "interior_bytearray_get",
+            start.clone(),
+            Hlvalue::Variable(got.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(ba.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+            ],
+            Hlvalue::Variable(got.clone()),
+        ));
+        close_return(&start, &graph, got);
+        match startblock_kinds(&graph).as_slice() {
+            [
+                OpKind::ArrayRead {
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    ..
+                },
+            ] => {}
+            other => panic!("BYTEARRAY getinteriorfield → ArrayRead gc, got {other:?}"),
+        }
+
+        let entries = variable_with_lltype("entries", entry_gcarray_ptr());
+        let start = Block::shared(vec![
+            Hlvalue::Variable(entries.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let got = variable_with_lltype("got", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "interior_dict_get",
+            start.clone(),
+            Hlvalue::Variable(got.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(entries.clone()),
+                Hlvalue::Variable(index.clone()),
+                constant_with_lltype(ConstValue::byte_str("v"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(got.clone()),
+        ));
+        close_return(&start, &graph, got);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::InteriorFieldRead { field, .. }] => {
+                assert_eq!(field.name, "v");
+                assert_eq!(field.owner_root.as_deref(), Some("ENTRY"));
+            }
+            other => panic!("GcArray-of-Struct → InteriorFieldRead, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![
+            Hlvalue::Variable(entries.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "interior_dict_get_void",
+            start.clone(),
+            Hlvalue::Variable(entries.clone()),
+        );
+        let void_res = variable_with_lltype("void", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorfield",
+            vec![
+                Hlvalue::Variable(entries.clone()),
+                Hlvalue::Variable(index.clone()),
+                constant_with_lltype(ConstValue::byte_str("v"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, entries.clone());
+        assert!(
+            startblock_kinds(&graph).is_empty(),
+            "Void getinteriorfield is dropped"
+        );
+
+        let start = Block::shared(vec![
+            Hlvalue::Variable(s.clone()),
+            Hlvalue::Variable(index.clone()),
+            Hlvalue::Variable(ch.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "interior_str_set",
+            start.clone(),
+            Hlvalue::Variable(s.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setinteriorfield",
+            vec![
+                Hlvalue::Variable(s.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+                Hlvalue::Variable(ch),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, s.clone());
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, .. }] => {
+                assert_eq!(opname, "strsetitem");
+            }
+            other => panic!("STR setinteriorfield → strsetitem, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![
+            Hlvalue::Variable(u.clone()),
+            Hlvalue::Variable(index.clone()),
+            Hlvalue::Variable(unich.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "interior_unicode_set",
+            start.clone(),
+            Hlvalue::Variable(u.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setinteriorfield",
+            vec![
+                Hlvalue::Variable(u.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+                Hlvalue::Variable(unich),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, u.clone());
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, .. }] => {
+                assert_eq!(opname, "unicodesetitem");
+            }
+            other => panic!("UNICODE setinteriorfield → unicodesetitem, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![
+            Hlvalue::Variable(ba.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "interior_bytearray_set",
+            start.clone(),
+            Hlvalue::Variable(ba.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setinteriorfield",
+            vec![
+                Hlvalue::Variable(ba.clone()),
+                chars_field(),
+                Hlvalue::Variable(index.clone()),
+                signed_const(b'x' as i64),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, ba.clone());
+        match startblock_kinds(&graph).as_slice() {
+            [
+                OpKind::ArrayWrite {
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    ..
+                },
+            ] => {}
+            other => panic!("BYTEARRAY setinteriorfield → ArrayWrite gc, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![
+            Hlvalue::Variable(entries.clone()),
+            Hlvalue::Variable(index.clone()),
+        ]);
+        let graph = FlowGraph::with_return_var(
+            "interior_dict_set",
+            start.clone(),
+            Hlvalue::Variable(entries.clone()),
+        );
+        let void_res = variable_with_lltype("set", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setinteriorfield",
+            vec![
+                Hlvalue::Variable(entries.clone()),
+                Hlvalue::Variable(index.clone()),
+                constant_with_lltype(ConstValue::byte_str("v"), LowLevelType::Void),
+                signed_const(1),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, entries.clone());
+        let field = startblock_kinds(&graph)
+            .into_iter()
+            .find_map(|kind| match kind {
+                OpKind::InteriorFieldWrite { field, .. } => Some(field),
+                _ => None,
+            });
+        let field = field.unwrap_or_else(|| panic!("GcArray-of-Struct set → InteriorFieldWrite"));
+        assert_eq!(field.name, "v");
+        assert_eq!(field.owner_root.as_deref(), Some("ENTRY"));
+
+        let start = Block::shared(vec![Hlvalue::Variable(s.clone())]);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "interior_str_len",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorarraysize",
+            vec![Hlvalue::Variable(s), chars_field()],
+            Hlvalue::Variable(n.clone()),
+        ));
+        close_return(&start, &graph, n);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, .. }] => assert_eq!(opname, "strlen"),
+            other => panic!("STR getinteriorarraysize → strlen, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![Hlvalue::Variable(u.clone())]);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "interior_unicode_len",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorarraysize",
+            vec![Hlvalue::Variable(u), chars_field()],
+            Hlvalue::Variable(n.clone()),
+        ));
+        close_return(&start, &graph, n);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::LoweredBlackholeOp { opname, .. }] => assert_eq!(opname, "unicodelen"),
+            other => panic!("UNICODE getinteriorarraysize → unicodelen, got {other:?}"),
+        }
+
+        let start = Block::shared(vec![Hlvalue::Variable(ba.clone())]);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "interior_bytearray_len",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getinteriorarraysize",
+            vec![Hlvalue::Variable(ba), chars_field()],
+            Hlvalue::Variable(n.clone()),
+        ));
+        close_return(&start, &graph, n);
+        match startblock_kinds(&graph).as_slice() {
+            [
+                OpKind::ArrayLen {
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    ..
+                },
+            ] => {}
+            other => panic!("BYTEARRAY getinteriorarraysize → ArrayLen gc, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_raw_load` / `rewrite_op_raw_store`: `raw_{load,store}_<kind>`
+    /// plus `arraydescrof(rffi.CArray(T))`. Kind `'r'` is refused.
+    #[test]
+    fn lower_graph_raw_load_store_arms() {
+        let addr = variable_with_lltype("addr", LowLevelType::Address);
+        let offset = variable_with_lltype("off", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(addr.clone()),
+            Hlvalue::Variable(offset.clone()),
+        ]);
+        let loaded = variable_with_lltype("loaded", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "raw_load_store",
+            start.clone(),
+            Hlvalue::Variable(loaded.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "raw_load",
+            vec![
+                Hlvalue::Variable(addr.clone()),
+                Hlvalue::Variable(offset.clone()),
+            ],
+            Hlvalue::Variable(loaded.clone()),
+        ));
+        let stored = variable_with_lltype("stored", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "raw_store",
+            vec![
+                Hlvalue::Variable(addr),
+                Hlvalue::Variable(offset),
+                Hlvalue::Variable(loaded.clone()),
+            ],
+            Hlvalue::Variable(stored),
+        ));
+        close_return(&start, &graph, loaded);
+
+        let word = crate::layout::target_signed_size();
+        let kinds = startblock_kinds(&graph);
+        match kinds.as_slice() {
+            [
+                OpKind::RawLoad {
+                    item_ty,
+                    itemsize,
+                    is_item_signed,
+                    ..
+                },
+                OpKind::RawStore {
+                    item_ty: store_ty,
+                    itemsize: store_size,
+                    is_item_signed: store_signed,
+                    ..
+                },
+            ] => {
+                assert_eq!(*item_ty, ValueType::Int);
+                assert_eq!(*itemsize, word);
+                assert!(*is_item_signed);
+                assert_eq!(*store_ty, ValueType::Int);
+                assert_eq!(*store_size, word);
+                assert!(*store_signed);
+            }
+            other => panic!("raw_load/store → RawLoad then RawStore, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_direct_ptradd`: CCHARP is one `int_add`; otherwise
+    /// `int_mul` by `sizeof(TO.OF)` then `int_add`.
+    #[test]
+    fn lower_graph_direct_ptradd_arm() {
+        let p = variable_with_lltype("p", CCHARP.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(p.clone()),
+            Hlvalue::Variable(n.clone()),
+        ]);
+        let q = variable_with_lltype("q", CCHARP.clone());
+        let graph = FlowGraph::with_return_var(
+            "direct_ptradd_ccharp",
+            start.clone(),
+            Hlvalue::Variable(q.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_ptradd",
+            vec![Hlvalue::Variable(p.clone()), Hlvalue::Variable(n.clone())],
+            Hlvalue::Variable(q.clone()),
+        ));
+        close_return(&start, &graph, q);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::BinOp { op, lhs, rhs, .. }] => {
+                assert_eq!(op, "int_add");
+                assert_eq!(lhs, &p);
+                assert_eq!(rhs, &n);
+            }
+            other => panic!("CCHARP direct_ptradd → int_add, got {other:?}"),
+        }
+
+        let signedp = CArrayPtr(LowLevelType::Signed);
+        let p = variable_with_lltype("p", signedp.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(p.clone()),
+            Hlvalue::Variable(n.clone()),
+        ]);
+        let q = variable_with_lltype("q", signedp);
+        let graph = FlowGraph::with_return_var(
+            "direct_ptradd_signed",
+            start.clone(),
+            Hlvalue::Variable(q.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_ptradd",
+            vec![Hlvalue::Variable(p.clone()), Hlvalue::Variable(n.clone())],
+            Hlvalue::Variable(q.clone()),
+        ));
+        close_return(&start, &graph, q);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        match ops.as_slice() {
+            [scale, mul, add] => match (&scale.kind, &mul.kind, &add.kind) {
+                (
+                    OpKind::ConstInt(by),
+                    OpKind::BinOp {
+                        op: mul_op, lhs, ..
+                    },
+                    OpKind::BinOp {
+                        op: add_op,
+                        lhs: add_lhs,
+                        rhs: add_rhs,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(*by, crate::layout::target_signed_size() as i64);
+                    assert_eq!(mul_op, "int_mul");
+                    assert_eq!(lhs, &n);
+                    assert_eq!(add_op, "int_add");
+                    assert_eq!(add_lhs, &p);
+                    assert_eq!(add_rhs, mul.result.as_ref().expect("int_mul result"));
+                }
+                other => panic!("CArray(Signed) direct_ptradd → int_mul + int_add, got {other:?}"),
+            },
+            other => panic!("CArray(Signed) direct_ptradd → int_mul + int_add, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_indirect_call` emits `OpKind::IndirectCall`. Trailing
+    /// Void graphs stay `None` (`transduce_op` has no CallControl).
+    #[test]
+    fn lower_graph_indirect_call_arm() {
+        use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+
+        let fnptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        }));
+        let f = variable_with_lltype("f", fnptr_ty);
+        let x = variable_with_lltype("x", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(f.clone()),
+            Hlvalue::Variable(x.clone()),
+        ]);
+        let y = variable_with_lltype("y", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "indirect_call_arm",
+            start.clone(),
+            Hlvalue::Variable(y.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "indirect_call",
+            vec![
+                Hlvalue::Variable(f.clone()),
+                Hlvalue::Variable(x.clone()),
+                constant_with_lltype(ConstValue::None, LowLevelType::Void),
+            ],
+            Hlvalue::Variable(y.clone()),
+        ));
+        close_return(&start, &graph, y);
+        match startblock_kinds(&graph).as_slice() {
+            [
+                OpKind::IndirectCall {
+                    funcptr,
+                    args,
+                    graphs,
+                    family_key,
+                    ..
+                },
+            ] => {
+                assert_eq!(funcptr, &f);
+                assert_eq!(args.as_slice(), std::slice::from_ref(&x));
+                assert!(graphs.is_none());
+                assert!(family_key.is_none());
+            }
+            other => panic!("indirect_call → IndirectCall graphs None, got {other:?}"),
+        }
+    }
+
+    /// Leftover Call so `rewrite_op_jit_force_virtualizable` can file
+    /// `vable_flags` / `get_vinfo`. Do not drain: empty CallControl asserts.
+    #[test]
+    fn lower_graph_jit_force_virtualizable_arm() {
+        let v = variable_with_lltype("v", STRPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "jit_force_virtualizable_arm",
+            start.clone(),
+            Hlvalue::Variable(v.clone()),
+        );
+        let void_res = variable_with_lltype("force", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_force_virtualizable",
+            vec![
+                Hlvalue::Variable(v.clone()),
+                constant_with_lltype(ConstValue::byte_str(""), LowLevelType::Void),
+                constant_with_lltype(
+                    ConstValue::Dict(std::sync::Arc::new(indexmap::IndexMap::new())),
+                    LowLevelType::Void,
+                ),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, v);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::Call { target, args, .. }] => {
+                assert_eq!(
+                    target.path_segments().as_deref(),
+                    Some(["jit_force_virtualizable"].as_slice())
+                );
+                assert_eq!(args.len(), 3, "hook_access_field [vinst, cname, cflags]");
+            }
+            other => panic!("jit_force_virtualizable leftover Call, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_jit_force_quasi_immutable`: `-live-` +
+    /// `jit_force_quasi_immutable(v_inst, fielddescr)`.
+    #[test]
+    fn lower_graph_jit_force_quasi_immutable_arm() {
+        let inst = variable_with_lltype("inst", STRINGBUILDERPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(inst.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "jit_force_quasi_immutable_arm",
+            start.clone(),
+            Hlvalue::Variable(inst.clone()),
+        );
+        let void_res = variable_with_lltype("force", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_force_quasi_immutable",
+            vec![
+                Hlvalue::Variable(inst.clone()),
+                constant_with_lltype(ConstValue::byte_str("current_pos"), LowLevelType::Void),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, inst);
+        match startblock_kinds(&graph).as_slice() {
+            [
+                OpKind::Live { .. },
+                OpKind::JitForceQuasiImmutable { mutate_field, .. },
+            ] => {
+                assert_eq!(mutate_field.name, "current_pos");
+                assert_eq!(mutate_field.owner_root.as_deref(), Some("stringbuilder"));
+            }
+            other => panic!("quasi-immutable → Live + JitForceQuasiImmutable, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_free`: flavor `'raw'`, leftover flags
+    /// `UnsupportedMallocFlags`, then `raw_free`.
+    #[test]
+    fn lower_graph_free_arm() {
+        let p = variable_with_lltype("p", CCHARP.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let graph =
+            FlowGraph::with_return_var("free_arm", start.clone(), Hlvalue::Variable(p.clone()));
+        let void_res = variable_with_lltype("freed", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "free",
+            vec![Hlvalue::Variable(p.clone()), raw_flavor_const(&[])],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, p.clone());
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::RawFree { ptr }] => assert_eq!(ptr, &p),
+            other => panic!("free → RawFree, got {other:?}"),
+        }
+    }
+
+    /// `rewrite_op_gc_add_memory_pressure = _do_builtin_call`. Leftover
+    /// Call so `rewrite_op_direct_call` residualizes it.
+    #[test]
+    fn lower_graph_gc_add_memory_pressure_arm() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "gc_add_memory_pressure_arm",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        let void_res = variable_with_lltype("pressure", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_add_memory_pressure",
+            vec![Hlvalue::Variable(n.clone())],
+            Hlvalue::Variable(void_res),
+        ));
+        close_return(&start, &graph, n);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::Call { target, .. }] => {
+                assert_eq!(
+                    target.path_segments().as_deref(),
+                    Some(["gc_add_memory_pressure"].as_slice())
+                );
+            }
+            other => panic!("gc_add_memory_pressure leftover Call, got {other:?}"),
+        }
+    }
+
+    /// Front / rtyper emit the 2-arg BinOp (offset, loop-invariant flag)
+    /// `rewrite_op_threadlocalref_get` residualizes.
+    #[test]
+    fn lower_graph_threadlocalref_get_arm() {
+        let offset = variable_with_lltype("offset", LowLevelType::Signed);
+        let flag = variable_with_lltype("flag", LowLevelType::Bool);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(offset.clone()),
+            Hlvalue::Variable(flag.clone()),
+        ]);
+        let got = variable_with_lltype("got", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "threadlocalref_get_arm",
+            start.clone(),
+            Hlvalue::Variable(got.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "threadlocalref_get",
+            vec![
+                Hlvalue::Variable(offset.clone()),
+                Hlvalue::Variable(flag.clone()),
+            ],
+            Hlvalue::Variable(got.clone()),
+        ));
+        close_return(&start, &graph, got);
+        match startblock_kinds(&graph).as_slice() {
+            [OpKind::BinOp { op, lhs, rhs, .. }] => {
+                assert_eq!(op, "threadlocalref_get");
+                assert_eq!(lhs, &offset);
+                assert_eq!(rhs, &flag);
+            }
+            other => panic!("threadlocalref_get → BinOp, got {other:?}"),
+        }
     }
 }

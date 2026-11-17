@@ -2072,7 +2072,7 @@ mod opname_spine_prejit_tests {
     use crate::model::{CallTarget, OpKind};
     use crate::parse::CallPath;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
+        FuncType, GCREF, LowLevelType, Ptr, PtrTarget, functionptr, functionptr_for_graph_with_type,
     };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, build_ll_append_char_helper_graph,
@@ -2086,6 +2086,8 @@ mod opname_spine_prejit_tests {
     use crate::translator::rtyper::rlist::{
         build_ll_fixed_length_helper_graph, items_array_ptr_lltype,
     };
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+    use crate::translator::rtyper::rtuple::TUPLE_TYPE;
     use crate::translator::rtyper::rtyper::{
         RPythonTyper, constant_with_lltype, functionptr_const, variable_with_lltype,
     };
@@ -2594,5 +2596,257 @@ mod opname_spine_prejit_tests {
             "oopspec publication path equals the lowered Call path"
         );
         let _keep = ann;
+    }
+
+    /// `TUPLE_TYPE([Ptr(gc), Signed])` malloc / setfield / getfield
+    /// assembles: `new` of `tuple2<GCREF,isize>`, then a pure item1 read
+    /// (`rewrite_op_getfield` / `STRUCT._immutable_field`).
+    #[test]
+    fn opname_spine_tuple_malloc_and_item_read_assemble() {
+        let tuple_ty = TUPLE_TYPE(&[GCREF.clone(), LowLevelType::Signed]);
+        let p = variable_with_lltype("p", GCREF.clone());
+        let t = variable_with_lltype("t", tuple_ty.clone());
+        let item1 = variable_with_lltype("item1", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "tuple_malloc_item_read",
+            start.clone(),
+            Hlvalue::Variable(item1.clone()),
+        );
+        let void0 = variable_with_lltype("set0", LowLevelType::Void);
+        let void1 = variable_with_lltype("set1", LowLevelType::Void);
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "malloc",
+                vec![
+                    lowlevel_type_const(tuple_ty),
+                    gc_flavor_const().expect("gc flavor const"),
+                ],
+                Hlvalue::Variable(t.clone()),
+            ),
+            SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(t.clone()),
+                    field_name_const("item0"),
+                    Hlvalue::Variable(p),
+                ],
+                Hlvalue::Variable(void0),
+            ),
+            SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(t.clone()),
+                    field_name_const("item1"),
+                    constant_with_lltype(ConstValue::Int(7), LowLevelType::Signed),
+                ],
+                Hlvalue::Variable(void1),
+            ),
+            SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(t), field_name_const("item1")],
+                Hlvalue::Variable(item1.clone()),
+            ),
+        ]);
+        close_return(&start, &graph, item1);
+
+        let path = CallPath::from_segments(["tuple_malloc_item_read"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("new"),
+            "assembled jitcode must contain new; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let news: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::New { owner } => Some(owner.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(news, vec!["tuple2<GCREF,isize>"], "dump:\n{dump}");
+        let item1_reads: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::FieldRead { field, pure, .. } if field.name == "item1" => Some(*pure),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            item1_reads,
+            vec![true],
+            "tuple item1 read is getfield_gc_*_pure (`rewrite_op_getfield` / `_immutable_field`); dump:\n{dump}"
+        );
+    }
+
+    /// Spine B `float_add` + `float_lt` + bool exitswitch assembles to
+    /// the same `float_add` / `float_lt` blackhole names the front spine
+    /// Transformer emits for Float operands.
+    #[test]
+    fn opname_spine_float_arith_assembles() {
+        let a = variable_with_lltype("a", LowLevelType::Float);
+        let b = variable_with_lltype("b", LowLevelType::Float);
+        let sum = variable_with_lltype("sum", LowLevelType::Float);
+        let cmp = variable_with_lltype("cmp", LowLevelType::Bool);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        let graph = FunctionGraph::with_return_var(
+            "float_arith",
+            start.clone(),
+            Hlvalue::Variable(sum.clone()),
+        );
+        start.borrow_mut().operations.extend([
+            SpaceOperation::new(
+                "float_add",
+                vec![Hlvalue::Variable(a.clone()), Hlvalue::Variable(b)],
+                Hlvalue::Variable(sum.clone()),
+            ),
+            SpaceOperation::new(
+                "float_lt",
+                vec![Hlvalue::Variable(sum.clone()), Hlvalue::Variable(a.clone())],
+                Hlvalue::Variable(cmp.clone()),
+            ),
+        ]);
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(cmp));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(sum.clone())],
+                Some(graph.returnblock.clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+            Link::new(
+                vec![Hlvalue::Variable(a)],
+                Some(graph.returnblock.clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(false),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref(),
+        ]);
+
+        let path = CallPath::from_segments(["float_arith"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        assert!(
+            dump.contains("float_lt"),
+            "assembled jitcode must contain float_lt; dump:\n{dump}"
+        );
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let binops: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::BinOp { op, .. } => Some(op.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.contains(&"float_add"),
+            "assembled SSA must contain float_add; binops={binops:?} dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("float_add") || binops.contains(&"float_add"),
+            "assembled jitcode must contain float_add; dump:\n{dump}"
+        );
+    }
+
+    /// Spine B `cast_ptr_to_int` of a GC pointer assembles as the same
+    /// `cast_ptr_to_int` UnaryOp the front spine Transformer keeps.
+    #[test]
+    fn opname_spine_cast_ptr_to_int_assembles() {
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let graph = FunctionGraph::with_return_var(
+            "cast_ptr_to_int",
+            start.clone(),
+            Hlvalue::Variable(n.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_ptr_to_int",
+            vec![Hlvalue::Variable(p)],
+            Hlvalue::Variable(n.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(n)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let path = CallPath::from_segments(["cast_ptr_to_int"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let dump = jitcode.dump();
+        let ssarepr = jitcode
+            ._ssarepr
+            .as_ref()
+            .expect("assembled jitcode has _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
+        let unaries: Vec<_> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::UnaryOp { op, .. } => Some(op.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unaries.contains(&"cast_ptr_to_int"),
+            "assembled SSA must contain cast_ptr_to_int; unaries={unaries:?} dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("unaryop") || dump.contains("cast_ptr_to_int"),
+            "assembled jitcode dumps UnaryOp as unaryop; dump:\n{dump}"
+        );
     }
 }

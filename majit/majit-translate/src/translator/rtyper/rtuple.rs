@@ -71,6 +71,44 @@ pub fn TUPLE_TYPE(field_lltypes: &[LowLevelType]) -> LowLevelType {
     }))
 }
 
+/// Inverse of [`TUPLE_TYPE`]: recover the item lltypes when `s` is the
+/// `GcStruct('tuple{n}', ('item0', T0), …)` that constructor builds.
+///
+/// `Some` only when the name is `tuple{n}`, the struct has exactly `n`
+/// fields named `item0..item{n-1}` in order, and it carries the
+/// `immutable` and `noidentity` hints `TUPLE_TYPE` sets. The bare
+/// `tuple{n}` name is not an identity across item types; callers that
+/// need one spell `tuple{n}<s0,s1,…>` from these items.
+pub(crate) fn tuple_struct_items(s: &Struct) -> Option<Vec<LowLevelType>> {
+    let n = tuple_arity_from_ll_name(&s._name)?;
+    if s._names.len() != n {
+        return None;
+    }
+    if !matches!(s._hints.get("immutable"), Some(ConstValue::Bool(true))) {
+        return None;
+    }
+    if !matches!(s._hints.get("noidentity"), Some(ConstValue::Bool(true))) {
+        return None;
+    }
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        let expected = format!("item{i}");
+        if s._names.get(i) != Some(&expected) {
+            return None;
+        }
+        items.push(s._flds.get(&expected)?.clone());
+    }
+    Some(items)
+}
+
+fn tuple_arity_from_ll_name(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix("tuple")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// RPython `rtype_newtuple(hop): return TupleRepr._rtype_newtuple(hop)`
 /// (rtuple.py).
 pub fn rtype_newtuple(
@@ -2409,6 +2447,28 @@ mod tests {
         };
         assert_eq!(body._name, "tuple1");
         assert!(body._flds.get("item0").is_some());
+    }
+
+    #[test]
+    fn tuple_struct_items_recovers_tuple_type_fields() {
+        let t = TUPLE_TYPE(&[LowLevelType::Signed, LowLevelType::Float]);
+        let LowLevelType::Ptr(ptr) = t else {
+            panic!("non-empty TUPLE_TYPE must produce Ptr");
+        };
+        let PtrTarget::Struct(body) = &ptr.TO else {
+            panic!("Ptr target must be Struct");
+        };
+        let items = tuple_struct_items(body).expect("TUPLE_TYPE body is a tuple struct");
+        assert_eq!(items, vec![LowLevelType::Signed, LowLevelType::Float]);
+
+        let other = Struct::gc(
+            "stringbuilder",
+            vec![("current_pos".into(), LowLevelType::Signed)],
+        );
+        assert!(
+            tuple_struct_items(&other).is_none(),
+            "a non-tuple GcStruct is not TUPLE_TYPE"
+        );
     }
 
     #[test]
