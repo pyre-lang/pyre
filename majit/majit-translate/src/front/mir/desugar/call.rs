@@ -868,7 +868,7 @@ impl<'a> Lowering<'a> {
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
                 continue;
             }
-            args.push(self.resolve_operand(mir_bb, op)?);
+            args.push(self.resolve_call_arg_value(mir_bb, op)?);
         }
         // A pair-slice Index argument forks the emit cursor
         // (`fork_in_bounds`); later ops and the close belong on that tail.
