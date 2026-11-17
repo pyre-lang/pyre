@@ -2852,10 +2852,17 @@ pub extern "C" fn rpyexc_raise(obj: PyObjectRef) {
 /// `dont_look_inside`: the installed cell has no extractable graph
 /// (`has_hash_w_hook`). Distinct `black_box` datum so the residual
 /// fnaddr is not folded onto a sibling predicate.
+///
+/// The installed cell is called from this body, not from a closure, so
+/// the GC root analysis sees the indirect call inside this wrapper and
+/// resolves it to its closed family (`HOOK_CALL_FAMILIES`).
 #[majit_macros::dont_look_inside]
 pub extern "C" fn rpyexc_occurred() -> bool {
     std::hint::black_box(8u32);
-    load_residual_exc_word_fn(&RESIDUAL_EXC_PEEK).is_some_and(|f| f() != 0)
+    match load_residual_exc_word_fn(&RESIDUAL_EXC_PEEK) {
+        Some(peek) => peek() != 0,
+        None => false,
+    }
 }
 
 /// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear`.
@@ -2864,9 +2871,10 @@ pub extern "C" fn rpyexc_occurred() -> bool {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn rpyexc_fetch() -> PyObjectRef {
     std::hint::black_box(9u32);
-    load_residual_exc_word_fn(&RESIDUAL_EXC_FETCH)
-        .map(|f| f() as PyObjectRef)
-        .unwrap_or(std::ptr::null_mut())
+    match load_residual_exc_word_fn(&RESIDUAL_EXC_FETCH) {
+        Some(fetch) => fetch() as PyObjectRef,
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[cfg(test)]

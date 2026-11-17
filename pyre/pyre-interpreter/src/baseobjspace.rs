@@ -144,14 +144,42 @@ pub fn space_lookup_builtin(name: &str) -> Option<PyObjectRef> {
 // it at the raise. Like `exc_data`, the note is per thread; every raise
 // a checked dict op recovers passes through one of the two trampolines,
 // so the note always describes the exception being fetched.
-thread_local! {
-    static PENDING_ERROR_FROM_HASH: Cell<bool> = const { Cell::new(false) };
+//
+// The state carries the exception instance, not the `OperationError`
+// that wrapped it, and the fetch builds a new carrier around the
+// instance. The note also keeps the carrier's
+// `_context_recorded` (`error.py OperationError.record_context`), so
+// a frame the error unwinds through does not record a context the
+// raising frame already decided.
+#[derive(Clone, Copy)]
+struct DictCallbackRaise {
+    from_hash: bool,
+    context_recorded: bool,
 }
 
-/// Record whether the raise a dict-key callback just published came from
-/// `hash_w` (`true`) or `eq_w` (`false`).
-pub fn note_dict_callback_raise(from_hash: bool) {
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(from_hash));
+const NO_DICT_CALLBACK_RAISE: DictCallbackRaise = DictCallbackRaise {
+    from_hash: false,
+    context_recorded: false,
+};
+
+thread_local! {
+    static PENDING_CALLBACK_RAISE: Cell<DictCallbackRaise> =
+        const { Cell::new(NO_DICT_CALLBACK_RAISE) };
+}
+
+/// Record the raise a dict-key callback is about to publish: whether
+/// `hash_w` (`from_hash`) or `eq_w` raised it, and its carrier's
+/// `context_recorded`.
+pub fn note_dict_callback_raise(err: &PyError, from_hash: bool) {
+    let raise = DictCallbackRaise {
+        from_hash,
+        context_recorded: err.context_recorded,
+    };
+    PENDING_CALLBACK_RAISE.with(|cell| cell.set(raise));
+}
+
+fn take_noted_callback_raise() -> DictCallbackRaise {
+    PENDING_CALLBACK_RAISE.with(|cell| cell.replace(NO_DICT_CALLBACK_RAISE))
 }
 
 /// Recover the exception a failed `hash_w` / `eq_w` residual left in the
@@ -163,22 +191,23 @@ pub fn note_dict_callback_raise(from_hash: bool) {
 /// raise (`jit_fnaddr` leaves this unpublished).
 #[majit_macros::dont_look_inside]
 pub fn take_pending_hash_error() -> PyError {
-    PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
-    fetch_pending_callback_error()
+    fetch_pending_callback_error(take_noted_callback_raise())
 }
 
 /// The one ll exception state also carries a collector failure from the
 /// checked op (`AbstractTypedStrategy.switch_to_object_strategy`), so the
 /// fetched word may be the low-level MemoryError singleton
 /// (`runtime_ops::fetch_memory_error`).
-fn fetch_pending_callback_error() -> PyError {
+fn fetch_pending_callback_error(noted: DictCallbackRaise) -> PyError {
     let obj = pyre_object::interp_exceptions::rpyexc_fetch();
     if obj.is_null() {
         PyError::type_error("unhashable type")
     } else if crate::runtime_ops::rpyexc_fetched_is_memory_error_singleton(obj) {
         crate::runtime_ops::asynchronous_memory_error()
     } else {
-        unsafe { PyError::from_exc_object(obj) }
+        let mut err = unsafe { PyError::from_exc_object(obj) };
+        err.set_context_recorded(noted.context_recorded);
+        err
     }
 }
 
@@ -248,12 +277,16 @@ fn take_pending_hash_error_for(
     subject: PyObjectRef,
     wrap: fn(PyObjectRef, PyError) -> PyError,
 ) -> PyError {
-    let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
-    let err = fetch_pending_callback_error();
-    if !from_hash {
-        return err;
+    let noted = take_noted_callback_raise();
+    if !noted.from_hash {
+        return fetch_pending_callback_error(noted);
     }
-    wrap(subject, err)
+    // The fetch builds the carrier (`from_exc_object`), which can collect;
+    // `subject` is read again after it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let subject_slot = pyre_object::gc_roots::pin_roots(&[subject]);
+    let err = fetch_pending_callback_error(noted);
+    wrap(pyre_object::gc_roots::shadow_stack_get(subject_slot), err)
 }
 
 /// The direct-hash counterpart of [`take_pending_dict_key_error`], used by
@@ -26577,6 +26610,26 @@ mod tests {
         let iterators = pyre_object::w_list_new_object(vec![it, it]);
         let zip_type = crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE);
         pyre_object::functional::w_zip_new(iterators, strict, zip_type)
+    }
+
+    /// `error.py OperationError.record_context`: a dict-callback raise
+    /// crosses the ll exception state as its instance, and the recovered
+    /// carrier keeps the raising carrier's `_context_recorded`, whichever
+    /// way it was set.
+    #[test]
+    fn dict_callback_raise_keeps_context_recorded() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        for recorded in [true, false] {
+            let mut err = PyError::value_error("boom");
+            err.set_context_recorded(recorded);
+            note_dict_callback_raise(&err, true);
+            crate::runtime_ops::jit_publish_residual_error(err);
+            let fetched = take_pending_dict_key_error(w_int_new(1));
+            assert_eq!(fetched.kind, PyErrorKind::ValueError);
+            assert_eq!(fetched.context_recorded, recorded);
+            assert!(!pyre_object::interp_exceptions::rpyexc_occurred());
+        }
     }
 
     /// `W_Zip.next_w`: one tuple iterator in both slots. An odd remainder

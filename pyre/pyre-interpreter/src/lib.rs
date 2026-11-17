@@ -223,7 +223,7 @@ pub mod test_hooks {
         match crate::builtins::try_hash_value(obj) {
             Ok(h) => h,
             Err(e) => {
-                crate::baseobjspace::note_dict_callback_raise(true);
+                crate::baseobjspace::note_dict_callback_raise(&e, true);
                 crate::runtime_ops::jit_publish_residual_error(e)
             }
         }

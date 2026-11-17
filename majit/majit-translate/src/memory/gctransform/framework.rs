@@ -597,6 +597,21 @@ pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
         "gc_hook::try_gc_write_barrier_managed",
         &["eval::pyre_object_gc_write_barrier_managed_trampoline"],
     ),
+    // `exceptiontransform.py` `rpyexc_occurred` / `rpyexc_fetch_exception`
+    // read `exc_data` directly. pyre installs the reader: the backend cell
+    // (`install_jit_call_bridge`) or, in an interpreter-only build, the
+    // blackhole cell (`register_interpreter_rpyexc_fallback`).
+    (
+        "interp_exceptions::rpyexc_occurred",
+        &["call_jit::jit_exc_peek_shim", "runtime_ops::rpyexc_peek_bh"],
+    ),
+    (
+        "interp_exceptions::rpyexc_fetch",
+        &[
+            "call_jit::jit_exc_fetch_shim",
+            "runtime_ops::rpyexc_fetch_bh",
+        ],
+    ),
 ];
 
 /// Public majit_gc dispatchers that can collect and must stay in

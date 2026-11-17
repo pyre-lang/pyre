@@ -4999,6 +4999,17 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // passes `PY_NULL` for both tolerances, and `isclose`
                         // reads every slot through its `bound(i)` null filter.
                         "isclose_slow" => nargs == 4,
+                        // `make_pyerror(kind, message, exc_object, attach_tb,
+                        // context_recorded, reraise_lasti, w_name_context,
+                        // w_obj_context, w_type)` — `alloc_pyerror_object`
+                        // stores `exc_object` and the two context words
+                        // without reading them and tests `w_type.is_null()`
+                        // before the `kind` class lookup.  A fresh
+                        // `OverflowError` from `int_pow` carries `PY_NULL` in
+                        // all four.  Declining it marked the walk unjournaled,
+                        // and the legacy loop-entry replay then delivered a
+                        // FOR_ITER item a second time.
+                        "make_pyerror" => matches!(arg_index, 2 | 6 | 7 | 8) && nargs == 9,
                         _ => false,
                     }
                 })
