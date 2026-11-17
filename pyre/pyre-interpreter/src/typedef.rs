@@ -1497,11 +1497,11 @@ pub fn init_typeobjects() {
             &pyre_object::memoryview::BUFFER_WRAPPER_TYPE as *const PyType as usize,
             buffer_wrapper_type as usize,
         );
-        let seq_iterator_type = unsafe {
+        let seq_iterator_type = pyre_object::with_roots!(object_type => unsafe {
             crate::baseobjspace::object_space()
                 .gettypeobject(crate::objspace::std::iterobject::typedef())
                 .expect("sequence iterator TypeDef construction")
-        };
+        });
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
         // `iter(obj)`, never by `iterator()`, so `tp_new` is NULL.
         unsafe {
@@ -1512,11 +1512,11 @@ pub fn init_typeobjects() {
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             seq_iterator_type as usize,
         );
-        let reverse_iterator_type = unsafe {
+        let reverse_iterator_type = pyre_object::with_roots!(object_type => unsafe {
             crate::baseobjspace::object_space()
                 .gettypeobject(crate::objspace::std::iterobject::reverse_typedef())
                 .expect("reverse sequence iterator TypeDef construction")
-        };
+        });
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(reverse_iterator_type);
             pyre_object::w_type_set_acceptable_as_base_class(reverse_iterator_type, false);

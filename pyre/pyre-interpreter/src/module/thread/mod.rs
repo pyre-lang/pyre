@@ -2442,7 +2442,14 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if let Some(handle_obj) = W_ThreadHandle::from_obj(handle) {
         lock_state(&handle_obj.state).daemon = daemon;
     }
-    spawn_thread(callable, PY_NULL, PY_NULL, handle)?;
+    let spawn_base = req_roots.pin_roots(&[handle, callable]);
+    spawn_thread(
+        req_roots.get(spawn_base + 1),
+        PY_NULL,
+        PY_NULL,
+        req_roots.get(spawn_base),
+    )?;
+    let handle = req_roots.get(spawn_base);
     if !daemon {
         SHUTDOWN_HANDLES.lock().push(handle as usize);
     }

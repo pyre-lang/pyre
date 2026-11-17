@@ -888,11 +888,11 @@ pub(crate) fn frozen_cache_load(
 /// recompile of the ~116 KB bootstrap on every startup, which nothing else
 /// does.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn frozen_cache_store(cache_key: &str, source: &[u8], code: pyre_object::PyObjectRef) {
-    let Some(path) = frozen_cache_path(cache_key) else {
+pub(crate) fn frozen_cache_store(cache_key: &str, source: &[u8], mut code: pyre_object::PyObjectRef) {
+    let Some(path) = pyre_object::with_roots!(code => frozen_cache_path(cache_key)) else {
         return;
     };
-    let Some(base) = frozen_cache_base() else {
+    let Some(base) = pyre_object::with_roots!(code => frozen_cache_base()) else {
         return;
     };
     let Ok(marshalled) = crate::module::marshal::dumps_bytes(code) else {
@@ -958,11 +958,11 @@ pub(crate) fn applevel_cache_load(
 }
 
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn applevel_cache_store(cache_key: &str, source: &str, code: pyre_object::PyObjectRef) {
-    let Some(path) = frozen_cache_path(cache_key) else {
+pub(crate) fn applevel_cache_store(cache_key: &str, source: &str, mut code: pyre_object::PyObjectRef) {
+    let Some(path) = pyre_object::with_roots!(code => frozen_cache_path(cache_key)) else {
         return;
     };
-    let Some(base) = frozen_cache_base() else {
+    let Some(base) = pyre_object::with_roots!(code => frozen_cache_base()) else {
         return;
     };
     let Ok(marshalled) = crate::module::marshal::dumps_bytes(code) else {

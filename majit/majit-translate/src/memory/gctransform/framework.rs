@@ -452,6 +452,9 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     // `lloperation.py` `gc_identityhash` `canmallocgc=True` (and `gc_id` the
     // same). MiniMark's public dispatcher covers both operations.
     "majit_gc::gc_id_or_identityhash",
+    // rffi.py llexternal random_effects_on_gcobjs (invoke_around_handlers): leaving the census for an external
+    // block lets another thread collect and move objects (CollectAnalyzer.analyze_external_call).
+    "majit_gc::gc_sync::before_external_block",
 ];
 
 /// Public `majit_gc` dispatchers whose every path, including the installed

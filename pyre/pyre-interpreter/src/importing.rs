@@ -1545,7 +1545,7 @@ fn quote_for_cflags(path: &str) -> String {
 /// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
 /// turn, so a cross-compilation snapshot still overrides it.
 #[cfg(not(windows))]
-fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
+fn init_sysconfigdata(mut ns: PyObjectRef) -> Result<(), crate::PyError> {
     // These take the root slot rather than the dict itself: a word passed by
     // value goes stale the moment the key or the value allocates.
     fn store_str(vars_slot: usize, key: &str, value: &str) {
@@ -1621,7 +1621,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
         String::from("clang++ -bundle -undefined dynamic_lookup "),
     );
 
-    let base_prefix = sysconfigdata_base_prefix();
+    let base_prefix = pyre_object::with_roots!(ns => sysconfigdata_base_prefix());
     // `include/{implementation_lower}{py_version_short}{abi_thread}`, the
     // directory the posix_prefix scheme resolves `get_paths()['include']` to.
     // An interpreter that publishes no base prefix has nowhere to name.

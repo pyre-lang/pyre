@@ -1625,24 +1625,27 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let _ = crate::builtins::try_vec_zeroed(n)?;
         // `interp_posix.urandom` / `_signal_checker`. Invoked
         // from `rurandom._getrandom` on Linux `EINTR`.
-        let mut signal_error: Option<crate::PyError> = None;
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        let _ = roots.pin_root(w_n);
+        let mut got_signal = false;
         let outcome = {
             let mut checker = || match crate::module::signal::interp_signal::checksignals_now() {
                 Ok(()) => true,
                 Err(err) => {
-                    signal_error = Some(err);
+                    let _ = roots.pin_root(err.as_gc_ref());
+                    got_signal = true;
                     false
                 }
             };
-            pyre_object::with_roots!(w_n => {
-                majit_rlib::rurandom::urandom(n, Some(&mut checker))
-            })
+            majit_rlib::rurandom::urandom(n, Some(&mut checker))
         };
+        w_n = roots.get(base);
         match outcome {
             Ok(buf) => buf,
             Err(errno) => {
-                if let Some(err) = signal_error.take() {
-                    return Err(err);
+                if got_signal {
+                    return Err(crate::PyError::from_raw(roots.get(base + 1)));
                 }
                 // `wrap_oserror(..., w_exception_class=NotImplementedError)`.
                 return Err(crate::PyError::not_implemented(

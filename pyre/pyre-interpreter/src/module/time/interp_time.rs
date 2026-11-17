@@ -749,6 +749,7 @@ fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef
     }
     #[cfg(not(feature = "sandbox"))]
     {
+        let mut w_info = w_info;
         let clock = if majit_rlib::rtime::HAS_CLOCK_GETTIME_RUNTIME {
             if let Some(clk) = majit_rlib::rtime::CLOCK_PROF {
                 Some((clk, "clock_gettime(CLOCK_PROF)"))
@@ -801,7 +802,8 @@ fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef
             ));
         }
         let mut tms = unsafe { std::mem::zeroed::<majit_rlib::rposix::TMS>() };
-        let ret = unsafe { majit_rlib::rposix::c_times(&mut tms) };
+        let ret =
+            pyre_object::with_roots!(w_info => unsafe { majit_rlib::rposix::c_times(&mut tms) });
         if ret as i64 != -1 {
             let cpu_time = tms.c_tms_utime as i64 + tms.c_tms_stime as i64;
             let ticks_per_second = *majit_rlib::rposix::CLOCK_TICKS_PER_SECOND;
