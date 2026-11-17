@@ -1459,6 +1459,68 @@ mod tests {
             names.iter().any(|n| n == "ll_copy"),
             "list(RustVec) must mint an ll_copy helper graph, got {names:?}"
         );
+        assert!(
+            names.iter().any(|n| n == "ll_copy_raw_array_to_raw_array"),
+            "list(RustVec) must mint the raw-copy helper, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "ll_arraycopy"),
+            "list(RustVec) must not mint ll_arraycopy, got {names:?}"
+        );
+        let graphs = ann.translator.graphs.borrow();
+        let copy = graphs
+            .iter()
+            .find(|g| g.borrow().name == "ll_copy")
+            .expect("ll_copy graph");
+        let inner = copy.borrow();
+        let start = inner.startblock.borrow();
+        let copy_op = start
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "direct_call"
+                    && matches!(&op.args[0], Hlvalue::Constant(c) if format!("{:?}", c.value).contains("ll_copy_raw_array_to_raw_array"))
+            })
+            .expect("ll_copy calls ll_copy_raw_array_to_raw_array");
+        assert_eq!(copy_op.args.len(), 6, "func + 5 args: {:?}", copy_op.args);
+        let dest = &copy_op.args[2];
+        // `ll_copy` calls `ll_newlist`; the RustVec body of that helper
+        // is `direct_call(ll_vec_newlist_hint_*, length)` (`NewHint`).
+        let new_lst = start
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "direct_call"
+                    && matches!(&op.args[0], Hlvalue::Constant(c) if format!("{:?}", c.value).contains("ll_newlist"))
+            })
+            .map(|op| &op.result)
+            .expect("ll_copy allocates a fresh header via ll_newlist");
+        let newlist = graphs
+            .iter()
+            .find(|g| g.borrow().name == "ll_newlist")
+            .expect("ll_newlist graph");
+        let newlist_start = newlist.borrow().startblock.clone();
+        let newlist_ops = newlist_start.borrow();
+        assert!(
+            newlist_ops.operations.iter().any(|op| {
+                op.opname == "direct_call"
+                    && matches!(&op.args[0], Hlvalue::Constant(c) if format!("{:?}", c.value).contains("ll_vec_newlist_hint"))
+            }),
+            "RustVec ll_newlist must call ll_vec_newlist_hint"
+        );
+        let dest_getfield = start
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "getfield"
+                    && op.result == *dest
+                    && matches!(&op.args[1], Hlvalue::Constant(c) if matches!(&c.value, ConstValue::ByteStr(b) if b == b"ptr"))
+            })
+            .expect("dest is getfield(ptr) of the new header");
+        assert_eq!(
+            &dest_getfield.args[0], new_lst,
+            "dest buffer is the freshly allocated header's ptr"
+        );
     }
 
     /// `v[start:stop]` on a `Vec<PyObjectRef>` (`VecItemKind::Ref`) with

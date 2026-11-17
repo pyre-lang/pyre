@@ -47,7 +47,7 @@
 
 use indexmap::IndexMap;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
@@ -7252,28 +7252,6 @@ fn pygraph_for_cached_subject(
     })
 }
 
-/// Wrap a two-phase adapter graph as a `PyGraph` when the path has no
-/// `FunctionDesc` yet. `normalize_calltable_row_annotation` only reads
-/// `PyGraph.graph`.
-fn pygraph_from_adapter_graph(graph: crate::flowspace::model::GraphRef) -> Rc<PyGraph> {
-    let func = {
-        let g = graph.borrow();
-        g.func.clone().unwrap_or_else(|| {
-            GraphFunc::new(
-                g.name.clone(),
-                Constant::new(ConstValue::Dict(Default::default())),
-            )
-        })
-    };
-    Rc::new(PyGraph {
-        graph,
-        func,
-        signature: RefCell::new(Signature::new(vec!["args".to_string()], None, None)),
-        defaults: RefCell::new(Some(Vec::new())),
-        access_directly: Cell::new(false),
-    })
-}
-
 fn rtype_skip_wrapper_subjects(
     call_registry: &CallRegistry,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
@@ -7306,6 +7284,9 @@ fn rtype_skip_wrapper_subjects(
 /// and `builtin_code_call` is `dont_look_inside`. Install each
 /// annotated subject on `FunctionDesc.cache` (`GraphCacheKey::None`)
 /// and consider the generated `simple_call(func, slice)` shape once.
+/// The family is normalized by `normalizecalls.py`
+/// `perform_normalizations` → `normalize_call_familes` (called from
+/// `run_phase_b_rtype_isolated` after this function).
 fn consider_builtin_wrapper_call_site(
     call_registry: &CallRegistry,
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
@@ -7313,8 +7294,7 @@ fn consider_builtin_wrapper_call_site(
 ) -> Result<(), crate::annotator::model::AnnotatorError> {
     use crate::annotator::argument::simple_args;
     use crate::annotator::description::{FunctionDesc, GraphCacheKey};
-    use crate::annotator::model::SomeValue;
-    use crate::translator::rtyper::normalizecalls::normalize_calltable_row_annotation;
+    use crate::annotator::model::{AnnotatorError, SomeValue};
 
     let annotated: Vec<(&crate::parse::CallPath, crate::flowspace::model::GraphRef)> = {
         let tp = call_registry.two_phase();
@@ -7328,57 +7308,54 @@ fn consider_builtin_wrapper_call_site(
             .collect()
     };
     let mut descs: Vec<Rc<RefCell<FunctionDesc>>> = Vec::new();
-    let mut by_nargs: BTreeMap<usize, Vec<Rc<PyGraph>>> = BTreeMap::new();
     let mut s_arg: Option<SomeValue> = None;
     let mut s_result: Option<SomeValue> = None;
     for (path, graph) in &annotated {
         let args = graph.borrow().getargs();
-        if args.len() == 1 && s_arg.is_none() {
+        if s_arg.is_none() {
             s_arg = Some(
-                annotator
-                    .annotation(&args[0])
+                args.first()
+                    .and_then(|a| annotator.annotation(a))
                     .unwrap_or(SomeValue::Impossible),
             );
             let ret = graph.borrow().getreturnvar();
             s_result = Some(annotator.annotation(&ret).unwrap_or(SomeValue::Impossible));
         }
-        let pygraph = if let Some(entry) = call_registry.lookup(&FunctionPathKey::from(*path)) {
-            let desc_rc = entry.function_desc.clone();
-            let (pygraph, include_desc) = {
-                let desc = desc_rc.borrow();
-                let include_desc = args.len() == 1
-                    && desc.signature.argnames.len() == 1
-                    && !desc.signature.has_vararg()
-                    && !desc.signature.has_kwarg();
-                let mut cache = desc.cache.borrow_mut();
-                let pygraph = if let Some(existing) = cache.get(&GraphCacheKey::None)
-                    && Rc::ptr_eq(&existing.graph, graph)
-                {
-                    existing.clone()
-                } else {
-                    let pg = pygraph_for_cached_subject(&desc, (*graph).clone());
-                    cache.insert(GraphCacheKey::None, pg.clone());
-                    pg
-                };
-                (pygraph, include_desc)
-            };
-            if include_desc {
-                descs.push(desc_rc);
-            }
-            pygraph
-        } else {
-            pygraph_from_adapter_graph((*graph).clone())
+        let Some(entry) = call_registry.lookup(&FunctionPathKey::from(*path)) else {
+            return Err(AnnotatorError::new(format!(
+                "builtin wrapper {} has no CallRegistry entry",
+                path.display_name(),
+            )));
         };
-        by_nargs.entry(args.len()).or_default().push(pygraph);
-    }
-    // One calltable row per `getargs` arity (`normalizecalls.py`
-    // `nbargs` assert). Mixing arities in a single row panics; dropping
-    // non-1-arg members left always-raise wrappers un-normalized when
-    // the adapter startblock is not a single slice word.
-    for graphs in by_nargs.values() {
-        if graphs.len() > 1 {
-            normalize_calltable_row_annotation(annotator, graphs)?;
+        if args.len() != 1 {
+            return Err(AnnotatorError::new(format!(
+                "builtin wrapper {} startblock is not one slice word (arity {})",
+                path.display_name(),
+                args.len(),
+            )));
         }
+        let desc_rc = entry.function_desc.clone();
+        {
+            let desc = desc_rc.borrow();
+            if desc.signature.argnames.len() != 1
+                || desc.signature.has_vararg()
+                || desc.signature.has_kwarg()
+            {
+                return Err(AnnotatorError::new(format!(
+                    "builtin wrapper {} FunctionDesc signature is not one plain arg",
+                    path.display_name(),
+                )));
+            }
+            let mut cache = desc.cache.borrow_mut();
+            let already = cache
+                .get(&GraphCacheKey::None)
+                .is_some_and(|existing| Rc::ptr_eq(&existing.graph, graph));
+            if !already {
+                let pg = pygraph_for_cached_subject(&desc, (*graph).clone());
+                cache.insert(GraphCacheKey::None, pg);
+            }
+        }
+        descs.push(desc_rc);
     }
     if descs.is_empty() {
         return Ok(());
@@ -25127,6 +25104,184 @@ mod tests {
             LegacyGraph::concretetype_of(&arg),
             ConcreteType::Void,
             "residual actual of an impossible value is Void"
+        );
+    }
+
+    fn builtin_wrapper_test_graph(name: &str, argnames: &[&str]) -> GraphRef {
+        let inputargs: Vec<_> = argnames
+            .iter()
+            .map(|n| Hlvalue::Variable(Variable::named(*n)))
+            .collect();
+        let startblock = crate::flowspace::model::Block::shared(inputargs);
+        let graph = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
+        let ret_arg = startblock.borrow().inputargs[0].clone();
+        startblock.closeblock(vec![
+            crate::flowspace::model::Link::new(
+                vec![ret_arg],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph.into_ref()
+    }
+
+    fn bind_builtin_wrapper_test_graph(
+        ann: &crate::annotator::annrpython::RPythonAnnotator,
+        graph: &GraphRef,
+        inputs: &[crate::annotator::model::SomeValue],
+        result: crate::annotator::model::SomeValue,
+    ) {
+        {
+            let startblock = graph.borrow().startblock.clone();
+            let mut blk = startblock.borrow_mut();
+            for (arg, value) in blk.inputargs.iter_mut().zip(inputs.iter()) {
+                let Hlvalue::Variable(v) = arg else {
+                    panic!("expected variable input");
+                };
+                ann.setbinding(v, value.clone());
+            }
+        }
+        {
+            let returnblock = graph.borrow().returnblock.clone();
+            let mut blk = returnblock.borrow_mut();
+            let Hlvalue::Variable(v) = &mut blk.inputargs[0] else {
+                panic!("expected variable return");
+            };
+            ann.setbinding(v, result);
+        }
+        let startblock = graph.borrow().startblock.clone();
+        let bkey = BlockKey::of(&startblock);
+        ann.annotated
+            .borrow_mut()
+            .insert(bkey.clone(), Some(graph.clone()));
+        ann.all_blocks.borrow_mut().insert(bkey, startblock);
+    }
+
+    fn insert_builtin_wrapper_test_subject(
+        registry: &CallRegistry,
+        path: &crate::parse::CallPath,
+        graph: &GraphRef,
+    ) {
+        registry.two_phase().subjects.insert(
+            path.clone(),
+            crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                graph: graph.clone(),
+                pygraph: None,
+                graph_key: GraphKey::of(graph),
+                value_to_var: HashMap::new(),
+                value_to_var_candidates: HashMap::new(),
+                constant_concretetypes: HashMap::new(),
+                constant_hlvalues: HashMap::new(),
+                block_map: HashMap::new(),
+            },
+        );
+    }
+
+    /// Two annotated wrappers, one always-raising, share one CallFamily
+    /// row; `perform_normalizations` → `normalize_call_familes` unions
+    /// their arg and return annotations.
+    #[test]
+    fn builtin_wrappers_share_one_callfamily_row_normalized_by_perform_normalizations() {
+        use crate::annotator::model::{SomeValue, s_bool, s_int};
+        use crate::translator::rtyper::normalizecalls::perform_normalizations;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let path_ok = crate::parse::CallPath::from_segments(["owner", "__majit_wrap_ok"]);
+        let path_raise =
+            crate::parse::CallPath::from_segments(["owner", "__majit_wrap_always_raise"]);
+        let graph_ok = builtin_wrapper_test_graph("__majit_wrap_ok", &["args"]);
+        let graph_raise = builtin_wrapper_test_graph("__majit_wrap_always_raise", &["args"]);
+        bind_builtin_wrapper_test_graph(&ann, &graph_ok, &[s_int()], s_int());
+        bind_builtin_wrapper_test_graph(&ann, &graph_raise, &[s_bool()], SomeValue::Impossible);
+        registry.get_or_register(
+            FunctionPathKey::from(&path_ok),
+            Signature::new(vec!["args".to_string()], None, None),
+        );
+        registry.get_or_register(
+            FunctionPathKey::from(&path_raise),
+            Signature::new(vec!["args".to_string()], None, None),
+        );
+        insert_builtin_wrapper_test_subject(&registry, &path_ok, &graph_ok);
+        insert_builtin_wrapper_test_subject(&registry, &path_raise, &graph_raise);
+
+        consider_builtin_wrapper_call_site(&registry, &ann, &[path_ok.clone(), path_raise.clone()])
+            .expect("consider_builtin_wrapper_call_site");
+
+        let desc_ok = registry
+            .lookup(&FunctionPathKey::from(&path_ok))
+            .expect("ok desc")
+            .function_desc
+            .clone();
+        let desc_raise = registry
+            .lookup(&FunctionPathKey::from(&path_raise))
+            .expect("raise desc")
+            .function_desc
+            .clone();
+        let fam_ok = desc_ok
+            .borrow()
+            .base
+            .querycallfamily()
+            .expect("ok CallFamily");
+        let fam_raise = desc_raise
+            .borrow()
+            .base
+            .querycallfamily()
+            .expect("raise CallFamily");
+        assert!(
+            Rc::ptr_eq(&fam_ok, &fam_raise),
+            "both wrappers belong to one CallFamily"
+        );
+        {
+            let fam = fam_ok.borrow();
+            assert_eq!(fam.calltables.len(), 1, "one call shape");
+            let table = fam.calltables.values().next().expect("row table");
+            assert_eq!(table.len(), 1, "one CallFamily row");
+            assert_eq!(table[0].len(), 2, "both wrappers in the row");
+        }
+        let ret_raise = graph_raise.borrow().getreturnvar();
+        assert!(
+            matches!(ann.binding(&ret_raise), SomeValue::Impossible),
+            "always-raising return stays Impossible until perform_normalizations"
+        );
+
+        perform_normalizations(&ann).expect("perform_normalizations");
+
+        let arg_ok = graph_ok.borrow().getargs()[0].clone();
+        let arg_raise = graph_raise.borrow().getargs()[0].clone();
+        let ret_ok = graph_ok.borrow().getreturnvar();
+        let ret_raise = graph_raise.borrow().getreturnvar();
+        assert!(matches!(ann.binding(&arg_ok), SomeValue::Integer(_)));
+        assert!(matches!(ann.binding(&arg_raise), SomeValue::Integer(_)));
+        assert!(matches!(ann.binding(&ret_ok), SomeValue::Integer(_)));
+        assert!(matches!(ann.binding(&ret_raise), SomeValue::Integer(_)));
+    }
+
+    /// A wrapper whose startblock has two inputargs is a front-lowering
+    /// inconsistency for the single-ABI `simple_call(func, slice)` site.
+    #[test]
+    fn builtin_wrapper_two_inputargs_is_an_error() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let path = crate::parse::CallPath::from_segments(["owner", "__majit_wrap_two_args"]);
+        let graph = builtin_wrapper_test_graph("__majit_wrap_two_args", &["args", "args_len"]);
+        registry.get_or_register(
+            FunctionPathKey::from(&path),
+            Signature::new(vec!["args".to_string()], None, None),
+        );
+        insert_builtin_wrapper_test_subject(&registry, &path, &graph);
+
+        let err = consider_builtin_wrapper_call_site(&registry, &ann, &[path.clone()])
+            .expect_err("two-inputarg wrapper");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display_name()),
+            "error names the wrapper; got: {msg}"
+        );
+        assert!(
+            msg.contains("startblock is not one slice word"),
+            "error names the startblock inconsistency; got: {msg}"
         );
     }
 }

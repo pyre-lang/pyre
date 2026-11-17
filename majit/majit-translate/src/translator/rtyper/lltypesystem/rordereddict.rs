@@ -6886,7 +6886,9 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
 /// Synthesise a struct-array specialisation of `rgc.ll_arraycopy` (`rgc.py`)
 /// for the `odictentry` entries array — the same primitive
 /// `build_ll_arraycopy_helper_graph` in `rlist.rs` specialises for bare
-/// scalar-item `Ptr(GcArray(ITEM))` lists:
+/// scalar-item `Ptr(GcArray(ITEM))` lists (`rgc.py` `ll_arraycopy`
+/// `length <= 1` `copy_item` head plus the slowpath loop). Struct-element
+/// ARRAYs use `copy_struct_item` (`getinteriorfield` / `setinteriorfield`):
 ///
 /// ```python
 /// def ll_arraycopy(source, dest, 0, 0, length):

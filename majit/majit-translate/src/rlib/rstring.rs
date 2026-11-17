@@ -44,9 +44,9 @@ use crate::translator::rtyper::lltypesystem::rstr::{
 };
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rlist::{
-    ListLayout, ListRepr, build_ll_append_helper_graph, build_ll_arraycopy_helper_graph,
-    build_ll_getitem_fast_helper_graph, build_ll_list_resize_ge_helper_graph,
-    build_ll_newlist_helper_graph, build_ll_setitem_fast_helper_graph, items_array_ptr_lltype,
+    ListLayout, ListRepr, build_ll_append_helper_graph, build_ll_getitem_fast_helper_graph,
+    build_ll_list_resize_ge_helper_graph, build_ll_newlist_helper_graph,
+    build_ll_setitem_fast_helper_graph, mint_ll_arraycopy,
 };
 use crate::translator::rtyper::rmodel::{Repr, gc_flavor_const, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
@@ -442,7 +442,6 @@ struct TwowayTableOps {
 fn twoway_table_ops(rtyper: &RPythonTyper) -> Result<TwowayTableOps, TyperError> {
     let list_lltype = table_list_ptr_lltype();
     let item_lltype = LowLevelType::Signed;
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
 
     let newlist = {
         let ptr = list_lltype.clone();
@@ -463,17 +462,7 @@ fn twoway_table_ops(rtyper: &RPythonTyper) -> Result<TwowayTableOps, TyperError>
         )?
     };
 
-    let arraycopy = {
-        let item = item_lltype.clone();
-        rtyper.lowlevel_helper_function_with_builder(
-            "ll_arraycopy".to_string(),
-            vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
-            LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
-            },
-        )?
-    };
+    let arraycopy = mint_ll_arraycopy(rtyper, item_lltype.clone())?;
     let setitem_fast = {
         let ptr = list_lltype.clone();
         let item = item_lltype.clone();
