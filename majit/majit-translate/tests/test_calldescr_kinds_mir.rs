@@ -232,6 +232,11 @@ fn scalar_pointer_params_match_int_callers() {
         })
         .expect("caller invokes the callback");
     let hash_out = args[5].as_variable().expect("hash_out value").clone();
+    let hash_word = args[2].as_variable().expect("hash value").clone();
+    assert_ne!(
+        hash_out, hash_word,
+        "hash_out is the address of keyhash, not the hash word"
+    );
     let produced = root_op(&caller, &hash_out);
     // `&raw mut *(&mut keyhash)` is spilled to a raw address.
     // `_rewrite_raw_malloc` types that word Int, the same bank as

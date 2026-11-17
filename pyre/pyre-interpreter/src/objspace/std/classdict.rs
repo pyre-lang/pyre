@@ -108,6 +108,12 @@ struct ClassDictMethods;
 
 static CLASS_DICT_METHODS: ClassDictMethods = ClassDictMethods;
 
+/// Address of [`CLASS_DICT_METHODS`] for `jit_static_ref_addrs`: the
+/// prebuilt instance every `ClassDictStrategySlot` method reads.
+pub(crate) fn class_dict_methods_addr() -> i64 {
+    &CLASS_DICT_METHODS as *const ClassDictMethods as i64
+}
+
 /// rerased unerase (`classdict.py`): `dstorage` is the type.
 unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
     (*(w_dict as *const pyre_object::W_DictObject)).dstorage as PyObjectRef

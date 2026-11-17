@@ -303,9 +303,8 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// Constructors and field reads now normalize at
 /// `Bookkeeper::intern_class_by_qualname`, including header-bearing structs;
 /// normalization keeps the crate-relative module path so their full base-chain
-/// walk still runs.  Keep this compare-time fallback for registry-absent or
-/// ambiguous constructor spellings: it fires only where `commonbase` is
-/// already None.
+/// walk still runs.  This compare uses that same intern key and fires only
+/// where `commonbase` is already None.
 ///
 /// It runs the intern's dotted-to-`::` spelling step — [`normalize_class_qualname`] —
 /// rather than a second rule of its own. Class intern keys are resolved on the
@@ -5049,7 +5048,7 @@ mod tests {
     }
 
     #[test]
-    fn someptr_call_instance_arg_matches_objectptr_and_returns_instance() {
+    fn someptr_call_rejects_classdef_less_instance_as_objectptr_arg() {
         use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
         use crate::translator::rtyper::rclass::OBJECTPTR;
 
@@ -5066,12 +5065,14 @@ mod tests {
         });
         let args =
             super::super::argument::ArgumentsForTranslation::new(vec![Some(s_inst)], None, None);
-        let result = s_ptr
+        let err = s_ptr
             .call(&args)
-            .expect("SomeInstance argument equals FUNC.ARGS OBJECTPTR");
+            .expect_err("SomePtr.call has no instance arm");
         assert!(
-            matches!(result, SomeValue::Instance(_)),
-            "ll_to_annotation of OBJECTPTR FUNC.RESULT is the instance, got {result:?}"
+            err.msg
+                .unwrap_or_default()
+                .contains("should return a low-level type"),
+            "annotation_to_lltype rejects a high-level instance"
         );
     }
 

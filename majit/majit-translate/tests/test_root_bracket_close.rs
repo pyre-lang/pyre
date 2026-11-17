@@ -8,11 +8,12 @@
 //! collection walks them, so a loop that opens one per iteration turns a
 //! constant root set into a growing one.
 //!
-//! The close is spelled as a call taking the guard by reference rather than as
-//! two field reads and a truncate, because a crate that imports `RootScope`
-//! sees an opaque stub with no fields. Reading the fields would confine the
-//! close to `pyre-object`, which is why `pyre_interpreter` is checked here and
-//! not just `pyre_object`.
+//! The close is spelled as a call taking the guard's save_point word rather
+//! than a reference or two field reads, because a crate that imports
+//! `RootScope` sees an opaque stub with no fields. Reading the fields would
+//! confine the close to `pyre-object`, which is why `pyre_interpreter` is
+//! checked here and not just `pyre_object`. The residual argument is Int so
+//! the jitcode has no `cast_int_to_ptr` before the close.
 //!
 //! Two things make the close conditional on more than the `Drop` arm existing,
 //! and each has a fixture below. The guard has to reach the dropping block:
@@ -38,15 +39,16 @@ use common::{
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     CallFunc, CallKind, FunId, JsonVal, Operand, PlaceKind, SwitchTargets, TermKind, TyRef,
-    Unstructured,
+    TypeDeclKind, Unstructured,
 };
 use majit_translate::CallPath;
 use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
-    LowerContext, RootStackState, erased_root_bracket_guards, lower_fun_decl,
-    lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
+    LowerContext, RootStackState, apply_published_structs, erased_root_bracket_guards,
+    harvest_published_structs, lower_fun_decl, lower_fun_decl_with_root_stack,
+    lower_fun_decl_with_static_addrs,
 };
 use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
 
@@ -62,8 +64,42 @@ fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGra
         .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
+/// Body-carrying FunDecls from defining crates so an Opaque import of a
+/// wrapper is a regular call into that crate's graph, matching the merged
+/// program (`StructFieldRegistry::foreign_callables`).
+fn extras_for(llbc: &'static Llbc) -> Vec<&'static Llbc> {
+    match llbc.crate_name() {
+        "pyre_interpreter" => vec![object_llbc()],
+        "pyre_module" => vec![object_llbc(), interpreter_llbc()],
+        _ => Vec::new(),
+    }
+}
+
+fn context_with_extras<'a>(llbc: &'a Llbc, extras: &[&Llbc]) -> LowerContext<'a> {
+    let mut context = LowerContext::new(llbc);
+    for extra in extras {
+        context.note_loaded_crate_bodies(extra);
+    }
+    context
+}
+
+/// `with_shared_lowering`'s cached context does not record other crates'
+/// bodies. Note them on a local context; the cached value is `&'static`
+/// and not `Clone`.
+fn with_linked_lowering<R>(llbc: &'static Llbc, f: impl FnOnce(&LowerContext<'_>) -> R) -> R {
+    with_shared_lowering(llbc, |shared| {
+        let extras = extras_for(llbc);
+        if extras.is_empty() {
+            f(shared)
+        } else {
+            let ctx = context_with_extras(llbc, &extras);
+            f(&ctx)
+        }
+    })
+}
+
 fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
-    with_shared_lowering(llbc, |ctx| lower_fun(llbc, ctx, leaf))
+    with_linked_lowering(llbc, |ctx| lower_fun(llbc, ctx, leaf))
 }
 
 /// Same class-static bucket the production driver stamps
@@ -75,7 +111,7 @@ fn lower_named_with_pytypes(
     leaf: &str,
     pytypes: &[(&str, i64)],
 ) -> FunctionGraph {
-    with_shared_lowering(llbc, |ctx| {
+    with_linked_lowering(llbc, |ctx| {
         lower_fun_decl_with_static_addrs(
             ctx,
             fun_decl_named(llbc, leaf),
@@ -107,7 +143,7 @@ fn calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
 fn assert_bracket_closes(llbc: &'static Llbc, leaf: &str) {
     let graph = lower_named(llbc, leaf);
     let opened = calls_to(&graph, "push_roots");
-    let closed = calls_to(&graph, "root_scope_close");
+    let closed = calls_to(&graph, "root_scope_close_word");
     assert!(
         opened > 0,
         "{leaf} is the fixture for a lowered root bracket, but it opens none"
@@ -150,6 +186,132 @@ fn bracket_closes_for_each_caller_shape() {
             panic!("case {name}: {msg}");
         }
     }
+}
+
+/// Residual `push_roots` returns the guard as its save_point Int. The close
+/// takes that word as Int (`root_scope_close_word`); a Ref argument would
+/// make jtransform insert `cast_int_to_ptr` of a non-GC word.
+#[test]
+fn close_takes_the_guard_word_as_int() {
+    let cases: &[(&str, fn() -> &'static Llbc, &str)] = &[
+        ("owns_guard", object_llbc, "w_tuple_items_copy_as_vec"),
+        (
+            "imports_guard",
+            interpreter_llbc,
+            "call_function_impl_result",
+        ),
+        ("runtime_pin_loop", interpreter_llbc, "tuple_concat"),
+    ];
+    for (name, load, leaf) in cases {
+        let llbc = load();
+        let graph = lower_named(llbc, leaf);
+        let mut found = 0usize;
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !segments
+                .last()
+                .is_some_and(|s| s == "root_scope_close_word")
+            {
+                continue;
+            }
+            found += 1;
+            assert_eq!(args.len(), 1, "{name}/{leaf}: close has one arg");
+            let arg = args[0]
+                .as_variable()
+                .unwrap_or_else(|| panic!("{name}/{leaf}: close arg is a variable"));
+            let from_cast = graph.blocks.iter().flat_map(|b| &b.operations).any(|prev| {
+                prev.result.as_ref() == Some(arg)
+                    && match &prev.kind {
+                        OpKind::UnaryOp { op, .. } => op == "cast_int_to_ptr",
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } => segments.last().is_some_and(|s| s == "cast_int_to_ptr"),
+                        _ => false,
+                    }
+            });
+            assert!(
+                !from_cast,
+                "{name}/{leaf}: close arg is produced by cast_int_to_ptr"
+            );
+        }
+        assert!(
+            found > 0,
+            "{name}/{leaf} is the fixture for a surviving root bracket, but it closes none"
+        );
+    }
+}
+
+/// Production copies the defining crate's field list onto an importer's
+/// Opaque wrapper. The copy has to keep the unique scalar-word field so
+/// identity can fire (`tyref_transparent_inner_value_type`).
+#[test]
+fn published_wrapper_on_jit_artefact_keeps_scalar_word_field() {
+    const JIT_LLBC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-jit.ullbc"
+    );
+    if !std::path::Path::new(OBJECT_LLBC).is_file() || !std::path::Path::new(JIT_LLBC).is_file() {
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
+    let mut jit = Llbc::load(JIT_LLBC).expect("load jit llbc");
+    let rows = harvest_published_structs(&object);
+    let harvested = rows
+        .iter()
+        .filter(|row| row.path.ends_with("RootScope"))
+        .map(|row| {
+            (
+                row.path.clone(),
+                row.fields
+                    .iter()
+                    .map(|f| (f.name.clone(), format!("{}", f.ty)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    apply_published_structs(&mut jit, &rows);
+    let td = jit
+        .iter_type_decls()
+        .find(|td| td.item_meta.name_path().ends_with("::RootScope"))
+        .expect("jit artefact names the wrapper");
+    let fields = match &td.kind {
+        TypeDeclKind::Struct(fields) => fields
+            .iter()
+            .map(|f| (f.name.clone(), format!("{:?}", f.ty)))
+            .collect::<Vec<_>>(),
+        other => {
+            panic!(
+                "jit wrapper after publish is {other:?}, harvested={harvested:?}, published={}",
+                td.published_struct_copy
+            )
+        }
+    };
+    assert!(
+        td.published_struct_copy,
+        "jit wrapper is a published copy; harvested={harvested:?} fields={fields:?}"
+    );
+    assert!(
+        td.is_repr_transparent(),
+        "jit wrapper keeps repr(transparent); fields={fields:?}"
+    );
+    let marker = fields
+        .iter()
+        .find(|(name, _)| name.as_deref() == Some("_not_send"));
+    let Some((_, ty)) = marker else {
+        panic!("published wrapper has no marker field; fields={fields:?}");
+    };
+    assert!(
+        ty.contains("PhantomData") && ty.contains("Path"),
+        "jit published marker stays Path-form PhantomData; fields={fields:?}"
+    );
 }
 
 /// A body whose guard is dropped several blocks away from where it is bound.
@@ -251,7 +413,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
             let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &root_stack_state) else {
                 continue;
             };
-            if calls_to(&graph, "root_scope_close") > 0 {
+            if calls_to(&graph, "root_scope_close_word") > 0 {
                 continue;
             }
             let name = fd.item_meta.name_path().to_string();
@@ -341,14 +503,25 @@ fn nearly_every_dropped_bracket_closes() {
     let llbcs: Vec<&'static Llbc> = vec![object_llbc(), interpreter_llbc()];
     with_shared_lowering_many(&llbcs, |ctxs| {
         // Derive metadata once per program and share each context across workers.
+        let extras_noted: Vec<Option<LowerContext<'_>>> = llbcs
+            .iter()
+            .map(|llbc| {
+                let extras = extras_for(llbc);
+                if extras.is_empty() {
+                    None
+                } else {
+                    Some(context_with_extras(llbc, &extras))
+                }
+            })
+            .collect();
         let mut work: Vec<(
             &'static Llbc,
-            &'static LowerContext<'static>,
+            &LowerContext<'_>,
             &majit_charon_reader::ullbc::FunDecl,
             usize,
         )> = Vec::new();
         for (i, llbc) in llbcs.iter().enumerate() {
-            let context = ctxs[i];
+            let context = extras_noted[i].as_ref().unwrap_or(ctxs[i]);
             let root_stack_state = RootStackState::new(llbc);
             for fd in llbc.iter_local_fns() {
                 let Some(body) = fd.unstructured() else {
@@ -611,7 +784,7 @@ fn reachable_closes(graph: &FunctionGraph) -> usize {
             .filter(|op| {
                 matches!(&op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if segments.last().is_some_and(|s| s == "root_scope_close"))
+                        if segments.last().is_some_and(|s| s == "root_scope_close_word"))
             })
             .count();
         stack.extend(graph.blocks[b].exits.iter().map(|e| e.target.0));
@@ -632,7 +805,7 @@ fn a_constant_offset_bracket_is_scalar_replaced() {
         "publish_roots",
         "normalize_roots",
         "shadow_stack_get",
-        "root_scope_close",
+        "root_scope_close_word",
     ] {
         assert_eq!(
             calls_to(&graph, leaf),
@@ -672,7 +845,7 @@ fn ll_listslice_inner_bracket_is_scalar_replaced() {
             "normalize_roots",
             "shadow_stack_get",
             "pin_root",
-            "root_scope_close",
+            "root_scope_close_word",
         ] {
             assert_eq!(
                 calls_to(&graph, leaf),
@@ -728,7 +901,7 @@ fn eval_slice_index_is_depth_neutral() {
             "push_roots",
             "pin_root",
             "shadow_stack_get",
-            "root_scope_close",
+            "root_scope_close_word",
         ] {
             assert_eq!(
                 calls_to(&graph, leaf),
@@ -754,7 +927,7 @@ fn zip_two_tuple_next_bracket_is_scalar_replaced() {
             "normalize_roots",
             "shadow_stack_get",
             "pin_root",
-            "root_scope_close",
+            "root_scope_close_word",
         ] {
             assert_eq!(
                 calls_to(&graph, leaf),
@@ -779,7 +952,7 @@ fn binary_slice_values_inner_bracket_is_scalar_replaced() {
         "normalize_roots",
         "shadow_stack_get",
         "pin_root",
-        "root_scope_close",
+        "root_scope_close_word",
     ] {
         assert_eq!(
             calls_to(&graph, leaf),
@@ -799,7 +972,7 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     let interpreter = load_llbc(INTERPRETER_LLBC);
     with_llbc_link_state(object, || {
         with_llbc_link_state(interpreter, || {
-            let context = LowerContext::new(interpreter);
+            let context = context_with_extras(interpreter, &[object]);
             let (mut sensitive, mut leaves, mut params, mut ret_idx, mut observes, mut neutral) =
                 majit_translate::front::mir::discover_stack_fn_effects(object);
             object.register_stack_sensitive_fns(sensitive.iter().cloned());
@@ -837,7 +1010,7 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
                 "normalize_roots",
                 "shadow_stack_get",
                 "pin_root",
-                "root_scope_close",
+                "root_scope_close_word",
             ] {
                 assert_eq!(
                     calls_to(&graph, leaf),
@@ -1137,7 +1310,7 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
         touching
             .extend(majit_translate::front::mir::harvest_root_stack_touching_paths(interpreter));
         interpreter.set_root_stack_effects(crates, touching);
-        let context = LowerContext::new(interpreter);
+        let context = context_with_extras(interpreter, &[object]);
         let graph = lower_fun(interpreter, &context, "type_get_annotations");
         assert!(
             !graph.blocks.is_empty(),
@@ -1188,7 +1361,7 @@ fn ll_listslice_new_int_list_bracket_is_scalar_replaced() {
         "normalize_roots",
         "shadow_stack_get",
         "pin_root",
-        "root_scope_close",
+        "root_scope_close_word",
     ] {
         assert_eq!(
             calls_to(&graph, leaf),
@@ -1214,9 +1387,8 @@ fn format_int_decimal_bracket_is_scalar_replaced() {
         "shadow_stack_get",
         "pin_root",
         "base",
-        "get",
-        "set",
-        "root_scope_close",
+        "shadow_stack_set",
+        "root_scope_close_word",
     ] {
         assert_eq!(
             calls_to(&graph, leaf),
@@ -1240,8 +1412,7 @@ fn set_add_value_bracket_is_scalar_replaced() {
         "shadow_stack_get",
         "pin_root",
         "base",
-        "get",
-        "root_scope_close",
+        "root_scope_close_word",
     ] {
         assert_eq!(
             calls_to(&graph, leaf),
@@ -1924,7 +2095,7 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
     with_llbc_link_state(interpreter, || {
         let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
         interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
-        let context = LowerContext::new(interpreter);
+        let context = context_with_extras(interpreter, &[object]);
         let graph = lower_fun(interpreter, &context, "slice_unpack");
         for leaf in [
             "push_roots",
@@ -1932,7 +2103,7 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
             "pin_roots",
             "shadow_stack_len",
             "shadow_stack_get",
-            "root_scope_close",
+            "root_scope_close_word",
         ] {
             assert_eq!(
                 calls_to(&graph, leaf),
@@ -2025,7 +2196,7 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
                     );
                     crates.push(llbc.crate_name().to_string());
                 }
-                let context = LowerContext::new(module);
+                let context = context_with_extras(module, &[object, interpreter]);
                 let graph = lower_fun(module, &context, "__majit_wrap_cdata_call");
                 for leaf in [
                     "push_roots",
@@ -2033,7 +2204,7 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
                     "pin_root",
                     "shadow_stack_get",
                     "shadow_stack_copy_range",
-                    "root_scope_close",
+                    "root_scope_close_word",
                 ] {
                     assert_eq!(
                         calls_to(&graph, leaf),
@@ -2232,7 +2403,7 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
                     );
                     crates.push(llbc.crate_name().to_string());
                 }
-                let context = LowerContext::new(module);
+                let context = context_with_extras(module, &[object, interpreter]);
                 let graph = lower_fun(module, &context, "do_call");
                 assert_eq!(
                     calls_to(&graph, "push_roots"),
@@ -2312,14 +2483,14 @@ fn isinstance_bracket_is_scalar_replaced() {
     with_llbc_link_state(interpreter, || {
         let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(object);
         interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
-        let context = LowerContext::new(interpreter);
+        let context = context_with_extras(interpreter, &[object]);
         let graph = lower_fun(interpreter, &context, "baseobjspace::isinstance");
         for leaf in [
             "push_roots",
             "pin_roots",
             "pin_root",
             "shadow_stack_get",
-            "root_scope_close",
+            "root_scope_close_word",
         ] {
             assert_eq!(
                 calls_to(&graph, leaf),
@@ -2328,4 +2499,32 @@ fn isinstance_bracket_is_scalar_replaced() {
             );
         }
     });
+}
+
+/// `_check_not_duplicate_kwargs` copies the published existing-names
+/// slice into `existing_now`, a separately allocated buffer.
+/// `pop_roots` / `expand_pop_roots` (`gc_restore_root`) reloads
+/// livevars; a no-op copy would leave that buffer holding stale words.
+/// The public `look_inside_iff` name is a trampoline; the rooted body
+/// is `_orig_check_not_duplicate_kwargs`.
+#[test]
+fn check_not_duplicate_kwargs_keeps_copy_into_existing_now() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let erase = majit_translate::front::mir::shadow_stack_erase_named(
+        &interpreter,
+        "::_orig_check_not_duplicate_kwargs",
+    );
+    assert!(
+        erase.starts_with("copy-range-dest-not-published-slice"),
+        "existing_now is a distinct buffer, erase={erase}"
+    );
 }

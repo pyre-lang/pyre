@@ -487,6 +487,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn object_key_entry_heuristic_value_offset_is_two_words() {
+        let word = target_word_size();
+        if word != 8 {
+            return;
+        }
+        let mut fields = HashMap::new();
+        fields.insert(
+            "ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        let entry = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        fields.insert(
+            entry.to_string(),
+            vec![
+                ("key".to_string(), "ObjectKey".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let known = HashSet::from(["ObjectKey".to_string(), entry.to_string()]);
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &known,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let layout = provider.get_struct_layout(entry).unwrap();
+        let value = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "value")
+            .expect("value");
+        assert_eq!(value.offset, 24);
+        assert_eq!(layout.size, 40);
+        assert_eq!(layout.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(layout.fields[0].size, 16);
+    }
+
+    #[test]
     fn test_heuristic_provider_basic_struct() {
         let mut fields = HashMap::new();
         fields.insert(
