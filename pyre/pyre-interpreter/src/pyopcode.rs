@@ -488,11 +488,12 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 /// that walk; this returns both from the single pass. `usize::MAX` /
 /// `u64::MAX` are the corruption sentinels of the two projections.
 ///
+/// The combined return is two words, so a residual cannot publish it.
 /// Same `@jit.unroll_safe` as the two projections (`dispatch_bytecode`'s
-/// EXTENDED_ARG loop). `instruction_discriminant` rather than
-/// `u8::from(instruction)`: Charon lowers `From` as
-/// `instruction::<Impl>::from`, which is not in the CallRegistry and
-/// skips `eval_loop_jit_portal` in the prepass.
+/// EXTENDED_ARG loop); the loop is bounded by the bytecode format.
+/// `instruction_discriminant` rather than `u8::from(instruction)`: Charon
+/// lowers `From` as `instruction::<Impl>::from`, which is not in the
+/// CallRegistry and skips `eval_loop_jit_portal` in the prepass.
 #[inline]
 #[majit_macros::unroll_safe]
 pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {
@@ -1145,6 +1146,9 @@ pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
 }
 
 pub trait OpcodeStepExecutor: SharedOpcodeHandler {
+    /// The frame's `pycode` wrapper (`pyframe.py` `PyFrame.pycode`).
+    fn pycode(&self) -> pyre_object::PyObjectRef;
+
     fn load_const(&mut self, constant: &ConstantData) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
@@ -2569,16 +2573,17 @@ where
     };
     // Remaining-sibling `JUMP_BACKWARD_NO_INTERRUPT` is a backward
     // offset whose target does not dominate the jump (`pyopcode.py`
-    // `JUMP_FORWARD` on PyPy). The domination predicate is residual
-    // (`dont_look_inside`); both opcodes share this already-skipped
-    // generic so the no-interrupt body is not a new two-phase subject.
+    // `JUMP_FORWARD` on PyPy). `code_jump_is_handler_only` answers from
+    // the cached `PyCode.loop_header_info` edges (`dont_look_inside`);
+    // both opcodes share this already-skipped generic so the
+    // no-interrupt body is not a new two-phase subject.
     if skip_handler_only {
         if target >= next_instr {
             executor.set_next_instr(target)?;
             return Ok(StepResult::Continue);
         }
         let source_pc = next_instr - 1;
-        if crate::backward_jump_is_handler_only_target(code, source_pc, target) {
+        if crate::code_jump_is_handler_only(executor.pycode(), source_pc, target) {
             executor.set_next_instr(target)?;
             return Ok(StepResult::Continue);
         }

@@ -1684,6 +1684,88 @@ fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
     );
 }
 
+/// `gil.py GILThreadLocals.gil_ready` is a harvested `_alloc_flavor_ = raw`
+/// `static mut`. The Global emits an Address-stamped ConstRefAddr and
+/// `__cast_instance_intrinsic` onto the class root so getattr of
+/// `gil_ready` annotates; the instance pointer is int-kinded
+/// (`descr.py get_type_flag` of a raw Ptr).
+#[test]
+fn orig_gil_ready_word_static_is_int_banked_address() {
+    let llbc = object_llbc();
+    let harvested = majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    assert!(
+        harvested.iter().any(|s| s.contains("GilReadyState")),
+        "harvested flavor set must include GilReadyState, got {harvested:?}"
+    );
+    let graph = with_shared_lowering(llbc, |ctx| {
+        lower_fun_decl_with_static_addrs(
+            ctx,
+            fun_decl_named(llbc, "gil_ready_word"),
+            HostStaticAddrs {
+                refs: &[("gil_ready::GIL_READY_STATE", 0x1111)],
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("lower gil_ready_word: {e:?}"))
+    });
+    let mut const_ref = Vec::new();
+    let mut casts = 0usize;
+    let mut cast_kind = None;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::ConstRefAddr(addr) => {
+                let ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+                let ll = op.result.as_ref().and_then(|v| v.concretetype());
+                const_ref.push((*addr, ct, ll));
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                casts += 1;
+                cast_kind = Some((
+                    op.result.as_ref().map(FunctionGraph::concretetype_of),
+                    result_ty.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        const_ref
+            .iter()
+            .map(|(addr, _, _)| *addr)
+            .collect::<Vec<_>>(),
+        vec![0x1111],
+        "gil_ready_word must load GIL_READY_STATE as ConstRefAddr: {const_ref:?} graph={graph:?}"
+    );
+    assert!(
+        const_ref.iter().any(|(_, ct, ll)| {
+            *ct == Some(majit_translate::ConcreteType::Signed)
+                && matches!(
+                    ll,
+                    Some(majit_translate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+                )
+        }),
+        "GIL_READY_STATE address word must be llmemory.Address, got {const_ref:?} graph={graph:?}"
+    );
+    assert_eq!(
+        casts, 1,
+        "raw-flavor STRUCT static wraps as the class instance: {graph:?}"
+    );
+    assert_eq!(
+        cast_kind,
+        Some((
+            Some(majit_translate::ConcreteType::Signed),
+            majit_translate::ValueType::Int
+        )),
+        "raw instance pointer is int-kinded: {graph:?}"
+    );
+}
+
 /// `jtransform.py rewrite_op_getfield` of `gil_ready?` is
 /// `-live-` + `record_quasiimmut_field` + `getfield_*_pure`. A residual
 /// Call of the static field would leave the sub-walk with a symbolic

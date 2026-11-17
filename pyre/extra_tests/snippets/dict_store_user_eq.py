@@ -189,3 +189,26 @@ for f, expected in (
     got = hash_error_message(f)
     assert got == expected, (got, expected)
 print("container hash errors ok")
+
+# Hash/eq of a large int against Decimal after a short warmup.
+# `blackhole_if_trace_too_long` raises `ABORT_TOO_LONG` rather than
+# continuing the inlined helper past `trace_limit`.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+from decimal import Decimal as D
+
+
+def check_int_decimal(i):
+    d = D(i)
+    assert hash(i) == hash(d) and i == d
+
+
+for i in range(80):
+    check_int_decimal(i)
+check_int_decimal(2**32)
+print("tower", 2**32)

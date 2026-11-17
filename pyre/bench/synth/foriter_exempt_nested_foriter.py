@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays above 4, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=3
+# The measured reading stays between 0.9 and 2.3, so the ceiling is 3.
 # The function-entry door reading its own cell took this off the 44 it needed
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
