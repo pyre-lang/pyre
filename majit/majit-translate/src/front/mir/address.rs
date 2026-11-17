@@ -321,6 +321,15 @@ fn residual_scalar_word_descr(
     if tyref_is_raw_pointer(ty, llbc) || output_type_is_ref(ty, llbc) {
         return None;
     }
+    // Same primitive / transparent-primitive node as the cell descr
+    // (`tyref_primitive_or_transparent_primitive_node`): instance
+    // generics are substituted and nested wrappers peel. A `Wrap<i64>`
+    // capture is then a Char-varsize cell like `Wrap(i64)`.
+    if let Some(descr) = function_local_primitive_cell_descr(ty, llbc)
+        .filter(|(_, size, _)| *size > 0 && *size <= RAW_SCALAR_SPILL_BYTES)
+    {
+        return Some(descr);
+    }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     if json_ty_is_copy_scalar(node, llbc) {
         return json_ty_raw_store_descr(node, llbc)
@@ -617,7 +626,7 @@ pub(in crate::front::mir) fn function_local_primitive_cell_descr(
     llbc: &Llbc,
 ) -> Option<(ValueType, usize, bool)> {
     tyref_primitive_or_transparent_primitive_node(ty, llbc)
-        .and_then(|node| json_ty_raw_store_descr(node, llbc))
+        .and_then(|node| json_ty_raw_store_descr(&node, llbc))
 }
 
 /// Residual `&T` of a parameter or field: one Char-varsize cell for the
