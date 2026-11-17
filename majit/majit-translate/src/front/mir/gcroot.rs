@@ -1171,12 +1171,6 @@ pub(in crate::front::mir) fn gc_rooted_items_type_path(name: &str) -> bool {
     segments.last() == Some(&ROOTED_ITEMS_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
-/// Class-root / intern-key spelling of [`ROOT_SCOPE_TYPE`]: the module
-/// path `gc_roots::RootScope`, or the harvested leaf.
-pub(crate) fn is_root_scope_class_root(name: &str) -> bool {
-    gc_root_scope_type_path(name) || name == ROOT_SCOPE_TYPE
-}
-
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 pub(in crate::front::mir) fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();

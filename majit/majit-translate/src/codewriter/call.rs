@@ -10884,11 +10884,10 @@ fn calldescr_type_of_value_type(
             if crate::front::llbc_hints::alloc_flavor_raw_contains(
                 raw_alloc_flavor_structs,
                 name,
-            ) || crate::front::mir::is_root_scope_class_root(name) =>
+            ) =>
         {
             // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
-            // Front stays `Ref(Some(flavor))`. `RootScope` is the same
-            // save_point address word (`llmemory.Address`).
+            // Front stays `Ref(Some(flavor))`.
             Some(Type::Int)
         }
         // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).

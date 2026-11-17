@@ -866,18 +866,6 @@ fn prepend_const_prefix(prefix: &mut Vec<SpaceOperation>, result: RewriteResult)
     }
 }
 
-/// `RootScope.save_point` is the address word itself (`history.py` `getkind`
-/// of a raw `Ptr`). `__pos_0` is Charon's positional spelling of that field.
-fn field_is_rootscope_save_point_word(field: &FieldDescriptor) -> bool {
-    let Some(root) = field.owner_root.as_deref() else {
-        return false;
-    };
-    if !crate::front::mir::is_root_scope_class_root(root) {
-        return false;
-    }
-    field.name == "save_point" || field.name == "__pos_0"
-}
-
 /// Result of rewriting a single operation.
 ///
 /// RPython: `rewrite_operation()` returns SpaceOperation, list, None, or Constant.
@@ -3830,7 +3818,6 @@ impl<'a> Transformer<'a> {
     /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
     /// rewrites that object.
     pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
-        crate::translator::rtyper::cutover::stamp_rootscope_int_bank(&graph);
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -10563,23 +10550,6 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: getfield({}) → dropped (void)", field.name),
             });
             return RewriteResult::Replace(Vec::new());
-        }
-        // `RootScope` is the save_point address word (`history.py` `getkind`
-        // of a raw `Ptr` / `llmemory.Address`). `emit_root_scope_close`
-        // already passes that word; a FieldRead of `save_point` is identity,
-        // not `getfield_raw` of a struct at that integer.
-        if let OpKind::FieldRead { base, .. } = &op.kind
-            && field_is_rootscope_save_point_word(field)
-        {
-            self.notes.push(GraphTransformNote {
-                function: graph_name.to_string(),
-                detail: format!(
-                    "rewrite: getfield({}.{}) → identity save_point word",
-                    field.owner_root.as_deref().unwrap_or("RootScope"),
-                    field.name
-                ),
-            });
-            return RewriteResult::Identity(base.clone());
         }
         // `jtransform.py rewrite_op_getfield`: `RESULT = op.result.concretetype`.
         // The frontend FieldRead carries `ty: Int` (`W_BytesIO.pos`) while
@@ -47987,57 +47957,6 @@ mod tests {
                     .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
             }),
             "typeptr getfield of a parameter must become guard_class"
-        );
-    }
-
-    /// `RootScope` is the save_point word. A FieldRead of that field is
-    /// identity, not `getfield_raw` of a struct at the integer.
-    #[test]
-    fn rewrite_op_getfield_rootscope_save_point_is_identity() {
-        let mut graph = FunctionGraph::new("root_scope_base");
-        let bb = graph.startblock;
-        let scope = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        graph.block_mut(bb).operations.push(SpaceOperation {
-            result: Some(scope.clone()),
-            kind: OpKind::Input {
-                name: "roots".into(),
-                ty: ValueType::Int,
-                class_root: Some("RootScope".into()),
-            },
-        });
-        let save = graph
-            .push_op_var(
-                bb,
-                OpKind::FieldRead {
-                    base: scope.clone(),
-                    field: crate::model::FieldDescriptor::new(
-                        "save_point",
-                        Some("RootScope".into()),
-                    ),
-                    ty: ValueType::Int,
-                    pure: true,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(bb, Some(save));
-        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
-        assert!(
-            transformed.graph.blocks.iter().all(|block| {
-                block.operations.iter().all(|op| {
-                    !matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. } if field.name == "save_point"
-                    )
-                })
-            }),
-            "RootScope.save_point FieldRead must become identity, got {:?}",
-            transformed
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter().map(|op| format!("{:?}", op.kind)))
-                .collect::<Vec<_>>()
         );
     }
 

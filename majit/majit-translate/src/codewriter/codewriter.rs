@@ -604,7 +604,6 @@ impl CodeWriter {
                 if let Ok((_, rtyper)) = self.dual_gate_registry(callcontrol).ensure_session() {
                     crate::translator::rtyper::cutover::stamp_named_ref_call_dests(graph, &rtyper);
                 }
-                crate::translator::rtyper::cutover::stamp_rootscope_int_bank(graph);
                 // Clear `Variable.annotation` after the Skip-arm
                 // legacy walker has committed each cell's
                 // `Variable.concretetype` via
