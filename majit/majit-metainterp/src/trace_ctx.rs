@@ -9251,6 +9251,26 @@ mod tests {
     }
 
     #[test]
+    fn find_merge_point_same_greenkey_typed_live_does_not_match_seed() {
+        // Typed-only same_greenkey (`#2478`): a live close that is not
+        // `same_constant` with the seed does not match it.
+        let mut recorder = Trace::new();
+        let _i0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0xABCD,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_green_key_values(crate::test_greens::gk(0));
+        ctx.seed_compile_and_run_once_merge_point();
+        let live = majit_ir::pypyjit_greenkey(23, false, 0x1000);
+        assert!(
+            ctx.find_merge_point_same_greenkey(&live).is_none(),
+            "typed live close does not same_constant-match the seed"
+        );
+    }
+
+    #[test]
     fn merge_point_green_key_does_not_double_prepend_pypyjit_portal_banks() {
         // pypyjit greens are `[next_instr, is_being_profiled, pycode]`
         // (`interp_jit.py`). `jit_merge_point` banks hold that full

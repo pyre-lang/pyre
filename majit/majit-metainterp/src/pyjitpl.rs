@@ -11107,35 +11107,39 @@ impl<M: Clone> MetaInterp<M> {
             None
         };
         let finish_oprefs: Vec<OpRef> = finish_args.iter().map(|b| b.to_opref()).collect();
-        let ctx = self.tracing.as_mut().unwrap();
+        let cut_at = {
+            let ctx = self.tracing.as_mut().unwrap();
 
-        // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
-        let cut_at = ctx.get_trace_position();
-        self.potential_retrace_position = Some(cut_at);
+            // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
+            let cut_at = ctx.get_trace_position();
+            self.potential_retrace_position = Some(cut_at);
 
-        // pyjitpl.py compile_trace: record tentative JUMP or FINISH
-        if let Some(descr) = finish_descr {
-            ctx.finish(&finish_oprefs, descr);
-        } else {
-            ctx.recorder.close_loop_with_descr(
-                &finish_oprefs,
-                Some(crate::call_descr::jit_cell_token_as_descr(
-                    jump_token.expect("JUMP token resolved before recording"),
-                )),
-            );
-        }
-        // compile.py compile_trace: `trace.tracing_done()` then
-        // `jitlog.start_new_trace` before optimize.
-        if let Err(reason) = ctx.recorder.tracing_done() {
-            ctx.cut_trace(cut_at);
-            self.pending_abort_reason = Some(reason.as_int());
-            return CompileOutcome::Aborted;
-        }
+            // pyjitpl.py compile_trace: record tentative JUMP or FINISH
+            if let Some(descr) = finish_descr {
+                ctx.finish(&finish_oprefs, descr);
+            } else {
+                ctx.recorder.close_loop_with_descr(
+                    &finish_oprefs,
+                    Some(crate::call_descr::jit_cell_token_as_descr(
+                        jump_token.expect("JUMP token resolved before recording"),
+                    )),
+                );
+            }
+            // compile.py compile_trace: `trace.tracing_done()` then
+            // `jitlog.start_new_trace` before optimize.
+            if let Err(reason) = ctx.recorder.tracing_done() {
+                ctx.cut_trace(cut_at);
+                self.pending_abort_reason = Some(reason.as_int());
+                return CompileOutcome::Aborted;
+            }
+            cut_at
+        };
         // compile.py compile_trace: start_new_trace after tracing_done.
         // Field write so it does not fight the live `ctx` borrow.
         self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, &jd_name);
         crate::rjitlog::set_addr2name(addr2name);
 
+        let ctx = self.tracing.as_mut().unwrap();
         // pyjitpl.py compile_trace: `try: compile.compile_trace(...) finally:
         // history.cut(cut_at)`. The JUMP stays on the live opencoder buffer
         // until `optimize_bridge` / `trace.get_iter()`. The `Vec<Op>`
@@ -13737,6 +13741,19 @@ impl<M: Clone> MetaInterp<M> {
         reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.make_enter_function(jd_no);
+        // `warmstate.py maybe_compile_and_run` enters assembler when that
+        // driver's cell still has a non-temporary procedure token whose
+        // outermost_jitdriver_sd is this driver. Nested `compile_and_run_once`
+        // parks the outer attempt first; only this cell's `JC_TRACING` returns.
+        // A FINISH-only row is still that compiled procedure
+        // (`compile_done_with_this_frame` → `ResumeFromInterpDescr`);
+        // excluding it here ticked the cell like uncompiled, so every
+        // back-edge retraced the same FINISH (`getframe` L=13→75,
+        // `trace_too_long` abort_ceiling_refused with threshold=1).
+        // JUMP entry-bridges and FINISH function-entry traces stay
+        // runnable the same way. Guard failures replace a FINISH stub
+        // through `compile_trace` / `compile_loop`, not by retracing
+        // from the back-edge door.
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             let has = warm_state.get_procedure_token(green_key).is_some_and(|t| {
@@ -15775,10 +15792,11 @@ impl<M: Clone> MetaInterp<M> {
         // mint fresh InputArg / ResOperation objects in a disjoint OpRef
         // namespace (`opencoder.py` `TraceIterator.__init__`
         // `self.inputargs = [rop.inputarg_from_tp(...)]`).
-        let use_byte_iter = self
-            .tracing
-            .as_ref()
-            .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+        let use_byte_iter = bridge_ops.is_empty()
+            && self
+                .tracing
+                .as_ref()
+                .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
         let mut prepared = if use_byte_iter {
             prepare_bridge_from_byte_recorder(
                 &self.tracing.as_ref().expect("checked").recorder,
