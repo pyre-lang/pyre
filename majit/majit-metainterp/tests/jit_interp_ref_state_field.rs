@@ -77,6 +77,16 @@ fn build_ref_dispatch_jitcode(asm: &mut Assembler) -> majit_metainterp::JitCode 
 }
 
 #[test]
+fn greens_empty_merge_point_reds_are_not_identity() {
+    use majit_metainterp::JitState as _;
+    let layout = RefTestState { a: 0, sel: 0 }.state_field_layout();
+    assert!(
+        !layout.merge_point_reds_are_identity,
+        "greens = [] emits pc as a named red before identity"
+    );
+}
+
+#[test]
 fn ref_state_field_lowers_load_and_store_state_field_ref() {
     let mut asm = Assembler::new();
     let dispatch_jc = build_ref_dispatch_jitcode(&mut asm);

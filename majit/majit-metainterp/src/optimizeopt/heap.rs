@@ -851,6 +851,10 @@ pub struct OptHeapState {
     /// True only while `with_taken_state` holds the live value outside the
     /// cell, outermost level.
     taken: bool,
+    /// The empty state `emit_extra` leaves in place of the parked live one.
+    /// Nothing writes to it: the nested `OptHeap::propagate_forward` runs on
+    /// the parked state.
+    spare: Option<Box<OptHeapState>>,
 }
 
 pub struct OptHeap {
@@ -913,6 +917,7 @@ impl OptHeapState {
             quasi_immut_cache: crate::FxIndexMap::default(),
             home,
             taken: false,
+            spare: None,
         }
     }
 
@@ -1343,7 +1348,7 @@ impl OptHeapState {
     ) {
         if self.taken {
             let cell = self.home.upgrade().expect("OptHeap state home");
-            let mut live = self.placeholder();
+            let mut live = self.spare.take().unwrap_or_else(|| self.placeholder());
             std::mem::swap(self, live.as_mut());
             // Park the live state. This is the only placeholder construction:
             // `vstring.py` `optstring.emit_extra` re-enters
@@ -1352,6 +1357,9 @@ impl OptHeapState {
             Self::send_extra_after_heap(opt, op, ctx);
             let mut live = cell.borrow_mut().take().expect("OptHeap state taken");
             std::mem::swap(self, live.as_mut());
+            // `live` now holds the untouched placeholder again.
+            debug_assert!(live.spare.is_none() && !live.taken);
+            self.spare = Some(live);
         } else {
             Self::send_extra_after_heap(opt, op, ctx);
         }

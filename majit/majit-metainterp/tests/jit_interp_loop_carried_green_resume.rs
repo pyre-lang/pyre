@@ -301,6 +301,16 @@ fn a_compiled_guard_failure_keeps_the_kind_set_wrote() {
     }
 }
 
+#[test]
+fn compiled_guard_crn_machine_merge_point_reds_are_identity() {
+    use majit_metainterp::JitState as _;
+    let layout = KindResumeState { acc: 0, cnt: 0 }.state_field_layout();
+    assert!(
+        layout.merge_point_reds_are_identity,
+        "greens [pc, kind, program] emit no named red before identity"
+    );
+}
+
 /// Item 4: Abort after SET must re-read the live frame greens, not
 /// publish the previous merge-point values.
 struct AbortState {

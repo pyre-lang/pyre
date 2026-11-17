@@ -353,6 +353,10 @@ pub struct BlackholeInterpreter {
     /// Set when handle_exception_in_frame finds a handler.
     /// Read by CheckExcMatch and other exception opcodes in the handler.
     pub exception_last_value: i64,
+    /// `blackhole.py _run_forever`'s `current_exc` local, held on the
+    /// running interpreter so the collector traces it with the interpreter's
+    /// other reference fields.
+    pending_exc: i64,
     /// Callback for the interpreter-level traceback record that occurs before
     /// an exception-table handler is entered.  The generic blackhole carries
     /// only raw frame/exception references; portal integrations install the
@@ -612,6 +616,7 @@ impl Default for BlackholeInterpreter {
             last_opcode_position: 0,
             entry_position: 0,
             exception_last_value: 0,
+            pending_exc: 0,
             record_caught_exception: None,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
@@ -1163,6 +1168,7 @@ impl BlackholeInterpreter {
         let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
         self.registers_r[..n_r].fill(0);
         self.exception_last_value = 0;
+        self.pending_exc = 0;
     }
 
     /// blackhole.py `get_current_position_info`.
@@ -3233,6 +3239,7 @@ impl BlackholeInterpBuilder {
                 &mut (*ctx).tmpreg_r,
                 &mut (*ctx).exception_last_value,
                 &mut (*ctx).virtualizable_ptr,
+                &mut (*ctx).pending_exc,
                 ctx as *const (),
             );
         }
@@ -3706,11 +3713,25 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         }
     }
 
-    // blackhole.py:1767-1769
+    // Bottommost entry: exception goes through. warmspot.py
+    // handle_jitexception reads ContinueRunningNormally from the
+    // exception lists, so covering CRN does not build a
+    // BlackholeTerminalImage. blackhole.py
+    // BlackholeInterpBuilder.release_interp still returns the interp.
     if bh.nextblackholeinterp.is_none() {
-        // Bottommost entry: exception goes through
         if let Some(terminal_out) = terminal_out {
-            BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            let skip_image = match &exc {
+                JitException::ContinueRunningNormally(args) => {
+                    bh.state_field_layout.has_no_scalar_identity()
+                        || bh.state_field_layout.crn_reds_are_identity(args)
+                }
+                _ => false,
+            };
+            if skip_image {
+                *terminal_out = None;
+            } else {
+                BlackholeTerminalImage::store_into(terminal_out, &mut bh);
+            }
         }
         builder.release_interp(bh);
         drop(exc_roots);
@@ -3856,11 +3877,11 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
     // `_run_forever`'s `current_exc` is a traced `OBJECTPTR` local: the level
     // callbacks, `release_interp` and `handle_jitexception` between two
     // `resume_mainloop` calls can collect.
-    let mut current_exc_slot = [current_exc];
-    let _current_exc_root = crate::resume::ResumeRefRootsScope::enter();
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(&mut current_exc_slot);
-    }
+    bh.pending_exc = current_exc;
+    // `pending_exc` is traced through the pool registration
+    // (`acquire_interp_new`); every interpreter `_run_forever` drives comes
+    // from `acquire_interp`.
+    debug_assert!(bh.rooted, "_run_forever on an interpreter outside the pool");
     loop {
         // executioncontext.py enter: publish this level's frame as
         // `ec.topframeref` before its residuals run (pyjitpl multi-frame
@@ -3870,9 +3891,9 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
             on_enter_level(bh.virtualizable_ptr);
         }
         // blackhole.py:1754-1755
-        match bh.resume_mainloop(current_exc_slot[0]) {
+        match bh.resume_mainloop(bh.pending_exc) {
             Ok(exc) => {
-                current_exc_slot[0] = exc;
+                bh.pending_exc = exc;
             }
             Err(jit_exc) => {
                 // blackhole.py:1756-1758
@@ -3884,7 +3905,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
                     on_leave_level,
                     terminal_out.as_deref_mut(),
                 ) {
-                    Ok((new_bh, exc)) => {
+                    Ok((mut new_bh, exc)) => {
                         // Handled at a recursive portal level.  `new_bh` is
                         // that portal frame (blackhole.py:1780 returns
                         // `blackholeinterp`), and its caller already holds the
@@ -3896,8 +3917,8 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
                         // they run on this arm too.  Re-entering `new_bh`
                         // instead would execute its tail a second time and
                         // overwrite the installed result.
+                        new_bh.pending_exc = exc;
                         bh = new_bh;
-                        current_exc_slot[0] = exc;
                     }
                     Err(propagated_exc) => {
                         // Bottommost or unhandled — propagate out
@@ -3921,14 +3942,20 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         // callback for each level it abandons on its walk.
         if let Some(on_leave_level) = on_leave_level {
             // `blackhole.py _run_forever`: `current_exc` after `_resume_mainloop`.
-            let exit = level_exit_after_resume(&bh, next.as_deref(), current_exc_slot[0]);
+            let exit = level_exit_after_resume(&bh, next.as_deref(), bh.pending_exc);
             if let Some(e) = on_leave_level(bh.virtualizable_ptr, exit) {
                 // pyframe.py execute_frame: return_trace/leave replace the
                 // pending outcome; the next `_resume_mainloop(current_exc)`
                 // raises it at the call site.
-                current_exc_slot[0] = e;
+                bh.pending_exc = e;
             }
         }
+        let mut next = next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
+        debug_assert!(
+            next.rooted,
+            "_run_forever on an interpreter outside the pool"
+        );
+        next.pending_exc = bh.pending_exc;
         builder.release_interp(bh);
         // blackhole.py:1760
         // RPython: blackholeinterp = blackholeinterp.nextblackholeinterp
@@ -3936,7 +3963,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         // bottommost frame always raises a JitException (via
         // _done_with_this_frame or _exit_frame_with_exception), so
         // this code is unreachable in normal operation.
-        bh = next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
+        bh = next;
     }
 }
 
@@ -4179,6 +4206,41 @@ mod tests {
         assert_eq!(live_r, vec![1]);
         assert_eq!(layout.total_live_values(), live_i.len() + live_r.len());
         assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn crn_reds_are_identity_requires_the_layout_flag_and_matching_lengths() {
+        use crate::jitexc::ContinueRunningNormallyArgs;
+
+        // two int scalars + one plain `[int]` (ptr, len) → total_slots 4;
+        // one vable identity + three ref scalars → red_ref 4; one float.
+        let mut layout = StateFieldLayout::new(2, 1, 1, 1);
+        layout.num_ref_scalars = 3;
+        layout.num_float_scalars = 1;
+        let rows = [
+            (false, 4usize, 4usize, 1usize, false, false),
+            (true, 4, 4, 1, true, false),
+            (true, 3, 4, 1, false, true),
+            (true, 4, 3, 1, false, true),
+            (true, 4, 4, 0, false, true),
+        ];
+        for (flag, n_int, n_ref, n_float, want, skip_debug) in rows {
+            if skip_debug && cfg!(debug_assertions) {
+                continue;
+            }
+            layout.merge_point_reds_are_identity = flag;
+            let args = ContinueRunningNormallyArgs {
+                red_int: vec![0; n_int],
+                red_ref: vec![0; n_ref],
+                red_float: vec![0; n_float],
+                ..ContinueRunningNormallyArgs::default()
+            };
+            assert_eq!(
+                layout.crn_reds_are_identity(&args),
+                want,
+                "flag={flag} red_int={n_int} red_ref={n_ref} red_float={n_float}"
+            );
+        }
     }
 
     // ── state_field handler register-slot tests (#183) ──
@@ -6127,6 +6189,35 @@ mod tests {
                 roots.contains(&(EXC as usize)),
                 "the caught exception is invisible to the collector while the \
                  handler runs; roots were {roots:x?}",
+            );
+        }
+
+        /// `_run_forever`'s `current_exc` is a field of the pooled interpreter,
+        /// so `visit_bh_interp_entry` traces it with the other reference slots.
+        #[test]
+        fn pending_exc_is_walked_with_the_interpreter() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            const EXC: i64 = 0x7f00_0000_def0;
+            bh.pending_exc = EXC;
+            bh.tmpreg_r = 0;
+            let pending_addr = std::ptr::from_mut(&mut bh.pending_exc) as usize;
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut bh.registers_r,
+                    &mut bh.tmpreg_r,
+                    &mut bh.exception_last_value,
+                )
+            };
+            let mut visited: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| {
+                visited.push(std::ptr::from_mut(slot) as usize);
+            });
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                visited.contains(&pending_addr),
+                "`pending_exc` is invisible to the collector; visited were {visited:x?}",
             );
         }
 
@@ -8760,6 +8851,9 @@ pub struct StateFieldLayout {
     /// stream would encode the state scalar where the re-executed
     /// jit_merge_point op expects the green pc.
     pub int_scalar_base: usize,
+    /// The `jit_merge_point` reds are exactly the state-field identity
+    /// slots, in identity order: no named red precedes them in a bank.
+    pub merge_point_reds_are_identity: bool,
 }
 
 impl StateFieldLayout {
@@ -8778,6 +8872,7 @@ impl StateFieldLayout {
             num_float_scalars: 0,
             float_scalar_base: 0,
             int_scalar_base,
+            merge_point_reds_are_identity: false,
         }
     }
 
@@ -8800,6 +8895,7 @@ impl StateFieldLayout {
             num_float_scalars: 0,
             float_scalar_base: 0,
             int_scalar_base,
+            merge_point_reds_are_identity: false,
         }
     }
 
@@ -8814,6 +8910,44 @@ impl StateFieldLayout {
         self.num_float_scalars = num_float_scalars;
         self.float_scalar_base = float_scalar_base;
         self
+    }
+
+    /// A jitdriver with no scalar identity slots. The portal is this
+    /// shape: its reds are the virtualizable frame and `ec`, not
+    /// `#[jit_interp]` scalars, and `state_field_layout` stays the empty
+    /// default.
+    pub fn has_no_scalar_identity(&self) -> bool {
+        self.num_scalars == 0
+            && self.num_ref_scalars == 0
+            && self.num_float_scalars == 0
+            && self.num_vable_identity_slots == 0
+            && self.num_plain_int_arrays == 0
+    }
+
+    /// Whether `ContinueRunningNormally` red lists are the identity
+    /// slots in identity order (`warmspot.py handle_jitexception` reads
+    /// those lists). A true flag with a length mismatch is an encoder
+    /// bug: debug builds assert, release returns false.
+    pub fn crn_reds_are_identity(&self, args: &crate::jitexc::ContinueRunningNormallyArgs) -> bool {
+        if !self.merge_point_reds_are_identity {
+            return false;
+        }
+        let lengths_match = args.red_int.len() == self.total_slots()
+            && args.red_ref.len() == self.num_vable_identity_slots + self.num_ref_scalars
+            && args.red_float.len() == self.num_float_scalars;
+        debug_assert!(
+            lengths_match,
+            "merge_point_reds_are_identity is set but CRN red lengths \
+             differ from identity slots (red_int={} total_slots={} \
+             red_ref={} vable+ref={} red_float={} float={})",
+            args.red_int.len(),
+            self.total_slots(),
+            args.red_ref.len(),
+            self.num_vable_identity_slots + self.num_ref_scalars,
+            args.red_float.len(),
+            self.num_float_scalars,
+        );
+        lengths_match
     }
 
     /// Total int identity slots: the real scalar count plus two words

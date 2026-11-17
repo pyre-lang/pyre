@@ -22,12 +22,19 @@
 //! `id_or_identityhash`), not the address. The key is recorded at
 //! intern time and is not recomputed during a collection.
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, ReentrantMutex};
 
 use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash, gc_is_young_object};
+
+/// Slot indexes recorded under one key, ascending.
+type SlotList = smallvec::SmallVec<[u32; 1]>;
+type PairMap = indexmap::IndexMap<u64, SlotList, rustc_hash::FxBuildHasher>;
+
+const fn empty_pairs() -> PairMap {
+    indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher)
+}
 
 /// Live word of `addr`. `gc_current_object_address` follows a nursery
 /// forwarding stub (`_trace_drag_out`) without treating the address as a
@@ -46,13 +53,12 @@ struct Table {
     /// Intern key recorded with the slot. `minimark.py`
     /// `id_or_identityhash` is not recomputed on a stale address.
     hashes: Vec<u64>,
-    /// `(identity hash, index)`, sorted by hash then index.
-    /// An ordered set so insert/remove stay logarithmic; `opencoder.py`
-    /// `_refs_dict` is a dict.
-    by_hash: BTreeSet<(u64, u32)>,
-    /// `(current address, index)`, sorted by address then index.
+    /// Identity hash → slot indexes, ascending per key.
+    /// `opencoder.py` `_refs_dict` is a dict.
+    by_hash: PairMap,
+    /// Current address → slot indexes, ascending per key.
     /// `history.py` `ConstPtr.value` after a move is this word.
-    by_addr: BTreeSet<(u64, u32)>,
+    by_addr: PairMap,
     /// `begin_wave` generation that last traced this slot. Wave 0 does
     /// not dedup: a unit test that never opens a wave still forwards.
     marks: Vec<u32>,
@@ -118,8 +124,8 @@ impl Table {
         Self {
             slots: vec![GcRef::NULL],
             hashes: vec![0],
-            by_hash: BTreeSet::new(),
-            by_addr: BTreeSet::new(),
+            by_hash: empty_pairs(),
+            by_addr: empty_pairs(),
             marks: vec![0],
             live: vec![0],
             free: Vec::new(),
@@ -132,8 +138,8 @@ impl Table {
 static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
     hashes: Vec::new(),
-    by_hash: BTreeSet::new(),
-    by_addr: BTreeSet::new(),
+    by_hash: empty_pairs(),
+    by_addr: empty_pairs(),
     marks: Vec::new(),
     live: Vec::new(),
     free: Vec::new(),
@@ -783,12 +789,27 @@ fn free_slot(guard: &mut Table, idx: usize) {
     guard.free.push(idx as u32);
 }
 
-fn insert_pair(pairs: &mut BTreeSet<(u64, u32)>, key: u64, idx: u32) {
-    pairs.insert((key, idx));
+fn insert_pair(pairs: &mut PairMap, key: u64, idx: u32) {
+    let list = pairs.entry(key).or_default();
+    if let Err(pos) = list.binary_search(&idx) {
+        list.insert(pos, idx);
+    }
 }
 
-fn remove_pair(pairs: &mut BTreeSet<(u64, u32)>, key: u64, idx: u32) {
-    pairs.remove(&(key, idx));
+fn remove_pair(pairs: &mut PairMap, key: u64, idx: u32) {
+    let empty = {
+        let Some(list) = pairs.get_mut(&key) else {
+            return;
+        };
+        match list.binary_search(&idx) {
+            Ok(pos) => list.remove(pos),
+            Err(_) => return,
+        };
+        list.is_empty()
+    };
+    if empty {
+        pairs.swap_remove(&key);
+    }
 }
 
 fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
@@ -828,15 +849,14 @@ fn find_by_addr(table: &Table, addr: usize) -> Option<u32> {
     let key = addr as u64;
     table
         .by_addr
-        .range((key, 0)..=(key, u32::MAX))
-        .next()
-        .map(|&(_, idx)| idx)
+        .get(&key)
+        .and_then(|list| list.first().copied())
 }
 
 fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
     let mut identity_hit = None;
     let mut identity_hits = 0u32;
-    for &(_, idx) in table.by_hash.range((hash, 0)..=(hash, u32::MAX)) {
+    for &idx in table.by_hash.get(&hash).into_iter().flatten() {
         if table.slots.get(idx as usize).map(|s| s.0) == Some(addr) {
             return Some(idx);
         }

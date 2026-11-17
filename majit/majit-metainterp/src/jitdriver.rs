@@ -3645,10 +3645,16 @@ impl<S: JitState> JitDriver<S> {
         }
         // The chain has run: it executed the rest of the half-finished opcodes
         // against the real heap.  The sym image the Abort arm staged predates
-        // those effects, so applying it would roll `state` back to before them
-        // — but only the terminal image can replace it, so keep it as the
-        // fallback when the run produced none.
-        if terminal.is_some() {
+        // those effects, so applying it would roll `state` back to before them.
+        // A terminal image or covering ContinueRunningNormally lists replace
+        // that stash; keep it only when the chain produced neither.
+        let crn_lists_cover = match &outcome {
+            crate::jitexc::JitException::ContinueRunningNormally(args) => {
+                layout.has_no_scalar_identity() || layout.crn_reds_are_identity(args)
+            }
+            _ => false,
+        };
+        if terminal.is_some() || crn_lists_cover {
             self.meta.single_pass_scalar_values = None;
             self.meta.single_pass_ref_scalar_values = None;
             self.meta.single_pass_virt_array_values = None;
@@ -3662,12 +3668,12 @@ impl<S: JitState> JitDriver<S> {
         // `ExitFrameWithExceptionRef` or re-enters the portal; it never
         // restores a nested jitcode's banks onto the portal virtualizable.
         // State-field machines write the identity-slot slice back. A Python
-        // portal has none (`layout_has_no_scalar_identity`): the chain already
+        // portal has none (`has_no_scalar_identity`): the chain already
         // ran vable ops against the live frame, and the terminal image of a
         // function jitcode starts with an int that `restore_single_frame`
         // would store as `PyreJitState.frame`.
         let writeback = |state: &mut S, resume_pc: usize| {
-            if layout_has_no_scalar_identity(&layout) {
+            if layout.has_no_scalar_identity() {
                 return;
             }
             let Some(terminal) = terminal.as_ref() else {
@@ -8421,18 +8427,40 @@ impl<S: JitState> JitDriver<S> {
                         if let Some(pc) = green_pc {
                             let _ = crate::handle_portal_crn_hook(target_pc, pc);
                         }
-                        // `restore_banked` consumes both banks densely
-                        // (int slot j at index j, ref scalar j at index
-                        // j); the register file holds them at
-                        // `scalar_slot(j) = int_scalar_base + j` /
-                        // `ref_scalar_slot(j) = ref_scalar_base + j`, so
-                        // slice off the dispatch JitCode's argument
-                        // prefix in each bank.
                         // A `jitdriver_sd is None` walk publishes nothing
                         // (`_handle_jitexception`); the CRN lists still live
                         // on the exception.
-                        if let Some(terminal) = terminal.as_ref() {
-                            let layout = state.state_field_layout();
+                        let layout = state.state_field_layout();
+                        if layout.has_no_scalar_identity() || layout.crn_reds_are_identity(&args) {
+                            if crate::callee_rca_enabled() {
+                                eprintln!(
+                                    "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
+                                     layout={:?} red_int={:?} red_ref={:?} red_float={:?}",
+                                    green_pc,
+                                    target_pc,
+                                    layout,
+                                    args.red_int,
+                                    args.red_ref,
+                                    args.red_float,
+                                );
+                                if let Some(dump) = state.debug_state_fields(compiled_meta) {
+                                    eprintln!("[callee-rca][crn-state-before]\n{dump}");
+                                }
+                            }
+                            state.restore_banked3(
+                                compiled_meta,
+                                &args.red_int,
+                                &args.red_ref,
+                                &args.red_float,
+                            );
+                        } else if let Some(terminal) = terminal.as_ref() {
+                            // `restore_banked` consumes both banks densely
+                            // (int slot j at index j, ref scalar j at index
+                            // j); the register file holds them at
+                            // `scalar_slot(j) = int_scalar_base + j` /
+                            // `ref_scalar_slot(j) = ref_scalar_base + j`, so
+                            // slice off the dispatch JitCode's argument
+                            // prefix in each bank.
                             let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
                             let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
                             if crate::callee_rca_enabled() {
@@ -8623,6 +8651,9 @@ impl<S: JitState> JitDriver<S> {
                 };
                 // `_run_forever` already released the chain. Put the
                 // terminal image back so the next run can swap banks.
+                // Covering ContinueRunningNormally leaves `terminal` as
+                // None, so this stores an empty scratch rather than a
+                // leftover image.
                 majit_gc::shadow_stack::pop_resume_ref_roots_to(terminal_root_depth);
                 self.meta.blackhole_terminal_scratch = terminal;
                 if let Some(resume) = resume_pc {
@@ -12324,17 +12355,6 @@ impl<S: JitState> JitDriver<S> {
     }
 }
 
-/// A jitdriver with no scalar identity slots. The portal is this shape:
-/// its reds are the virtualizable frame and `ec`, not `#[jit_interp]`
-/// scalars, and `state_field_layout` stays the empty default.
-fn layout_has_no_scalar_identity(layout: &crate::blackhole::StateFieldLayout) -> bool {
-    layout.num_scalars == 0
-        && layout.num_ref_scalars == 0
-        && layout.num_float_scalars == 0
-        && layout.num_vable_identity_slots == 0
-        && layout.num_plain_int_arrays == 0
-}
-
 /// `ContinueRunningNormally` restore inputs.
 ///
 /// No scalar identity slots: the portal calldescr is `iirrr`, so the
@@ -12343,15 +12363,18 @@ fn layout_has_no_scalar_identity(layout: &crate::blackhole::StateFieldLayout) ->
 /// `args.red_ref[0]` (`interp_jit.py` reds `['frame', 'ec']`).
 /// Passing the int bank to `restore` stores the green pc as that frame.
 ///
-/// A state-field layout keeps the identity-slot slice of the terminal
-/// register file. `terminal` is absent only when the chain produced no
-/// image; the reds are still the CRN arguments.
+/// Identity-aligned merge-point reds (`crn_reds_are_identity`) are the
+/// state-field identity slots in identity order, so restore reads the
+/// exception lists. Otherwise a state-field layout keeps the
+/// identity-slot slice of the terminal register file. `terminal` is
+/// absent when the chain produced no image; the reds are still the
+/// CRN arguments.
 fn crn_restore_banks<'a>(
     layout: &crate::blackhole::StateFieldLayout,
     terminal: Option<&'a crate::blackhole::BlackholeTerminalImage>,
     args: &'a crate::jitexc::ContinueRunningNormallyArgs,
 ) -> (&'a [i64], &'a [i64], &'a [i64]) {
-    if layout_has_no_scalar_identity(layout) {
+    if layout.has_no_scalar_identity() || layout.crn_reds_are_identity(args) {
         return (&args.red_int, &args.red_ref, &args.red_float);
     }
     match terminal {

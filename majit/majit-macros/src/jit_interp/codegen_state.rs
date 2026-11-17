@@ -1376,15 +1376,53 @@ fn generate_state_fields_jit_state(
     // scalars still has a vable identity at `ref_identity_base - 1`,
     // and `StateFieldLayout::new` leaves `ref_scalar_base` at 0 so
     // `vable_identity_ref_slot` would alias r0 (`program`).
+    // The jit_merge_point reds are identity-aligned when no named portal
+    // red precedes the identity slots in a bank (`pc`/`program` are
+    // greens, so named reds are empty or only `vable_var` in identity
+    // position). A heap virtualizable that is a `ref(_)` scalar at
+    // `ref_pos != 0` is declaration-order vs named-red prefix.
+    let green_names: Vec<String> = config
+        .greens
+        .iter()
+        .filter_map(super::expr_single_ident)
+        .collect();
+    let vable_var_name: Option<String> = config
+        .virtualizable_decl
+        .as_ref()
+        .map(|decl| decl.var_name.to_string())
+        .or_else(|| state_is_vable_identity.then(|| "state".to_string()));
+    let named_red_candidates: Vec<String> = if config.reds.is_empty() {
+        let mut names = vec!["pc".to_string(), "program".to_string()];
+        if let Some(vable) = &vable_var_name {
+            names.push(vable.clone());
+        }
+        names
+    } else {
+        config
+            .reds
+            .iter()
+            .filter_map(super::expr_single_ident)
+            .collect()
+    };
+    let merge_point_reds_are_identity = named_red_candidates
+        .iter()
+        .filter(|name| !green_names.iter().any(|g| g == *name))
+        .all(|name| Some(name.as_str()) == vable_var_name.as_deref())
+        && !heap_vable_ref_pos.is_some_and(|pos| pos != 0);
     let state_field_layout_ctor: TokenStream = quote! {
-        majit_metainterp::blackhole::StateFieldLayout::with_ref_scalars(
-            #num_scalars,
-            #num_arrays,
-            #num_vable_identity_slots,
-            #num_ref_scalars,
-            #ref_identity_base,
-            #int_identity_base,
-        ).with_float_scalars(#num_float_scalars, #float_identity_base)
+        {
+            let mut __layout = majit_metainterp::blackhole::StateFieldLayout::with_ref_scalars(
+                #num_scalars,
+                #num_arrays,
+                #num_vable_identity_slots,
+                #num_ref_scalars,
+                #ref_identity_base,
+                #int_identity_base,
+            )
+            .with_float_scalars(#num_float_scalars, #float_identity_base);
+            __layout.merge_point_reds_are_identity = #merge_point_reds_are_identity;
+            __layout
+        }
     };
 
     // Naming the virtualizable on the jitdriver static data
