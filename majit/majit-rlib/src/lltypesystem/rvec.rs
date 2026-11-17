@@ -1096,6 +1096,63 @@ pub fn ll_copy_list_to_raw_array_r(ll_list: GCREF, dst_ptr: usize) {
     ll_copy_list_to_raw_array(ll_list, dst_ptr, ITEM_SIZE_R, ITEM_ALIGN_R);
 }
 
+/// `ll_copy_raw_array_to_raw_array`: residual twin of the minted
+/// `@jit.dont_look_inside` helper (`rrawarray.py` `get_raw_buf` +
+/// `raw_memcopy`). Source and dest are already the item base of a
+/// nolength raw `Array`. `Signed` and `Unsigned` share `_i`. Public
+/// leaves bake `item_size` the way [`ll_copy_list_to_raw_array_i`]
+/// bakes it; `raw_memcopy` is memcpy, so the ranges do not overlap.
+fn ll_copy_raw_array_to_raw_array(
+    src: usize,
+    dst: usize,
+    src_start: usize,
+    dst_start: usize,
+    length: usize,
+    item_size: usize,
+) {
+    let nbytes = item_bytes(length, item_size).expect("Vec capacity overflow");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            slice_item_addr(src, src_start, item_size) as *const u8,
+            slice_item_addr(dst, dst_start, item_size) as *mut u8,
+            nbytes,
+        );
+    }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_raw_array_to_raw_array_i(
+    src: usize,
+    dst: usize,
+    src_start: usize,
+    dst_start: usize,
+    length: usize,
+) {
+    ll_copy_raw_array_to_raw_array(src, dst, src_start, dst_start, length, ITEM_SIZE_I);
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_raw_array_to_raw_array_f(
+    src: usize,
+    dst: usize,
+    src_start: usize,
+    dst_start: usize,
+    length: usize,
+) {
+    ll_copy_raw_array_to_raw_array(src, dst, src_start, dst_start, length, ITEM_SIZE_F);
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_raw_array_to_raw_array_r(
+    src: usize,
+    dst: usize,
+    src_start: usize,
+    dst_start: usize,
+    length: usize,
+) {
+    ll_copy_raw_array_to_raw_array(src, dst, src_start, dst_start, length, ITEM_SIZE_R);
+}
+
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
 /// GcArray word, not a `(items, length)` pair. Body of `rlist.py ll_extend`:
 /// `len1`, `len2`, `ovfcheck(len1 + len2)`, `_ll_resize_ge`, then one
@@ -2058,6 +2115,9 @@ mod tests {
             "ll_copy_list_to_raw_array_i",
             "ll_copy_list_to_raw_array_f",
             "ll_copy_list_to_raw_array_r",
+            "ll_copy_raw_array_to_raw_array_i",
+            "ll_copy_raw_array_to_raw_array_f",
+            "ll_copy_raw_array_to_raw_array_r",
             "ll_slice_arraycopy_r",
             "ll_gcarray_arraycopy_r",
         ] {
@@ -2150,6 +2210,44 @@ mod tests {
         };
         let mut rdst = [std::ptr::null_mut(), std::ptr::null_mut()];
         ll_copy_list_to_raw_array_r(&mut refs as *mut Refs as GCREF, rdst.as_mut_ptr() as usize);
+        assert_eq!(rdst[0], 0x10 as GCREF);
+        assert_eq!(rdst[1], 0x20 as GCREF);
+    }
+
+    /// `ll_copy_raw_array_to_raw_array` copies `length` items from
+    /// `src + src_start` to `dst + dst_start`. A zero length leaves the
+    /// destination unchanged. Getslice uses a nonzero `source_start`.
+    #[test]
+    fn copy_raw_array_to_raw_array_copies_with_starts() {
+        let src = [1usize, 2, 3, 4];
+        let mut dst = [0usize; 3];
+        ll_copy_raw_array_to_raw_array_i(src.as_ptr() as usize, dst.as_mut_ptr() as usize, 1, 0, 3);
+        assert_eq!(dst, [2, 3, 4]);
+
+        dst = [7, 7, 7];
+        ll_copy_raw_array_to_raw_array_i(src.as_ptr() as usize, dst.as_mut_ptr() as usize, 0, 1, 0);
+        assert_eq!(dst, [7, 7, 7]);
+
+        let fsrc = [1.5f64, 2.5, 3.5];
+        let mut fdst = [0.0f64; 2];
+        ll_copy_raw_array_to_raw_array_f(
+            fsrc.as_ptr() as usize,
+            fdst.as_mut_ptr() as usize,
+            1,
+            0,
+            2,
+        );
+        assert_eq!(fdst, [2.5, 3.5]);
+
+        let rsrc = [0x10 as GCREF, 0x20 as GCREF, 0x30 as GCREF];
+        let mut rdst = [std::ptr::null_mut(), std::ptr::null_mut()];
+        ll_copy_raw_array_to_raw_array_r(
+            rsrc.as_ptr() as usize,
+            rdst.as_mut_ptr() as usize,
+            0,
+            0,
+            2,
+        );
         assert_eq!(rdst[0], 0x10 as GCREF);
         assert_eq!(rdst[1], 0x20 as GCREF);
     }

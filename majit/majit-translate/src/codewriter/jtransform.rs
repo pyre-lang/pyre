@@ -14407,6 +14407,21 @@ impl<'a> Transformer<'a> {
                 item_ll,
             );
         }
+        // jtransform.py `Transformer._handle_list_call`:
+        //   resizable = isinstance(LIST, lltype.GcStruct)
+        //   assert resizable == (not isinstance(LIST, lltype.GcArray))
+        // A raw `Ptr(Array)` / raw `Struct` / `FixedSizeArray` fails that
+        // assert. `Ptr(Opaque)` (`GCREF`) is the tolerant prepass residual
+        // path: skip the assert and keep lowering.
+        if let Some(list_ty) = list_ty.as_ref()
+            && let Some(is_gc_list) = list_call_gc_list_pointee(list_ty)
+        {
+            assert!(
+                is_gc_list,
+                "Transformer._handle_list_call: LIST must be GcStruct or GcArray, got {}",
+                list_ty.short_name()
+            );
+        }
         // jtransform.py `_handle_list_call`: `list.ll_arraymove` is an OS9
         // residual call. Descriptor analysis still sees the helper graph —
         // its per-item `setarrayitem` arms are what populate
@@ -18366,6 +18381,29 @@ fn fixed_repeat_identity(
 
 /// `Ptr(Array)` GC array (`do_fixed_list_*` receiver, `jtransform.py`).
 /// Follows `ForwardReference` the way `gc_array_from_lltype` does.
+/// `jtransform.py` `Transformer._handle_list_call`:
+/// `resizable = isinstance(LIST, lltype.GcStruct)` then
+/// `assert resizable == (not isinstance(LIST, lltype.GcArray))`.
+/// `Some(true)` is a `GcStruct` or `GcArray`. `Some(false)` fails the
+/// assert (raw `Array` / raw `Struct` / `FixedSizeArray`). `None` is
+/// `Ptr(Opaque)` / a non-pointer, the tolerant prepass residual path.
+fn list_call_gc_list_pointee(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<bool> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::ForwardReference(fwd) => list_call_gc_list_pointee(&fwd.resolved()?),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(st) => Some(st._gckind == GcKind::Gc),
+            PtrTarget::Array(arr) => Some(arr._gckind == GcKind::Gc),
+            PtrTarget::FixedSizeArray(_) => Some(false),
+            PtrTarget::ForwardReference(fwd) => list_call_gc_list_pointee(&fwd.resolved()?),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn gc_array_ptr_from_lltype(
     ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
@@ -46476,6 +46514,104 @@ mod tests {
         };
         let _ =
             transformer._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy");
+    }
+
+    /// `Transformer._handle_list_call` (`jtransform.py`):
+    /// `assert resizable == (not isinstance(LIST, lltype.GcArray))`.
+    /// A raw `Ptr(Array)` is neither `GcStruct` nor `GcArray`.
+    #[test]
+    #[should_panic(expected = "LIST must be GcStruct or GcArray")]
+    fn list_ll_arraycopy_raw_ptr_array_is_rejected() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let array_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
+        }));
+        let args = vec![
+            variable_with_lltype("source", array_ty.clone()),
+            variable_with_lltype("dest", array_ty),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let _ =
+            transformer._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy");
+    }
+
+    /// `_handle_raw_resizable_list_call` is reached only for a RustVec
+    /// header (`rust_vec_item_kind`). A raw items `Ptr(Array)` is not a
+    /// header, so `list.ll_arraycopy` is not swallowed there; it reaches
+    /// the GcStruct/GcArray assert.
+    #[test]
+    fn raw_items_ptr_array_is_not_a_rustvec_header() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rlist::rust_vec_items_array_ptr_lltype;
+        use crate::translator::rtyper::rrustvec::{rust_vec_item_kind, rust_vec_lltype};
+
+        let items = rust_vec_items_array_ptr_lltype(&LowLevelType::Signed);
+        assert!(
+            rust_vec_item_kind(&items).is_none(),
+            "raw items Ptr(Array) must not match rust_vec_item_kind"
+        );
+        let header = rust_vec_lltype(&LowLevelType::Signed);
+        assert!(
+            rust_vec_item_kind(&header).is_some(),
+            "RustVec header is the raw-resizable fork"
+        );
+    }
+
+    /// A RustVec header `list.ll_arraycopy` hits `_handle_raw_resizable_list_call`
+    /// first; that match has no `list.ll_arraycopy` arm (`_ => return None`),
+    /// so the call residualizes instead of becoming `OS_ARRAYCOPY`.
+    #[test]
+    fn rustvec_header_list_ll_arraycopy_is_not_os_arraycopy() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let header = rust_vec_lltype(&LowLevelType::Signed);
+        let args = vec![
+            variable_with_lltype("source", header.clone()),
+            variable_with_lltype("dest", header),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        assert!(
+            transformer
+                ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+                .is_none(),
+            "RustVec header list.ll_arraycopy must not become OS_ARRAYCOPY"
+        );
     }
 
     /// Other `rgc.*` spellings are not ported and fall through to the

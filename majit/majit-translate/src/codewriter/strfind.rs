@@ -30,7 +30,7 @@ use crate::annotator::annrpython::RPythonAnnotator;
 use crate::codewriter::call::{CallControl, CallKind};
 use crate::codewriter::jtransform_opname::lower_graph;
 use crate::flowspace::model::{ConstValue, FunctionGraph, GraphKey, Hlvalue, host_env_callable};
-use crate::model::{CallTarget, OpKind, ValueType};
+use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
 use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
 use crate::rlib::rstring::effect_graph_from_search_helper;
@@ -64,6 +64,15 @@ const LL_LIST_RESIZE_HINT_REALLY_F: &str = "_ll_list_resize_hint_really_f";
 const LL_LIST_RESIZE_HINT_REALLY_WRAPPER: &str = "_ll_list_resize_hint_really_look_inside_iff";
 /// `dont_look_inside` trampoline the wrapper's false arm `direct_call`s.
 const LL_LIST_RESIZE_HINT_REALLY_TRAMPOLINE: &str = "_ll_list_resize_hint_really_trampoline";
+/// Minted `@jit.dont_look_inside` raw-to-raw `raw_memcopy` (`rlist.rs`
+/// `build_ll_copy_raw_array_to_raw_array_helper_graph`). Native leaves
+/// are `ll_copy_raw_array_to_raw_array_{i,f,r}` in `rvec.rs`.
+const LL_COPY_RAW_ARRAY_TO_RAW_ARRAY: &str = "ll_copy_raw_array_to_raw_array";
+/// Minted `@jit.dont_look_inside` GcArray-to-raw `raw_memcopy`
+/// (`rrawarray.py` `ll_copy_list_to_raw_array`). Graph names carry a
+/// segment (`ll_copy_list_to_raw_array_Signed`); native leaves are
+/// `ll_copy_list_to_raw_array_{i,f,r}`.
+const LL_COPY_LIST_TO_RAW_ARRAY: &str = "ll_copy_list_to_raw_array";
 
 #[cfg(test)]
 fn helper_fnaddr_path() -> String {
@@ -806,6 +815,9 @@ fn string_element_of_path(dest: &CallPath) -> Option<StringElement> {
 
 fn residual_native_fnaddr_row(dest: &CallPath, args: &[LowLevelType]) -> Option<CallPath> {
     let name = unspecialized_helper_name(dest.last_segment()?);
+    if let Some(src) = copy_residual_native_fnaddr_row(name, args) {
+        return Some(src);
+    }
     let element = string_element_of_path(dest).or_else(|| string_element_of_args(args))?;
     match (name, element) {
         (LL_FIND_CHAR, StringElement::Str) => Some(CallPath::from_segments([
@@ -826,6 +838,54 @@ fn residual_native_fnaddr_row(dest: &CallPath, args: &[LowLevelType]) -> Option<
         }
         _ => None,
     }
+}
+
+/// ITEM of `Ptr(Array(ITEM))` / `Ptr(GcArray(ITEM))`.
+fn array_item_of_ptr(ty: &LowLevelType) -> Option<&LowLevelType> {
+    let LowLevelType::Ptr(p) = ty else {
+        return None;
+    };
+    match &p.TO {
+        PtrTarget::Array(arr) => Some(&arr.OF),
+        _ => None,
+    }
+}
+
+/// Kind leaf shared by `ll_copy_list_to_raw_array_{i,f,r}` and
+/// `ll_copy_raw_array_to_raw_array_{i,f,r}` (`list_to_raw.rs` `native_leaf`).
+/// `Signed` and `Unsigned` share `_i`.
+fn copy_item_kind_leaf(args: &[LowLevelType]) -> Option<&'static str> {
+    let item = args.first().and_then(array_item_of_ptr)?;
+    match crate::model::getkind(item) {
+        ConcreteType::Signed => Some("i"),
+        ConcreteType::Float => Some("f"),
+        ConcreteType::GcRef => Some("r"),
+        ConcreteType::Void | ConcreteType::Unknown => None,
+    }
+}
+
+/// `HELPER_FNADDRS` row for a minted raw-copy residual. `None` when `name`
+/// is not a copy family or `args[0]` is not an array pointer of a one-word
+/// item.
+fn copy_residual_native_fnaddr_row(name: &str, args: &[LowLevelType]) -> Option<CallPath> {
+    let leaf = if name == LL_COPY_RAW_ARRAY_TO_RAW_ARRAY {
+        match copy_item_kind_leaf(args)? {
+            "i" => "ll_copy_raw_array_to_raw_array_i",
+            "f" => "ll_copy_raw_array_to_raw_array_f",
+            "r" => "ll_copy_raw_array_to_raw_array_r",
+            _ => return None,
+        }
+    } else if name == LL_COPY_LIST_TO_RAW_ARRAY || name.starts_with("ll_copy_list_to_raw_array_") {
+        match copy_item_kind_leaf(args)? {
+            "i" => "ll_copy_list_to_raw_array_i",
+            "f" => "ll_copy_list_to_raw_array_f",
+            "r" => "ll_copy_list_to_raw_array_r",
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    Some(CallPath::from_segments(["lltypesystem", "rvec", leaf]))
 }
 
 fn bind_residual_native_fnaddr(cc: &mut CallControl, dest: &CallPath, args: &[LowLevelType]) {
@@ -980,11 +1040,14 @@ mod tests {
     use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::policy::JitPolicy;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        FuncType, Ptr, Struct, functionptr, functionptr_for_graph_with_type,
+        FuncType, GCREF, Ptr, Struct, functionptr, functionptr_for_graph_with_type,
     };
     use crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR;
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_find_helper_graph, build_ll_strhash_helper_graph, funcobj_from_funcptr_constant,
+    };
+    use crate::translator::rtyper::rlist::{
+        items_array_ptr_lltype, mint_ll_copy_raw_array, rust_vec_items_array_ptr_lltype,
     };
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
     use majit_ir::descr::ExtraEffect;
@@ -2957,6 +3020,216 @@ mod tests {
             "look_inside_graph refuses `_jit_look_inside_ = False`"
         );
         assert_eq!(cc.lookup_function_fnaddr(&path), Some(0x5000));
+    }
+
+    fn register_raw_copy_fnaddrs(cc: &mut CallControl) {
+        cc.register_macro_helper_trace_fnaddr(
+            "majit_rlib::lltypesystem::rvec::ll_copy_raw_array_to_raw_array_i",
+            0x6161,
+        );
+        cc.register_macro_helper_trace_fnaddr(
+            "majit_rlib::lltypesystem::rvec::ll_copy_raw_array_to_raw_array_f",
+            0x6162,
+        );
+        cc.register_macro_helper_trace_fnaddr(
+            "majit_rlib::lltypesystem::rvec::ll_copy_raw_array_to_raw_array_r",
+            0x6163,
+        );
+    }
+
+    fn copy_raw_array_args(item: &LowLevelType) -> Vec<LowLevelType> {
+        let items = rust_vec_items_array_ptr_lltype(item);
+        vec![
+            items.clone(),
+            items,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ]
+    }
+
+    fn copy_list_to_raw_args(item: &LowLevelType) -> Vec<LowLevelType> {
+        vec![
+            items_array_ptr_lltype(item),
+            rust_vec_items_array_ptr_lltype(item),
+        ]
+    }
+
+    /// RustVec `list(v)` (`rtype_bltn_list_via_ll_copy`) and RustVec
+    /// getslice (`rtype_getslice_via_ll_listslice`) both mint
+    /// `ll_copy_raw_array_to_raw_array` through `mint_item_copy_helper`.
+    /// `register_callee_graph` residualizes it and
+    /// `bind_residual_native_fnaddr` aliases the per-kind HELPER_FNADDRS
+    /// leaf (`list_to_raw.rs` `copy_helper_is_residual_and_outer_is_regular`).
+    #[test]
+    fn rustvec_list_and_getslice_raw_copy_residual_binds_fnaddr() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let mut cc = CallControl::new();
+        register_raw_copy_fnaddrs(&mut cc);
+
+        let signed = LowLevelType::Signed;
+        let float = LowLevelType::Float;
+        let gcref = (*GCREF).clone();
+        let cases: [(&LowLevelType, i64); 3] =
+            [(&signed, 0x6161), (&float, 0x6162), (&gcref, 0x6163)];
+        for &(item, addr) in &cases {
+            let helper =
+                mint_ll_copy_raw_array(&rtyper, item.clone()).expect("mint_ll_copy_raw_array");
+            let py = helper.graph.as_ref().expect("helper graph");
+            let args = graph_arg_lltypes(&py.graph.borrow());
+            let path = specialized_helper_path(LL_COPY_RAW_ARRAY_TO_RAW_ARRAY, &args);
+            register_callee_graph(
+                &mut cc,
+                path.clone(),
+                &py.graph.borrow(),
+                true,
+                GraphKey::of(&py.graph).as_usize(),
+            );
+            assert!(!cc.is_candidate(&path), "{path} must stay residual");
+            assert_eq!(
+                cc.lookup_function_fnaddr(&path),
+                Some(addr),
+                "{path} must bind the native leaf"
+            );
+            let graph = cc
+                .function_graphs()
+                .get(&path)
+                .unwrap_or_else(|| panic!("missing helper {path}"));
+            assert!(graph.hints.iter().any(|hint| hint == "dont_look_inside"));
+            let leaf = path.last_segment().expect("specialized path has a leaf");
+            assert_eq!(cc.guess_call_kind(&call_op_named(leaf)), CallKind::Residual);
+            let binding = cc.fnaddr_binding_for_target(&CallTarget::function_path([leaf]));
+            assert!(!binding.symbolic, "{path}");
+            assert!(!is_symbolic_fnaddr(binding.addr));
+            assert_eq!(binding.addr, addr);
+            assert!(
+                binding.path.contains("ll_copy_raw_array_to_raw_array"),
+                "{}",
+                binding.path
+            );
+        }
+
+        let helper = mint_ll_copy_raw_array(&rtyper, LowLevelType::Signed).expect("memoized");
+        let py = helper.graph.as_ref().expect("helper graph");
+        let unspecialized = CallPath::from_segments([LL_COPY_RAW_ARRAY_TO_RAW_ARRAY]);
+        register_callee_graph(
+            &mut cc,
+            unspecialized.clone(),
+            &py.graph.borrow(),
+            true,
+            GraphKey::of(&py.graph).as_usize(),
+        );
+        assert_eq!(
+            cc.lookup_function_fnaddr(&unspecialized),
+            Some(0x6161),
+            "unspecialized dest name binds the Signed leaf"
+        );
+    }
+
+    fn call_op_named(name: &str) -> crate::model::SpaceOperation {
+        crate::model::SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path([name]),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Void,
+            },
+        }
+    }
+
+    /// Every synthesised `@jit.dont_look_inside` family
+    /// `residual_native_fnaddr_row` is expected to cover resolves to a
+    /// `HELPER_FNADDRS` row. A future minted residual without a row is a
+    /// unit failure rather than a registration panic.
+    #[test]
+    fn residual_native_fnaddr_row_covers_synthesized_dont_look_inside_families() {
+        let str_find_char_args = ll_find_char_arg_types(&STRPTR);
+        let uni_find_char_args = ll_find_char_arg_types(&UNICODEPTR);
+        let str_search_args = ll_search_arg_types(&STRPTR);
+        let uni_search_args = ll_search_arg_types(&UNICODEPTR);
+        let raw_signed = copy_raw_array_args(&LowLevelType::Signed);
+        let raw_unsigned = copy_raw_array_args(&LowLevelType::Unsigned);
+        let raw_float = copy_raw_array_args(&LowLevelType::Float);
+        let raw_gcref = copy_raw_array_args(&*GCREF);
+        let list_signed = copy_list_to_raw_args(&LowLevelType::Signed);
+        let list_unsigned = copy_list_to_raw_args(&LowLevelType::Unsigned);
+        let list_float = copy_list_to_raw_args(&LowLevelType::Float);
+        let list_gcref = copy_list_to_raw_args(&*GCREF);
+
+        let expected: &[(&str, &[LowLevelType], &[&str])] = &[
+            (
+                LL_FIND_CHAR,
+                &str_find_char_args,
+                &["lltypesystem", "rstr", LL_FIND_CHAR],
+            ),
+            (
+                LL_FIND_CHAR,
+                &uni_find_char_args,
+                &["lltypesystem", "rstr", LL_FIND_CHAR_UNICODE],
+            ),
+            (
+                SEARCH_ELIDABLE,
+                &str_search_args,
+                &["rstring", SEARCH_ELIDABLE],
+            ),
+            (SEARCH_NORMAL, &uni_search_args, &["rstring", SEARCH_NORMAL]),
+            (
+                LL_COPY_RAW_ARRAY_TO_RAW_ARRAY,
+                &raw_signed,
+                &["lltypesystem", "rvec", "ll_copy_raw_array_to_raw_array_i"],
+            ),
+            (
+                LL_COPY_RAW_ARRAY_TO_RAW_ARRAY,
+                &raw_unsigned,
+                &["lltypesystem", "rvec", "ll_copy_raw_array_to_raw_array_i"],
+            ),
+            (
+                LL_COPY_RAW_ARRAY_TO_RAW_ARRAY,
+                &raw_float,
+                &["lltypesystem", "rvec", "ll_copy_raw_array_to_raw_array_f"],
+            ),
+            (
+                LL_COPY_RAW_ARRAY_TO_RAW_ARRAY,
+                &raw_gcref,
+                &["lltypesystem", "rvec", "ll_copy_raw_array_to_raw_array_r"],
+            ),
+            (
+                "ll_copy_list_to_raw_array_Signed",
+                &list_signed,
+                &["lltypesystem", "rvec", "ll_copy_list_to_raw_array_i"],
+            ),
+            (
+                "ll_copy_list_to_raw_array_Unsigned",
+                &list_unsigned,
+                &["lltypesystem", "rvec", "ll_copy_list_to_raw_array_i"],
+            ),
+            (
+                "ll_copy_list_to_raw_array_Float",
+                &list_float,
+                &["lltypesystem", "rvec", "ll_copy_list_to_raw_array_f"],
+            ),
+            (
+                "ll_copy_list_to_raw_array_GCREF",
+                &list_gcref,
+                &["lltypesystem", "rvec", "ll_copy_list_to_raw_array_r"],
+            ),
+        ];
+        for &(name, args, segs) in expected {
+            let dest = CallPath::from_segments([name]);
+            let row = residual_native_fnaddr_row(&dest, args);
+            assert_eq!(
+                row,
+                Some(CallPath::from_segments(segs.iter().copied())),
+                "family {name} args={args:?}"
+            );
+            let specialized = specialized_helper_path(name, args);
+            assert_eq!(
+                residual_native_fnaddr_row(&specialized, args),
+                Some(CallPath::from_segments(segs.iter().copied())),
+                "specialized {specialized}"
+            );
+        }
     }
 
     fn caller_direct_call_of(
