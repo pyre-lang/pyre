@@ -588,9 +588,23 @@ impl<'a> Lowering<'a> {
         alias: &InteriorFieldAlias,
         entries_array: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
     ) -> Result<Variable, LowerError> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+        // `rewrite_op_getinteriorfield` `ARRAY = op.args[0].concretetype.TO`
+        // (`jtransform.py`); `get_ll_dict` (`rordereddict.py`) one
+        // DICTENTRYARRAY per instantiation. Stamp Local and Entries from
+        // the same pointer so the recovered header is that ARRAY too.
+        let entries_ptr = entries_array.map(|arr| {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Array(arr.clone()),
+            }))
+        });
         match &alias.header {
             InteriorHeader::Local { local, var } => {
-                Ok(self.realias_operand(Some(*local), var.clone()))
+                let base = self.realias_operand(Some(*local), var.clone());
+                if let Some(ptr) = entries_ptr.clone() {
+                    base.set_concretetype(Some(ptr));
+                }
+                Ok(base)
             }
             InteriorHeader::Entries {
                 recv_local,
@@ -602,13 +616,8 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                if let Some(arr) = entries_array {
-                    use crate::translator::rtyper::lltypesystem::lltype::{
-                        LowLevelType, Ptr, PtrTarget,
-                    };
-                    res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
-                        TO: PtrTarget::Array(arr.clone()),
-                    }))));
+                if let Some(ptr) = entries_ptr {
+                    res.set_concretetype(Some(ptr));
                 }
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),

@@ -9501,6 +9501,10 @@ impl<'a> InlineFrameGuard<'a> {
             walk.next_call_id = walk.next_call_id.saturating_add(1);
             call_id
         };
+        debug_assert!(
+            w_code == 0 || !parents.is_empty(),
+            "every admitted Python MIFrame has a paused caller section"
+        );
         walk.framestack.push(InlineFrame {
             is_portal: false,
             w_code,

@@ -3579,6 +3579,9 @@ impl Bookkeeper {
     /// lattice type. `is_r_dict` stays false: a custom eq/hash dict
     /// is `r_dict`, and that key function is not wired.
     fn project_ordered_dict_root(self: &Rc<Self>, root: &str) -> Option<SomeValue> {
+        if !is_ordered_dict_root(root) {
+            return None;
+        }
         let inner = strip_generic_one(root.trim(), "RDict<")?;
         let parts = split_generic_args(inner);
         if parts.len() < 2 {
@@ -9122,6 +9125,18 @@ fn fn_ptr_result_lltype(
 pub(crate) fn is_fn_type_spelling(t: &str) -> bool {
     let t = t.trim();
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
+}
+
+/// Unprefixed `RDict<K, V>` / `RDict<K, V, S>` spelling used by
+/// `__cast_instance_intrinsic` (`rdict_insert_get_cast_root`) and by
+/// `project_ordered_dict_root`. Qualified FieldRead `owner_root` values
+/// (`rordereddict::RDict<…>`) stay outside this grammar so a field whose
+/// type is that struct still intern as `SomeInstance`.
+pub(crate) fn is_ordered_dict_root(root: &str) -> bool {
+    let Some(inner) = strip_generic_one(root.trim(), "RDict<") else {
+        return false;
+    };
+    split_generic_args(inner).len() >= 2
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,

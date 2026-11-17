@@ -563,3 +563,118 @@ fn voidp_matches_ccharp_shape_not_identity() {
         "VOIDP hints (`render_as_void`) differ from CCHARP"
     );
 }
+
+/// `interior_header_base` stamps `Ptr(ARRAY)` on both the recovered
+/// Local header and the synthetic `entries` FieldRead
+/// (`jtransform.py` `rewrite_op_getinteriorfield`; `rordereddict.py`
+/// `get_ll_dict`).
+#[test]
+fn interior_header_base_stamps_concrete_array_on_local_and_entries() {
+    use super::{
+        AccumulatorFacts, InteriorFieldAlias, InteriorHeader, Lowering, RootStackAnalyzer,
+        RootStackState, harvest_declared_gc_facts, no_immutable_fields,
+    };
+    use crate::model::{FieldDescriptor, ValueType};
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
+    };
+    use majit_charon_reader::ullbc::Unstructured;
+
+    let entry = Struct::new(
+        "Entry<ObjectKey, PyObjectRef>",
+        vec![
+            ("key".into(), GCREF.clone()),
+            ("f_valid".into(), LowLevelType::Bool),
+            ("value".into(), GCREF.clone()),
+            ("f_hash".into(), LowLevelType::Signed),
+        ],
+    );
+    let concrete = Array::gc(LowLevelType::Struct(Box::new(entry)));
+    let expected = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(concrete.clone()),
+    }));
+
+    let llbc = crate::front::mir::tests::empty_llbc();
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    let root_state = RootStackState::new(&llbc);
+    let root_stack = RootStackAnalyzer::new(&llbc, &root_state);
+    let mut lowering = Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        no_immutable_fields(),
+        &raw_alloc,
+        &accum,
+        &root_stack,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let local_var = crate::flowspace::model::Variable::new();
+    let local_alias = InteriorFieldAlias {
+        header: InteriorHeader::Local {
+            local: 0,
+            var: local_var.clone(),
+        },
+        index_local: 1,
+        index_var: crate::flowspace::model::Variable::new(),
+        array_type_id: "GcArray<Entry<ObjectKey, PyObjectRef>>".into(),
+    };
+    let local_base = lowering
+        .interior_header_base(lowering.graph.startblock, &local_alias, Some(&concrete))
+        .expect("Local header");
+    assert_eq!(local_base.concretetype().as_ref(), Some(&expected));
+    assert_eq!(local_var.concretetype().as_ref(), Some(&expected));
+
+    let recv_var = crate::flowspace::model::Variable::new();
+    let entries_alias = InteriorFieldAlias {
+        header: InteriorHeader::Entries {
+            recv_local: 0,
+            recv_var,
+            field: FieldDescriptor::new("entries", Some("RDict".into())),
+            ty: ValueType::Ref(None),
+        },
+        index_local: 1,
+        index_var: crate::flowspace::model::Variable::new(),
+        array_type_id: "GcArray<Entry<ObjectKey, PyObjectRef>>".into(),
+    };
+    let entries_base = lowering
+        .interior_header_base(lowering.graph.startblock, &entries_alias, Some(&concrete))
+        .expect("Entries header");
+    assert_eq!(entries_base.concretetype().as_ref(), Some(&expected));
+    let field_read = lowering
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .find(|op| {
+            matches!(
+                &op.kind,
+                crate::model::OpKind::FieldRead { field, .. } if field.name == "entries"
+            )
+        })
+        .expect("Entries emits FieldRead entries");
+    assert_eq!(field_read.result.as_ref(), Some(&entries_base));
+    assert_eq!(
+        field_read.result.as_ref().and_then(|v| v.concretetype()),
+        Some(expected)
+    );
+}

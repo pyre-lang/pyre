@@ -59,6 +59,34 @@ pub fn apply_from_flowspace_variables(
         let Some(ct) = typed_var.concretetype() else {
             continue;
         };
+        // `interior_header_base` stamps `Ptr(DICTENTRYARRAY)` on a Local interior
+        // header; the typed input must name the same ARRAY, which is
+        // `v_inst.concretetype.TO` for `jtransform.py rewrite_op_getinteriorfield`
+        // (`rordereddict.py get_ll_dict`).
+        debug_assert!(
+            match (
+                crate::codewriter::call::array_from_concretetype(
+                    legacy_var.concretetype().as_ref()
+                ),
+                crate::codewriter::call::array_from_concretetype(Some(&ct)),
+            ) {
+                (Some(front), Some(typed)) => {
+                    !matches!(
+                        (&front.OF, &typed.OF),
+                        (
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(
+                                _
+                            ),
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(
+                                _
+                            ),
+                        )
+                    ) || front == typed
+                }
+                _ => true,
+            },
+            "typed input ARRAY must equal the front stamp"
+        );
         legacy_var.set_concretetype(Some(ct));
     }
 }

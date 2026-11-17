@@ -701,8 +701,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
     // point), instead of collapsing to the caller boundary (re-execute).
     // Every admitted Python inline records its caller (`perform_call` /
-    // `newframe`); an empty chain is the collapse fallback for a level that
-    // has no parent snapshot.
+    // `newframe`). `Trace._ensure_parent_resumedata` (`opencoder.py`) is
+    // the eager parent snapshot; pyre publishes it at entry
+    // (`enter_with_resume`).
     if inline_subwalk {
         let parent_frames = {
             let session = ctx.session.borrow();
@@ -712,17 +713,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 .flat_map(|frame| frame.parents.iter().cloned())
                 .collect::<Vec<_>>()
         };
-        // Fire the multi-frame snapshot only when the paused-caller chain
-        // covers the FULL current inline depth. A nested straight-line callee
-        // inlined under a multiframe ancestor (e.g. `add3` inside a multiframe
-        // `mix`) pushes NO parent frame, so its own guards see a SHORTER chain
-        // than the callee depth — fall through to the single-frame collapse
-        // (the strict callee's resume-at-CALL behavior) rather than emit a
-        // chain that skips the intermediate frame.
-        //
-        // Numbered helper levels number their callers plus the helper
-        // sections (`capture_resumedata`). The Python levels below them take
-        // the same full-chain rule (`numbered_helper_guard_resume`).
+        // Fire the multi-frame snapshot when the paused-caller chain covers
+        // the current inline depth. Numbered helper levels number their
+        // callers plus the helper sections (`capture_resumedata`). The Python
+        // levels below them take the same full-chain rule
+        // (`numbered_helper_guard_resume`).
         let helper_chain = if ctx.fbw_mode.transparent_helper_subwalk {
             ctx.session.borrow().helper_chain()
         } else {
@@ -3330,7 +3325,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
 }
 
 /// How a guard inside a numbered helper chain resumes.
-enum NumberedHelperGuard {
+pub(crate) enum NumberedHelperGuard {
     /// The frames to number, outermost-first.
     Frames(Vec<InlineParentFrame>),
     /// The root portal's CALL boundary.
@@ -3359,8 +3354,14 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
     parent_frames: Vec<InlineParentFrame>,
 ) -> Result<Vec<InlineParentFrame>, DispatchError> {
     let live_after_jit_pc = ctx.live_after_jit_pc;
-    let innermost =
-        helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope, live_after_jit_pc)?;
+    let innermost = helper_innermost_resume_frame(
+        ctx,
+        op_pc,
+        after_residual_call,
+        scope,
+        live_after_jit_pc,
+        None,
+    )?;
     let ancestors = unpublished_ancestor_helper_resume_frames(ctx, op_pc)?;
     let mut frames = if parent_frames.first().is_some_and(python_resume_frame) {
         parent_frames
@@ -3397,36 +3398,33 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     scope: &GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
     live_after_jit_pc: usize,
-) -> Result<
-    (
-        Vec<InlineParentFrame>,
-        bool, /* runnable */
-        bool, /* python_chain_complete */
-    ),
-    DispatchError,
-> {
+    pending_result: Option<(char, usize)>,
+) -> Result<(Vec<InlineParentFrame>, bool /* runnable */), DispatchError> {
     parent_frames.push(helper_innermost_resume_frame(
         ctx,
         op_pc,
         after_residual_call,
         scope,
         live_after_jit_pc,
+        pending_result,
     )?);
-    // `capture_resumedata` numbers every frame on `framestack`. A Python
-    // inline level below the helper levels that holds no paused-caller image
-    // (a straight-line callee) has no section here, so numbering would skip
-    // it. Such a guard takes the caller-boundary collapse that
-    // `walker_inline_guard_resumes_in_callee` gives the same Python level.
-    let python_chain_complete = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .rev()
-            .skip_while(|frame| frame.is_helper_level())
-            .filter(|frame| !frame.is_portal)
-            .all(|frame| !frame.parents.is_empty())
-    };
+    // `Trace._ensure_parent_resumedata` (`opencoder.py`) walks `framestack`
+    // and creates every missing parent snapshot
+    // (`MIFrame.get_list_of_active_boxes`). Every admitted Python inline
+    // already publishes that paused caller at entry (`enter_with_resume`).
+    debug_assert!(
+        {
+            let session = ctx.session.borrow();
+            session
+                .framestack
+                .iter()
+                .rev()
+                .skip_while(|frame| frame.is_helper_level())
+                .filter(|frame| !frame.is_portal)
+                .all(|frame| !frame.parents.is_empty())
+        },
+        "every live Python MIFrame has a paused caller section"
+    );
     // `capture_resumedata` numbers every frame on `framestack`. A
     // `GUARD_NO_EXCEPTION` failure is `blackhole.py
     // handle_exception_in_frame`: skip `-live-`, jump to this frame's
@@ -3434,24 +3432,18 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // `helper_resume_reaches_blocker` would collapse to the Python CALL
     // and leave the residual exception pending there. The looked-inside
     // helper is already on `parent_frames`; a residual call is not.
-    // A Python level below with no paused-caller image makes
-    // `python_chain_complete` false (straight-line inline). Exception
-    // resume still has to number this helper; CALL-collapse is what
-    // lets `check_truediv`'s `except OverflowError` steal the residual.
+    // Exception resume still has to number this helper; CALL-collapse is
+    // what lets `check_truediv`'s `except OverflowError` steal the residual.
     // Reported as runnable so numbered_helper_guard_resume takes NumberedHelperGuard::Frames.
     if after_residual_call {
-        return Ok((parent_frames, true, python_chain_complete));
+        return Ok((parent_frames, true));
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
     // unless a heap write already ran, in which case the guard is refused.
     let (sections_have_markers, any_blocker) =
         numbered_helper_sections_blocker_free(ctx, &parent_frames);
-    Ok((
-        parent_frames,
-        python_chain_complete && sections_have_markers && !any_blocker,
-        python_chain_complete,
-    ))
+    Ok((parent_frames, sections_have_markers && !any_blocker))
 }
 
 /// Marker and blocker facts for every helper section in `parent_frames`.
@@ -3531,7 +3523,7 @@ fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
 /// heap-writing residual or a journaled live-heap effect has executed
 /// since the level was entered, and so is a blocker section then (the
 /// guard is refused).
-fn numbered_helper_guard_resume<Sym: WalkSym>(
+pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
@@ -3539,13 +3531,14 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     parent_frames: Vec<InlineParentFrame>,
 ) -> Result<NumberedHelperGuard, DispatchError> {
     let live_after_jit_pc = ctx.live_after_jit_pc;
-    let (parent_frames, runnable, python_chain_complete) = numbered_helper_runnable_frames(
+    let (parent_frames, runnable) = numbered_helper_runnable_frames(
         ctx,
         op_pc,
         after_residual_call,
         scope,
         parent_frames,
         live_after_jit_pc,
+        None,
     )?;
     if after_residual_call {
         return Ok(NumberedHelperGuard::Frames(parent_frames));
@@ -3592,13 +3585,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         return Err(refused);
     }
     if fbw_debug_abort_enabled() {
-        eprintln!(
-            "[numbered-helper-guard] collapse op_pc={op_pc} runnable={runnable} \
-             python_chain={python_chain_complete}"
-        );
-    }
-    if !python_chain_complete {
-        return Ok(NumberedHelperGuard::CallerBoundary);
+        eprintln!("[numbered-helper-guard] collapse op_pc={op_pc} runnable={runnable}");
     }
     let session = ctx.session.borrow();
     let Some(outer) = session.framestack.get(outer_index) else {
@@ -3640,12 +3627,15 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
 /// the later `ctx.live_after_jit_pc = op.next_pc` assigns before those
 /// guards are captured — so this numbers the helper section at the
 /// post-call `-live-` (`do_residual_call` captures with `MIFrame.pc`
-/// already there). Any `Err` is false. Reads the walk; does not write the
-/// trace or session.
+/// already there). `pending_result` is the destination
+/// `make_result_of_lastop` (`pyjitpl.py`) writes after the call; the real
+/// capture in [`numbered_helper_guard_resume`] passes `None`. Any `Err` is
+/// false. Reads the walk; does not write the trace or session.
 pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     post_call_pc: usize,
+    pending_result: Option<(char, usize)>,
 ) -> bool {
     if !(ctx.fbw_mode.inline_subwalk && ctx.fbw_mode.transparent_helper_subwalk) {
         return false;
@@ -3687,8 +3677,9 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
         &scope,
         parent_frames,
         post_call_pc,
+        pending_result,
     ) {
-        Ok((frames, runnable, _)) => {
+        Ok((frames, runnable)) => {
             let (sections_have_markers, any_blocker) =
                 numbered_helper_sections_blocker_free(ctx, &frames);
             runnable && sections_have_markers && !any_blocker
@@ -3702,13 +3693,15 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
 /// `after_residual_guard_marker` / `live_after_jit_pc`, else
 /// `plain_guard_resume_jitcode_pc`. Box count must equal
-/// `frame_value_count_at`.
+/// `frame_value_count_at`, minus the pending result slot when the
+/// admission probe omits it.
 fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
     scope: &GuardCaptureScope,
     live_after_jit_pc: usize,
+    pending_result: Option<(char, usize)>,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -3744,16 +3737,21 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
-    let boxes = collect_callee_active_boxes(
+    // `do_residual_call` (`pyjitpl.py`) writes the result with
+    // `make_result_of_lastop` after the call. The admission probe omits
+    // that not-yet-produced slot from the post-call live window.
+    let (boxes, skipped_pending_result) = collect_callee_active_boxes_excluding(
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
         jitcode_index as u32,
         op_pc,
         helper_jitcode_pc as i32,
+        pending_result,
     )?;
     let expected =
-        crate::state::frame_value_count_at(jitcode_index as i32, helper_jitcode_pc as i32);
+        crate::state::frame_value_count_at(jitcode_index as i32, helper_jitcode_pc as i32)
+            - usize::from(skipped_pending_result);
     if boxes.len() != expected {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }

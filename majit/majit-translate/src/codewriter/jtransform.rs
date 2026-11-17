@@ -665,39 +665,6 @@ pub fn keep_operation_unchanged(
     op.clone()
 }
 
-fn interior_array_of_struct_name(
-    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
-) -> Option<&str> {
-    match &arr.OF {
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
-            Some(s._name.as_str())
-        }
-        _ => None,
-    }
-}
-
-/// Keep emitted ARRAY `a` when `from_ct` `b` is its TypeDecl template
-/// (`b.OF._name == strip_generic_args(a.OF._name)`). `jtransform.py
-/// rewrite_op_getinteriorfield` sets `ARRAY = op.args[0].concretetype.TO`;
-/// `rordereddict.py get_ll_dict` builds one DICTENTRYARRAY per
-/// DICTKEY/DICTVALUE, so a template ARRAY must not replace that instance.
-fn prefer_emitted_interior_array(
-    emitted: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
-    from_ct: crate::translator::rtyper::lltypesystem::lltype::Array,
-) -> crate::translator::rtyper::lltypesystem::lltype::Array {
-    match emitted {
-        Some(a) if a != &from_ct => {
-            let keep = interior_array_of_struct_name(a)
-                .zip(interior_array_of_struct_name(&from_ct))
-                .is_some_and(|(a_name, b_name)| {
-                    b_name == majit_ir::descr::strip_generic_args(a_name).as_ref()
-                });
-            if keep { a.clone() } else { from_ct }
-        }
-        _ => from_ct,
-    }
-}
-
 /// JIT graph transformer.
 ///
 /// RPython equivalent: `jtransform.py` class `Transformer`.
@@ -11701,8 +11668,7 @@ impl<'a> Transformer<'a> {
     /// `ARRAY = op.args[0].concretetype.TO` then
     /// `cpu.interiorfielddescrof(ARRAY, name)`.
     /// `rordereddict.py get_ll_dict` mints one DICTENTRYARRAY per
-    /// DICTKEY/DICTVALUE; a template ARRAY.OF must not replace that
-    /// concrete ARRAY already on the op.
+    /// DICTKEY/DICTVALUE.
     fn rewrite_op_getinteriorfield(
         &mut self,
         op: &SpaceOperation,
@@ -11729,7 +11695,11 @@ impl<'a> Transformer<'a> {
         if let Some(from_ct) =
             crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
         {
-            array = Some(prefer_emitted_interior_array(array.as_ref(), from_ct));
+            debug_assert!(
+                array.as_ref().is_none_or(|emitted| emitted == &from_ct),
+                "interior ARRAY must equal v_inst.concretetype.TO (jtransform.py rewrite_op_getinteriorfield; rordereddict.py get_ll_dict)"
+            );
+            array = Some(from_ct);
         }
         if array != had_array {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -11749,7 +11719,7 @@ impl<'a> Transformer<'a> {
 
     /// `jtransform.py rewrite_op_setinteriorfield`:
     /// `interiorfielddescrof(v_inst.concretetype.TO, c_field.value)`.
-    /// Same ARRAY.OF rule as `rewrite_op_getinteriorfield`
+    /// Same ARRAY as `rewrite_op_getinteriorfield`
     /// (`rordereddict.py get_ll_dict`).
     fn rewrite_op_setinteriorfield(
         &mut self,
@@ -11779,7 +11749,11 @@ impl<'a> Transformer<'a> {
         if let Some(from_ct) =
             crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
         {
-            array = Some(prefer_emitted_interior_array(array.as_ref(), from_ct));
+            debug_assert!(
+                array.as_ref().is_none_or(|emitted| emitted == &from_ct),
+                "interior ARRAY must equal v_inst.concretetype.TO (jtransform.py rewrite_op_setinteriorfield; rordereddict.py get_ll_dict)"
+            );
+            array = Some(from_ct);
         }
         if array != had_array {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -21802,6 +21776,155 @@ mod tests {
             kind: OpKind::live(),
         };
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
+
+    /// `rewrite_op_getinteriorfield` / `rewrite_op_setinteriorfield` take
+    /// ARRAY only from `v_inst.concretetype.TO` (`jtransform.py`;
+    /// `rordereddict.py` `get_ll_dict`).
+    #[test]
+    fn rewrite_interiorfield_uses_base_concretetype_as_only_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        fn entry_array(name: &str) -> Array {
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                name,
+                vec![
+                    ("key".into(), GCREF.clone()),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::Signed),
+                ],
+            ))))
+        }
+        fn ptr_of(arr: &Array) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Array(arr.clone()),
+            }))
+        }
+
+        let concrete = entry_array("odictentry");
+        let mut graph = FunctionGraph::new("interior_array_authority");
+        let base = graph.alloc_value_var();
+        base.set_concretetype(Some(ptr_of(&concrete)));
+        let index = graph.alloc_value_var();
+        let value = graph.alloc_value_var();
+        let read_res = graph.alloc_value_var();
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(base.clone()),
+                kind: OpKind::Input {
+                    name: "entries".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(index.clone()),
+                kind: OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(value.clone()),
+                kind: OpKind::Input {
+                    name: "v".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(read_res.clone()),
+                kind: OpKind::InteriorFieldRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    field: FieldDescriptor::new("f_valid", Some("odictentry".into())),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("GcArray<odictentry>".into()),
+                    array: Some(concrete.clone()),
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::InteriorFieldWrite {
+                    base: base.clone(),
+                    index: index.clone(),
+                    field: FieldDescriptor::new("f_valid", Some("odictentry".into())),
+                    value: value.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("GcArray<odictentry>".into()),
+                    array: Some(concrete.clone()),
+                },
+            });
+        graph.set_return(graph.startblock, Some(read_res));
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let mut saw_read = false;
+        let mut saw_write = false;
+        for op in out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::InteriorFieldRead { array, .. } => {
+                    assert_eq!(array.as_ref(), Some(&concrete));
+                    saw_read = true;
+                }
+                OpKind::InteriorFieldWrite { array, .. } => {
+                    assert_eq!(array.as_ref(), Some(&concrete));
+                    saw_write = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_read && saw_write, "both interior ops must remain");
+
+        #[cfg(debug_assertions)]
+        {
+            let other = entry_array("odictentry_other");
+            let mismatch_base = crate::flowspace::model::Variable::new();
+            mismatch_base.set_concretetype(Some(ptr_of(&concrete)));
+            let mismatch_index = crate::flowspace::model::Variable::new();
+            let mismatch_op = SpaceOperation {
+                result: Some(crate::flowspace::model::Variable::new()),
+                kind: OpKind::InteriorFieldRead {
+                    base: mismatch_base.clone(),
+                    index: mismatch_index,
+                    field: FieldDescriptor::new("f_valid", Some("odictentry".into())),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("GcArray<odictentry_other>".into()),
+                    array: Some(other),
+                },
+            };
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transformer.rewrite_op_getinteriorfield(&mismatch_op, &mismatch_base);
+            }))
+            .is_err();
+            assert!(
+                panicked,
+                "producer assertion must fire when emitted ARRAY differs from v_inst.concretetype.TO"
+            );
+        }
     }
 
     #[test]

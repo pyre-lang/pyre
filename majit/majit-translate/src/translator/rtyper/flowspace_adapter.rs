@@ -2556,6 +2556,54 @@ fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp
     ))
 }
 
+/// Recast an RDict `entries` FieldRead onto the concrete `RDict<K, V[, S]>`
+/// owner before `getattr`. `__cast_instance_intrinsic` of that root is
+/// `SomeDict` (`project_ordered_dict_root`); `getrepr` builds
+/// `OrderedDictRepr` and `get_ll_dict` (`rordereddict.py`) puts
+/// `Ptr(DICTENTRYARRAY)` on `DICT.entries`.
+fn concrete_rdict_entries_getattr_ops(
+    base_hl: Hlvalue,
+    field: &crate::model::FieldDescriptor,
+    result: Hlvalue,
+) -> Result<Option<Vec<FlowspaceOp>>, TyperError> {
+    if field.name != "entries" {
+        return Ok(None);
+    }
+    let Some(owner) = field.owner_root.as_deref() else {
+        return Ok(None);
+    };
+    if !crate::annotator::bookkeeper::is_ordered_dict_root(owner) {
+        return Ok(None);
+    }
+    let callable_host = HOST_ENV
+        .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+        .ok_or_else(|| {
+            TyperError::message(
+                "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+            )
+        })?;
+    let narrowed = Hlvalue::Variable(Variable::new());
+    Ok(Some(vec![
+        FlowspaceOp::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                base_hl,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+            ],
+            narrowed.clone(),
+        ),
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                narrowed,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("entries"))),
+            ],
+            result,
+        ),
+    ]))
+}
+
 /// Recast a `__discriminant` FieldRead receiver onto the FieldRead owner
 /// before `getattr`, so `getuniqueclassdef` of that tagged instantiation
 /// (`rclass.py`) supplies the tag field. Variant payload reads use
@@ -4242,6 +4290,11 @@ pub fn translate_op(
                         result,
                     ),
                 ]);
+            }
+            if let Some(ops) =
+                concrete_rdict_entries_getattr_ops(base_hl.clone(), field, result.clone())?
+            {
+                return Ok(ops);
             }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
@@ -16900,6 +16953,159 @@ mod tests {
             elem_v1.id(),
             elem_v2.id(),
             "elem Variable identity must thread"
+        );
+    }
+
+    /// FieldRead of `RDict<K, V>.entries` recasts onto that root so
+    /// `getrepr` builds `OrderedDictRepr` (`rordereddict.py`
+    /// `get_ll_dict`) and the typed base is `Ptr(DICTENTRYARRAY)`, equal
+    /// to the front stamp.
+    #[test]
+    fn entries_interior_base_keeps_ordered_dict_repr_entryarray() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{ConstValue, HOST_ENV};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::sync::Arc;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let signed_dict = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let str_dict = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let r_signed = OrderedDictRepr::new(
+            rtyper.clone(),
+            signed_repr() as Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            string_repr() as Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            signed_dict,
+            None,
+            false,
+            false,
+        )
+        .expect("signed-key OrderedDictRepr");
+        let r_str = OrderedDictRepr::new(
+            rtyper,
+            string_repr() as Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            string_repr() as Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            str_dict,
+            None,
+            false,
+            false,
+        )
+        .expect("string-key OrderedDictRepr");
+        assert_ne!(
+            r_signed.DICTKEY, r_str.DICTKEY,
+            "key layouts differ so DICTENTRYARRAY differs (get_ll_dict)"
+        );
+        assert_ne!(r_signed.DICTENTRYARRAY, r_str.DICTENTRYARRAY);
+
+        let owner = "RDict<ObjectKey, PyObjectRef>";
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("entries_interior_base");
+        let vars = mint_vars(&mut graph, 6);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[4].clone(), Hlvalue::Variable(Variable::new()));
+        let field_read = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("entries", Some(owner.into())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        };
+        let translated = translate_op(&field_read, &value_map, &empty_call_registry())
+            .expect("entries FieldRead must CAST then getattr");
+        assert_eq!(
+            translated
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["simple_call", "getattr"]
+        );
+        let cast = HOST_ENV
+            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+            .expect("CAST_INSTANCE");
+        let Hlvalue::Constant(ref callee) = translated[0].args[0] else {
+            panic!("cast callee");
+        };
+        assert!(
+            matches!(&callee.value, ConstValue::HostObject(h) if h == &cast),
+            "entries FieldRead recasts via __cast_instance_intrinsic"
+        );
+        let Hlvalue::Constant(ref root) = translated[0].args[2] else {
+            panic!("cast root");
+        };
+        assert!(
+            matches!(&root.value, ConstValue::ByteStr(b) if b == owner.as_bytes()),
+            "cast root is the RDict instantiation, got {:?}",
+            root.value
+        );
+        let Hlvalue::Constant(ref attr) = translated[1].args[1] else {
+            panic!("getattr name");
+        };
+        assert!(matches!(&attr.value, ConstValue::ByteStr(b) if b == b"entries"));
+
+        let interior = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::InteriorFieldRead {
+                base: vars[2].clone(),
+                index: vars[4].clone(),
+                field: crate::model::FieldDescriptor::new("f_valid", Some("odictentry".into())),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+                array: None,
+            },
+        };
+        let unfolded = translate_op(&interior, &value_map, &empty_call_registry())
+            .expect("InteriorFieldRead unfolds");
+        assert_eq!(
+            unfolded
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getitem", "getattr"]
+        );
+
+        let expected = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(r_signed.DICTENTRYARRAY.clone()),
+        }));
+        vars[2].set_concretetype(Some(expected.clone()));
+        assert_eq!(
+            vars[2].concretetype().as_ref(),
+            Some(&expected),
+            "front stamp is Ptr(DICTENTRYARRAY) from OrderedDictRepr"
+        );
+        assert!(
+            !matches!(
+                vars[2].concretetype().as_ref(),
+                Some(LowLevelType::Ptr(ptr))
+                    if matches!(&ptr.TO, PtrTarget::Array(arr)
+                        if matches!(&arr.OF, LowLevelType::Struct(s) if s._name == "GcEntries"
+                            || s._name.starts_with("GcEntries<??")))
+            ),
+            "front stamp must not be the unsuffixed GcEntries template"
         );
     }
 

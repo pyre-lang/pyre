@@ -5581,6 +5581,9 @@ pub(crate) enum AssemblerContinuationEscape {
 /// [`try_execute_residual_call_via_executor_inner`] return
 /// `OrthodoxSubWalkTraceUnsupported` before executing the call.
 /// `op_pc` is the residual's jitcode pc; `post_call_pc` is its next pc.
+/// `pending_result` is the destination `make_result_of_lastop`
+/// (`pyjitpl.py`) writes after `do_residual_call`; `None` when there is
+/// none or the result is already in the banks.
 pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
@@ -5588,6 +5591,7 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     op_pc: usize,
     post_call_pc: usize,
+    pending_result: Option<(char, usize)>,
 ) -> Option<(&'static str, i64, i64)> {
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
@@ -5643,7 +5647,12 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
         } else if may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
-            && !super::resume_snapshot::helper_may_force_resumes_in_frame(ctx, op_pc, post_call_pc)
+            && !super::resume_snapshot::helper_may_force_resumes_in_frame(
+                ctx,
+                op_pc,
+                post_call_pc,
+                pending_result,
+            )
         {
             Some(("may-force-in-transparent-helper", addr, 0))
         } else {
@@ -5709,12 +5718,21 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // concrete result `execute_varargs` would have produced.
 
     // `blackhole_result`'s pc is the residual's next jitcode pc.
-    let post_call_pc = match blackhole_result {
-        Some((pc, _, _)) => pc,
-        None => usize::MAX,
+    // `pending_result` is the destination `make_result_of_lastop`
+    // (`pyjitpl.py`) writes after `do_residual_call`; void (`'v'`) has none.
+    let (post_call_pc, pending_result) = match blackhole_result {
+        Some((pc, bank, color)) => (pc, (bank != 'v').then_some((bank, color))),
+        None => (usize::MAX, None),
     };
-    let unsupported_funcbox =
-        residual_call_refused_up_front(ctx, call_opcode, allboxes, call_descr, op_pc, post_call_pc);
+    let unsupported_funcbox = residual_call_refused_up_front(
+        ctx,
+        call_opcode,
+        allboxes,
+        call_descr,
+        op_pc,
+        post_call_pc,
+        pending_result,
+    );
     if let Some((reason, addr, symbolic)) = unsupported_funcbox {
         // Every caller catches this variant to decline its whole fold, so
         // without a report here the helper that stopped the descent is
@@ -8853,8 +8871,16 @@ fn record_operator_tail_residual_inner<Sym: WalkSym>(
     // caller's latch (`blackhole.py convert_and_run_from_pyjitpl` resumes
     // past `__new__`). Any later error comes after the call ran and
     // propagates.
-    if residual_call_refused_up_front(ctx, call_opcode, &allboxes, call_descr, op.pc, op.next_pc)
-        .is_some()
+    if residual_call_refused_up_front(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        op.pc,
+        op.next_pc,
+        (dst_bank != 'v').then_some((dst_bank, dst)),
+    )
+    .is_some()
     {
         return Ok(OperatorTailResidual::NotRun);
     }

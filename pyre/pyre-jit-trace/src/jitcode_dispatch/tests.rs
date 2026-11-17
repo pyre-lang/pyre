@@ -24879,6 +24879,7 @@ fn residual_call_refused_up_front_probe(
         call_descr,
         usize::MAX,
         usize::MAX,
+        None,
     )
 }
 
@@ -24952,10 +24953,42 @@ fn numbered_helper_level(parents: Vec<InlineParentFrame>) -> InlineFrame {
     }
 }
 
+fn python_level(parents: Vec<InlineParentFrame>) -> InlineFrame {
+    InlineFrame {
+        is_portal: false,
+        w_code: 1,
+        is_being_profiled: false,
+        recursion_greenkey: false,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents,
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::Unavailable,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    }
+}
+
 fn install_live_only_helper_jitcode() -> u32 {
-    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    install_live_helper_jitcode("may_force_numbered_helper_live", &[], &[])
+}
+
+fn install_live_int_helper_jitcode(name: &str, live_i: &[u8]) -> u32 {
+    install_live_helper_jitcode(name, live_i, &[])
+}
+
+fn install_live_ref_helper_jitcode(name: &str, live_r: &[u8]) -> u32 {
+    install_live_helper_jitcode(name, &[], live_r)
+}
+
+fn install_live_helper_jitcode(name: &str, live_i: &[u8], live_r: &[u8]) -> u32 {
+    let live_off = crate::state::intern_liveness(live_i, live_r, &[]).expect("live window");
     let live = crate::state::op_live();
-    let runtime_jc = majit_metainterp::jitcode::JitCode::new("may_force_numbered_helper_live");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![live, (live_off & 0xff) as u8, (live_off >> 8) as u8],
         startpoints: Some([0_usize].into_iter().collect()),
@@ -24995,6 +25028,8 @@ fn residual_call_refused_up_front_numbered_may_force(
     session: &std::cell::RefCell<WalkSession>,
     helper_index: u32,
     post_call_pc: usize,
+    pending_result: Option<(char, usize)>,
+    regs_i: &[OpRef],
 ) -> Option<(&'static str, i64, i64)> {
     let mut tc = fresh_trace_ctx();
     let addr = pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64;
@@ -25002,7 +25037,6 @@ fn residual_call_refused_up_front_numbered_may_force(
     let allboxes = [funcbox];
     let descr = make_call_descr(90, vec![], Type::Int, majit_ir::ExtraEffect::RandomEffects);
     let call_descr = descr.as_call_descr().expect("CallDescr");
-    let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -25043,6 +25077,7 @@ fn residual_call_refused_up_front_numbered_may_force(
         call_descr,
         post_call_pc,
         post_call_pc,
+        pending_result,
     )
 }
 
@@ -25088,8 +25123,13 @@ fn residual_call_refused_up_front_declines_may_force_when_numbered_ancestor_reac
         HelperChain::Numbered,
         "one Section helper with a parent is a numbered chain"
     );
-    let admitted =
-        residual_call_refused_up_front_numbered_may_force(&session, helper_index, live_pc);
+    let admitted = residual_call_refused_up_front_numbered_may_force(
+        &session,
+        helper_index,
+        live_pc,
+        None,
+        &[],
+    );
     assert_eq!(
         admitted, None,
         "a blocker-free numbered chain still records the may-force residual: {admitted:?}"
@@ -25103,11 +25143,514 @@ fn residual_call_refused_up_front_declines_may_force_when_numbered_ancestor_reac
             ANCESTOR_BLOCKER_JITCODE,
             live_pc,
         )]));
-    let refused =
-        residual_call_refused_up_front_numbered_may_force(&session, helper_index, live_pc);
+    let refused = residual_call_refused_up_front_numbered_may_force(
+        &session,
+        helper_index,
+        live_pc,
+        None,
+        &[],
+    );
     assert!(
         matches!(refused, Some(("may-force-in-transparent-helper", _, 0))),
         "an ancestor helper_resume_reaches_blocker refuses the residual up front: {refused:?}"
+    );
+}
+
+/// Admission still records a may-force residual when every live Python
+/// `MIFrame` already holds its paused caller (`Trace._ensure_parent_resumedata`
+/// in `opencoder.py`; `MIFrame.get_list_of_active_boxes`).
+#[test]
+fn residual_call_refused_up_front_admits_may_force_with_complete_python_chain() {
+    let _ = test_outer_resume_jitcode_index();
+    let python_outer = install_python_resume_jitcode();
+    let python_inner = install_python_resume_jitcode();
+    let helper_index = install_live_only_helper_jitcode();
+    let live_pc = 0;
+    assert!(
+        crate::state::pyjitcode_for_jitcode_index(python_outer as i32)
+            .is_some_and(|pjc| !pjc.code_ptr.is_null()),
+        "outer python parent must satisfy python_resume_frame"
+    );
+    assert!(
+        crate::state::pyjitcode_for_jitcode_index(python_inner as i32)
+            .is_some_and(|pjc| !pjc.code_ptr.is_null()),
+        "inner python parent must satisfy python_resume_frame"
+    );
+    let helper_pjc = crate::state::pyjitcode_for_jitcode_index(helper_index as i32)
+        .expect("live-only helper payload");
+    assert!(
+        helper_pjc
+            .jitcode
+            .can_decode_live_vars(live_pc, crate::state::op_live()),
+        "innermost post_call_pc must decode -live-"
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_index as usize, live_pc, None),
+        "live-only helper remaining body must be blocker-free"
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session
+        .borrow_mut()
+        .framestack
+        .push(python_level(vec![numbered_helper_parent(
+            python_outer,
+            live_pc,
+        )]));
+    session
+        .borrow_mut()
+        .framestack
+        .push(python_level(vec![numbered_helper_parent(
+            python_inner,
+            live_pc,
+        )]));
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            python_inner,
+            live_pc,
+        )]));
+    assert_eq!(
+        session.borrow().helper_chain(),
+        HelperChain::Numbered,
+        "one Section helper with a parent is a numbered chain"
+    );
+    let admitted = residual_call_refused_up_front_numbered_may_force(
+        &session,
+        helper_index,
+        live_pc,
+        None,
+        &[],
+    );
+    assert_eq!(
+        admitted, None,
+        "a complete Python caller chain still records the may-force residual: {admitted:?}"
+    );
+}
+
+/// Seeded user-call, generator-resume (`parent` then `_send_ex` tail), and
+/// bridge (`parent_for_current` then pending tails) all publish through
+/// `InlineFrameGuard::enter`. Every non-portal Python level has nonempty
+/// `parents`, outermost-first.
+#[test]
+fn python_inline_entry_paths_publish_parent_sections() {
+    let _ = test_outer_resume_jitcode_index();
+    let caller = install_python_resume_jitcode();
+    let nested = install_python_resume_jitcode();
+    let send_ex = send_ex_continuation_parent_frame(OpRef::const_ptr(majit_ir::GcRef::NULL))
+        .expect("send_ex tail installs");
+    let send_ex_index = send_ex.jitcode_index;
+
+    let published_indexes = |session: &std::cell::RefCell<WalkSession>| {
+        let walk = session.borrow();
+        let frame = walk
+            .framestack
+            .last()
+            .expect("enter publishes one Python level");
+        assert!(!frame.is_portal, "enter leaves is_portal false");
+        assert_ne!(frame.w_code, 0, "Python enter carries w_code");
+        assert!(
+            !frame.parents.is_empty(),
+            "every admitted Python MIFrame has a paused caller section"
+        );
+        frame
+            .parents
+            .iter()
+            .map(|parent| parent.jitcode_index)
+            .collect::<Vec<_>>()
+    };
+
+    let user_session = std::cell::RefCell::new(WalkSession::default());
+    let _user = InlineFrameGuard::enter(
+        &user_session,
+        1,
+        false,
+        false,
+        vec![numbered_helper_parent(caller, 0)],
+        0,
+    );
+    assert_eq!(
+        published_indexes(&user_session),
+        [caller],
+        "seeded user-call parent is the sole section"
+    );
+
+    let gen_session = std::cell::RefCell::new(WalkSession::default());
+    let _gen = InlineFrameGuard::enter(
+        &gen_session,
+        2,
+        false,
+        false,
+        vec![numbered_helper_parent(caller, 0), send_ex],
+        0,
+    );
+    assert_eq!(
+        published_indexes(&gen_session),
+        [caller, send_ex_index],
+        "generator-resume is FOR_ITER caller then _send_ex tail"
+    );
+
+    let bridge_session = std::cell::RefCell::new(WalkSession::default());
+    let _bridge = InlineFrameGuard::enter(
+        &bridge_session,
+        3,
+        false,
+        false,
+        vec![
+            numbered_helper_parent(caller, 0),
+            numbered_helper_parent(nested, 0),
+        ],
+        0,
+    );
+    assert_eq!(
+        published_indexes(&bridge_session),
+        [caller, nested],
+        "bridge recipe parents stay outermost-first"
+    );
+}
+
+/// After-residual capture numbers both Python parent sections plus the
+/// helper section (`Trace.capture_resumedata` / `MIFrame.do_residual_call`).
+#[test]
+fn numbered_helper_after_residual_guard_numbers_complete_python_chain() {
+    let _ = test_outer_resume_jitcode_index();
+    let python_outer = install_python_resume_jitcode();
+    let python_inner = install_python_resume_jitcode();
+    let helper_index = install_live_only_helper_jitcode();
+    let live_pc = 0;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame::portal());
+    session
+        .borrow_mut()
+        .framestack
+        .push(python_level(vec![numbered_helper_parent(
+            python_outer,
+            live_pc,
+        )]));
+    session
+        .borrow_mut()
+        .framestack
+        .push(python_level(vec![numbered_helper_parent(
+            python_inner,
+            live_pc,
+        )]));
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            python_inner,
+            live_pc,
+        )]));
+    assert_eq!(session.borrow().helper_chain(), HelperChain::Numbered);
+
+    let parent_frames = {
+        let walk = session.borrow();
+        walk.framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    let mut tc = fresh_trace_ctx();
+    let regs_r = RegisterBank::default();
+    let regs_i = RegisterBank::default();
+    let regs_f = RegisterBank::default();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(helper_index as usize),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &regs_i,
+        registers_f: &regs_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: live_pc,
+    };
+    let scope = GuardCaptureScope {
+        residual_call_catch_resume: true,
+        ..GuardCaptureScope::default()
+    };
+    let NumberedHelperGuard::Frames(frames) = numbered_helper_guard_resume(
+        &mut wc,
+        live_pc,
+        /*after_residual_call=*/ true,
+        &scope,
+        parent_frames,
+    )
+    .expect("after-residual numbered helper capture") else {
+        panic!("after-residual capture must return Frames, not CallerBoundary");
+    };
+    let indexes: Vec<u32> = frames.iter().map(|frame| frame.jitcode_index).collect();
+    assert_eq!(
+        indexes,
+        [python_outer, python_inner, python_inner, helper_index],
+        "after-residual Frames keep both Python parents then the helper section"
+    );
+}
+
+/// The admission probe omits only the not-yet-produced destination
+/// (`MIFrame.do_residual_call` / `make_result_of_lastop` in `pyjitpl.py`).
+/// Other post-call-live slots still reject a pre-call `OpRef::NONE`.
+#[test]
+fn residual_call_refused_up_front_ignores_only_pending_may_force_result_in_post_call_liveness() {
+    let _ = test_outer_resume_jitcode_index();
+    let python_index = install_python_resume_jitcode();
+    let live_pc = 0;
+    assert!(
+        crate::state::pyjitcode_for_jitcode_index(python_index as i32)
+            .is_some_and(|pjc| !pjc.code_ptr.is_null()),
+        "python parent must satisfy python_resume_frame"
+    );
+
+    let helper_i0 = install_live_int_helper_jitcode("may_force_numbered_helper_live_i0", &[0]);
+    let helper_i0_pjc = crate::state::pyjitcode_for_jitcode_index(helper_i0 as i32)
+        .expect("int-color-0 helper payload");
+    assert!(
+        helper_i0_pjc
+            .jitcode
+            .can_decode_live_vars(live_pc, crate::state::op_live()),
+        "innermost post_call_pc must decode -live-"
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_i0 as usize, live_pc, None),
+        "live-only helper remaining body must be blocker-free"
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            python_index,
+            live_pc,
+        )]));
+    assert_eq!(
+        session.borrow().helper_chain(),
+        HelperChain::Numbered,
+        "one Section helper with a parent is a numbered chain"
+    );
+    let admitted = residual_call_refused_up_front_numbered_may_force(
+        &session,
+        helper_i0,
+        live_pc,
+        Some(('i', 0)),
+        &[OpRef::NONE],
+    );
+    assert_eq!(
+        admitted, None,
+        "excluding the pending int destination admits the may-force residual: {admitted:?}"
+    );
+
+    let helper_i01 = install_live_int_helper_jitcode("may_force_numbered_helper_live_i01", &[0, 1]);
+    let helper_i01_pjc = crate::state::pyjitcode_for_jitcode_index(helper_i01 as i32)
+        .expect("int-color-0-1 helper payload");
+    assert!(
+        helper_i01_pjc
+            .jitcode
+            .can_decode_live_vars(live_pc, crate::state::op_live()),
+        "innermost post_call_pc must decode -live-"
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_i01 as usize, live_pc, None),
+        "live-only helper remaining body must be blocker-free"
+    );
+    let refused = residual_call_refused_up_front_numbered_may_force(
+        &session,
+        helper_i01,
+        live_pc,
+        Some(('i', 0)),
+        &[OpRef::NONE, OpRef::NONE],
+    );
+    assert!(
+        matches!(refused, Some(("may-force-in-transparent-helper", _, 0))),
+        "a second live int slot still refuses when it holds OpRef::NONE: {refused:?}"
+    );
+}
+
+/// Operator-tail preflight omits only `(dst_bank, dst)` from the post-call
+/// `-live-` (`MIFrame.do_residual_call` then `make_result_of_lastop`).
+#[test]
+fn operator_tail_preflight_ignores_its_pending_post_call_live_destination() {
+    let _ = test_outer_resume_jitcode_index();
+    let python_index = install_python_resume_jitcode();
+    let live_pc = 0;
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: live_pc,
+        next_pc: live_pc,
+    };
+    let helper_r0 = install_live_ref_helper_jitcode("operator_tail_numbered_helper_live_r0", &[0]);
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_r0 as usize, live_pc, None),
+        "live-only helper remaining body must be blocker-free"
+    );
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            python_index,
+            live_pc,
+        )]));
+    assert_eq!(session.borrow().helper_chain(), HelperChain::Numbered);
+
+    let regs_r = RegisterBank::new([OpRef::NONE]);
+    let regs_i = RegisterBank::default();
+    let regs_f = RegisterBank::default();
+    let mut tc = fresh_trace_ctx();
+    // Non-null refs so the executor actually runs `bh_type_call_new_tail`
+    // (`mayforce_null_ref_arg_is_checked_sentinel` does not name this leaf).
+    // A non-tuple receiver returns `w_newobject` without `__init__`.
+    let value_obj = pyre_object::w_int_new(0);
+    let receiver_obj = pyre_object::w_int_new(1);
+    let value = tc.const_ref(value_obj as i64);
+    let receiver = tc.const_ref(receiver_obj as i64);
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null],
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(helper_r0 as usize),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &regs_i,
+        registers_f: &regs_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: live_pc,
+    };
+    let recorded = record_operator_tail_residual(
+        &mut wc,
+        &op,
+        0,
+        'r',
+        crate::operator_continuation::OperatorTail::TypeCallNew,
+        value,
+        receiver,
+    );
+    assert!(
+        !matches!(recorded, Ok(OperatorTailResidual::NotRun)),
+        "excluding the pending ref destination admits the TypeCallNew tail"
+    );
+    let dest = regs_r.get(0).expect("r0 is the TypeCallNew destination");
+    if dest == OpRef::NONE {
+        match recorded {
+            Err(err) => panic!(
+                "make_result_of_lastop writes the destination before GUARD_NOT_FORCED capture; Err={err:?}"
+            ),
+            Ok(_) => panic!(
+                "make_result_of_lastop writes the destination before GUARD_NOT_FORCED capture"
+            ),
+        }
+    }
+    let opcodes: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+    let call_at = opcodes
+        .iter()
+        .position(|&opcode| opcode == majit_ir::OpCode::CallMayForceR);
+    let guard_at = opcodes
+        .iter()
+        .position(|&opcode| opcode == majit_ir::OpCode::GuardNotForced);
+    assert!(
+        call_at.is_some_and(|call| guard_at.is_some_and(|guard| call < guard)),
+        "CallMayForceR then GuardNotForced, got {opcodes:?}"
+    );
+    drop(wc);
+
+    let helper_r01 =
+        install_live_ref_helper_jitcode("operator_tail_numbered_helper_live_r01", &[0, 1]);
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_r01 as usize, live_pc, None),
+        "two-live-ref helper remaining body must be blocker-free"
+    );
+    let regs_r01 = RegisterBank::new([OpRef::NONE, OpRef::NONE]);
+    let mut tc01 = fresh_trace_ctx();
+    let value01 = tc01.const_null();
+    let receiver01 = tc01.const_null();
+    let mut wc01 = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null, ConcreteValue::Null],
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(helper_r01 as usize),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &regs_r01,
+        registers_i: &regs_i,
+        registers_f: &regs_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc01,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: live_pc,
+    };
+    let refused = record_operator_tail_residual(
+        &mut wc01,
+        &op,
+        0,
+        'r',
+        crate::operator_continuation::OperatorTail::TypeCallNew,
+        value01,
+        receiver01,
+    );
+    assert!(
+        matches!(refused, Ok(OperatorTailResidual::NotRun)),
+        "a second live ref slot still refuses when it holds OpRef::NONE"
     );
 }
 

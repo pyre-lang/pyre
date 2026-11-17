@@ -3623,6 +3623,37 @@ pub(crate) fn collect_callee_active_boxes(
     callee_op_pc: usize,
     carried_jitcode_pc: i32,
 ) -> Result<Vec<OpRef>, DispatchError> {
+    collect_callee_active_boxes_excluding(
+        regs_i,
+        regs_r,
+        regs_f,
+        callee_jitcode_index,
+        callee_op_pc,
+        carried_jitcode_pc,
+        None,
+    )
+    .map(|(boxes, _)| boxes)
+}
+
+/// Same live-window collection as [`collect_callee_active_boxes`], omitting
+/// one not-yet-produced destination.
+///
+/// `MIFrame.do_residual_call` (`pyjitpl.py`) runs the call, then
+/// `make_result_of_lastop` writes the result into the destination bank, and
+/// only then is `GUARD_NOT_FORCED` generated. An up-front admission probe
+/// still has the pre-call banks, so it skips that slot rather than reading
+/// `OpRef::NONE` or inventing a placeholder. The real guard snapshot calls
+/// [`collect_callee_active_boxes`] (`excluded = None`) after the result is
+/// in the bank. `skipped` is whether that slot was live and omitted.
+pub(crate) fn collect_callee_active_boxes_excluding(
+    regs_i: &(impl RegisterValues + ?Sized),
+    regs_r: &(impl RegisterValues + ?Sized),
+    regs_f: &(impl RegisterValues + ?Sized),
+    callee_jitcode_index: u32,
+    callee_op_pc: usize,
+    carried_jitcode_pc: i32,
+    excluded: Option<(char, usize)>,
+) -> Result<(Vec<OpRef>, bool), DispatchError> {
     // Without a carried coordinate there is no `-live-` window to size this
     // frame's box section from, and the decoder would resume on one anyway;
     // decline the inline rather than encode against an empty window.
@@ -3666,7 +3697,12 @@ pub(crate) fn collect_callee_active_boxes(
                 }
             }
         };
+    let mut skipped = false;
     for &idx in &banks.int {
+        if excluded == Some(('i', idx as usize)) {
+            skipped = true;
+            continue;
+        }
         active.push(read(
             regs_i.get_box(idx as usize),
             regs_i.len(),
@@ -3675,6 +3711,10 @@ pub(crate) fn collect_callee_active_boxes(
         )?);
     }
     for &idx in &banks.ref_ {
+        if excluded == Some(('r', idx as usize)) {
+            skipped = true;
+            continue;
+        }
         active.push(read(
             regs_r.get_box(idx as usize),
             regs_r.len(),
@@ -3683,6 +3723,10 @@ pub(crate) fn collect_callee_active_boxes(
         )?);
     }
     for &idx in &banks.float {
+        if excluded == Some(('f', idx as usize)) {
+            skipped = true;
+            continue;
+        }
         active.push(read(
             regs_f.get_box(idx as usize),
             regs_f.len(),
@@ -3690,7 +3734,7 @@ pub(crate) fn collect_callee_active_boxes(
             "float",
         )?);
     }
-    Ok(active)
+    Ok((active, skipped))
 }
 
 /// Whether a loop-carried operand parked below the call keeps the fold
