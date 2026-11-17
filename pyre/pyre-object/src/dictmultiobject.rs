@@ -7435,10 +7435,17 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
 /// Every stateless strategy is zero-sized, so a reference to it is valid at
 /// the holder's address.
-pub fn prebuilt_strategy_imp<T: DictStrategy + 'static>(
+///
+/// # Safety
+///
+/// `holder` must be the non-null, pointer-aligned address of a live immortal
+/// allocation (the prebuilt holder itself) that is never freed, since the
+/// returned reference is `'static`.
+pub unsafe fn prebuilt_strategy_imp<T: DictStrategy + 'static>(
     _strategy: &'static T,
     holder: usize,
 ) -> &'static dyn DictStrategy {
+    assert_ne!(holder, 0);
     assert_eq!(
         std::mem::size_of::<T>(),
         0,

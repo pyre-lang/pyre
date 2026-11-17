@@ -425,10 +425,17 @@ pub fn stamp_prebuilt_set_strategy_ref(holder: &'static SetStrategyRef, tid: u32
 /// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
 /// Every stateless strategy is zero-sized, so a reference to it is valid at
 /// the holder's address.
-pub fn prebuilt_set_strategy_imp<T: SetStrategy + 'static>(
+///
+/// # Safety
+///
+/// `holder` must be the non-null, pointer-aligned address of a live immortal
+/// allocation (the prebuilt holder itself) that is never freed, since the
+/// returned reference is `'static`.
+pub unsafe fn prebuilt_set_strategy_imp<T: SetStrategy + 'static>(
     _strategy: &'static T,
     holder: usize,
 ) -> &'static dyn SetStrategy {
+    assert_ne!(holder, 0);
     assert_eq!(
         std::mem::size_of::<T>(),
         0,
