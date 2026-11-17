@@ -1140,6 +1140,13 @@ impl<'a> Lowering<'a> {
                             variable
                         }
                     };
+                    if self.is_cell_local(local as usize) {
+                        // A cell-backed wrapper local holds the address
+                        // (`rdtoa.py` `strtod` `end_ptr`); the field store
+                        // is `rewrite_op_raw_store` of the scalar.
+                        self.emit_cell_store(mir_bb, local as usize, variable)?;
+                        return Ok(());
+                    }
                     self.local_var[local as usize] = Some(LocalValue::One(variable));
                     Ok(())
                 }
@@ -8548,15 +8555,16 @@ impl<'a> Lowering<'a> {
                     }
                     // `let p = &mut *(*env).flag; let r = *p;`: `p` is the
                     // cell address (`place_is_cell_address_repr` follows
-                    // `atomic_ref_place`). `rewrite_op_raw_load` loads the
-                    // pointee; the projection-cache arm below would return
-                    // the address. A GC mut-ref cell is `getfield` of
-                    // `value` above (`gc_mut_ref_param_root`).
+                    // an exclusive recorded borrow). `rewrite_op_raw_load`
+                    // loads the pointee; the projection-cache arm below
+                    // would return the address. A GC mut-ref cell is
+                    // `getfield` of `value` above (`gc_mut_ref_param_root`).
+                    // A `repr(transparent)` primitive wrapper is the inner
+                    // word (`tyref_primitive_or_transparent_primitive_node`).
                     if !self.index_elem_alias.contains_key(&local)
-                        && tyref_is_primitive_scalar(&place_ty, self.llbc)
                         && self.place_is_cell_address_repr(inner.as_ref())
                         && let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&place_ty)
+                            function_local_primitive_cell_descr(&place_ty, self.llbc)
                     {
                         let base = self.resolve_place(mir_bb, *inner)?;
                         let bb = self.emit_bb(mir_bb);
@@ -8778,9 +8786,10 @@ impl<'a> Lowering<'a> {
                     && !matches!(inner.kind, PlaceKind::Local(local)
                         if self.atomic_ref_place.contains_key(&(local as usize))
                             || self.index_elem_alias.contains_key(&(local as usize)))
-                    && tyref_is_primitive_scalar(&place_ty, self.llbc)
+                    // Primitive or `repr(transparent)` primitive wrapper
+                    // (`tyref_primitive_or_transparent_primitive_node`).
                     && let Some((item_ty, itemsize, is_item_signed)) =
-                        self.raw_word_descr(&place_ty)
+                        function_local_primitive_cell_descr(&place_ty, self.llbc)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
