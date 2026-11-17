@@ -29,14 +29,21 @@
 //! diverges is the slot type: this struct holds a raw `*mut PyFrame`
 //! rather than a `PyObjectRef`, and the edge reaches the collector
 //! only through the hand-written `pytraceback_object_custom_trace`
-//! hook, which forwards it as a mutable slot.
+//! hook, which forwards it as a mutable slot unconditionally, matching
+//! `pytraceback.py PyTraceback.__init__`.
 //!
 //! The frame moves, matching `pyframe.py class PyFrame(W_Root)`.  An
 //! executing frame is reached through a live Rust `&mut PyFrame` that
 //! spans every allocation the running opcode performs; the opcode path
 //! reads it back through `crate::eval::FrameAnchor` (`shadowstack.py`
-//! `push_roots` / `pop_roots`).  This file's conditional frame edge and
-//! `w_code` snapshot are downstream of that rewrite.
+//! `push_roots` / `pop_roots`).
+//!
+//! `w_pytraceback_new` asserts that a non-null frame is GC-owned
+//! whenever a collector is installed (`gc_owns_object_hook_installed`).
+//! `record_application_traceback` always prepends a node
+//! (`pytraceback.py record_application_traceback`); a `FrameBox::new_boxed`
+//! frame exists only in processes that never install a collector, where
+//! no collector can trace the node.
 //!
 //! A compiled trace's own inlined-callee frame is a nursery allocation
 //! too, and making every frame old-gen times `fib_recursive` out of its
@@ -67,7 +74,7 @@ pub const LINENO_NOT_COMPUTED: i64 = -1;
 pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 
 /// Layout: `[ob_header | frame: *mut PyFrame | lasti: i64 | w_next:
-/// PyObjectRef | lineno: i64 | w_code: PyObjectRef]`.
+/// PyObjectRef | lineno: i64]`.
 ///
 /// Every reference slot is traced, but by the hand-written
 /// `pytraceback_object_custom_trace` rather than by an offsets table:
@@ -79,12 +86,9 @@ pub struct PyTraceback {
     /// `pytraceback.py self.frame = frame` — a raw `*mut PyFrame`
     /// rather than a `PyObjectRef`, so it takes part in collection
     /// only through `pytraceback_object_custom_trace`.  That hook
-    /// forwards the slot when the GC owns the frame, which keeps it
-    /// live and would rewrite it if the frame ever moved.  Every frame
-    /// that can reach here is GC-owned: `FrameBox::new` allocates from
-    /// the GC whenever the hook is installed, and the one path that is
-    /// not — the pre-hook bootstrap window — collects nothing, so a
-    /// frame born there is never swept either way.
+    /// forwards the slot unconditionally, matching
+    /// `PyTraceback.__init__`.  `w_pytraceback_new` asserts a non-null
+    /// frame is GC-owned whenever a collector is installed.
     pub frame: *mut crate::pyframe::PyFrame,
     /// `pytraceback.py self.lasti = lasti` — where in the bytecode the
     /// exception was raised, in the units `tb_lasti` is defined in: bytes,
@@ -100,33 +104,15 @@ pub struct PyTraceback {
     pub w_next: PyObjectRef,
     /// `pytraceback.py self.lineno = lineno` — either a real
     /// source line number or `LINENO_NOT_COMPUTED`, in which case
-    /// `w_pytraceback_get_lineno` resolves it from `w_code` and `lasti`.
+    /// `w_pytraceback_get_lineno` resolves it from `self.frame.pycode`
+    /// and `lasti`.
     pub lineno: i64,
-    /// Snapshot of the raising frame's `pycode`, with no upstream
-    /// counterpart — `pytraceback.py` reads `self.frame.pycode`
-    /// directly (`:36`), because upstream's frame edge is unconditional
-    /// and the frame therefore outlives the traceback.  Pyre's edge is
-    /// conditional on the GC owning the frame, so consumers that must
-    /// keep working otherwise (`write_traceback_chain`) read
-    /// `source_path` / `obj_name` / `qualname` through this handle
-    /// instead.
-    ///
-    /// The condition now excludes only the pre-hook bootstrap frame:
-    /// the tracer snapshot, which used to be the reachable case, is
-    /// GC-owned since `snapshot_for_tracing` moved to `FrameBox::new`,
-    /// and a full-corpus probe on the forwarding hook saw no non-GC
-    /// frame reach a traceback.  Retiring the field would still mean
-    /// deleting a guard whose failure mode is handing the collector a
-    /// `std::alloc` address, on evidence that is an absence rather than
-    /// a proof, so it stays.
-    pub w_code: PyObjectRef,
 }
 
 pub const PYTRACEBACK_FRAME_OFFSET: usize = std::mem::offset_of!(PyTraceback, frame);
 pub const PYTRACEBACK_LASTI_OFFSET: usize = std::mem::offset_of!(PyTraceback, lasti);
 pub const PYTRACEBACK_W_NEXT_OFFSET: usize = std::mem::offset_of!(PyTraceback, w_next);
 pub const PYTRACEBACK_LINENO_OFFSET: usize = std::mem::offset_of!(PyTraceback, lineno);
-pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(PyTraceback, w_code);
 
 /// GC type id assigned to `PyTraceback`.  Pre-registered in
 /// `pyre-jit/src/eval.rs` immediately after `PyCode`
@@ -153,26 +139,35 @@ pub fn w_pytraceback_new(
     lasti: i64,
     w_next: PyObjectRef,
     lineno: i64,
-    w_code: PyObjectRef,
 ) -> PyObjectRef {
-    // `frame` is pinned alongside the two managed fields, because the
-    // allocation below can safepoint and a raw `*mut PyFrame` held only in
-    // this function's locals is reachable from no root walker.  Frames are
-    // nursery objects (`FrameBox::new`, and a compiled trace's inlined
-    // callee), so a minor triggered here would recycle an unrooted copy.
-    // Upstream relocates that frame and rewrites the slot
-    // (`incminimark.py minor_collection`).
+    // `pytraceback.py PyTraceback.__init__` stores `self.frame = frame` as
+    // an ordinary traced field.  A non-null frame is GC-owned whenever a
+    // collector is installed (`gc_owns_object_hook_installed`); the
+    // pre-hook `FrameBox::new_boxed` fallback exists only in processes
+    // that never install a collector.
+    assert!(
+        frame.is_null()
+            || !majit_gc::gc_owns_object_hook_installed()
+            || pyre_object::gc_hook::try_gc_owns_object(frame as pyre_object::gc_hook::GCREF),
+        "pytraceback.py PyTraceback.__init__: frame must be GC-owned whenever a collector is installed"
+    );
+    // `frame` is pinned alongside `w_next`, because the allocation below
+    // can safepoint and a raw `*mut PyFrame` held only in this function's
+    // locals is reachable from no root walker.  Frames are nursery objects
+    // (`FrameBox::new`, and a compiled trace's inlined callee), so a minor
+    // triggered here would recycle an unrooted copy.  Upstream relocates
+    // that frame and rewrites the slot (`incminimark.py minor_collection`).
     let roots = pyre_object::gc_roots::push_roots();
-    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
+    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, frame as PyObjectRef]);
 
     // Nursery, same as `space.allocate_instance(PyTraceback)` /
     // `malloc_fixedsize` → `collect_and_reserve`.  The host-side constructor
     // used to take the no-collect hook and spill old when the nursery was
-    // full.  `w_next` is the chain child handed to the rooted slot; `w_code`
-    // and `frame` stay on the shadow stack this bracket already published
-    // and are re-read below.  Before the GC hook is wired (bootstrap, tests)
-    // the collecting hook returns `None`; fall back to the leaked
-    // `malloc_typed` block.
+    // full.  `w_next` is the chain child handed to the rooted slot; `frame`
+    // stays on the shadow stack this bracket already published and is
+    // re-read below.  Before the GC hook is wired (bootstrap, tests) the
+    // collecting hook returns `None`; fall back to the leaked `malloc_typed`
+    // block.
     let mut allocation_root = roots.get(inputs) as pyre_object::gc_hook::GCREF;
     let mut needs_write_barrier = true;
     let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
@@ -198,16 +193,29 @@ pub fn w_pytraceback_new(
     // reused from the argument: the allocation above may have moved any of
     // them.  Before the GC hook is wired nothing moves and each read answers
     // the address it was given.
+    let frame = roots.get(inputs + 1) as *mut crate::pyframe::PyFrame;
+    // `pytraceback.py PyTraceback.__init__` stores `self.frame = frame`.
+    // `record_application_traceback` does not call `mark_as_escaped`;
+    // `error.py OperationError.get_traceback` and
+    // `interp_exceptions.py descr_gettraceback` do. With a collector the
+    // node's frame edge keeps the frame. Without one, `FrameBox::drop`
+    // would free a `new_boxed` frame the node still names, so `escaped`
+    // (`pyframe.py mark_as_escaped`) is the existing flag that means a
+    // Python-visible object references it.
+    if !frame.is_null() && !majit_gc::gc_owns_object_hook_installed() {
+        unsafe {
+            (*frame).mark_as_escaped();
+        }
+    }
     let value = PyTraceback {
         ob_header: PyObject {
             ob_type: &PYTRACEBACK_TYPE as *const PyType,
             w_class: get_instantiate(&PYTRACEBACK_TYPE),
         },
-        frame: roots.get(inputs + 2) as *mut crate::pyframe::PyFrame,
+        frame,
         lasti,
         w_next: roots.get(inputs),
         lineno,
-        w_code: roots.get(inputs + 1),
     };
 
     let Some(tb_slot) = tb_slot else {
@@ -220,8 +228,8 @@ pub fn w_pytraceback_new(
     unsafe {
         std::ptr::write(raw, value);
     }
-    // The node may point at a still-young `w_next` / `w_code` (and, once
-    // GC-owned, the frame); remember it if this alloc spilled old.
+    // The node may point at a still-young `w_next` and frame; remember it
+    // if this alloc spilled old.
     if needs_write_barrier {
         pyre_object::gc_hook::try_gc_write_barrier(raw as pyre_object::gc_hook::GCREF);
     }
@@ -292,11 +300,22 @@ pub unsafe fn w_pytraceback_get_lineno_raw(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const PyTraceback)).lineno }
 }
 
+/// `pytraceback.py` `self.frame.pycode` — the code object the node's
+/// frame carries.  The frame edge is unconditional
+/// (`PyTraceback.__init__`), so this is the live wrapper.
+///
 /// # Safety
 /// `obj` must point to a valid `PyTraceback`.
 #[inline]
-pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const PyTraceback)).w_code }
+pub unsafe fn w_pytraceback_frame_pycode(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let frame = w_pytraceback_get_frame(obj);
+        if frame.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            (*frame).pycode as PyObjectRef
+        }
+    }
 }
 
 /// `pytraceback.py PyTraceback.get_lineno` /
@@ -312,15 +331,13 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 ///     return space.newint(self.get_lineno())
 /// ```
 ///
-/// The resolution walks the `w_code` snapshot rather than upstream's
-/// `self.frame.pycode`: `frame` is only forwarded for a frame the GC owns, so
-/// it may already have been freed by the time `tb_lineno` is read, while
-/// `w_code` is forwarded unconditionally and IS that `pycode`.
+/// The resolution walks `self.frame.pycode`, matching
+/// `pytraceback.py PyTraceback.get_lineno`.  The frame edge is
+/// unconditional, so the code object outlives the traceback with the frame.
 ///
 /// `None` is the `Py_RETURN_NONE` arm of `tb_lineno_get`, taken when
 /// `PyCode_Addr2Line` reports no line for `tb_lasti` — here also when the node
-/// carries no code object at all, which upstream cannot reach because its
-/// frame edge is unconditional.
+/// carries no frame, which tests use for an unresolvable node.
 ///
 /// The resolved line is NOT written back to the slot.  Upstream memoizes
 /// (`self.lineno = offset2lineno(...)`); `tb_lineno_get` re-reads instead.
@@ -337,7 +354,7 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
         if raw != LINENO_NOT_COMPUTED {
             return Some(raw);
         }
-        let w_code = w_pytraceback_get_w_code(tb);
+        let w_code = w_pytraceback_frame_pycode(tb);
         if w_code.is_null() {
             return None;
         }
@@ -360,10 +377,11 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
 /// the same arms so the jitcode never carries that ABI.
 ///
 /// A stamped slot boxes with `space.newint`.  A sentinel slot calls
-/// `offset2lineno` (`w_code_addr2line`) and boxes the resolved line, or
-/// answers `None` when the offset names no line — `tb_lineno_get`'s
-/// `Py_RETURN_NONE` arm, which upstream cannot take because it always
-/// `space.newint`s.  No writeback: see [`w_pytraceback_get_lineno`].
+/// `offset2lineno` (`w_code_addr2line`) on `self.frame.pycode` and boxes
+/// the resolved line, or answers `None` when the offset names no line —
+/// `tb_lineno_get`'s `Py_RETURN_NONE` arm, which upstream cannot take
+/// because it always `space.newint`s.  No writeback: see
+/// [`w_pytraceback_get_lineno`].
 ///
 /// `location.py _offset2lineno` is a loop, so `look_inside_graph` refuses
 /// it and stays a residual call.  `w_code_addr2line` is `offset2lineno`,
@@ -375,7 +393,7 @@ pub fn descr_get_tb_lineno(tb: PyObjectRef) -> PyObjectRef {
         if raw != LINENO_NOT_COMPUTED {
             return pyre_object::w_int_new(raw);
         }
-        let w_code = w_pytraceback_get_w_code(tb);
+        let w_code = w_pytraceback_frame_pycode(tb);
         if w_code.is_null() {
             return pyre_object::w_none();
         }
@@ -476,26 +494,12 @@ pub unsafe fn w_pytraceback_for_frame(
         };
         // `PyTraceback(space, frame, last_instruction, w_next)` leaves
         // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from
-        // the code object and `lasti` on the first read.  A node whose line
-        // is never read never walks the line table.
-        //
-        // The `PyCode` PyObjectRef is captured into the `w_code` slot so the
-        // traceback's source-path / function name metadata stays GC-rooted,
-        // and the getter resolves the line from it at any later point —
-        // readers (e.g. `write_traceback_chain` in `error.rs`) MUST go
-        // through `w_code` rather than dereferencing the `frame` pointer.
-        let frame =
-            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
-        let w_code = (*frame).pycode as PyObjectRef;
-        let code_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_code);
-        // The constructor sees the forwarded frame, code, and next node
-        // rather than the locals.
+        // `self.frame.pycode` and `lasti` on the first read.  A node whose
+        // line is never read never walks the line table.
         let frame =
             pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
         let w_next = pyre_object::gc_roots::shadow_stack_get(next_slot);
-        let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
-        w_pytraceback_new(frame, lasti, w_next, LINENO_NOT_COMPUTED, w_code)
+        w_pytraceback_new(frame, lasti, w_next, LINENO_NOT_COMPUTED)
     }
 }
 
@@ -686,20 +690,14 @@ mod tests {
     #[test]
     fn pytraceback_alloc_and_accessors() {
         enter_runtime();
-        let tb = w_pytraceback_new(
-            std::ptr::null_mut(),
-            42,
-            PY_NULL,
-            LINENO_NOT_COMPUTED,
-            PY_NULL,
-        );
+        let tb = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, LINENO_NOT_COMPUTED);
         unsafe {
             assert!(is_pytraceback(tb));
             assert_eq!(w_pytraceback_get_lasti(tb), 42);
             assert!(w_pytraceback_get_w_next(tb).is_null());
             assert_eq!(w_pytraceback_get_lineno_raw(tb), LINENO_NOT_COMPUTED);
             assert!(w_pytraceback_get_frame(tb).is_null());
-            assert!(w_pytraceback_get_w_code(tb).is_null());
+            assert!(w_pytraceback_frame_pycode(tb).is_null());
         }
     }
 
@@ -717,23 +715,18 @@ mod tests {
     fn an_unresolvable_node_answers_none_and_a_stamped_line_answers_itself() {
         enter_runtime();
         unsafe {
-            let unresolvable = w_pytraceback_new(
-                std::ptr::null_mut(),
-                42,
-                PY_NULL,
-                LINENO_NOT_COMPUTED,
-                PY_NULL,
-            );
+            let unresolvable =
+                w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, LINENO_NOT_COMPUTED);
             assert_eq!(w_pytraceback_get_lineno(unresolvable), None);
 
-            let stamped = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 7, PY_NULL);
+            let stamped = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 7);
             assert_eq!(w_pytraceback_get_lineno(stamped), Some(7));
 
             // `-2` is not the sentinel, so it reads back rather than resolving.
-            let negative = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, -2, PY_NULL);
+            let negative = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, -2);
             assert_eq!(w_pytraceback_get_lineno(negative), Some(-2));
 
-            let zero = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 0, PY_NULL);
+            let zero = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 0);
             assert_eq!(w_pytraceback_get_lineno(zero), Some(0));
 
             assert!(pyre_object::is_none(descr_get_tb_lineno(unresolvable)));
@@ -753,7 +746,7 @@ mod tests {
     #[test]
     fn pytraceback_set_next_self_loop_rejects() {
         enter_runtime();
-        let tb = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
+        let tb = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0);
         unsafe {
             assert!(w_pytraceback_set_w_next(tb, tb).is_err());
             assert!(w_pytraceback_get_w_next(tb).is_null());
@@ -764,8 +757,8 @@ mod tests {
     fn pytraceback_set_next_chain_loop_rejects() {
         enter_runtime();
         // Chain: outer -> inner -> outer should be rejected.
-        let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
-        let inner = w_pytraceback_new(std::ptr::null_mut(), 1, outer, 0, PY_NULL);
+        let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0);
+        let inner = w_pytraceback_new(std::ptr::null_mut(), 1, outer, 0);
         unsafe {
             // outer.w_next = inner — inner.w_next is outer → cycle.
             assert!(w_pytraceback_set_w_next(outer, inner).is_err());
@@ -776,8 +769,8 @@ mod tests {
     #[test]
     fn pytraceback_set_next_chain_ok() {
         enter_runtime();
-        let inner = w_pytraceback_new(std::ptr::null_mut(), 1, PY_NULL, 0, PY_NULL);
-        let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
+        let inner = w_pytraceback_new(std::ptr::null_mut(), 1, PY_NULL, 0);
+        let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0);
         unsafe {
             assert!(w_pytraceback_set_w_next(outer, inner).is_ok());
             assert_eq!(w_pytraceback_get_w_next(outer), inner);
@@ -793,13 +786,81 @@ mod tests {
         let code = crate::compile_exec("pass\n").expect("compile");
         let w_code = crate::pycode::box_code_constant(&code).unwrap();
         let globals = pyre_object::w_dict_new();
-        let mut frame =
+        let frame =
             crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
                 .expect("frame");
         assert_eq!(frame.last_instr, -1);
+        // `PyTraceback.__init__` stores a negative `lasti` unchanged, which
+        // is the conversion `w_pytraceback_for_frame` applies to the `-1`
+        // sentinel.
+        let tb = w_pytraceback_new(std::ptr::null_mut(), -1, PY_NULL, LINENO_NOT_COMPUTED);
         unsafe {
-            let tb = w_pytraceback_for_frame(frame.as_mut_ptr(), -1, PY_NULL);
             assert_eq!(w_pytraceback_get_lasti(tb), -1);
+        }
+    }
+
+    /// `pytraceback.py record_application_traceback` prepends a node for
+    /// every non-`hidden_applevel` frame, including a `FrameBox::new_boxed`
+    /// frame when no collector is installed.
+    #[test]
+    fn new_boxed_frame_records_a_traceback_node() {
+        enter_runtime();
+        if majit_gc::gc_owns_object_hook_installed() {
+            return;
+        }
+        // `is_exception` is `rclass.py ll_isinstance` against `EXCEPTION_TYPE`.
+        // This process never runs `init_gc_subsystem`, so publish the vtables
+        // `typedef::init_subclass_ranges` writes at interpreter startup.
+        crate::typedef::init_subclass_ranges();
+        let code = crate::compile_exec("pass\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code).unwrap();
+        let globals = pyre_object::w_dict_new();
+        let mut frame =
+            crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+                .expect("frame");
+        assert!(!frame.is_gc_owned());
+        let frame_ptr = frame.as_mut_ptr();
+        let exc = pyre_object::w_exception_new(pyre_object::ExcKind::ValueError, "tb");
+        assert!(unsafe { record_application_traceback(exc, frame_ptr, 0) });
+        let tb = unsafe { pyre_object::w_exception_get_traceback(exc) };
+        assert!(!tb.is_null());
+        assert_eq!(unsafe { w_pytraceback_get_frame(tb) }, frame_ptr);
+    }
+
+    /// A `FrameBox::new_boxed` frame a traceback names stays alive after
+    /// `Drop`: `pytraceback.py PyTraceback.__init__` stores `self.frame`,
+    /// and without a collector that edge is `escaped`
+    /// (`pyframe.py mark_as_escaped`).
+    #[test]
+    fn new_boxed_frame_stays_alive_after_framebox_drop() {
+        enter_runtime();
+        if majit_gc::gc_owns_object_hook_installed() {
+            return;
+        }
+        crate::typedef::init_subclass_ranges();
+        let code = crate::compile_exec("pass\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code).unwrap();
+        let globals = pyre_object::w_dict_new();
+        let mut frame =
+            crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+                .expect("frame");
+        assert!(!frame.is_gc_owned());
+        let frame_ptr = frame.as_mut_ptr();
+        let exc = pyre_object::w_exception_new(pyre_object::ExcKind::ValueError, "tb");
+        assert!(unsafe { record_application_traceback(exc, frame_ptr, 0) });
+        let tb = unsafe { pyre_object::w_exception_get_traceback(exc) };
+        assert!(!tb.is_null());
+        assert!(unsafe { (*frame_ptr).escaped() });
+        let pycode_before = unsafe { w_pytraceback_frame_pycode(tb) };
+        assert!(!pycode_before.is_null());
+        assert_eq!(pycode_before, w_code as PyObjectRef);
+        let lineno_before = unsafe { w_pytraceback_get_lineno(tb) };
+        assert!(lineno_before.is_some(), "tb_lineno={lineno_before:?}");
+        drop(frame);
+        unsafe {
+            assert_eq!(w_pytraceback_get_frame(tb), frame_ptr);
+            assert_eq!(w_pytraceback_frame_pycode(tb), pycode_before);
+            assert_eq!(w_pytraceback_get_lineno(tb), lineno_before);
         }
     }
 }

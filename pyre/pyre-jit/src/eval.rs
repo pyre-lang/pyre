@@ -826,30 +826,21 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 /// PyPy's `PyTraceback.frame` is a normal `PyFrame` W_Root, so its
 /// tracer reaches the frame (and thence its locals / `f_backref`
 /// chain) through the ordinary reference.  Pyre stores `frame` as a
-/// raw `*mut PyFrame` and the two `PyObjectRef` slots (`w_next`,
-/// `w_code`) inline; none are reachable through `gc_ptr_offsets`
-/// (the type was registered with empty offsets), so forward all of
-/// them here:
+/// raw `*mut PyFrame` and `w_next` inline; none are reachable through
+/// `gc_ptr_offsets` (the type was registered with empty offsets), so
+/// forward all of them here:
 ///
 ///   * `ob_header.w_class` — the type object every `PyObject`-layout
 ///     struct carries.
 ///   * `w_next` — the chained caller-side traceback link.
-///   * `w_code` — the raising frame's PyCode snapshot (kept alive so
-///     source-path / function-name metadata survives).
-///   * `frame` — forwarded as a managed edge **only** when
-///     `try_gc_owns_object(frame)` holds (an executing/oldgen frame,
-///     `PYFRAME_GC_TYPE_ID`).  Mark greys the frame block and its own
-///     `pyframe_object_custom_trace` recurses into locals/cells/
-///     valuestack and the `f_backref` chain, so a frame reachable only
-///     through a live traceback (the whole point of `tb_frame`) is not
-///     reclaimed.  The condition covers the pre-hook bootstrap frame
-///     (`FrameBox::new`'s `new_boxed` fallback), whose address the
-///     collector does not own and must never be handed; such a pointer
-///     is left alone and is never dereferenced.  A walk records
-///     tracebacks against the live virtualizable
-///     (`pyjitpl.rs record_application_traceback` unwraps the
-///     standard vable), which is GC-owned (`FrameBox::pin_existing`
-///     / `FrameBox::new`), so that traceback keeps its frame alive.
+///   * `frame` — forwarded as a managed edge unconditionally, matching
+///     `pytraceback.py PyTraceback.__init__`.  Mark greys the frame
+///     block and its own `pyframe_object_custom_trace` recurses into
+///     locals/cells/valuestack and the `f_backref` chain, so a frame
+///     reachable only through a live traceback (the whole point of
+///     `tb_frame`) is not reclaimed.  `w_pytraceback_new` asserts the
+///     frame is GC-owned (`try_gc_owns_object`), so this slot is never
+///     a `FrameBox::new_boxed` address.
 unsafe fn pytraceback_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -857,12 +848,7 @@ unsafe fn pytraceback_object_custom_trace(
     let tb = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pytraceback::PyTraceback) };
     f(&mut tb.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !tb.frame.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(tb.frame as pyre_object::gc_hook::GCREF)
-    {
-        f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
-    }
+    f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
 }
 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -3363,9 +3349,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_code_tid,
     );
     // `pytraceback.py PyTraceback` — pre-registered here, right
-    // after PyCode, with a custom trace that forwards `w_next` /
-    // `w_code` and (when GC-owned) the raw `frame` edge so a frame
-    // reachable only through `tb.tb_frame` survives.  Like PyCode it
+    // after PyCode, with a custom trace that forwards `w_next` and
+    // the raw `frame` edge so a frame reachable only through
+    // `tb.tb_frame` survives.  Like PyCode it
     // stays in `all_foreign_pytypes()` and is skipped by the loop's
     // `contains_key` guard, so the net register-call count through
     // `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged (one explicit

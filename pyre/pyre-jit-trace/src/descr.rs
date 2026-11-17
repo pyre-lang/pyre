@@ -9523,7 +9523,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     use pyre_interpreter::pytraceback::{
         PYTRACEBACK_FRAME_OFFSET, PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_LASTI_OFFSET,
         PYTRACEBACK_LINENO_OFFSET, PYTRACEBACK_OBJECT_SIZE, PYTRACEBACK_TYPE,
-        PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
+        PYTRACEBACK_W_NEXT_OFFSET,
     };
 
     build_object_descr_group_with_extra_gc_edges(
@@ -9569,15 +9569,6 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 8,
                 Type::Int,
                 true,
-                false,
-                false,
-            ),
-            (
-                "w_code",
-                PYTRACEBACK_W_CODE_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
                 false,
                 false,
             ),

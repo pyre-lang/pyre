@@ -3053,7 +3053,7 @@ impl PyError {
                 {
                     break;
                 }
-                let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
+                let w_code = crate::pytraceback::w_pytraceback_frame_pycode(tb);
                 if w_code.is_null() {
                     break;
                 }
@@ -5080,7 +5080,10 @@ fn write_traceback_chain_from_tb<W: Write>(
         if !unsafe { crate::pytraceback::is_pytraceback(current_tb) } {
             break;
         }
-        let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(current_tb) };
+        let w_code = unsafe { crate::pytraceback::w_pytraceback_frame_pycode(current_tb) };
+        let code_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+        let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
         // `FrameSummary.lineno` is whatever `tb_lineno` answered, `None`
         // included: the node is still printed, with `None` where the line
         // would go and with no source line under it, because `_set_lines`
@@ -5095,9 +5098,9 @@ fn write_traceback_chain_from_tb<W: Write>(
         let (filename, funcname, location) = if w_code.is_null() {
             (b"<unknown>".to_vec(), unknown_name(), None)
         } else {
-            // `w_code` is a GC-rooted `PyCode` pointer captured
-            // at `record_application_traceback` time; the inner
-            // `CodeObject` lives as long as `w_code` is reachable.
+            // `w_code` is `self.frame.pycode` (`pytraceback.py`); the inner
+            // `CodeObject` lives as long as the frame — and therefore the
+            // traceback — is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) };
             if code_obj.is_null() {
                 (b"<unknown>".to_vec(), unknown_name(), None)
@@ -5378,7 +5381,7 @@ fn frame_source_line(tb_slot: usize, filename: &[u8], lineno: i64) -> Option<Str
         return None;
     }
     let w_code = unsafe {
-        crate::pytraceback::w_pytraceback_get_w_code(pyre_object::gc_roots::shadow_stack_get(
+        crate::pytraceback::w_pytraceback_frame_pycode(pyre_object::gc_roots::shadow_stack_get(
             tb_slot,
         ))
     };
