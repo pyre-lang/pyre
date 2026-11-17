@@ -1297,6 +1297,28 @@ fn real_main() {
                     "opcode_ops",
                     "set_add_value",
                 ]),
+                // CALL_KW walker descends `Arguments::match_signature`
+                // (`argument.py` `_match_signature`, `@jit.unroll_safe`;
+                // `MATCH_SIGNATURE_DESCENT`). Flatten residualizes the
+                // opcode to `bh_call_kw`; `parse_into_scope` / `funcrun`
+                // are never named by the portal, so the portal closure
+                // never reaches this graph (`call.py`
+                // `CallControl.register_helper_graph` /
+                // `grab_initial_jitcodes`). Path is
+                // `CallPath::for_impl_method` of the crate-stripped owner
+                // (`argument::Arguments`).
+                //
+                // Seeded with the other opcode-residual helpers, before the
+                // JUMP_BACKWARD pair. `grab_initial_jitcodes` pushes helper
+                // seeds onto `unfinished_graphs` after the portals, and
+                // `enum_pending_graphs` pops LIFO (`call.py`), so the last
+                // seed is the first assembled jitcode and the first interned
+                // `all_liveness` record (`assembler.py` `_encode_liveness`).
+                majit_translate::CallPath::from_segments([
+                    "argument",
+                    "Arguments",
+                    "match_signature",
+                ]),
                 // Handwritten JUMP_BACKWARD jitcode inline_calls these
                 // (`emit_jump_absolute_tick`); the portal never names them.
                 majit_translate::CallPath::from_segments([
