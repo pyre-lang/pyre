@@ -4412,8 +4412,7 @@ fn active_runtime_alloc_young_nonmoving_typed(type_id: u32, payload_size: usize)
 }
 
 /// gc.py `malloc_big_fixedsize(size, tid)` — fixed-size object
-/// large enough to skip the nursery, or a `young_nonmoving` descr of any
-/// size.
+/// large enough to skip the nursery.
 ///
 /// Upstream calls `do_malloc_fixedsize_clear`, whose large arm is
 /// `external_malloc(typeid, 0, alloc_young=True)`.  Rewrite reaches this
