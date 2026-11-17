@@ -14,3 +14,25 @@ for i in range(N):
     last = 10 ** k
 print(last)
 assert last == 10**29, last
+
+
+def pow_overflows(n):
+    return 2**n
+
+
+def foriter_around_inlined_pow_overflow():
+    # An inlined callee whose `**` overflows to long, after an inner
+    # FOR_ITER loop in the same traced iteration: the inner loop's first item
+    # must not run twice.
+    total = 0
+    i = 0
+    while i < 2000:
+        for v in range(10, 0, -3):
+            total += v
+        pow_overflows(70)
+        i += 1
+    return total
+
+
+total = foriter_around_inlined_pow_overflow()
+assert total == 2000 * 22, total
