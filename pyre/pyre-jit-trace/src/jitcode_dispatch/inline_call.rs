@@ -23814,6 +23814,38 @@ pub(crate) fn splice_active_driver_ancestors<Sym: WalkSym>(trace_ctx: &TraceCtx)
     })
 }
 
+/// A helper walk whose return is not the CALL's result (`HelperReturn::Converted` /
+/// `CalleePrologue`) has no frame that holds the conversion, so a guard below it
+/// resumes at the Python CALL entry, as `helper_subwalk_level` does.
+/// `FbwWalkMode::call_entry_helper_chain` is the `'v'` boxed descent whose
+/// return the walk takes back inside the CALL; `helper_blackhole_resumes_at_call`
+/// declines the abort latch under it for the same reason.
+pub(crate) fn unpublished_helper_resumes_at_call_entry<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> bool {
+    if ctx.fbw_mode.helper_return.resumes_at_call_entry() || ctx.fbw_mode.call_entry_helper_chain {
+        return true;
+    }
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return false;
+        }
+        // SAFETY: same scoped driver pointer as `splice_active_driver_ancestors`.
+        let exchange = unsafe { &*(pointer as *const SubWalkExchange<'_, Sym>) };
+        if exchange.ancestor_len == 0 {
+            return false;
+        }
+        let ancestors =
+            unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
+        ancestors.iter().any(|frame| {
+            frame.fbw_mode.transparent_helper_subwalk
+                && (frame.fbw_mode.helper_return.resumes_at_call_entry()
+                    || frame.fbw_mode.call_entry_helper_chain)
+        })
+    })
+}
+
 /// Paused helper sections for live looked-inside ancestors that
 /// `helper_subwalk_level` left unpublished (`Ok(None)` under a portal).
 ///
@@ -24924,7 +24956,15 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 // walk (`call_trace`) keeps CalleePrologue so nested
                 // `gettrace` resumes at the Python CALL (`pyframe.py
                 // execute_frame`); every other child is CallResult.
-                helper_return: ctx.fbw_mode.helper_return.child_helper_return(),
+                // A portal look-inside keeps the parent's tag: Converted
+                // (`run_orthodox_helper_subwalk`) must stay on this frame so
+                // a guard below it resumes at the CALL entry
+                // (`unpublished_helper_resumes_at_call_entry`).
+                helper_return: if ctx.fbw_mode.transparent_helper_subwalk {
+                    ctx.fbw_mode.helper_return.child_helper_return()
+                } else {
+                    ctx.fbw_mode.helper_return
+                },
                 // A helper has no Python PC. Residual last_instr publication
                 // reads this field when `current_inline_concrete_frame()==0`.
                 // The parent MIFrame's CALL-site jitcode pc maps to that

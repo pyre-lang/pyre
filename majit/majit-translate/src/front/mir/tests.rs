@@ -20559,6 +20559,118 @@ fn intern_tagged_option_from_map_call_with_open_closure_arg() {
     );
 }
 
+/// A call whose only generics are trait refs still queues a spec copy.
+/// `decl_is_generic` accepts trait-clause-only declarations, and
+/// `FunctionDesc.cachedgraph` caches that key. The intern harvest then
+/// substitutes the copy (`substituted_signature` /
+/// `substituted_unstructured`) without indexing `types[0]`.
+#[test]
+fn intern_enqueue_fun_spec_keeps_trait_only_generics() {
+    let unit = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let call_generics = serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": [{
+            "kind": {
+                "TraitImpl": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        }]
+    });
+    let callee = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "trait_only"], true),
+        "generics": {
+            "types": [],
+            "trait_clauses": [{}],
+            "const_generics": []
+        },
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit.clone()},
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [interior_local(0, None, &unit)]
+                },
+                "body": [interior_bb(vec![], interior_return())]
+            }
+        }
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![],
+        vec![
+            intern_call_caller(
+                0,
+                "call_trait_only",
+                serde_json::json!({"Fun": 1}),
+                call_generics.clone(),
+            ),
+            callee,
+        ],
+    );
+    let mut queue = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    super::intern_enqueue_fun_spec(&llbc, 1, &call_generics, &mut queue, &mut seen);
+    assert_eq!(
+        queue.len(),
+        1,
+        "trait-only generics enqueue a spec copy; queue={queue:?}"
+    );
+    let (id, types, const_generics, trait_refs) = &queue[0];
+    assert_eq!(*id, 1);
+    assert!(types.is_empty(), "types={types:?}");
+    assert!(
+        const_generics.is_empty(),
+        "const_generics={const_generics:?}"
+    );
+    assert_eq!(trait_refs.len(), 1, "trait_refs={trait_refs:?}");
+
+    let empty = serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let mut empty_queue = Vec::new();
+    let mut empty_seen = std::collections::HashSet::new();
+    super::intern_enqueue_fun_spec(&llbc, 1, &empty, &mut empty_queue, &mut empty_seen);
+    assert!(
+        empty_queue.is_empty(),
+        "all-empty generics stay dropped; queue={empty_queue:?}"
+    );
+
+    // Harvest pop of the trait-only entry: substituted body/signature with
+    // empty `types` must not index `types[0]`.
+    let _insts = super::collect_ref_enum_instantiations(
+        &llbc,
+        &std::collections::HashSet::new(),
+        None,
+        None,
+        &std::collections::HashSet::new(),
+    );
+}
+
 /// Interned `Option<char>::Some` and `Option<Value>::Some` keep distinct
 /// `__pos_0` payload types. The Value intern ROW is the TypeDecl identity
 /// (`value::Value` = `strip_crate_prefix` of `majit_ir::value::Value`),

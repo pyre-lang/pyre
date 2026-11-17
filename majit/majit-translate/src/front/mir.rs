@@ -1389,12 +1389,15 @@ fn intern_enqueue_fun_spec(
     // JSON). `concrete_type_args` would drop the whole call; intern still
     // needs `Option<T>` from `types[0]` (`specialize.py`
     // `FunctionDesc.cachedgraph`). A leftover TypeVar suffix is skipped
-    // by `intern_enum_from_ty`.
+    // by `intern_enum_from_ty`. `decl_is_generic` also admits a
+    // trait-clause-only declaration; `FunctionDesc.cachedgraph` caches
+    // that key too, so empty types/const_generics still enqueue when
+    // `trait_refs` is nonempty.
     let (types, const_generics) = crate::front::clause_spec::generic_args_lists(generics);
-    if types.is_empty() && const_generics.is_empty() {
+    let trait_refs = intern_call_trait_refs(generics);
+    if types.is_empty() && const_generics.is_empty() && trait_refs.is_empty() {
         return;
     }
-    let trait_refs = intern_call_trait_refs(generics);
     // `description.py FunctionDesc.cachedgraph` is keyed by every specialization value.
     let key = (
         id,
