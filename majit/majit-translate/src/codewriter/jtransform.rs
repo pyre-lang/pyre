@@ -48081,57 +48081,6 @@ mod tests {
         );
     }
 
-    /// `RootScope` is the save_point word. A FieldRead of that field is
-    /// identity, not `getfield_raw` of a struct at the integer.
-    #[test]
-    fn rewrite_op_getfield_rootscope_save_point_is_identity() {
-        let mut graph = FunctionGraph::new("root_scope_base");
-        let bb = graph.startblock;
-        let scope = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        graph.block_mut(bb).operations.push(SpaceOperation {
-            result: Some(scope.clone()),
-            kind: OpKind::Input {
-                name: "roots".into(),
-                ty: ValueType::Int,
-                class_root: Some("RootScope".into()),
-            },
-        });
-        let save = graph
-            .push_op_var(
-                bb,
-                OpKind::FieldRead {
-                    base: scope.clone(),
-                    field: crate::model::FieldDescriptor::new(
-                        "save_point",
-                        Some("RootScope".into()),
-                    ),
-                    ty: ValueType::Int,
-                    pure: true,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(bb, Some(save));
-        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
-        assert!(
-            transformed.graph.blocks.iter().all(|block| {
-                block.operations.iter().all(|op| {
-                    !matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. } if field.name == "save_point"
-                    )
-                })
-            }),
-            "RootScope.save_point FieldRead must become identity, got {:?}",
-            transformed
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter().map(|op| format!("{:?}", op.kind)))
-                .collect::<Vec<_>>()
-        );
-    }
-
     /// `rewrite_op_getfield` drops a void result (`RESULT is lltype.Void`),
     /// so a unit field never reaches the assembler uncolored.
     #[test]

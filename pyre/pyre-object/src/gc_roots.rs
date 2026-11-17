@@ -532,7 +532,7 @@ impl RootScope {
 impl Drop for RootScope {
     #[inline]
     fn drop(&mut self) {
-        root_scope_close(self.save_point);
+        root_scope_close(self);
     }
 }
 
