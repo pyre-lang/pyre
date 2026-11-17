@@ -42108,7 +42108,6 @@ fn parent_read_and_write_of_cell_backed_wrapper_field() {
 /// when `p` was created (`atomic_ref_place` projection cache).
 /// `InstanceRepr.rtype_getattr` emits a fresh getfield.
 #[test]
-#[ignore = "atomic_ref_place projection cache returns the FieldRead captured when p was bound; InstanceRepr.rtype_getattr emits a fresh getfield"]
 fn deref_read_after_write_through_field_borrow_temp() {
     let i64_ty = interior_i64();
     let obj_ty = interior_adt(0);
@@ -42193,6 +42192,441 @@ fn deref_read_after_write_through_field_borrow_temp() {
         "read after write through the field borrow reused the pre-write FieldRead \
          (`atomic_ref_place` projection cache); InstanceRepr.rtype_getattr emits a \
          fresh getfield; ops={ops:?}"
+    );
+}
+
+/// Two live reads through `p` each emit a FieldRead of the owner
+/// (`InteriorPtrRepr.rtype_getattr` at each use).
+#[test]
+fn two_deref_reads_through_field_borrow_temp_each_getfield() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "two_reads",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("a"), &i64_ty),
+            interior_local(4, Some("b"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_place(3, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+                interior_assign(
+                    interior_place(4, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    serde_json::json!({"BinaryOp": [
+                        "Add",
+                        interior_copy(interior_place(3, &i64_ty)),
+                        interior_copy(interior_place(4, &i64_ty))
+                    ]}),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "two_reads")
+        .expect("lower two *p reads through a field borrow");
+    let ops = graph_ops(&graph);
+    let reads: Vec<Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "each *p read must FieldRead the owner; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } if name == "add" => reads.contains(lhs) && reads.contains(rhs),
+            _ => false,
+        }),
+        "both FieldRead results must feed the Add; ops={ops:?}"
+    );
+}
+
+/// `*p` in a later block than the borrow: the owner flows through `p`
+/// (`InteriorPtrRepr` field-only `lowleveltype = parentptrtype`), so the
+/// Deref getfield does not `resolve_place` the owner MIR local.
+#[test]
+fn deref_read_through_field_borrow_temp_in_later_block() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "later_block_read",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("k"), &i64_ty),
+            interior_local(4, Some("a"), &i64_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        p_place,
+                        serde_json::json!({
+                            "Ref": {
+                                "place": field_place,
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    // Keep the bind block non-empty so `eliminate_empty_blocks`
+                    // cannot fold the Deref into the start block.
+                    interior_assign(
+                        interior_place(3, &i64_ty),
+                        serde_json::json!({
+                            "Use": [interior_const_i64("1", &i64_ty), "No"]
+                        }),
+                    ),
+                ],
+                interior_goto(1),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(4, &i64_ty),
+                        interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        serde_json::json!({"BinaryOp": [
+                            "Add",
+                            interior_copy(interior_place(4, &i64_ty)),
+                            interior_copy(interior_place(3, &i64_ty))
+                        ]}),
+                    ),
+                ],
+                interior_goto(2),
+            ),
+            // `duplicate_return` inlines a Goto-to-Return predecessor. Keep
+            // the Deref off the start block by landing Return one hop later.
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "later_block_read")
+        .expect("lower *p in a later block than the field borrow");
+    let start = graph.startblock;
+    let start_has_field_read = graph
+        .block(start)
+        .operations
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "field"));
+    assert!(
+        !start_has_field_read,
+        "bind of p is the owner, not a bind-time FieldRead; graph={}",
+        graph.dump()
+    );
+    let mut found = false;
+    for block in &graph.blocks {
+        if block.id == start {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::FieldRead { field, base, .. } = &op.kind else {
+                continue;
+            };
+            if field.name != "field" {
+                continue;
+            }
+            assert!(
+                block.inputargs.iter().any(|ia| ia == base),
+                "later-block getfield base must be the owner flowing through p; \
+                 inputargs={:?} graph={}",
+                block.inputargs,
+                graph.dump()
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "Deref in the successor must FieldRead the owner; graph={}",
+        graph.dump()
+    );
+}
+
+/// A residual call taking `&mut obj.field` receives the field value (or
+/// the cell that spills that value), never the GC owner
+/// (`ann_cast_ptr_to_adr`).
+#[test]
+fn residual_call_of_field_borrow_temp_receives_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "call_touch",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &mut_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let touch = interior_opaque(1, &["fixture", "touch"], vec![mut_i64], i64_ty);
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller, touch]);
+    let graph = crate::test_support::lower_function(&llbc, "call_touch")
+        .expect("lower residual touch(&mut obj.field)");
+    let ops = graph_ops(&graph);
+    let field_reads: Vec<&Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !field_reads.is_empty(),
+        "call must getfield the owner at the use; ops={ops:?}"
+    );
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("touch") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("touch call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("touch arg0 {other:?}; ops={ops:?}"),
+    };
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    assert_ne!(
+        arg0, obj,
+        "residual must not receive the GC owner; ops={ops:?}"
+    );
+    let stored_field = ops.iter().any(|op| match &op.kind {
+        OpKind::RawStore { value, .. } => field_reads.contains(&value),
+        OpKind::FieldWrite {
+            value: LinkArg::Value(v),
+            ..
+        } => field_reads.contains(&v),
+        _ => false,
+    });
+    assert!(
+        field_reads.contains(&arg0) || stored_field,
+        "residual must receive the field value or a cell of that value; ops={ops:?}"
+    );
+}
+
+/// `let p = &obj.field; Env { p }` of a GC scalar field: the Aggregate
+/// payload is getattr at the use (`InteriorPtrRepr.rtype_getattr`), the
+/// same value-consumer rule as a residual call arg
+/// (`ann_cast_ptr_to_adr`). `append_right` captures `&deque.len` this way.
+#[test]
+fn aggregate_of_field_borrow_temp_receives_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let env_ty = interior_adt(1);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let shared_i64 = interior_shared(i64_ty.clone());
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &shared_i64);
+    let env_place = interior_place(0, &env_ty);
+    let caller = interior_caller(
+        "capture_field",
+        1,
+        vec![mut_obj.clone()],
+        env_ty.clone(),
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &shared_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place,
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [
+                                {
+                                    "id": 1,
+                                    "generics": {
+                                        "regions": [],
+                                        "types": [],
+                                        "const_generics": [],
+                                        "trait_refs": []
+                                    },
+                                    "builtin": null
+                                },
+                                null,
+                                null
+                            ]},
+                            [{"Move": interior_place(2, &shared_i64)}]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let env_decl = interior_struct(
+        1,
+        &["fixture", "Env"],
+        &[("captured", shared_i64)],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl, env_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "capture_field")
+        .expect("lower Env { p } of p = &obj.field");
+    let ops = graph_ops(&graph);
+    let field_reads: Vec<&Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !field_reads.is_empty(),
+        "Aggregate must getfield the owner at the use; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    let stored_field = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldWrite {
+            value: LinkArg::Value(v),
+            ..
+        } => field_reads.contains(&v),
+        _ => false,
+    });
+    assert!(
+        stored_field,
+        "Env payload must be the field value, not the GC owner; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ..
+            } => v == obj,
+            _ => false,
+        }),
+        "Env payload must not be the GC owner; ops={ops:?}"
     );
 }
 
