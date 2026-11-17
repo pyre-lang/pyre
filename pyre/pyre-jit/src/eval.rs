@@ -10034,9 +10034,12 @@ fn tuple_hash_merge_point_jit(
 }
 
 /// `warmspot.py ll_portal_runner`: `maybe_compile_and_run` with
-/// `increment_function_threshold`. A compiled token is
-/// `EnterJitAssembler`; a counter fire is `bound_reached`. `NotHot`
-/// returns `None` so the runner continues at `portal_ptr`.
+/// `increment_function_threshold`. Hash once (`get_uhash`); one
+/// `JitCell.get_jitcell` / `lookup_chain` walk
+/// (`resolve_cell_key_with_greenargs_on_driver`); then
+/// `function_entry_step`. A compiled token is `EnterJitAssembler`; a
+/// counter fire is `bound_reached`. `NotHot` returns `None` so the
+/// runner continues at `portal_ptr`.
 fn tuple_hash_function_entry_jit(
     w_type: pyre_object::PyObjectRef,
     w_tuple: pyre_object::PyObjectRef,
@@ -10057,26 +10060,23 @@ fn tuple_hash_function_entry_jit(
     let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
     let (driver, _) = driver_pair();
     let jd_no = pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX;
+    // `warmstate.py maybe_compile_and_run` hashes greens once
+    // (`get_uhash` / `hash_whatever` / `id_or_identityhash`).
     let hash = pyre_jit_trace::tuplehash_state::tuple_hash_green_hash(
         pin.get() as pyre_object::PyObjectRef
     );
+    // `id_or_identityhash` / `_find_shadow` can collect. Rebuild the Ref
+    // green from the pin; the identity hash is move-stable.
     let greenargs = [pin.get() as i64];
-    let (cell_key, _) = driver
+    let cell_key = driver
         .meta_interp()
-        .resolved_entry_procedure_token_on_driver(
+        .resolve_cell_key_with_greenargs_on_driver(
             jd_no,
             hash,
-            Some((
-                &greenargs,
-                pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
-            )),
+            &greenargs,
+            &pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES,
         );
-    // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
-    // `_find_shadow`). Re-read every w_type/w_tuple from the pins.
     let greenargs = [pin.get() as i64];
-    let hash = pyre_jit_trace::tuplehash_state::tuple_hash_green_hash(
-        pin.get() as pyre_object::PyObjectRef
-    );
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
     let step = driver.meta_interp_mut().function_entry_step_on_driver(
         jd_no,

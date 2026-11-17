@@ -22511,9 +22511,10 @@ pub unsafe fn tuple_hash_portal(
 /// `tupleobject.py _descr_hash_jitdriver`.
 ///
 /// Prologue: length, empty early return, `w_type` from the first item.
-/// `warmspot.py` `rewrite_jit_merge_point` / `split_graph_and_record_jitdriver`
-/// leave this original graph as a stub that returns `portal_runner(*args)`
-/// (`ll_portal_runner`). The walk lives in [`tuple_hash_portal`].
+/// Calls [`crate::call::tuple_hash_portal_runner`]. Tracing sees that
+/// function as the origportal stub `return portal_runner(*args)`
+/// (`JitDriverSpec.extends`, `warmspot.py rewrite_jit_merge_point`).
+/// The walk lives in [`tuple_hash_portal`].
 unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
     unsafe {
         let len = w_tuple_len(obj);
