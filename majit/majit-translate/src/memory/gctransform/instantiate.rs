@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{
-    CallFunc, CallKind, FunId, Operand, TermKind, TypeDeclSrc, Unstructured, is_closure_leaf,
+    CallFunc, CallKind, FunId, Operand, TermKind, TyRef, TypeDeclSrc, Unstructured, is_closure_leaf,
 };
 use majit_charon_reader::{FunDecl, Llbc};
 use serde_json::Value;
@@ -828,9 +828,11 @@ fn is_external_callee(llbc: &Llbc, fn_id: u64, workspace: &HashSet<String>) -> b
 /// `GraphAnalyzer.analyze_external_call` / `_callbacks`.
 ///
 /// `None` is a blocker (`Clause` / `ParentClause` / `Dyn`, a dyn type, a
-/// fn pointer, a closure type, or a by-value workspace ADT). `Some` is
-/// `bottom_result` joined with `analyze_direct_call` over each callback
-/// method graph.
+/// fn pointer, a closure type, a by-value workspace ADT, a `FnDef` that
+/// is not a Regular function item, or a dyn / fn pointer / closure in
+/// the callee's own signature). `Some` is `bottom_result` joined with
+/// `analyze_direct_call` over each callback: workspace `TraitImpl`
+/// methods, and Regular `FnDef` function items in the generics.
 fn analyze_external_call(
     llbc: &Llbc,
     fn_id: u64,
@@ -842,7 +844,7 @@ fn analyze_external_call(
         return None;
     }
     let types = generic_arg_types(call_generics);
-    collect_external_effects(llbc, &types, trait_refs, workspace, 0).ok()
+    collect_external_effects(llbc, fn_id, &types, trait_refs, workspace, 0).ok()
 }
 
 fn generic_arg_types(generics: &Value) -> Vec<Value> {
@@ -855,6 +857,7 @@ fn generic_arg_types(generics: &Value) -> Vec<Value> {
 
 fn collect_external_effects(
     llbc: &Llbc,
+    fn_id: u64,
     types: &[Value],
     trait_refs: &[Value],
     workspace: &HashSet<String>,
@@ -865,12 +868,34 @@ fn collect_external_effects(
     }
     let mut callbacks = Vec::new();
     for ty in types {
-        type_has_blocker(ty, llbc, workspace, false, depth)?;
+        type_has_blocker(ty, llbc, workspace, false, depth, Some(&mut callbacks))?;
     }
     for tref in trait_refs {
         walk_trait_ref_effects(tref, llbc, workspace, depth, Some(&mut callbacks))?;
     }
+    let Some(fd) = llbc.fn_by_id(fn_id) else {
+        return Err(());
+    };
+    for ty in fd
+        .signature
+        .inputs
+        .iter()
+        .chain(std::iter::once(&fd.signature.output))
+    {
+        let Some(v) = tyref_json(ty, llbc) else {
+            return Err(());
+        };
+        type_has_blocker(v, llbc, workspace, false, depth, Some(&mut callbacks))?;
+    }
     Ok(callbacks)
+}
+
+fn tyref_json<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a Value> {
+    match ty {
+        TyRef::Inline { value: (_, v) } => Some(v.as_ref()),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+        TyRef::Other(v) => Some(v.as_ref()),
+    }
 }
 
 fn walk_trait_ref_effects(
@@ -900,7 +925,14 @@ fn walk_trait_ref_effects(
             let g = peel_generic_args(&generics);
             if let Some(types) = g.get("types").and_then(Value::as_array) {
                 for ty in types {
-                    type_has_blocker(ty, llbc, workspace, false, depth + 1)?;
+                    type_has_blocker(
+                        ty,
+                        llbc,
+                        workspace,
+                        false,
+                        depth + 1,
+                        callbacks.as_deref_mut(),
+                    )?;
                 }
             }
             if let Some(refs) = g.get("trait_refs").and_then(Value::as_array) {
@@ -947,12 +979,22 @@ fn impl_in_workspace(llbc: &Llbc, impl_id: u64, workspace: &HashSet<String>) -> 
     })
 }
 
+/// Whether `ty` blocks `GraphAnalyzer.analyze_external_call`.
+///
+/// `Ok` is no blocker. A Regular `FnDef` (`FunId::Regular`, Charon's
+/// `kind.Fun` as a bare id) is recorded in `callbacks` like `_callbacks`,
+/// and that item's own generic `types` / `trait_refs` are walked. `Err`
+/// is `top_result`: a dyn type, a fn pointer, a closure type, a by-value
+/// workspace ADT, a `FnDef` that is a trait method, a builtin, or
+/// anything else, or `callbacks` is `None` on a `FnDef`. A `TypeVar`
+/// stays `Ok`.
 fn type_has_blocker(
     ty: &Value,
     llbc: &Llbc,
     workspace: &HashSet<String>,
     behind_pointer: bool,
     depth: usize,
+    mut callbacks: Option<&mut Vec<(u64, Value)>>,
 ) -> Result<(), ()> {
     if depth > MAX_INSTANTIATION_DEPTH {
         return Err(());
@@ -969,37 +1011,94 @@ fn type_has_blocker(
     {
         return Err(());
     }
-    if node.get("FnDef").is_some() {
+    if let Some(fn_def) = node.get("FnDef") {
+        let inner = fn_def.get("skip_binder").unwrap_or(fn_def);
+        let Some(id) = inner
+            .get("kind")
+            .and_then(|k| k.get("Fun"))
+            .and_then(Value::as_u64)
+        else {
+            return Err(());
+        };
+        let generics = inner
+            .get("generics")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        {
+            let Some(out) = callbacks.as_deref_mut() else {
+                return Err(());
+            };
+            out.push((id, generics.clone()));
+        }
+        let g = peel_generic_args(&generics);
+        if let Some(types) = g.get("types").and_then(Value::as_array) {
+            for ty in types {
+                type_has_blocker(
+                    ty,
+                    llbc,
+                    workspace,
+                    false,
+                    depth + 1,
+                    callbacks.as_deref_mut(),
+                )?;
+            }
+        }
+        if let Some(refs) = g.get("trait_refs").and_then(Value::as_array) {
+            for tref in refs {
+                walk_trait_ref_effects(tref, llbc, workspace, depth + 1, callbacks.as_deref_mut())?;
+            }
+        }
         return Ok(());
     }
     if let Some(arr) = node.get("Ref").and_then(Value::as_array) {
         return match arr.get(1) {
-            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1),
+            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1, callbacks),
             None => Ok(()),
         };
     }
     if let Some(arr) = node.get("RawPtr").and_then(Value::as_array) {
         return match arr.first() {
-            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1),
+            Some(inner) => type_has_blocker(inner, llbc, workspace, true, depth + 1, callbacks),
             None => Ok(()),
         };
     }
     if let Some(adt) = node.get("Adt") {
-        return adt_has_blocker(adt, llbc, workspace, behind_pointer, depth);
+        return adt_has_blocker(adt, llbc, workspace, behind_pointer, depth, callbacks);
     }
     if let Some(parts) = node.get("Tuple").and_then(Value::as_array) {
         for part in parts {
-            type_has_blocker(part, llbc, workspace, behind_pointer, depth + 1)?;
+            type_has_blocker(
+                part,
+                llbc,
+                workspace,
+                behind_pointer,
+                depth + 1,
+                callbacks.as_deref_mut(),
+            )?;
         }
         return Ok(());
     }
     if let Some(element) = node.get("Array").or_else(|| node.get("Slice")) {
         if let Some(parts) = element.as_array() {
             if let Some(inner) = parts.first() {
-                type_has_blocker(inner, llbc, workspace, behind_pointer, depth + 1)?;
+                type_has_blocker(
+                    inner,
+                    llbc,
+                    workspace,
+                    behind_pointer,
+                    depth + 1,
+                    callbacks.as_deref_mut(),
+                )?;
             }
         } else {
-            type_has_blocker(element, llbc, workspace, behind_pointer, depth + 1)?;
+            type_has_blocker(
+                element,
+                llbc,
+                workspace,
+                behind_pointer,
+                depth + 1,
+                callbacks,
+            )?;
         }
         return Ok(());
     }
@@ -1012,6 +1111,7 @@ fn adt_has_blocker(
     workspace: &HashSet<String>,
     behind_pointer: bool,
     depth: usize,
+    mut callbacks: Option<&mut Vec<(u64, Value)>>,
 ) -> Result<(), ()> {
     if let Some(id) = adt_def_id(adt)
         && let Some(td) = llbc.type_by_id(id)
@@ -1031,12 +1131,19 @@ fn adt_has_blocker(
     let generics = adt.get("generics").unwrap_or(adt);
     if let Some(types) = generics.get("types").and_then(Value::as_array) {
         for ty in types {
-            type_has_blocker(ty, llbc, workspace, behind_pointer, depth + 1)?;
+            type_has_blocker(
+                ty,
+                llbc,
+                workspace,
+                behind_pointer,
+                depth + 1,
+                callbacks.as_deref_mut(),
+            )?;
         }
     }
     if let Some(refs) = generics.get("trait_refs").and_then(Value::as_array) {
         for tref in refs {
-            walk_trait_ref_effects(tref, llbc, workspace, depth + 1, None)?;
+            walk_trait_ref_effects(tref, llbc, workspace, depth + 1, callbacks.as_deref_mut())?;
         }
     }
     Ok(())

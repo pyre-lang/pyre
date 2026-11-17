@@ -3129,12 +3129,13 @@ mod tests {
     /// Caller Regular-calls generic `into` with a `TraitImpl`; `into` Trait-calls
     /// a Clause that resolves to an Opaque method at `method_path`.
     fn llbc_blanket_into_opaque(method_path: &[&str]) -> majit_charon_reader::Llbc {
-        llbc_blanket_into_opaque_bound(method_path, true)
+        llbc_blanket_into_opaque_bound(method_path, true, serde_json::json!([]))
     }
 
     fn llbc_blanket_into_opaque_bound(
         method_path: &[&str],
         bind_impl: bool,
+        method_inputs: serde_json::Value,
     ) -> majit_charon_reader::Llbc {
         let span = serde_json::json!({
             "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
@@ -3224,7 +3225,11 @@ mod tests {
         let method = serde_json::json!({
             "def_id": 1,
             "item_meta": item_meta(method_path),
-            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "signature": {
+                "is_unsafe": false,
+                "inputs": method_inputs,
+                "output": scalar.clone()
+            },
             "body": "Opaque"
         });
         let callee_ref = if bind_impl { impl_ref } else { clause_ref };
@@ -3287,6 +3292,25 @@ mod tests {
         trait_ref: serde_json::Value,
         with_callback: bool,
     ) -> majit_charon_reader::Llbc {
+        llbc_regular_external_call(
+            serde_json::json!({
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": [trait_ref]
+            }),
+            with_callback,
+            vec![],
+            serde_json::json!([]),
+        )
+    }
+
+    fn llbc_regular_external_call(
+        call_generics: serde_json::Value,
+        with_callback: bool,
+        type_decls: Vec<serde_json::Value>,
+        external_inputs: serde_json::Value,
+    ) -> majit_charon_reader::Llbc {
         let span = serde_json::json!({
             "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
         });
@@ -3336,12 +3360,7 @@ mod tests {
                 call_term(
                     serde_json::json!({"Regular": {
                         "kind": {"Fun": 1},
-                        "generics": {
-                            "regions": [],
-                            "types": [],
-                            "const_generics": [],
-                            "trait_refs": [trait_ref]
-                        }
+                        "generics": call_generics
                     }}),
                     2,
                     1,
@@ -3353,7 +3372,11 @@ mod tests {
         let external = serde_json::json!({
             "def_id": 1,
             "item_meta": item_meta(&["core", "external_opaque"]),
-            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "signature": {
+                "is_unsafe": false,
+                "inputs": external_inputs,
+                "output": scalar.clone()
+            },
             "body": "Opaque"
         });
         let mut fun_decls = vec![caller, external];
@@ -3408,7 +3431,7 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "type_decls": [],
+                "type_decls": type_decls,
                 "fun_decls": fun_decls,
                 "global_decls": [],
                 "trait_decls": trait_decls,
@@ -3503,7 +3526,11 @@ mod tests {
     /// leaf and does not mark the caller unresolved — that is today's edge.)
     #[test]
     fn external_callee_with_unbound_clause_stays_unresolved() {
-        let llbc = llbc_blanket_into_opaque_bound(&["rustpython_wtf8", "from"], false);
+        let llbc = llbc_blanket_into_opaque_bound(
+            &["rustpython_wtf8", "from"],
+            false,
+            serde_json::json!([]),
+        );
         let crates = workspace_list(&["fixture"]);
         let cg = build_with_workspace_crates(&llbc, &crates);
         assert!(
@@ -3515,6 +3542,168 @@ mod tests {
         assert!(
             reached.contains(&0),
             "caller of the unbound-clause template still reaches unresolved dispatch: {reached:?}"
+        );
+    }
+
+    /// Bodiless non-workspace callee whose generic arg is a FnDef of a
+    /// workspace function that calls a collecting seed.
+    #[test]
+    fn external_callee_with_fn_item_generic_reaches_it() {
+        let fn_def = serde_json::json!({
+            "FnDef": {
+                "regions": [],
+                "outlives": [],
+                "skip_binder": {
+                    "kind": {"Fun": 2},
+                    "generics": {
+                        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                    }
+                }
+            }
+        });
+        let llbc = llbc_regular_external_call(
+            serde_json::json!({
+                "regions": [],
+                "types": [fn_def],
+                "const_generics": [],
+                "trait_refs": []
+            }),
+            true,
+            vec![],
+            serde_json::json!([]),
+        );
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        let seeds = cg.collecting_seed_ids();
+        assert!(
+            seeds.contains(&3),
+            "try_gc_collect must be a seed: {seeds:?}"
+        );
+        let reached = cg.reaching(&seeds);
+        assert!(
+            reached.contains(&0),
+            "caller must reach the seed via the FnDef callback: {reached:?}"
+        );
+        let caller_callees = cg.callees.get(&0).expect("caller callees");
+        assert!(
+            caller_callees.contains(&1),
+            "caller must edge to the external leaf, callees={caller_callees:?}"
+        );
+        assert!(
+            caller_callees.contains(&2),
+            "caller must edge to the FnDef function item, callees={caller_callees:?}"
+        );
+        assert!(
+            !cg.indirect.contains(&0),
+            "resolved external call must not mark the caller indirect"
+        );
+        assert!(
+            !cg.indirect.contains(&1),
+            "external leaf must not be unresolved"
+        );
+    }
+
+    /// Generic arg is an ADT whose generics carry a trait_ref to a
+    /// workspace TraitImpl whose method calls a collecting seed.
+    #[test]
+    fn external_callee_with_adt_trait_ref_impl_reaches_it() {
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }}
+        });
+        let adt = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": [impl_ref]
+                }
+            }
+        });
+        let type_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "iter", "adapters", "map", "Map"]),
+            "kind": "Opaque"
+        });
+        let llbc = llbc_regular_external_call(
+            serde_json::json!({
+                "regions": [],
+                "types": [adt],
+                "const_generics": [],
+                "trait_refs": []
+            }),
+            true,
+            vec![type_decl],
+            serde_json::json!([]),
+        );
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        let seeds = cg.collecting_seed_ids();
+        assert!(
+            seeds.contains(&3),
+            "try_gc_collect must be a seed: {seeds:?}"
+        );
+        let reached = cg.reaching(&seeds);
+        assert!(
+            reached.contains(&0),
+            "caller must reach the seed via the ADT trait_ref impl: {reached:?}"
+        );
+        let caller_callees = cg.callees.get(&0).expect("caller callees");
+        assert!(
+            caller_callees.contains(&1),
+            "caller must edge to the external leaf, callees={caller_callees:?}"
+        );
+        assert!(
+            caller_callees.contains(&2),
+            "caller must edge to the workspace impl method, callees={caller_callees:?}"
+        );
+        assert!(
+            !cg.indirect.contains(&0),
+            "resolved external call must not mark the caller indirect"
+        );
+        assert!(
+            !cg.indirect.contains(&1),
+            "external leaf must not be unresolved"
+        );
+    }
+
+    /// Trait call that resolves to a bodiless non-workspace method whose
+    /// signature input is `&mut dyn Trait`. The specialized copy is not
+    /// built (`analyze_external_call` is `top_result`) and the caller
+    /// stays unresolved, as `external_callee_with_unbound_clause_stays_unresolved`.
+    #[test]
+    fn external_callee_with_dyn_param_stays_unresolved() {
+        let dyn_ref = serde_json::json!({
+            "Ref": [{"Erased": null}, {"DynTrait": {"id": 0}}, "Mut"]
+        });
+        let llbc = llbc_blanket_into_opaque_bound(
+            &["rustpython_wtf8", "from"],
+            true,
+            serde_json::json!([dyn_ref]),
+        );
+        let crates = workspace_list(&["fixture"]);
+        let cg = build_with_workspace_crates(&llbc, &crates);
+        assert!(
+            cg.indirect.contains(&2),
+            "generic into with a dyn-param external method stays unresolved: {:?}",
+            cg.indirect
+        );
+        let (callee, generics) = first_regular_fun_call(&llbc, 0);
+        let node = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_eq!(
+            node, 2,
+            "dyn-param external trait method must keep the generic node"
+        );
+        let reached = cg.reaching(&cg.indirect);
+        assert!(
+            reached.contains(&0),
+            "caller of the dyn-param external still reaches unresolved dispatch: {reached:?}"
         );
     }
 
