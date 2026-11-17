@@ -3978,7 +3978,10 @@ fn make_jitcodes(
     let builtin_wrapper_targets: Vec<jitcode::JitCodeHandle> = call_control
         .builtin_wrapper_indirect_graphs()
         .iter()
-        .filter_map(|path| call_control.jitcodes().get(path).cloned())
+        .filter_map(|path| {
+            let path = call_control.function_graphs().canonical_path(path);
+            call_control.jitcodes().get(&path).cloned()
+        })
         .map(jitcode::JitCodeHandle::from)
         .collect();
     codewriter

@@ -6230,10 +6230,12 @@ fn phase_a_failure_reason<T>(
 
 fn record_phase_a_skip(
     call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
     reason: String,
     phase_a_reasons: &mut Vec<String>,
 ) {
+    let path = function_graphs.canonical_path(path);
     {
         let mut tp = call_registry.two_phase();
         tp.annotate_skipped.insert(path.clone(), reason.clone());
@@ -6549,7 +6551,7 @@ fn phase_a_try_drive(
             pygraph,
         ))) => {
             call_registry.two_phase().insert_subject(
-                path.clone(),
+                function_graphs.canonical_path(path),
                 crate::translator::rtyper::call_registry::TwoPhaseSubject {
                     graph: graph.clone(),
                     pygraph,
@@ -6569,7 +6571,13 @@ fn phase_a_try_drive(
         }
         other => {
             if let Some(reason) = phase_a_failure_reason(&other) {
-                record_phase_a_skip(call_registry, path, reason, phase_a_reasons);
+                record_phase_a_skip(
+                    call_registry,
+                    function_graphs,
+                    path,
+                    reason,
+                    phase_a_reasons,
+                );
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 unpoison_failed_subject_callees(
@@ -6636,17 +6644,38 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     entry_roots: &[crate::parse::CallPath],
 ) {
+    let candidate_graphs: HashSet<crate::parse::CallPath> = candidate_graphs
+        .iter()
+        .map(|path| function_graphs.canonical_path(path))
+        .collect();
+    let builtin_wrapper_graphs: Vec<crate::parse::CallPath> = builtin_wrapper_graphs
+        .iter()
+        .map(|path| function_graphs.canonical_path(path))
+        .collect();
+    let entry_roots: Vec<crate::parse::CallPath> = entry_roots
+        .iter()
+        .map(|path| function_graphs.canonical_path(path))
+        .collect();
+    let portals: Vec<(crate::parse::CallPath, crate::parse::CallPath)> = portals
+        .iter()
+        .map(|(portal, origin)| {
+            (
+                function_graphs.canonical_path(portal),
+                function_graphs.canonical_path(origin),
+            )
+        })
+        .collect();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(
             call_registry,
-            candidate_graphs,
+            &candidate_graphs,
             function_graphs,
-            builtin_wrapper_graphs,
-            portals,
-            entry_roots,
+            &builtin_wrapper_graphs,
+            &portals,
+            &entry_roots,
         )
     }));
-    check_access_directly_sanity(call_registry, candidate_graphs, function_graphs, portals);
+    check_access_directly_sanity(call_registry, &candidate_graphs, function_graphs, &portals);
     call_registry.two_phase().prepass_done = true;
 }
 
@@ -7160,8 +7189,9 @@ fn check_access_directly_sanity(
     {
         let tp = call_registry.two_phase();
         for path in candidate_graphs {
-            if crate::codewriter::call::is_access_directly_path(path)
-                && let Some(pygraph) = tp.subjects.get(path).and_then(|s| s.pygraph.as_ref())
+            let path = function_graphs.canonical_path(path);
+            if crate::codewriter::call::is_access_directly_path(&path)
+                && let Some(pygraph) = tp.subjects.get(&path).and_then(|s| s.pygraph.as_ref())
             {
                 jit_graphs.insert(Rc::as_ptr(pygraph));
                 candidate_flow_graphs.push(pygraph.graph.clone());
@@ -7169,7 +7199,7 @@ fn check_access_directly_sanity(
             insert_candidate_function_desc_jit_graphs(
                 call_registry,
                 function_graphs,
-                path,
+                &path,
                 portals,
                 &mut jit_graphs,
                 &mut candidate_flow_graphs,
@@ -7516,27 +7546,6 @@ fn run_two_phase_prepass_inner(
         .collect();
     paths.sort_by_cached_key(|p| p.display_name());
 
-    // Alias spellings of one GraphStore slot are one prepass subject:
-    // `description.py FunctionDesc.cachedgraph` returns the cached graph
-    // on a hit, and `GraphStore::alias_paths` lists every spelling bound
-    // to that GraphKey. AccessDirect and Regular stay distinct
-    // (`specialize.py default_specialize` keys).
-    let mut alias_rep: HashMap<
-        crate::parse::CallPath,
-        (&crate::parse::CallPath, &crate::parse::CallPath),
-    > = HashMap::new();
-    for path in paths.iter().copied() {
-        let aliases = function_graphs.alias_paths(path);
-        let Some(rep) = paths.iter().copied().find(|candidate| {
-            aliases.contains(candidate) && candidate.specialization == path.specialization
-        }) else {
-            continue;
-        };
-        if path != rep {
-            alias_rep.insert(path.clone(), (path, rep));
-        }
-    }
-
     // Seed every AccessDirect key with that subject's own lift before
     // any Phase A caller can `cachedgraph` the None-key template
     // (`description.py FunctionDesc.cachedgraph`: first asker builds,
@@ -7546,9 +7555,6 @@ fn run_two_phase_prepass_inner(
     let mut seeded_access_direct: HashMap<crate::parse::CallPath, FlowspaceAdapterOutput> =
         HashMap::new();
     for path in paths.iter() {
-        if alias_rep.contains_key(*path) {
-            continue;
-        }
         if !crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
@@ -7564,7 +7570,13 @@ fn run_two_phase_prepass_inner(
             }
             other => {
                 if let Some(reason) = phase_a_failure_reason(&other) {
-                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
+                    record_phase_a_skip(
+                        call_registry,
+                        function_graphs,
+                        path,
+                        reason,
+                        &mut phase_a_reasons,
+                    );
                 }
             }
         }
@@ -7575,9 +7587,6 @@ fn run_two_phase_prepass_inner(
         HashMap::new();
     let mut fresh_regular: HashSet<crate::parse::CallPath> = HashSet::new();
     for path in paths.iter() {
-        if alias_rep.contains_key(*path) {
-            continue;
-        }
         if crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
@@ -7597,7 +7606,13 @@ fn run_two_phase_prepass_inner(
             }
             other => {
                 if let Some(reason) = phase_a_failure_reason(&other) {
-                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
+                    record_phase_a_skip(
+                        call_registry,
+                        function_graphs,
+                        path,
+                        reason,
+                        &mut phase_a_reasons,
+                    );
                 }
             }
         }
@@ -7607,12 +7622,8 @@ fn run_two_phase_prepass_inner(
     let path_set: HashSet<crate::parse::CallPath> = paths.iter().copied().cloned().collect();
     let mut root_set: HashSet<crate::parse::CallPath> = HashSet::new();
     for seed in entry_roots.iter().chain(builtin_wrapper_graphs.iter()) {
-        let mapped = alias_rep
-            .get(seed)
-            .map(|(_, r)| (*r).clone())
-            .unwrap_or_else(|| seed.clone());
-        if path_set.contains(&mapped) {
-            root_set.insert(mapped);
+        if path_set.contains(seed) {
+            root_set.insert(seed.clone());
         }
     }
 
@@ -7623,9 +7634,6 @@ fn run_two_phase_prepass_inner(
 
     // ── Phase A — entry roots first (`annrpython.py` `build_types`) ──
     for path in paths.iter() {
-        if alias_rep.contains_key(*path) {
-            continue;
-        }
         if !root_set.contains(*path) {
             continue;
         }
@@ -7667,9 +7675,6 @@ fn run_two_phase_prepass_inner(
 
     let mut leftover_paths: Vec<&crate::parse::CallPath> = Vec::new();
     for path in paths.iter() {
-        if alias_rep.contains_key(*path) {
-            continue;
-        }
         if phase_a_subject_recorded(call_registry, path) {
             continue;
         }
@@ -7719,15 +7724,13 @@ fn run_two_phase_prepass_inner(
     let mut leftover_index: HashMap<crate::parse::CallPath, usize> = HashMap::new();
     for (i, path) in leftover_paths.iter().enumerate() {
         leftover_index.entry((*path).clone()).or_insert(i);
-        for alias in function_graphs.alias_paths(path) {
-            leftover_index.entry(alias).or_insert(i);
-        }
     }
     let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); leftover_paths.len()];
     for (caller_i, caller) in leftover_paths.iter().enumerate() {
         let callees = function_graphs.body_call_callees(caller, builtin_wrapper_graphs);
         let mut seen: HashSet<usize> = HashSet::new();
         for callee in callees {
+            let callee = function_graphs.canonical_path(&callee);
             let Some(&callee_i) = leftover_index.get(&callee) else {
                 continue;
             };
@@ -7829,23 +7832,6 @@ fn run_two_phase_prepass_inner(
         "[PREPASS entry-vs-callee] roots={n_roots} callees={n_callees} leftovers={n_leftovers} batches={n_batches} occupied-key-fallbacks={occupied_key_fallbacks}"
     );
 
-    let mut alias_keys: Vec<crate::parse::CallPath> = alias_rep.keys().cloned().collect();
-    alias_keys.sort_by_cached_key(|p| p.display_name());
-    for alias_key in alias_keys {
-        let (alias_path, rep) = alias_rep[&alias_key];
-        let subject = call_registry.two_phase().subjects.get(rep).cloned();
-        if let Some(subject) = subject {
-            call_registry
-                .two_phase()
-                .subjects
-                .insert(alias_key, subject);
-            continue;
-        }
-        let reason = call_registry.two_phase().annotate_skipped.get(rep).cloned();
-        if let Some(reason) = reason {
-            record_phase_a_skip(call_registry, alias_path, reason, &mut phase_a_reasons);
-        }
-    }
     check_access_directly_sanity(call_registry, candidate_graphs, function_graphs, portals);
 
     if rtyper_verbose_enabled() {
@@ -9772,17 +9758,20 @@ pub(crate) fn dual_gate_outcome_from_cache(
     // a census could not separate "never attempted" from "attempted and
     // declined" — the same conflation the decline census exists to remove.
     // Neither spelling matches any `unported_category` arm, so
-    // classification is unchanged.  Lookup is by the subject [`CallPath`]
-    // (`GraphSpecialization` keeps AccessDirect distinct from Regular);
+    // classification is unchanged.  Lookup is by the GraphStore
+    // representative of the drain path (`GraphStore::canonical_path`;
+    // `GraphSpecialization` keeps AccessDirect distinct from Regular);
     // graph names are not unique (`default`, `new`, `call`, and
     // `<Impl>::copy` shared across Int/Unicode/Bytes/Object dict
     // strategies) so a name scan can publish another graph's
     // concretetypes. `FunctionGraph::source_identity` is the unique
-    // funcobj key.
+    // funcobj key. An unregistered path is its own representative, so a
+    // wrong `diag_key` stays never-a-subject.
+    let path = function_graphs.canonical_path(path);
     let cached = {
-        let is_ad = crate::codewriter::call::is_access_directly_path(path);
+        let is_ad = crate::codewriter::call::is_access_directly_path(&path);
         let tp = call_registry.two_phase();
-        match tp.subjects.get(path) {
+        match tp.subjects.get(&path) {
             Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => {
                 // An AccessDirect candidate must publish the annotator's
                 // `(AccessDirect, key)` PyGraph of the same FunctionDesc.
@@ -9792,7 +9781,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
                     && !function_desc_access_direct_pygraph_is_subject(
                         call_registry,
                         function_graphs,
-                        path,
+                        &path,
                         subj.pygraph.as_ref(),
                     )
                 {
@@ -9813,7 +9802,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
             }
             Some(_) => Err("two-phase: subject rtype-skipped in prepass".to_string()),
             None => {
-                if let Some(reason) = tp.annotate_skipped.get(path) {
+                if let Some(reason) = tp.annotate_skipped.get(&path) {
                     Err(format!(
                         "two-phase: subject annotate-skipped in prepass: {reason}"
                     ))
@@ -9884,7 +9873,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         let callees = {
             let tp = call_registry.two_phase();
             function_graphs
-                .key_for(path)
+                .key_for(&path)
                 .and_then(|store_key| tp.tdc_plans.get(&store_key))
                 .map(|plan| plan.cutoff_callees.clone())
         };
@@ -11503,6 +11492,41 @@ mod tests {
         );
     }
 
+    /// Harvest DISPLAY drain and FunDecl identity BFS must share one
+    /// prepass subject (`call.py CallControl.get_jitcode` keys
+    /// `self.jitcodes` on the graph object).
+    #[test]
+    fn dual_gate_lookup_of_harvest_drain_finds_identity_bfs_subject() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let harvest = crate::parse::CallPath::from_segments(["mod", "f"]);
+        let identity = crate::parse::CallPath::from_segments(["crate", "mod", "f"]);
+        let graph = empty_return_graph("f");
+        let mut cc = crate::codewriter::call::CallControl::new();
+        cc.register_function_graph(harvest.clone(), graph.clone());
+        cc.function_graphs_mut()
+            .share_path(identity.clone(), &harvest);
+        cc.function_graphs_mut().mark_canonical_path(&harvest);
+        // BFS/candidate insertion under identity.
+        cc.add_candidate_graph(identity.clone());
+        run_two_phase_prepass(&registry, cc.candidate_graphs(), cc.function_graphs(), &[]);
+        // Drain via get_jitcode (commit 5 keys unfinished_graphs on harvest).
+        let _ = cc.get_jitcode(&identity);
+        let drain_path = cc.function_graphs().canonical_path(&identity);
+        assert_eq!(drain_path, harvest);
+        assert!(cc.jitcodes().contains_key(&harvest));
+        let outcome =
+            dual_gate_outcome_from_cache(&graph, &registry, cc.function_graphs(), &drain_path)
+                .expect("publish reads the cache");
+        if let DualGateOutcome::Skip(reason) = &outcome {
+            assert_ne!(
+                non_arm_skip_category(reason),
+                Some("two-phase-never-a-subject"),
+                "harvest drain must find the identity-BFS subject, got {reason}"
+            );
+        }
+    }
+
     fn origin_and_access_direct_fixture() -> (
         std::rc::Rc<CallRegistry>,
         crate::parse::CallPath,
@@ -11750,18 +11774,13 @@ mod tests {
             &[],
         );
         let tp = registry.two_phase();
-        let both_subjects =
-            tp.subjects.contains_key(&ad_path) && tp.subjects.contains_key(&alias_ad);
-        let both_skipped = match (
-            tp.annotate_skipped.get(&ad_path),
-            tp.annotate_skipped.get(&alias_ad),
-        ) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
+        let canonical_ad = graphs.canonical_path(&ad_path);
+        assert_eq!(canonical_ad, graphs.canonical_path(&alias_ad));
+        let in_subjects = tp.subjects.contains_key(&canonical_ad);
+        let skipped = tp.annotate_skipped.contains_key(&canonical_ad);
         assert!(
-            both_subjects || both_skipped,
-            "alias AccessDirect keys must share a subject or the same skip; subjects={:?} skipped={:?}",
+            in_subjects || skipped,
+            "canonical AccessDirect key must be a subject or skip; subjects={:?} skipped={:?}",
             tp.subjects.keys().collect::<Vec<_>>(),
             tp.annotate_skipped,
         );
@@ -11771,6 +11790,22 @@ mod tests {
                 "alias spelling must not re-lift: {reason}"
             );
         }
+        drop(tp);
+        let ad_graph = graphs.get(&ad_path).expect("AccessDirect graph");
+        let not_never = |outcome: &DualGateOutcome| match outcome {
+            DualGateOutcome::Skip(reason) => {
+                non_arm_skip_category(reason) != Some("two-phase-never-a-subject")
+            }
+            DualGateOutcome::Match { .. } => true,
+        };
+        let outcome_ad = dual_gate_outcome_from_cache(&ad_graph, &registry, &graphs, &ad_path)
+            .expect("publish reads the cache");
+        let outcome_alias = dual_gate_outcome_from_cache(&ad_graph, &registry, &graphs, &alias_ad)
+            .expect("publish reads the cache");
+        assert!(
+            not_never(&outcome_ad) && not_never(&outcome_alias),
+            "either AccessDirect spelling must find the one subject"
+        );
     }
 
     /// `stack_base`-shaped getter: one Int formal returned. Live Signed

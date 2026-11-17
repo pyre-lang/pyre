@@ -352,7 +352,7 @@ impl CodeWriter {
         let mut subjects = callcontrol.candidate_graphs().clone();
         for path in callcontrol.builtin_wrapper_indirect_graphs() {
             if callcontrol.has_function_graph(path) {
-                subjects.insert(path.clone());
+                subjects.insert(callcontrol.function_graphs().canonical_path(path));
             }
         }
         // ProfileFunc family members join `candidate_graphs` in
@@ -363,8 +363,13 @@ impl CodeWriter {
         // too (`warmspot.py check_access_directly_sanity`): Phase A
         // `default_specialize` mints those copies after BFS.
         for path in callcontrol.profilefunc_indirect_graphs() {
+            let path = callcontrol.function_graphs().canonical_path(&path);
             subjects.insert(path.clone());
-            subjects.insert(crate::call::access_directly_path(&path));
+            subjects.insert(
+                callcontrol
+                    .function_graphs()
+                    .canonical_path(&crate::call::access_directly_path(&path)),
+            );
         }
         let portals: Vec<_> = callcontrol
             .jitdrivers_sd()
