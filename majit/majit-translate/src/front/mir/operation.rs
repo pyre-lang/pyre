@@ -907,6 +907,13 @@ impl<'a> Lowering<'a> {
         if variant.is_some() {
             return false;
         }
+        // The cell descr (`tyref_primitive_or_transparent_primitive_node`)
+        // already admits every primitive Scalar, including Float.
+        // `rewrite_op_raw_store` takes its kind from the stored type.
+        // A VersionTag-style non-transparent integer newtype is still
+        // `IntegerRepr` (`Int` / `Unsigned` / `Bool`).
+        let cell_primitive =
+            tyref_primitive_or_transparent_primitive_node(&inner.ty, self.llbc).is_some();
         let kind = tyref_transparent_inner_value_type(
             &inner.ty,
             self.llbc,
@@ -914,10 +921,12 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
         );
-        if !matches!(
-            kind,
-            Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool)
-        ) {
+        if !cell_primitive
+            && !matches!(
+                kind,
+                Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+            )
+        {
             return false;
         }
         if let Some((field_index, _)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
@@ -3420,6 +3429,12 @@ impl<'a> Lowering<'a> {
                 if borrow_kind_is_exclusive(&kind)
                     && let Some(inner) = self.exclusive_reborrow_cell_address_inner(&place)
                 {
+                    let v = self.resolve_place(mir_bb, inner)?;
+                    return Ok((None, v));
+                }
+                // `&mut *p` of a raw pointer is `p` (`cast_ptr_to_adr`).
+                // Same predicate as `Rvalue::RawPtr`.
+                if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
@@ -6860,9 +6875,14 @@ impl<'a> Lowering<'a> {
         if name != "Deref" {
             return None;
         }
+        // `cast_ptr_to_adr` keeps pointer identity. The Deref load arm
+        // admits a `repr(transparent)` primitive wrapper through
+        // `function_local_primitive_cell_descr` /
+        // `tyref_primitive_or_transparent_primitive_node`; the reborrow
+        // uses that same descr so `&raw mut *p` of `*mut Wrap(i64)` is
+        // `p`, not a RawLoad of the integer.
         if !tyref_is_raw_pointer(&inner.ty, self.llbc)
-            || !tyref_is_primitive_scalar(&place.ty, self.llbc)
-            || self.raw_word_descr(&place.ty).is_none()
+            || function_local_primitive_cell_descr(&place.ty, self.llbc).is_none()
         {
             return None;
         }

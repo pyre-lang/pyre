@@ -3733,10 +3733,19 @@ impl<'a> Lowering<'a> {
                     // word. Recording that local as a scalar alias makes
                     // the later `*q` skip `RawLoad`. A cell reborrow is
                     // recorded even when the local is assigned again.
-                    if self.raw_primitive_reborrow_inner(&place).is_none()
+                    // `&mut *p` of a raw pointer is that same address
+                    // (`cast_ptr_to_adr`); `*q` is `rewrite_op_raw_load`,
+                    // like a call-returned `&T` on `scalar_address_locals`.
+                    let reborrow = self.raw_primitive_reborrow_inner(&place);
+                    if reborrow.is_none()
                         && (cell_reborrow || !self.multi_assigned_locals.contains(&local))
                     {
                         self.atomic_ref_place.insert(local, place);
+                    } else if reborrow.is_some()
+                        && !self.multi_assigned_locals.contains(&local)
+                        && !self.scalar_address_locals.contains(&local)
+                    {
+                        self.scalar_address_locals.push(local);
                     }
                 }
                 if !self.multi_assigned_locals.contains(&(i as usize))
