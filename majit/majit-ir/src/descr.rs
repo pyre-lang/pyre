@@ -8121,6 +8121,7 @@ pub fn make_simple_descr_group_keyed(
         vtable,
         is_gc_managed,
         false,
+        false,
         field_specs,
         &[],
     )
@@ -8138,6 +8139,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     vtable: usize,
     is_gc_managed: bool,
     headerless: bool,
+    is_immutable: bool,
     field_specs: &[SimpleFieldDescrSpec],
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
 ) -> SimpleDescrGroup {
@@ -8149,6 +8151,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
         vtable,
         is_gc_managed,
         headerless,
+        is_immutable,
         field_specs,
         extra_gc_fielddescrs,
         &[],
@@ -8201,6 +8204,7 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     vtable: usize,
     is_gc_managed: bool,
     headerless: bool,
+    is_immutable: bool,
     field_specs: &[SimpleFieldDescrSpec],
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
     inlined_parent: &[Arc<SimpleFieldDescr>],
@@ -8300,6 +8304,8 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     sd.set_cache_key(cache_key);
     sd.set_gc_managed(is_gc_managed);
     sd.set_headerless(headerless);
+    // descr.py get_size_descr: SizeDescr(size, vtable, is_immutable) in one mint.
+    sd.is_immutable = is_immutable;
     let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
     for fd in &gc_only {
         sd = sd.with_extra_gc_fielddescr(fd.clone());
@@ -10527,6 +10533,7 @@ mod register_keyed_size_authority_tests {
             0x1000,
             true,
             false,
+            false,
             &[spec.clone()],
             &[],
         );
@@ -10537,6 +10544,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0,
             true,
+            false,
             false,
             &[spec],
             &[],
@@ -10573,6 +10581,7 @@ mod register_keyed_size_authority_tests {
             0x2222,
             true,
             false,
+            false,
             &[spec("intval", 16, 0)],
             &[],
         );
@@ -10586,6 +10595,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0x2222,
             true,
+            false,
             false,
             &[spec("intval", 16, 0)],
             &[],
@@ -10607,6 +10617,7 @@ mod register_keyed_size_authority_tests {
             0x1000,
             true,
             false,
+            false,
             &[],
             &[],
         );
@@ -10619,6 +10630,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0,
             true,
+            false,
             false,
             &[],
             &[],
@@ -10645,6 +10657,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0x1000,
             true,
+            false,
             false,
             &[SimpleFieldDescrSpec {
                 index: 0,
@@ -10698,6 +10711,7 @@ mod register_keyed_size_authority_tests {
             0x1111,
             true,
             false,
+            false,
             &[spec.clone()],
             &[],
         );
@@ -10708,6 +10722,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0x2222,
             true,
+            false,
             false,
             &[spec],
             &[],
@@ -10722,6 +10737,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0x1111,
             true,
+            false,
             false,
             &[],
             &[],
@@ -10779,6 +10795,7 @@ mod register_keyed_size_authority_tests {
             0x1111,
             true,
             false,
+            false,
             &[spec.clone()],
             &extra,
         );
@@ -10789,6 +10806,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0x2222,
             true,
+            false,
             false,
             &[spec],
             &extra,
@@ -11578,6 +11596,7 @@ mod register_keyed_size_authority_tests {
                 0x1000,
                 true,
                 false,
+                false,
                 &[spec()],
                 &[],
             );
@@ -11602,6 +11621,7 @@ mod register_keyed_size_authority_tests {
                 cache_key,
                 0x1000,
                 true,
+                false,
                 false,
                 &[spec()],
                 &[],
@@ -11673,6 +11693,7 @@ mod register_keyed_size_authority_tests {
             cache_key,
             0,
             true,
+            false,
             false,
             &[spec],
             &[],
@@ -12401,6 +12422,7 @@ mod tests {
             0,
             true,
             false,
+            false,
             &[spec("intval", 16, Type::Int, 0)],
             &[header.clone()],
         );
@@ -12495,6 +12517,7 @@ mod tests {
             0x0C1A_0002,
             0,
             true,
+            false,
             false,
             &[spec("intval", 16, Type::Int, 0)],
             &[header.clone(), token.clone()],

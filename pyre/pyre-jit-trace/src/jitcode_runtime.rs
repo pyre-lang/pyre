@@ -4407,6 +4407,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: vec![BhFieldSpec {
                     index: 0,
                     field_key: "slot".to_string(),

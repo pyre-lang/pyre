@@ -6265,6 +6265,7 @@ fn minted_exception_instance_size_spec(
         size,
         is_gc_managed,
         headerless,
+        is_immutable: cc.size_descr_immutable_flag(owner, None),
         type_id: bh_size_type_id(owner, owner, is_gc_managed),
         vtable: 0,
         owner: key,
@@ -6532,6 +6533,7 @@ fn bh_size_spec_for(
         size,
         is_gc_managed,
         headerless,
+        is_immutable: cc.size_descr_immutable_flag(owner, owner_id),
         // `descr.py get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash_for_gc_kind(owner, is_gc_managed)` per

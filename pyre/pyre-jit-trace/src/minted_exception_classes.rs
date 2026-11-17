@@ -671,6 +671,7 @@ mod tests {
             minted.pytype as usize,
             true,
             false,
+            false,
             std::slice::from_ref(&spec),
             &[],
         );

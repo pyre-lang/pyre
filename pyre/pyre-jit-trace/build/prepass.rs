@@ -1004,6 +1004,7 @@ fn opcode_published_descr_members(
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
+                    is_immutable: false,
                     all_fielddescrs: all_fielddescrs.clone(),
                 },
             ),
@@ -2094,6 +2095,7 @@ fn real_main() {
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
+                    is_immutable: false,
                     all_fielddescrs: all_fielddescrs.clone(),
                 }
                 .pack_into(&mut descrs_bin);

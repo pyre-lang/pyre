@@ -254,6 +254,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
             *vtable as usize,
             *is_gc_managed,
             headerless,
+            false,
             &specs,
             &[],
         );
@@ -482,6 +483,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             p.vtable as usize,
                             p.is_gc_managed,
                             p.headerless,
+                            p.is_immutable,
                             &specs,
                             &[],
                         );
@@ -530,6 +532,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             p.vtable as usize,
                             p.is_gc_managed,
                             p.headerless,
+                            p.is_immutable,
                             &specs,
                             &[],
                         );
@@ -659,6 +662,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             p.vtable as usize,
                             p.is_gc_managed,
                             p.headerless,
+                            p.is_immutable,
                             std::slice::from_ref(&spec),
                             &[],
                         );
@@ -667,18 +671,15 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     }
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let mut gc = majit_ir::descr::gc_cache().lock();
-                    // `immutable_flag` is `descr.py:112
-                    // heaptracker.is_immutable_struct(STRUCT)`, which reads the
-                    // STRUCT's `immutable` hint.  A serialized parent spec
-                    // carries no such hint — size, type id, vtable, GC-managed
-                    // and headerless are its whole payload — so `false` is not a
-                    // choice made over an available alternative but the absence
-                    // of the declaration channel, the same absence
-                    // `get_field_descr`'s cache-hit branch already resolves for
-                    // per-field immutability.  The sibling keyed mint just above
-                    // lands on the same `false` through
-                    // `SimpleSizeDescr::with_vtable`.
-                    gc.get_size_descr(struct_key.clone(), p.size, p.vtable as usize, false);
+                    // descr.py get_size_descr: immutable_flag =
+                    // heaptracker.is_immutable_struct(STRUCT). The serialized
+                    // parent spec carries that hint as `BhSizeSpec.is_immutable`.
+                    gc.get_size_descr(
+                        struct_key.clone(),
+                        p.size,
+                        p.vtable as usize,
+                        p.is_immutable,
+                    );
                     let fd = gc.get_field_descr(
                         struct_key,
                         field_key,
@@ -6718,6 +6719,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: vec![spec],
             })),
             name: field.to_string(),
@@ -6764,7 +6766,152 @@ mod tests {
         );
     }
 
-    /// The empty-`all_fielddescrs` twin of the above. That branch derives the
+    fn parent_size_descr(descr: &majit_ir::DescrRef) -> majit_ir::DescrRef {
+        descr
+            .as_field_descr()
+            .expect("field descr")
+            .get_parent_descr()
+            .expect("field descr must carry a parent")
+    }
+
+    fn parent_is_immutable(descr: &majit_ir::DescrRef) -> bool {
+        parent_size_descr(descr)
+            .as_size_descr()
+            .expect("parent is a size descr")
+            .is_immutable()
+    }
+
+    fn field_descr_with_immutable_parent(
+        field: &str,
+        type_id: u64,
+        size: usize,
+        fields: Vec<majit_jitcode::jitcode::BhFieldSpec>,
+    ) -> crate::blackhole::BhDescr {
+        field_descr_with_immutable_parent_gc(field, type_id, size, fields, true)
+    }
+
+    fn field_descr_with_immutable_parent_gc(
+        field: &str,
+        type_id: u64,
+        size: usize,
+        fields: Vec<majit_jitcode::jitcode::BhFieldSpec>,
+        is_gc_managed: bool,
+    ) -> crate::blackhole::BhDescr {
+        crate::blackhole::BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: Some(std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
+                size,
+                type_id,
+                vtable: 0,
+                owner: String::new(),
+                is_gc_managed,
+                headerless: false,
+                is_immutable: true,
+                all_fielddescrs: fields,
+            })),
+            name: field.to_string(),
+            owner: String::new(),
+            load_is_acquire: false,
+            store_is_release: false,
+        }
+    }
+
+    /// `descr.py get_size_descr` `immutable_flag = heaptracker.is_immutable_struct(STRUCT)`.
+    /// The serialized parent spec carries that hint; both the field-list
+    /// rebuild and the empty-list `get_size_descr` mint must stamp it.
+    #[test]
+    fn field_descr_ref_from_bh_rebuilds_immutable_parent() {
+        const LISTED: u64 = 0xE153_0000_1515_0001;
+        const EMPTY: u64 = 0xE153_0000_1515_0002;
+        let field = majit_jitcode::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: "imm".to_string(),
+            name: "imm".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let listed_fd = field_descr_ref_from_bh(&field_descr_with_immutable_parent(
+            "imm",
+            LISTED,
+            8,
+            vec![field],
+        ))
+        .1;
+        assert!(
+            parent_is_immutable(&listed_fd),
+            "field-list rebuild must keep heaptracker.is_immutable_struct"
+        );
+        let empty_fd =
+            field_descr_ref_from_bh(&field_descr_with_immutable_parent("imm", EMPTY, 8, vec![])).1;
+        assert!(
+            parent_is_immutable(&empty_fd),
+            "empty-list get_size_descr mint must keep heaptracker.is_immutable_struct"
+        );
+    }
+
+    /// A raw (`is_gc_managed=false`) immutable parent must mint gc-kind and
+    /// `is_immutable` together. Seeding `get_size_descr` first would birth the
+    /// SizeDescr as GC-managed; the group builder then trips
+    /// `register_keyed_size` "two producers disagree about the gc-kind".
+    #[test]
+    fn field_descr_ref_from_bh_rebuilds_raw_immutable_parent() {
+        const RAW: u64 = 0xE153_0000_1515_0003;
+        let field = majit_jitcode::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: "imm".to_string(),
+            name: "imm".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: false,
+            store_is_release: false,
+        };
+        let fd = field_descr_ref_from_bh(&field_descr_with_immutable_parent_gc(
+            "imm",
+            RAW,
+            8,
+            vec![field],
+            false,
+        ))
+        .1;
+        assert!(
+            parent_is_immutable(&fd),
+            "raw immutable parent must keep heaptracker.is_immutable_struct"
+        );
+        let parent = parent_size_descr(&fd);
+        assert!(
+            !parent
+                .as_size_descr()
+                .expect("parent is a size descr")
+                .is_gc_managed(),
+            "raw immutable parent must keep is_gc_managed==false"
+        );
+    }
+
+    /// The empty-`all_fielddescrs` twin of
+    /// `type_id_less_parents_do_not_share_one_size_descr`. That branch derives the
     /// parent from `size`/`vtable` alone (`descr.py:238 parent_descr =
     /// get_size_descr(gccache, STRUCT, vtable)`), so under `Struct(0)` the
     /// second resolution reads back the first one's published size slot.
@@ -6835,6 +6982,7 @@ mod tests {
             0,
             TID,
             0,
+            false,
             false,
             false,
             &[spec],
@@ -6949,6 +7097,7 @@ mod tests {
             TID,
             VTABLE as usize,
             true,
+            false,
             false,
             &[one],
             &[],
@@ -7096,6 +7245,7 @@ mod tests {
             0,
             true,
             false,
+            false,
             &specs,
             &[],
         );
@@ -7130,6 +7280,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: parent_specs,
             })),
             name: "PyFrame.flags".to_string(),

@@ -5824,6 +5824,32 @@ impl CallControl {
         self.struct_layouts.borrow().get(&sid).cloned()
     }
 
+    /// `descr.py get_size_descr` `immutable_flag = heaptracker.is_immutable_struct(STRUCT)`.
+    ///
+    /// Reads `Struct._hints['immutable']` off the layout's lltype record
+    /// (`StructLayout.ll_struct` / `ll_struct_by_args`). A missing record or
+    /// missing hint is mutable.
+    pub(crate) fn size_descr_immutable_flag(
+        &self,
+        owner: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+    ) -> bool {
+        let layout = owner_id
+            .and_then(|sid| self.struct_layout_for_id(sid))
+            .or_else(|| self.struct_layout_for(owner));
+        let Some(layout) = layout else {
+            return false;
+        };
+        if let Some(s) = layout.ll_struct_by_args.borrow().get(owner) {
+            return crate::codewriter::heaptracker::is_immutable_struct(s);
+        }
+        layout
+            .ll_struct
+            .borrow()
+            .as_ref()
+            .is_some_and(crate::codewriter::heaptracker::is_immutable_struct)
+    }
+
     /// The layout stored under `sid`, whose spelling is `name`. A
     /// positional aggregate (`Tuple<A,B>` / `Array<T;N>`) and an rtyper
     /// tuple (`tuple{n}<s0,s1,…>`, `rtuple.py` `TUPLE_TYPE`) have no
@@ -6792,11 +6818,10 @@ impl CallControl {
         // Mirror upstream by minting/hitting the parent here
         // from the analyzer's struct layout knowledge:
         // `compute_struct_size` matches `symbolic.get_size(STRUCT)`;
-        // analyzer has no vtable / immutability surface so we
-        // pass 0 / false (a runtime `build_object_descr_group`
+        // vtable is 0 until a runtime `build_object_descr_group`
         // publish under the same `struct_key` carries the real
-        // vtable on its PyreSizeDescr — cache-hit returns
-        // *that* Arc here unchanged).
+        // vtable (cache-hit returns *that* Arc unchanged);
+        // `immutable_flag` is `heaptracker.is_immutable_struct(STRUCT)`.
         if owner_id.is_some() && registry_struct_id.is_none() {
             self.field_footprint.borrow_mut().owner_id_miss = true;
             majit_ir::descr::record_field_owner_id_registry_miss();
@@ -6841,7 +6866,12 @@ impl CallControl {
         };
         let size_descr_arc = {
             let mut gc = majit_ir::descr::gc_cache().lock();
-            gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+            gc.get_size_descr(
+                struct_key.clone(),
+                struct_size,
+                0,
+                self.size_descr_immutable_flag(owner_root, owner_id),
+            )
         };
         // Field-walk pass (PyPy `cpu.fielddescrof` per-tuple
         // identity convergence): when the runtime published
@@ -7255,7 +7285,12 @@ impl CallControl {
                 let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let size_descr_arc = {
                     let mut gc = majit_ir::descr::gc_cache().lock();
-                    gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+                    gc.get_size_descr(
+                        struct_key.clone(),
+                        struct_size,
+                        0,
+                        self.size_descr_immutable_flag(&elem_name, None),
+                    )
                 };
                 // Field-walk pass (same convergence pattern as
                 // `fielddescrof_concrete` B-3): when runtime published
@@ -15874,11 +15909,15 @@ fn all_interiorfielddescrs(
     if let Some(layout) = cc.struct_layout_for(struct_name) {
         let size_descr_arc = {
             let mut gc = majit_ir::descr::gc_cache().lock();
-            // descr.py:108-118: vtable=0 here — pyre struct-array
+            // descr.py get_size_descr: vtable=0 here — pyre struct-array
             // interior fields are not GcStruct-of-Object so no vtable.
-            // immutable_flag=false: defensive default; field-level
-            // immutability lives on FieldDescr.is_immutable.
-            gc.get_size_descr(struct_key.clone(), layout.size, 0, false)
+            // immutable_flag = heaptracker.is_immutable_struct(STRUCT).
+            gc.get_size_descr(
+                struct_key.clone(),
+                layout.size,
+                0,
+                cc.size_descr_immutable_flag(struct_name, None),
+            )
         };
         let mut entries: Vec<(
             String,
@@ -16051,7 +16090,12 @@ fn all_interiorfielddescrs(
     // `parent_descr` to the size descr instead of `None` (`descr.py`).
     let size_descr_arc = {
         let mut gc = majit_ir::descr::gc_cache().lock();
-        gc.get_size_descr(struct_key.clone(), item_size, 0, false)
+        gc.get_size_descr(
+            struct_key.clone(),
+            item_size,
+            0,
+            cc.size_descr_immutable_flag(struct_name, None),
+        )
     };
     let mut result = Vec::new();
     for (
@@ -32685,6 +32729,68 @@ mod tests {
         let after = majit_ir::descr::field_mint_census_snapshot();
         assert!(after.offset_template_hit > before.offset_template_hit);
         assert!(after.cache_hit_offset > before.cache_hit_offset);
+    }
+
+    /// `descr.py get_size_descr` `immutable_flag = heaptracker.is_immutable_struct(STRUCT)`.
+    /// A GcStruct whose lltype record carries `_hints['immutable']` yields a
+    /// SizeDescr whose `is_immutable()` is true through the translator mint.
+    #[test]
+    fn get_size_descr_honors_struct_immutable_hint() {
+        use crate::codewriter::heaptracker::is_immutable_struct;
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Struct};
+
+        let owner = "E153ImmutableGc";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let body = Struct::gc_with_hints(
+            owner,
+            vec![("x".into(), LowLevelType::Signed)],
+            vec![("immutable".into(), ConstValue::Bool(true))],
+        );
+        assert!(is_immutable_struct(&body));
+
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(owner.to_string(), vec![("x".into(), "i64".into())]);
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "x".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(Some(body)),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let descr = cc
+            .fielddescrof(0, owner, Some(sid), "x")
+            .expect("immutable struct field");
+        let parent = descr
+            .as_field_descr()
+            .expect("field descr")
+            .get_parent_descr()
+            .expect("parent");
+        assert!(
+            parent.as_size_descr().expect("size descr").is_immutable(),
+            "get_size_descr must stamp heaptracker.is_immutable_struct onto SizeDescr"
+        );
     }
 
     /// `FreshMallocs`: a write into an object the graph allocated, directly
