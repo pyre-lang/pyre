@@ -2059,14 +2059,20 @@ fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
         }
     };
     // `w_key` is the `(module, name)` pair registered for this code
-    // (`get_extension` `space.listview(w_key)`).
+    // (`get_extension` `w_module_name, w_name = space.listview(w_key)`).
     let _ = pyre_object::gc_roots::pin_root(w_key);
     let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let pair = pyre_interpreter::baseobjspace::fixedview(
+    let items = pyre_interpreter::baseobjspace::listview(
         pyre_object::gc_roots::shadow_stack_get(key_slot),
-        2,
+        -1,
     )?;
-    let pair_base = pyre_object::gc_roots::pin_roots(&[pair[0], pair[1]]);
+    if items.len() != 2 {
+        // listview then unpack; test_bad_ext_inverted_registry observes `_inverted_registry[%d] isn't a 2-tuple of strings`.
+        return Err(PyError::value_error(format!(
+            "_inverted_registry[{code}] isn't a 2-tuple of strings"
+        )));
+    }
+    let pair_base = pyre_object::gc_roots::pin_roots(&[items[0], items[1]]);
     let obj = call_find_class(
         slot,
         pyre_object::gc_roots::shadow_stack_get(pair_base),

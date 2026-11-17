@@ -2385,11 +2385,16 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     let w_args = bound(1)
         .ok_or_else(|| crate::PyError::type_error("start_new_thread expected 2 or 3 arguments"))?;
+    // `is_tuple` includes `TUPLE_USER_TYPE`, so a tuple subclass is accepted
+    // the way `os_thread.py start_new_thread` uses
+    // `space.isinstance_w(w_args, space.w_tuple)`.
     if unsafe { !is_tuple(w_args) } {
         return Err(crate::PyError::type_error("2nd arg must be a tuple"));
     }
     let kwargs = bound(2);
-    if kwargs.is_some_and(|d| unsafe { !is_dict(d) }) {
+    // `os_thread.py start_new_thread`: `space.isinstance_w(w_kwargs, space.w_dict)`.
+    // `is_dict` is the exact tag; a dict subclass is a wrapper object.
+    if kwargs.is_some_and(|d| unsafe { !crate::baseobjspace::isinstance_dict_w(d) }) {
         return Err(crate::PyError::type_error(
             "optional 3rd arg must be a dictionary",
         ));

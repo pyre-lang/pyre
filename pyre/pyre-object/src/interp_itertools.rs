@@ -567,16 +567,16 @@ pub fn w_product_new(gears: PyObjectRef, stopped: bool, w_subtype: PyObjectRef) 
     let _ = crate::gc_roots::pin_root(w_subtype);
     let subtype_slot = crate::gc_roots::shadow_stack_len() - 1;
     // `W_Product.__init__`: empty gear → `indices = None`; otherwise
-    // `indices = [0] * len(self.gears)`.
+    // `indices = [0] * len(self.gears)`. `ll_newlist` of that length is
+    // `IntArray::try_with_len` (zero-filled Signed `GcArray`).
     let n = unsafe { crate::listobject::w_list_len(gears) };
     let indices = if stopped || n == 0 {
         crate::IntArray::empty()
     } else {
-        let fresh = crate::IntArray::from_vec(vec![0; n]);
-        if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
-            return crate::PY_NULL;
+        match crate::IntArray::try_with_len(n) {
+            Some(fresh) => fresh,
+            None => return crate::PY_NULL,
         }
-        fresh
     };
     let gears = crate::gc_roots::shadow_stack_get(gears_slot);
     let w_subtype = crate::gc_roots::shadow_stack_get(subtype_slot);
@@ -742,31 +742,28 @@ pub fn w_permutations_new(
     let subtype_slot = crate::gc_roots::shadow_stack_len() - 1;
     // `W_Permutations.__init__`: `n_minus_r < 0` leaves indices/cycles
     // unset; otherwise `indices = range(n)` and
-    // `cycles = range(n, n_minus_r, -1)`.
+    // `cycles = range(n, n_minus_r, -1)`. Each is `ll_newlist` of that
+    // length (`IntArray::try_with_len`) filled in place.
     let n = unsafe { crate::listobject::w_list_len(pool_w) };
     let (indices, cycles) = if stopped {
         (crate::IntArray::empty(), crate::IntArray::empty())
     } else {
-        let mut indices = if n == 0 {
-            crate::IntArray::empty()
-        } else {
-            let fresh = crate::IntArray::from_vec((0..n).map(|i| i as i64).collect());
-            if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
-                return crate::PY_NULL;
-            }
-            fresh
+        let mut indices = match crate::IntArray::try_with_len(n) {
+            Some(fresh) => fresh,
+            None => return crate::PY_NULL,
         };
+        for i in 0..n {
+            indices[i] = i as i64;
+        }
         let indices_slot = indices.pin_block();
         let ru = r as usize;
-        let cycles = if ru == 0 {
-            crate::IntArray::empty()
-        } else {
-            let fresh = crate::IntArray::from_vec((0..ru).map(|i| (n - i) as i64).collect());
-            if crate::gc_hook::gc_alloc_failed_pending() && fresh.block.is_null() {
-                return crate::PY_NULL;
-            }
-            fresh
+        let mut cycles = match crate::IntArray::try_with_len(ru) {
+            Some(fresh) => fresh,
+            None => return crate::PY_NULL,
         };
+        for i in 0..ru {
+            cycles[i] = (n - i) as i64;
+        }
         indices.reload_block(indices_slot);
         (indices, cycles)
     };

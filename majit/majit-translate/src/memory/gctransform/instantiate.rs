@@ -11,10 +11,14 @@
 //! name a `TraitImpl` supplies the binding: the copy substitutes each
 //! depth-0 `Clause` with that ref, and a `ParentClause` of a resolved impl
 //! reads that impl's `implied_trait_refs`. Each concrete instantiation is
-//! its own node (`FunctionDesc.cachedgraph`). The unspecialized body is
-//! left unchanged and stays `indirect`.
+//! its own node (`FunctionDesc.cachedgraph`): the graph is stored under
+//! the key on first request, before the body is walked. Bodies are flowed
+//! later from a FIFO pending worklist (`RPythonAnnotator.addpendingblock`
+//! / `complete_pending_blocks`). Recursive cycles in the resulting call
+//! graph are handled at analysis time by `DependencyTracker`. The
+//! unspecialized body is left unchanged and stays `indirect`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, Operand, TermKind, Unstructured};
 use majit_charon_reader::{FunDecl, Llbc};
@@ -24,10 +28,10 @@ use super::framework::{
     CallGraph, OpaqueCensus, call_graph_flow_is_incomplete, call_graph_walks_block,
 };
 
-/// Nesting bound on Regular → spec → Regular instantiation.
-/// A clause the caller cannot resolve, a `dyn`, a bodyless impl method,
-/// or a walk past this bound falls back to the generic node.
-pub(crate) const MAX_INSTANTIATION_DEPTH: usize = 8;
+/// Nesting bound on `bind_trait_ref` / `unwrap_ref_binders_at` over a
+/// trait-ref value (`Deduplicated`, `skip_binder`, `Clause`,
+/// `ParentClause`). A walk past this bound is unresolvable.
+pub(crate) const MAX_TRAIT_REF_NESTING: usize = 8;
 
 /// Outcome of substituting a `CallKind::Trait` payload through the
 /// current instantiation's clause bindings.
@@ -49,12 +53,10 @@ pub(crate) enum TraitCallRes {
 /// walking a FunDecl as itself). `callee` is the `FunId::Regular` id and
 /// `generics` is the call site's generic arguments (`trait_refs`).
 ///
-/// During [`build_call_graph`] this creates a specialized node when the
-/// callee body has a `Clause` / `ParentClause` Trait call — or a Regular
-/// `Fun` that forwards such a clause in `generics.trait_refs` — that
-/// resolves to a `TraitImpl` method. After the graph is built, it is
-/// lookup-only on `spec_memo` and falls back to `callee` when the
-/// instantiation was not recorded — never narrower than the generic node.
+/// After [`build_call_graph`] this is lookup-only on `spec_memo` and
+/// falls back to `callee` when the instantiation was not recorded —
+/// never narrower than the generic node. The builder mints a node per
+/// key (`FunctionDesc.cachedgraph`) before walking the body.
 pub(crate) fn callee_node_for_call(
     graph: &CallGraph,
     llbc: &Llbc,
@@ -114,7 +116,7 @@ pub(crate) fn bind_trait_ref(
     bindings: &[Value],
     depth: usize,
 ) -> Option<Value> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return None;
     }
     let (obj, extra) = unwrap_ref_binders(tref, llbc, 0)?;
@@ -252,10 +254,13 @@ pub(crate) fn build_call_graph(llbc: &Llbc) -> CallGraph {
         builder.install_generic(fd);
     }
     // `Joined::build` sorts `part.keys` by name then id so numbering does
-    // not follow `HashMap` order. Walk order here mints spec nodes
-    // (`spec_memo` identity-while-in-progress + `MAX_INSTANTIATION_DEPTH`),
-    // so the same comparator keeps `struct_error#0=…` from flickering in
-    // and out of the unjustified column.
+    // not follow `HashMap` order. Generic ids are walked in that order;
+    // each new instantiation is minted immediately
+    // (`FunctionDesc.cachedgraph`) and queued on `pending`, then flowed
+    // FIFO (`RPythonAnnotator.addpendingblock` /
+    // `complete_pending_blocks`). Recursive call-graph cycles are
+    // handled later by `DependencyTracker`. The comparator keeps
+    // `struct_error#0=…` join keys stable across artefacts.
     let mut generic_ids: Vec<u64> = builder.graph.names.keys().copied().collect();
     generic_ids.sort_unstable_by(|&a, &b| {
         builder.graph.names[&a]
@@ -265,6 +270,7 @@ pub(crate) fn build_call_graph(llbc: &Llbc) -> CallGraph {
     for id in generic_ids {
         builder.walk_generic(id);
     }
+    builder.drain_pending();
     builder.finish()
 }
 
@@ -273,6 +279,11 @@ struct Builder<'a> {
     graph: CallGraph,
     next_id: u64,
     open_trait: HashMap<u64, bool>,
+    /// `(spec_id, generic callee id, clause bindings)` waiting to be
+    /// walked. Minted by `callee_node_for_call` the way
+    /// `FunctionDesc.cachedgraph` stores the graph before the annotator
+    /// flows its body (`addpendingblock` / `complete_pending_blocks`).
+    pending: VecDeque<(u64, u64, Vec<Value>)>,
 }
 
 impl<'a> Builder<'a> {
@@ -296,6 +307,7 @@ impl<'a> Builder<'a> {
             },
             next_id,
             open_trait: HashMap::new(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -323,20 +335,29 @@ impl<'a> Builder<'a> {
         let Some(body) = self.llbc.fn_by_id(id).and_then(|fd| fd.unstructured()) else {
             return;
         };
-        self.walk_body(id, &body, &[], 0, true);
+        self.walk_body(id, &body, &[], true);
+    }
+
+    fn drain_pending(&mut self) {
+        while let Some((spec_id, callee, bindings)) = self.pending.pop_front() {
+            let Some(body) = self.llbc.fn_by_id(callee).and_then(|fd| fd.unstructured()) else {
+                continue;
+            };
+            self.walk_body(spec_id, &body, &bindings, false);
+        }
     }
 
     /// Node for a Regular call from a body walked under `caller_bindings`.
+    ///
+    /// Mints the specialized graph immediately and queues its body, matching
+    /// `FunctionDesc.cachedgraph`: a recursive request for the same key
+    /// returns that graph. Cycles are analysed later by `DependencyTracker`.
     fn callee_node_for_call(
         &mut self,
         caller_bindings: &[Value],
         callee: u64,
         generics: &Value,
-        depth: usize,
     ) -> u64 {
-        if depth >= MAX_INSTANTIATION_DEPTH {
-            return callee;
-        }
         let Some(key) = instantiation_memo_key(self.llbc, caller_bindings, callee, generics) else {
             return callee;
         };
@@ -350,14 +371,13 @@ impl<'a> Builder<'a> {
         let Some(bindings) = subst_call_trait_refs(self.llbc, caller_bindings, generics) else {
             return callee;
         };
-        let Some(body) = self.llbc.fn_by_id(callee).and_then(|fd| fd.unstructured()) else {
+        if self
+            .llbc
+            .fn_by_id(callee)
+            .and_then(|fd| fd.unstructured())
+            .is_none()
+        {
             self.graph.spec_memo.insert(key, callee);
-            return callee;
-        };
-        // Identity while this instantiation is in progress so a Regular
-        // forward that mutually recurses terminates (`node == callee`).
-        self.graph.spec_memo.insert(key.clone(), callee);
-        if !self.has_resolvable_trait_call(&body, &bindings, depth) {
             return callee;
         }
         let spec_id = self.next_id;
@@ -384,18 +404,11 @@ impl<'a> Builder<'a> {
         self.graph.names.insert(spec_id, spec_name);
         self.graph.keys.insert(spec_id, spec_key);
         self.graph.callees.entry(spec_id).or_default();
-        self.walk_body(spec_id, &body, &bindings, depth + 1, false);
+        self.pending.push_back((spec_id, callee, bindings));
         spec_id
     }
 
-    fn walk_body(
-        &mut self,
-        id: u64,
-        body: &Unstructured,
-        bindings: &[Value],
-        depth: usize,
-        note_opaque: bool,
-    ) {
+    fn walk_body(&mut self, id: u64, body: &Unstructured, bindings: &[Value], note_opaque: bool) {
         let forward = crate::front::mir::forward_reachable_mask(self.llbc, body);
         let mut incomplete = false;
         let mut unresolved = false;
@@ -412,8 +425,7 @@ impl<'a> Builder<'a> {
             match &call.func {
                 CallFunc::Regular(reg) => match &reg.kind {
                     CallKind::Fun(FunId::Regular { id: callee }) => {
-                        let node =
-                            self.callee_node_for_call(bindings, *callee, &reg.generics, depth);
+                        let node = self.callee_node_for_call(bindings, *callee, &reg.generics);
                         self.graph.callees.entry(id).or_default().insert(node);
                     }
                     CallKind::Fun(FunId::Other(v)) => {
@@ -443,8 +455,7 @@ impl<'a> Builder<'a> {
                         } else {
                             match resolve_trait_call(self.llbc, v, bindings) {
                                 TraitCallRes::Method { fn_id, generics } => {
-                                    let node =
-                                        self.callee_node_for_call(&[], fn_id, &generics, depth);
+                                    let node = self.callee_node_for_call(&[], fn_id, &generics);
                                     self.graph.callees.entry(id).or_default().insert(node);
                                 }
                                 TraitCallRes::Empty => {}
@@ -492,12 +503,8 @@ impl<'a> Builder<'a> {
                             "trait_refs": [],
                         });
                         for member_id in members {
-                            let node = self.callee_node_for_call(
-                                bindings,
-                                member_id,
-                                &empty_generics,
-                                depth,
-                            );
+                            let node =
+                                self.callee_node_for_call(bindings, member_id, &empty_generics);
                             self.graph.callees.entry(id).or_default().insert(node);
                         }
                     } else {
@@ -568,57 +575,6 @@ impl<'a> Builder<'a> {
             }
         }
         self.graph
-    }
-
-    /// True when a clause-bound Trait terminator resolves to a method body,
-    /// or a Regular `Fun` that still carries a `Clause` / `ParentClause`
-    /// substitutes to a `TraitImpl` whose callee itself specializes.
-    fn has_resolvable_trait_call(
-        &mut self,
-        body: &Unstructured,
-        bindings: &[Value],
-        depth: usize,
-    ) -> bool {
-        let forward = crate::front::mir::forward_reachable_mask(self.llbc, body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !call_graph_walks_block(bb, forward[bb_idx]) {
-                continue;
-            }
-            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
-                continue;
-            };
-            let CallFunc::Regular(reg) = &call.func else {
-                continue;
-            };
-            match &reg.kind {
-                CallKind::Trait(v) => {
-                    if !payload_is_clause_or_parent(self.llbc, v) {
-                        continue;
-                    }
-                    if matches!(
-                        resolve_trait_call(self.llbc, v, bindings),
-                        TraitCallRes::Method { .. }
-                    ) {
-                        return true;
-                    }
-                }
-                CallKind::Fun(FunId::Regular { id: callee }) => {
-                    if !generics_has_clause_or_parent(self.llbc, &reg.generics) {
-                        continue;
-                    }
-                    if instantiation_memo_key(self.llbc, bindings, *callee, &reg.generics).is_none()
-                    {
-                        continue;
-                    }
-                    let node = self.callee_node_for_call(bindings, *callee, &reg.generics, depth);
-                    if node != *callee {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
     }
 }
 
@@ -696,7 +652,7 @@ fn unwrap_ref_binders_at<'a>(
     depth: usize,
     binders: u64,
 ) -> Option<(&'a Value, u64)> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return None;
     }
     let obj = v.as_object()?;

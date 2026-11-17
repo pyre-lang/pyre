@@ -194,14 +194,17 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     err
 }
 
-/// `SSLError.__str__`: a non-empty `strerror` is the message, otherwise
-/// `str(self.args)`. `os_error_fill_slots` stores that text on the OSError
-/// `w_strerror` slot. Keep the policy on this class rather than the
-/// process-wide exception formatter.
+/// `SSLError.__str__`: if the `strerror` slot is set and an instance of `str`
+/// (subclasses and the empty string included), return that value; otherwise
+/// `str()` of the `args` slot. Slots are read directly, with no attribute
+/// lookup and no truth test.
 fn ssl_error_str(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let mut exc = args[0];
+    // [3.15-spec] strerror/args slots read directly, str check without truth test (measured python3.15); SSLError.__str__ uses getattr and truth.
     let w_strerror = unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(exc) };
-    if !w_strerror.is_null() && unsafe { is_str(w_strerror) && w_str_len(w_strerror) > 0 } {
+    if !w_strerror.is_null()
+        && unsafe { pyre_interpreter::baseobjspace::isinstance_str_w(w_strerror) }
+    {
         return Ok(w_strerror);
     }
     let mut w_args = pyre_object::with_roots!(exc => unsafe {
@@ -1465,10 +1468,31 @@ mod context_methods {
             owner: Option<PyObjectRef>,
             session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let server_side = server_side
-                .map(pyre_interpreter::baseobjspace::is_true)
-                .transpose()?
-                .unwrap_or(false);
+            let mut owner = owner.unwrap_or(pyre_object::PY_NULL);
+            let mut session = session.unwrap_or(pyre_object::PY_NULL);
+            let mut server_hostname = server_hostname.unwrap_or(pyre_object::PY_NULL);
+            // `is_true` may run a user `__bool__` and collect.
+            let server_side = pyre_object::with_roots!(
+                incoming,
+                outgoing,
+                owner,
+                session,
+                server_hostname => server_side
+                    .map(pyre_interpreter::baseobjspace::is_true)
+                    .transpose()?
+                    .unwrap_or(false)
+            );
+            let owner = if owner.is_null() { None } else { Some(owner) };
+            let session = if session.is_null() {
+                None
+            } else {
+                Some(session)
+            };
+            let server_hostname = if server_hostname.is_null() {
+                None
+            } else {
+                Some(server_hostname)
+            };
             let mut owner = owner.unwrap_or_else(w_none);
             let hostname = server_hostname;
             if W_MemoryBIO::from_obj(incoming).is_none()
@@ -1525,16 +1549,36 @@ mod context_methods {
 
         fn _wrap_socket(
             &self,
-            sock: PyObjectRef,
+            mut sock: PyObjectRef,
             server_side: Option<PyObjectRef>,
             server_hostname: Option<PyObjectRef>,
             owner: Option<PyObjectRef>,
             session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let server_side = server_side
-                .map(pyre_interpreter::baseobjspace::is_true)
-                .transpose()?
-                .unwrap_or(false);
+            let mut owner = owner.unwrap_or(pyre_object::PY_NULL);
+            let mut session = session.unwrap_or(pyre_object::PY_NULL);
+            let mut server_hostname = server_hostname.unwrap_or(pyre_object::PY_NULL);
+            // `is_true` may run a user `__bool__` and collect.
+            let server_side = pyre_object::with_roots!(
+                sock,
+                owner,
+                session,
+                server_hostname => server_side
+                    .map(pyre_interpreter::baseobjspace::is_true)
+                    .transpose()?
+                    .unwrap_or(false)
+            );
+            let owner = if owner.is_null() { None } else { Some(owner) };
+            let session = if session.is_null() {
+                None
+            } else {
+                Some(session)
+            };
+            let server_hostname = if server_hostname.is_null() {
+                None
+            } else {
+                Some(server_hostname)
+            };
             let mut owner = owner.unwrap_or_else(w_none);
             let mut socket = sock;
             let hostname = server_hostname;
