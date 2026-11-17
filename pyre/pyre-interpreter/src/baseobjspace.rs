@@ -17126,9 +17126,9 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
     }
     let offsets =
         unsafe { pyre_object::interp_exceptions::exception_unmanaged_gc_ptr_offsets(exc) };
-    let mut buf = [pyre_object::PY_NULL; 35];
+    let mut buf = [pyre_object::PY_NULL; 36];
     const _: () = assert!(
-        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.len() <= 35
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.len() <= 36
     );
     debug_assert!(offsets.len() <= buf.len());
     for (index, &offset) in offsets.iter().enumerate() {

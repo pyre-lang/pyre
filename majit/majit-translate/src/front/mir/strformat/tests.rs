@@ -2258,6 +2258,390 @@ fn result_opaque_err_eq_ok_lit_lowers_to_disc_switch_and_string_binop() {
     assert_result_str_cmp_shape(&graph, "eq");
 }
 
+/// `let mut r = Ok(..); *(&mut r) = Err(e); r != lhs`.
+///
+/// `lhs` is a runtime `Result` so a false-positive const Ok on `r`
+/// would set `skip_err` and compare `lhs` as an Ok payload. Opaque `E`
+/// then either declines or emits the full switch; never the const-Ok
+/// diamond.
+fn result_opaque_err_mut_store_fixture(leaf: &str) -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let str_ty = serde_json::json!({
+        "Adt": {"builtin": "Str", "generics": generics}
+    });
+    let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+    let err_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let result_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [str_ref.clone(), err_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty, "Shared"]});
+    let result_mut = serde_json::json!({"Ref": ["Erased", result_ty, "Mut"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let deref_r = serde_json::json!({
+        "kind": {"Projection": [place(4, &result_mut), "Deref"]},
+        "ty": result_ty
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "result", "Result"]),
+                    "kind": {"Enum": [
+                        {
+                            "name": "Ok",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                        },
+                        {
+                            "name": "Err",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                        }
+                    ]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "ErrPayload"]),
+                    "kind": "Opaque"
+                }
+            ],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_result_str"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), err_ty.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 2, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 2, "name": "e", "span": span, "ty": err_ty.clone()},
+                            {"index": 3, "name": "r", "span": span, "ty": result_ty.clone()},
+                            {"index": 4, "name": "r_mut", "span": span, "ty": result_mut.clone()},
+                            {"index": 5, "name": "r_ref", "span": span, "ty": result_ref.clone()},
+                            {"index": 6, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(3, &result_ty),
+                                        {"Aggregate": [
+                                            {"Adt": [0, 0, null]},
+                                            [{"Const": [{"Str": "hello"}, str_ref.clone()]}]
+                                        ]}
+                                    ]}
+                                },
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(4, &result_mut),
+                                        {"Ref": {
+                                            "place": place(3, &result_ty),
+                                            "kind": "Mut",
+                                            "ptr_metadata": null
+                                        }}
+                                    ]}
+                                },
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        deref_r,
+                                        {"Aggregate": [
+                                            {"Adt": [0, 1, null]},
+                                            [{"Move": place(2, &err_ty)}]
+                                        ]}
+                                    ]}
+                                },
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(5, &result_ref),
+                                        {"Ref": {
+                                            "place": place(3, &result_ty),
+                                            "kind": "Shared",
+                                            "ptr_metadata": null
+                                        }}
+                                    ]}
+                                }
+                            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(5, &result_ref)},
+                                        {"Read": place(1, &result_ref)}
+                                    ]}, "dest": place(6, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(6, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "result", "Result", leaf]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone(), result_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("result opaque-err mut-store fixture parses")
+}
+
+/// Operand is a `Mut` borrow of a fresh Ok aggregate (`&mut r` hop).
+fn result_opaque_err_mut_alias_hop_fixture(leaf: &str) -> Llbc {
+    let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let str_ty = serde_json::json!({
+        "Adt": {"builtin": "Str", "generics": generics}
+    });
+    let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+    let err_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let result_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [str_ref.clone(), err_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty, "Shared"]});
+    let result_mut = serde_json::json!({"Ref": ["Erased", result_ty, "Mut"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let place = |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "result", "Result"]),
+                    "kind": {"Enum": [
+                        {
+                            "name": "Ok",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                        },
+                        {
+                            "name": "Err",
+                            "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}}],
+                            "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                        }
+                    ]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["fixture", "ErrPayload"]),
+                    "kind": "Opaque"
+                }
+            ],
+            "fun_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "cmp_result_str"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_ref.clone()],
+                        "output": bool_ty.clone()
+                    },
+                    "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                            {"index": 1, "name": "lhs", "span": span, "ty": result_ref.clone()},
+                            {"index": 2, "name": "r", "span": span, "ty": result_ty.clone()},
+                            {"index": 3, "name": "r_mut", "span": span, "ty": result_mut.clone()},
+                            {"index": 4, "name": null, "span": span, "ty": bool_ty.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(2, &result_ty),
+                                        {"Aggregate": [
+                                            {"Adt": [0, 0, null]},
+                                            [{"Const": [{"Str": "hello"}, str_ref.clone()]}]
+                                        ]}
+                                    ]}
+                                },
+                                {
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(3, &result_mut),
+                                        {"Ref": {
+                                            "place": place(2, &result_ty),
+                                            "kind": "Mut",
+                                            "ptr_metadata": null
+                                        }}
+                                    ]}
+                                }
+                            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                    "args": [
+                                        {"Read": place(3, &result_mut)},
+                                        {"Read": place(1, &result_ref)}
+                                    ]}, "dest": place(4, &bool_ty),
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &bool_ty),
+                                    {"Use": [{"Read": place(4, &bool_ty)}, "Yes"]}
+                                ]}
+                            }], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": meta(&["core", "result", "Result", leaf]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [result_mut.clone(), result_ref.clone()],
+                        "output": bool_ty
+                    },
+                    "body": "Opaque"
+                }
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("result opaque-err mut-alias-hop fixture parses")
+}
+
+fn assert_result_ne_declines_or_full_switch(graph: &crate::model::FunctionGraph, leaf: &str) {
+    use crate::model::{CallTarget, OpKind};
+
+    let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+    let residual = ops()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => super::fmt_path_ends_with_owner_method(
+                segments,
+                &["result", "Result"],
+                &["core", "cmp", "PartialEq"],
+                leaf,
+            ),
+            _ => false,
+        })
+        .count();
+    let disc_reads = ops()
+        .filter(|op| {
+            matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+        })
+        .count();
+    let const_int_zero = ops().any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+    let string_binop = ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == leaf));
+    assert!(
+        !(residual == 0 && disc_reads == 1 && const_int_zero && string_binop),
+        "mutably-borrowed Result must not take the const-Ok skip_err path"
+    );
+    assert!(
+        residual == 1 || disc_reads >= 2,
+        "must decline (residual Result::{leaf}) or emit the full discriminant switch"
+    );
+}
+
+/// `let mut r = Ok(..); *(&mut r) = Err(e); r != runtime`.
+/// The unique Ok assign does not make `r` a compile-time Ok.
+#[test]
+fn result_mut_borrow_store_does_not_take_const_ok_path() {
+    let llbc = result_opaque_err_mut_store_fixture("ne");
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower mut-store Result::ne");
+    assert_result_ne_declines_or_full_switch(&graph, "ne");
+}
+
+/// A `&mut` alias hop of an Ok aggregate is not a const discriminant.
+#[test]
+fn result_mut_ref_alias_hop_declines_const_ok() {
+    let llbc = result_opaque_err_mut_alias_hop_fixture("ne");
+    let graph = crate::test_support::lower_function(&llbc, "cmp_result_str")
+        .expect("lower mut-alias-hop Result::ne");
+    assert_result_ne_declines_or_full_switch(&graph, "ne");
+}
+
 fn result_err_kind_fixture(
     err_kind: serde_json::Value,
     trait_decls: serde_json::Value,

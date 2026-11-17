@@ -6241,7 +6241,7 @@ fn note_raw_word_owner(
     // Closure envs that only capture Copy words are raw storage, but they
     // are not C structs. `raw_struct_ptr_annotation` must not mint SomePtr
     // for them (`tyref_input_class_root`; RPython forbids closures).
-    if majit_charon_reader::ullbc::is_closure_leaf(&leaf) {
+    if type_decl_is_closure_env(td) {
         return;
     }
     // A transparent scalar is the inner word, not a C struct.

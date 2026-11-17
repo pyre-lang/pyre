@@ -148,3 +148,134 @@ fn noncapturing_closure_passed_to_and_then_is_not_void_none() {
         "the closure operand must keep its callable, not Constant(None, Void)"
     );
 }
+
+/// Outer env whose `__pos_0` is another closure; the driver calls that
+/// captured value. rustc emits `CallKind::Fun` of the inner `{closure}
+/// as Fn::call` impl — a unique known function, so the call is a
+/// `FunctionPath` of that body with the captured env as arg[0]
+/// (`description.py` `FunctionDesc`, `rpbc.py` `FunctionReprBase.call`).
+fn nested_closure_calls_captured() -> Llbc {
+    let span = json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: Vec<Value>| {
+        json!({
+            "name": path,
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let ident = |name: &str| json!({"Ident": [name, 0]});
+    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let adt = |id| json!({"Adt": {"id": id, "generics": generics}});
+    let word = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = json!({"Adt": {
+        "id": 0, "builtin": "Tuple",
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let inner_ty = adt(0);
+    let outer_ty = adt(1);
+    let field = |ty: &Value| json!({"name": null, "ty": ty, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}});
+    let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
+    let inner_impl = json!({"Impl": {"Ty": {
+        "params": {"regions": [], "types": [], "const_generics": [], "trait_clauses": [], "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []},
+        "skip_binder": {"Value": [0, {"Adt": {"id": 0, "generics": generics}}]},
+        "kind": "InherentImplBlock"
+    }}});
+    let captured = json!({
+        "kind": {"Projection": [place(1, &outer_ty), {"Field": [null, 0]}]},
+        "ty": inner_ty
+    });
+    let file = json!({"charon_version": "0.1.201", "has_errors": false,
+        "translated": {"crate_name": "fixture",
+            "type_decls": [
+                {"def_id": 0, "item_meta": meta(vec![ident("fixture"), ident("inner"), ident("closure")]),
+                 "kind": {"Struct": [field(&word)]},
+                 "src": {"Closure": {"info": {"kind": "Fn"}}}},
+                {"def_id": 1, "item_meta": meta(vec![ident("fixture"), ident("outer"), ident("closure")]),
+                 "kind": {"Struct": [field(&inner_ty)]},
+                 "src": {"Closure": {"info": {"kind": "Fn"}}}}
+            ],
+            "fun_decls": [
+                {"def_id": 0, "item_meta": meta(vec![ident("fixture"), ident("outer_calls_captured")]),
+                 "signature": {"is_unsafe": false, "inputs": [outer_ty], "output": unit},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 1, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": unit},
+                        {"index": 1, "name": "self", "span": span, "ty": outer_ty}
+                    ]},
+                    "body": [
+                        {"statements": [], "kind": "Regular",
+                         "terminator": {"span": span, "kind": {"Call": {
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                "args": [{"Move": captured}]},
+                            "dest": place(0, &unit),
+                            "target": 1, "on_unwind": 2
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                    ]
+                 }}},
+                {"def_id": 1, "item_meta": meta(vec![
+                    ident("fixture"), ident("inner"), ident("closure"), inner_impl, ident("call")
+                ]),
+                 "signature": {"is_unsafe": false, "inputs": [inner_ty], "output": unit},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 1, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": unit},
+                        {"index": 1, "name": "self", "span": span, "ty": inner_ty}
+                    ]},
+                    "body": [
+                        {"statements": [], "kind": "Regular",
+                         "terminator": {"span": span, "kind": "Return"}}
+                    ]
+                 }}}
+            ],
+            "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("nested-closure fixture parses")
+}
+
+#[test]
+fn captured_closure_call_is_direct_inner_body() {
+    let graph = lower_function(&nested_closure_calls_captured(), "outer_calls_captured")
+        .expect("outer_calls_captured lowers");
+    let mut method_call = Vec::new();
+    let mut direct_inner = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::Method { name, .. } if name == "call" => {
+                    method_call.push(format!("{target:?} args={args:?}"));
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("call") =>
+                {
+                    assert!(
+                        !args.is_empty(),
+                        "inner body must receive the captured env as arg[0]; args={args:?}"
+                    );
+                    direct_inner.push(segments.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        method_call.is_empty(),
+        "captured closure must not lower as getattr \"call\": {method_call:?}"
+    );
+    assert_eq!(
+        direct_inner.len(),
+        1,
+        "one direct call of the inner closure body; got {direct_inner:?}"
+    );
+    assert_eq!(
+        direct_inner[0].as_slice(),
+        ["inner", "closure", "call"],
+        "FunctionPath is spec_segments of the inner body, env first"
+    );
+}
