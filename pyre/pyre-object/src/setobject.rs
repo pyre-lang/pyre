@@ -353,6 +353,9 @@ pub trait SetStrategy {
 /// `W_BaseSetObject.strategy` is one instance pointer. A `&dyn SetStrategy`
 /// in the object would be a fat pointer, and the unit-struct singletons are
 /// zero-sized, so this `#[repr(C)]` holder is what `strategy` stores.
+///
+/// `imp`'s data word is the strategy instance: this holder for a prebuilt
+/// strategy, or `owner` for a per-dict one.
 #[repr(C)]
 pub struct SetStrategyRef {
     /// Compared by field, the way `DictStrategyRef.kind` is, so a guard reads
@@ -417,6 +420,31 @@ pub fn stamp_prebuilt_set_strategy_ref(holder: &'static SetStrategyRef, tid: u32
     }
 }
 
+/// The trait object a prebuilt holder stores: its data word is the holder
+/// itself, so the word the JIT reads as `imp`'s data is the prebuilt
+/// strategy instance (a GC object), as `space.fromcache(StrategyCls)` is.
+/// Every stateless strategy is zero-sized, so a reference to it is valid at
+/// the holder's address.
+///
+/// # Safety
+///
+/// `holder` must be the non-null, pointer-aligned address of a live immortal
+/// allocation (the prebuilt holder itself) that is never freed, since the
+/// returned reference is `'static`.
+pub unsafe fn prebuilt_set_strategy_imp<T: SetStrategy + 'static>(
+    _strategy: &'static T,
+    holder: usize,
+) -> &'static dyn SetStrategy {
+    assert_ne!(holder, 0);
+    assert_eq!(
+        std::mem::size_of::<T>(),
+        0,
+        "a prebuilt strategy is stateless"
+    );
+    assert_eq!(holder % std::mem::align_of::<usize>(), 0);
+    unsafe { &*(holder as *const T) }
+}
+
 /// Same-file `LOAD_GLOBAL` of the OnceLock plus `get_or_init`, matching
 /// [`crate::noneobject::w_none`]. The registered refs row is the GC object,
 /// not the lock. `get_or_init` lives in the accessor body so the translator
@@ -426,14 +454,19 @@ macro_rules! define_prebuilt_set_strategy_ref {
         static $cell: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
         /// Process-wide `space.fromcache(StrategyCls)` holder. Prebuilt GC
         /// object (`malloc_typed_immortal`), matching `w_not_implemented`.
+        /// The holder's `imp` data word is the holder itself.
         #[inline]
         pub fn $accessor() -> &'static crate::setobject::SetStrategyRef {
             let addr = *$cell.get_or_init(|| {
-                crate::lltype::malloc_typed_immortal(crate::setobject::SetStrategyRef {
+                let p = crate::lltype::malloc_typed_immortal(crate::setobject::SetStrategyRef {
                     kind: $kind,
                     imp: $imp,
                     owner: ::std::ptr::null_mut(),
-                }) as usize
+                });
+                unsafe {
+                    (*p).imp = crate::setobject::prebuilt_set_strategy_imp($imp, p as usize);
+                }
+                p as usize
             });
             unsafe { &*(addr as *const crate::setobject::SetStrategyRef) }
         }
@@ -6542,6 +6575,24 @@ mod tests {
             assert_eq!((*hdr).type_id(), T);
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+    }
+
+    #[test]
+    fn prebuilt_set_strategy_holders_point_imp_at_themselves() {
+        let holders = [
+            object_set_strategy_ref(),
+            empty_set_strategy_ref(),
+            integer_set_strategy_ref(),
+            bytes_set_strategy_ref(),
+            ascii_set_strategy_ref(),
+            identity_set_strategy_ref(),
+        ];
+        for holder in holders {
+            assert_eq!(
+                holder.imp as *const dyn SetStrategy as *const u8 as usize,
+                holder as *const _ as usize
+            );
         }
     }
 
