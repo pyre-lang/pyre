@@ -30,7 +30,7 @@ use crate::annotator::annrpython::RPythonAnnotator;
 use crate::codewriter::call::{CallControl, CallKind};
 use crate::codewriter::jtransform_opname::lower_graph;
 use crate::flowspace::model::{ConstValue, FunctionGraph, GraphKey, Hlvalue, host_env_callable};
-use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
+use crate::model::{CallTarget, OpKind, ValueType};
 use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
 use crate::rlib::rstring::effect_graph_from_search_helper;
@@ -43,6 +43,7 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_search_helper_graph_on, chars_array_ptr_lltype_from_strptr, direct_call_funcobjs,
     graph_ref_for_funcptr_id,
 };
+use crate::translator::rtyper::rlist::copy_item_word_sized_leaf;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 
 /// `LLHelpers.ll_find` (`rstr.py`).
@@ -853,15 +854,12 @@ fn array_item_of_ptr(ty: &LowLevelType) -> Option<&LowLevelType> {
 
 /// Kind leaf shared by `ll_copy_list_to_raw_array_{i,f,r}` and
 /// `ll_copy_raw_array_to_raw_array_{i,f,r}` (`list_to_raw.rs` `native_leaf`).
-/// `Signed` and `Unsigned` share `_i`.
+/// Matches only items whose storage size equals the leaf's baked
+/// `ITEM_SIZE_{I,F,R}` in `rvec.rs`; `getkind` is too wide (Char/Bool
+/// / narrow ints floor to Signed).
 fn copy_item_kind_leaf(args: &[LowLevelType]) -> Option<&'static str> {
     let item = args.first().and_then(array_item_of_ptr)?;
-    match crate::model::getkind(item) {
-        ConcreteType::Signed => Some("i"),
-        ConcreteType::Float => Some("f"),
-        ConcreteType::GcRef => Some("r"),
-        ConcreteType::Void | ConcreteType::Unknown => None,
-    }
+    copy_item_word_sized_leaf(item)
 }
 
 /// `HELPER_FNADDRS` row for a minted raw-copy residual. `None` when `name`
@@ -3125,6 +3123,24 @@ mod tests {
             Some(0x6161),
             "unspecialized dest name binds the Signed leaf"
         );
+
+        let narrow = crate::translator::rtyper::lltypesystem::rffi::number_from_forced_int(
+            "r_int32_copy_leaf",
+            true,
+            32,
+        );
+        for item in [LowLevelType::Char, LowLevelType::Bool, narrow] {
+            let err = mint_ll_copy_raw_array(&rtyper, item.clone()).expect_err("non-word item");
+            let text = err.to_string();
+            assert!(
+                text.contains(&item.short_name()),
+                "mint names the item type, got {text}"
+            );
+            assert!(
+                text.contains("no word-sized native leaf"),
+                "mint refuses a non-word item, got {text}"
+            );
+        }
     }
 
     fn call_op_named(name: &str) -> crate::model::SpaceOperation {
@@ -3228,6 +3244,34 @@ mod tests {
                 residual_native_fnaddr_row(&specialized, args),
                 Some(CallPath::from_segments(segs.iter().copied())),
                 "specialized {specialized}"
+            );
+        }
+
+        let raw_char = copy_raw_array_args(&LowLevelType::Char);
+        let raw_bool = copy_raw_array_args(&LowLevelType::Bool);
+        let narrow = crate::translator::rtyper::lltypesystem::rffi::number_from_forced_int(
+            "r_int32_copy_leaf_row",
+            true,
+            32,
+        );
+        let raw_narrow = copy_raw_array_args(&narrow);
+        let list_char = copy_list_to_raw_args(&LowLevelType::Char);
+        let list_bool = copy_list_to_raw_args(&LowLevelType::Bool);
+        let list_narrow = copy_list_to_raw_args(&narrow);
+        let none_cases: &[(&str, &[LowLevelType])] = &[
+            (LL_COPY_RAW_ARRAY_TO_RAW_ARRAY, &raw_char),
+            (LL_COPY_RAW_ARRAY_TO_RAW_ARRAY, &raw_bool),
+            (LL_COPY_RAW_ARRAY_TO_RAW_ARRAY, &raw_narrow),
+            ("ll_copy_list_to_raw_array_Char", &list_char),
+            ("ll_copy_list_to_raw_array_Bool", &list_bool),
+            ("ll_copy_list_to_raw_array_INT32", &list_narrow),
+        ];
+        for &(name, args) in none_cases {
+            let dest = CallPath::from_segments([name]);
+            assert_eq!(
+                residual_native_fnaddr_row(&dest, args),
+                None,
+                "non-word item {name} args={args:?} must not pick a word leaf"
             );
         }
     }

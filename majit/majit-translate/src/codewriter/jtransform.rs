@@ -18387,12 +18387,20 @@ fn fixed_repeat_identity(
 /// `Some(true)` is a `GcStruct` or `GcArray`. `Some(false)` fails the
 /// assert (raw `Array` / raw `Struct` / `FixedSizeArray`). `None` is
 /// `Ptr(Opaque)` / a non-pointer, the tolerant prepass residual path.
+///
+/// `ForwardReference.become` stores the real container, so
+/// `Ptr(ForwardReference)` classifies that container the same way as a
+/// direct `Ptr(container)`. The container arms catch a resolved
+/// Array/Struct (recursing with the container, not wrapping it in Ptr).
 fn list_call_gc_list_pointee(
     ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Option<bool> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
     match ty {
         LowLevelType::ForwardReference(fwd) => list_call_gc_list_pointee(&fwd.resolved()?),
+        LowLevelType::Struct(st) => Some(st._gckind == GcKind::Gc),
+        LowLevelType::Array(arr) => Some(arr._gckind == GcKind::Gc),
+        LowLevelType::FixedSizeArray(_) => Some(false),
         LowLevelType::Ptr(ptr) => match &ptr.TO {
             PtrTarget::Struct(st) => Some(st._gckind == GcKind::Gc),
             PtrTarget::Array(arr) => Some(arr._gckind == GcKind::Gc),
@@ -18410,6 +18418,7 @@ fn gc_array_ptr_from_lltype(
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
     match ty {
         LowLevelType::ForwardReference(fwd) => gc_array_ptr_from_lltype(&fwd.resolved()?),
+        LowLevelType::Array(arr) if arr._gckind == GcKind::Gc => Some(arr.as_ref().clone()),
         LowLevelType::Ptr(ptr) => match &ptr.TO {
             PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => Some(arr.clone()),
             PtrTarget::ForwardReference(fwd) => gc_array_ptr_from_lltype(&fwd.resolved()?),
@@ -46552,6 +46561,92 @@ mod tests {
         };
         let _ =
             transformer._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy");
+    }
+
+    /// `Ptr(ForwardReference)` whose target became a raw `Array` is the
+    /// same LIST as a direct `Ptr(Array)`: neither GcStruct nor GcArray.
+    #[test]
+    #[should_panic(expected = "LIST must be GcStruct or GcArray")]
+    fn list_ll_arraycopy_raw_ptr_forward_ref_array_is_rejected() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, ForwardReference, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let fwd = ForwardReference::new();
+        fwd.r#become(LowLevelType::Array(Box::new(Array::new(
+            LowLevelType::Signed,
+        ))))
+        .unwrap();
+        let array_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+        let args = vec![
+            variable_with_lltype("source", array_ty.clone()),
+            variable_with_lltype("dest", array_ty),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let _ =
+            transformer._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy");
+    }
+
+    /// `Ptr(ForwardReference)` whose target became a `GcArray` is a
+    /// fixed list: `list.len` lowers through `gc_array_ptr_from_lltype`.
+    #[test]
+    fn handle_list_call_forward_ref_gcarray_len_lowers_to_arraylen() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, ForwardReference, LowLevelType, Ptr, PtrTarget,
+        };
+        let mut graph = FunctionGraph::new("fwd_gcarray_len");
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Array(Box::new(Array::gc(
+            LowLevelType::Signed,
+        ))))
+        .unwrap();
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        l.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }))));
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let Some(RewriteResult::Replace(ops)) = transformer._handle_list_call(
+            "list.len",
+            &op,
+            std::slice::from_ref(&l),
+            &mut graph,
+            "fwd_gcarray_len",
+        ) else {
+            panic!("list.len on Ptr(ForwardReference → GcArray) must lower");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::ArrayLen { base, gckind, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(*gckind, crate::model::ArrayGcKind::Gc);
+                assert_eq!(ops[0].result.as_ref(), Some(&result));
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
     }
 
     /// `_handle_raw_resizable_list_call` is reached only for a RustVec
