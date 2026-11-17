@@ -6139,23 +6139,6 @@ pub trait SizeDescr: Descr {
         false
     }
 
-    /// Whether `NEW` for this descr must allocate as a young non-moving
-    /// rawmalloc (`incminimark.py` `external_malloc(..., alloc_young=True)`),
-    /// skipping the movable nursery.
-    ///
-    /// Distinct from [`SizeDescr::non_moving`]: that flag is the old
-    /// generation (`malloc_big_fixedsize_oldgen_fn`). This flag declines
-    /// the nursery and takes `malloc_big_fixedsize_fn`, whose helper is
-    /// `do_malloc_fixedsize_clear`'s large arm. Use it when the host
-    /// allocator for the type is `try_gc_alloc_young_nonmoving_raw` and a
-    /// residual caller holds a raw pointer across collections without a
-    /// shadowstack rewrite (`pyframe.py PyFrame.__init__` is
-    /// `_always_inline_` and returns the malloc'd `W_Root`; pyre's
-    /// `FrameBox::new` is that malloc).
-    fn young_nonmoving(&self) -> bool {
-        false
-    }
-
     /// Vtable address, if is_object().
     fn vtable(&self) -> usize {
         0
@@ -7689,9 +7672,6 @@ pub struct SimpleSizeDescr {
     /// (`id_of_type`). Set once that id is this descr's tid so
     /// `register_unresolved_struct_tids` does not assign a new one.
     collector_tid_fixed: AtomicBool,
-    /// Young-rawmalloc bit for `NEW` rewriting; see
-    /// [`SizeDescr::young_nonmoving`].
-    young_nonmoving: AtomicBool,
     /// descr.py `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py `self.gc_fielddescrs = gc_fielddescrs`.
@@ -7725,7 +7705,6 @@ impl Clone for SimpleSizeDescr {
             headerless: self.headerless,
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
             collector_tid_fixed: AtomicBool::new(self.collector_tid_fixed.load(Ordering::Relaxed)),
-            young_nonmoving: AtomicBool::new(self.young_nonmoving.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
             assigned_all_fielddescrs: {
@@ -7768,7 +7747,6 @@ impl SimpleSizeDescr {
             headerless: false,
             non_moving: AtomicBool::new(false),
             collector_tid_fixed: AtomicBool::new(false),
-            young_nonmoving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7791,7 +7769,6 @@ impl SimpleSizeDescr {
             headerless: false,
             non_moving: AtomicBool::new(false),
             collector_tid_fixed: AtomicBool::new(false),
-            young_nonmoving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
@@ -7847,14 +7824,6 @@ impl SimpleSizeDescr {
     /// it after the descr is already behind an `Arc` and registered.
     pub fn set_non_moving(&self, non_moving: bool) {
         self.non_moving.store(non_moving, Ordering::Relaxed);
-    }
-
-    /// Override the young-rawmalloc flag (default `false`); see
-    /// [`SizeDescr::young_nonmoving`].  Takes `&self` so a frontend can stamp
-    /// it after the descr is already behind an `Arc` and registered.
-    pub fn set_young_nonmoving(&self, young_nonmoving: bool) {
-        self.young_nonmoving
-            .store(young_nonmoving, Ordering::Relaxed);
     }
 
     /// descr.py — `get_size_descr` calls
@@ -7987,9 +7956,6 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn non_moving(&self) -> bool {
         self.non_moving.load(Ordering::Relaxed)
-    }
-    fn young_nonmoving(&self) -> bool {
-        self.young_nonmoving.load(Ordering::Relaxed)
     }
     fn vtable(&self) -> usize {
         self.vtable
