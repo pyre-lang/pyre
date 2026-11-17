@@ -1031,7 +1031,7 @@ fn ga_get_typing_unpacked_tuple_args(args: &[PyObjectRef]) -> crate::PyResult {
 /// `builtins::builtin_dir` for a GenericAlias receiver.
 pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(ga) };
-    let dir_origin = crate::builtins::builtin_dir(&[origin])?;
+    let mut dir_origin = crate::builtins::builtin_dir(&[origin])?;
     let mut names: Vec<Wtf8Buf> = ATTR_EXCEPTIONS
         .iter()
         .map(|s| {
@@ -1042,7 +1042,8 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
         .collect();
     let n = unsafe { w_list_len(dir_origin) };
     for i in 0..n {
-        if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) }
+        if let Some(item) =
+            pyre_object::with_roots!(dir_origin => unsafe { w_list_getitem(dir_origin, i as i64) })
             && unsafe { is_str(item) }
         {
             // `dir(origin)` can name a lone surrogate. Keep the WTF-8 bytes;

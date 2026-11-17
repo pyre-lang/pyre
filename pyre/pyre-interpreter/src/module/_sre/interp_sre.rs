@@ -2302,8 +2302,16 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
     }
     let n = unsafe { pyre_object::w_list_len(w_result) };
     let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_result);
     for i in 0..n {
-        let Some(elem) = (unsafe { pyre_object::w_list_getitem(w_result, i as i64) }) else {
+        let Some(elem) = (unsafe {
+            pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                i as i64,
+            )
+        }) else {
             continue;
         };
         if unsafe { is_int(elem) } {

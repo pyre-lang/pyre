@@ -3696,7 +3696,7 @@ pub(crate) fn socket_recv_raw(
 /// cannot hold the release across the whole exchange.
 #[cfg(any(unix, windows))]
 pub(crate) fn socket_send_bytes(
-    obj: pyre_object::PyObjectRef,
+    mut obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     buf: &[u8],
     flags: libc::c_int,
@@ -3705,14 +3705,14 @@ pub(crate) fn socket_send_bytes(
         let outcome = {
             #[cfg(unix)]
             {
-                match majit_rlib::rsocket::send(fd, buf, flags) {
+                match pyre_object::with_roots!(obj => majit_rlib::rsocket::send(fd, buf, flags)) {
                     Ok(sent) => Ok(sent),
                     Err(error) => Err(error.errno),
                 }
             }
             #[cfg(windows)]
             {
-                socket_call(|| socket_send_raw(fd, buf, flags)).0
+                pyre_object::with_roots!(obj => socket_call(|| socket_send_raw(fd, buf, flags)).0)
             }
         };
         match outcome {
@@ -3731,7 +3731,7 @@ pub(crate) fn socket_send_bytes(
 /// buffer rather than a fresh `bytes`.
 #[cfg(any(unix, windows))]
 pub(crate) fn socket_recv_bytes(
-    obj: pyre_object::PyObjectRef,
+    mut obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     buf: &mut [u8],
     flags: libc::c_int,
@@ -3740,14 +3740,14 @@ pub(crate) fn socket_recv_bytes(
         let outcome = {
             #[cfg(unix)]
             {
-                match majit_rlib::rsocket::recv(fd, buf, flags) {
+                match pyre_object::with_roots!(obj => majit_rlib::rsocket::recv(fd, buf, flags)) {
                     Ok(read) => Ok(read),
                     Err(error) => Err(error.errno),
                 }
             }
             #[cfg(windows)]
             {
-                socket_call(|| socket_recv_raw(fd, buf, flags)).0
+                pyre_object::with_roots!(obj => socket_call(|| socket_recv_raw(fd, buf, flags)).0)
             }
         };
         match outcome {
@@ -4829,12 +4829,14 @@ fn storage_from_rsocket(bytes: &[u8], slen: i32) -> (rffi::sockaddr_storage, rff
 /// `accept`, retrying `EINTR`. `FD_CLOEXEC` is set on the new descriptor.
 #[cfg(unix)]
 fn accept_socket(
-    obj: pyre_object::PyObjectRef,
+    mut obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     family: libc::c_int,
 ) -> Result<(rffi::Socket, rffi::sockaddr_storage, rffi::SockLen), pyre_interpreter::PyError> {
     loop {
-        match majit_rlib::rsocket::accept(fd, family as majit_rlib::rffi::SIGNED) {
+        match pyre_object::with_roots!(obj => {
+            majit_rlib::rsocket::accept(fd, family as majit_rlib::rffi::SIGNED)
+        }) {
             Ok((cfd, bytes, addrlen)) => {
                 let (storage, slen) = storage_from_rsocket(&bytes, addrlen);
                 return Ok((cfd, storage, slen));
@@ -4867,13 +4869,13 @@ fn connect_sockaddr(
 /// `recvfrom`, retrying `EINTR`. The address is a `sockaddr_storage`.
 #[cfg(unix)]
 fn recvfrom_socket(
-    obj: pyre_object::PyObjectRef,
+    mut obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     buf: &mut [u8],
     flags: libc::c_int,
 ) -> Result<(usize, rffi::sockaddr_storage, rffi::SockLen), pyre_interpreter::PyError> {
     loop {
-        match majit_rlib::rsocket::recvfrom(fd, buf, flags) {
+        match pyre_object::with_roots!(obj => majit_rlib::rsocket::recvfrom(fd, buf, flags)) {
             Ok((read, bytes, addrlen)) => {
                 let (storage, slen) = storage_from_rsocket(&bytes, addrlen);
                 return Ok((read, storage, slen));
@@ -6769,10 +6771,11 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                         msg.msg_controllen = ancbufsize as _;
                     }
-                    let (r, errno) =
+                    let (r, errno) = pyre_object::with_roots!(obj => {
                         pyre_interpreter::module::thread::call_external_function(|| {
                             libc::recvmsg(fd, &mut msg, flags)
-                        });
+                        })
+                    });
                     if r >= 0 {
                         break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
                     }

@@ -20,8 +20,9 @@ use std::os::unix::ffi::OsStringExt;
 /// pyre-object's `Buffer`, because the subclass fallback needs `isinstance_w`.
 unsafe fn memoryview_backing_buffer(backing: PyObjectRef) -> pyre_object::buffer::Buffer {
     use pyre_object::buffer::Buffer;
+    let mut backing = backing;
     unsafe {
-        crate::typedef::ensure_array_typeobjects();
+        pyre_object::with_roots!(backing => crate::typedef::ensure_array_typeobjects());
         if pyre_object::interp_array::is_array(backing) {
             Buffer::Array { w_obj: backing }
         } else if pyre_object::bytearrayobject::is_bytearray(backing) {
@@ -302,19 +303,22 @@ unsafe fn w_memoryview_new_plain(
 ) -> PyObjectRef {
     use pyre_object::bufferview::BufferView;
     unsafe {
-        crate::typedef::ensure_array_typeobjects();
-        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-        let is_array = pyre_object::interp_array::is_array(w_obj)
-            || crate::baseobjspace::isinstance_w(w_obj, array_ty);
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
+        crate::typedef::ensure_array_typeobjects();
+        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let is_array = pyre_object::interp_array::is_array(r_obj)
+            || crate::baseobjspace::isinstance_w(r_obj, array_ty);
         // A Raw view keeps its explicit format object; a Simple view derives 'B'.
         if is_array {
             let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(fmt));
         }
         // Root view over an exporter: it owns the backing's buffer export.
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(mv);
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         // `buffer_w`: record the export on a bytearray backing so a
         // size-changing mutation is refused while this view is live.
@@ -324,6 +328,7 @@ unsafe fn w_memoryview_new_plain(
             pyre_object::interp_array::w_array_exports_incref(r_obj);
         }
         let backing = memoryview_backing_buffer(r_obj);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         let view = if is_array {
             let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             BufferView::Raw {
@@ -341,6 +346,7 @@ unsafe fn w_memoryview_new_plain(
             }
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         memoryview_register_finalizer(mv);
         mv
@@ -360,17 +366,20 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::pin_roots(&[w_backing, w_obj]);
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(mv);
         let r_backing = pyre_object::gc_roots::shadow_stack_get(sp);
-        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         pyre_object::bytearrayobject::w_bytearray_exports_incref(r_backing);
         let length = pyre_object::bytearrayobject::w_bytearray_len(r_backing) as i64;
         let backing = memoryview_backing_buffer(r_backing);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         let view = BufferView::Simple {
             backing,
             w_obj: r_obj,
             length,
         };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         memoryview_register_finalizer(mv);
         mv
@@ -480,8 +489,9 @@ unsafe fn memoryview_gather_fortran_bytes(mv: PyObjectRef) -> Vec<u8> {
 /// for a bytes / bytearray / array exporter (or a subclass of one), or
 /// `None` when `obj` provides no buffer.
 unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, bool, usize)> {
+    let mut obj = obj;
     unsafe {
-        crate::typedef::ensure_array_typeobjects();
+        pyre_object::with_roots!(obj => crate::typedef::ensure_array_typeobjects());
         let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
         if pyre_object::interp_array::is_array(obj)
             || crate::baseobjspace::isinstance_w(obj, array_ty)
@@ -527,8 +537,9 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
 /// inheritance: `class C(bytearray, A)` stays native, while
 /// `class C(A, bytearray)` reaches `A.__buffer__`.
 unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
+    let mut descr = descr;
     unsafe {
-        crate::typedef::ensure_array_typeobjects();
+        pyre_object::with_roots!(descr => crate::typedef::ensure_array_typeobjects());
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
@@ -549,8 +560,9 @@ unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
 /// type uses a native buffer slot (or has no Python-visible descriptor).
 unsafe fn memoryview_python_buffer_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        let descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
-        (!memoryview_is_native_buffer_descr(descr)).then_some(descr)
+        let mut descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
+        (!pyre_object::with_roots!(descr => memoryview_is_native_buffer_descr(descr)))
+            .then_some(descr)
     }
 }
 
@@ -2184,8 +2196,9 @@ unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool 
 
 /// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
 unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
+    let mut descr = descr;
     unsafe {
-        crate::typedef::ensure_array_typeobjects();
+        pyre_object::with_roots!(descr => crate::typedef::ensure_array_typeobjects());
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
@@ -2204,8 +2217,9 @@ unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
 /// Python `slot_bf_releasebuffer` selected by the concrete type's MRO.
 unsafe fn memoryview_python_release_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        let descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
-        (!memoryview_is_native_release_descr(descr)).then_some(descr)
+        let mut descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
+        (!pyre_object::with_roots!(descr => memoryview_is_native_release_descr(descr)))
+            .then_some(descr)
     }
 }
 
@@ -2270,11 +2284,14 @@ unsafe fn w_memoryview_new_restricted_snapshot(source: PyObjectRef) -> PyObjectR
 /// when user code retained it.
 unsafe fn memoryview_release_native_python_slot(exporter: PyObjectRef, source: PyObjectRef) {
     unsafe {
-        let Some(descr) = memoryview_python_release_descr(exporter) else {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::pin_roots(&[exporter, source]);
+        let Some(descr) =
+            memoryview_python_release_descr(pyre_object::gc_roots::shadow_stack_get(sp))
+        else {
             return;
         };
-        let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::pin_roots(&[exporter, source, descr]);
+        let _ = pyre_object::gc_roots::pin_root(descr);
         let restricted =
             w_memoryview_new_restricted_snapshot(pyre_object::gc_roots::shadow_stack_get(sp + 1));
         let _ = pyre_object::gc_roots::pin_root(restricted);
@@ -22868,12 +22885,21 @@ fn _hash_frozenset(items: &[i64]) -> i64 {
 /// never again for `hash(frozenset)`.
 fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
     unsafe {
-        if let Some(hash) = pyre_object::w_frozenset_cached_hash(obj) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        if let Some(hash) =
+            pyre_object::w_frozenset_cached_hash(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        {
             return hash;
         }
-        let hashes = pyre_object::w_set_stored_hashes(obj);
+        let hashes =
+            pyre_object::w_set_stored_hashes(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let hash = _hash_frozenset(&hashes);
-        pyre_object::w_frozenset_set_cached_hash(obj, hash);
+        pyre_object::w_frozenset_set_cached_hash(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            hash,
+        );
         hash
     }
 }
@@ -26222,7 +26248,9 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         {
             #[cfg(unix)]
             {
-                majit_rlib::rposix::lseek(fd, 0, libc::SEEK_CUR).is_ok()
+                pyre_object::with_roots!(self_obj => {
+                    majit_rlib::rposix::lseek(fd, 0, libc::SEEK_CUR).is_ok()
+                })
             }
             #[cfg(not(unix))]
             {
