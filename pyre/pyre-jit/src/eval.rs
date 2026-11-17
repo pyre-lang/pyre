@@ -5753,9 +5753,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
-    // for synthetic struct tids during translation. pyre stamps them from
-    // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
-    // once this collector is installed. They are not registered in this
+    // for synthetic struct tids during translation. pyre installs the mint
+    // callbacks when this collector is stored; kind-0 leftovers drain in
+    // `materialize_gccache_owned_descrs`. They are not registered in this
     // function: it runs before `gc_sync` publishes the collector.
 
     // `interp_deque.py Lock` is a fieldless internal GC identity token, not a
@@ -6595,6 +6595,10 @@ fn build_gc_global() {
         // eval-breaker poll.
         majit_ir::eval_breaker_word::publish_addr();
         majit_gc::gc_sync::store_singleton(gc);
+        // `gc.py` `GcLLDescr_framework.init_size_descr` / `init_array_descr`
+        // stamp at mint because `gc_ll_descr` already exists. Install the
+        // collector half before any later `get_size_descr` / `get_array_descr`.
+        pyre_jit_trace::jitcode_runtime::install_collector_tid_register();
     });
 }
 
@@ -6615,6 +6619,7 @@ fn build_gc_global() {
 /// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
+    pyre_jit_trace::jitcode_runtime::install_collector_tid_register();
     pyre_interpreter::call::register_thread_entry_hook(|| {
         init_jit_hooks();
         init_gc_root_walkers();
@@ -11415,8 +11420,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// The first call with a live collector stamps unresolved tids; later
-/// calls on the same collector skip the census (`LAST_GC`).
+/// Kind-0 decode stamps unresolved tids on the GIL thread after the
+/// helper returns; later calls share that `Once`.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -11475,11 +11480,10 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     // Kind-0 Size tids are published on the first trace by
     // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
-    // `bound_reached`. The first live collector stamps unresolved tids;
-    // later calls on that collector skip the census (`LAST_GC`). The
-    // type-registry close hook drains leftovers before `freeze_types`,
-    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` /
-    // `PYRE_NO_JIT` never reach those callers.
+    // `bound_reached`. The decode `Once` stamps unresolved tids on the
+    // GIL thread. The type-registry close hook drains EffectInfo leftovers
+    // before `freeze_types`, off the recursive `CALL_ASSEMBLER` stack.
+    // `PYRE_JIT=0` / `PYRE_NO_JIT` never reach those callers.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the

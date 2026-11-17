@@ -16847,7 +16847,7 @@ pub(crate) fn publish_pyre_class_vtables() {
 
 /// Second pass after the collector has stamped `TypeIdCell`s.
 ///
-/// One walk per collector (`LAST_GC` epoch), matching
+/// Runs after kind-0 decode stamps tids, matching
 /// `heaptracker.py` `setup_cache_gcstruct2vtable`.
 pub(crate) fn refresh_pyre_class_vtable_tids() {
     publish_pyre_class_vtables_inner();
@@ -16980,14 +16980,14 @@ fn minted_size_collector_tid(owner: &str, vtable: u64, fallback: u32) -> u32 {
 
 /// Stamp that id onto the cached SizeDescr and fix it there.
 ///
-/// Parent layouts publish before `register_synthetic_struct_tids`
-/// (`materialize_gccache_owned_descrs_with`: `publish_pyre_class_vtables`,
+/// Parent layouts publish before kind-0 decode stamps tids
+/// (`materialize_gccache_owned_descrs`: `publish_pyre_class_vtables`,
 /// then `decode_kind0_descrs` which publishes packed parents before
-/// parentless slots, then the census). The tid has to be on the descr
-/// before that census. A different nonzero collector tid already on the
-/// slot is a host group that won the STRUCT key (`descr.py` one
-/// SizeDescr per STRUCT); leave it. A zero or unresolved tid is the
-/// structural placeholder and takes the minted id.
+/// parentless slots, then `drain_unresolved_gccache_tids`). The tid has
+/// to be on the descr before that drain. A different nonzero collector
+/// tid already on the slot is a host group that won the STRUCT key
+/// (`descr.py` one SizeDescr per STRUCT); leave it. A zero or unresolved
+/// tid is the structural placeholder and takes the minted id.
 fn bind_minted_size_descr(cache_key: u64, owner: &str, vtable: u64) {
     let Some(tid) = crate::minted_exception_classes::minted_exception_collector_tid(owner, vtable)
     else {

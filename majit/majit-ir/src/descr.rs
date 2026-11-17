@@ -2132,56 +2132,11 @@ impl GcCache {
         registered
     }
 
-    /// Re-announce synthetic struct layouts to a replacement collector.
-    ///
-    /// `register_unresolved_struct_tids` skips a descriptor whose collector
-    /// tid is already stored. A fresh `MiniMarkGC` starts with an empty
-    /// registry, so those stored tids have to be appended again, in the
-    /// same insertion order, before any still-unresolved descriptor.
-    pub fn replay_synthetic_struct_tids(
-        &mut self,
-        mut register: impl FnMut(usize, Vec<usize>) -> u32,
-    ) {
-        // A replacement collector does not hand the same ids back: its
-        // `build_gc` prefix can be one longer than the collector that
-        // stamped these descriptors. The old heap is gone, so the
-        // descriptor adopts the id this collector just assigned.
-        let mut pending: Vec<(usize, Vec<usize>, *const SimpleSizeDescr)> = Vec::new();
-        for descr in self._cache_size.values() {
-            let Some(sd) = descr
-                .as_any()
-                .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
-            else {
-                continue;
-            };
-            // A fixed tid is `id_of_type` for that TYPE. A replacement
-            // collector re-registers the TYPE itself; this walk must not
-            // assign a second id. Other synthetic structs still replay.
-            if sd.collector_tid_is_fixed()
-                || !sd.is_gc_managed()
-                || sd.headerless()
-                || sd.cache_key() <= u32::MAX as u64
-            {
-                continue;
-            }
-            let ref_offsets = sd
-                .gc_fielddescrs()
-                .iter()
-                .map(|field| field.offset())
-                .collect();
-            pending.push((sd.size(), ref_offsets, sd as *const SimpleSizeDescr));
-        }
-        for (size, offsets, sd) in pending {
-            let tid = register(size, offsets);
-            unsafe { (*sd).set_type_id(tid) };
-        }
-    }
-
     /// `gc.py GcLLDescr_framework.init_array_descr` asks
     /// `TypeLayoutBuilder.get_type_id(A)` and writes `descr.tid`. majit-ir
     /// cannot see the collector, so the callback (`register`) is the
-    /// collector half, called from the freeze-close hook before
-    /// `freeze_types`.
+    /// collector half, called after kind-0 decode and again from the
+    /// freeze-close hook before `freeze_types`.
     ///
     /// `(base_size, item_size, len_offset, item_gc_offsets, is_ptr)` is
     /// `encode_type_shape`'s `ofstovar` / `varitemsize` / `ofstolength` /
@@ -2222,35 +2177,6 @@ impl GcCache {
             registered += 1;
         }
         registered
-    }
-
-    /// Re-announce array layouts to a replacement collector, the array twin
-    /// of [`Self::replay_synthetic_struct_tids`].
-    pub fn replay_synthetic_array_tids(
-        &mut self,
-        mut register: impl FnMut(usize, usize, usize, Vec<usize>, bool) -> u32,
-    ) {
-        let pending: Vec<DescrRef> = self
-            ._cache_array
-            .values()
-            .filter(|descr| descr.as_array_descr().is_some_and(|ad| ad.is_gc_managed()))
-            .cloned()
-            .collect();
-        for descr in pending {
-            let Some(ad) = descr.as_array_descr() else {
-                continue;
-            };
-            let is_ptr = ad.is_array_of_pointers();
-            let offsets = array_var_gc_ptr_offsets(ad);
-            let tid = register(
-                ad.base_size(),
-                ad.item_size(),
-                array_len_offset(ad),
-                offsets,
-                is_ptr,
-            );
-            ad.set_type_id(tid);
-        }
     }
 
     /// Install the collector half of `init_size_descr` / `init_array_descr`.
@@ -2298,8 +2224,8 @@ impl GcCache {
     ///
     /// Upstream asks `TypeLayoutBuilder.get_type_id` here and stores that
     /// collector id on the SizeDescr. majit-ir does not own the collector;
-    /// [`Self::set_collector_tid_register`] is the same callback the census
-    /// (`register_unresolved_struct_tids`) already uses for `gc.register_type`.
+    /// [`Self::set_collector_tid_register`] is the same callback
+    /// `register_unresolved_struct_tids` already uses for `gc.register_type`.
     /// An analyzer-side `next_type_id` counter would mint dense ids that
     /// collide with the collector's (`W_BufferedRWPairUser` is 209);
     /// `gen_initialize_tid` then stamps that foreign layout onto a vtable-0
@@ -7744,7 +7670,7 @@ pub struct SimpleSizeDescr {
     non_moving: AtomicBool,
     /// `TypeLayoutBuilder.get_type_id` memoizes one id per TYPE
     /// (`id_of_type`). Set once that id is this descr's tid so
-    /// `replay_synthetic_struct_tids` does not assign a new one.
+    /// `register_unresolved_struct_tids` does not assign a new one.
     collector_tid_fixed: AtomicBool,
     /// descr.py `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
@@ -7949,8 +7875,7 @@ impl SimpleSizeDescr {
     }
 
     /// `get_type_id` / `id_of_type`: this SizeDescr's tid is the TYPE's id.
-    /// `register_unresolved_struct_tids` and `replay_synthetic_struct_tids`
-    /// leave it in place.
+    /// `register_unresolved_struct_tids` leaves it in place.
     pub fn fix_collector_tid(&self) {
         self.collector_tid_fixed.store(true, Ordering::Relaxed);
     }
@@ -8163,7 +8088,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
 /// get_size_descr`); when it was born with `0` or the truncated cache
 /// key, it adopts the cached collector tid. A tid fixed on the cached
 /// descr (`id_of_type`) stays fixed on that clone so
-/// `replay_synthetic_struct_tids` does not assign a new id to either.
+/// `register_unresolved_struct_tids` does not assign a new id to either.
 fn share_struct_collector_tid(cached: &SimpleSizeDescr, built: &SimpleSizeDescr) {
     if cached.cache_key() == 0 || cached.cache_key() != built.cache_key() {
         return;

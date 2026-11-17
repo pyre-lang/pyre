@@ -1282,8 +1282,8 @@ fn prebuilt_instance_tid(desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDes
     }
     // `GCTransformer.finish_tables` stamps every TYPE
     // `TypeLayoutBuilder.consider_constant` registered before any
-    // code uses a prebuilt constant. Decode kind-0 and
-    // `register_synthetic_struct_tids` are that happens-before.
+    // code uses a prebuilt constant. Decode kind-0 and the post-decode
+    // drain in `materialize_gccache_owned_descrs` are that happens-before.
     crate::jitcode_runtime::materialize_gccache_owned_descrs();
     let descr = crate::descr::make_descr_from_bh(&prebuilt_instance_size_descr(desc));
     let (cache_key, tid) = {

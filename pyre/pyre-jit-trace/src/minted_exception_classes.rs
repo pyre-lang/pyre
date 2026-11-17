@@ -649,10 +649,11 @@ mod tests {
         );
     }
 
-    /// `register_unresolved_struct_tids` / `replay_synthetic_struct_tids`
-    /// must not mint a second `TypeInfo` for a minted SizeDescr, and the
-    /// vtable-mismatch clone `size_descr_ref_from_bh` records keeps the
-    /// same tid (`init_size_descr` / `get_type_id`).
+    /// `register_unresolved_struct_tids` must not mint a second `TypeInfo`
+    /// for a minted SizeDescr, and the vtable-mismatch clone
+    /// `size_descr_ref_from_bh` records keeps the same tid
+    /// (`init_size_descr` / `get_type_id`). A fresh cache under a new
+    /// collector stamps at mint instead of replaying.
     #[test]
     fn register_unresolved_leaves_minted_size_descr_tid_unchanged() {
         use majit_ir::descr::SizeDescr;
@@ -724,9 +725,38 @@ mod tests {
         );
         let registered = private.register_unresolved_struct_tids(|_, _| 1);
         assert_eq!(registered, 0);
-        private.replay_synthetic_struct_tids(|_, _| 1);
         assert_eq!(SizeDescr::type_id(minted.descr.as_ref()), minted.tid);
         assert!(minted.descr.collector_tid_is_fixed());
+
+        fn stamp_fresh(_size: usize, _offsets: Vec<usize>) -> u32 {
+            7
+        }
+        let mut fresh = majit_ir::descr::GcCache::new();
+        fresh.set_collector_tid_register(Some(stamp_fresh), None);
+        let fresh_key = 0xfeed_face_dead_beef;
+        let mut sd = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, minted.size, 0);
+        sd.set_cache_key(fresh_key);
+        let fresh_descr: majit_ir::DescrRef = std::sync::Arc::new(sd.with_all_fielddescrs(vec![
+            std::sync::Arc::new(
+                majit_ir::descr::SimpleFieldDescr::new_with_name(
+                    0,
+                    field_off,
+                    8,
+                    majit_ir::value::Type::Ref,
+                    false,
+                    majit_ir::descr::ArrayFlag::Pointer,
+                    "ref0".to_string(),
+                    "ref0".to_string(),
+                )
+                .with_index_in_parent(0),
+            ) as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+        ]));
+        fresh.register_keyed_size(
+            majit_ir::descr::LLType::Struct(fresh_key),
+            fresh_descr.clone(),
+        );
+        assert_eq!(fresh_descr.as_size_descr().unwrap().type_id(), 7);
+        assert_eq!(SizeDescr::type_id(minted.descr.as_ref()), minted.tid);
     }
 
     /// The parent here is `TypeInfo::object`, which has no offsets.
