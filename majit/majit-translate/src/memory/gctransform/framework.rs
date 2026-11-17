@@ -3677,9 +3677,9 @@ mod tests {
     }
 
     /// Trait call that resolves to a bodiless non-workspace method whose
-    /// signature input is `&mut dyn Trait`. The specialized copy is not
-    /// built (`analyze_external_call` is `top_result`) and the caller
-    /// stays unresolved, as `external_callee_with_unbound_clause_stays_unresolved`.
+    /// signature input is `&mut dyn Trait`. `analyze_external_call` is
+    /// `top_result`: the specialized copy is minted and stays unresolved,
+    /// so the caller reaches unresolved dispatch.
     #[test]
     fn external_callee_with_dyn_param_stays_unresolved() {
         let dyn_ref = serde_json::json!({
@@ -3698,10 +3698,11 @@ mod tests {
             cg.indirect
         );
         let (callee, generics) = first_regular_fun_call(&llbc, 0);
-        let node = cg.callee_node(&llbc, &[], callee, &generics);
-        assert_eq!(
-            node, 2,
-            "dyn-param external trait method must keep the generic node"
+        let spec = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec, 2, "concrete call must name a specialized node");
+        assert!(
+            cg.indirect.contains(&spec),
+            "dyn-param external trait method leaves the specialized copy unresolved"
         );
         let reached = cg.reaching(&cg.indirect);
         assert!(
@@ -3711,7 +3712,8 @@ mod tests {
     }
 
     /// Opaque method in a workspace crate is not external: the specialized
-    /// copy is not built and the generic node stays in `indirect`.
+    /// copy is minted and stays unresolved, so the caller reaches
+    /// unresolved dispatch.
     #[test]
     fn bodiless_workspace_callee_stays_unresolved() {
         let llbc = llbc_blanket_into_opaque(&["fixture", "from"]);
@@ -3723,10 +3725,11 @@ mod tests {
             cg.indirect
         );
         let (callee, generics) = first_regular_fun_call(&llbc, 0);
-        let node = cg.callee_node(&llbc, &[], callee, &generics);
-        assert_eq!(
-            node, 2,
-            "workspace Opaque method must keep the generic node"
+        let spec = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec, 2, "concrete call must name a specialized node");
+        assert!(
+            cg.indirect.contains(&spec),
+            "workspace Opaque method leaves the specialized copy unresolved"
         );
         assert!(
             cg.reaching(&cg.indirect).contains(&0),
@@ -3740,9 +3743,10 @@ mod tests {
         let llbc = llbc_blanket_into_opaque(&["rustpython_wtf8", "from"]);
         let cg = build(&llbc);
         let (callee, generics) = first_regular_fun_call(&llbc, 0);
-        let node = cg.callee_node(&llbc, &[], callee, &generics);
-        assert_eq!(
-            node, 2,
+        let spec = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec, 2, "concrete call must name a specialized node");
+        assert!(
+            cg.indirect.contains(&spec),
             "without a workspace list the Opaque method stays Unresolved"
         );
         assert!(

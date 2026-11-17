@@ -17,6 +17,17 @@
 //! / `complete_pending_blocks`). Recursive cycles in the resulting call
 //! graph are handled at analysis time by `DependencyTracker`. The
 //! unspecialized body is left unchanged and stays `indirect`.
+//!
+//! A Regular `Fun` or resolved trait method whose declaration has no
+//! Unstructured body is `GraphAnalyzer.analyze_external_call` when the
+//! decl's crate is not a workspace crate: `bottom_result` (a leaf, not
+//! unresolved) joined with `_callbacks` — workspace `TraitImpl` methods
+//! and Regular `FnDef` function items in the generics. A shape the walk
+//! cannot enumerate callbacks for (`dyn` / fn pointer / closure, a
+//! non-Regular `FnDef`, a dyn / fn pointer / closure in the callee
+//! signature) is `top_result` for a resolved trait method call
+//! (`resolve_trait_call` → `TraitCallRes::Unresolved`); a Regular `Fun`
+//! call to a bodiless callee with a blocker keeps the leaf edge.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -448,7 +459,7 @@ impl<'a> Builder<'a> {
             match &call.func {
                 CallFunc::Regular(reg) => match &reg.kind {
                     CallKind::Fun(FunId::Regular { id: callee }) => {
-                        self.add_regular_fun_call(id, *callee, &reg.generics, bindings, depth);
+                        self.add_regular_fun_call(id, *callee, &reg.generics, bindings);
                     }
                     CallKind::Fun(FunId::Other(v)) => {
                         unresolved = true;
@@ -488,7 +499,7 @@ impl<'a> Builder<'a> {
                                 }
                                 TraitCallRes::Empty => {}
                                 TraitCallRes::External { fn_id, callbacks } => {
-                                    self.add_external_edges(id, fn_id, callbacks, depth);
+                                    self.add_external_edges(id, fn_id, callbacks);
                                 }
                                 TraitCallRes::Unresolved => {
                                     if let Some(c) = v.get(2).and_then(Value::as_u64)
@@ -608,30 +619,23 @@ impl<'a> Builder<'a> {
         callee: u64,
         generics: &Value,
         bindings: &[Value],
-        depth: usize,
     ) {
         if is_external_callee(self.llbc, callee, self.workspace_crates)
             && let Some(refs) = subst_call_trait_refs(self.llbc, bindings, generics)
             && let Some(callbacks) =
                 analyze_external_call(self.llbc, callee, generics, &refs, self.workspace_crates)
         {
-            self.add_external_edges(caller, callee, callbacks, depth);
+            self.add_external_edges(caller, callee, callbacks);
             return;
         }
-        let node = self.callee_node_for_call(bindings, callee, generics, depth);
+        let node = self.callee_node_for_call(bindings, callee, generics);
         self.graph.callees.entry(caller).or_default().insert(node);
     }
 
-    fn add_external_edges(
-        &mut self,
-        caller: u64,
-        fn_id: u64,
-        callbacks: Vec<(u64, Value)>,
-        depth: usize,
-    ) {
+    fn add_external_edges(&mut self, caller: u64, fn_id: u64, callbacks: Vec<(u64, Value)>) {
         self.graph.callees.entry(caller).or_default().insert(fn_id);
         for (cb, generics) in callbacks {
-            let node = self.callee_node_for_call(&[], cb, &generics, depth);
+            let node = self.callee_node_for_call(&[], cb, &generics);
             self.graph.callees.entry(caller).or_default().insert(node);
         }
     }
@@ -863,7 +867,7 @@ fn collect_external_effects(
     workspace: &HashSet<String>,
     depth: usize,
 ) -> Result<Vec<(u64, Value)>, ()> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return Err(());
     }
     let mut callbacks = Vec::new();
@@ -905,7 +909,7 @@ fn walk_trait_ref_effects(
     depth: usize,
     mut callbacks: Option<&mut Vec<(u64, Value)>>,
 ) -> Result<(), ()> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return Err(());
     }
     let Some(bound) = bind_trait_ref(llbc, tref, &[], 0) else {
@@ -996,7 +1000,7 @@ fn type_has_blocker(
     depth: usize,
     mut callbacks: Option<&mut Vec<(u64, Value)>>,
 ) -> Result<(), ()> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return Err(());
     }
     let Some(node) = peel_ty(ty, llbc) else {
@@ -1160,7 +1164,7 @@ fn peel_ty<'a>(ty: &'a Value, llbc: &'a Llbc) -> Option<&'a Value> {
 }
 
 fn peel_ty_at<'a>(ty: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Value> {
-    if depth > MAX_INSTANTIATION_DEPTH {
+    if depth > MAX_TRAIT_REF_NESTING {
         return None;
     }
     if let Some(id) = ty.get("Deduplicated").and_then(Value::as_u64) {
