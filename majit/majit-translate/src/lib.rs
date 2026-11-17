@@ -556,10 +556,12 @@ fn build_semantic_program_via_active_frontend(
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
 /// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py).
-/// `(jd_idx, vtypeptr_token) -> Option<handle>`.  Hosts that own a
-/// runtime `VirtualizableInfo` impl supply the constructor here.
-pub type VirtualizableInfoFactory<'a> =
-    dyn Fn(usize, &str) -> Option<std::sync::Arc<dyn call::VirtualizableInfoHandle>> + 'a;
+/// `(jd_idx, vtypeptr_token, cpu) -> Option<handle>`.  Hosts that own a
+/// runtime `VirtualizableInfo` impl supply the constructor here.  `cpu`
+/// is the `CallControl` analog of `self` in that constructor, used for
+/// `cpu.arraydescrof`.
+pub type VirtualizableInfoFactory<'a> = dyn Fn(usize, &str, &call::CallControl) -> Option<std::sync::Arc<dyn call::VirtualizableInfoHandle>>
+    + 'a;
 
 /// Optional binding table from macro-generated helper path
 /// (`module_path!()::helper_name`) to the compiled trace-call address.
@@ -1561,7 +1563,7 @@ pub fn analyze_helper_pipeline_with_modules(
         helper_roots,
         config,
         None,
-        &|_, _| None,
+        &|_, _, _| None,
         fnaddr_bindings,
         impl_fnaddr_bindings,
         static_addrs,
@@ -2973,8 +2975,9 @@ fn analyze_pipeline_from_module_paths(
     // warmspot.py WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
-    call_control
-        .make_virtualizable_infos(|jd_idx, vtypeptr_token| vinfo_factory(jd_idx, vtypeptr_token));
+    call_control.make_virtualizable_infos(|jd_idx, vtypeptr_token, cpu| {
+        vinfo_factory(jd_idx, vtypeptr_token, cpu)
+    });
     // Register oopspecs for jit.* builtin functions.
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
     // the codewriter converts calls to them into dedicated opcodes.

@@ -950,6 +950,7 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayRead {
             base: remap_var(base),
             array_index: *array_index,
@@ -957,6 +958,7 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::VableArrayLen {
             base,
@@ -964,12 +966,14 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayLen {
             base: remap_var(base),
             array_index: *array_index,
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::VableArrayWrite {
             base,
@@ -979,6 +983,7 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayWrite {
             base: remap_var(base),
             array_index: *array_index,
@@ -987,6 +992,7 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::BinOp {
             op,

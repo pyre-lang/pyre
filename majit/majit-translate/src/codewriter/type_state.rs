@@ -2665,6 +2665,7 @@ mod tests {
             item_ty: ValueType::Ref(None),
             array_itemsize: 8,
             array_is_signed: false,
+            array_descr: None,
         };
         let empty = HashSet::new();
         assert_eq!(

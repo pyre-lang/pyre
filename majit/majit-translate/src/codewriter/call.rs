@@ -1987,45 +1987,115 @@ pub enum CallKind {
 
 /// Thin `VirtualizableInfo` for the codewriter. Runtime offsets live in
 /// `majit-metainterp::VirtualizableInfo`; this handle only answers
-/// `get_vinfo` / `is_virtualizable_getset` / `get_virtualizable_field_descr`.
+/// `get_vinfo` / `is_virtualizable_getset` / `get_virtualizable_field_descr`
+/// and holds `array_descrs` minted once in
+/// `virtualizable.py VirtualizableInfo.__init__`.
 #[derive(Debug)]
 pub struct CodewriterVirtualizableInfo {
     vtype_name: String,
     static_fields: Vec<String>,
     array_fields: Vec<String>,
+    /// `getattr(VTYPE, name).TO` per `array_fields` index
+    /// (`virtualizable.py VirtualizableInfo.__init__` takes each ARRAY
+    /// independently). A names-only declaration is `None`.
+    recorded_arrays: Vec<Option<crate::translator::rtyper::lltypesystem::lltype::Array>>,
+    /// `virtualizable.py VirtualizableInfo.__init__`
+    /// `self.array_descrs = [cpu.arraydescrof(getattr(VTYPE, name).TO)
+    /// for name in array_fields]`. Aligned with `array_fields`; a hole is
+    /// a names-only field that has not seen the VTYPE ARRAY yet.
+    array_descrs: Vec<Option<crate::jitcode::BhDescr>>,
 }
 
 impl CodewriterVirtualizableInfo {
     /// `virtualizable.py VirtualizableInfo.__init__` over the declaration:
     /// the static and array fields `config` declares on `vtype`, each in
     /// declared index order, array names without the `[*]` suffix.
+    ///
+    /// Without a cpu, `array_descrs` stay empty. Upstream mints through
+    /// `warmrunnerdesc.cpu` (`VirtualizableInfo.__init__`); a private
+    /// `CallControl` would be a second `ei_index` namespace.
+    /// [`Self::from_config_with_cpu`] mints `cpu.arraydescrof`.
     pub fn from_config(vtype: &str, config: &GraphTransformConfig) -> Option<Self> {
-        let declared = |fields: &[VirtualizableFieldDescriptor]| {
-            let mut owned: Vec<&VirtualizableFieldDescriptor> = fields
-                .iter()
-                .filter(|field| {
-                    field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|owner| names_same_type(owner, vtype))
-                })
-                .collect();
-            owned.sort_by_key(|field| field.index);
-            owned
-                .into_iter()
-                .map(|field| field.name.clone())
-                .collect::<Vec<_>>()
-        };
-        let static_fields = declared(&config.vable_fields);
-        let array_fields = declared(&config.vable_arrays);
-        if static_fields.is_empty() && array_fields.is_empty() {
+        Self::from_config_with_optional_cpu(vtype, config, None)
+    }
+
+    /// `virtualizable.py VirtualizableInfo.__init__` including
+    /// `cpu.arraydescrof(getattr(VTYPE, name).TO)` per array field.
+    pub fn from_config_with_cpu(
+        vtype: &str,
+        config: &GraphTransformConfig,
+        cpu: &CallControl,
+    ) -> Option<Self> {
+        Self::from_config_with_optional_cpu(vtype, config, Some(cpu))
+    }
+
+    fn from_config_with_optional_cpu(
+        vtype: &str,
+        config: &GraphTransformConfig,
+        cpu: Option<&CallControl>,
+    ) -> Option<Self> {
+        let static_decls = declared_vtype_fields(&config.vable_fields, vtype);
+        let array_decls = declared_vtype_fields(&config.vable_arrays, vtype);
+        if static_decls.is_empty() && array_decls.is_empty() {
             return None;
         }
+        let static_fields: Vec<String> = static_decls
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        let array_fields: Vec<String> =
+            array_decls.iter().map(|field| field.name.clone()).collect();
+        let recorded: Vec<Option<crate::translator::rtyper::lltypesystem::lltype::Array>> =
+            array_decls
+                .iter()
+                .map(|field| field.array.clone())
+                .collect();
+        let array_descrs = match cpu {
+            Some(cpu) => mint_array_descrs_for_fields(cpu, vtype, &array_fields, &recorded)
+                .into_iter()
+                .map(Some)
+                .collect(),
+            None => vec![None; array_fields.len()],
+        };
         Some(Self {
             vtype_name: vtype.to_string(),
             static_fields,
             array_fields,
+            recorded_arrays: recorded,
+            array_descrs,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_array_descrs(
+        vtype: impl Into<String>,
+        static_fields: Vec<String>,
+        array_fields: Vec<String>,
+        array_descrs: Vec<crate::jitcode::BhDescr>,
+    ) -> Self {
+        let recorded_arrays = vec![None; array_fields.len()];
+        Self {
+            vtype_name: vtype.into(),
+            static_fields,
+            array_fields,
+            recorded_arrays,
+            array_descrs: array_descrs.into_iter().map(Some).collect(),
+        }
+    }
+
+    pub fn array_descr(&self, index: usize) -> Option<crate::jitcode::BhDescr> {
+        self.array_descrs.get(index).cloned().flatten()
+    }
+
+    /// Recorded `getattr(VTYPE, name).TO` at `array_fields[index]`.
+    /// A names-only declaration is `None`.
+    pub fn recorded_array(
+        &self,
+        index: usize,
+    ) -> Option<&crate::translator::rtyper::lltypesystem::lltype::Array> {
+        self.recorded_arrays
+            .get(index)
+            .and_then(|array| array.as_ref())
     }
 }
 
@@ -2045,6 +2115,15 @@ impl VirtualizableInfoHandle for CodewriterVirtualizableInfo {
     fn static_field_index(&self, name: &str) -> Option<usize> {
         self.static_fields.iter().position(|field| field == name)
     }
+    fn static_field_names(&self) -> &[String] {
+        &self.static_fields
+    }
+    fn array_field_names(&self) -> &[String] {
+        &self.array_fields
+    }
+    fn array_descr(&self, index: usize) -> Option<crate::jitcode::BhDescr> {
+        CodewriterVirtualizableInfo::array_descr(self, index)
+    }
 }
 
 /// `WarmRunnerDesc.make_virtualizable_infos` constructor for the
@@ -2056,6 +2135,531 @@ pub fn codewriter_vinfo_from_config(
 ) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
     let info = CodewriterVirtualizableInfo::from_config(vtype, config)?;
     Some(std::sync::Arc::new(info))
+}
+
+/// `warmspot.py` `VirtualizableInfo(self, VTYPEPTR)`: mint `array_descrs`
+/// through `cpu.arraydescrof` at construction, one ARRAY per field.
+pub fn codewriter_vinfo_from_config_with_cpu(
+    vtype: &str,
+    config: &GraphTransformConfig,
+    cpu: &CallControl,
+) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
+    let info = CodewriterVirtualizableInfo::from_config_with_cpu(vtype, config, cpu)?;
+    Some(std::sync::Arc::new(info))
+}
+
+/// `cpu.arraydescrof(ARRAY)` as a codewriter `BhDescr::Array`.
+/// `virtualizable.py VirtualizableInfo.__init__` stores this on
+/// `array_descrs`.
+pub(crate) fn bh_array_descr_of(
+    cpu: &CallControl,
+    array: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> crate::jitcode::BhDescr {
+    let descr = cpu.arraydescrof_array(array);
+    let array_descr = descr
+        .as_array_descr()
+        .expect("cpu.arraydescrof must return an ArrayDescr");
+    crate::jitcode::BhDescr::Array {
+        base_size: array_descr.base_size(),
+        itemsize: array_descr.item_size(),
+        len_offset: array_descr.len_descr().map(|fd| fd.offset()),
+        type_id: array_descr.cache_key(),
+        gc_type_id: array_descr.type_id(),
+        item_type: array_descr.item_type(),
+        is_array_of_pointers: array_descr.is_array_of_pointers(),
+        is_array_of_structs: array_descr.is_array_of_structs(),
+        is_item_signed: array_descr.is_item_signed(),
+        ei_index: descr.get_ei_index(),
+        array_type_id: Some(array_type_id_of_lltype(array)),
+        interior_fields: crate::jitcode::bh_interior_field_specs_from_array_descr(array_descr),
+        is_gc_managed: array_descr.is_gc_managed(),
+        load_is_acquire: array_descr.load_is_acquire(),
+    }
+}
+
+/// Config-only `jtransform.py rewrite_op_getarrayitem`: mint
+/// `vinfo.array_descrs[arrayindex]` from `getattr(VTYPE, name).TO`
+/// through the same `bh_array_descr_of` path as `VirtualizableInfo.__init__`.
+/// No cpu means no mint: `warmrunnerdesc.cpu` is the only namespace.
+pub(crate) fn vable_array_descr_from_config(
+    config: &GraphTransformConfig,
+    owner: Option<&str>,
+    arr_idx: usize,
+    cpu: Option<&CallControl>,
+) -> Option<crate::jitcode::BhDescr> {
+    let vtype = owner?;
+    let field = declared_vtype_fields(&config.vable_arrays, vtype)
+        .into_iter()
+        .find(|field| field.index == arr_idx)?;
+    let cpu = cpu?;
+    Some(mint_vable_array_descr(
+        cpu,
+        vtype,
+        &field.name,
+        field.array.as_ref(),
+    ))
+}
+
+fn declared_vtype_fields<'a>(
+    fields: &'a [VirtualizableFieldDescriptor],
+    vtype: &str,
+) -> Vec<&'a VirtualizableFieldDescriptor> {
+    let mut owned: Vec<&VirtualizableFieldDescriptor> = fields
+        .iter()
+        .filter(|field| {
+            field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| names_same_type(owner, vtype))
+        })
+        .collect();
+    owned.sort_by_key(|field| field.index);
+    owned
+}
+
+fn mint_array_descrs_for_fields(
+    cpu: &CallControl,
+    vtype: &str,
+    array_fields: &[String],
+    recorded: &[Option<crate::translator::rtyper::lltypesystem::lltype::Array>],
+) -> Vec<crate::jitcode::BhDescr> {
+    array_fields
+        .iter()
+        .zip(recorded.iter())
+        .map(|(name, recorded)| mint_vable_array_descr(cpu, vtype, name, recorded.as_ref()))
+        .collect()
+}
+
+fn mint_vable_array_descr(
+    cpu: &CallControl,
+    vtype: &str,
+    name: &str,
+    recorded: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
+) -> crate::jitcode::BhDescr {
+    let array = array_from_vtype_field(cpu, vtype, name, recorded);
+    assert_vable_gcarray(name, &array);
+    assert_vable_arrayitem_kind(name, &array);
+    bh_array_descr_of(cpu, &array)
+}
+
+/// `virtualizable.py VirtualizableInfo.__init__`:
+/// `assert isinstance(ARRAYPTR, lltype.Ptr)` then
+/// `if not isinstance(ARRAY, lltype.GcArray): raise Exception(...)`.
+fn assert_vable_gcarray(
+    name: &str,
+    array: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    assert!(
+        array._gckind == GcKind::Gc,
+        "virtualizable.py VirtualizableInfo.__init__: \
+         The virtualizable field '{name}' is not an array (found {array:?}). \
+         It usually means that you must try harder to ensure that the list is not \
+         resized at run-time. You can do that by using rpython.rlib.debug.make_sure_not_resized()."
+    );
+}
+
+/// `virtualizable.py VirtualizableInfo.__init__`
+/// `self.arrayitem_extra_types = [history.getkind(ITEM) for ITEM in ARRAYITEMTYPES]`.
+/// `history.py getkind` returns int/ref/float/void and raises for an
+/// inline struct.
+fn assert_vable_arrayitem_kind(
+    _name: &str,
+    array: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) {
+    let _ = crate::model::getkind(&array.OF);
+}
+
+/// `getattr(VTYPE, name)` on the VTYPE struct lltype. `owner_ll_container`
+/// fills `StructLayout.ll_struct` on demand (`gc_struct_ptr_lltype_from_layout`
+/// / `raw_struct_ptr_from_layout`).
+fn vtype_struct_lltype(
+    cpu: &CallControl,
+    vtype: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Struct> {
+    if let Some(st) = cached_vtype_ll_struct(cpu, vtype) {
+        return Some(st);
+    }
+    let _ = crate::annotator::bookkeeper::gc_struct_ptr_lltype_from_layout(
+        cpu.struct_fields(),
+        &cpu.struct_layouts_handle(),
+        &cpu.field0_parents,
+        vtype,
+    );
+    let _ = crate::annotator::bookkeeper::raw_struct_ptr_from_layout(
+        cpu.struct_fields(),
+        &cpu.struct_layouts_handle(),
+        vtype,
+    );
+    cached_vtype_ll_struct(cpu, vtype)
+}
+
+fn cached_vtype_ll_struct(
+    cpu: &CallControl,
+    vtype: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Struct> {
+    let layout = cpu.struct_layout_for(vtype)?;
+    if vtype.contains('<') {
+        layout.ll_struct_by_args.borrow().get(vtype).cloned()
+    } else {
+        layout.ll_struct.borrow().clone()
+    }
+}
+
+/// `ARRAYPTR = getattr(VTYPE, name)`; `ARRAY = ARRAYPTR.TO` for
+/// `cpu.arraydescrof` (`virtualizable.py VirtualizableInfo.__init__`
+/// `fieldType(VTYPE, name)`).
+///
+/// `owner_ll_container` fills `ll_struct` on demand
+/// (`gc_struct_ptr_lltype_from_layout` / `raw_struct_ptr_from_layout`).
+/// No VTYPE struct panics. A known field that is not an array pointer,
+/// the `FixedObjectArray` wrapper, or the Address-spelled `CHAR_ARRAY`
+/// intern gap panics (`isinstance(ARRAYPTR, lltype.Ptr)`). A VTYPE
+/// whose struct is known but has no field `name` panics. A recorded
+/// ARRAY must intern to the same ARRAY (`CallControl::intern_array`).
+fn array_from_vtype_field(
+    cpu: &CallControl,
+    vtype: &str,
+    name: &str,
+    recorded: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
+) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+    let Some(st) = vtype_struct_lltype(cpu, vtype) else {
+        panic!(
+            "virtualizable.py VirtualizableInfo.__init__: \
+             fieldType({vtype}, {name})"
+        );
+    };
+    let Some(ft) = st.getattr_field_type(name) else {
+        panic!(
+            "virtualizable.py VirtualizableInfo.__init__: \
+             fieldType({vtype}, {name})"
+        );
+    };
+    // `field_spelling_lltype` answers Address when `owner_ll_container`
+    // cannot intern the field (`bookkeeper.rs`), including a names-only
+    // `GcArray<u8>`. That Address is not an ARRAYPTR; `rstr.py CHAR_ARRAY`
+    // is recovered from the declared spelling. A declared spelling that
+    // is not an array is a known non-pointer
+    // (`virtualizable.py VirtualizableInfo.__init__`).
+    if matches!(ft, LowLevelType::Address) {
+        if let Some(arr) = cpu
+            .field_type(vtype, name)
+            .and_then(array_from_declared_field_spelling)
+        {
+            assert_recorded_agrees_with_field(cpu, vtype, name, &arr, recorded);
+            return arr;
+        }
+        panic!(
+            "virtualizable.py VirtualizableInfo.__init__: \
+             assert isinstance(ARRAYPTR, lltype.Ptr) failed for field '{name}' \
+             (found {ft:?})"
+        );
+    }
+    let arr = if let Some(arr) = array_from_vable_arrayptr(name, &ft) {
+        arr
+    } else if field_lltype_is_fixed_object_array(&ft) {
+        Array::gc(GCREF.clone())
+    } else {
+        panic!(
+            "virtualizable.py VirtualizableInfo.__init__: \
+             assert isinstance(ARRAYPTR, lltype.Ptr) failed for field '{name}' \
+             (found {ft:?})"
+        );
+    };
+    assert_recorded_agrees_with_field(cpu, vtype, name, &arr, recorded);
+    arr
+}
+
+fn assert_recorded_agrees_with_field(
+    cpu: &CallControl,
+    vtype: &str,
+    name: &str,
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+    recorded: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
+) {
+    if let Some(recorded) = recorded {
+        assert_eq!(
+            cpu.intern_array(arr),
+            cpu.intern_array(recorded),
+            "virtualizable.py VirtualizableInfo.__init__: \
+             getattr({vtype}, {name}).TO disagrees with the recorded ARRAY"
+        );
+    }
+}
+
+/// Names-only VTYPE field: `FixedObjectArray` is `GcArray(GCREF)`;
+/// `GcArray<u8>` / `[u8]` is `rstr.py CHAR_ARRAY`.
+fn array_from_declared_field_spelling(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF};
+    if crate::front::mir::type_spelling_is_fixed_object_array(spelling) {
+        return Some(Array::gc(GCREF.clone()));
+    }
+    let mut s = spelling.trim();
+    while let Some(inner) = crate::front::typestr::peel_pointer_prefix(s) {
+        s = inner;
+    }
+    if s == "GcArray<u8>" || s == "[u8]" {
+        return Some(gcarray_char());
+    }
+    None
+}
+
+/// `ARRAYPTR = getattr(VTYPE, name)`; `assert isinstance(ARRAYPTR, lltype.Ptr)`;
+/// `ARRAY = ARRAYPTR.TO`. A `FixedObjectArray` pointer is the product
+/// stand-in for `GcArray(GCREF)` and is resolved by the caller.
+fn array_from_vable_arrayptr(
+    name: &str,
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::ForwardReference(fwd) => {
+            array_from_vable_arrayptr(name, fwd.resolved().as_ref()?)
+        }
+        LowLevelType::Ptr(ptr) => {
+            let not_an_array = |found: &dyn std::fmt::Debug| -> ! {
+                panic!(
+                    "virtualizable.py VirtualizableInfo.__init__: \
+                     The virtualizable field '{name}' is not an array (found {found:?}). \
+                     It usually means that you must try harder to ensure that the list is not \
+                     resized at run-time. You can do that by using rpython.rlib.debug.make_sure_not_resized()."
+                )
+            };
+            match &ptr.TO {
+                PtrTarget::Array(arr) => Some(arr.clone()),
+                // `ForwardReference.become` replaces the referenced container,
+                // so the resolved value is the pointee itself, not a pointer.
+                PtrTarget::ForwardReference(fwd) => match fwd.resolved()? {
+                    LowLevelType::Array(arr) => Some(*arr),
+                    resolved @ LowLevelType::Struct(_)
+                        if field_lltype_is_fixed_object_array(&resolved) =>
+                    {
+                        None
+                    }
+                    other => not_an_array(&other),
+                },
+                PtrTarget::Struct(_) if field_lltype_is_fixed_object_array(ty) => None,
+                other => not_an_array(other),
+            }
+        }
+        LowLevelType::Struct(_) if field_lltype_is_fixed_object_array(ty) => None,
+        other => panic!(
+            "virtualizable.py VirtualizableInfo.__init__: \
+             assert isinstance(ARRAYPTR, lltype.Ptr) failed for field '{name}' \
+             (found {other:?})"
+        ),
+    }
+}
+
+/// Bind `owner` on `CallControl.struct_layouts` so [`vtype_struct_lltype`]
+/// answers (`set_struct_layout` / `StructLayout.ll_struct`, the table
+/// the prepass fills). `fields` is the VTYPE `getattr` table
+/// (`virtualizable.py VirtualizableInfo.__init__` `fieldType`).
+pub fn install_vtype_layout(
+    cc: &mut CallControl,
+    owner: &str,
+    fields: Vec<(
+        String,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )>,
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, Struct};
+    let sid = majit_ir::descr::StructId::from_canonical(owner);
+    cc.set_struct_layout(
+        sid,
+        StructLayout {
+            size: 16,
+            align: 8,
+            gckind: GcKind::Gc,
+            repr_transparent: false,
+            fields: vec![],
+            host: None,
+            ll_struct: std::cell::RefCell::new(Some(Struct::gc(owner, fields))),
+            ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+        },
+    );
+}
+
+/// [`install_vtype_layout`] with each field a `Ptr(Array)` ARRAYPTR.
+pub fn install_vtype_array_layout(
+    cc: &mut CallControl,
+    owner: &str,
+    fields: &[(&str, crate::translator::rtyper::lltypesystem::lltype::Array)],
+) {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    let ll_fields = fields
+        .iter()
+        .map(|(name, array)| {
+            (
+                (*name).to_string(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::Array(array.clone()),
+                })),
+            )
+        })
+        .collect();
+    install_vtype_layout(cc, owner, ll_fields);
+}
+
+#[cfg(test)]
+mod vable_arrayptr_tests {
+    use super::{
+        CallControl, StructLayout, array_from_vable_arrayptr, array_from_vtype_field,
+        field_lltype_is_fixed_object_array,
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        Array, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, Struct,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_pointer_to_a_resolved_forward_reference_names_its_gcarray() {
+        let array = Array::gc(LowLevelType::Signed);
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Array(Box::new(array.clone())))
+            .unwrap();
+        let field = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+        assert_eq!(array_from_vable_arrayptr("locals_w", &field), Some(array));
+    }
+
+    fn named_struct(name: &str) -> LowLevelType {
+        LowLevelType::Struct(Box::new(Struct::gc(
+            name,
+            vec![("len".to_string(), LowLevelType::Signed)],
+        )))
+    }
+
+    fn cc_with_vtype_field(
+        owner: &str,
+        field: &str,
+        field_ty: LowLevelType,
+    ) -> (CallControl, parking_lot::MutexGuard<'static, ()>) {
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let body = Struct::gc(owner, vec![(field.to_string(), field_ty)]);
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(owner.to_string(), vec![(field.to_string(), "field".into())]);
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(Some(body)),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        (cc, registry)
+    }
+
+    #[test]
+    #[should_panic(expected = "fieldType")]
+    fn array_from_vtype_field_panics_when_vtype_has_no_named_field() {
+        let owner = "VableMissingNamedFieldHolder";
+        let vtype_array = Array::gc(LowLevelType::Signed);
+        let field_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(vtype_array.clone()),
+        }));
+        let (cc, _registry) = cc_with_vtype_field(owner, "other", field_ty);
+        let _ = array_from_vtype_field(&cc, owner, "stack", Some(&vtype_array));
+    }
+
+    #[test]
+    #[should_panic(expected = "isinstance(ARRAYPTR, lltype.Ptr)")]
+    fn array_from_vtype_field_panics_when_named_field_is_signed() {
+        let owner = "VableSignedArrayFieldHolder";
+        let (cc, _registry) = cc_with_vtype_field(owner, "stack", LowLevelType::Signed);
+        let recorded = Array::gc(LowLevelType::Signed);
+        let _ = array_from_vtype_field(&cc, owner, "stack", Some(&recorded));
+    }
+
+    #[test]
+    #[should_panic(expected = "fieldType")]
+    fn array_from_vtype_field_panics_when_vtype_has_no_struct() {
+        let cc = CallControl::new();
+        let recorded = Array::gc(LowLevelType::Signed);
+        let _ = array_from_vtype_field(&cc, "VableUnresolvedVtypeHolder", "stack", Some(&recorded));
+    }
+
+    #[test]
+    fn array_from_vtype_field_returns_getattr_array() {
+        let owner = "VableNamedArrayFieldHolder";
+        let vtype_array = Array::gc(LowLevelType::Signed);
+        let field_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(vtype_array.clone()),
+        }));
+        let (cc, _registry) = cc_with_vtype_field(owner, "stack", field_ty);
+        let got = array_from_vtype_field(&cc, owner, "stack", Some(&vtype_array));
+        assert_eq!(cc.intern_array(&got), cc.intern_array(&vtype_array));
+    }
+
+    /// Product `FixedObjectArray` is the interned wrapper
+    /// (`object_array::FixedObjectArray`); a last-segment namesake is not.
+    #[test]
+    fn field_lltype_is_fixed_object_array_matches_product_identity() {
+        assert!(field_lltype_is_fixed_object_array(&named_struct(
+            "object_array::FixedObjectArray"
+        )));
+        assert!(field_lltype_is_fixed_object_array(&named_struct(
+            "pyre_object::object_array::FixedObjectArray"
+        )));
+        let product_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(
+                "object_array::FixedObjectArray",
+                vec![("len".to_string(), LowLevelType::Signed)],
+            )),
+        }));
+        assert!(field_lltype_is_fixed_object_array(&product_ptr));
+        assert!(!field_lltype_is_fixed_object_array(&named_struct(
+            "other_module::FixedObjectArray"
+        )));
+    }
+}
+
+fn field_lltype_is_fixed_object_array(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let name = match ty {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(st) => st._name.as_str(),
+            PtrTarget::ForwardReference(fwd) => {
+                return match fwd.resolved().as_ref() {
+                    Some(resolved) => field_lltype_is_fixed_object_array(resolved),
+                    None => false,
+                };
+            }
+            _ => return false,
+        },
+        LowLevelType::Struct(st) => st._name.as_str(),
+        LowLevelType::ForwardReference(fwd) => {
+            return match fwd.resolved().as_ref() {
+                Some(resolved) => field_lltype_is_fixed_object_array(resolved),
+                None => false,
+            };
+        }
+        _ => return false,
+    };
+    // Product wrapper interned as `object_array::FixedObjectArray`
+    // (`bookkeeper.rs` `items_root`). `names_same_type` accepts a crate
+    // prefix of that path; a last-segment match would also take
+    // `other_module::FixedObjectArray`.
+    names_same_type(name, "object_array::FixedObjectArray")
 }
 
 /// `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path naming the
@@ -5805,11 +6409,15 @@ impl CallControl {
 
     /// Resolve a registered [`StructLayout`] by a struct / enum-variant
     /// name in any spelling, through the name → StructId resolver.
-    /// `None` for an unknown or cross-module-ambiguous name — the layout
-    /// channel is keyed by object identity, so a name that does not
-    /// resolve to one identity has no layout.
+    /// A name missing from that table still looks up
+    /// `StructId::from_canonical`, so a layout installed that way
+    /// (`set_struct_layout` / `StructLayout.ll_struct`, the table the
+    /// prepass fills) is visible without a name-table row. `None` when
+    /// that identity has no layout — the channel is keyed by object
+    /// identity.
     pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
-        let sid = majit_ir::descr::struct_id_for_name(name)?;
+        let sid = majit_ir::descr::struct_id_for_name(name)
+            .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(name));
         self.layout_of(sid, name)
     }
 
@@ -8365,12 +8973,13 @@ impl CallControl {
     /// later overrides it with [`Self::set_jitdriver_virtualizable_info`]
     /// at runtime — matching pyre's
     /// `MetaInterp::set_virtualizable_info` (in `jitdriver.rs`) wiring.
-    /// The factory receives `(jd_idx, vtypeptr_token)` where
+    /// The factory receives `(jd_idx, vtypeptr_token, cpu)` where
     /// `vtypeptr_token` is the `red_types[index_of_virtualizable]`
-    /// string the codewriter resolved.
+    /// string the codewriter resolved and `cpu` is this `CallControl`
+    /// (`cpu.arraydescrof`).
     pub fn make_virtualizable_infos<VF>(&mut self, mut vinfo_factory: VF)
     where
-        VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+        VF: FnMut(usize, &str, &CallControl) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
     {
         // warmspot.py `vinfos = {}` — per-VTYPEPTR cache so multiple
         // jitdrivers sharing the same virtualizable type reuse one handle.
@@ -8386,8 +8995,44 @@ impl CallControl {
         vinfo_factory: &mut VF,
         vinfos: &mut std::collections::HashMap<String, std::sync::Arc<dyn VirtualizableInfoHandle>>,
     ) where
-        VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+        VF: FnMut(usize, &str, &CallControl) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
     {
+        // Exclusive write of greenfield / index, then an immutable lend of
+        // `self` as `cpu` (`VirtualizableInfo(self, VTYPEPTR)`), then
+        // exclusive assign of `jd.virtualizable_info`.
+        let pending = self.prepare_virtualizable_infos();
+        let assigned = self.mint_pending_virtualizable_infos(pending, vinfo_factory, vinfos);
+        for (jd_idx, info) in assigned {
+            self.jitdrivers_sd[jd_idx].virtualizable_info = info;
+        }
+    }
+
+    fn mint_pending_virtualizable_infos<VF>(
+        &self,
+        pending: Vec<(usize, String)>,
+        vinfo_factory: &mut VF,
+        vinfos: &mut std::collections::HashMap<String, std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    ) -> Vec<(usize, Option<std::sync::Arc<dyn VirtualizableInfoHandle>>)>
+    where
+        VF: FnMut(usize, &str, &CallControl) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    {
+        let mut assigned = Vec::with_capacity(pending.len());
+        for (jd_idx, vtypeptr_token) in pending {
+            let info = if let Some(cached) = vinfos.get(&vtypeptr_token) {
+                Some(cached.clone())
+            } else if let Some(fresh) = vinfo_factory(jd_idx, &vtypeptr_token, self) {
+                vinfos.insert(vtypeptr_token, fresh.clone());
+                Some(fresh)
+            } else {
+                None
+            };
+            assigned.push((jd_idx, info));
+        }
+        assigned
+    }
+
+    fn prepare_virtualizable_infos(&mut self) -> Vec<(usize, String)> {
+        let mut pending = Vec::new();
         for jd_idx in 0..self.jitdrivers_sd.len() {
             // warmspot.py `jd.greenfield_info = None`
             self.jitdrivers_sd[jd_idx].greenfield_info = None;
@@ -8494,23 +9139,16 @@ impl CallControl {
             //
             // Pyre resolves VTYPEPTR via `red_types[index_of_virtualizable]`
             // (the `_JIT_ENTER_FUNCTYPE.ARGS` analog supplied at
-            // `setup_jitdriver` time) and delegates the constructor
-            // call to `vinfo_factory`.
+            // `setup_jitdriver` time). The factory is `VirtualizableInfo(self, VTYPEPTR)`
+            // and receives this `CallControl` as `cpu`.
             let vtypeptr_token = self.jitdrivers_sd[jd_idx]
                 .red_types
                 .get(idx)
                 .cloned()
                 .unwrap_or_default();
-            let info = if let Some(cached) = vinfos.get(&vtypeptr_token) {
-                Some(cached.clone())
-            } else if let Some(fresh) = vinfo_factory(jd_idx, &vtypeptr_token) {
-                vinfos.insert(vtypeptr_token, fresh.clone());
-                Some(fresh)
-            } else {
-                None
-            };
-            self.jitdrivers_sd[jd_idx].virtualizable_info = info;
+            pending.push((jd_idx, vtypeptr_token));
         }
+        pending
     }
 
     /// call.py `jitdriver_sd_from_portal_graph(graph)`.
@@ -29793,7 +30431,7 @@ mod tests {
             vec!["PyFrame".into(), "ExecutionContext".into()],
             CallPath::from_segments(["execute_opcode_step"]),
         );
-        cc.make_virtualizable_infos(|_, _| None);
+        cc.make_virtualizable_infos(|_, _, _| None);
         // warmspot.py:534-538 — `index_of_virtualizable = reds.index('frame')`
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
         // warmspot.py:540-545 — codewriter side leaves vinfo None;
@@ -29821,7 +30459,7 @@ mod tests {
             vec!["PyFrame".into()],
             CallPath::from_segments(["portal"]),
         );
-        cc.make_virtualizable_infos(|_, _| None);
+        cc.make_virtualizable_infos(|_, _, _| None);
     }
 
     #[test]
@@ -29843,7 +30481,7 @@ mod tests {
             vtypeptr_id: 0xfeed,
         }));
         cc.jitdrivers_sd[0].index_of_virtualizable = 7;
-        cc.make_virtualizable_infos(|_, _| None);
+        cc.make_virtualizable_infos(|_, _, _| None);
         assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, -1);
     }
@@ -29865,7 +30503,7 @@ mod tests {
             vec!["PyFrame".into()],
             CallPath::from_segments(["portal_with_greenfield"]),
         );
-        cc.make_virtualizable_infos(|_, _| None);
+        cc.make_virtualizable_infos(|_, _, _| None);
         let gfinfo = cc.jitdrivers_sd[0]
             .greenfield_info
             .as_ref()
@@ -29906,7 +30544,7 @@ mod tests {
             CallPath::from_segments(["portal_b"]),
         );
         let mut factory_calls: Vec<String> = Vec::new();
-        cc.make_virtualizable_infos(|_jd_idx, vtypeptr_token| {
+        cc.make_virtualizable_infos(|_jd_idx, vtypeptr_token, _cpu| {
             factory_calls.push(vtypeptr_token.to_string());
             Some(std::sync::Arc::new(StubVInfo {
                 vtypeptr_id: 0xfeed,
@@ -29956,6 +30594,485 @@ mod tests {
         assert!(codewriter_vinfo_from_config("interp::frame::Frame", &config).is_some());
         assert!(codewriter_vinfo_from_config("OtherFrame", &config).is_none());
         assert!(codewriter_vinfo_from_config("Plain", &config).is_none());
+        assert!(
+            vinfo.array_descr(0).is_none(),
+            "from_config without cpu leaves array_descrs unminted"
+        );
+    }
+
+    #[test]
+    fn codewriter_vinfo_from_config_mints_a_recorded_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let array = Array::gc(LowLevelType::Char);
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("stack", Some("Frame".into()), 0)
+                    .with_array(array.clone()),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let mut cc = CallControl::new();
+        install_vtype_array_layout(&mut cc, "Frame", &[("stack", array)]);
+        let vinfo =
+            codewriter_vinfo_from_config_with_cpu("Frame", &config, &cc).expect("Frame handle");
+        let descr = vinfo
+            .array_descr(0)
+            .expect("recorded ARRAY is minted through the caller cpu");
+        let crate::jitcode::BhDescr::Array {
+            itemsize,
+            item_type,
+            is_item_signed,
+            ..
+        } = descr
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        assert_eq!(itemsize, 1);
+        assert_eq!(item_type, majit_ir::Type::Int);
+        assert!(!is_item_signed);
+    }
+
+    #[test]
+    #[should_panic(expected = "VirtualizableInfo.__init__")]
+    fn codewriter_vinfo_from_config_rejects_a_raw_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let array = Array::new(LowLevelType::Signed);
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("stack", Some("Frame".into()), 0)
+                    .with_array(array.clone()),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let mut cc = CallControl::new();
+        install_vtype_array_layout(&mut cc, "Frame", &[("stack", array)]);
+        let _ = codewriter_vinfo_from_config_with_cpu("Frame", &config, &cc);
+    }
+
+    fn cc_with_vtype_array_field(
+        owner: &str,
+        field: &str,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> (CallControl, parking_lot::MutexGuard<'static, ()>) {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GcKind, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let field_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(array),
+        }));
+        let body = Struct::gc(owner, vec![(field.to_string(), field_ty)]);
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![(field.to_string(), "GcArray".into())],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(Some(body)),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        (cc, registry)
+    }
+
+    #[test]
+    #[should_panic(expected = "VirtualizableInfo.__init__")]
+    fn from_config_with_cpu_rejects_a_recorded_array_that_disagrees_with_vtype() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let owner = "VableArrayDisagreeHolder";
+        let vtype_array = Array::gc(LowLevelType::Signed);
+        let (cc, _registry) = cc_with_vtype_array_field(owner, "stack", vtype_array);
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("stack", Some(owner.into()), 0)
+                    .with_array(Array::gc(LowLevelType::Char)),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let _ = CodewriterVirtualizableInfo::from_config_with_cpu(owner, &config, &cc);
+    }
+
+    #[test]
+    #[should_panic(expected = "VirtualizableInfo.__init__")]
+    fn from_config_with_cpu_rejects_a_recorded_array_for_a_non_pointer_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GcKind, LowLevelType, Struct,
+        };
+        let owner = "VableNonPtrArrayHolder";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let body = Struct::gc(owner, vec![("stack".to_string(), LowLevelType::Signed)]);
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("stack".to_string(), "Signed".into())],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(Some(body)),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("stack", Some(owner.into()), 0)
+                    .with_array(Array::gc(LowLevelType::Signed)),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let _ = CodewriterVirtualizableInfo::from_config_with_cpu(owner, &config, &cc);
+    }
+
+    #[test]
+    fn from_config_with_cpu_accepts_a_recorded_array_that_agrees_with_vtype() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let owner = "VableArrayAgreeHolder";
+        let vtype_array = Array::gc(LowLevelType::Signed);
+        let (cc, _registry) = cc_with_vtype_array_field(owner, "stack", vtype_array.clone());
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("stack", Some(owner.into()), 0)
+                    .with_array(vtype_array),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let vinfo = CodewriterVirtualizableInfo::from_config_with_cpu(owner, &config, &cc)
+            .expect("Holder vinfo");
+        let descr = vinfo
+            .array_descr(0)
+            .expect("agreeing recorded ARRAY constructs");
+        let crate::jitcode::BhDescr::Array {
+            item_type,
+            is_item_signed,
+            ..
+        } = descr
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        assert_eq!(item_type, majit_ir::Type::Int);
+        assert!(is_item_signed);
+    }
+
+    #[test]
+    fn make_virtualizable_infos_mints_array_descrs_from_vtype_field() {
+        // virtualizable.py VirtualizableInfo.__init__
+        // `cpu.arraydescrof(getattr(VTYPE, name).TO)` once per vinfo.
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF};
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "PyFrame".to_string(),
+            vec![(
+                "locals_cells_stack_w".to_string(),
+                "*mut FixedObjectArray".to_string(),
+            )],
+        );
+        cc.set_struct_fields(registry);
+        install_vtype_array_layout(
+            &mut cc,
+            "PyFrame",
+            &[("locals_cells_stack_w", Array::gc(GCREF.clone()))],
+        );
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec![],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new(
+                "locals_cells_stack_w",
+                Some("PyFrame".into()),
+                0,
+            )],
+            ..GraphTransformConfig::default()
+        };
+        cc.make_virtualizable_infos(|_, vtype, cpu| {
+            codewriter_vinfo_from_config_with_cpu(vtype, &config, cpu)
+        });
+        let vinfo = cc.unique_virtualizable_info().expect("PyFrame vinfo");
+        let descr = vinfo
+            .array_descr(0)
+            .expect("array_descrs minted from VTYPE field ARRAY");
+        let crate::jitcode::BhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset,
+            is_array_of_pointers,
+            array_type_id,
+            ..
+        } = descr
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        let word = crate::layout::target_word_size();
+        assert_eq!((base_size, itemsize, len_offset), (word, word, Some(0)));
+        assert!(is_array_of_pointers);
+        assert_eq!(
+            array_type_id.as_deref(),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+        );
+    }
+
+    #[test]
+    fn from_config_with_cpu_resolves_a_char_array_when_ll_struct_is_empty() {
+        // `virtualizable.py VirtualizableInfo.__init__`
+        // `cpu.arraydescrof(getattr(VTYPE, name).TO)` does not wait for
+        // `StructLayout.ll_struct` to have been filled earlier.
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        let owner = "VableEmptySlotHolder";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            owner.to_string(),
+            vec![("chars".to_string(), "GcArray<u8>".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        assert!(
+            cc.struct_layout_for(owner)
+                .expect("layout")
+                .ll_struct
+                .borrow()
+                .is_none(),
+            "layout slot is empty at construction"
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new(
+                "chars",
+                Some(owner.into()),
+                0,
+            )],
+            ..GraphTransformConfig::default()
+        };
+        let vinfo = CodewriterVirtualizableInfo::from_config_with_cpu(owner, &config, &cc)
+            .expect("Holder vinfo");
+        let descr = vinfo
+            .array_descr(0)
+            .expect("empty ll_struct still resolves GcArray<u8>");
+        let crate::jitcode::BhDescr::Array {
+            itemsize,
+            item_type,
+            is_item_signed,
+            ..
+        } = descr
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        assert_eq!(itemsize, 1);
+        assert_eq!(item_type, majit_ir::Type::Int);
+        assert!(!is_item_signed);
+    }
+
+    #[test]
+    fn make_virtualizable_infos_keeps_the_recorded_array() {
+        // `codewriter_vinfo_from_config` is names-only. A recorded ARRAY
+        // is the field type interned for `getattr(VTYPE, name).TO` and
+        // minted through `warmrunnerdesc.cpu`.
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let array = Array::gc(LowLevelType::Char);
+        let mut cc = CallControl::new();
+        install_vtype_array_layout(
+            &mut cc,
+            "PyFrame",
+            &[("locals_cells_stack_w", array.clone())],
+        );
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec![],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new(
+                    "locals_cells_stack_w",
+                    Some("PyFrame".into()),
+                    0,
+                )
+                .with_array(array),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        cc.make_virtualizable_infos(|_, vtype, cpu| {
+            codewriter_vinfo_from_config_with_cpu(vtype, &config, cpu)
+        });
+        let vinfo = cc.unique_virtualizable_info().expect("PyFrame vinfo");
+        let descr = vinfo
+            .array_descr(0)
+            .expect("recorded ARRAY survives make_virtualizable_infos");
+        let crate::jitcode::BhDescr::Array {
+            itemsize,
+            item_type,
+            is_item_signed,
+            ..
+        } = descr
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        assert_eq!(itemsize, 1);
+        assert_eq!(item_type, majit_ir::Type::Int);
+        assert!(!is_item_signed);
+    }
+
+    #[test]
+    fn make_virtualizable_infos_mints_mixed_recorded_and_names_only_arrays() {
+        // `virtualizable.py VirtualizableInfo.__init__` takes each
+        // `getattr(VTYPE, name).TO` independently. A recorded
+        // `GcArray(Char)` agrees with the VTYPE field; a sibling
+        // names-only field is the ARRAY interned on the VTYPE layout
+        // (`fieldType(VTYPE, name)`).
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+        let chars = Array::gc(LowLevelType::Char);
+        let locals = Array::gc(GCREF.clone());
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "PyFrame".to_string(),
+            vec![(
+                "locals_cells_stack_w".to_string(),
+                "*mut FixedObjectArray".to_string(),
+            )],
+        );
+        cc.set_struct_fields(registry);
+        install_vtype_array_layout(
+            &mut cc,
+            "PyFrame",
+            &[("chars", chars.clone()), ("locals_cells_stack_w", locals)],
+        );
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec![],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("chars", Some("PyFrame".into()), 0)
+                    .with_array(chars),
+                VirtualizableFieldDescriptor::new(
+                    "locals_cells_stack_w",
+                    Some("PyFrame".into()),
+                    1,
+                ),
+            ],
+            ..GraphTransformConfig::default()
+        };
+        let before = codewriter_vinfo_from_config("PyFrame", &config).expect("Frame handle");
+        assert!(
+            before.array_descr(0).is_none(),
+            "from_config without cpu leaves a recorded ARRAY unminted"
+        );
+        assert!(
+            before.array_descr(1).is_none(),
+            "names-only field stays a hole until from_config_with_cpu sees the VTYPE ARRAY"
+        );
+        let owned = CodewriterVirtualizableInfo::from_config_with_cpu("PyFrame", &config, &cc)
+            .expect("Frame handle");
+        assert!(
+            owned.recorded_array(0).is_some(),
+            "recorded GcArray(Char) is stored per field"
+        );
+        assert!(
+            owned.recorded_array(1).is_none(),
+            "names-only sibling stays None in recorded_arrays"
+        );
+        cc.make_virtualizable_infos(|_, vtype, cpu| {
+            codewriter_vinfo_from_config_with_cpu(vtype, &config, cpu)
+        });
+        let vinfo = cc.unique_virtualizable_info().expect("PyFrame vinfo");
+        let crate::jitcode::BhDescr::Array {
+            itemsize: char_itemsize,
+            item_type,
+            is_item_signed,
+            ..
+        } = vinfo
+            .array_descr(0)
+            .expect("recorded CHAR_ARRAY is minted at construction")
+        else {
+            panic!("array_descrs[0] must be BhDescr::Array");
+        };
+        assert_eq!(char_itemsize, 1);
+        assert_eq!(item_type, majit_ir::Type::Int);
+        assert!(!is_item_signed);
+        let crate::jitcode::BhDescr::Array {
+            base_size,
+            itemsize: obj_itemsize,
+            len_offset,
+            is_array_of_pointers,
+            array_type_id,
+            ..
+        } = vinfo
+            .array_descr(1)
+            .expect("names-only FixedObjectArray is minted at construction")
+        else {
+            panic!("array_descrs[1] must be BhDescr::Array");
+        };
+        let word = crate::layout::target_word_size();
+        assert_eq!((base_size, obj_itemsize, len_offset), (word, word, Some(0)));
+        assert!(is_array_of_pointers);
+        assert_eq!(
+            array_type_id.as_deref(),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+        );
     }
 
     #[test]
@@ -30118,7 +31235,7 @@ mod tests {
             vec!["PyFrame".into()],
             CallPath::from_segments(["portal"]),
         );
-        cc.make_virtualizable_infos(|_, _| None);
+        cc.make_virtualizable_infos(|_, _, _| None);
         assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
     }

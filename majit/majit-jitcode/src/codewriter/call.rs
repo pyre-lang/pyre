@@ -51,6 +51,21 @@ pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
     fn static_field_index(&self, _name: &str) -> Option<usize> {
         None
     }
+    /// `vinfo.static_fields` names in declaration order
+    /// (`virtualizable.py VirtualizableInfo.__init__`).
+    fn static_field_names(&self) -> &[String] {
+        &[]
+    }
+    /// `vinfo.array_fields` names in declaration order
+    /// (`virtualizable.py VirtualizableInfo.__init__`).
+    fn array_field_names(&self) -> &[String] {
+        &[]
+    }
+    /// `vinfo.array_descrs[index]` (`virtualizable.py
+    /// VirtualizableInfo.__init__` `cpu.arraydescrof(getattr(VTYPE, name).TO)`).
+    fn array_descr(&self, _index: usize) -> Option<crate::jitcode::BhDescr> {
+        None
+    }
 }
 
 /// greenfield.py `GreenFieldInfo.green_fields` membership test.
