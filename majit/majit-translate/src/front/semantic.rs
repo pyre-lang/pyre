@@ -1189,8 +1189,7 @@ impl StructFieldRegistry {
         {
             return Some(fields.as_slice());
         }
-        let key = self.unique_suffix_owner_key(owner)?;
-        self.fields.get(key).map(Vec::as_slice)
+        self.unique_suffix_owner_entry(owner).map(|(_, rows)| rows)
     }
 
     /// Registry key [`Self::lookup_fields`] resolved `owner` to.
@@ -1327,7 +1326,7 @@ impl StructFieldRegistry {
         let matched = {
             let index = self.field_path_index.borrow();
             let index = index.as_ref().expect("path index built");
-            let mut found: Option<String> = None;
+            let mut found: Option<std::sync::Arc<str>> = None;
             let mut ambiguous = false;
             if let Some(bucket) = index.by_last.get(leaf) {
                 for key in bucket {
@@ -1338,17 +1337,17 @@ impl StructFieldRegistry {
                         ambiguous = true;
                         break;
                     }
-                    found = Some(key.to_string());
+                    found = Some(std::sync::Arc::clone(key));
                 }
             }
             if ambiguous { None } else { found }
         }?;
         self.fields
-            .get_key_value(&matched)
+            .get_key_value(&*matched)
             .map(|(key, _)| key.as_str())
     }
 
-    fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
+    fn unique_suffix_owner_entry<'a>(&'a self, owner: &str) -> Option<(&'a str, &'a [FieldRow])> {
         // Two path-suffix-related keys share their last `::` segment, so
         // the bucket is the full candidate set. More than one match is
         // still `None`.
@@ -1357,7 +1356,7 @@ impl StructFieldRegistry {
         let matched = {
             let index = self.field_path_index.borrow();
             let index = index.as_ref().expect("path index built");
-            let mut found: Option<String> = None;
+            let mut found: Option<std::sync::Arc<str>> = None;
             let mut ambiguous = false;
             if let Some(bucket) = index.by_last.get(leaf) {
                 for key in bucket {
@@ -1369,14 +1368,18 @@ impl StructFieldRegistry {
                         ambiguous = true;
                         break;
                     }
-                    found = Some(key.to_string());
+                    found = Some(std::sync::Arc::clone(key));
                 }
             }
             if ambiguous { None } else { found }
         }?;
         self.fields
-            .get_key_value(&matched)
-            .map(|(key, _)| key.as_str())
+            .get_key_value(&*matched)
+            .map(|(key, rows)| (key.as_str(), rows.as_slice()))
+    }
+
+    fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
+        self.unique_suffix_owner_entry(owner).map(|(key, _)| key)
     }
 
     /// Run `f` over the registered keys whose last `::` segment is `leaf`.

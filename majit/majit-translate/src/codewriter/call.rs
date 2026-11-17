@@ -567,28 +567,6 @@ fn close_carried_flag_ids(
     annotated: &[BlockAnn],
     followed: &[(usize, usize)],
 ) -> HashSet<u64> {
-    let mut incoming: Vec<(u64, Option<u64>)> = Vec::new();
-    for &(block_idx, exit_idx) in followed {
-        let Some(exit) = graph
-            .blocks
-            .get(block_idx)
-            .and_then(|block| block.exits.get(exit_idx))
-        else {
-            continue;
-        };
-        let target = exit.target.0;
-        for (arg_idx, arg) in exit.args.iter().enumerate() {
-            let Some(dest) = graph
-                .blocks
-                .get(target)
-                .and_then(|block| block.inputargs.get(arg_idx))
-                .map(|var| var.id())
-            else {
-                continue;
-            };
-            incoming.push((dest, arg.as_variable().map(|var| var.id())));
-        }
-    }
     let mut forwards = Vec::new();
     for (block_idx, block) in graph.blocks.iter().enumerate() {
         let ann = annotated
@@ -611,6 +589,33 @@ fn close_carried_flag_ids(
                 Some(Carry::Forward(source, result)) => forwards.push((source, result)),
                 None => {}
             }
+        }
+    }
+    // With no seed nothing is hinted: no forward or incoming edge fires
+    // and the result is the empty set.
+    if seeds.is_empty() {
+        return seeds;
+    }
+    let mut incoming: Vec<(u64, Option<u64>)> = Vec::new();
+    for &(block_idx, exit_idx) in followed {
+        let Some(exit) = graph
+            .blocks
+            .get(block_idx)
+            .and_then(|block| block.exits.get(exit_idx))
+        else {
+            continue;
+        };
+        let target = exit.target.0;
+        for (arg_idx, arg) in exit.args.iter().enumerate() {
+            let Some(dest) = graph
+                .blocks
+                .get(target)
+                .and_then(|block| block.inputargs.get(arg_idx))
+                .map(|var| var.id())
+            else {
+                continue;
+            };
+            incoming.push((dest, arg.as_variable().map(|var| var.id())));
         }
     }
     let mut hinted = seeds.clone();

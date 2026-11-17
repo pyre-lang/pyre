@@ -299,7 +299,6 @@ fn build_semantic_program_via_active_frontend(
                     exception_class_hints.clone(),
                 );
                 exception_class_hint_ends.push(exception_class_hints.len());
-                prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -399,6 +398,7 @@ fn build_semantic_program_via_active_frontend(
                         fnptr_field_families.push(row);
                     }
                 }
+                prof.mark(&format!("    harvest {p}"));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
@@ -1079,13 +1079,16 @@ fn apply_harvested_funcobj_hints(
     }
 }
 
-/// `MAJIT_PROFILE_PIPELINE=1` phase profiler: elapsed wall time plus the
-/// process high-water RSS at each mark, so a phase's contribution to the
-/// translation prepass's peak footprint is visible next to its cost in time.
+/// `MAJIT_PROFILE_PIPELINE=1` phase profiler: elapsed wall time, the process
+/// CPU time the phase consumed (comparable across runs on a loaded machine,
+/// where wall time is not), plus the process high-water RSS at each mark, so
+/// a phase's contribution to the translation prepass's peak footprint is
+/// visible next to its cost in time.
 pub struct PhaseProfiler {
     enabled: bool,
     start: std::time::Instant,
     last: std::time::Instant,
+    last_cpu: f64,
 }
 
 impl PhaseProfiler {
@@ -1095,6 +1098,7 @@ impl PhaseProfiler {
             enabled: std::env::var_os("MAJIT_PROFILE_PIPELINE").is_some(),
             start: now,
             last: now,
+            last_cpu: process_cpu_secs(),
         }
     }
 
@@ -1103,15 +1107,18 @@ impl PhaseProfiler {
             return;
         }
         let now = std::time::Instant::now();
+        let cpu = process_cpu_secs();
         const GB: f64 = (1u64 << 30) as f64;
         eprintln!(
-            "[MAJIT_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  live {:>6.2}GB  peak {:>6.2}GB  {name}",
+            "[MAJIT_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  cpu {:>8.3}s  live {:>6.2}GB  peak {:>6.2}GB  {name}",
             (now - self.start).as_secs_f64(),
             (now - self.last).as_secs_f64(),
+            cpu - self.last_cpu,
             live_rss_bytes() as f64 / GB,
             peak_rss_bytes() as f64 / GB,
         );
         self.last = now;
+        self.last_cpu = cpu;
     }
 
     /// Emit a free-form line under the same gate as [`Self::mark`], for
@@ -1150,6 +1157,22 @@ pub fn peak_rss_bytes() -> u64 {
 #[cfg(not(unix))]
 pub fn peak_rss_bytes() -> u64 {
     0
+}
+
+/// `getrusage(RUSAGE_SELF)` user plus system time of the process, in seconds.
+#[cfg(unix)]
+fn process_cpu_secs() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
+#[cfg(not(unix))]
+fn process_cpu_secs() -> f64 {
+    0.0
 }
 
 /// Current resident set size. Unlike [`peak_rss_bytes`] this falls back when a

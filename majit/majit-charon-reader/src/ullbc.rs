@@ -461,15 +461,22 @@ impl FunDecl {
             .clone()
     }
 
+    /// The [`FunDecl::unstructured_shared`] body when that is already parsed, else a fresh
+    /// parse that leaves the shared cache unset. For a reader that does not modify the body
+    /// and does not query it again.
+    pub fn unstructured_transient(&self) -> Option<Arc<Unstructured>> {
+        let cached = self.unstructured_cache.lock().unwrap().clone();
+        match cached {
+            Some(shared) => shared,
+            None => self.unstructured().map(Arc::new),
+        }
+    }
+
     /// An owned [`FunDecl::unstructured`] body for a caller that modifies it: a copy of the
     /// [`FunDecl::unstructured_shared`] body when that is already parsed, else a fresh parse
     /// that leaves the shared cache unset.
     pub fn unstructured_owned(&self) -> Option<Unstructured> {
-        let cached = self.unstructured_cache.lock().unwrap().clone();
-        match cached {
-            Some(shared) => shared.as_deref().cloned(),
-            None => self.unstructured(),
-        }
+        self.unstructured_transient().map(Arc::unwrap_or_clone)
     }
 
     /// Drop the body [`FunDecl::unstructured_shared`] parsed. A later query parses again.

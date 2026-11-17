@@ -3621,6 +3621,8 @@ pub(in crate::front::mir) struct LlbcDerived {
         std::sync::OnceLock<Vec<(String, String)>>,
     pub(in crate::front::mir) fnptr_field_families:
         std::sync::OnceLock<Vec<(String, String, String)>>,
+    /// `(overrides, plain)` of the EvalFn family (`discover_eval_hook_families`).
+    pub(in crate::front::mir) eval_hook_families: std::sync::OnceLock<(Vec<String>, Vec<String>)>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {

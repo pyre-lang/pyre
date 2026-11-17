@@ -28,7 +28,7 @@ pub(in crate::front::mir) enum FnPtrFamily {
 
 /// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
 /// assigned to that parameter's type (the plain evaluator).
-fn discover_eval_hook_families(llbc: &Llbc) -> (Vec<String>, Vec<String>) {
+fn discover_eval_hook_families_uncached(llbc: &Llbc) -> (Vec<String>, Vec<String>) {
     let Some(eval_ty) = eval_fn_type_id(llbc) else {
         return (Vec::new(), Vec::new());
     };
@@ -80,10 +80,17 @@ fn discover_eval_hook_families(llbc: &Llbc) -> (Vec<String>, Vec<String>) {
     (overrides, plain)
 }
 
+/// [`discover_eval_hook_families_uncached`], computed once per artefact.
+fn discover_eval_hook_families(llbc: &Llbc) -> &(Vec<String>, Vec<String>) {
+    llbc_derived(llbc)
+        .eval_hook_families
+        .get_or_init(|| discover_eval_hook_families_uncached(llbc))
+}
+
 /// The registered-override graph of the EvalFn family (`register_eval_override`'s
 /// `FnDef` argument). The plain evaluator is not in this list.
 pub(crate) fn discover_eval_override_graphs(llbc: &Llbc) -> Vec<String> {
-    discover_eval_hook_families(llbc).0
+    discover_eval_hook_families(llbc).0.clone()
 }
 
 /// Crate-stripped paths of the prebuilt eval hook in this artefact.
@@ -93,10 +100,11 @@ pub(crate) fn discover_eval_override_graphs(llbc: &Llbc) -> Vec<String> {
 /// another crate see the registrar as an external `FunDecl`; the
 /// translator unions the lists before lowering.
 pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
-    let (mut overrides, plain) = discover_eval_hook_families(llbc);
+    let (overrides, plain) = discover_eval_hook_families(llbc);
+    let mut overrides = overrides.clone();
     for path in plain {
-        if !overrides.contains(&path) {
-            overrides.push(path);
+        if !overrides.contains(path) {
+            overrides.push(path.clone());
         }
     }
     overrides
@@ -570,7 +578,7 @@ fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, S
         if !fd.has_unstructured_body() {
             continue;
         }
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_transient() else {
             continue;
         };
         enroll_fnptr_field_stores(llbc, &body, &structs, &mut out, &mut unknown);

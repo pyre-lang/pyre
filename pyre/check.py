@@ -501,6 +501,13 @@ def cargo_finished_line(proc):
         "cargo build done",
     )
 
+
+def print_prepass_peak_rss(proc):
+    """Echo the build script's `peak RSS` warning from captured cargo stderr."""
+    for line in (proc.stderr or "").splitlines():
+        if "peak RSS" in line:
+            print(f"  {line.strip()}", flush=True)
+
 # ── Child-process user CPU time and peak RSS ─────────────────────────
 
 # Peak RSS in MiB of the most recent `run_timed` child, or None when the run
@@ -4862,6 +4869,7 @@ class Check:
             sys.exit(1)
         # The wall clock beside cargo's own figure is what makes a build that
         # recompiled the world distinguishable from a cache hit.
+        print_prepass_peak_rss(proc)
         print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
         # The digest has to be read back after this build, not carried over
         # from an earlier one in the same run.
@@ -4919,6 +4927,7 @@ class Check:
                     print(proc.stderr.rstrip())
                 print("────────────────────")
                 sys.exit(1)
+            print_prepass_peak_rss(proc)
             print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
         if not Path(WASM_BUILD_OUTPUT).exists():
             print(f"ERROR: wasm module not produced at {WASM_BUILD_OUTPUT}")

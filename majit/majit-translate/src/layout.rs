@@ -360,6 +360,27 @@ fn field_rows_cover_exact(
         .all(|name| rows.iter().any(|row| row.name == *name))
 }
 
+/// Every registry spelling that has a STRUCT identity, with its rows, ordered by identity and,
+/// within one identity, in registry iteration order.
+fn spellings_by_struct_id(
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+) -> Vec<(
+    majit_ir::descr::StructId,
+    &str,
+    &[crate::front::semantic::FieldRow],
+)> {
+    let mut out: Vec<_> = struct_fields
+        .fields
+        .iter()
+        .filter_map(|(name, rows)| {
+            majit_ir::descr::struct_id_for_name(name).map(|sid| (sid, name.as_str(), &rows[..]))
+        })
+        .collect();
+    // Stable: spellings of one identity keep registry order.
+    out.sort_by_key(|(sid, _, _)| *sid);
+    out
+}
+
 /// Registry spelling whose STRUCT identity is `sid` and whose rows name
 /// every field in `exact`. `get_field_descr(STRUCT, fieldname)` reads
 /// FIELD off STRUCT; a covering name of a different identity is not
@@ -367,9 +388,17 @@ fn field_rows_cover_exact(
 fn spelling_covering_exact<'a>(
     sid: majit_ir::descr::StructId,
     exact: &crate::front::semantic::ExactLayout,
-    struct_fields: &'a crate::front::semantic::StructFieldRegistry,
+    by_struct_id: &[(
+        majit_ir::descr::StructId,
+        &'a str,
+        &'a [crate::front::semantic::FieldRow],
+    )],
 ) -> Option<&'a str> {
-    for (name, rows) in struct_fields.fields.iter() {
+    let start = by_struct_id.partition_point(|(id, _, _)| *id < sid);
+    for (_, name, rows) in by_struct_id[start..]
+        .iter()
+        .take_while(|(id, _, _)| *id == sid)
+    {
         // A Void-only instance has empty offsets and empty rows; that
         // spelling still names the STRUCT (`get_size_descr` cache[STRUCT]).
         if !exact.field_offsets.is_empty() {
@@ -379,9 +408,7 @@ fn spelling_covering_exact<'a>(
         } else if !rows.is_empty() && !field_rows_cover_exact(rows, exact) {
             continue;
         }
-        if majit_ir::descr::struct_id_for_name(name) == Some(sid) {
-            return Some(name.as_str());
-        }
+        return Some(name);
     }
     None
 }
@@ -400,6 +427,7 @@ pub(crate) fn program_struct_layouts(
 ) -> Vec<ProgramStructLayout> {
     let mut installed = HashSet::new();
     let mut out = Vec::new();
+    let by_struct_id = spellings_by_struct_id(struct_fields);
     for (sid, exact) in exact_layouts {
         // A Void-only variant keeps `size` and no occupying fields
         // (`heaptracker.all_fielddescrs` skips `lltype.Void`). Install
@@ -408,7 +436,7 @@ pub(crate) fn program_struct_layouts(
         if exact.field_offsets.is_empty() && exact.size.is_none() {
             continue;
         }
-        let Some(spelling) = spelling_covering_exact(*sid, exact, struct_fields) else {
+        let Some(spelling) = spelling_covering_exact(*sid, exact, &by_struct_id) else {
             continue;
         };
         let Some(layout) =

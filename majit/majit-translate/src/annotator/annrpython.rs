@@ -518,7 +518,8 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
             // have recorded the link, then the snapshot below puts the
             // result annotation back to unbound. Drop the link record
             // with the annotation or `specialize_block` bindingreprs it.
-            *self.ann.links_followed.borrow_mut() = self.links_followed_at_entry.clone();
+            *self.ann.links_followed.borrow_mut() =
+                std::mem::take(&mut self.links_followed_at_entry);
             // Restore only previously-seen blocks that this subject actually
             // touched. `snapshot_block_if_tracking` records the cells before
             // mergeinputargs/reflow mutates them.
