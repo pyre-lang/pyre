@@ -28,7 +28,7 @@ use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory::{itemoffsetof, sizeof};
 use crate::translator::rtyper::lltypesystem::lltype::{
-    Array, FuncType, GcKind, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
+    Array, FuncType, GCREF, GcKind, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::lltypesystem::rbuilder::close_ovfcheck_block;
 use crate::translator::rtyper::lltypesystem::rstr::{
@@ -2892,6 +2892,51 @@ pub(crate) fn mint_ll_arraycopy(
     )
 }
 
+/// Native residual leaf for a raw/list copy of `item`.
+///
+/// The leaves in `rvec.rs` bake a WORD item:
+/// `ITEM_SIZE_I = size_of::<usize>()`, `ITEM_SIZE_F = size_of::<f64>()`,
+/// `ITEM_SIZE_R = size_of::<*mut u8>()` (the GCREF word). `getkind`
+/// maps Char, Bool, UniChar, SingleFloat and narrow ints onto Signed,
+/// which would pick `_i` and memcpy words. Upstream sizes the copy with
+/// `sizeof(ITEM)` (`rrawarray.py` `ll_copy_list_to_raw_array`,
+/// `rgc.py` `ll_arraycopy` `llmemory.sizeof(TP.OF)`).
+///
+/// `_i` is Signed and Unsigned (word-sized ints). Other Number
+/// primitives (`SignedLongLong` on LP64, `SIZE_T` / `INTPTR_T`) share
+/// `_i` only when `rffi::sizeof` equals `sizeof(Signed)`. SSIZE_T on
+/// Windows is already `Signed`. `_f` is Float. `_r` is a GC pointer.
+pub(crate) fn copy_item_word_sized_leaf(item: &LowLevelType) -> Option<&'static str> {
+    match item {
+        LowLevelType::Signed | LowLevelType::Unsigned => Some("i"),
+        LowLevelType::Float => Some("f"),
+        LowLevelType::Ptr(ptr)
+            if matches!(ptr._gckind(), GcKind::Gc | GcKind::Prebuilt)
+                && item_nbytes(item) == item_nbytes(&*GCREF) =>
+        {
+            Some("r")
+        }
+        other if other.is_number() && item_nbytes(other) == item_nbytes(&LowLevelType::Signed) => {
+            Some("i")
+        }
+        _ => None,
+    }
+}
+
+fn item_nbytes(item: &LowLevelType) -> Option<i64> {
+    match crate::translator::rtyper::lltypesystem::rffi::sizeof(item) {
+        Ok(ConstValue::Int(n)) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+fn no_word_sized_copy_leaf(helper: &str, item: &LowLevelType) -> TyperError {
+    TyperError::message(format!(
+        "{helper}: item lltype {} has no word-sized native leaf",
+        item.short_name()
+    ))
+}
+
 /// `ll_copy_raw_array_to_raw_array`: one `@jit.dont_look_inside`
 /// raw-to-raw `raw_memcopy` of `sizeof(ITEM) * length`. Used by
 /// `ListLayout::RustVec` `ll_copy` / getslice. Not `rgc.ll_arraycopy`
@@ -2901,6 +2946,12 @@ pub(crate) fn mint_ll_copy_raw_array(
     rtyper: &RPythonTyper,
     item: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
+    if copy_item_word_sized_leaf(&item).is_none() {
+        return Err(no_word_sized_copy_leaf(
+            "ll_copy_raw_array_to_raw_array",
+            &item,
+        ));
+    }
     let items_ptr = rust_vec_items_array_ptr_lltype(&item);
     rtyper.lowlevel_helper_function_with_builder(
         "ll_copy_raw_array_to_raw_array".to_string(),
@@ -2926,25 +2977,6 @@ fn mint_item_copy_helper(
     }
 }
 
-fn assert_gc_array_items_ptr(items_ptr: &LowLevelType) -> Result<(), TyperError> {
-    let LowLevelType::Ptr(ptr) = items_ptr else {
-        return Err(TyperError::message(format!(
-            "ll_arraycopy: {} is not a Ptr",
-            items_ptr.short_name()
-        )));
-    };
-    match &ptr.TO {
-        PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => Ok(()),
-        PtrTarget::Array(_) => Err(TyperError::message(
-            "ll_arraycopy: raw Array copies through ll_copy_raw_array_to_raw_array".to_string(),
-        )),
-        PtrTarget::FixedSizeArray(_) => Ok(()),
-        other => Err(TyperError::message(format!(
-            "ll_arraycopy: expected Ptr(GcArray), got Ptr({other:?})"
-        ))),
-    }
-}
-
 /// Synthesise `rgc.ll_arraycopy(source, dest, source_start, dest_start,
 /// length)` (`rpython/rlib/rgc.py` `ll_arraycopy`) as the `length <= 1`
 /// `copy_item` head plus the slowpath element loop:
@@ -2961,12 +2993,11 @@ fn assert_gc_array_items_ptr(items_ptr: &LowLevelType) -> Result<(), TyperError>
 ///         i += 1
 /// ```
 ///
-/// One helper per ARRAY lltype (`@specialize.ll()`). `items_ptr` is
-/// `Ptr(GcArray(ITEM))`; a raw nolength `Ptr(Array(ITEM))` is
-/// `ListLayout::RustVec` and copies through
-/// [`build_ll_copy_raw_array_to_raw_array_helper_graph`] instead.
-/// `jtransform.py` `_handle_list_call` asserts LIST is GcStruct or
-/// GcArray.
+/// One helper per ARRAY lltype (`@specialize.ll()`). `items_ptr` is any
+/// `Ptr(Array(ITEM))`: `rgc.ll_arraycopy` has no GC-only check. The
+/// restriction lives in `Transformer._handle_list_call` (`jtransform.py`):
+/// `resizable = isinstance(LIST, lltype.GcStruct)` then
+/// `assert resizable == (not isinstance(LIST, lltype.GcArray))`.
 ///
 /// The fast arm (`_contains_gcptr` → `gc_writebarrier_before_copy`,
 /// `raw_memcopy` + `keepalive_until_here`) is not minted: no graph-level
@@ -2985,7 +3016,6 @@ pub(crate) fn build_ll_arraycopy_helper_graph(
     item_lltype: LowLevelType,
     items_ptr: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    assert_gc_array_items_ptr(&items_ptr)?;
     let src = variable_with_lltype("source", items_ptr.clone());
     let dst = variable_with_lltype("dest", items_ptr.clone());
     let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
@@ -7355,6 +7385,9 @@ pub(crate) fn ll_copy_list_to_raw_array_helper(
     rtyper: &RPythonTyper,
     item: &LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
+    if copy_item_word_sized_leaf(item).is_none() {
+        return Err(no_word_sized_copy_leaf("ll_copy_list_to_raw_array", item));
+    }
     let segment = rust_vec_item_key_segment(item).ok_or_else(|| {
         TyperError::message(format!(
             "ll_copy_list_to_raw_array: item lltype {} has no key segment",
@@ -17235,6 +17268,35 @@ mod tests {
         let _keep = ann;
     }
 
+    /// Char / Bool / a narrow int have no word-sized native leaf.
+    /// `ll_copy_list_to_raw_array_helper` fails at rtype time.
+    #[test]
+    fn ll_copy_list_to_raw_array_helper_refuses_non_word_item() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let narrow = crate::translator::rtyper::lltypesystem::rffi::number_from_forced_int(
+            "r_int32_list_to_raw",
+            true,
+            32,
+        );
+        for item in [LowLevelType::Char, LowLevelType::Bool, narrow] {
+            let err = ll_copy_list_to_raw_array_helper(&rtyper, &item).expect_err("non-word item");
+            let text = err.to_string();
+            assert!(
+                text.contains(&item.short_name()),
+                "helper names the item type, got {text}"
+            );
+            assert!(
+                text.contains("no word-sized native leaf"),
+                "helper refuses a non-word item, got {text}"
+            );
+        }
+        let _keep = ann;
+    }
+
     /// A `GCREF` source copied into an `OBJECTPTR` header is its own
     /// graph: same segment name, different result lowleveltype.
     #[test]
@@ -17279,5 +17341,50 @@ mod tests {
         assert_eq!(into.result, header);
         let again = ll_vec_copy_from_fixed_list_into(&rtyper, &*GCREF, &header).expect("memo");
         assert_eq!(into.graph_key(), again.graph_key());
+    }
+
+    /// `rgc.ll_arraycopy` (`@specialize.ll()`) mints for whatever ARRAY,
+    /// including a raw `Ptr(Array(Signed))`. The GC-only restriction is
+    /// `Transformer._handle_list_call`, not this builder.
+    #[test]
+    fn rtyper_mints_ll_arraycopy_for_raw_ptr_array_signed() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
+        }));
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_arraycopy".to_string(),
+                vec![
+                    items_ptr.clone(),
+                    items_ptr.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                {
+                    let items_ptr = items_ptr.clone();
+                    move |_rtyper, _args, _result| {
+                        build_ll_arraycopy_helper_graph(
+                            "ll_arraycopy",
+                            LowLevelType::Signed,
+                            items_ptr.clone(),
+                        )
+                    }
+                },
+            )
+            .expect("raw Ptr(Array(Signed)) mints ll_arraycopy");
+        assert_eq!(helper.name, "ll_arraycopy");
+        assert!(helper.graph.is_some());
+        let inner = helper.graph.as_ref().unwrap().graph.borrow();
+        checkgraph(&inner);
+        let (_, all_ops) = walk_ops(&inner.startblock);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert!(
+            n("getarrayitem") >= 1 && n("setarrayitem") >= 1,
+            "element loop over a raw Ptr(Array) is well-defined, ops={all_ops:?}"
+        );
     }
 }
