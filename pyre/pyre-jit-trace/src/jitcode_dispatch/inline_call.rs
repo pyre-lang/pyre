@@ -17365,6 +17365,11 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        // `perform_call` raises `ChangeFrame`; `_interpret` continues
+        // over `framestack`. Nested under a sub-walk driver,
+        // `run_sub_jitcode_walk_from` returns `SubWalkSuspended` instead
+        // of driving — the same ChangeFrame. `pending` is already published.
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         outcome => {
             // The same odometer the `__next__` route reads: once the sub-walk
             // has executed a concrete effect, `cut_trace_with_snapshots`
@@ -17578,6 +17583,11 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        // `perform_call` raises `ChangeFrame`; `_interpret` continues
+        // over `framestack`. Nested under a sub-walk driver,
+        // `run_sub_jitcode_walk_from` returns `SubWalkSuspended` instead
+        // of driving — the same ChangeFrame. `pending` is already published.
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         outcome => {
             // Rewinding the emission and falling through to the caller's
             // residual re-runs the whole `__next__`. Once the sub-walk has
@@ -20794,6 +20804,11 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // since handed to another operation.
     let descent = match descent {
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
+        // `perform_call` raises `ChangeFrame`; `_interpret` continues
+        // over `framestack`. Nested under a sub-walk driver,
+        // `run_sub_jitcode_walk_from` returns `SubWalkSuspended` instead
+        // of driving — the same ChangeFrame. `pending` is already published.
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         other => other,
     };
     let rewind_outermost = rewind_guard

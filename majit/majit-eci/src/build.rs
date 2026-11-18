@@ -239,7 +239,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected, extra);
-    merge_cextern_variables(&mut collected);
+    merge_cextern_variables(&mut collected, extra);
     resolve_llexternal_use_ecis(&collected);
     write_copaque_sizes(&collected, extra);
 
@@ -405,8 +405,12 @@ fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationI
 
 /// `rffi.CExternVariable`: merge each declaration's getter/setter C into
 /// its named ECI (`eci.merge` of `separate_module_sources` and
-/// `post_include_bits`).
-fn merge_cextern_variables(collected: &mut CrateItems) {
+/// `post_include_bits`). Typedefs in `RFFI_TYPES` / `SIMPLE_TYPES` are
+/// measured the same way `generate_macro_wrapper` measures them, so a
+/// `libc::uid_t` site becomes the integer class `rffi_platform.SimpleType`
+/// recorded. `extra` is the `compile_crate_ecis` ECI the macro-wrapper
+/// path already merges into each SimpleType configure.
+fn merge_cextern_variables(collected: &mut CrateItems, extra: &ExternalCompilationInfo) {
     let items = std::mem::take(&mut collected.cextern_variables);
     let mut eci_idxs: Vec<usize> = Vec::new();
     for item in &items {
@@ -419,8 +423,21 @@ fn merge_cextern_variables(collected: &mut CrateItems) {
             &item.head.compilation_info,
         ));
     }
-    let measured_rffi: Vec<(String, crate::rffi_platform::IntType)> = Vec::new();
-    let measured_simple: Vec<((usize, String), crate::rffi_platform::IntType)> = Vec::new();
+    let mut sites: Vec<(Vec<&syn::Type>, &[String], usize)> = Vec::new();
+    for (item, eci_idx) in items.iter().zip(&eci_idxs) {
+        sites.push((vec![&item.head.ty], item.module_path.as_slice(), *eci_idx));
+    }
+    let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(
+        collected,
+        sites
+            .iter()
+            .map(|(types, module_path, eci_idx)| (types.as_slice(), *module_path, *eci_idx)),
+    );
+    let (measured_rffi, measured_simple) = if rffi_names.is_empty() && simple_groups.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        measure_collected_inttypes(collected, extra, rffi_names, simple_groups)
+    };
     for (item, eci_idx) in items.iter().zip(&eci_idxs) {
         let eci_idx = *eci_idx;
         let resolve =
@@ -559,17 +576,13 @@ fn cextern_c_type(
     if let Some(c_type) = &item.head.c_type {
         return c_type.clone();
     }
-    match resolved_cextern_extern_path(&item.head.ty, &item.module_path, resolve)
+    let resolved_path = resolved_cextern_extern_path(&item.head.ty, &item.module_path, resolve);
+    match resolved_path
         .as_deref()
         .and_then(classify_cextern_rffi_type)
     {
         Some(CexternRffiCType::CharPP) => "char **".into(),
         Some(CexternRffiCType::CharP) => "char *".into(),
-        Some(CexternRffiCType::AmbiguousInt) => panic!(
-            "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
-            item.file_path.display(),
-            item.head.name
-        ),
         None => {
             let template = crate::cdecl::gettype(&item.head.ty, &item.module_path, resolve)
                 .unwrap_or_else(|msg| {
@@ -579,8 +592,73 @@ fn cextern_c_type(
                         item.head.name
                     )
                 });
-            crate::cdecl::cdecl(&template, "")
+            let model = CIntDataModel::from_target_env();
+            if let Some(path) = resolved_path.as_deref() {
+                let is_rffi = matches!(path, [a, b, _] if a == "majit_rlib" && b == "rffi");
+                if !is_rffi {
+                    if let Some(last) = path.last() {
+                        if template == format!("{last} @")
+                            && cextern_template_int_identity(&template, &model).is_none()
+                        {
+                            // An unmeasured typedef has no lltype here; its C name is emitted as written.
+                            return crate::cdecl::cdecl(&template, "");
+                        }
+                    }
+                }
+            }
+            let pointee_is_array =
+                cextern_pointee_is_array(&item.head.ty, &item.module_path, resolve);
+            match cextern_default_c_type(&template, &model, pointee_is_array) {
+                Ok(c_type) => c_type,
+                Err(CexternDefaultCTypeError::AmbiguousInt) => panic!(
+                    "{}: cextern_variable `{}`: ambiguous type on 32-bit machines: give a c_type",
+                    item.file_path.display(),
+                    item.head.name
+                ),
+                Err(CexternDefaultCTypeError::NoPrimitive) => panic!(
+                    "{}: cextern_variable `{}`: no primitive C type for this type: give a c_type",
+                    item.file_path.display(),
+                    item.head.name
+                ),
+            }
         }
+    }
+}
+
+/// `CExternVariable` `c_type is None` after `TYPE == CCHARPP` / `CCHARP`.
+#[derive(Debug, PartialEq, Eq)]
+enum CexternDefaultCTypeError {
+    /// `TYPE == INT or TYPE == LONG`.
+    AmbiguousInt,
+    /// `PrimitiveType[TYPE]` KeyError: pointer other than `CCHARP`/`CCHARPP`,
+    /// struct, array, function, `CONST_CCHARP` (`const char *@`), or a
+    /// typedef in neither `RFFI_TYPES` nor `SIMPLE_TYPES`.
+    NoPrimitive,
+}
+
+/// Default `c_type` from a `gettype` template: integer identity, then the
+/// non-integer primitive spellings `int_template` / `rffi_type_template` /
+/// `last_segment_c_type` can emit (`Char` / `Float` / `SingleFloat` / `Void`),
+/// then `CCHARP`/`CCHARPP` structure (`char *@` / `char **@`) when the type is
+/// not a pointer to an array or slice. `UniChar` / `Bool` have no scalar
+/// spelling there. `CONST_CCHARP` stays `NoPrimitive`.
+fn cextern_default_c_type(
+    template: &str,
+    model: &CIntDataModel,
+    pointee_is_array: bool,
+) -> Result<String, CexternDefaultCTypeError> {
+    if cextern_template_int_identity(template, model).is_some() {
+        if cextern_template_is_ambiguous_int(template, model) {
+            Err(CexternDefaultCTypeError::AmbiguousInt)
+        } else {
+            Ok(crate::cdecl::cdecl(template, ""))
+        }
+    } else if matches!(template, "char @" | "float @" | "double @" | "void @") {
+        Ok(crate::cdecl::cdecl(template, ""))
+    } else if matches!(template, "char *@" | "char **@") && !pointee_is_array {
+        Ok(crate::cdecl::cdecl(template, ""))
+    } else {
+        Err(CexternDefaultCTypeError::NoPrimitive)
     }
 }
 
@@ -589,10 +667,9 @@ fn cextern_c_type(
 pub(crate) enum CexternRffiCType {
     CharPP,
     CharP,
-    AmbiguousInt,
 }
 
-/// Match a resolved extern path against `majit_rlib::rffi::{CCHARPP, CCHARP, INT, LONG}`.
+/// Match a resolved extern path against `majit_rlib::rffi::{CCHARPP, CCHARP}`.
 pub(crate) fn classify_cextern_rffi_type(resolved: &[String]) -> Option<CexternRffiCType> {
     let [a, b, c] = resolved else {
         return None;
@@ -603,8 +680,79 @@ pub(crate) fn classify_cextern_rffi_type(resolved: &[String]) -> Option<CexternR
     match c.as_str() {
         "CCHARPP" => Some(CexternRffiCType::CharPP),
         "CCHARP" => Some(CexternRffiCType::CharP),
-        "INT" | "LONG" => Some(CexternRffiCType::AmbiguousInt),
         _ => None,
+    }
+}
+
+/// Data model `rffi.CExternVariable` uses when comparing `TYPE == INT or TYPE == LONG`.
+/// `rarithmetic.build_int` / `lltype.build_number` identify an integer class by
+/// `(signed, bits)`; C `int` is 32 bits, C `long` is 32 on Windows or 32-bit
+/// pointers and 64 otherwise, and `Signed`/`intptr_t`/`ssize_t` follow the
+/// pointer width (`LONG_BIT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CIntDataModel {
+    int_bits: u32,
+    long_bits: u32,
+    ptr_bits: u32,
+}
+
+impl CIntDataModel {
+    fn from_cfg(os: &str, pointer_width: u32) -> Self {
+        let long_bits = if os == "windows" || pointer_width == 32 {
+            32
+        } else {
+            64
+        };
+        Self {
+            int_bits: 32,
+            long_bits,
+            ptr_bits: pointer_width,
+        }
+    }
+
+    fn from_target_env() -> Self {
+        let os = match std::env::var("CARGO_CFG_TARGET_OS") {
+            Ok(os) => os,
+            Err(_) => {
+                if cfg!(windows) {
+                    "windows".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        let pointer_width = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
+            .ok()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(usize::BITS);
+        Self::from_cfg(&os, pointer_width)
+    }
+}
+
+/// Integer identity `(signed, bits)` of a `gettype` template under `model`.
+/// Spellings from `int_template` / `rffi_type_template` / `last_segment_c_type`.
+fn cextern_template_int_identity(template: &str, model: &CIntDataModel) -> Option<(bool, u32)> {
+    Some(match template {
+        "signed char @" => (true, 8),
+        "unsigned char @" => (false, 8),
+        "short @" => (true, 16),
+        "unsigned short @" => (false, 16),
+        "int @" => (true, model.int_bits),
+        "unsigned int @" => (false, model.int_bits),
+        "long @" => (true, model.long_bits),
+        "unsigned long @" => (false, model.long_bits),
+        "long long @" => (true, 64),
+        "unsigned long long @" => (false, 64),
+        "Signed @" | "ssize_t @" | "intptr_t @" => (true, model.ptr_bits),
+        "size_t @" | "uintptr_t @" => (false, model.ptr_bits),
+        _ => return None,
+    })
+}
+
+fn cextern_template_is_ambiguous_int(template: &str, model: &CIntDataModel) -> bool {
+    match cextern_template_int_identity(template, model) {
+        Some((true, bits)) => bits == model.int_bits || bits == model.long_bits,
+        _ => false,
     }
 }
 
@@ -613,6 +761,24 @@ fn resolved_cextern_extern_path(
     module_path: &[String],
     resolve: &dyn Fn(&syn::Path, &[String]) -> Option<crate::cdecl::Resolved>,
 ) -> Option<Vec<String>> {
+    let (current, module_path) = cextern_peel_aliases(ty, module_path, resolve)?;
+    match current {
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            match resolve(&type_path.path, &module_path) {
+                Some(crate::cdecl::Resolved::Extern(p)) => Some(p),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Peel `Type::Paren`/`Type::Group` and follow `Resolved::Alias`.
+fn cextern_peel_aliases(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<crate::cdecl::Resolved>,
+) -> Option<(Type, Vec<String>)> {
     let mut current = ty.clone();
     let mut module_path = module_path.to_vec();
     let mut visited: Vec<(Vec<String>, String)> = Vec::new();
@@ -631,13 +797,32 @@ fn resolved_cextern_extern_path(
                         module_path = alias_module;
                         target
                     }
-                    Some(crate::cdecl::Resolved::Extern(p)) => return Some(p),
-                    _ => return None,
+                    _ => return Some((Type::Path(type_path), module_path)),
                 }
             }
-            _ => return None,
+            other => return Some((other, module_path)),
         };
     }
+}
+
+/// `TYPE == CCHARP` is false for `Ptr(FixedSizeArray(Char, n))`; `gettype`
+/// still spells that pointer as `char *@` because `FixedSizeArrayDefNode.getptrtype`
+/// collapses to a pointer to the item.
+fn cextern_pointee_is_array(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<crate::cdecl::Resolved>,
+) -> bool {
+    let Some((current, module_path)) = cextern_peel_aliases(ty, module_path, resolve) else {
+        return false;
+    };
+    let Type::Ptr(ptr) = current else {
+        return false;
+    };
+    matches!(
+        cextern_peel_aliases(&ptr.elem, &module_path, resolve),
+        Some((Type::Array(_) | Type::Slice(_), _))
+    )
 }
 
 fn resolve_macro_type(
@@ -923,18 +1108,38 @@ fn measure_macro_wrapper_inttypes(
     Vec<(String, crate::rffi_platform::IntType)>,
     Vec<((usize, String), crate::rffi_platform::IntType)>,
 ) {
-    let mut rffi_names = Vec::new();
-    let mut simple_groups: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut sites: Vec<(Vec<&syn::Type>, &[String], usize)> = Vec::new();
     for (item, eci_idx) in llexternals.iter().zip(eci_idxs) {
         if item.head.macro_.is_none() {
             continue;
         }
         let eci_idx = eci_idx.expect("macro llexternal eci_idx");
+        let mut types: Vec<&syn::Type> = item.head.args.iter().collect();
+        types.push(&item.head.result);
+        sites.push((types, item.module_path.as_slice(), eci_idx));
+    }
+    measure_inttypes_for_type_sites(
+        collected,
+        extra,
+        sites
+            .iter()
+            .map(|(types, module_path, eci_idx)| (types.as_slice(), *module_path, *eci_idx)),
+    )
+}
+
+/// Split `libc` names at each type site into `RFFI_TYPES` and per-ECI
+/// `SIMPLE_TYPES` groups. Empty groups mean no `rffi_platform.configure`.
+fn collect_inttype_groups_for_sites<'a>(
+    collected: &CrateItems,
+    sites: impl IntoIterator<Item = (&'a [&'a syn::Type], &'a [String], usize)>,
+) -> (Vec<String>, Vec<(usize, Vec<String>)>) {
+    let mut rffi_names = Vec::new();
+    let mut simple_groups: Vec<(usize, Vec<String>)> = Vec::new();
+    for (types, module_path, eci_idx) in sites {
         let mut names = Vec::new();
-        for ty in &item.head.args {
-            collect_macro_inttypes(collected, ty, &item.module_path, &mut names);
+        for ty in types {
+            collect_macro_inttypes(collected, ty, module_path, &mut names);
         }
-        collect_macro_inttypes(collected, &item.head.result, &item.module_path, &mut names);
         for name in names {
             if RFFI_TYPES.contains(&name.as_str()) {
                 if !rffi_names.contains(&name) {
@@ -952,7 +1157,30 @@ fn measure_macro_wrapper_inttypes(
             }
         }
     }
+    (rffi_names, simple_groups)
+}
 
+fn measure_inttypes_for_type_sites<'a>(
+    collected: &CrateItems,
+    extra: &ExternalCompilationInfo,
+    sites: impl IntoIterator<Item = (&'a [&'a syn::Type], &'a [String], usize)>,
+) -> (
+    Vec<(String, crate::rffi_platform::IntType)>,
+    Vec<((usize, String), crate::rffi_platform::IntType)>,
+) {
+    let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(collected, sites);
+    measure_collected_inttypes(collected, extra, rffi_names, simple_groups)
+}
+
+fn measure_collected_inttypes(
+    collected: &CrateItems,
+    extra: &ExternalCompilationInfo,
+    rffi_names: Vec<String>,
+    simple_groups: Vec<(usize, Vec<String>)>,
+) -> (
+    Vec<(String, crate::rffi_platform::IntType)>,
+    Vec<((usize, String), crate::rffi_platform::IntType)>,
+) {
     let measured_rffi = if rffi_names.is_empty() {
         Vec::new()
     } else {
@@ -2046,10 +2274,42 @@ fn env_key(name: &str) -> String {
 
 #[cfg(test)]
 mod classify_cextern_rffi_type_tests {
-    use super::{CexternRffiCType, classify_cextern_rffi_type};
+    use super::{
+        CIntDataModel, CexternDefaultCTypeError, CexternRffiCType, CollectedCExternVariable,
+        CrateItems, cextern_c_type, cextern_default_c_type, cextern_template_is_ambiguous_int,
+        classify_cextern_rffi_type, collect_inttype_groups_for_sites,
+    };
+    use std::path::PathBuf;
 
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn collected(src: &str) -> CollectedCExternVariable {
+        CollectedCExternVariable {
+            file_path: PathBuf::from("test.rs"),
+            module_path: Vec::new(),
+            head: syn::parse_str(src).unwrap_or_else(|err| panic!("{src}: {err}")),
+        }
+    }
+
+    fn resolve_as_extern(
+        path: &syn::Path,
+        _module_path: &[String],
+    ) -> Option<crate::cdecl::Resolved> {
+        Some(crate::cdecl::Resolved::Extern(
+            path.segments.iter().map(|s| s.ident.to_string()).collect(),
+        ))
+    }
+
+    fn assert_ambiguous(model: &CIntDataModel, cases: &[(&str, &str, bool)]) {
+        for (name, template, expected) in cases {
+            assert_eq!(
+                cextern_template_is_ambiguous_int(template, model),
+                *expected,
+                "{name} template {template} under {model:?}"
+            );
+        }
     }
 
     #[test]
@@ -2064,11 +2324,11 @@ mod classify_cextern_rffi_type_tests {
         );
         assert_eq!(
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "INT"])),
-            Some(CexternRffiCType::AmbiguousInt)
+            None
         );
         assert_eq!(
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "LONG"])),
-            Some(CexternRffiCType::AmbiguousInt)
+            None
         );
     }
 
@@ -2083,5 +2343,309 @@ mod classify_cextern_rffi_type_tests {
             classify_cextern_rffi_type(&path(&["majit_rlib", "rffi", "VOIDP"])),
             None
         );
+    }
+
+    #[test]
+    fn from_cfg_lp64_llp64_ilp32() {
+        let lp64 = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            lp64,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 64,
+                ptr_bits: 64
+            }
+        );
+        let llp64 = CIntDataModel::from_cfg("windows", 64);
+        assert_eq!(
+            llp64,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 32,
+                ptr_bits: 64
+            }
+        );
+        let ilp32 = CIntDataModel::from_cfg("linux", 32);
+        assert_eq!(
+            ilp32,
+            CIntDataModel {
+                int_bits: 32,
+                long_bits: 32,
+                ptr_bits: 32
+            }
+        );
+    }
+
+    #[test]
+    fn lp64_signed_int_and_long_classes_are_ambiguous() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_ambiguous(
+            &model,
+            &[
+                ("INT", "int @", true),
+                ("LONG", "Signed @", true),
+                ("LONGLONG", "Signed @", true),
+                ("SIGNED", "Signed @", true),
+                ("i32", "int @", true),
+                ("i64", "Signed @", true),
+                ("isize", "Signed @", true),
+                ("std::ffi::c_long", "Signed @", true),
+                ("UINT", "unsigned int @", false),
+                ("ULONG", "size_t @", false),
+                ("SHORT", "short @", false),
+                ("CHAR", "char @", false),
+                ("u32", "unsigned int @", false),
+                ("u64", "size_t @", false),
+                ("usize", "size_t @", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn llp64_only_signed_32_is_ambiguous() {
+        let model = CIntDataModel::from_cfg("windows", 64);
+        assert_ambiguous(
+            &model,
+            &[
+                ("INT", "int @", true),
+                ("LONG", "int @", true),
+                ("i32", "int @", true),
+                ("LONGLONG", "Signed @", false),
+                ("SIGNED", "Signed @", false),
+                ("i64", "Signed @", false),
+                ("isize", "Signed @", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn cextern_c_type_ccharpp_feeds_generate_cextern_variable() {
+        let item = collected(
+            r#"pub os_get_environ, pub _os_set_environ = "environ", majit_rlib::rffi::CCHARPP, compilation_info = ECI"#,
+        );
+        let c_type = cextern_c_type(&item, &resolve_as_extern);
+        assert_eq!(c_type, "char **");
+        let eci = crate::generate_cextern_variable("environ", &c_type, false, false, &[]);
+        assert!(
+            eci.separate_module_sources[0].contains("char ** get_environ () { return environ; }"),
+            "{:?}",
+            eci.separate_module_sources
+        );
+    }
+
+    #[test]
+    fn cextern_c_type_keeps_explicit_int() {
+        let item = collected(
+            r#"pub _get_errno, pub _set_errno = "errno", majit_rlib::rffi::INT, compilation_info = ECI, c_type = "int""#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "int");
+    }
+
+    #[test]
+    fn cextern_c_type_short_is_not_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::SHORT, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "short");
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous type on 32-bit machines: give a c_type")]
+    fn cextern_c_type_int_without_c_type_is_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::INT, compilation_info = ECI"#,
+        );
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    #[should_panic(expected = "ambiguous type on 32-bit machines: give a c_type")]
+    fn cextern_c_type_i32_without_c_type_is_ambiguous() {
+        let item = collected(r#"pub get_x, pub set_x = "x", i32, compilation_info = ECI"#);
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    fn cextern_default_c_type_accepts_primitives() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            cextern_default_c_type("double @", &model, false),
+            Ok("double".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("float @", &model, false),
+            Ok("float".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("char @", &model, false),
+            Ok("char".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("void @", &model, false),
+            Ok("void".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("unsigned int @", &model, false),
+            Ok("unsigned int".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("int @", &model, false),
+            Err(CexternDefaultCTypeError::AmbiguousInt)
+        );
+    }
+
+    #[test]
+    fn cextern_default_c_type_rejects_non_primitives() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        for template in ["void *@", "struct foo @", "pid_t @", "const char *@"] {
+            assert_eq!(
+                cextern_default_c_type(template, &model, false),
+                Err(CexternDefaultCTypeError::NoPrimitive),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn cextern_default_c_type_accepts_char_pointer_templates() {
+        let model = CIntDataModel::from_cfg("linux", 64);
+        assert_eq!(
+            cextern_default_c_type("char *@", &model, false),
+            Ok("char *".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("char **@", &model, false),
+            Ok("char **".into())
+        );
+        assert_eq!(
+            cextern_default_c_type("const char *@", &model, false),
+            Err(CexternDefaultCTypeError::NoPrimitive)
+        );
+        assert_eq!(
+            cextern_default_c_type("char *@", &model, true),
+            Err(CexternDefaultCTypeError::NoPrimitive)
+        );
+        assert_eq!(
+            cextern_default_c_type("char **@", &model, true),
+            Err(CexternDefaultCTypeError::NoPrimitive)
+        );
+    }
+
+    #[test]
+    fn cextern_type_site_collects_measurable_libc_names() {
+        let collected = CrateItems::default();
+        let uid: syn::Type = syn::parse_str("libc::uid_t").unwrap();
+        let gid: syn::Type = syn::parse_str("libc::gid_t").unwrap();
+        let pid: syn::Type = syn::parse_str("libc::pid_t").unwrap();
+        let time: syn::Type = syn::parse_str("libc::time_t").unwrap();
+        let sock: syn::Type = syn::parse_str("libc::socklen_t").unwrap();
+        let ino: syn::Type = syn::parse_str("libc::ino_t").unwrap();
+        let charp: syn::Type = syn::parse_str("*mut std::ffi::c_char").unwrap();
+        let uid_ty: [&syn::Type; 1] = [&uid];
+        let gid_ty: [&syn::Type; 1] = [&gid];
+        let pid_ty: [&syn::Type; 1] = [&pid];
+        let time_ty: [&syn::Type; 1] = [&time];
+        let sock_ty: [&syn::Type; 1] = [&sock];
+        let ino_ty: [&syn::Type; 1] = [&ino];
+        let charp_ty: [&syn::Type; 1] = [&charp];
+        let empty: &[String] = &[];
+        let (rffi_names, simple_groups) = collect_inttype_groups_for_sites(
+            &collected,
+            [
+                (uid_ty.as_slice(), empty, 0usize),
+                (gid_ty.as_slice(), empty, 0),
+                (pid_ty.as_slice(), empty, 1),
+                (time_ty.as_slice(), empty, 1),
+                (sock_ty.as_slice(), empty, 0),
+                (ino_ty.as_slice(), empty, 0),
+                (charp_ty.as_slice(), empty, 0),
+            ],
+        );
+        assert_eq!(rffi_names, vec!["pid_t".to_string(), "time_t".to_string()]);
+        assert_eq!(
+            simple_groups,
+            vec![(
+                0usize,
+                vec![
+                    "uid_t".to_string(),
+                    "gid_t".to_string(),
+                    "socklen_t".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn cextern_c_type_uint_is_not_ambiguous() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::UINT, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "unsigned int");
+    }
+
+    #[test]
+    fn cextern_c_type_double_is_primitive() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::DOUBLE, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "double");
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_voidp_needs_c_type() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", majit_rlib::rffi::VOIDP, compilation_info = ECI"#,
+        );
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    fn cextern_c_type_unmeasured_extern_typedef_keeps_c_name() {
+        let ino = collected(r#"pub get_x, pub set_x = "x", libc::ino_t, compilation_info = ECI"#);
+        assert_eq!(cextern_c_type(&ino, &resolve_as_extern), "ino_t");
+        // Unmeasured via this helper; ambiguity needs measurement, which
+        // `merge_cextern_variables` performs for SIMPLE_TYPES names.
+        let pid = collected(r#"pub get_x, pub set_x = "x", libc::pid_t, compilation_info = ECI"#);
+        assert_eq!(cextern_c_type(&pid, &resolve_as_extern), "pid_t");
+        let pid_bare = collected(r#"pub get_x, pub set_x = "x", pid_t, compilation_info = ECI"#);
+        assert_eq!(cextern_c_type(&pid_bare, &resolve_as_extern), "pid_t");
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_struct_needs_c_type() {
+        let item = collected(r#"pub get_x, pub set_x = "x", stat, compilation_info = ECI"#);
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_local_struct_needs_c_type() {
+        let item = collected(r#"pub get_x, pub set_x = "x", Foo, compilation_info = ECI"#);
+        let resolve = |path: &syn::Path, _module_path: &[String]| {
+            Some(crate::cdecl::Resolved::LocalStruct {
+                name: path.segments.last().unwrap().ident.to_string(),
+                c_name: None,
+            })
+        };
+        let _ = cextern_c_type(&item, &resolve);
+    }
+
+    #[test]
+    #[should_panic(expected = "no primitive C type for this type: give a c_type")]
+    fn cextern_c_type_pointer_to_char_array_is_not_ccharp() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", *mut [std::ffi::c_char; 4], compilation_info = ECI"#,
+        );
+        let _ = cextern_c_type(&item, &resolve_as_extern);
+    }
+
+    #[test]
+    fn cextern_c_type_char_pointer_is_ccharp() {
+        let item = collected(
+            r#"pub get_x, pub set_x = "x", *mut std::ffi::c_char, compilation_info = ECI"#,
+        );
+        assert_eq!(cextern_c_type(&item, &resolve_as_extern), "char *");
     }
 }
