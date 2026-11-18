@@ -74,6 +74,8 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::num::_::is_ascii_whitespace",
     "--include",
+    "core::num::_::is_ascii_digit",
+    "--include",
     "core::num::_::wrapping_sub",
     "--include",
     "core::char::methods::_::from_u32",
@@ -296,6 +298,13 @@ CHARON_ARGS = [
     "rustpython_wtf8::core_char::len_utf8",
     "--include",
     "rustpython_wtf8::core_char::encode_utf8_raw",
+    # Primitive `Bits` associated consts (`EMPTY`) that `Flags::{intersects,
+    # is_empty}` compare against. The impl lives outside the extraction set,
+    # so the NamedConst initializer stays Opaque unless included; the
+    # generic global const-eval then has no body. Matcher shape is the same
+    # as `core::num::_::div_ceil` (subitems of the module, then the leaf).
+    "--include",
+    "bitflags::traits::_::EMPTY",
     *CHARON_CORE_INCLUDE,
 ]
 

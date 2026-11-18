@@ -27684,6 +27684,21 @@ fn bytes_sub_arg(mut w_sub: PyObjectRef) -> Result<BytesSubArg, crate::PyError> 
     }
 }
 
+/// `W_BytearrayObject._op_val` / `W_BytesObject._op_val` without
+/// `allow_char`: `space.buffer_w(w_other, space.BUF_SIMPLE)` then
+/// `buf.as_str()`.  The export is released before the copy is returned.
+fn bytes_buffer_arg(mut w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    match pyre_object::with_roots!(w_obj => crate::baseobjspace::simple_buffer_bytes(w_obj)
+        .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
+    {
+        Some(data) => Ok(data),
+        None => Err(crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            type_name_of(w_obj)
+        ))),
+    }
+}
+
 /// Argument-clinic `slice_index` conversion for bytes/bytearray search
 /// methods.  Conversion precedes the bytearray implementation's receiver
 /// export, so a re-entrant `__index__` may resize the receiver.
@@ -27777,7 +27792,7 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
     // resize the storage under a borrowed slice.  Argument-clinic converted
     // start/end above, before the implementation acquires that export.
-    let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
+    let mut receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
@@ -27790,6 +27805,9 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
             return Err(error);
         }
     };
+    // `_op_val` ran under the held export; recopy so in-place writes are
+    // visible (`W_BytearrayObject._data` / `BytearrayBuffer`).
+    receiver.recopy_live_storage();
     let result = (|| {
         let data = receiver.as_bytes();
         let Some((start, end)) = bytes_idx_window(data.len(), bounds) else {
@@ -27850,7 +27868,7 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     // converting `sub` (gh-142560), so re-entrant buffer conversion cannot
     // resize the storage under a borrowed slice.  Argument-clinic converted
     // start/end above, before the implementation acquires that export.
-    let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
+    let mut receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
@@ -27863,6 +27881,9 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Err(error);
         }
     };
+    // `_op_val` ran under the held export; recopy so in-place writes are
+    // visible (`W_BytearrayObject._data` / `BytearrayBuffer`).
+    receiver.recopy_live_storage();
     let n = {
         let data = receiver.as_bytes();
         match bytes_idx_window(data.len(), bounds) {
@@ -27886,16 +27907,16 @@ fn bytes_prefix_match(
     let base = pyre_object::gc_roots::pin_roots(args);
     let load = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i);
     let bounds = bytes_idx_args(base, args.len())?;
-    let receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
+    let mut receiver = crate::baseobjspace::simple_buffer_bytes(load(0))?
         .expect("bytes/bytearray receiver always exports a buffer");
     let result = (|| {
-        let data = receiver.as_bytes();
         // `start > len(value)` collapses the window to None → no match.
         // `_startswith`/`_endswith` reach that early-out only after
         // `_op_val` has converted the operand, so the window being empty
-        // does not excuse a prefix of the wrong type.
-        let bounds = bytes_idx_window(data.len(), bounds);
-        let test = |prefix: &[u8]| {
+        // does not excuse a prefix of the wrong type.  Recopy after `_op_val`
+        // so in-place writes are visible (`W_BytearrayObject._data`).
+        let test = |data: &[u8], prefix: &[u8]| {
+            let bounds = bytes_idx_window(data.len(), bounds);
             let Some((start, end)) = bounds else {
                 return false;
             };
@@ -27923,7 +27944,8 @@ fn bytes_prefix_match(
                             type_name_of(item)
                         )));
                     };
-                    if test(&prefix) {
+                    receiver.recopy_live_storage();
+                    if test(receiver.as_bytes(), &prefix) {
                         return Ok(true);
                     }
                 }
@@ -27938,7 +27960,8 @@ fn bytes_prefix_match(
                     type_name_of(needle)
                 )));
             };
-            Ok(test(&prefix))
+            receiver.recopy_live_storage();
+            Ok(test(receiver.as_bytes(), &prefix))
         }
     })();
     receiver.release();
@@ -29078,13 +29101,14 @@ fn bytes_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytes.removeprefix` — drop a leading bytes-like prefix if present.
 fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Cuts allocate, and `require_bytes_like` can snapshot a memoryview, so
-    // pin the receiver and prefix first and copy their payloads off.
+    // Cuts allocate, so pin the receiver and prefix first and copy their
+    // payloads off. `descr_removeprefix`: `prefix = self._op_val(space,
+    // w_prefix)` then `selfval = self._val(space)`.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let prefix = bytes_buffer_arg(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
-    let prefix = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     // `descr_removeprefix` (stringmethods.py) slices on a match and
     // rewraps the receiver's own storage otherwise.  `ll_stringslice_startonly`
     // (rstr.py) goes straight to `_ll_stringslice` with no whole-span
@@ -29101,8 +29125,10 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    // `descr_removesuffix`: `suffix = self._op_val(space, w_suffix)` then
+    // `selfval = self._val(space)`.
+    let suffix = bytes_buffer_arg(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
-    let suffix = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     // `descr_removesuffix` (stringmethods.py) guards the slice arm with
     // `if suffix and ...`, so an empty suffix falls through to the arm that
     // rewraps the receiver's own storage rather than cutting a whole span.

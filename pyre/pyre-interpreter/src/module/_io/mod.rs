@@ -1533,17 +1533,20 @@ fn buffered_iobase_readinto_impl(args: &[PyObjectRef], read_once: bool) -> crate
             args.len().saturating_sub(1)
         )));
     }
-    let self_obj = args[0];
-    let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
+    // `WritableBuffer::acquire` now runs `space.acquire_writebuf` (a Python
+    // `__buffer__` can collect). Pin `self` and the exporter before that call
+    // (`fileio_method_readinto`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let mut buffer = unsafe {
+        crate::builtins::WritableBuffer::acquire(pyre_object::gc_roots::shadow_stack_get(base + 1))
+    }?;
     let target = unsafe { buffer.as_mut_slice() };
     let method = if read_once { "read1" } else { "read" };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(self_obj);
     let size_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_int_new(target.len() as i64));
     let data = call_method_result(
-        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        pyre_object::gc_roots::shadow_stack_get(base),
         method,
         &[pyre_object::gc_roots::shadow_stack_get(size_slot)],
     )?;

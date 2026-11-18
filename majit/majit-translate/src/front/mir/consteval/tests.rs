@@ -5,7 +5,7 @@ use super::{
 
 use crate::flowspace::model::ConstValue;
 
-use crate::model::OpKind;
+use crate::model::{CallTarget, OpKind};
 
 use majit_charon_reader::{Llbc, ullbc::NameSeg};
 
@@ -1757,6 +1757,115 @@ fn impl_associated_const_literal_is_not_shared_across_decl_ids() {
     let gb = crate::test_support::lower_function(&llbcs[1], "read_b").expect("b lowers");
     assert_eq!(folded_uints(&ga), vec![1]);
     assert_eq!(folded_uints(&gb), vec![7]);
+}
+
+fn trait_assoc_const_artifact(init_body: serde_json::Value, is_local: bool) -> Llbc {
+    let path = ["fixture", "<Impl>", "N"];
+    let ty = u32_ty();
+    let tref = serde_json::json!({
+        "kind": {
+            "TraitImpl": {
+                "id": 0,
+                "generics": empty_generics()
+            }
+        }
+    });
+    let reader = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_n"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"Use": [{"Const": [
+                            {"TraitConst": [tref, 0]},
+                            ty
+                        ]}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let mut init = init_fun(1, &path, init_body);
+    init["item_meta"]["is_local"] = serde_json::json!(is_local);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [reader, init],
+            "global_decls": [
+                null,
+                named_const_global(1, &path, "const N: u32 = 7;", is_local, "NamedConst", 1)
+            ],
+            "trait_decls": [],
+            "trait_impls": [{
+                "def_id": 0,
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [ty],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                },
+                "consts": [{"id": 1}]
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("trait-assoc-const fixture parses")
+}
+
+fn graph_calls_trait_const_sentinel(graph: &crate::model::FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.len() == 2
+                    && segments[0] == "__str_const"
+                    && segments[1] == "__trait_const"
+            )
+        })
+    })
+}
+
+#[test]
+fn trait_assoc_const_literal_init_folds_via_impl_global() {
+    let llbc = trait_assoc_const_artifact(literal_init_body("7"), true);
+    let graph = crate::test_support::lower_function(&llbc, "read_n").expect("literal init lowers");
+    assert_eq!(folded_uints(&graph), vec![7]);
+    assert!(
+        !graph_calls_trait_const_sentinel(&graph),
+        "selected impl initializer must fold, got {graph:?}"
+    );
+}
+
+#[test]
+fn trait_assoc_const_opaque_init_stays_residual() {
+    let llbc = trait_assoc_const_artifact(serde_json::json!("Opaque"), false);
+    let graph = crate::test_support::lower_function(&llbc, "read_n").expect("opaque init lowers");
+    assert!(
+        folded_uints(&graph).is_empty(),
+        "opaque initializer must not invent a literal, got {graph:?}"
+    );
+    assert!(
+        graph_calls_trait_const_sentinel(&graph),
+        "opaque initializer stays the unresolved TraitConst residual: {graph:?}"
+    );
 }
 
 #[test]

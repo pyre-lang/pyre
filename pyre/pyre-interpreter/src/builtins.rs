@@ -537,15 +537,19 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
 /// inheritance: `class C(bytearray, A)` stays native, while
 /// `class C(A, bytearray)` reaches `A.__buffer__`.
 unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
-    let mut descr = descr;
     unsafe {
-        pyre_object::with_roots!(descr => crate::typedef::ensure_array_typeobjects());
+        // `W_Array.typedef` is installed when the array module initializes
+        // (`ensure_array_typeobjects`). Empty startup does not import array,
+        // so that wrapped type object is null until then; skip the null base.
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
             crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
         ] {
+            if base.is_null() {
+                continue;
+            }
             if crate::baseobjspace::lookup_in_type(base, "__buffer__")
                 .is_some_and(|native| std::ptr::eq(native, descr))
             {
@@ -25665,21 +25669,42 @@ impl WritableBuffer {
         })
     }
 
-    /// `_struct.pack_into` uses the same `space.acquire_writebuf` lease as
-    /// `FileIO.readinto`; only its argument converter owns different wording
-    /// for a rejected exporter.  Keep non-type failures (notably a released
-    /// memoryview's `ValueError`) unchanged.
-    pub(crate) unsafe fn acquire_for_pack_into(obj: PyObjectRef) -> Result<Self, crate::PyError> {
-        unsafe { Self::acquire(obj) }.map_err(|err| match err.kind {
-            crate::PyErrorKind::TypeError => {
-                crate::PyError::type_error("argument must be read-write bytes-like object")
+    /// `w*` converter wording for `_struct.pack_into`.  `obj` is the
+    /// exporter reloaded from the caller's root slot after `acquire`
+    /// returned (`do_pack_into`).
+    pub(crate) fn pack_into_rejected(
+        obj: PyObjectRef,
+        argn: i32,
+        err: crate::PyError,
+    ) -> crate::PyError {
+        match err.kind {
+            crate::PyErrorKind::TypeError | crate::PyErrorKind::BufferError => {
+                let type_name = crate::type_methods::clinic_arg_type_name(obj);
+                crate::PyError::type_error(format!(
+                    "pack_into() argument {argn} must be read-write bytes-like object, not {type_name}"
+                ))
             }
             _ => err,
-        })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.length
     }
 
     pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
+    }
+
+    /// Re-read the writable window from the rooted owner after a call that
+    /// may have collected.  The captured address must not outlive such a
+    /// call; `pack_values` allocates while this lease is held.
+    pub unsafe fn refresh_mut_slice(&mut self) -> Result<&mut [u8], crate::PyError> {
+        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+        let (data, _, _) = unsafe { fileio_writebuf(owner)? };
+        self.address = data.as_mut_ptr();
+        self.length = data.len();
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.address, self.length) })
     }
 }
 
@@ -25706,23 +25731,46 @@ impl Drop for WritableBuffer {
 /// Every readable exporter pyre has: bytes / bytearray, a live mmap, an
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
 pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
+    match unsafe { try_acquire_readbuf(obj)? } {
+        Some(buf) => Ok(buf),
+        None => Err(crate::PyError::type_error(if pyre_object::is_none(obj) {
+            "a bytes-like object is required, not None".to_string()
+        } else {
+            format!(
+                "a bytes-like object is required, not {}",
+                crate::error::type_name_of(obj)
+            )
+        })),
+    }
+}
+
+/// Native half of `space.readbuf_w`.  `Ok(None)` is `BufferInterfaceNotFound`
+/// so a caller can fall through to `w_memoryview_new_with_flags` for a
+/// Python `__buffer__` / C exporter without swallowing a real error (a
+/// released or strided memoryview).
+pub unsafe fn try_acquire_readbuf<'a>(
+    obj: PyObjectRef,
+) -> Result<Option<&'a [u8]>, crate::PyError> {
     unsafe {
         if let Some(hooks) = crate::importing::optional_module_hooks()
             && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
         {
-            return Ok(std::slice::from_raw_parts(address, length));
+            return Ok(Some(std::slice::from_raw_parts(address, length)));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
-            return Ok(pyre_object::bytesobject::bytes_like_data(obj));
+            return Ok(Some(pyre_object::bytesobject::bytes_like_data(obj)));
         }
         // `W_MMap.readbuf_w` — the live mapping.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
             let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
-            return Ok(std::slice::from_raw_parts(address as *const u8, length));
+            return Ok(Some(std::slice::from_raw_parts(
+                address as *const u8,
+                length,
+            )));
         }
         if pyre_object::interp_array::is_array(obj) {
-            return Ok(pyre_object::interp_array::w_array_bytes(obj));
+            return Ok(Some(pyre_object::interp_array::w_array_bytes(obj)));
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
             memoryview_check_released(obj)?;
@@ -25740,18 +25788,149 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
             let off = view.offset() as usize;
             let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
             if off <= full.len() && len <= full.len() - off {
-                return Ok(&full[off..off + len]);
+                return Ok(Some(&full[off..off + len]));
             }
         }
-        // `ObjSpace._getarg_error("bytes-like object")` (`acquire_py_buffer`).
-        Err(crate::PyError::type_error(if pyre_object::is_none(obj) {
-            "a bytes-like object is required, not None".to_string()
-        } else {
-            format!(
-                "a bytes-like object is required, not {}",
-                crate::error::type_name_of(obj)
-            )
-        }))
+        Ok(None)
+    }
+}
+
+fn bytes_like_required(obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "a bytes-like object is required, not '{}'",
+        crate::baseobjspace::object_functionstr_type_name(obj)
+    ))
+}
+
+/// One `space.acquire_py_buffer(w_obj, space.BUF_SIMPLE)` export.
+///
+/// Pins the exporter (or the memoryview `acquire_py_buffer` built) onto
+/// the caller's live root bracket.  Drop is `space.release_py_buffer` and
+/// does not pop that bracket, so pins the caller added after acquire
+/// survive the release (`do_unpack` roots the result tuple across
+/// `__release_buffer__`).  Native exporters keep the existing zero-copy
+/// window; a Python `__buffer__` is the memoryview
+/// `w_memoryview_new_with_flags` built, released by `memoryview_release`.
+pub struct ReadableBuffer {
+    owner_slot: usize,
+    held: bool,
+    made_view: bool,
+}
+
+impl ReadableBuffer {
+    pub unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
+        unsafe {
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if memoryview_python_buffer_descr(r_obj).is_some() {
+                return Self::acquire_made_view(r_obj, 0);
+            }
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if try_acquire_readbuf(r_obj)?.is_some() {
+                let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let held = buffer_export_incref(r_obj);
+                return Ok(Self {
+                    owner_slot: obj_slot,
+                    held,
+                    made_view: false,
+                });
+            }
+            let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            #[cfg(all(
+                feature = "cpyext",
+                not(feature = "sandbox"),
+                any(target_os = "macos", target_os = "linux")
+            ))]
+            let c_exporter = crate::cpyext::buffer::exports_buffer(r_obj);
+            #[cfg(not(all(
+                feature = "cpyext",
+                not(feature = "sandbox"),
+                any(target_os = "macos", target_os = "linux")
+            )))]
+            let c_exporter = false;
+            let ctypes = crate::importing::optional_module_hooks()
+                .and_then(|hooks| (hooks.ctypes_buffer_view)(r_obj))
+                .is_some();
+            if !c_exporter && !ctypes {
+                return Err(bytes_like_required(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                ));
+            }
+            Self::acquire_made_view(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0)
+        }
+    }
+
+    unsafe fn acquire_made_view(obj: PyObjectRef, flags: i32) -> Result<Self, crate::PyError> {
+        let view = w_memoryview_new_with_flags(obj, flags)?;
+        let _ = pyre_object::gc_roots::pin_root(view);
+        let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        if !memoryview_contiguity(r_view).0 {
+            let mut view = r_view;
+            if let Err(mut error) = pyre_object::with_roots!(view => memoryview_release(&[view])) {
+                error.write_unraisable_with_traceback(
+                    pyre_object::w_none(),
+                    Wtf8::new("in __release_buffer__"),
+                    view,
+                    true,
+                    Wtf8::new(""),
+                );
+            }
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "memoryview: underlying buffer is not C-contiguous",
+            ));
+        }
+        Ok(Self {
+            owner_slot: view_slot,
+            held: false,
+            made_view: true,
+        })
+    }
+
+    pub fn owner(&self) -> PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.owner_slot)
+    }
+
+    pub unsafe fn len(&self) -> Result<usize, crate::PyError> {
+        Ok(unsafe { acquire_readbuf(self.owner()) }?.len())
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    pub fn made_view(&self) -> bool {
+        self.made_view
+    }
+
+    /// Hand the export to a longer-lived owner (`W_UnpackIter.view`).
+    /// Drop becomes a no-op; the caller must release.
+    pub fn disarm(&mut self) {
+        self.held = false;
+        self.made_view = false;
+    }
+}
+
+impl Drop for ReadableBuffer {
+    fn drop(&mut self) {
+        if self.held {
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+            unsafe { buffer_export_decref(owner) };
+        }
+        if self.made_view {
+            let mut view = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+            if let Err(mut error) = pyre_object::with_roots!(view => memoryview_release(&[view])) {
+                error.write_unraisable_with_traceback(
+                    pyre_object::w_none(),
+                    Wtf8::new("in __release_buffer__"),
+                    view,
+                    true,
+                    Wtf8::new(""),
+                );
+            }
+        }
     }
 }
 
@@ -25944,28 +26123,51 @@ pub unsafe fn fileio_writebuf(
             }
             return Ok((&mut full[offset..offset + length], obj, false));
         }
-        // An exporter whose storage only `bf_getbuffer` names -- a type an
-        // extension defined -- is asked for a writable window and answers with
-        // one this layer then reads as any other view.  The request is what
-        // decides: an exporter with nothing writable refuses it, and the
-        // refusal is the argument error the arms above raise.
+        // `space.acquire_writebuf`: a Python `__buffer__` or C exporter that
+        // the arms above did not name is asked for a writable window the same
+        // way `w_memoryview_new_with_flags` answers `memoryview()`.  A
+        // read-only export becomes the argument TypeError, matching the
+        // `w*` converter.
+        let python_slot = unsafe { memoryview_python_buffer_descr(obj) }.is_some();
         #[cfg(all(
             feature = "cpyext",
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]
-        if crate::cpyext::buffer::exports_buffer(obj) {
-            let Ok(view) = w_memoryview_new_with_flags(obj, 0x0001) else {
-                return Err(type_error(obj));
-            };
-            // The exporter's own `bf_getbuffer` ran to build this view, and
-            // the recursive call can run more Python, so the view is pinned
-            // across it -- with a bracket, since a pin with nothing to pop it
-            // leaves the slot on the shadow stack for good.
+        let c_exporter = crate::cpyext::buffer::exports_buffer(obj);
+        #[cfg(not(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        )))]
+        let c_exporter = false;
+        if python_slot || c_exporter {
             let _roots = pyre_object::gc_roots::push_roots();
-            let view = pyre_object::gc_roots::pin_root(view);
-            let (data, owner, _) = fileio_writebuf(view)?;
-            return Ok((data, owner, true));
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            match w_memoryview_new_with_flags(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                0x0001,
+            ) {
+                Ok(view) => {
+                    // The exporter's own `bf_getbuffer` ran to build this view,
+                    // and the recursive call can run more Python, so the view
+                    // is pinned across it -- with a bracket, since a pin with
+                    // nothing to pop it leaves the slot on the shadow stack
+                    // for good.
+                    let view = pyre_object::gc_roots::pin_root(view);
+                    let (data, owner, _) = fileio_writebuf(view)?;
+                    return Ok((data, owner, true));
+                }
+                Err(err) => {
+                    return match err.kind {
+                        crate::PyErrorKind::TypeError | crate::PyErrorKind::BufferError => Err(
+                            type_error(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+                        ),
+                        _ => Err(err),
+                    };
+                }
+            }
         }
         Err(type_error(obj))
     }

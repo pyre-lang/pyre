@@ -2451,18 +2451,62 @@ fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
-/// `import_re` — `AppReCache.get_re`.
-fn import_re() -> Result<PyObjectRef, crate::PyError> {
-    match crate::importing::get_sys_module("re") {
-        Some(w_re) => Ok(w_re),
-        None => crate::importing::importhook(
-            rustpython_wtf8::Wtf8::new("re"),
-            pyre_object::w_none(),
-            pyre_object::w_none(),
-            0,
-            crate::call::getexecutioncontext(),
-        ),
+/// `interp_sre.py AppReCache` — `space.fromcache(AppReCache)`.
+pub struct AppReCache {
+    space: crate::baseobjspace::SpaceHandle,
+    w_re: crate::baseobjspace::SpaceAttr,
+}
+
+impl AppReCache {
+    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+        Self {
+            space,
+            w_re: crate::baseobjspace::SpaceAttr::new(),
+        }
     }
+
+    /// `AppReCache.get_re`.
+    pub fn get_re(&self) -> Result<PyObjectRef, crate::PyError> {
+        let existing = self.w_re.get();
+        if !existing.is_null() {
+            return Ok(existing);
+        }
+        use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+        let _roots = push_roots();
+        let builtin_slot = shadow_stack_len();
+        let _ = pin_root(self.space.get().builtin());
+        let w_import =
+            crate::baseobjspace::getattr_str(shadow_stack_get(builtin_slot), "__import__")?;
+        let import_slot = shadow_stack_len();
+        let _ = pin_root(w_import);
+        let name_slot = shadow_stack_len();
+        let _ = pin_root(pyre_object::w_str_new_managed("re"));
+        let w_re = crate::call::call_function_impl_result(
+            shadow_stack_get(import_slot),
+            &[shadow_stack_get(name_slot)],
+        )?;
+        let re_slot = shadow_stack_len();
+        let _ = pin_root(w_re);
+        self.w_re.set(shadow_stack_get(re_slot));
+        Ok(shadow_stack_get(re_slot))
+    }
+
+    pub fn walk_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+        self.w_re.walk(forward);
+    }
+}
+
+/// `import_re` — `space.fromcache(AppReCache).get_re()`.
+fn import_re() -> Result<PyObjectRef, crate::PyError> {
+    let crate::baseobjspace::SpaceCacheInstance::AppReCache(cache) =
+        crate::baseobjspace::object_space()
+            .fromcache(crate::baseobjspace::SpaceCacheClass::AppReCache)
+    else {
+        unreachable!(
+            "fromcache(SpaceCacheClass::AppReCache) always returns SpaceCacheInstance::AppReCache"
+        );
+    };
+    cache.get_re()
 }
 
 /// `compile_template` — call `re._compile_template(pattern, template)`.
@@ -3212,4 +3256,27 @@ fn sre_scanner_clinic(
         return crate::gateway::method_takes_no_arguments(clinic_name);
     }
     Ok(sre_scanner_step(self_, anchored)?.unwrap_or_else(w_none))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::baseobjspace::{ObjSpace, RetainedSpaceCache, SpaceCacheClass, SpaceCacheInstance};
+
+    #[test]
+    fn fromcache_returns_one_app_re_cache_per_space() {
+        let a = ObjSpace::new();
+        let b = ObjSpace::new();
+        let SpaceCacheInstance::AppReCache(first) = a.fromcache(SpaceCacheClass::AppReCache) else {
+            panic!("expected AppReCache");
+        };
+        let SpaceCacheInstance::AppReCache(again) = a.fromcache(SpaceCacheClass::AppReCache) else {
+            panic!("expected AppReCache");
+        };
+        assert!(RetainedSpaceCache::ptr_eq(&first, &again));
+        let SpaceCacheInstance::AppReCache(other) = b.fromcache(SpaceCacheClass::AppReCache) else {
+            panic!("expected AppReCache");
+        };
+        assert!(!RetainedSpaceCache::ptr_eq(&first, &other));
+    }
 }

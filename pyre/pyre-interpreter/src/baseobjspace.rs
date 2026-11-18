@@ -655,6 +655,7 @@ impl AppExecCache {
 pub enum SpaceCacheClass {
     ClassDictStrategy,
     SysState,
+    AppReCache,
 }
 
 /// A `fromcache` value plus the IsolatedStrong that keeps an isolated
@@ -706,6 +707,7 @@ impl<T> std::ops::Deref for RetainedSpaceCache<T> {
 pub enum SpaceCacheInstance {
     ClassDictStrategy(RetainedSpaceCache<crate::objspace::std::classdict::ClassDictStrategy>),
     SysState(RetainedSpaceCache<crate::module::sys::state::SysState>),
+    AppReCache(RetainedSpaceCache<crate::module::_sre::interp_sre::AppReCache>),
 }
 
 impl SpaceCacheInstance {
@@ -715,6 +717,7 @@ impl SpaceCacheInstance {
         match self {
             Self::ClassDictStrategy(cache) => Self::ClassDictStrategy(cache.retain_owner()),
             Self::SysState(cache) => Self::SysState(cache.retain_owner()),
+            Self::AppReCache(cache) => Self::AppReCache(cache.retain_owner()),
         }
     }
 }
@@ -796,12 +799,18 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
                 space.clone(),
                 std::sync::Arc::new(crate::module::sys::state::SysState::new()),
             )),
+            Self::AppReCache => SpaceCacheInstance::AppReCache(RetainedSpaceCache::stored(
+                space.clone(),
+                std::sync::Arc::new(crate::module::_sre::interp_sre::AppReCache::new(
+                    space.clone(),
+                )),
+            )),
         })
     }
 }
 
-/// One `space.w_*` attribute of an object space: written while the space
-/// initializes, then rewritten only by the collector through
+/// One space-owned `W_Root` slot: written at initialization or when a space
+/// cache first publishes it, then rewritten only by the collector through
 /// [`ObjSpace::walk_cache_roots`].
 pub struct SpaceAttr(std::cell::UnsafeCell<PyObjectRef>);
 
@@ -822,12 +831,12 @@ impl SpaceAttr {
 
     /// `setattr(space, 'w_' + name, w_obj)`. The space is prebuilt, so the
     /// store is a prebuilt-family store (`remember_young_pointer`).
-    fn set(&self, w_obj: PyObjectRef) {
+    pub(crate) fn set(&self, w_obj: PyObjectRef) {
         unsafe { *self.0.get() = w_obj };
         pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     }
 
-    fn walk(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    pub(crate) fn walk(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
         let slot = unsafe { &mut *self.0.get() };
         if !slot.is_null() {
             forward(slot);
@@ -914,6 +923,11 @@ impl ObjSpace {
 
     pub fn type_cache(&self) -> &crate::objspace::std::typeobject::TypeCache {
         &self.type_cache
+    }
+
+    /// `space.builtin`; null before `make_builtins` sets it.
+    pub fn builtin(&self) -> PyObjectRef {
+        self.builtin.get()
     }
 
     /// `space.w_object`; null before `init_typeobjects` sets it.
@@ -1007,6 +1021,7 @@ impl ObjSpace {
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
+            SpaceCacheInstance::AppReCache(cache) => cache.walk_roots(forward),
         });
     }
 
@@ -11355,6 +11370,39 @@ pub struct SimpleBufferBytes {
 impl SimpleBufferBytes {
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Re-read the exporter's current storage while this export is still held.
+    ///
+    /// `BytearrayBuffer` / `_check_exports` forbids resize for the duration of
+    /// the export, so a nested `__buffer__` can only write in place; those
+    /// writes are what `descr_find` / `descr_contains` observe after `_op_val`.
+    /// Fetch the exporter from its root slot first: it is a movable GC object.
+    /// Bytes exporters are immutable, so this is a no-op for them.  The copy
+    /// is a `Vec<u8>`; no slice into the object outlives this call.
+    pub(crate) fn recopy_live_storage(&mut self) {
+        if !self.native_export_active {
+            return;
+        }
+        let slot = self
+            .native_owner_slot
+            .expect("active native export has an owner");
+        let owner = pyre_object::gc_roots::shadow_stack_get(slot);
+        if !unsafe { pyre_object::bytearrayobject::is_bytearray(owner) } {
+            return;
+        }
+        // `_check_exports` pins the length.  `resize` can collect, so the
+        // slice from `w_bytearray_data` must not outlive it; re-fetch the
+        // exporter from its root slot before copying.
+        let n = unsafe { pyre_object::bytearrayobject::w_bytearray_data(owner) }.len();
+        if self.data.len() != n {
+            self.data.resize(n, 0);
+        }
+        let owner = pyre_object::gc_roots::shadow_stack_get(slot);
+        let live = unsafe { pyre_object::bytearrayobject::w_bytearray_data(owner) };
+        let copy_len = live.len().min(self.data.len());
+        self.data.truncate(copy_len);
+        self.data.copy_from_slice(&live[..copy_len]);
     }
 
     /// `Py_buffer.itemsize` / `BufferView.getitemsize` captured with the
@@ -25911,7 +25959,7 @@ fn contains_bytes_like(
         let exported = simple_buffer_bytes(haystack);
         haystack = roots.get(base);
         needle = roots.get(base + 1);
-        let receiver = exported?.expect("bytes/bytearray receiver always exports a buffer");
+        let mut receiver = exported?.expect("bytes/bytearray receiver always exports a buffer");
         if is_int(needle) || is_long(needle) {
             let v = if is_int(needle) {
                 pyre_object::w_int_get_value(needle)
@@ -25948,6 +25996,9 @@ fn contains_bytes_like(
         }) {
             Ok(Some(sub)) => {
                 // `stringmethods.py descr_contains`: `value.find(other, start, end) >= 0`.
+                // `_op_val` ran under the held export; recopy so in-place writes
+                // are visible (`W_BytearrayObject._data` / `BytearrayBuffer`).
+                receiver.recopy_live_storage();
                 let hay = receiver.as_bytes();
                 let needle = sub.as_slice();
                 let found = if needle.is_empty() {

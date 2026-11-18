@@ -40,4 +40,47 @@ for n in (2**30 - 2, 2**30 - 1, 2**31 - 1):
     else:
         raise AssertionError("(?(%d)) compiled" % n)
 
+# `AppReCache.get_re` imports through builtin `__import__` and stores `w_re`
+# once. A first template compile while `sys.modules["re"]` is None, or with
+# `__import__` replaced, observes that import; after a successful import,
+# replacing `sys.modules["re"]` does not change which `re` `_sre` calls.
+import builtins
+import sys
+
+saved_re = sys.modules["re"]
+sys.modules["re"] = None
+try:
+    re.compile(b"a").sub(b"\\g<0>y", b"a")
+except ModuleNotFoundError as e:
+    assert "import of re halted" in str(e), e
+else:
+    raise AssertionError("expected ModuleNotFoundError while sys.modules['re'] is None")
+finally:
+    sys.modules["re"] = saved_re
+
+saved_import = builtins.__import__
+
+
+def _hijack(*a, **k):
+    raise RuntimeError("hijacked")
+
+
+builtins.__import__ = _hijack
+try:
+    re.compile(b"a").sub(b"\\g<0>y", b"a")
+except RuntimeError as e:
+    assert str(e) == "hijacked", e
+else:
+    raise AssertionError("expected RuntimeError from replaced builtins.__import__")
+finally:
+    builtins.__import__ = saved_import
+
+assert re.compile(b"a").sub(b"\\g<0>x", b"a") == b"ax"
+saved_re = sys.modules["re"]
+sys.modules["re"] = None
+try:
+    assert re.compile(b"a").sub(b"\\g<0>y", b"a") == b"ay"
+finally:
+    sys.modules["re"] = saved_re
+
 print("OK")

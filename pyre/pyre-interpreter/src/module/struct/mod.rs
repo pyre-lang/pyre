@@ -1304,24 +1304,39 @@ fn pack_values(
 
 /// `do_pack_into` — pack `values` into `buffer` starting at `offset`,
 /// resolving a negative offset against the buffer end.
+///
+/// `buffer_argn` is the 1-based clinic index of `buffer` for the `w*`
+/// converter diagnostic (`2` on the module function, `1` on `Struct.pack_into`).
 fn do_pack_into(
     format: &str,
-    mut buffer: PyObjectRef,
+    buffer: PyObjectRef,
     offset: i64,
     values: &[PyObjectRef],
+    buffer_argn: i32,
 ) -> Result<PyObjectRef, crate::PyError> {
     // `values` is a native copy; the buffer lease and packing can collect.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(values);
-    let parsed = pyre_object::with_roots!(buffer => parse_format(format))?;
+    let buf_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(buffer);
+    let parsed = parse_format(format)?;
     let size = parsed.calcsize()?;
-    // PyPy `Struct.pack_into` acquires `space.writebuf_w` once and keeps that
-    // buffer object alive through `s_pack_internal`.  Reuse pyre's common
-    // writable-buffer lease so a C exporter follows the same `bf_getbuffer`
-    // / `bf_releasebuffer` path as every other consumer.
-    let mut export = unsafe { crate::builtins::WritableBuffer::acquire_for_pack_into(buffer) }?;
-    let buf = unsafe { export.as_mut_slice() };
-    let buflen = buf.len() as i64;
+    // `do_pack_into`: `space.acquire_py_buffer(w_buffer, space.BUF_WRITABLE)`
+    // and `space.release_py_buffer(view)` in `finally`.  Reload the
+    // exporter after acquire so a TypeError remap names the forwarded
+    // object (`w*` converter).
+    let mut export = match unsafe { crate::builtins::WritableBuffer::acquire(_roots.get(buf_slot)) }
+    {
+        Ok(export) => export,
+        Err(err) => {
+            return Err(crate::builtins::WritableBuffer::pack_into_rejected(
+                _roots.get(buf_slot),
+                buffer_argn,
+                err,
+            ));
+        }
+    };
+    let buflen = export.len() as i64;
     let mut offset = offset;
     if offset < 0 {
         if offset + size > 0 {
@@ -1349,6 +1364,7 @@ fn do_pack_into(
     }
     let packed = pack_values(&parsed, &_roots, base, values.len())?;
     let start = offset as usize;
+    let buf = unsafe { export.refresh_mut_slice()? };
     buf[start..start + packed.len()].copy_from_slice(&packed);
     Ok(w_none())
 }
@@ -1490,9 +1506,10 @@ unsafe fn unpack_window_bytes<'a>(
 fn do_unpack(format: &str, buf: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let buf_slot = _roots.pin_roots(&[buf]);
-    // `do_unpack`: acquire the buffer (`space.buffer_w` / `readbuf_w`)
-    // before `UnpackFormatIterator.interpret`.
-    let buflen = unsafe { readbuf(_roots.get(buf_slot))? }.len();
+    // `do_unpack`: `space.acquire_py_buffer(w_str, space.BUF_SIMPLE)` before
+    // `UnpackFormatIterator.interpret`; Drop is `release_py_buffer`.
+    let acquired = unsafe { crate::builtins::ReadableBuffer::acquire(_roots.get(buf_slot))? };
+    let buflen = unsafe { acquired.len()? };
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
     if buflen != size {
@@ -1500,11 +1517,15 @@ fn do_unpack(format: &str, buf: PyObjectRef) -> Result<PyObjectRef, crate::PyErr
             "unpack requires a buffer of {size} bytes"
         )));
     }
-    let owner = unsafe { crate::builtins::acquired_exporter(_roots.get(buf_slot)) };
-    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(_roots.get(buf_slot)) };
+    let owner = unsafe { crate::builtins::acquired_exporter(acquired.owner()) };
+    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(acquired.owner()) };
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(owner);
-    unpack_units(&parsed, owner_slot, window_offset, buflen, 0)
+    let unpacked = unpack_units(&parsed, owner_slot, window_offset, buflen, 0)?;
+    let unpacked_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(unpacked);
+    drop(acquired);
+    Ok(_roots.get(unpacked_slot))
 }
 
 /// `UnpackFormatIterator.operate` is `@jit.unroll_safe`.
@@ -1698,7 +1719,9 @@ fn do_unpack_from(
     let buf_slot = _roots.pin_roots(&[buf]);
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
-    let buflen = unsafe { readbuf(_roots.get(buf_slot))? }.len() as i64;
+    // `do_unpack_from`: `space.acquire_py_buffer(w_buffer, space.BUF_SIMPLE)`.
+    let acquired = unsafe { crate::builtins::ReadableBuffer::acquire(_roots.get(buf_slot))? };
+    let buflen = unsafe { acquired.len()? } as i64;
     let mut offset = offset;
     if offset < 0 {
         if offset + size as i64 > 0 {
@@ -1722,17 +1745,21 @@ fn do_unpack_from(
             required, size, offset, buflen
         )));
     }
-    let owner = unsafe { crate::builtins::acquired_exporter(_roots.get(buf_slot)) };
-    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(_roots.get(buf_slot)) };
+    let owner = unsafe { crate::builtins::acquired_exporter(acquired.owner()) };
+    let window_offset = unsafe { crate::builtins::acquired_exporter_offset(acquired.owner()) };
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(owner);
-    unpack_units(
+    let unpacked = unpack_units(
         &parsed,
         owner_slot,
         window_offset,
         buflen as usize,
         offset as usize,
-    )
+    )?;
+    let unpacked_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(unpacked);
+    drop(acquired);
+    Ok(_roots.get(unpacked_slot))
 }
 
 // ── half-float (IEEE 754 binary16) ───────────────────────────────────
@@ -2148,6 +2175,7 @@ fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         offset,
         &values,
+        2,
     )
 }
 
@@ -2181,6 +2209,7 @@ fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         offset,
         &values,
+        1,
     )
 }
 
@@ -2193,7 +2222,9 @@ pub mod unpack_iter {
     use super::{do_unpack_from, readbuf, struct_error};
     use pyre_object::*;
 
-    fn unpack_iter_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub(super) fn unpack_iter_getattribute(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, crate::PyError> {
         // `args` is the gateway's native copy; `text_w` can collect.
         let mut w_obj = args[0];
         let w_name = args.get(1).copied().unwrap_or_else(w_none);
@@ -2212,6 +2243,10 @@ pub mod unpack_iter {
         /// value owns exactly one exporter count and is cleared on normal
         /// exhaustion or from the native finalizer.
         export_active: bool,
+        /// The iterator built this memoryview via `acquire_py_buffer` for a
+        /// Python `__buffer__` exporter; `_finalize_` / exhaustion must
+        /// `release_py_buffer` it (`memoryview_release`).
+        made_view: bool,
     }
 
     #[crate::pyre_methods]
@@ -2261,13 +2296,43 @@ pub mod unpack_iter {
             if self.buffer.is_null() {
                 return;
             }
-            if self.export_active {
+            if self.made_view {
+                self.made_view = false;
+                self.export_active = false;
+                let mut view = self.buffer;
+                if let Err(mut error) = pyre_object::with_roots!(
+                    view => crate::builtins::memoryview_release(&[view])
+                ) {
+                    error.write_unraisable_with_traceback(
+                        pyre_object::w_none(),
+                        rustpython_wtf8::Wtf8::new("in __release_buffer__"),
+                        view,
+                        true,
+                        rustpython_wtf8::Wtf8::new(""),
+                    );
+                }
+            } else if self.export_active {
                 self.export_active = false;
                 unsafe { crate::builtins::buffer_export_decref(self.buffer) };
             }
             self.buffer = PY_NULL;
             self.format = PY_NULL;
         }
+    }
+
+    /// Install `W_UnpackIter.typedef` flags when `_struct` initializes.
+    /// The TypeDef is a translation-time constant with no `__new__`;
+    /// `deque_iter::public_type` applies `W_DequeIter.typedef`
+    /// `acceptable_as_base_class=False` the same way, and `dict_keys`
+    /// pairs that flag with `disallow_instantiation`.  `__module__` comes
+    /// from the qualified PYNAME via `type_ready_set_dict`.
+    pub fn setup_type() -> PyObjectRef {
+        let ty = type_object();
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(ty, false);
+            pyre_object::w_type_set_disallow_instantiation(ty);
+        }
+        ty
     }
 
     /// `interp_struct.py:178 W_UnpackIter.__init__` — build an unpack
@@ -2278,69 +2343,38 @@ pub mod unpack_iter {
         size: i64,
         buffer: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        // Force the type's method table to be built before allocating (the
-        // `unpack_iterator` type is not exposed as a module attribute, so
-        // nothing else triggers `type_object()`).  The dict entries and the
-        // TypeDef flags below are constant, so they are installed once: every
-        // `iter_unpack()` call otherwise rewrites the shared type dict, which
-        // both allocates and races other threads reading it.
-        static TYPE_SETUP: std::sync::Once = std::sync::Once::new();
-        let iter_type = type_object();
-        TYPE_SETUP.call_once(|| unsafe {
-            let _root_scope = pyre_object::gc_roots::push_roots();
-            let type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(iter_type);
-            let ns = pyre_object::w_type_get_dict_ptr(pyre_object::gc_roots::shadow_stack_get(
-                type_slot,
-            )) as PyObjectRef;
-            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(ns);
-            crate::__pyre_put_new!(ns_slot, "__module__", w_str_new("_struct"));
-            crate::__pyre_put_new!(
-                ns_slot,
-                "__getattribute__",
-                crate::make_builtin_function_with_arity(
-                    "__getattribute__",
-                    unpack_iter_getattribute,
-                    2
-                )
-            );
-            // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
-            // TypeDef shape: the implementation type is returned by `type(it)`
-            // but cannot be instantiated or used as a base class.
-            pyre_object::w_type_set_acceptable_as_base_class(
-                pyre_object::gc_roots::shadow_stack_get(type_slot),
-                false,
-            );
-            pyre_object::w_type_set_disallow_instantiation(
-                pyre_object::gc_roots::shadow_stack_get(type_slot),
-            );
-        });
-        // `readbuf_w` may dispatch a Python-level `__buffer__` hook.  Keep
-        // both operands rooted across that call and the stable allocation:
-        // PyPy's W_UnpackIter stores the live `self.view` lease on the
-        // iterator, never an unrooted caller-local pointer.
+        let _ = type_object();
+        // `W_UnpackIter.__init__`: size is checked before
+        // `space.acquire_py_buffer`; the live `self.view` lease is stored
+        // on the iterator, never an unrooted caller-local pointer.
         let _roots = pyre_object::gc_roots::push_roots();
         // Both operands already exist. Sequential `pin_root` would normalize
         // after the format and leave the buffer unpublished
         // (`RootScope::pin_roots`).
         let sp = pyre_object::gc_roots::pin_roots(&[format, buffer]);
-        let buf_len = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? }.len();
         if size <= 0 {
             return Err(struct_error(format!(
                 "cannot iteratively unpack with a struct of length {size}"
             )));
         }
+        let mut acquired = unsafe {
+            crate::builtins::ReadableBuffer::acquire(pyre_object::gc_roots::shadow_stack_get(
+                sp + 1,
+            ))?
+        };
+        let buf_len = unsafe { acquired.len()? };
         if buf_len as i64 % size != 0 {
             return Err(struct_error(format!(
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        let export_active = unsafe {
-            crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(sp + 1))
-        };
-        // Both slots are reread here rather than reused from a local: `readbuf`
-        // and `buffer_export_incref` above can each run Python and collect, and
+        let made_view = acquired.made_view();
+        let export_active = acquired.is_held() || made_view;
+        let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(acquired.owner());
+        acquired.disarm();
+        // Both slots are reread here rather than reused from a local:
+        // `acquire_py_buffer` can run Python and collect, and
         // `allocate_stable` itself allocates, so a value captured before them
         // would name the pre-relocation address.
         let w_iter = W_UnpackIter::allocate_stable(W_UnpackIter {
@@ -2349,10 +2383,11 @@ pub mod unpack_iter {
                 w_class: std::ptr::null_mut(),
             },
             format: pyre_object::gc_roots::shadow_stack_get(sp),
-            buffer: pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            buffer: pyre_object::gc_roots::shadow_stack_get(owner_slot),
             size,
             index: 0,
             export_active,
+            made_view,
         });
         // `_finalize_` releases the acquired export; nothing to release when
         // the buffer was never acquired.
@@ -2547,5 +2582,24 @@ crate::py_module! {
                 ))
             )
         );
+        // `W_UnpackIter.typedef` is not a module attribute; the module still
+        // builds the type object here (`deque_iter::public_type`).
+        {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let unpack_iter_type = unpack_iter::setup_type();
+            let unpack_iter_dict =
+                unsafe { pyre_object::w_type_get_dict_ptr(unpack_iter_type) } as PyObjectRef;
+            let unpack_iter_base = _roots.pin_roots(&[unpack_iter_type, unpack_iter_dict]);
+            let unpack_iter_dict_slot = unpack_iter_base + 1;
+            crate::__pyre_put_new!(
+                unpack_iter_dict_slot,
+                "__getattribute__",
+                crate::make_builtin_function_with_arity(
+                    "__getattribute__",
+                    unpack_iter::unpack_iter_getattribute,
+                    2
+                )
+            );
+        }
     },
 }

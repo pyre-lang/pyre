@@ -13,6 +13,7 @@ import math
 import os
 import pickle
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -435,5 +436,109 @@ def apply_body(function, value):
 
 assert APPLY(apply_body)(inner, 20) == 42
 assert cast(pair_callback, c_void_p).value
+
+
+# struct: buffer arguments go through the space buffer protocol, so a
+# Python `__buffer__` exporter is accepted the same way `bytes()` /
+# `memoryview()` / `zlib.crc32` already accept it.
+class Exp:
+    def __init__(self, b):
+        self.b = bytearray(b)
+
+    def __buffer__(self, flags):
+        return memoryview(self.b)
+
+
+class RoExp:
+    def __init__(self, b):
+        self.b = bytes(b)
+
+    def __buffer__(self, flags):
+        return memoryview(self.b)
+
+
+class CountedExp:
+    def __init__(self, b):
+        self.b = bytearray(b)
+        self.acquires = 0
+        self.releases = 0
+
+    def __buffer__(self, flags):
+        self.acquires += 1
+        return memoryview(self.b)
+
+    def __release_buffer__(self, view):
+        self.releases += 1
+
+
+assert struct.unpack("b", Exp(b"\x05")) == (5,)
+assert struct.unpack_from("b", Exp(b"\x05")) == (5,)
+assert struct.unpack_from("b", Exp(b"\x00\x05"), 1) == (5,)
+assert list(struct.iter_unpack("b", Exp(b"\x05"))) == [(5,)]
+assert struct.Struct("b").unpack(Exp(b"\x05")) == (5,)
+assert struct.Struct("b").unpack_from(Exp(b"\x05")) == (5,)
+assert list(struct.Struct("b").iter_unpack(Exp(b"\x05"))) == [(5,)]
+e = Exp(b"\x05")
+struct.pack_into("b", e, 0, 7)
+assert bytes(e.b) == b"\x07"
+e = Exp(b"\x05")
+struct.Struct("b").pack_into(e, 0, 7)
+assert bytes(e.b) == b"\x07"
+
+assert struct.unpack("b", b"\x05") == (5,)
+assert struct.unpack("b", bytearray(b"\x05")) == (5,)
+assert struct.unpack("b", memoryview(b"\x05")) == (5,)
+assert struct.unpack("b", array.array("b", [5])) == (5,)
+
+assert refusal(lambda: struct.unpack("b", 1)) == "a bytes-like object is required, not 'int'"
+assert refusal(lambda: struct.unpack("b", None)) == (
+    "a bytes-like object is required, not 'NoneType'"
+)
+assert refusal(lambda: struct.unpack("b", "x")) == "a bytes-like object is required, not 'str'"
+assert refusal(lambda: struct.unpack_from("b", 1)) == (
+    "a bytes-like object is required, not 'int'"
+)
+assert refusal(lambda: list(struct.iter_unpack("b", 1))) == (
+    "a bytes-like object is required, not 'int'"
+)
+assert refusal(lambda: struct.pack_into("b", 1, 0, 7)) == (
+    "pack_into() argument 2 must be read-write bytes-like object, not int"
+)
+assert refusal(lambda: struct.pack_into("b", None, 0, 7)) == (
+    "pack_into() argument 2 must be read-write bytes-like object, not None"
+)
+assert refusal(lambda: struct.pack_into("b", b"\x00", 0, 7)) == (
+    "pack_into() argument 2 must be read-write bytes-like object, not bytes"
+)
+assert refusal(lambda: struct.pack_into("b", RoExp(b"\x05"), 0, 7)) == (
+    "pack_into() argument 2 must be read-write bytes-like object, not RoExp"
+)
+assert refusal(lambda: struct.Struct("b").pack_into(RoExp(b"\x05"), 0, 7)) == (
+    "pack_into() argument 1 must be read-write bytes-like object, not RoExp"
+)
+assert refusal(lambda: struct.unpack("h", Exp(b"\x05")), struct.error) == (
+    "unpack requires a buffer of 2 bytes"
+)
+assert refusal(lambda: struct.unpack_from("h", Exp(b"\x05")), struct.error) == (
+    "unpack_from requires a buffer of at least 2 bytes for unpacking 2 bytes "
+    "at offset 0 (actual buffer size is 1)"
+)
+assert refusal(lambda: list(struct.iter_unpack("h", Exp(b"\x05"))), struct.error) == (
+    "iterative unpacking requires a buffer of a multiple of 2 bytes"
+)
+
+counted = CountedExp(b"\x05")
+assert struct.unpack("b", counted) == (5,)
+assert (counted.acquires, counted.releases) == (1, 1)
+counted = CountedExp(b"\x05")
+assert struct.unpack_from("b", counted) == (5,)
+assert (counted.acquires, counted.releases) == (1, 1)
+counted = CountedExp(b"\x05")
+assert list(struct.iter_unpack("b", counted)) == [(5,)]
+assert (counted.acquires, counted.releases) == (1, 1)
+counted = CountedExp(b"\x00")
+struct.pack_into("b", counted, 0, 9)
+assert bytes(counted.b) == b"\t"
+assert (counted.acquires, counted.releases) == (1, 1)
 
 print("stdlib native contracts ok")
