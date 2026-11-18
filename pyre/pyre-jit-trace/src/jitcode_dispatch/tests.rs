@@ -34007,3 +34007,43 @@ fn int_pow_overflow_catch_does_not_collapse_guard_no_exception() {
             .collect::<Vec<_>>(),
     );
 }
+
+/// Parked generator-resume caller lives on the session (`pending_portal_level`
+/// then the child's `InlineFrame.parents`). `MetaInterp.replace_box` must
+/// rewrite that one instance (`replace_box_in_paused_frames`).
+#[test]
+fn replace_box_rewrites_parked_send_ex_caller_on_session() {
+    let old = OpRef::input_arg_ref(0);
+    let new = OpRef::input_arg_ref(1);
+    let mut session = WalkSession::default();
+    session.pending_portal_level = Some(PendingPortalLevel {
+        w_code: 0,
+        is_being_profiled: false,
+        recursion_greenkey: false,
+        parents: vec![InlineParentFrame {
+            jitcode_index: 0,
+            call_jitcode_pc: Some(0),
+            resume_pc: None,
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: None,
+            boxes: vec![old],
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Unknown,
+        }],
+        entry_trace_index: 0,
+        concrete_frame: 0,
+        jd_no: None,
+    });
+    replace_box_in_paused_frames(&mut session, old, new);
+    assert_eq!(
+        session.pending_portal_level.as_ref().unwrap().parents[0].boxes,
+        vec![new],
+        "parked send_ex caller boxes follow replace_box",
+    );
+}

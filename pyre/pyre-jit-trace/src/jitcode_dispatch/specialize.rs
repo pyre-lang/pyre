@@ -10766,7 +10766,9 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         ));
     }
     let walk = match parked_result {
-        Some((done, _)) => done.map(|outcome| (outcome, pre_fold_pos)),
+        Some((done, _)) => {
+            orthodox_helper_subwalk_result(done).map(|outcome| (outcome, pre_fold_pos))
+        }
         None => run_orthodox_helper_subwalk(
             ctx,
             op_pc,
@@ -10829,8 +10831,10 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     // cannot decline into an entry replay that would call `__next__` again,
     // and its abort continues forward from the latched image
     // (`convert_and_run_from_pyjitpl`).
-    let cursor_moved =
-        helper_already_ran || !cursor_unchanged || (replay && (item.is_some() || exhausted));
+    // `W_FastListIterObject.descr_next`: exhausted (`w_seq is None`) raises
+    // without touching `index` / `w_seq`. Compare the CALL-entry checkpoint
+    // with the iterator now; a parked helper is not itself "moved".
+    let cursor_moved = !cursor_unchanged || (replay && (item.is_some() || exhausted));
     let journaled = cursor_moved && ctx.trace_ctx.is_bridge_trace;
     if journaled {
         fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
@@ -16135,6 +16139,7 @@ fn take_list_append_replay<Sym: WalkSym>(
     let Some(done) = take_completed_nested_subwalk(ctx, op.pc) else {
         return Ok(None);
     };
+    let done = orthodox_helper_subwalk_result(done);
     let bookmark = end_list_append_suspend_bookmark(op.pc);
     match done {
         Err(error) if list_append_resume_declines(&error) => {
@@ -16903,14 +16908,27 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // `MayForceNullRefArgUnsupported` from an empty extra-args array interned
     // as `CONST_NULL` is a representation defect; converting it here would
     // residualize the helper instead of recording the body.
-    let walk_result = match walk_result {
+    let walk_result = orthodox_helper_subwalk_result(walk_result);
+
+    Ok((walk_result?, walk_start))
+}
+
+/// Convert a helper-body abort into the fold's residual-continuation error.
+///
+/// `MetaInterp._interpret` keeps walking the caller after a completed child;
+/// an un-lowered helper `abort/` is the same class as a symbolic residual, so
+/// the enclosing walk residualizes the helper. Parked (already-finished)
+/// results take this conversion too — they skip the walk-time setup/teardown
+/// in `run_orthodox_helper_subwalk`.
+fn orthodox_helper_subwalk_result(
+    walk_result: Result<DispatchOutcome, DispatchError>,
+) -> Result<DispatchOutcome, DispatchError> {
+    match walk_result {
         Err(DispatchError::AbortMarkerReached { pc }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,
-    };
-
-    Ok((walk_result?, walk_start))
+    }
 }
 
 /// Append `parent` as the innermost parent of `level` and refuse CALL-entry
@@ -20044,7 +20062,9 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         ));
     }
     let walk = match parked_result {
-        Some((done, _)) => done.map(|outcome| (outcome, pre_fold_pos)),
+        Some((done, _)) => {
+            orthodox_helper_subwalk_result(done).map(|outcome| (outcome, pre_fold_pos))
+        }
         None => {
             let sym = unsafe { &*sym_ptr };
             let Ok(nested_entry) =
@@ -20118,7 +20138,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     fbw_gc_store_journal_keep_since(journal_mark, iter_obj);
     if concrete_continues {
         let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
-        if after == concrete_current && !helper_already_ran {
+        if after == concrete_current {
             let concrete_item = unsafe { shape.replay(iter_obj) };
             if concrete_item.is_null() {
                 return Ok(None);

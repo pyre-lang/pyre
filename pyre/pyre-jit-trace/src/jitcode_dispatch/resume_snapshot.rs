@@ -3302,6 +3302,11 @@ pub(crate) struct PendingPortalLevel {
     /// `push_frame`; `InlineConcreteFrameGuard` then holds the
     /// `OwnerRootGuard`.
     pub(crate) concrete_frame: usize,
+    /// Canonical portal activation [`note_inline_subwalk_start`] opened.
+    /// Nested `SubWalkSuspended` must not close it (`perform_call` /
+    /// `ChangeFrame` keeps the new `MIFrame` until `finishframe` /
+    /// `popframe`).
+    pub(crate) jd_no: Option<usize>,
 }
 
 impl HelperLevel {

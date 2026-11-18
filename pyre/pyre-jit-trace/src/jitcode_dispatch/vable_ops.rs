@@ -79,7 +79,32 @@ pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
     session.borrow_mut().helper_live.pop();
 }
 
-fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
+fn replace_box_in_parent_frame(parent: &mut InlineParentFrame, oldbox: OpRef, newbox: OpRef) {
+    replace_slots(&mut parent.boxes, oldbox, newbox);
+    if let Some(state) = parent.frame_state.as_ref() {
+        state.replace_active_box(oldbox, newbox);
+    }
+    let bank = match oldbox.ty() {
+        Some(Type::Int) => parent.registers_i.as_ref(),
+        Some(Type::Ref) => parent.registers_r.as_ref(),
+        Some(Type::Float) => parent.registers_f.as_ref(),
+        _ => None,
+    };
+    if let Some(bank) = bank {
+        bank.replace_active_box(oldbox, newbox);
+    }
+    if let Some(blackhole) = parent.blackhole.as_mut() {
+        for (_, value) in &mut blackhole.float_values {
+            replace_slots(std::slice::from_mut(value), oldbox, newbox);
+        }
+    }
+}
+
+pub(crate) fn replace_box_in_paused_frames(
+    session: &mut WalkSession,
+    oldbox: OpRef,
+    newbox: OpRef,
+) {
     for live in &session.helper_live {
         replace_live_regs(live, oldbox, newbox);
     }
@@ -94,24 +119,21 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
             HelperCallEntry::Unavailable | HelperCallEntry::CallerBoundary => None,
         };
         for parent in frame.parents.iter_mut().chain(call_entry) {
-            replace_slots(&mut parent.boxes, oldbox, newbox);
-            if let Some(state) = parent.frame_state.as_ref() {
-                state.replace_active_box(oldbox, newbox);
-            }
-            let bank = match oldbox.ty() {
-                Some(Type::Int) => parent.registers_i.as_ref(),
-                Some(Type::Ref) => parent.registers_r.as_ref(),
-                Some(Type::Float) => parent.registers_f.as_ref(),
-                _ => None,
-            };
-            if let Some(bank) = bank {
-                bank.replace_active_box(oldbox, newbox);
-            }
-            if let Some(blackhole) = parent.blackhole.as_mut() {
-                for (_, value) in &mut blackhole.float_values {
-                    replace_slots(std::slice::from_mut(value), oldbox, newbox);
-                }
-            }
+            replace_box_in_parent_frame(parent, oldbox, newbox);
+        }
+    }
+    if let Some(level) = session.pending_helper_level.as_mut() {
+        let call_entry = match &mut level.call_entry {
+            HelperCallEntry::Frame(entry) => Some(entry),
+            HelperCallEntry::Unavailable | HelperCallEntry::CallerBoundary => None,
+        };
+        for parent in level.parents.iter_mut().chain(call_entry) {
+            replace_box_in_parent_frame(parent, oldbox, newbox);
+        }
+    }
+    if let Some(level) = session.pending_portal_level.as_mut() {
+        for parent in &mut level.parents {
+            replace_box_in_parent_frame(parent, oldbox, newbox);
         }
     }
 }
