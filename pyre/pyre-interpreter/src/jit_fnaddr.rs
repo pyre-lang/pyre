@@ -2505,6 +2505,113 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::runtime_ops::bh_next,
     );
     cp1!(&mut entries, "next", crate::runtime_ops::bh_next);
+    // The `next_w` bodies `shortcut_next` dispatches to are residual calls in
+    // its JitCode; each binds to its `bh_*_next_w` bridge.
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::count_next_w",
+        crate::runtime_ops::bh_count_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::repeat_next_w",
+        crate::runtime_ops::bh_repeat_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::takewhile_next_w",
+        crate::runtime_ops::bh_takewhile_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::dropwhile_next_w",
+        crate::runtime_ops::bh_dropwhile_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filterfalse_next_w",
+        crate::runtime_ops::bh_filterfalse_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::islice_next_w",
+        crate::runtime_ops::bh_islice_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::batched_next_w",
+        crate::runtime_ops::bh_batched_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::product_next_w",
+        crate::runtime_ops::bh_product_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::groupby_next_w",
+        crate::runtime_ops::bh_groupby_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::groupby_iterator_next_w",
+        crate::runtime_ops::bh_groupby_iterator_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::tee_iterable_next_w",
+        crate::runtime_ops::bh_tee_iterable_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::compress_next_w",
+        crate::runtime_ops::bh_compress_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::starmap_next_w",
+        crate::runtime_ops::bh_starmap_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::accumulate_next_w",
+        crate::runtime_ops::bh_accumulate_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::zip_longest_next_w",
+        crate::runtime_ops::bh_zip_longest_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filter_next_w",
+        crate::runtime_ops::bh_filter_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::map_next_w",
+        crate::runtime_ops::bh_map_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::zip_next_w",
+        crate::runtime_ops::bh_zip_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::pairwise_next_w",
+        crate::runtime_ops::bh_pairwise_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::cycle_next_w",
+        crate::runtime_ops::bh_cycle_next_w,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::chain_next_w",
+        crate::runtime_ops::bh_chain_next_w,
+    );
     cpa2!(
         &mut entries,
         "pyre_object::listobject::drain_list_append",
@@ -2880,6 +2987,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::root_scope_close_word",
         "pyre_object::root_scope_close_word",
         pyre_object::gc_roots::root_scope_close_word,
+    );
+    // The bracket's open. `dont_look_inside` residualises `push_roots`; the
+    // result is one `save_point` word. An unbound path aborts any walk that
+    // inlines `next` through the shortcut pin.
+    pa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots,
     );
     cpa2!(
         &mut entries,
@@ -4031,6 +4147,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pycode::w_code_get_w_globals",
         crate::pycode::w_code_get_w_globals,
+    );
+    // `pycode.py frame_stores_global` is a field store. These two helpers are
+    // the pyre-only live-wrapper / stamped-globals registries for the raw
+    // `CodeObject` / GC `PyCode` split; both take a process-global Mutex
+    // HashMap and are `dont_look_inside`. Void + `"ir"` / `"r"` is
+    // ResidualRet-safe. Bind both so a walked `createframe` residual is a
+    // real address rather than a symbolic abort.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::pycode::register_live_code_wrapper",
+        "pyre_interpreter::register_live_code_wrapper",
+        crate::pycode::register_live_code_wrapper,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::pycode::register_w_globals_stamped_code",
+        "pyre_interpreter::register_w_globals_stamped_code",
+        crate::pycode::register_w_globals_stamped_code,
     );
     // `name_idx` is `u32 -> u32`. The word bridge is what the residual reads.
     cp1!(
@@ -5586,6 +5720,99 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_dict_unicode_key_hash",
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash,
     );
+    // `_ll_dictnext` (`rordereddict.py`) residual: signed slot or -1.
+    // `support.py _ll_1_odictiter_next`. The trampoline is the word ABI
+    // `dont_look_inside` emits for each monomorphic storage.
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_ll_dictnext",
+        "pyre_object::object_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_ll_dictnext",
+        "pyre_object::int_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_ll_dictnext",
+        "pyre_object::bytes_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_ll_dictnext",
+        "pyre_object::identity_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_ll_dictnext",
+        "pyre_object::module_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_live_key_obj",
+        "pyre_object::object_dict_live_key_obj",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_live_key_obj,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_live_value",
+        "pyre_object::object_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_live_key",
+        "pyre_object::int_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_live_value",
+        "pyre_object::int_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_live_key",
+        "pyre_object::bytes_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_live_value",
+        "pyre_object::bytes_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_live_key",
+        "pyre_object::identity_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_live_value",
+        "pyre_object::identity_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_live_key_obj",
+        "pyre_object::module_dict_live_key_obj",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_live_key_obj,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_live_value",
+        "pyre_object::module_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_live_value,
+    );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw. Same shape for the `W_SetObject.set_id`
@@ -6031,6 +6258,46 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::stack_check::drain_jit_pending_exception",
         crate::stack_check::drain_jit_pending_exception_jit_abi,
+    );
+    // jd3 `DoneWithThisFrameInt` analogue: Void marker then Int kind /
+    // parked append-count. Both helpers are `dont_look_inside` TLS takes
+    // (`call.rs` `list_extend_compiled_kind` / `list_extend_compiled_i`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::list_extend_compiled_kind",
+        crate::call::list_extend_compiled_kind,
+    );
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::list_extend_compiled_i",
+        crate::call::list_extend_compiled_i,
+    );
+    // jd4 `DoneWithThisFrameRef` analogue: Void marker then Int kind /
+    // parked object. Both helpers are `dont_look_inside` TLS takes
+    // (`call.rs` `filter_compiled_kind` / `filter_compiled_obj`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::filter_compiled_kind",
+        crate::call::filter_compiled_kind,
+    );
+    cpa0!(
+        &mut entries,
+        "pyre_interpreter::call::filter_compiled_obj",
+        "pyre_interpreter::filter_compiled_obj",
+        crate::call::filter_compiled_obj,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filter_jitdriver_jit_abi",
+        "pyre_interpreter::filter_jitdriver_jit_abi",
+        crate::baseobjspace::filter_jitdriver_jit_abi,
+    );
+    // jd6 `DoneWithThisFrameVoid` analogue: Void marker then Int kind.
+    // `dont_look_inside` TLS take (`call.rs` `unpack_into_compiled_kind`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::unpack_into_compiled_kind",
+        crate::call::unpack_into_compiled_kind,
     );
 
     // `ncells` / `npure_cellvars` take a `CodeObject` and carry
@@ -9663,6 +9930,26 @@ mod tests {
             &bindings,
             "pyre_interpreter::pycode::w_code_get_w_globals",
             crate::pycode::w_code_get_w_globals as *const () as usize as i64,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::pycode::register_live_code_wrapper",
+            crate::pycode::register_live_code_wrapper as *const () as usize as i64,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::register_live_code_wrapper",
+            crate::pycode::register_live_code_wrapper as *const () as usize as i64,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::pycode::register_w_globals_stamped_code",
+            crate::pycode::register_w_globals_stamped_code as *const () as usize as i64,
+        );
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::register_w_globals_stamped_code",
+            crate::pycode::register_w_globals_stamped_code as *const () as usize as i64,
         );
         assert_occupied_binding(
             &bindings,

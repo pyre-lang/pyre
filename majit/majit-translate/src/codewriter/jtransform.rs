@@ -1000,6 +1000,9 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
     "TupleHashJitDriver",
+    "ListExtendJitDriver",
+    "FilterJitDriver",
+    "UnpackIntoJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -3818,6 +3821,7 @@ impl<'a> Transformer<'a> {
     /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
     /// rewrites that object.
     pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
+        crate::translator::rtyper::cutover::stamp_rootscope_int_bank(&graph);
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -12088,6 +12092,18 @@ impl<'a> Transformer<'a> {
                 let src = resolve_alias(&args[0], &self.aliases);
                 return self.rewrite_op_force_cast(&src, op.result.as_ref(), graph_name, graph);
             }
+            // `pyframe.py PyFrame.__init__` is `_always_inline_` and
+            // returns the malloc'd `W_Root`. `heapify_pyframe_w_root` is
+            // the FrameBox wrap of that GCREF. When the constructor
+            // already `new_with_vtable`'d the frame, the wrap is
+            // `rewrite_op_same_as` of the operand. A raw `*mut PyFrame`
+            // still residualizes so the interpreter mallocs once.
+            if is_heapify_pyframe_w_root_path(segments) && args.len() == 1 {
+                let src = resolve_alias(&args[0], &self.aliases);
+                if self.get_value_kind_var(&src) == 'r' {
+                    return RewriteResult::Identity(src);
+                }
+            }
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
                 // `__cast_instance_intrinsic` onto a flavor-raw ADT
@@ -19909,6 +19925,14 @@ pub(crate) fn is_llmemory_cast_path(segments: &[String], name: &str) -> bool {
 pub(crate) fn is_current_gc_ref_path(segments: &[String]) -> bool {
     path_segments_end_with(segments, &["listobject", "current_gc_ref"])
         || segments == ["pyre_object", "current_gc_ref"]
+}
+
+/// FrameBox wrap of an already-heap `PyFrame` GCREF.
+///
+/// `pyframe.py PyFrame.__init__._always_inline_` mallocs once and
+/// returns `self`. A user function of this name is an ordinary call.
+pub(crate) fn is_heapify_pyframe_w_root_path(segments: &[String]) -> bool {
+    path_segments_end_with(segments, &["pyframe", "heapify_pyframe_w_root"])
 }
 
 /// `direct_ptradd`'s pointer argument as the front emitted it. Captured
@@ -35572,6 +35596,23 @@ mod tests {
             jit_marker_key_from_target(&tuplehash_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
+        let list_extend_merge =
+            CallTarget::method("jit_merge_point", Some("ListExtendJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&list_extend_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let filter_merge = CallTarget::method("jit_merge_point", Some("FilterJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&filter_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let unpack_into_merge =
+            CallTarget::method("jit_merge_point", Some("UnpackIntoJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&unpack_into_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
 
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
@@ -38624,6 +38665,86 @@ mod tests {
                 _ => panic!("expected Identity alias for {segs:?}"),
             }
         }
+    }
+
+    /// `pyframe.py PyFrame.__init__` mallocs once. A GCREF wrap of that
+    /// frame is `rewrite_op_same_as`; a raw `*mut PyFrame` stays a call.
+    #[test]
+    fn heapify_pyframe_w_root_aliases_a_gcref_operand() {
+        let user: Vec<String> = ["user", "heapify_pyframe_w_root"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_heapify_pyframe_w_root_path(&user),
+            "ordinary call to heapify_pyframe_w_root must not alias its argument"
+        );
+
+        let segs: Vec<String> = ["pyre_interpreter", "pyframe", "heapify_pyframe_w_root"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            is_heapify_pyframe_w_root_path(&segs),
+            "helper spelling is the FrameBox wrap of a GCREF"
+        );
+        assert!(
+            !is_same_as_identity_call_path(&segs),
+            "a raw *mut PyFrame still residualizes"
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("heapify_pyframe_w_root_calls");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_ty = ValueType::Ref(None);
+        let target =
+            CallTarget::function_path(["pyre_interpreter", "pyframe", "heapify_pyframe_w_root"]);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "heapify_pyframe_w_root_calls",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias for a GCREF operand"),
+        }
+
+        let int_arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let int_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let int_op = SpaceOperation {
+            result: Some(int_result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![int_arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        assert!(
+            !matches!(
+                transformer.rewrite_op_direct_call(
+                    &int_op,
+                    &target,
+                    std::slice::from_ref(&int_arg),
+                    &result_ty,
+                    "heapify_pyframe_w_root_calls",
+                    &mut graph,
+                ),
+                RewriteResult::Identity(_)
+            ),
+            "a raw *mut PyFrame still residualizes"
+        );
     }
 
     /// `ManuallyDrop::new` is `repr(transparent)` over the payload.

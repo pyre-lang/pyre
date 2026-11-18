@@ -1004,6 +1004,112 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     );
 }
 
+#[test]
+fn list_extend_drain_match_fuses_to_kind_test() {
+    let llbc = interp();
+    let graph = lower_function(llbc, "pyre_interpreter::type_methods::list_extend_portal")
+        .expect("lower list_extend_portal");
+    assert!(
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method {
+                        name,
+                        receiver_root: Some(root),
+                        ..
+                    },
+                    ..
+                } if name == "jit_merge_point" && root == "ListExtendJitDriver"
+            )
+        }),
+        "jit_merge_point must stay a Method on the driver receiver"
+    );
+
+    let handlers: Vec<(usize, majit_translate::flowspace::model::Variable)> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.exits.iter())
+        .filter(|link| link.exitcase == Some(ExitCase::ErrorCarrier))
+        .filter_map(|link| {
+            let caught = link.last_exc_value.as_ref()?.as_variable()?;
+            let pos = link
+                .args
+                .iter()
+                .position(|arg| arg.as_variable() == Some(caught))?;
+            Some((
+                link.target.0,
+                graph.blocks[link.target.0].inputargs[pos].clone(),
+            ))
+        })
+        .collect();
+    let is_predicate = |op: &majit_translate::model::SpaceOperation| {
+        let OpKind::Call { target, .. } = &op.kind else {
+            return false;
+        };
+        let leaf = match target {
+            CallTarget::Method { name, .. } => Some(name.as_str()),
+            CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+            _ => None,
+        };
+        matches!(
+            leaf,
+            Some("matches_stop_iteration") | Some("matches_stop_iteration_keep")
+        )
+    };
+    let fused_predicates = handlers
+        .iter()
+        .filter(|(block, caught)| {
+            graph.blocks[*block].operations.iter().any(|op| {
+                is_predicate(op)
+                    && matches!(&op.kind, OpKind::Call { args, .. }
+                        if args.first()
+                            .and_then(|a| a.as_variable())
+                            .is_some_and(|arg| *arg == *caught))
+            })
+        })
+        .count();
+    assert!(
+        fused_predicates >= 1,
+        "list_extend drain fusion must run the StopIteration predicate on the caught carrier"
+    );
+    let stray_predicates = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !handlers.iter().any(|(h, _)| h == bi))
+        .flat_map(|(_, b)| b.operations.iter())
+        .filter(|op| is_predicate(op))
+        .count();
+    assert_eq!(
+        stray_predicates, 0,
+        "the source Err-arm predicate must be gone after the drain fusion"
+    );
+    let closure_calls: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        receiver_root: Some(receiver),
+                        ..
+                    },
+                ..
+            } if name == "call" && receiver.starts_with("closure") => {
+                Some(format!("{receiver}.{name}"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        closure_calls.is_empty(),
+        "list_extend_portal must not residualize `||` closures: {closure_calls:?}"
+    );
+}
+
 fn call_target_leaf(target: &CallTarget) -> String {
     match target {
         CallTarget::FunctionPath { segments, .. } => segments.last().cloned().unwrap_or_default(),

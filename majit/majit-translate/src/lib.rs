@@ -3402,8 +3402,10 @@ fn register_configured_jitdrivers(
         // copies it so original and portal share greens + autodetected reds.
         // `rewrite_jit_merge_point` then turns origportalgraph's marker into
         // `return portal_runner(*greens, *reds)` with that `jd.numreds`.
+        // `spec.reds` is empty when `reds='auto'`.
         let mut numreds = spec.reds.len();
         let mut extra_declared: Vec<crate::model::ValueType> = Vec::new();
+        let mut seed_red_kinds = spec.red_kinds.clone();
         let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
@@ -3478,6 +3480,7 @@ fn register_configured_jitdrivers(
                             })
                             .collect()
                     };
+                    seed_red_kinds = crate::codewriter::support::ir_kinds_for_seed(original, &reds);
                     reds.len()
                 } else {
                     spec.reds.len()
@@ -3526,8 +3529,9 @@ fn register_configured_jitdrivers(
             crate::codewriter::support::seed_split_portal_input_ops(
                 &mut portal,
                 split_start,
+                &spec.greens,
                 &spec.green_kinds,
-                &spec.red_kinds,
+                &seed_red_kinds,
                 &spec.red_types,
                 &extra_declared,
             );

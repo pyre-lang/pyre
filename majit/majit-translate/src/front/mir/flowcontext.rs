@@ -980,6 +980,14 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 .or_else(|| {
                     if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                         None
+                    } else if let Some(root) =
+                        tyref_rootscope_class_root(&local.ty, llbc, tombstoned_leaves)
+                    {
+                        // `&RootScope` / `RootScope` is the save_point int
+                        // (`history.py` `getkind` of a raw `Ptr`). Carry the
+                        // name so `derive_subject_inputcells` seeds SomePtr;
+                        // do not let `raw_address_owner_root` paint a Ref.
+                        Some(root)
                     } else {
                         raw_address_owner_root(
                             &local.ty,
@@ -993,7 +1001,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             }
         };
         if let Some((root, _)) = cell_stamp {
-            ty = ValueType::Ref(Some(root));
+            if !is_root_scope_class_root(&root) {
+                ty = ValueType::Ref(Some(root));
+            }
         }
         let len_slot = len_shadow[i];
         let (ty, class_root) = match len_slot {
@@ -1859,6 +1869,10 @@ impl<'a> Lowering<'a> {
                     .or_else(|| {
                         if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                             None
+                        } else if let Some(root) =
+                            tyref_rootscope_class_root(&local.ty, llbc, tombstoned_leaves)
+                        {
+                            Some(root)
                         } else {
                             raw_address_owner_root(
                                 &local.ty,
@@ -1872,7 +1886,9 @@ impl<'a> Lowering<'a> {
                 }
             };
             if let Some((root, _)) = cell_stamp {
-                ty = ValueType::Ref(Some(root));
+                if !is_root_scope_class_root(&root) {
+                    ty = ValueType::Ref(Some(root));
+                }
             }
             let len_slot = len_shadow[i];
             let (ty, class_root) = match len_slot {

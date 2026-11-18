@@ -16731,8 +16731,15 @@ fn generic_payload_enum_instantiations_get_distinct_variant_structs() {
     assert_ne!(ref_sid, template);
 
     let cc = call_control_from_program(&program);
-    let unit_parent = size_parent(&cc, "__discriminant", "payload::E::V", unit_sid);
-    let ref_disc = size_parent(&cc, "__discriminant", "payload::E::V", ref_sid);
+    // `rclass.InstanceRepr._get_field` keys `__discriminant` on the BASE
+    // STRUCT, so `size_parent` of the tag is the enum layout. The variant
+    // instance list is `bh_size_spec_for` (`heaptracker.all_fielddescrs`).
+    let unit_parent =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "payload::E::V", Some(unit_sid))
+            .expect("unit variant size");
+    let ref_disc =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "payload::E::V", Some(ref_sid))
+            .expect("ref variant size");
     let ref_pos = size_parent(&cc, "__pos_0", "payload::E::V", ref_sid);
     assert_eq!(field_keys(&unit_parent), vec!["__discriminant".to_string()]);
     assert_eq!(
@@ -16862,8 +16869,18 @@ fn unshelled_generic_payload_enum_instance_layout_is_tag_plus_payload() {
     assert_ne!(unit_sid, i64_sid);
 
     let cc = call_control_from_program(&program);
-    let unit_parent = size_parent(&cc, "__discriminant", "ops::range::E::Included", unit_sid);
-    let i64_disc = size_parent(&cc, "__discriminant", "ops::range::E::Included", i64_sid);
+    let unit_parent = crate::codewriter::assembler::bh_size_spec_for(
+        &cc,
+        "ops::range::E::Included",
+        Some(unit_sid),
+    )
+    .expect("unit variant size");
+    let i64_disc = crate::codewriter::assembler::bh_size_spec_for(
+        &cc,
+        "ops::range::E::Included",
+        Some(i64_sid),
+    )
+    .expect("i64 variant size");
     let i64_pos = size_parent(&cc, "__pos_0", "ops::range::E::Included", i64_sid);
     assert_eq!(field_keys(&unit_parent), vec!["__discriminant".to_string()]);
     assert_eq!(
@@ -17127,7 +17144,8 @@ fn nongeneric_fat_pointer_payload_enum_instance_layout_is_tag_plus_payload() {
     let sid = super::concrete_adt_struct_id(template, Some(&adt), &llbc, &tomb);
     assert_eq!(sid, template, "empty args leave the template identity");
     let cc = call_control_from_program(&program);
-    let parent = size_parent(&cc, "__discriminant", "fmt::Arg::Bytes", sid);
+    let parent = crate::codewriter::assembler::bh_size_spec_for(&cc, "fmt::Arg::Bytes", Some(sid))
+        .expect("Bytes variant size");
     let keys = field_keys(&parent);
     assert!(
         keys.iter().any(|k| k == "__discriminant"),
@@ -17259,7 +17277,9 @@ fn residual_sibling_arg_occupying_payload_is_tag_plus_payload() {
     let sid = super::concrete_adt_struct_id(template, Some(&adt), &llbc, &tomb);
     assert_ne!(sid, template);
     let cc = call_control_from_program(&program);
-    let parent = size_parent(&cc, "__discriminant", "ops::Flow::Continue", sid);
+    let parent =
+        crate::codewriter::assembler::bh_size_spec_for(&cc, "ops::Flow::Continue", Some(sid))
+            .expect("Continue variant size");
     assert_eq!(
         field_keys(&parent),
         vec!["__discriminant".to_string(), "__pos_0".to_string()]
@@ -21144,6 +21164,124 @@ fn foreign_opaque_gcrefopaque_ptr_is_gcref_ref() {
     );
 }
 
+/// `heapify_pyframe_w_root` / `try_createframe` return `*mut GCREFOpaque`.
+/// `flatten.py` `make_return` of that dest must `ref_return`.
+#[test]
+fn live_heapify_try_createframe_output_is_gcref() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    for name in ["heapify_pyframe_w_root", "try_createframe"] {
+        let fd = llbc
+            .local_fn(name)
+            .unwrap_or_else(|| panic!("missing {name} in interpreter ULLBC"));
+        let out = &fd.signature.output;
+        let path = fd.item_meta.name_path();
+        let vt =
+            super::tyref_to_value_type_with(out, llbc, super::no_tombstoned_leaves(), &gc, &empty);
+        let token = dont_look_inside_return_token(
+            out,
+            llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+        );
+        let spelling = tyref_is_gcref_spelling(out, llbc);
+        let raw = super::ty_is_raw_address(out, llbc, &gc, &empty);
+        let voidp = super::raw_c_void_ptr_bank(out, llbc);
+        let scalar = super::raw_scalar_address_value_type(out, llbc);
+        assert!(
+            spelling,
+            "{path}: output is GCREF spelling; vt={vt:?} token={token:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+        assert!(
+            !raw,
+            "{path}: GCREF is not a raw address; vt={vt:?} token={token:?}"
+        );
+        assert_eq!(
+            vt,
+            ValueType::Ref(None),
+            "{path}: getkind(Ptr(GcOpaqueType)) is ref; token={token:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+        assert_eq!(
+            token.as_deref(),
+            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+            "{path}: residual FUNC.RESULT is gcref; vt={vt:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+    }
+}
+
+/// Isolated `lower_function` does not apply `SemanticFunctionHeader`.
+/// `call.py` `FUNC.RESULT` is the header token copied onto the graph
+/// at registration (`GraphTransform.apply`).
+#[test]
+fn live_try_createframe_header_stamps_gcref() {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["try_createframe"],
+    )
+    .expect("header of try_createframe");
+    let func = program
+        .functions
+        .iter()
+        .find(|f| f.name == "try_createframe")
+        .unwrap_or_else(|| {
+            panic!(
+                "try_createframe missing; names={:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        func.return_type.as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+        "look_inside FUNC.RESULT of GCREF; class_root={:?}",
+        func.return_class_root
+    );
+    let graph = crate::test_support::lower_function(llbc, "try_createframe")
+        .expect("lower try_createframe");
+    let heapify: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let name = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
+                CallTarget::Method { name, .. } => name.as_str(),
+                _ => return None,
+            };
+            if !name.contains("heapify") {
+                return None;
+            }
+            Some(format!(
+                "{name} dest_ct={:?} result_ty={result_ty:?} var={:?}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of),
+                op.result.as_ref().map(|r| r.name())
+            ))
+        })
+        .collect();
+    assert!(
+        heapify
+            .iter()
+            .any(|row| row.contains("result_ty=Ref(None)")),
+        "heapify dest is GCREF; header={:?} heapify={heapify:?}",
+        func.return_type
+    );
+}
+
 /// `w_code_get_ptr` returns `*const CodeObject`. `history.py` `getkind`
 /// of that raw `Ptr` is `'int'` (`rclass.py` `getgcflavor`). The header
 /// stamps `raw:<owner>` so `call.py` `RESULT == FUNC.RESULT` rewrites a
@@ -21187,7 +21325,7 @@ fn live_w_code_get_ptr_result_kind() {
         &[llbc],
         crate::HostStaticAddrs::default(),
         &[],
-        &["w_code_get_ptr"],
+        &["w_code_get_ptr", "try_createframe"],
     )
     .expect("header of w_code_get_ptr");
     let func = program
@@ -21203,6 +21341,41 @@ fn live_w_code_get_ptr_result_kind() {
         header.starts_with("raw:") && header.contains("CodeObject"),
         "look_inside FUNC.RESULT is raw:CodeObject; header={header:?} class_root={:?}",
         func.return_class_root
+    );
+
+    let caller = program
+        .functions
+        .iter()
+        .find(|f| f.name == "try_createframe")
+        .expect("try_createframe semantic");
+    let calls: Vec<&ValueType> = caller
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let name = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
+                CallTarget::Method { name, .. } => name.as_str(),
+                _ => return None,
+            };
+            (name == "w_code_get_ptr").then_some(result_ty)
+        })
+        .collect();
+    assert!(!calls.is_empty(), "try_createframe inlines w_code_get_ptr");
+    assert!(
+        calls.iter().any(|ty| match ty {
+            ValueType::Ref(Some(root)) => root.contains("CodeObject"),
+            ValueType::Int => true,
+            _ => false,
+        }),
+        "try_createframe dest of w_code_get_ptr is *const CodeObject; calls={calls:?}"
     );
 }
 

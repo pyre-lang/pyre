@@ -6239,18 +6239,24 @@ fn note_raw_word_owner(
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
+    let name = td.item_meta.name_path();
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(
-        td.def_id,
-        llbc,
-        gc_struct_ids,
-        immutable_fields,
-        raw_alloc_flavor_structs,
-        &mut stack,
-    ) {
+    // `RootScope` is the `save_point` address word (`history.py` `getkind`
+    // of a raw `Ptr` / `llmemory.Address`). A depending crate sees an
+    // Opaque copy, and PhantomData can look like a second field, so the
+    // storage walk may miss it; the name is the residual ABI.
+    if !gc_root_scope_type_path(&name)
+        && !adt_def_is_raw_storage(
+            td.def_id,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            &mut stack,
+        )
+    {
         return;
     }
-    let name = td.item_meta.name_path();
     let leaf = name
         .rsplit("::")
         .next()
@@ -9642,8 +9648,8 @@ pub(crate) use self::desugar::rewire::{
 pub(crate) use self::gcroot::{
     OWNER_ROOT_DECLARED_PATH, ROOT_SCOPE_CLOSE, RootStackAnalyzer,
     harvest_root_stack_touching_paths_with, harvest_scope_owning_identities_with,
-    is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
-    is_slice_buffer_free_call, owner_root_type_path,
+    is_root_scope_class_root, is_root_scope_drop_glue_call, is_rust_vec_free_call,
+    is_shadow_stack_bracket_close, is_slice_buffer_free_call, owner_root_type_path,
 };
 pub use self::gcroot::{
     PublishedStructBody, PublishedStructField, RootStackState, apply_published_structs,

@@ -6368,6 +6368,16 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
+                if self.try_lower_then_some(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,

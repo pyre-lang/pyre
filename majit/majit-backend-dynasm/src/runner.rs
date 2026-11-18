@@ -1955,7 +1955,7 @@ fn dynasm_alloc_oldgen_varsize_typed_and_set_len(
     ptr as u64
 }
 
-/// The old-generation twin of [`dynasm_alloc_fixedsize_typed_or_raw`], for a
+/// The old-generation twin of [`dynasm_alloc_young_nonmoving_typed_or_raw`], for a
 /// size descr that demands a non-moving address at any size.  Same OOM contract.
 fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     let result = with_dynasm_active_gc_mut(|gc| {
@@ -1968,9 +1968,9 @@ fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     }
 }
 
-fn dynasm_alloc_fixedsize_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
+fn dynasm_alloc_young_nonmoving_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     let result = with_dynasm_active_gc_collecting(|gc| {
-        let obj = gc.alloc_nursery_typed(type_id, payload_size);
+        let obj = gc.alloc_young_nonmoving_typed(type_id, payload_size);
         if obj.is_null() { 0 } else { obj.0 as u64 }
     });
     // gc.py:51 contract: helper returns NULL on OOM so
@@ -1988,17 +1988,16 @@ fn dynasm_alloc_fixedsize_typed_or_raw(type_id: u32, payload_size: usize) -> u64
 /// gc.py `malloc_big_fixedsize(size, tid)` — fixed-size object
 /// large enough to skip the nursery.
 ///
-/// Upstream calls `do_malloc_fixedsize_clear`, which is the ordinary
-/// `malloc_fixedsize`, so the size decides the arm: over `nonlarge_max` it
-/// takes `external_malloc(typeid, 0, alloc_young=True)`.  `alloc_nursery_typed`
-/// is that entry point here — it dispatches on size, and only its small arm is
-/// the nursery — so the object is born *young* raw-malloced and can die at the
-/// next minor.  Header is stamped with the type id so callers MUST
+/// Upstream calls `do_malloc_fixedsize_clear`, whose large arm is
+/// `external_malloc(typeid, 0, alloc_young=True)`.  Rewrite reaches this
+/// helper only after declining `gen_malloc_nursery`, so the birth is always
+/// that large arm — never the nursery bump `alloc_nursery_typed` would take
+/// at a small size.  Header is stamped with the type id so callers MUST
 /// NOT emit a separate `gen_initialize_tid`.
 pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
     // The CALL_R arg is `total = payload + GcHeader::SIZE` (built by
     // `handle_new` in rewrite.rs to include the GC header).  The
-    // runtime allocators (`alloc_with_type`, `alloc_nursery_typed`)
+    // runtime allocators (`alloc_young_nonmoving_typed`)
     // and the raw fallback both prepend the GC header themselves and
     // expect a payload-only size, so subtract `HDR` here once —
     // mirroring `dynasm_nursery_slowpath` above
@@ -2007,11 +2006,14 @@ pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
     // `GcLLDescr_boehm.malloc_fixedsize` (`rewrite.py gen_malloc_fixedsize`,
     // Boehm arm): no HDR, the block is the object, vtable at offset 0.
     // `handle_new` still passes the headered total; the payload is
-    // `descr.size()`. Unset keeps `dynasm_alloc_fixedsize_typed_or_raw`.
+    // `descr.size()`. Unset keeps `dynasm_alloc_young_nonmoving_typed_or_raw`.
     if let Some(ptr) = call_malloc_fixedsize(payload) {
         return oom_signal_if_zero(ptr as u64);
     }
-    oom_signal_if_zero(dynasm_alloc_fixedsize_typed_or_raw(type_id as u32, payload))
+    oom_signal_if_zero(dynasm_alloc_young_nonmoving_typed_or_raw(
+        type_id as u32,
+        payload,
+    ))
 }
 
 /// `malloc_big_fixedsize`'s old-generation twin, selected by
@@ -2477,7 +2479,7 @@ impl DynasmBackend {
     /// here as `max_nursery_size: 0`, and `write_barrier_descr = None`
     /// (gc.py:156). Allocation then declines to the `dynasm_malloc_*`
     /// helpers, which already answer without a collector by falling back to
-    /// a raw alloc (`dynasm_alloc_fixedsize_typed_or_raw`). Note this default
+    /// a raw alloc (`dynasm_alloc_young_nonmoving_typed_or_raw`). Note this default
     /// differs deliberately from `dynasm_write_barrier_descr`, which
     /// substitutes the MiniMark layout when the *mutator thread* is not the
     /// one compiling; here `None` from `with_dynasm_active_gc` means no
@@ -3951,16 +3953,16 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let (jf_ptr, gc_object, needs_wb, _arg_roots) =
+        let (jf_ptr, gc_object, _needs_wb, _arg_roots) =
             alloc_entry_jitframe(self.jitframe_facts, JitFrame::alloc_size(num_slots), &[]);
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
-        // llmodel.py `execute_token`: `llop.gc_writebarrier(ll_frame)`.
-        // A nursery frame is young.
-        if needs_wb {
+        // llmodel.py `make_execute_token`: `llop.gc_writebarrier(ll_frame)`
+        // after the inputs are stored.
+        if gc_object {
             majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
         }
 
