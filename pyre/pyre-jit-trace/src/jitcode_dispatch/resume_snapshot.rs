@@ -561,8 +561,8 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// Capture encodes that section from `MIFrame.jitcode` (`jitcode.index`);
 /// the walk stamps it as `transparent_helper_jitcode_index`. Leftover
 /// Converted helpers (`HelperChain::Collapsed`) go through
-/// `numbered_helper_guard_resume` (CALL orgpc when the leftover recorded
-/// no heap write, else runnable Frames).
+/// `numbered_helper_guard_resume` (CALL orgpc when a CALL-level leftover
+/// recorded no heap write, else runnable Frames).
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
@@ -857,16 +857,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         {
             // Leftover Converted helpers (`HelperChain::Collapsed`) cannot
             // number a section of their own (`HelperResume::CallEntry`).
-            // Routing them through `numbered_helper_guard_resume`: a leftover
-            // that recorded no heap write / journaled effect is CALL orgpc
-            // (`generate_guard(resumepc=orgpc)`), so a wrapper that converts
-            // the helper return (`list_method_pop` IndexError) re-runs; a
-            // leftover after-effect (list.append) or a Numbered CallResult
-            // helper is helper-innermost Frames. Unrunnable leftover
-            // residualizes (`history.cut` + `do_residual_call`) or CALL
-            // orgpc when the leftover recorded nothing. Unconditional
-            // leftover Python MF retraces exception/iteration CALLs until
-            // abort; unconditional residualize re-opens CALL-boundary extras.
+            // Routing them through `numbered_helper_guard_resume`: a
+            // CALL-level leftover (`helper_levels == 1`) whose return is
+            // not the CALL dest (`resumes_at_call_entry`) and that recorded
+            // no heap write / journaled effect is CALL orgpc
+            // (`generate_guard(resumepc=orgpc)`), so a wrapper that
+            // converts the helper return (`list_method_pop` IndexError)
+            // re-runs; a nested leftover (`helper_levels > 1`) and a leftover
+            // after-effect (list.append) or a Numbered CallResult helper is
+            // helper-innermost Frames. Unrunnable leftover residualizes
+            // (`history.cut` + `do_residual_call`) or CALL orgpc when the
+            // leftover recorded nothing. Unconditional leftover Python MF
+            // retraces exception/iteration CALLs until abort; unconditional
+            // residualize re-opens CALL-boundary extras.
             match numbered_helper_guard_resume(
                 ctx,
                 op_pc,
@@ -3810,9 +3813,15 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // complete.
     let (sections_have_markers, any_blocker) =
         numbered_helper_sections_blocker_free(ctx, &parent_frames);
+    // Runnable matches main: a straight-line Python inline below the
+    // helpers (`python_chain_complete` false) still numbers the helper
+    // section when markers are complete and blocker-free. AND-ing the
+    // flag here collapsed those leftovers to CALL orgpc and retraced
+    // exception/iteration CALLs until abort. The flag still gates
+    // leftover after-effect Frames in `numbered_helper_guard_resume`.
     Ok((
         parent_frames,
-        python_chain_complete && sections_have_markers && !any_blocker,
+        sections_have_markers && !any_blocker,
         python_chain_complete,
     ))
 }
@@ -3974,7 +3983,7 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         pc: op_pc,
         symbolic: 0,
     };
-    let (heap_moved, journal_delta, outer_index) = {
+    let (heap_moved, journal_delta, outer_index, helper_levels) = {
         let session = ctx.session.borrow();
         let helper_levels = session
             .framestack
@@ -3988,7 +3997,7 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         };
         let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
         let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
-        (heap_moved, journal_delta, outer_index)
+        (heap_moved, journal_delta, outer_index, helper_levels)
     };
     if runnable {
         debug_assert!(
@@ -4005,13 +4014,21 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         // None, so that dest is NULL and STORE_FAST leaves the local
         // unbound; the wrapper (`list_method_pop`) is what raises.
         // `generate_guard(resumepc=orgpc)` / `capture_resumedata` re-runs
-        // the CALL instead when the leftover recorded no heap write
-        // (`entry_heap_writing_effects`) and no journaled effect
-        // (`entry_journal_mark`). After-effect leftovers (list.append)
-        // still number Frames so the CALL is not replayed.
+        // the CALL instead when the leftover is the CALL itself
+        // (`helper_levels == 1`), its return is not the CALL dest
+        // (`HelperReturn::resumes_at_call_entry`), and it recorded no heap
+        // write (`entry_heap_writing_effects`) and no journaled effect
+        // (`entry_journal_mark`). Nested leftovers under a Converted walk
+        // (`helper_levels > 1`) keep the parent's Converted tag when the
+        // portal look-inside is not yet transparent; collapsing those to
+        // the outer CALL orgpc retraces exception/iteration CALLs until
+        // abort. After-effect leftovers (list.append) still number Frames
+        // so the CALL is not replayed.
         let collapse_to_call = !heap_moved
             && journal_delta == 0
-            && ctx.session.borrow().helper_chain() == HelperChain::Collapsed;
+            && ctx.session.borrow().helper_chain() == HelperChain::Collapsed
+            && ctx.fbw_mode.helper_return.resumes_at_call_entry()
+            && helper_levels == 1;
         if !collapse_to_call {
             if fbw_debug_abort_enabled() {
                 eprintln!("[numbered-helper-guard] frames op_pc={op_pc}");
