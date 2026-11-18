@@ -13458,7 +13458,7 @@ fn slice_component_eq(
         )
     };
     let _roots = pyre_object::gc_roots::push_roots();
-    let left_slot = pyre_object::gc_roots::pin_roots(&[left, right]);
+    let left_slot = _roots.pin_roots(&[left, right]);
     let right_slot = left_slot + 1;
     crate::baseobjspace::eq_w(
         unsafe { pyre_object::gc_roots::shadow_stack_get(left_slot) },
@@ -13734,18 +13734,26 @@ fn init_slice_type(ns: PyObjectRef) {
 /// free parameters with `items`, then fold the substituted members back into
 /// a union with `|`.
 fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
-    let mut self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if !unsafe { pyre_object::is_union(self_) } {
         return Err(crate::PyError::type_error(
             "descriptor '__getitem__' requires a 'types.UnionType' object",
         ));
     }
-    let items_raw = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
+    // `self` and the subscription argument are live together across the
+    // tuple boxing below; publish both in one run and read them back.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[
+        self_,
+        args.get(1).copied().unwrap_or_else(pyre_object::w_none),
+    ]);
+    let items_raw = pyre_object::gc_roots::shadow_stack_get(self_slot + 1);
     let items = if unsafe { pyre_object::is_tuple(items_raw) } {
         items_raw
     } else {
-        pyre_object::with_roots!(self_ => pyre_object::w_tuple_new(vec![items_raw]))
+        pyre_object::w_tuple_new(vec![items_raw])
     };
+    let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let params = unsafe { pyre_object::w_union_get_parameters(self_) };
     let union_args = unsafe { pyre_object::w_union_get_args(self_) };
     let newargs = crate::_pypy_generic_alias::subs_parameters(self_, union_args, params, items)?;
@@ -13762,11 +13770,7 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     // allocates a fresh union.  PyPy's `newargs` is an app-level list the
     // collector traces, so pin the members and reread both the accumulator and
     // the next member from their slots after each step.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in &newargs {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
+    let base = pyre_object::gc_roots::pin_roots(&newargs);
     let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(base));
     let curr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for i in 1..newargs.len() {
@@ -28416,18 +28420,20 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     .expect("bytes/bytearray receiver always exports a buffer");
     let mut sep_buffer = None;
     let result = (|| {
+        let _roots = pyre_object::gc_roots::push_roots();
         if let Some(i) = sep_idx {
-            let mut o = pyre_object::gc_roots::shadow_stack_get(recv_slot + i);
+            let o = pyre_object::gc_roots::shadow_stack_get(recv_slot + i);
             if !o.is_null() && unsafe { !pyre_object::is_none(o) } {
-                sep_buffer = match pyre_object::with_roots!(o =>
-                    crate::baseobjspace::simple_buffer_bytes(o)
-                        .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes)))?
+                sep_buffer = match crate::baseobjspace::simple_buffer_bytes(
+                    pyre_object::gc_roots::shadow_stack_get(recv_slot + i),
+                )
+                .map(|buffer| buffer.map(crate::baseobjspace::SimpleBufferBytes::into_bytes))?
                 {
                     Some(sep) => Some(sep),
                     None => {
                         return Err(crate::PyError::type_error(format!(
                             "a bytes-like object is required, not '{}'",
-                            type_name_of(o)
+                            type_name_of(pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
                         )));
                     }
                 };

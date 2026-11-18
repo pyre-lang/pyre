@@ -7362,14 +7362,13 @@ pub fn getattr_str_impl(
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. This function
-    // opens its own `push_roots` (`ShadowStackFrameworkGCTransformer.push_roots`).
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. One scope
+    // owns every pin in this body (`ShadowStackFrameworkGCTransformer.push_roots`).
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
-    // unbracketed `PyObjectRef`. This function opens its own bracket
-    // (`ShadowStackFrameworkGCTransformer.push_roots`).
+    // unbracketed `PyObjectRef`.
 
     if name == "__dict__"
         && let Some(obj_type) =
@@ -7456,7 +7455,6 @@ pub fn getattr_str_impl(
             // The default result is memoized on the live, possibly retagged
             // type so ordinary modules retain the hot path.
             if call_getattr && let Some(slot) = module_getattribute_if_not_from_default(w_type) {
-                let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                 match get_and_call_function(
@@ -7675,7 +7673,6 @@ pub fn getattr_str_impl(
                         suppress,
                     );
                 }
-                let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                 // objspace.py:666 / descroperation.py:238
@@ -7850,7 +7847,6 @@ pub fn getattr_str_impl(
                 // not wrap and then unwrap an already validated name merely
                 // to re-enter that same canonical body.
                 if !is_type_getattribute_descr(slot) {
-                    let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                     // objspace.py:666 — bind the metaclass

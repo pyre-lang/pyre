@@ -2406,12 +2406,12 @@ fn format_render(
         pyre_object::gc_roots::publish_roots(&[mapping.unwrap_or(pyre_object::PY_NULL)]);
     pyre_object::gc_roots::normalize_roots(positional_base, npositional + 2);
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
+        let _roots = pyre_object::gc_roots::push_roots();
         if has_mapping {
             // `newformat.format_method(... w_mapping, True)` resolves
             // `{name}` via `space.getitem(mapping, w_key)` per
             // `newformat.py:Template.get_value`; KeyError propagates
             // to the caller (no silent default).
-            let _key_roots = pyre_object::gc_roots::push_roots();
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
             // `w_str_new_managed` / `pin_root` may collect; reload the

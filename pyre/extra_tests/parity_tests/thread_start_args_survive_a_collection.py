@@ -13,7 +13,8 @@
 A churn thread allocates without pause, so collections keep running while the
 main thread starts workers.  Each worker's callable is a fresh bound method and
 its arguments are fresh objects, all born in the nursery, and each worker
-records what it received.
+records what it received.  Some workers receive their text as a keyword
+argument.
 """
 
 import _thread
@@ -55,8 +56,14 @@ churner.start()
 try:
     for n in range(STARTS):
         worker = Worker(n)
-        if n % 2:
+        case = n % 3
+        if case == 1:
             _thread.start_new_thread(worker.run, ([n, n + 1], "w%d" % n))
+            assert worker.done.acquire(True, 60.0), n
+        elif case == 2:
+            _thread.start_new_thread(
+                worker.run, ([n, n + 1],), {"text": "w%d" % n}
+            )
             assert worker.done.acquire(True, 60.0), n
         else:
             thread = threading.Thread(

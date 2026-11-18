@@ -417,6 +417,9 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
 /// and from a requested collection — which is why an artefact carrying only
 /// interpreter bodies legitimately matches none of the allocator entries and
 /// takes its whole closure from [`PYTHON_DISPATCH_SEEDS`].
+///
+/// `malloc_varsize_clear` is seeded through [`CallGraph::collecting_seed_ids`]
+/// because it allocates through the collecting rooted hook.
 pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::alloc_nursery_collecting_typed",
     "majit_gc::alloc_nursery_collecting_typed_rooted",
@@ -2900,7 +2903,7 @@ mod tests {
                 "item_meta": item_meta(&[
                     "pyre_object",
                     "lltype",
-                    "malloc_varsize_clear#0=GcArrayType<ItemsBlock>"
+                    "malloc_varsize_clear#0=pyre_object::lltype::GcArrayType<pyre_object::object_array::ItemsBlock>"
                 ]),
                 "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
                 "body": "Opaque"
@@ -2933,7 +2936,9 @@ mod tests {
         );
         assert_eq!(
             cg.names.get(&1).map(String::as_str),
-            Some("pyre_object::lltype::malloc_varsize_clear#0=GcArrayType<ItemsBlock>")
+            Some(
+                "pyre_object::lltype::malloc_varsize_clear#0=pyre_object::lltype::GcArrayType<pyre_object::object_array::ItemsBlock>"
+            )
         );
         assert!(
             seeds.contains(&1),

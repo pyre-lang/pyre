@@ -434,8 +434,10 @@ fn load_lazy_import_resolve(
         && !root_attr.is_null()
         && unsafe { is_tuple(root_attr) && w_tuple_len(root_attr) > 0 }
     {
-        let mut attr = unsafe { (*w_lazy_import_cast(first)).w_attr };
-        pyre_object::with_roots!(attr => w_tuple_new(vec![attr]))
+        let attr = unsafe { (*w_lazy_import_cast(first)).w_attr };
+        let attr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(attr);
+        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(attr_slot)])
     } else if root_attr.is_null() {
         w_none()
     } else {
@@ -1774,19 +1776,28 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         &[true, false, false, false, false],
         "__lazy_import__",
     )?;
-    let mut name = scope[0];
-    let mut globals = scope[1];
-    let mut locals = scope[2];
-    let mut fromlist = if scope[3].is_null() {
-        pyre_object::with_roots!(name, globals, locals => w_tuple_new(Vec::new()))
+    // Every argument is live across the empty-tuple allocation and the
+    // level conversion; publish all five in one run and read them back.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let scope_base =
+        pyre_object::gc_roots::pin_roots(&[scope[0], scope[1], scope[2], scope[4], scope[3]]);
+    let fromlist_slot = if pyre_object::gc_roots::shadow_stack_get(scope_base + 4).is_null() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(Vec::new()));
+        slot
     } else {
-        scope[3]
+        scope_base + 4
     };
-    let level = if scope[4].is_null() {
+    let level_obj = pyre_object::gc_roots::shadow_stack_get(scope_base + 3);
+    let level = if level_obj.is_null() {
         0
     } else {
-        pyre_object::with_roots!(fromlist, globals, locals, name => level_from_obj(scope[4]))?
+        level_from_obj(level_obj)?
     };
+    let mut name = pyre_object::gc_roots::shadow_stack_get(scope_base);
+    let mut globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
+    let mut locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
+    let mut fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
     if globals.is_null() {
         let frame = current_frame();
         if frame.is_null() {
@@ -1795,9 +1806,11 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             ));
         }
         globals = unsafe { (*frame).get_w_globals() };
+        pyre_object::gc_roots::shadow_stack_set(scope_base + 1, globals);
     }
     if locals.is_null() {
         locals = globals;
+        pyre_object::gc_roots::shadow_stack_set(scope_base + 2, locals);
     }
     if unsafe { !is_dict(globals) } {
         return Err(crate::PyError::type_error(format!(
@@ -1805,10 +1818,19 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             crate::type_methods::arg_type_name(globals)
         )));
     }
-    let mut builtins = pyre_object::with_roots!(fromlist, globals, locals, name => {
-        crate::baseobjspace::finditem_str(globals, "__builtins__")
-    })?
-    .ok_or_else(|| crate::PyError::value_error("unable to get builtins for lazy import"))?;
+    name = pyre_object::gc_roots::shadow_stack_get(scope_base);
+    globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
+    locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    let mut builtins = crate::baseobjspace::finditem_str(globals, "__builtins__")?
+        .ok_or_else(|| crate::PyError::value_error("unable to get builtins for lazy import"))?;
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(builtins);
+    name = pyre_object::gc_roots::shadow_stack_get(scope_base);
+    globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
+    locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
     if unsafe { is_module(builtins) } {
         let dict = unsafe { w_module_get_w_dict(builtins) };
         if dict.is_null() {
@@ -1817,7 +1839,13 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             ));
         }
         builtins = dict;
+        pyre_object::gc_roots::shadow_stack_set(builtins_slot, builtins);
     }
+    name = pyre_object::gc_roots::shadow_stack_get(scope_base);
+    globals = pyre_object::gc_roots::shadow_stack_get(scope_base + 1);
+    locals = pyre_object::gc_roots::shadow_stack_get(scope_base + 2);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
     lazy_import_module_level(name, builtins, globals, locals, fromlist, level)
 }
 

@@ -429,14 +429,19 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(items_slot),
     )?;
     let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-    let origin_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(unsafe { w_generic_alias_get_origin(self_) });
-    let args = w_tuple_new(newargs);
-    let res = make_generic_alias(
-        pyre_object::gc_roots::shadow_stack_get(origin_slot),
-        args,
-        pyre_object::PY_NULL,
-    )?;
+    let origin = unsafe { w_generic_alias_get_origin(self_) };
+    let n = newargs.len();
+    let mut live = Vec::with_capacity(n + 1);
+    live.push(origin);
+    live.extend(newargs);
+    let base = pyre_object::gc_roots::pin_roots(&live);
+    let args_tuple = w_tuple_new(
+        (0..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+            .collect(),
+    );
+    let origin = pyre_object::gc_roots::shadow_stack_get(base);
+    let res = make_generic_alias(origin, args_tuple, pyre_object::PY_NULL)?;
     if unsafe { w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(self_slot)) } {
         unsafe { w_generic_alias_set_unpacked(res, true) };
     }
@@ -991,6 +996,7 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(pair),
         pyre_object::gc_roots::shadow_stack_get(pair + 1),
     ]);
+    let ga_type = pyre_object::gc_roots::shadow_stack_get(ga_type_slot);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args);
     Ok(w_tuple_new(vec![

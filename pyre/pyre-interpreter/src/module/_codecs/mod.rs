@@ -1404,6 +1404,7 @@ fn utf8_decode_impl(
 /// `LookupError` / `KeyError` propagates, so a `__getitem__` of its own is not
 /// mistaken for "undefined".
 fn charmap_output(mapping_slot: usize, cp: u32, out: &mut Vec<u8>) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     let w_mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
     if unsafe { is_str(w_mapping) } && cp as usize >= unsafe { w_str_len(w_mapping) } {
         return Ok(false);
@@ -1435,7 +1436,6 @@ fn charmap_output(mapping_slot: usize, cp: u32, out: &mut Vec<u8>) -> Result<boo
     // Minting the key can collect, and a table read can run a `__getitem__` of
     // its own, so the table is pinned and re-read rather than carried across
     // either in a plain local.
-    let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_mapping);
     let w_key = pyre_object::gc_roots::pin_root(w_int_new(cp as i64));

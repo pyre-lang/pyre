@@ -6639,35 +6639,28 @@ pub fn new_exception_class(
     // this frame's copy of the pointer behind, the way `alloc_dict_object`
     // re-reads `dstorage` across its header malloc.
     let _roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = match w_dict {
-        Some(w_dict) => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = _roots.pin_root(w_dict);
-            Some(slot)
-        }
-        None => None,
-    };
-    let w_bases = match w_bases {
-        None => pyre_object::w_tuple_new(vec![crate::typedef::gettypeobject(
+    let dict_in_slot = _roots.pin_roots(&[
+        w_dict.unwrap_or(pyre_object::PY_NULL),
+        w_bases.unwrap_or(pyre_object::PY_NULL),
+    ]);
+    let incoming_bases = _roots.get(dict_in_slot + 1);
+    let w_bases = if incoming_bases.is_null() {
+        pyre_object::w_tuple_new(vec![crate::typedef::gettypeobject(
             &pyre_object::interp_exceptions::EXC_EXCEPTION_TYPE,
-        )]),
-        Some(w_bases) if unsafe { !pyre_object::is_tuple(w_bases) } => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = _roots.pin_root(w_bases);
-            pyre_object::w_tuple_new(vec![_roots.get(slot)])
-        }
-        Some(w_bases) => w_bases,
+        )])
+    } else if unsafe { !pyre_object::is_tuple(incoming_bases) } {
+        pyre_object::w_tuple_new(vec![_roots.get(dict_in_slot + 1)])
+    } else {
+        incoming_bases
     };
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_bases);
-    let dict_slot = match dict_slot {
-        Some(slot) => slot,
-        None => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = _roots.pin_root(pyre_object::w_dict_new());
-            slot
-        }
-    };
+    let mut w_dict = _roots.get(dict_in_slot);
+    if w_dict.is_null() {
+        w_dict = pyre_object::w_dict_new();
+    }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = _roots.pin_root(w_dict);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(pyre_object::w_str_new_managed(name));
     let args = [

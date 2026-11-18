@@ -23774,7 +23774,10 @@ pub fn sort_list_in_place(
     // answers the rebound `key_fn` with None, so no GC local outside the
     // shadow stack is live across a collecting call (`framework.py`
     // `gc_push_roots` / `gc_pop_roots`).
-    let key_fn = if key_fn.is_none() {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(key_fn.unwrap_or(pyre_object::PY_NULL));
+    if key_fn.is_none() {
         if pyre_object::gc_hook::gc_alloc_failed_pending() {
             return Err(crate::runtime_ops::fetch_memory_error());
         }
@@ -23803,10 +23806,7 @@ pub fn sort_list_in_place(
                 return Ok(());
             }
         }
-        None
-    } else {
-        key_fn
-    };
+    }
     unsafe {
         // Hold the detached values in shadow-stack slots, not a bare Rust Vec,
         // while key and comparison calls can collect.  The receiver is empty
@@ -23827,7 +23827,6 @@ pub fn sort_list_in_place(
         // plus `descr_sort`'s `sorter.list` are GC objects; the shadow stack
         // is the equivalent registered area, re-read after every `lt`.
         let saved_len = pyre_object::listobject::w_list_len(list);
-        let _roots = pyre_object::gc_roots::push_roots();
         let item_base = pyre_object::gc_roots::shadow_stack_len();
         for i in 0..saved_len {
             let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
@@ -23841,7 +23840,17 @@ pub fn sort_list_in_place(
         // the detach is `__init__` via `w_list_init_items`, not `w_list_clear`.
         pyre_object::listobject::w_list_init_items(list, Vec::new());
 
+        let key_obj = pyre_object::gc_roots::shadow_stack_get(key_slot);
+        let key_fn = if key_obj.is_null() {
+            None
+        } else {
+            Some(key_obj)
+        };
         let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
+        let sort_error_slot = match sorted {
+            Ok(()) => None,
+            Err(mut error) => Some(error.pin(&_roots)),
+        };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         // `descr_sort` `finally`: with list strategies, `mucked` is
         // `self.strategy is not space.fromcache(EmptyListStrategy)`; without,
@@ -23861,7 +23870,9 @@ pub fn sort_list_in_place(
         if saved != 0 || live != 0 {
             pyre_object::listobject::w_list_publish_physical_capacity(list, saved.max(live));
         }
-        sorted?;
+        if let Some(slot) = sort_error_slot {
+            return Err(crate::PyError::from_raw(_roots.get(slot)));
+        }
         if mucked {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,

@@ -859,26 +859,12 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// (pure interpreter / early startup). Items are left uninitialised
 /// either way. The bool is whether the block is GC-owned.
 ///
-/// # Why `try_gc_alloc` and not the collecting hook
+/// # Collection point
 ///
-/// `try_gc_alloc` is the *no-collect* hook, so a block over the collector's
-/// large-object threshold is born in the old generation and only a major
-/// reclaims it. `malloc_varsize`'s large arm instead takes
-/// `external_malloc(..., alloc_young=True)`, and every caller here already
-/// brackets this call with `push_roots` and republishes the result through the
-/// shadow stack, so the rooting discipline the collecting hook wants is
-/// already met at these three sites.
-///
-/// What is not met is the invariant the rest of the interpreter rests on. The
-/// house rule for a *stable* kind is one lifetime-scoped pin at the mint with
-/// no read-back at later uses, and it is sound only because an old-generation
-/// object cannot change address. A young rawmalloced object also cannot change
-/// address — but it *dies* at the next minor if nothing reached it, so moving
-/// this allocation to the collecting hook would make every unrooted holder
-/// elsewhere wrong for a reason no relocation audit looks for. That is the same
-/// blocker the born-old stepping stone in `gc_interp.rs` names, not a separate
-/// one, and it is why the entry point here stays the no-collect one until the
-/// root-set census is re-graded for liveness rather than for movement.
+/// [`crate::lltype::malloc_varsize_clear`] allocates through the collecting
+/// rooted hook (`malloc_varsize` → `collect_and_reserve`), so this call can
+/// run a minor collection. Every caller here brackets it with `push_roots`
+/// and republishes the result through the shadow stack.
 unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
     match unsafe { try_alloc_items_block_gc(cap) } {
         Some(pair) => pair,

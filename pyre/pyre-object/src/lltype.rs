@@ -766,7 +766,11 @@ pub trait GcArrayType {
 
 /// `lltype.malloc(ARRAY, n, zero=True)` / `gct_fv_gc_malloc_varsize`.
 ///
-/// The allocator writes the GcArray length header; callers must not.
+/// A collection point: `CollectAnalyzer.analyze_simple_operation` returns
+/// True for `malloc_varsize` with flavor `'gc'`, and
+/// `IncrementalMiniMarkGC.malloc_varsize` calls `collect_and_reserve` when
+/// the nursery is full. A caller holding GC refs across this call must root
+/// them. The allocator writes the GcArray length header; callers must not.
 /// Returns null on failure and keeps the `gc_alloc_failed_pending`
 /// contract. GC ownership of a non-null result is
 /// [`crate::gc_hook::try_gc_owns_object`].
@@ -774,12 +778,17 @@ pub trait GcArrayType {
 pub unsafe fn malloc_varsize_clear<T: GcArrayType>(n: i64) -> *mut T {
     match T::payload_layout(n) {
         Some(payload) => {
-            match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-                T::type_id(),
-                payload.size(),
-            ))
-            .allocated_or_raise()
-            {
+            let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+            let mut needs_write_barrier = true;
+            let raw = unsafe {
+                crate::gc_hook::try_gc_alloc_collecting_rooted(
+                    T::type_id(),
+                    payload.size(),
+                    &mut allocation_root,
+                    &mut needs_write_barrier,
+                )
+            };
+            match crate::gc_hook::GcAllocOutcome::from_hook(raw).allocated_or_raise() {
                 Some(raw) => unsafe {
                     // IncrementalMiniMark does not zero-fill. Publish
                     // the length header only after the payload is NULL:
