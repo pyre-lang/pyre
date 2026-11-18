@@ -14820,6 +14820,33 @@ fn walker_guard_fold_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// `GuardClass` for a range-iterator FOR_ITER. Always records on a
+/// non-constant box.
+///
+/// `SubWalkDriver` cuts the specialize preamble and restores a heap-cache
+/// snapshot taken at helper suspend (`snapshot_residual_heap_before_suspend`),
+/// after this fold already ran `class_now_known`. The frame-loaded iterator
+/// predates the CALL, so `drop_dead_frontend_ops` leaves that flag and a
+/// replay through [`walker_guard_fold_class`] would skip. PyPy's
+/// `opimpl_guard_class` after `getarrayitem_gc_r` of the generator valuestack
+/// keeps `GUARD_CLASS` (`W_IntRangeOneArgIterator.next` has no JIT hint).
+/// `optimize_GUARD_CLASS` still drops a later same-box `NewWithVtable`.
+fn walker_guard_range_iter_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !obj.is_constant() {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const]);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
+    Ok(())
+}
+
 /// Unstamped `GuardClass` plus GETFIELD `w_class` + `GuardValue`.
 /// `is_plain_int1` / `is_plain_float_strict` read `value.w_class`.
 fn walker_guard_fold_value_w_class<Sym: WalkSym>(
@@ -20201,7 +20228,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     let type_addr = shape.type_addr();
     // The guard appends to `opencoder.py Trace._ops` and can minor-collect.
     let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
-    walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
+    walker_guard_range_iter_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let mut journal_mark = fbw_effect_journal_mark();
@@ -20240,6 +20267,12 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
             else {
                 return Ok(None);
             };
+            // Nested in an active `SubWalkDriver` (generator FOR_ITER
+            // descending `W_IntRange*Iterator.next`), the yield would cut
+            // the class guard and restore a heap cache that still names it.
+            // The helper body then records getfields with no preceding
+            // `GuardClass`, and replay appends the guard after the stores.
+            keep_residual_recordings_across_suspend::<Sym>();
             run_orthodox_helper_subwalk(
                 ctx,
                 op_pc,
@@ -20425,9 +20458,11 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
 
-    // guard_class W_IntRangeIterator, unless the operand is already known.
+    // guard_class W_IntRangeIterator. Always recorded: the three range-iter
+    // layouts share the Python type name `range_iterator`, so a compiled
+    // loop must re-check `ob_type` after a generator-frame reload.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op_pc, iter_op, range_iter_type_addr)?;
+    walker_guard_range_iter_class(ctx, op_pc, iter_op, range_iter_type_addr)?;
 
     if !concrete_continues {
         // Exhausted arrival: the walker concretely reached remaining==0 (a nested
