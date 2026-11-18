@@ -24412,7 +24412,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
         helper_class_state: bool,
         entry_pos: majit_metainterp::recorder::TracePosition,
     ) -> Result<(), DispatchError> {
-        let (parent_id, pending_caller_pc, entry_pos) = {
+        let (parent_id, pending_caller_pc) = {
             let parent = self
                 .frames
                 .last()
@@ -24421,7 +24421,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 .pending_generator_bind
                 .as_ref()
                 .expect("pending generator bind missing");
-            (parent.id, pending.caller_pc, parent.entry_pos)
+            (parent.id, pending.caller_pc)
         };
         let skip_reentry_residual = match &helper_result {
             Err(error) => {
