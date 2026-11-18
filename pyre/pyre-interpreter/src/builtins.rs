@@ -26059,31 +26059,6 @@ pub unsafe fn acquire_readbuf_raw_address(
     }
 }
 
-/// Writable window over a bytearray after `ll_nonmovable_raw_ptr_for_resizable_list`.
-///
-/// Reloads `obj` after the non-moving malloc, which can collect.
-unsafe fn bytearray_nonmoving_window(
-    obj: PyObjectRef,
-) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let addr = unsafe {
-        pyre_object::bytearrayobject::w_bytearray_raw_address(
-            pyre_object::gc_roots::shadow_stack_get(slot),
-        )
-    };
-    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
-    if addr == 0 {
-        return Err(crate::PyError::memory_error(""));
-    }
-    let len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(obj) };
-    Ok((
-        unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) },
-        obj,
-    ))
-}
-
 /// `space.acquire_writebuf` for FileIO.readinto.  These are pyre's native
 /// writable exporters; a memoryview contributes its exact contiguous window.
 pub unsafe fn fileio_writebuf(
@@ -26106,8 +26081,24 @@ pub unsafe fn fileio_writebuf(
             return Ok((std::slice::from_raw_parts_mut(address, length), obj, false));
         }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            let (data, obj) = bytearray_nonmoving_window(obj)?;
-            return Ok((data, obj, false));
+            // Reloads `obj` after `ll_nonmovable_raw_ptr_for_resizable_list`,
+            // which can collect.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let addr = pyre_object::bytearrayobject::w_bytearray_raw_address(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+            );
+            let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+            if addr == 0 {
+                return Err(crate::PyError::memory_error(""));
+            }
+            let len = pyre_object::bytearrayobject::w_bytearray_len(obj);
+            return Ok((
+                std::slice::from_raw_parts_mut(addr as *mut u8, len),
+                obj,
+                false,
+            ));
         }
         if pyre_object::interp_array::is_array(obj) {
             return Ok((
@@ -26131,7 +26122,18 @@ pub unsafe fn fileio_writebuf(
             && let Some((backing, offset, length, _format, _itemsize, _shape)) =
                 (hooks.ctypes_buffer_view)(obj)
         {
-            let (full, backing) = bytearray_nonmoving_window(backing)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(backing);
+            let addr = pyre_object::bytearrayobject::w_bytearray_raw_address(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+            );
+            let backing = pyre_object::gc_roots::shadow_stack_get(slot);
+            if addr == 0 {
+                return Err(crate::PyError::memory_error(""));
+            }
+            let len = pyre_object::bytearrayobject::w_bytearray_len(backing);
+            let full = std::slice::from_raw_parts_mut(addr as *mut u8, len);
             if offset <= full.len() && length <= full.len() - offset {
                 return Ok((&mut full[offset..offset + length], backing, false));
             }
