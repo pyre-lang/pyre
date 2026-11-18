@@ -2531,9 +2531,9 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
     // serializes the flattened row under the variant parent while a read of
     // that row can name the enum, so recover that one proven inheritance edge
-    // from the qualified owners.  Two *different* variants of one enum are not
-    // that edge -- their payloads are different fields sharing an address --
-    // and neither is a same-name/same-offset field from an arbitrary struct.
+    // from the qualified owners.  Payloads of two variants share an address
+    // and stay distinct `(STRUCT, fieldname)` rows; the tag is the one field
+    // the base carries, so Ok and Err inherit the same `__discriminant`.
     fn is_registered_std_shell(owner: &str) -> bool {
         // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
         // uses, plus the enum roots the inherited-tag edge names. A name
@@ -2551,26 +2551,46 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
             "core::option::Option",
             "std::option::Option",
         ];
-        let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
-            return false;
+        // Charon `strip_crate_prefix` harvests `result::Result::Ok` for the
+        // std enum (`front/mir.rs`). That spelling is often absent from
+        // `STRUCT_ID_BY_NAME`, so the identity match below cannot see it.
+        const STRIPPED: [&str; 5] = [
+            "result::Result::Ok",
+            "result::Result::Err",
+            "option::Option::Some",
+            "result::Result",
+            "option::Option",
+        ];
+        let owner = majit_ir::descr::strip_generic_args(owner);
+        let name = owner.as_ref();
+        let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(name) else {
+            return STRIPPED.contains(&name)
+                || matches!(name, "Result::Ok" | "Result::Err" | "Option::Some");
         };
         ANCHORS.iter().any(|anchor| {
             majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id)
                 || majit_ir::descr::StructId::from_canonical(anchor) == owner_id
-        })
+        }) || STRIPPED
+            .iter()
+            .any(|stripped| majit_ir::descr::StructId::from_canonical(stripped) == owner_id)
     }
 
-    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
+    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str, field_name: &str) -> bool {
         let (Some((slot_enum, slot_variant)), Some((field_enum, field_variant))) = (
             shelled_sum_owner(slot_owner),
             shelled_sum_owner(field_owner),
         ) else {
             return false;
         };
+        // The tag is the one field the enum base carries; Ok and Err
+        // inherit that same row. Payloads of two variants do not.
+        let shared_tag =
+            field_name == "__discriminant" && !slot_variant.is_empty() && !field_variant.is_empty();
         if slot_enum != field_enum
             || !(slot_variant == field_variant
                 || slot_variant.is_empty()
-                || field_variant.is_empty())
+                || field_variant.is_empty()
+                || shared_tag)
         {
             return false;
         }
@@ -2612,10 +2632,17 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
             return false;
         }
         let slot = majit_ir::descr::strip_generic_args(slot_owner);
+        let field_spelling = majit_ir::descr::strip_generic_args(field_owner);
         let Some((base, _variant)) = slot.rsplit_once("::") else {
             return false;
         };
-        if base != majit_ir::descr::strip_generic_args(field_owner).as_ref() {
+        let same_base = base == field_spelling.as_ref()
+            || field_spelling
+                .rsplit_once("::")
+                .is_some_and(|(field_base, field_variant)| {
+                    !field_variant.is_empty() && field_base == base
+                });
+        if !same_base {
             return false;
         }
         // Unlike the two explicitly-declared Result/Option shells above, an
@@ -2633,7 +2660,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     }
 
     let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
-        explicit_sum_inherits(slot_owner, field_owner)
+        explicit_sum_inherits(slot_owner, field_owner, field.field_key())
             || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
     };
 
@@ -4150,6 +4177,62 @@ mod tests {
         assert!(
             slot_holds_field(&alias_slot, &alias_base),
             "the crate-stripped alias of the standard-library shell must still reconcile"
+        );
+    }
+
+    /// A virtual `Result::Err` New lists `Result::Err.__discriminant`; the
+    /// match then reads `Result::Ok.__discriminant`. Both names are the
+    /// inherited tag (`rclass.InstanceRepr._setup_repr` super edge).
+    #[test]
+    fn slot_identity_accepts_ok_and_err_as_the_same_inherited_tag() {
+        let descr = |size: usize, owner: &str, key: &str| {
+            let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                format!("{owner}.{key}"),
+                key,
+            )
+            .with_parent_descr(parent.clone(), 0);
+            (field, parent)
+        };
+
+        let (err_tag, _err_parent) = descr(16, "result::Result::Err", "__discriminant");
+        let (ok_tag, _ok_parent) = descr(16, "result::Result::Ok", "__discriminant");
+        let (base_tag, _base_parent) = descr(
+            16,
+            "result::Result<*mut PyObject,PyError>",
+            "__discriminant",
+        );
+        assert!(
+            slot_holds_field(&err_tag, &ok_tag),
+            "Err and Ok inherit one discriminant field"
+        );
+        assert!(
+            slot_holds_field(&ok_tag, &err_tag),
+            "Ok and Err inherit one discriminant field"
+        );
+        assert!(
+            slot_holds_field(&err_tag, &base_tag),
+            "Err inherits the instantiated Result tag"
+        );
+        assert!(
+            slot_holds_field(&ok_tag, &base_tag),
+            "Ok inherits the instantiated Result tag"
+        );
+
+        let (err_payload, _err_payload_parent) = descr(16, "result::Result::Err", "__pos_0");
+        let (ok_payload, _ok_payload_parent) = descr(16, "result::Result::Ok", "__pos_0");
+        assert!(
+            !slot_holds_field(&err_payload, &ok_payload),
+            "Ok and Err payloads stay distinct fields"
         );
     }
 
