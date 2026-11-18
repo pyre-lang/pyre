@@ -984,6 +984,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         op_pc,
                         frames,
                         scope.guard_stamp,
+                        after_residual_call,
+                        scope,
                     );
                 }
             }
@@ -3755,7 +3757,14 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     mut parent_frames: Vec<InlineParentFrame>,
     live_after_jit_pc: usize,
     pending_result: Option<(char, usize)>,
-) -> Result<(Vec<InlineParentFrame>, bool /* runnable */), DispatchError> {
+) -> Result<
+    (
+        Vec<InlineParentFrame>,
+        bool, /* runnable */
+        bool, /* python_chain_complete */
+    ),
+    DispatchError,
+> {
     parent_frames.push(helper_innermost_resume_frame(
         ctx,
         op_pc,
@@ -3764,23 +3773,21 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
         live_after_jit_pc,
         pending_result,
     )?);
-    // `Trace._ensure_parent_resumedata` (`opencoder.py`) walks `framestack`
-    // and creates every missing parent snapshot
-    // (`MIFrame.get_list_of_active_boxes`). Every admitted Python inline
-    // already publishes that paused caller at entry (`enter_with_resume`).
-    debug_assert!(
-        {
-            let session = ctx.session.borrow();
-            session
-                .framestack
-                .iter()
-                .rev()
-                .skip_while(|frame| frame.is_helper_level())
-                .filter(|frame| !frame.is_portal)
-                .all(|frame| !frame.parents.is_empty())
-        },
-        "every live Python MIFrame has a paused caller section"
-    );
+    // `capture_resumedata` numbers every frame on `framestack`. A Python
+    // inline level below the helper levels that holds no paused-caller image
+    // (a straight-line callee) has no section here, so numbering would skip
+    // it. Such a guard takes the caller-boundary collapse that
+    // `walker_inline_guard_resumes_in_callee` gives the same Python level.
+    let python_chain_complete = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .rev()
+            .skip_while(|frame| frame.is_helper_level())
+            .filter(|frame| !frame.is_portal)
+            .all(|frame| !frame.parents.is_empty())
+    };
     // `capture_resumedata` numbers every frame on `framestack`. A
     // `GUARD_NO_EXCEPTION` failure is `blackhole.py
     // handle_exception_in_frame`: skip `-live-`, jump to this frame's
@@ -3788,11 +3795,13 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // `helper_resume_reaches_blocker` would collapse to the Python CALL
     // and leave the residual exception pending there. The looked-inside
     // helper is already on `parent_frames`; a residual call is not.
-    // Exception resume still has to number this helper; CALL-collapse is
-    // what lets `check_truediv`'s `except OverflowError` steal the residual.
+    // A Python level below with no paused-caller image makes
+    // `python_chain_complete` false (straight-line inline). Exception
+    // resume still has to number this helper; CALL-collapse is what
+    // lets `check_truediv`'s `except OverflowError` steal the residual.
     // Reported as runnable so numbered_helper_guard_resume takes NumberedHelperGuard::Frames.
     if after_residual_call {
-        return Ok((parent_frames, true));
+        return Ok((parent_frames, true, python_chain_complete));
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
@@ -3801,7 +3810,11 @@ fn numbered_helper_runnable_frames<Sym: WalkSym>(
     // complete.
     let (sections_have_markers, any_blocker) =
         numbered_helper_sections_blocker_free(ctx, &parent_frames);
-    Ok((parent_frames, sections_have_markers && !any_blocker))
+    Ok((
+        parent_frames,
+        python_chain_complete && sections_have_markers && !any_blocker,
+        python_chain_complete,
+    ))
 }
 
 /// Marker and blocker facts for every helper section in `parent_frames`.
@@ -3945,7 +3958,7 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         return Ok(callee_prologue_call_orgpc(ctx, parent_frames));
     }
     let live_after_jit_pc = ctx.live_after_jit_pc;
-    let (parent_frames, runnable) = numbered_helper_runnable_frames(
+    let (parent_frames, runnable, python_chain_complete) = numbered_helper_runnable_frames(
         ctx,
         op_pc,
         after_residual_call,
@@ -4147,7 +4160,7 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
         post_call_pc,
         pending_result,
     ) {
-        Ok((frames, runnable)) => {
+        Ok((frames, runnable, _)) => {
             let (sections_have_markers, any_blocker) =
                 numbered_helper_sections_blocker_free(ctx, &frames);
             runnable && sections_have_markers && !any_blocker
