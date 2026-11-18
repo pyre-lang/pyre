@@ -561,8 +561,8 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// Capture encodes that section from `MIFrame.jitcode` (`jitcode.index`);
 /// the walk stamps it as `transparent_helper_jitcode_index`. Leftover
 /// Converted helpers (`HelperChain::Collapsed`) go through
-/// `numbered_helper_guard_resume` (runnable Frames, else CALL orgpc or
-/// residualize).
+/// `numbered_helper_guard_resume` (CALL orgpc when the leftover recorded
+/// no heap write, else runnable Frames).
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
@@ -857,12 +857,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         {
             // Leftover Converted helpers (`HelperChain::Collapsed`) cannot
             // number a section of their own (`HelperResume::CallEntry`).
-            // Routing them through `numbered_helper_guard_resume` still
-            // records a runnable leftover body as helper-innermost Frames
-            // (the leftover multi-frame snapshot that keeps CALL-boundary
-            // from re-executing an inlined Python CALL) and refuses an
-            // unrunnable leftover (`history.cut` + `do_residual_call`, or
-            // CALL orgpc when the leftover recorded nothing). Unconditional
+            // Routing them through `numbered_helper_guard_resume`: a leftover
+            // that recorded no heap write / journaled effect is CALL orgpc
+            // (`generate_guard(resumepc=orgpc)`), so a wrapper that converts
+            // the helper return (`list_method_pop` IndexError) re-runs; a
+            // leftover after-effect (list.append) or a Numbered CallResult
+            // helper is helper-innermost Frames. Unrunnable leftover
+            // residualizes (`history.cut` + `do_residual_call`) or CALL
+            // orgpc when the leftover recorded nothing. Unconditional
             // leftover Python MF retraces exception/iteration CALLs until
             // abort; unconditional residualize re-opens CALL-boundary extras.
             match numbered_helper_guard_resume(
@@ -3982,10 +3984,30 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
                 .is_some_and(|frame| matches!(frame.resume_coord, ParentResumeCoord::Backxlat(_))),
             "numbered helper innermost is a helper section, not a pending CALL dest"
         );
-        if fbw_debug_abort_enabled() {
-            eprintln!("[numbered-helper-guard] frames op_pc={op_pc}");
+        // Converted leftover (`HelperChain::Collapsed`) has no helper
+        // MIFrame (`HelperResume::CallEntry`). Numbering that leftover as
+        // Frames then swapping the parent to CallFallthrough writes the
+        // helper's return through `_setup_return_value_*` (`blackhole.py`)
+        // into the CALL dest. `w_list_pop_end_inner`'s empty arm returns
+        // None, so that dest is NULL and STORE_FAST leaves the local
+        // unbound; the wrapper (`list_method_pop`) is what raises.
+        // `generate_guard(resumepc=orgpc)` / `capture_resumedata` re-runs
+        // the CALL instead when the leftover recorded no heap write
+        // (`entry_heap_writing_effects`) and no journaled effect
+        // (`entry_journal_mark`). After-effect leftovers (list.append)
+        // still number Frames so the CALL is not replayed.
+        let collapse_to_call = !heap_moved
+            && journal_delta == 0
+            && ctx.session.borrow().helper_chain() == HelperChain::Collapsed;
+        if !collapse_to_call {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[numbered-helper-guard] frames op_pc={op_pc}");
+            }
+            return Ok(NumberedHelperGuard::Frames(parent_frames));
         }
-        return Ok(NumberedHelperGuard::Frames(parent_frames));
+        if fbw_debug_abort_enabled() {
+            eprintln!("[numbered-helper-guard] leftover-converted-orgpc op_pc={op_pc}");
+        }
     }
     if heap_moved || journal_delta != 0 {
         // Collapse to CALL-orgpc would re-run the residual (`do_residual_call`
