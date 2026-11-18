@@ -104,6 +104,8 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_erased_drop(&place.ty, self.llbc)
             || frame_anchor::tyref_is_erased_drop(&place.ty, self.llbc)
+            || frame_box::tyref_is_frame_box(&place.ty, self.llbc)
+            || tyref_is_error_carrier(&place.ty, self.llbc)
         {
             return Ok(true);
         }

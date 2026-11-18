@@ -5360,8 +5360,8 @@ impl majit_backend::Backend for WasmBackend {
         // visit shape.  The dynasm and cranelift runners assert the same.
         let type_id = arraydescr.resolve_gc_tid();
         assert!(
-            type_id != 0,
-            "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
+            majit_ir::descr::is_collector_array_tid(type_id),
+            "bh_new_array requires ArrayDescr.tid (descr.py get_type_id) — got {type_id}"
         );
         let Some(payload_size) = itemsize
             .checked_mul(length)
@@ -8864,6 +8864,8 @@ mod tests {
     fn gc_rewrite_on_merges_adjacent_news() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let mut gc = MiniMarkGC::new();
+        // `gctypelayout.py`: "don't use typeid 0".
+        gc.register_type(TypeInfo::simple(0));
         let type_id = gc.register_type(TypeInfo::simple(16));
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
@@ -9007,6 +9009,8 @@ mod tests {
         use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
         use std::sync::Arc;
         let mut gc = MiniMarkGC::new();
+        // `gctypelayout.py`: "don't use typeid 0".
+        gc.register_type(TypeInfo::simple(0));
         let type_id = gc.register_type(TypeInfo::simple(16));
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));

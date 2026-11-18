@@ -4865,8 +4865,10 @@ impl SemanticFunctionHeader {
         // pointer, or a declared-Raw ADT pointer
         // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
         // `scalar_result_token` matches that spelling, including `"()"` so
-        // a `fn(...) -> ()` graph declares `FUNC.RESULT = Void`. Ordinary
-        // looked-inside aggregate graphs keep FUNC.RESULT unstamped so
+        // a `fn(...) -> ()` graph declares `FUNC.RESULT = Void`. `llmemory.py`
+        // `GCREF` is `Ptr(GcOpaqueType)` so `getkind` is `'ref'`; stamp
+        // that token on look-inside graphs too (`call.py` `FUNC.RESULT`).
+        // Ordinary looked-inside aggregate graphs keep FUNC.RESULT unstamped so
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
@@ -4887,6 +4889,19 @@ impl SemanticFunctionHeader {
                     raw_alloc_flavor_structs,
                 )
             {
+                signature_token
+            } else if signature_token.as_deref()
+                == Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
+            {
+                signature_token
+            } else if signature_token
+                .as_deref()
+                .is_some_and(|s| s.starts_with("raw:") && s.len() > 4)
+            {
+                // `history.py` `getkind` of a raw `Ptr` is `'int'`. Stamp
+                // FUNC.RESULT on look-inside graphs too (`call.py`
+                // `RESULT == FUNC.RESULT`) so a frontend Ref dest rewrites
+                // to `inline_call_*_i`.
                 signature_token
             } else {
                 None
@@ -9573,6 +9588,9 @@ mod rbigint_gc_root;
 
 #[path = "gc_root_registration.rs"]
 mod gc_root_registration;
+
+#[path = "frame_box.rs"]
+pub(in crate::front::mir) mod frame_box;
 
 mod address;
 mod consteval;

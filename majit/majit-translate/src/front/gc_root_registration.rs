@@ -524,14 +524,18 @@ fn is_erased_identity_token(fd: &FunDecl) -> bool {
 }
 
 /// Calls that are not a registration effect: identity tokens, erased
-/// `OwnerRootGuard` ops (the pin of `FrameLocalsRoot`), and residual
-/// bool queries (`ptr::is_null`, an Opaque `bool` dest). Remaining
-/// callees still have to share one Add/Remove effect.
+/// `OwnerRootGuard` / `FrameAnchor` ops (the pin of `FrameLocalsRoot`,
+/// the frame word), and residual bool queries (`ptr::is_null`, an
+/// Opaque `bool` dest). Remaining callees still have to share one
+/// Add/Remove effect.
 fn call_is_registration_neutral(call: &CallPayload, fd: &FunDecl, llbc: &Llbc) -> bool {
     if is_erased_identity_token(fd) {
         return true;
     }
     if super::owner_root_guard::classify(call, llbc).is_some() {
+        return true;
+    }
+    if super::frame_anchor::classify(call, llbc).is_some() {
         return true;
     }
     if primitive_effect(fd).is_some() {
@@ -745,8 +749,21 @@ fn ty_needs_drop_glue(ty: &TyRef, llbc: &Llbc, depth: usize, seen: &mut Vec<u64>
     }
     // The pin is an erased GCREF word (`owner_root_guard` Drop is
     // nothing). It must not make `drop_glue_effect` refuse the
-    // `FrameLocalsRoot` Drop that is `try_gc_remove_root`.
-    if super::owner_root_guard::tyref_is_erased_drop(ty, llbc) {
+    // `FrameLocalsRoot` Drop that is `try_gc_remove_root`. `FrameAnchor`,
+    // `FrameBox`, and the production error carrier are the same: Drop
+    // emits nothing (`emit_place_drop`), so a field of one is not glue
+    // that blocks Add/Remove erasure of the enclosing guard.
+    if super::owner_root_guard::tyref_is_erased_drop(ty, llbc)
+        || super::frame_anchor::tyref_is_erased_drop(ty, llbc)
+        || super::frame_box::tyref_is_frame_box(ty, llbc)
+        || super::tyref_is_error_carrier(ty, llbc)
+    {
+        return false;
+    }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+        && (super::frame_box::tyref_is_frame_box(&payload, llbc)
+            || super::tyref_is_error_carrier(&payload, llbc))
+    {
         return false;
     }
     let Some(node) =

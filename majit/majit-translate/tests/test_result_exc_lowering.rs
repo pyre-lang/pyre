@@ -1406,6 +1406,77 @@ fn a_payload_less_err_shell_of_an_inlined_callee_is_left_materialised() {
 }
 
 #[test]
+fn jit_publish_residual_error_ref_raises_the_carrier() {
+    // `jit_publish_residual_error_ref` is the residual-ABI spelling of
+    // `rpyexc_raise` + `error_constant` (`exceptiontransform.py`
+    // `transform_jump_to_except_block`). Looking inside it must close
+    // on `exceptblock`, not residual-call the unpublished publisher.
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::runtime_ops::jit_publish_residual_error_ref",
+    )
+    .expect("jit_publish_residual_error_ref lowers");
+    let calls_publisher = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| {
+                    matches!(
+                        leaf.as_str(),
+                        "jit_publish_residual_error"
+                            | "jit_publish_residual_error_ref"
+                            | "jit_publish_exception"
+                            | "publish_residual"
+                    )
+                })
+            )
+        });
+    assert!(
+        !calls_publisher,
+        "publisher call must become a raise: {graph:#?}"
+    );
+    assert!(
+        graph.blocks.iter().any(|block| block
+            .exits
+            .iter()
+            .any(|link| link.target == graph.exceptblock)),
+        "the carrier must raise to exceptblock: {graph:#?}"
+    );
+}
+
+#[test]
+fn jit_publish_residual_error_ref_raises_the_runtime_exception() {
+    // `exceptiontransform.py` `transform_jump_to_except_block` raises
+    // the instance. The residual ABI stores `to_exc_object` in
+    // `BH_LAST_EXC_VALUE` (`error_carrier_edges`).
+    let graph = lower_function_to_runtime_edges(
+        interp(),
+        "pyre_interpreter::runtime_ops::jit_publish_residual_error_ref",
+    )
+    .expect("jit_publish_residual_error_ref lowers to runtime edges");
+    let to_exc = graph.blocks.iter().flat_map(|block| &block.operations).any(
+        |op| matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object")),
+    );
+    assert!(
+        to_exc,
+        "carrier raise converts through pyerror_to_exc_object: {graph:#?}"
+    );
+    assert!(
+        graph.blocks.iter().any(|block| block
+            .exits
+            .iter()
+            .any(|link| link.target == graph.exceptblock)),
+        "the converted exception must raise to exceptblock: {graph:#?}"
+    );
+}
+
+#[test]
 fn a_dont_look_inside_by_value_adt_return_declares_its_class() {
     let graph = lower_function(interp(), "pyre_interpreter::call::take_call_error")
         .expect("take_call_error lowers");

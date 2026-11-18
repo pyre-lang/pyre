@@ -6198,13 +6198,23 @@ impl MiniMarkGC {
             } else {
                 unsafe { (*header_of(holder_addr)).tid_and_flags }
             };
+            let holder_layout = if holder_addr == 0 {
+                "layout=none".to_string()
+            } else {
+                self.debug_describe_type_layout(holder_addr)
+            };
+            let holder_name = match holder_type_id {
+                Some(tid) if holder_addr != 0 => self.debug_object_type_name(holder_addr, tid),
+                _ => "?",
+            };
             let backtrace = std::backtrace::Backtrace::force_capture();
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
                  (minor={}, header_addr={:#x}, nursery_start={:#x}, site={}, \
                  parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
-                 holder_type_id={:?}, holder_offset={:?}, holder_words={}, \
+                 holder_type_id={:?}, holder_name={}, holder_layout={}, \
+                 holder_offset={:?}, holder_words={}, \
                  child_tid_and_flags={:#x}, child_flag_complement={:#x}, \
                  child_words={}, child_vtable_type_id={:?}, \
                  nearest_header={}, \
@@ -6224,6 +6234,8 @@ impl MiniMarkGC {
                 self.nursery.top_ptr() as usize,
                 holder_addr,
                 holder_type_id,
+                holder_name,
+                holder_layout,
                 slot_addr.checked_sub(holder_addr),
                 Self::hex_words(&holder_words),
                 unsafe { (*hdr_ptr).tid_and_flags },

@@ -1027,6 +1027,10 @@ impl CodeWriter {
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
         super::type_state::stamp_unknown_call_args(rewritten_graph);
         super::type_state::align_gc_link_args(rewritten_graph);
+        // `call.py` `FUNC.RESULT` of `llmemory.GCREF` is Ref. A look-inside
+        // `createframe` can still colour that pointer Signed; stamp the
+        // returnblock before coerce so `flatten.py` `make_return` `ref_return`s.
+        super::type_state::promote_gcref_returnblock(rewritten_graph);
         // Stamp address results before kind lists are split, so a cell
         // that moves to the int bank is not left inside a ref list.
         super::type_state::force_int_bank_cells(rewritten_graph);

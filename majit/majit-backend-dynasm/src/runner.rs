@@ -4285,8 +4285,8 @@ impl Backend for DynasmBackend {
         // the per-item visit shape the tracer reads.
         let type_id = arraydescr.resolve_gc_tid();
         assert!(
-            type_id != 0,
-            "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
+            majit_ir::descr::is_collector_array_tid(type_id),
+            "bh_new_array requires ArrayDescr.tid (descr.py get_type_id) — got {type_id}"
         );
         // Old-gen for the same reason as `bh_new_with_vtable`: a resume
         // materializes the inlined frame's `locals_cells_stack` array and the

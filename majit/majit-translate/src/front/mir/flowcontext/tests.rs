@@ -2594,12 +2594,11 @@ fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
 /// A declared-Raw ADT pointer is a raw address word (`history.py`
 /// `getkind` of a raw `Ptr` is `"int"`), so
 /// `dont_look_inside_return_token` is `"raw:Owner"` — the int-bank
-/// token `raw_address_owner_root` names. An ordinary looked-inside
-/// function leaves FUNC.RESULT unstamped; the CFG return of
-/// `get_raw_owner` is a reference (`flatten.py` `make_return`).
+/// token `raw_address_owner_root` names. Look-inside graphs stamp
+/// that token as FUNC.RESULT (`call.py` `RESULT == FUNC.RESULT`).
 /// Residual callees keep the token through `stamp_return_token`.
 #[test]
-fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
+fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
     use std::collections::{HashMap, HashSet};
     let mut owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
     owner["layout"] = c_layout();
@@ -2686,14 +2685,10 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
         "declared-Raw ADT pointer stays an int-bank residual token"
     );
     let ptr_header = header_of(ptr_fd);
-    assert_ne!(
+    assert_eq!(
         ptr_header.return_type.as_deref(),
-        Some("i64"),
-        "ordinary looked-inside declared-Raw ADT pointer must not stamp FUNC.RESULT=i64"
-    );
-    assert!(
-        ptr_header.return_type.is_none(),
-        "CFG kind r is kept by leaving FUNC.RESULT unstamped, got {:?}",
+        Some("raw:Owner"),
+        "look_inside FUNC.RESULT of a raw Ptr is the int-bank token, got {:?}",
         ptr_header.return_type
     );
 

@@ -2302,13 +2302,15 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 
 /// Declared gckind of the struct or enum `ty` names, after one pointer peel.
 ///
-/// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
-/// the raw-address classifier rejects (exception carrier, a GC-pointer field)
-/// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
-/// [`declared_raw_adt_node`] accepts is Raw, plus an owner whose harvested
-/// `_alloc_flavor_` is `"raw"` (`rclass.py getgcflavor`): that classdesc
-/// fact is the gckind even when a field of the STRUCT would fail the
-/// storage-raw walk.
+/// `None` when `ty` is not a struct or enum. A harvested `_alloc_flavor_ =
+/// "raw"` owner is Raw (`rclass.py getgcflavor` / `STRUCT._gckind`): a
+/// `Vec` field fails [`adt_def_is_raw_storage`] and must not default the
+/// class to Gc. A `GcType` seed is Gc. An owner the raw-address classifier
+/// rejects (exception carrier, a GC-pointer field) stays a GC base unless
+/// that harvest named it raw. Only an owner [`declared_raw_adt_node`]
+/// accepts, or a flavor-raw class, is Raw. That classdesc fact is the
+/// gckind even when a field of the STRUCT would fail the storage-raw walk.
+
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2617,8 +2619,11 @@ fn adt_fields_are_raw_storage_in(
             None => clone_tyref(&field.ty),
         };
         // A Void field occupies no storage (`lltype.py`
-        // `Struct._names_without_voids`).
-        if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) {
+        // `Struct._names_without_voids`). A zero-sized marker
+        // (`PhantomData`) must not poison a raw owner
+        // (`RootScope.save_point` is the one stored word).
+        if tyref_is_void_zst(&ty, llbc) || tyref_is_zero_sized(&ty, llbc) || field_is_zst(&ty, llbc)
+        {
             return true;
         }
         if field_ty_is_raw_word(
@@ -3490,6 +3495,13 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
+    }
+    // `llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`. `history.py`
+    // `getkind` of a `Ptr` with `_gckind != 'raw'` is `'ref'`. Classify
+    // before VOIDP / declared-raw so a Foreign Opaque `*mut GCREFOpaque`
+    // cannot fall into the int bank.
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return ValueType::Ref(None);
     }
     // `rffi.py` `VOIDP` / `VOIDPP`. `history.py` `getkind` of a raw `Ptr`
     // is `'int'`. `*mut u8` stays `Ref` (GC byte erasure); `c_void` is
@@ -5276,6 +5288,11 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     // so a caller `simple_call` of the result is callable.
     if let Some(spelling) = tyref_fn_ptr_spelling(kind_src, llbc) {
         return Some(format!("fn:{spelling}"));
+    }
+    // `llmemory.py` `GCREF`. `history.py` `getkind` of `Ptr(GcOpaqueType)`
+    // is `'ref'` even when an earlier raw-address arm would see a word.
+    if tyref_is_gcref_spelling(kind_src, llbc) {
+        return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
     }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
@@ -17596,6 +17613,34 @@ pub(crate) fn strip_crate_prefix(path: &str) -> String {
         // single-segment name (rare — top-level item without crate
         // prefix in some Charon outputs): leave as-is.
         None => path.to_string(),
+    }
+}
+
+/// Production exception carrier (`error.rs PyError`). `OperationError`
+/// is the exception instance; the host handle is that one GCREF word.
+/// A fixture of the same leaf stays a struct.
+pub(in crate::front::mir) fn owner_is_error_carrier(owner: &str) -> bool {
+    let Some((parent, leaf)) = owner.rsplit_once("::") else {
+        return false;
+    };
+    leaf == "PyError" && parent.rsplit("::").next() == Some("error")
+}
+
+pub(in crate::front::mir) fn tyref_is_error_carrier(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|path| owner_is_error_carrier(&path))
+}
+
+#[cfg(test)]
+mod error_carrier_owner_tests {
+    use super::owner_is_error_carrier;
+
+    #[test]
+    fn production_pyerror_is_the_carrier_handle() {
+        assert!(owner_is_error_carrier("pyre_interpreter::error::PyError"));
+        assert!(owner_is_error_carrier("error::PyError"));
+        assert!(!owner_is_error_carrier("fixture::PyError"));
+        assert!(!owner_is_error_carrier("PyError"));
+        assert!(!owner_is_error_carrier("error::PyErrorObject"));
     }
 }
 

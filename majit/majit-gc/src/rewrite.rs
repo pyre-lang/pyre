@@ -1346,6 +1346,11 @@ impl GcRewriterImpl {
 
     fn handle_new(&self, op: &OpRc, st: &mut RewriteState) {
         let descr_arc = op.getdescr().expect("NEW must have a SizeDescr");
+        // `gc.py init_size_descr` then `handle_new_fixedsize`
+        // `gen_initialize_tid(op, descr.tid)`. A reconstructed
+        // `BhDescr::Size` still carries the STRUCT `cache_key`; stamp
+        // the collector id before the header write.
+        majit_ir::descr::stamp_and_assert_size_tid_for_malloc(&descr_arc, "handle_new");
         let descr = descr_arc
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
@@ -1547,6 +1552,16 @@ impl GcRewriterImpl {
     /// is ported below and emits CALL_R + CHECK_MEMORY_ERROR like
     /// rewrite.py:768-846.
     fn handle_new_array(&self, descr_ref: DescrRef, op: &OpRc, st: &mut RewriteState, kind: i64) {
+        // `gc.py init_array_descr` then `malloc_array` `check_typeid`.
+        // A no-identity mint (`arraydescrof_concrete` without ARRAY)
+        // is invisible to `register_unresolved_array_tids`; stamp here
+        // while the GIL is held so path #2 `gen_initialize_tid` does
+        // not bake `UNSET_GC_TYPE_ID`. NEWSTR / NEWUNICODE carry
+        // `gc_ll_descr.str_descr` / `unicode_descr`, which the GC
+        // description owns and is not an `op.getdescr()` mint.
+        if kind == 0 {
+            majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr_ref, "handle_new_array");
+        }
         let descr = descr_ref
             .as_array_descr()
             .expect("handle_new_array descr must be ArrayDescr");

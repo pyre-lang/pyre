@@ -7287,6 +7287,8 @@ impl<'a> Lowering<'a> {
             || frame_anchor::tyref_is_option_of_anchor(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_root(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_option_of_root(&place.ty, self.llbc)
+            || frame_box::tyref_is_frame_box(&place.ty, self.llbc)
+            || tyref_is_error_carrier(&place.ty, self.llbc)
         {
             return BorrowAddress::None;
         }
@@ -7842,6 +7844,20 @@ impl<'a> Lowering<'a> {
                             return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                         }
                         return Ok(self.emit_unit(self.emit_bb(mir_bb)));
+                    }
+                    // `ptr` and `owner_root` are the PyFrame GCREF
+                    // (`createframe`'s `W_Root`). Applying FrameBox field
+                    // offsets to that object would read `locals_cells_stack_w`.
+                    if frame_box::tyref_is_frame_box(&inner.ty, self.llbc)
+                        && frame_box::field_is_frame_gcref(&field_name)
+                    {
+                        let wrapper_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        // `frame_ptr` is `get().0 as *mut PyFrame`. The
+                        // handle is the GCREF; a later `cast_int_to_ptr`
+                        // of this word would take the integer bank.
+                        self.guard_word_vars.insert(base.clone());
+                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
@@ -9827,6 +9843,29 @@ impl<'a> Lowering<'a> {
         if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
             return Ok(AggregateShape::Operand {
                 index: 0,
+                transparent: true,
+            });
+        }
+        // `createframe` returns the GC `PyFrame`. The handle around that
+        // GCREF is the same word (`frame_box.rs`).
+        if frame_box::tyref_is_frame_box(dest_ty, self.llbc) && n_operands > 0 {
+            let index = frame_box::gcref_operand_index(dest_ty, self.llbc)
+                .filter(|&index| index < n_operands)
+                .unwrap_or(n_operands - 1);
+            return Ok(AggregateShape::Operand {
+                index,
+                transparent: true,
+            });
+        }
+        // `OperationError` is the exception instance. The host `PyError`
+        // handle is that GCREF (`rclass.py` MRO through the carrier).
+        if tyref_is_error_carrier(dest_ty, self.llbc) && n_operands > 0 {
+            let index = tyref_transparent_nonzst_field(dest_ty, self.llbc)
+                .map(|(index, _)| index)
+                .filter(|&index| index < n_operands)
+                .unwrap_or(0);
+            return Ok(AggregateShape::Operand {
+                index,
                 transparent: true,
             });
         }
