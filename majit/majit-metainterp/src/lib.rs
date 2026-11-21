@@ -1781,7 +1781,7 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 /// 66 splits those leaks by AGE rather than into leak-vs-healthy. It counts the
 /// subset of 65 whose `cell.tracing_generation` is strictly older than the warm
 /// state's, i.e. a session a later `start_tracing_cell` superseded. Only
-/// `start_tracing_cell`/`start_tracing_cell_for_key` increment the generation;
+/// `start_tracing_cell` increments the generation;
 /// the `mark_as_being_traced` pair stamp it without incrementing. So `65 > 0`
 /// with `66 == 0` is a flag leaking from the most recent session — if anything
 /// the more direct miss, since that is exactly the clear the tracing teardown

@@ -6916,6 +6916,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `code_slot` is the live pin of the portal `W_Code` (or the first
     /// Ref green). Reload after collecting calls
     /// (`gctransform/shadowstack.py`).
+    ///
+    /// Tests and doors without a comparekey result resolve once, then
+    /// commit. Production passes the matched cell through
+    /// [`Self::force_start_tracing_cell`].
     pub fn force_start_tracing(
         &mut self,
         green_key: u64,
@@ -6925,6 +6929,29 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        self.force_start_tracing_cell(
+            green_key,
+            code_slot,
+            target_pc,
+            greenargs,
+            driver_descriptor,
+            live_values,
+            None,
+        )
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5 plus the MetaInterp constructor
+    /// half. `matched` is the cell the one comparekey walk returned.
+    pub fn force_start_tracing_cell(
+        &mut self,
+        green_key: u64,
+        code_slot: usize,
+        target_pc: usize,
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
+        live_values: &[Value],
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+    ) -> BackEdgeAction {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
@@ -6932,35 +6959,38 @@ impl<M: Clone> MetaInterp<M> {
         let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         let mut owned_fallback = None;
-        let (hot, mut typed_values) = match greenargs {
+        let (matched, mut typed_values, has_greenargs) = match greenargs {
             Some((values, types)) => {
                 let key = majit_ir::GreenKey::from_greenargs(values, types);
                 let mut live = pin.live_clone(&key);
-                let hot = self
-                    .warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(&pin, &mut live, live_values);
-                (hot, live)
+                let matched = self.matched_or_resolve(jd_no, matched, &pin, &mut live);
+                pin.reload(&mut live);
+                (matched, live, true)
             }
             None => {
-                let (hot, live, fallback) = self.tracing_start_without_greenargs(
-                    jd_no,
-                    green_key,
-                    code_slot,
-                    target_pc,
-                    live_values,
-                );
+                let (resolved, live, fallback, has_greenargs) = self
+                    .tracing_resolve_without_greenargs(
+                        jd_no, green_key, code_slot, target_pc, matched,
+                    );
                 owned_fallback = fallback;
-                (hot, live)
+                (resolved, live, has_greenargs)
             }
         };
         let finish_pin = owned_fallback.as_ref().unwrap_or(&pin);
+        let marked = self.mark_matched_tracing_cell(
+            jd_no,
+            matched,
+            finish_pin,
+            &mut typed_values,
+            has_greenargs,
+        );
+        let green_key = marked.cell_key.get().unwrap_or(green_key);
         self.finish_force_start_tracing(
             green_key,
             target_pc,
             jd_no,
             driver_descriptor,
             live_values,
-            hot,
             &mut typed_values,
             finish_pin,
         )
@@ -6973,154 +7003,136 @@ impl<M: Clone> MetaInterp<M> {
         jd_no: usize,
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
-        hot: HotResult,
         typed_values: &mut majit_ir::GreenKey,
         pin: &crate::warmstate::GreenRefPin,
     ) -> BackEdgeAction {
-        match hot {
-            HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => {
-                // `force_start_tracing_for_key` set JC_TRACING on the cell
-                // selected by comparekey. Carry that cell's identity into the
-                // TraceCtx, JitCellToken and the unconditional
-                // finally-clear instead of falling back to the bucket hash.
-                // This is the function-entry twin of on_back_edge_typed's
-                // resolve-once step below (`warmstate.py maybe_compile_and_run`).
-                pin.reload(typed_values);
-                let green_key = self
-                    .warm_state_for_driver(jd_no)
-                    .cell_key_for(pin, typed_values)
-                    .unwrap_or(green_key);
-                self.prepare_trace_start_runtime();
-                // warmstate.py bound_reached / function-entry: MetaInterp(...)
-                // then compile_and_run_once. This arm does not call
-                // `setup_tracing`, so it runs the same constructor half.
-                self.begin_attempt();
-                // pyjitpl.py compile_and_run_once: self.jitdriver_sd = jitdriver_sd
-                // immediately after the constructor, so abort_tracing
-                // (warmstate.py bound_reached finally) hits this cell.
-                self.active_jitdriver_sd = Some(jd_no);
-                // RPython pyjitpl.py `create_empty_history(inputargs)`: the
-                // MetaInterp owns the history/Trace factory, not warmstate.
-                let mut recorder = crate::recorder::Trace::new();
-                for value in live_values {
-                    recorder.record_input_arg(value.get_type());
-                }
-
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] force start tracing at key={}, num_inputs={}",
-                        green_key,
-                        live_values.len()
-                    );
-                }
-
-                live_greenkey_after_collect(pin, typed_values);
-                let mut ctx = TraceCtx::with_green_key(
-                    recorder,
-                    green_key,
-                    typed_values.clone(),
-                    self.staticdata.clone(),
-                );
-                live_greenkey_after_collect(pin, typed_values);
-                let green_key_raw = (
-                    crate::warmstate::caller_pin_live_code(pin.save(), &typed_values.types)
-                        as usize,
-                    target_pc,
-                );
-                ctx.set_root_green_key_raw(green_key_raw);
-                // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
-                ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
-                ctx.callinfocollection = self.callinfocollection.clone();
-                // history.py/268/314 — Const{Int,Float,Ptr}.value
-                // is inline on the Box; snapshot each value as an
-                // inline-const OpRef (ConstPtr gcrefs GC-forwarded in place).
-                ctx.initial_inputarg_consts = live_values
-                    .iter()
-                    .map(OpRef::const_inline_from_value)
-                    .collect();
-                ctx.stamp_live_inputargs(live_values);
-                if let Some(ref descriptor) = driver_descriptor {
-                    ctx.set_driver_descriptor(descriptor.clone());
-                }
-                // pyjitpl.py `self.jitdriver_sd = jitdriver_sd` from the
-                // bound_reached / function-entry caller. `setup_tracing`
-                // keeps `jd_no`; electing a vinfo-bearing sibling would
-                // stamp leftover compiling onto this function-entry token.
-                self.active_jitdriver_sd = Some(jd_no);
-                // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
-                // `current_merge_points[0]`. The seed copies `green_key_values`
-                // so `should_force_finish_tracing_for_key` reads the cell
-                // `bound_reached` marked.
-                // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
-                // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
-                // matched.
-                live_greenkey_after_collect(pin, typed_values);
-                let force_finish = self
-                    .warm_state_for_driver(jd_no)
-                    .should_force_finish_tracing_for_key(pin, typed_values);
-                live_greenkey_after_collect(pin, typed_values);
-                ctx.set_green_key_values(typed_values.clone());
-                // Store the ctx before `initialize_virtualizable`.
-                // `clear_vable_token` can minor-collect, and
-                // `walk_active_trace_refs` only sees `self.tracing`.
-                self.publish_trace_start(ctx, live_values, force_finish);
-                // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
-                // `setup_tracing` for rationale.  Bridge-trace
-                // distinction now flows through
-                // `TraceCtx::is_bridge_trace` rather than
-                // `has_compiled_targets_fn` presence, so the parallel
-                // entry installs both fns unconditionally.
-                let self_ptr = self as *const Self as *const ();
-                let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
-                let depth_ptr = std::ptr::addr_of_mut!(self.portal_call_depth);
-                if let Some(ref mut ctx) = self.tracing {
-                    ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
-                        let meta = unsafe { &*(self_ptr as *const Self) };
-                        meta.has_compiled_targets(gk)
-                    }));
-                    ctx.compiled_key_for_greens_fn = Some(Box::new(
-                        move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
-                            let meta = unsafe { &*(self_ptr as *const Self) };
-                            meta.compiled_key_for_greens(greens)
-                        },
-                    ));
-                    ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
-                        let meta = unsafe { &*(self_ptr as *const Self) };
-                        meta.portal_call_depth
-                    }));
-                    ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
-                        *depth_ptr += delta;
-                    }));
-                    ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
-                        let meta = unsafe { &*(self_ptr as *const Self) };
-                        meta.unique_id_for_greenkey(jd_no, greenkey)
-                    }));
-                    ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
-                        let meta = unsafe { &*(self_ptr as *const Self) };
-                        meta.call_ids.last().copied().unwrap_or(0)
-                    }));
-                    ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
-                        Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
-                    }));
-                }
-                self.pending_green_key = Some(green_key);
-                if let Some(ref hook) = self.hooks.on_trace_start {
-                    hook(green_key);
-                }
-                BackEdgeAction::StartedTracing
-            }
-            HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
-            HotResult::RunCompiled => BackEdgeAction::RunCompiled,
+        // The commit marked this cell. Carry that cell's identity into
+        // the TraceCtx, JitCellToken and the unconditional
+        // finally-clear (`warmstate.py bound_reached`).
+        pin.reload(typed_values);
+        self.prepare_trace_start_runtime();
+        // warmstate.py bound_reached / function-entry: MetaInterp(...)
+        // then compile_and_run_once. This arm does not call
+        // `setup_tracing`, so it runs the same constructor half.
+        self.begin_attempt();
+        // pyjitpl.py compile_and_run_once: self.jitdriver_sd = jitdriver_sd
+        // immediately after the constructor, so abort_tracing
+        // (warmstate.py bound_reached finally) hits this cell.
+        self.active_jitdriver_sd = Some(jd_no);
+        // RPython pyjitpl.py `create_empty_history(inputargs)`: the
+        // MetaInterp owns the history/Trace factory, not warmstate.
+        let mut recorder = crate::recorder::Trace::new();
+        for value in live_values {
+            recorder.record_input_arg(value.get_type());
         }
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] force start tracing at key={}, num_inputs={}",
+                green_key,
+                live_values.len()
+            );
+        }
+
+        live_greenkey_after_collect(pin, typed_values);
+        let mut ctx = TraceCtx::with_green_key(
+            recorder,
+            green_key,
+            typed_values.clone(),
+            self.staticdata.clone(),
+        );
+        live_greenkey_after_collect(pin, typed_values);
+        let green_key_raw = (
+            crate::warmstate::caller_pin_live_code(pin.save(), &typed_values.types) as usize,
+            target_pc,
+        );
+        ctx.set_root_green_key_raw(green_key_raw);
+        // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
+        ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
+        ctx.callinfocollection = self.callinfocollection.clone();
+        // history.py/268/314 — Const{Int,Float,Ptr}.value
+        // is inline on the Box; snapshot each value as an
+        // inline-const OpRef (ConstPtr gcrefs GC-forwarded in place).
+        ctx.initial_inputarg_consts = live_values
+            .iter()
+            .map(OpRef::const_inline_from_value)
+            .collect();
+        ctx.stamp_live_inputargs(live_values);
+        if let Some(ref descriptor) = driver_descriptor {
+            ctx.set_driver_descriptor(descriptor.clone());
+        }
+        // pyjitpl.py `self.jitdriver_sd = jitdriver_sd` from the
+        // bound_reached / function-entry caller. `setup_tracing`
+        // keeps `jd_no`; electing a vinfo-bearing sibling would
+        // stamp leftover compiling onto this function-entry token.
+        self.active_jitdriver_sd = Some(jd_no);
+        // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
+        // `current_merge_points[0]`. The seed copies `green_key_values`
+        // so `should_force_finish_tracing_for_key` reads the cell
+        // `bound_reached` marked.
+        // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
+        // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
+        // matched.
+        live_greenkey_after_collect(pin, typed_values);
+        let force_finish = self
+            .warm_state_for_driver(jd_no)
+            .should_force_finish_tracing_for_key(pin, typed_values);
+        live_greenkey_after_collect(pin, typed_values);
+        ctx.set_green_key_values(typed_values.clone());
+        // Store the ctx before `initialize_virtualizable`.
+        // `clear_vable_token` can minor-collect, and
+        // `walk_active_trace_refs` only sees `self.tracing`.
+        self.publish_trace_start(ctx, live_values, force_finish);
+        // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
+        // `setup_tracing` for rationale.  Bridge-trace
+        // distinction now flows through
+        // `TraceCtx::is_bridge_trace` rather than
+        // `has_compiled_targets_fn` presence, so the parallel
+        // entry installs both fns unconditionally.
+        let self_ptr = self as *const Self as *const ();
+        let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
+        let depth_ptr = std::ptr::addr_of_mut!(self.portal_call_depth);
+        if let Some(ref mut ctx) = self.tracing {
+            ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.has_compiled_targets(gk)
+            }));
+            ctx.compiled_key_for_greens_fn = Some(Box::new(
+                move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                    let meta = unsafe { &*(self_ptr as *const Self) };
+                    meta.compiled_key_for_greens(greens)
+                },
+            ));
+            ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.portal_call_depth
+            }));
+            ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
+                *depth_ptr += delta;
+            }));
+            ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.unique_id_for_greenkey(jd_no, greenkey)
+            }));
+            ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.call_ids.last().copied().unwrap_or(0)
+            }));
+            ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
+                Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
+            }));
+        }
+        self.pending_green_key = Some(green_key);
+        if let Some(ref hook) = self.hooks.on_trace_start {
+            hook(green_key);
+        }
+        BackEdgeAction::StartedTracing
     }
 
     /// `warmstate.py maybe_compile_and_run`, function-threshold half.
     /// Resolve the portal greens through `comparekey` and run the whole warm
     /// decision on that cell.  The returned boolean only says whether the
-    /// already-counted entry should call [`Self::force_start_tracing`]; that
-    /// call resolves the same typed key again without allocating on the common
-    /// unchained path.
+    /// already-counted entry should call [`Self::force_start_tracing_cell`].
     pub fn should_trace_function_entry(
         &mut self,
         green_key: u64,
@@ -7144,7 +7156,8 @@ impl<M: Clone> MetaInterp<M> {
     /// Like `on_back_edge_typed` but bypasses the counter tick — the
     /// caller (can_enter_jit_hook) already verified the counter fired.
     ///
-    /// `code_slot` is the live pin of the portal `W_Code`.
+    /// `code_slot` is the live pin of the portal `W_Code`. Doors without a
+    /// comparekey result resolve once inside [`Self::bound_reached_cell`].
     pub fn bound_reached(
         &mut self,
         green_key: u64,
@@ -7154,6 +7167,29 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        self.bound_reached_cell(
+            green_key,
+            code_slot,
+            target_pc,
+            green_key_values,
+            driver_descriptor,
+            live_values,
+            None,
+        )
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
+    /// `matched` is the cell the one comparekey walk returned.
+    pub fn bound_reached_cell(
+        &mut self,
+        green_key: u64,
+        code_slot: usize,
+        target_pc: usize,
+        green_key_values: Option<majit_ir::GreenKey>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
+        live_values: &[Value],
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+    ) -> BackEdgeAction {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
@@ -7162,34 +7198,36 @@ impl<M: Clone> MetaInterp<M> {
         let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         let mut owned_fallback = None;
-        let (hot, mut typed_values) = match green_key_values {
+        let (matched, mut typed_values, has_greenargs) = match green_key_values {
             Some(key) => {
                 let mut live = pin.live_clone(&key);
-                let hot = self
-                    .warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(&pin, &mut live, live_values);
-                (hot, live)
+                let matched = self.matched_or_resolve(jd_no, matched, &pin, &mut live);
+                pin.reload(&mut live);
+                (matched, live, true)
             }
             None => {
-                let (hot, live, fallback) = self.tracing_start_without_greenargs(
-                    jd_no,
-                    green_key,
-                    code_slot,
-                    target_pc,
-                    live_values,
-                );
+                let (resolved, live, fallback, has_greenargs) = self
+                    .tracing_resolve_without_greenargs(
+                        jd_no, green_key, code_slot, target_pc, matched,
+                    );
                 owned_fallback = fallback;
-                (hot, live)
+                (resolved, live, has_greenargs)
             }
         };
         let finish_pin = owned_fallback.as_ref().unwrap_or(&pin);
+        let marked = self.mark_matched_tracing_cell(
+            jd_no,
+            matched,
+            finish_pin,
+            &mut typed_values,
+            has_greenargs,
+        );
+        let green_key = marked.cell_key.get().unwrap_or(green_key);
         self.finish_bound_reached(
             green_key,
             target_pc,
-            jd_no,
             driver_descriptor,
             live_values,
-            hot,
             &mut typed_values,
             finish_pin,
         )
@@ -7199,107 +7237,36 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         target_pc: usize,
-        jd_no: usize,
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
-        hot: HotResult,
         typed_values: &mut majit_ir::GreenKey,
         pin: &crate::warmstate::GreenRefPin,
     ) -> BackEdgeAction {
-        match hot {
-            HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => {
-                // Same resolve as the sibling `force_start_tracing` arm and as
-                // `on_back_edge_typed`: the incoming number is a bucket hash,
-                // and the cell the typed arm just marked owns a minted key
-                // whenever that hash was already claimed. Resolve it ONCE:
-                // `with_typed_decision_key` asserts its first argument buckets
-                // to `make_green_key(green_key_raw)`, which a minted cell key
-                // does not, so feeding a resolved key back in fails that
-                // assertion on exactly the chained-cell case this supports.
-                pin.reload(typed_values);
-                let green_key = self
-                    .warm_state_for_driver(jd_no)
-                    .cell_key_for(pin, typed_values)
-                    .unwrap_or(green_key);
-                self.prepare_trace_start_runtime();
-                live_greenkey_after_collect(pin, typed_values);
-                let green_key_raw = (
-                    crate::warmstate::caller_pin_live_code(pin.save(), &typed_values.types)
-                        as usize,
-                    target_pc,
-                );
-                self.setup_tracing(
-                    green_key,
-                    green_key_raw,
-                    typed_values.clone(),
-                    driver_descriptor,
-                    live_values,
-                    pin,
-                )
-            }
-            HotResult::RunCompiled => BackEdgeAction::RunCompiled,
-            HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
-        }
+        pin.reload(typed_values);
+        self.prepare_trace_start_runtime();
+        live_greenkey_after_collect(pin, typed_values);
+        let green_key_raw = (
+            crate::warmstate::caller_pin_live_code(pin.save(), &typed_values.types) as usize,
+            target_pc,
+        );
+        self.setup_tracing(
+            green_key,
+            green_key_raw,
+            typed_values.clone(),
+            driver_descriptor,
+            live_values,
+            pin,
+        )
     }
 
     /// Cheap half of `warmstate.py maybe_compile_and_run`: resolve the cell and
     /// tick its counter, but do not build or consume tracing state.
     ///
-    /// Upstream orders the decision the same way: greenargs, hash,
-    /// `lookup_chain`, then `jitcounter.tick` (`warmstate.py
-    /// maybe_compile_and_run`), and only the overflow calls `bound_reached`.
-    /// Returning `StartTracing` here is permission to build the frontend
-    /// snapshot and call [`Self::start_back_edge_trace`]; it has not marked the
-    /// cell as tracing yet, so a later descriptor/live-value refusal remains a
-    /// clean refusal rather than stranding a `JC_TRACING` cell.
-    #[cfg(test)]
-    pub(crate) fn on_back_edge_typed_decision(
-        &mut self,
-        green_key: u64,
-        code_slot: usize,
-        pc: usize,
-        reds: &[Value],
-    ) -> HotResult {
-        self.on_back_edge_typed_decision_on_driver(0, green_key, code_slot, pc, reds)
-    }
-
-    /// `warmstate.py maybe_compile_and_run` occupied-cell decision on that
-    /// driver's WarmEnterState.
-    pub(crate) fn on_back_edge_typed_decision_on_driver(
-        &mut self,
-        jd_no: usize,
-        green_key: u64,
-        code_slot: usize,
-        pc: usize,
-        reds: &[Value],
-    ) -> HotResult {
-        self.make_enter_function(jd_no);
-        let typed = {
-            let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-            Self::with_typed_decision_key(green_key, code_slot, pc, |key, pin| {
-                warm_state.maybe_compile_decision_with_key(pin, key, reds)
-            })
-        };
-        match typed {
-            Some(hot) => hot,
-            None => {
-                let types = self
-                    .staticdata
-                    .jitdrivers_sd
-                    .get(jd_no)
-                    .map(|d| d.green_args_spec())
-                    .unwrap_or_default();
-                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-                warm_state.maybe_compile_decision_with_meta(green_key, &types, reds)
-            }
-        }
-    }
-
     /// Commit a `StartTracing` answer from
-    /// [`Self::on_back_edge_typed_decision_on_driver`] and consume the expensive tracing
+    /// [`Self::maybe_compile_and_run_step_on_driver`] and consume the expensive tracing
     /// arguments. The caller ran [`Self::bound_reached_prelude`]; this is
-    /// steps 4-5 plus `setup_tracing`.
+    /// steps 4-5 plus `setup_tracing`. `matched` is the cell that decision
+    /// walked.
     pub(crate) fn start_back_edge_trace(
         &mut self,
         green_key: u64,
@@ -7308,14 +7275,16 @@ impl<M: Clone> MetaInterp<M> {
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
     ) -> BackEdgeAction {
-        self.bound_reached(
+        self.bound_reached_cell(
             green_key,
             code_slot,
             target_pc,
             green_key_values,
             driver_descriptor.cloned().map(std::sync::Arc::new),
             live_values,
+            matched,
         )
     }
 
@@ -7330,29 +7299,44 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> BackEdgeAction {
         let jd_no = self.entry_warm_jd(driver_descriptor);
-        match self.on_back_edge_typed_decision_on_driver(
-            jd_no,
-            green_key,
-            code_slot,
-            target_pc,
-            live_values,
-        ) {
+        let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
+        let mut owned_live = green_key_values.clone();
+        let resolved = match owned_live.as_ref() {
+            Some(key) => {
+                let mut live = pin.live_clone(key);
+                pin.reload(&mut live);
+                let hash = live.get_uhash();
+                pin.reload(&mut live);
+                self.resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types)
+            }
+            None => crate::warmstate::ResolvedJitCell::miss(green_key),
+        };
+        let matched = resolved.cell.clone();
+        match self
+            .maybe_compile_and_run_step_on_driver(
+                jd_no,
+                resolved,
+                code_slot,
+                target_pc,
+                live_values,
+            )
+            .0
+        {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 let reconstructed;
-                let (greens, types): (&[i64], &[majit_ir::GreenType]) =
-                    match green_key_values.as_ref() {
-                        Some(k) => (&k.values, &k.types),
-                        None => {
-                            reconstructed = self.reconstructed_greenkey_without_greenargs(
-                                jd_no, green_key, code_slot, target_pc,
-                            );
-                            match reconstructed.as_slices() {
-                                Some((values, types)) => (values, types),
-                                None => (&[], &[]),
-                            }
+                let (greens, types): (&[i64], &[majit_ir::GreenType]) = match owned_live.as_ref() {
+                    Some(k) => (&k.values, &k.types),
+                    None => {
+                        reconstructed = self.reconstructed_greenkey_without_greenargs(
+                            jd_no, green_key, code_slot, target_pc,
+                        );
+                        match reconstructed.as_slices() {
+                            Some((values, types)) => (values, types),
+                            None => (&[], &[]),
                         }
-                    };
+                    }
+                };
                 if !self.bound_reached_prelude(jd_no, greens, types, live_values) {
                     return BackEdgeAction::Interpret;
                 }
@@ -7360,9 +7344,10 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     code_slot,
                     target_pc,
-                    green_key_values,
+                    owned_live.take(),
                     driver_descriptor,
                     live_values,
+                    matched,
                 )
             }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
@@ -7443,57 +7428,90 @@ impl<M: Clone> MetaInterp<M> {
         }))
     }
 
+    /// `warmstate.py bound_reached` steps 4-5: mark the matched cell, or
+    /// `JitCell(*greenargs)` + `install_new_cell` on a miss with greens.
+    fn mark_matched_tracing_cell(
+        &mut self,
+        jd_no: usize,
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        pin: &crate::warmstate::GreenRefPin,
+        live: &mut majit_ir::GreenKey,
+        has_greenargs: bool,
+    ) -> std::rc::Rc<crate::warmstate::BaseJitCell> {
+        let mut warm = self.warm_state_for_driver(jd_no);
+        if has_greenargs {
+            pin.reload(live);
+            warm.start_tracing_cell(matched.as_ref(), pin, live)
+        } else {
+            let cell = matched.expect(
+                "the hash form names an installed cell; a tracing start without one needs greens, \
+                 warmstate.py bound_reached JitCell(*greenargs)",
+            );
+            warm.mark_cell_tracing(&cell);
+            cell
+        }
+    }
+
+    /// Keep `matched` when the door already walked; otherwise one
+    /// `JitCell.get_jitcell` / `lookup_chain` walk.
+    fn matched_or_resolve(
+        &self,
+        jd_no: usize,
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        pin: &crate::warmstate::GreenRefPin,
+        live: &mut majit_ir::GreenKey,
+    ) -> Option<std::rc::Rc<crate::warmstate::BaseJitCell>> {
+        match matched {
+            Some(cell) => Some(cell),
+            None => {
+                pin.reload(live);
+                let hash = live.get_uhash();
+                pin.reload(live);
+                self.resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types)
+                    .cell
+            }
+        }
+    }
+
     /// `warmstate.py bound_reached` when the door did not pass `*greenargs`.
     ///
     /// A live portal pin rebuilds `[pc, profiled, pycode]`. An already
     /// installed cell whose greens match the driver's spec is re-pinned
-    /// from those fields. Otherwise the hash form names the cell
-    /// (`force_start_tracing(cell_key, types, reds)`); Int-only tests and
-    /// empty specs take that arm.
-    fn tracing_start_without_greenargs(
-        &mut self,
+    /// from those fields. Otherwise the hash form names the installed cell;
+    /// Int-only tests and empty specs take that arm. Resolves once; the
+    /// caller marks.
+    fn tracing_resolve_without_greenargs(
+        &self,
         jd_no: usize,
         green_key: u64,
         code_slot: usize,
         target_pc: usize,
-        live_values: &[Value],
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
     ) -> (
-        HotResult,
+        Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
         majit_ir::GreenKey,
         Option<crate::warmstate::GreenRefPin>,
+        bool,
     ) {
         match self.reconstructed_greenkey_without_greenargs(jd_no, green_key, code_slot, target_pc)
         {
             GreensWithoutGreenargs::Portal(key) => {
                 let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
                 let mut live = pin.live_clone(&key);
-                let hot = self
-                    .warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(&pin, &mut live, live_values);
-                (hot, live, None)
+                let matched = self.matched_or_resolve(jd_no, matched, &pin, &mut live);
+                pin.reload(&mut live);
+                (matched, live, None, true)
             }
             GreensWithoutGreenargs::Installed(key)
                 if key.types.iter().any(|t| *t == majit_ir::GreenType::Ref) =>
             {
                 let fallback = crate::warmstate::GreenRefPin::pin(&key);
                 let mut live = fallback.live_clone(&key);
-                let hot = self
-                    .warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(&fallback, &mut live, live_values);
-                (hot, live, Some(fallback))
+                let matched = self.matched_or_resolve(jd_no, matched, &fallback, &mut live);
+                fallback.reload(&mut live);
+                (matched, live, Some(fallback), true)
             }
             other => {
-                let types = self
-                    .staticdata
-                    .jitdrivers_sd
-                    .get(jd_no)
-                    .map(|d| d.green_args_spec())
-                    .unwrap_or_default();
-                let hot = self.warm_state_for_driver(jd_no).force_start_tracing(
-                    green_key,
-                    &types,
-                    live_values,
-                );
                 let live = match other {
                     GreensWithoutGreenargs::Installed(key) => key,
                     _ => majit_ir::GreenKey::with_types(
@@ -7501,7 +7519,19 @@ impl<M: Clone> MetaInterp<M> {
                         Vec::<majit_ir::GreenType>::new(),
                     ),
                 };
-                (hot, live, None)
+                let has_greenargs = !live.types.is_empty();
+                let matched = match matched {
+                    Some(cell) => Some(cell),
+                    None if has_greenargs => {
+                        let pin = crate::warmstate::GreenRefPin::pin_one(0);
+                        let mut resolved_live = pin.live_clone(&live);
+                        self.matched_or_resolve(jd_no, None, &pin, &mut resolved_live)
+                    }
+                    None => self
+                        .warm_state_ref_for_driver(jd_no)
+                        .and_then(|warm| warm.cell_by_key(green_key)),
+                };
+                (matched, live, None, has_greenargs)
             }
         }
     }
@@ -24975,12 +25005,13 @@ mod metainterp_static_data_tests {
         );
     }
 
-    /// `warmstate.py maybe_compile_and_run`: `on_back_edge_typed_decision`
-    /// enters a live procedure token after `confirm_enter_jit`. The token
-    /// need not answer `has_compiled_code()`, and `outermost_jitdriver_sd`
-    /// is not a second filter — the cell lives on this driver's warmstate.
+    /// `warmstate.py maybe_compile_and_run`:
+    /// [`MetaInterp::maybe_compile_and_run_step_on_driver`] enters a live
+    /// procedure token after `confirm_enter_jit`. The token need not answer
+    /// `has_compiled_code()`, and `outermost_jitdriver_sd` is not a second
+    /// filter — the cell lives on this driver's warmstate.
     #[test]
-    fn on_back_edge_typed_decision_enters_a_live_token_without_compiled_code() {
+    fn maybe_compile_and_run_step_enters_a_live_token_without_compiled_code() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         fn allow(_args: &[majit_ir::Value]) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -24992,18 +25023,30 @@ mod metainterp_static_data_tests {
         extern "C" fn portal_runner_helper() -> i64 {
             0
         }
-        // `gk` is one Int green. The hash fallback of
-        // `on_back_edge_typed_decision_on_driver` packs `confirm_enter_jit`
-        // from `_green_args_spec` (`warmstate.py`).
-        let mut first =
-            crate::jitdriver::JitDriverStaticData::new(vec![("g", majit_ir::Type::Int)], vec![]);
+        // Portal greens are `(next_instr, is_being_profiled, pycode)`.
+        // `maybe_compile_and_run_step_on_driver` packs `confirm_enter_jit(*args)`
+        // from that pin (`warmstate.py maybe_compile_and_run`).
+        let mut first = crate::jitdriver::JitDriverStaticData::new(
+            vec![
+                ("next_instr", majit_ir::Type::Int),
+                ("is_being_profiled", majit_ir::Type::Int),
+                ("pycode", majit_ir::Type::Ref),
+            ],
+            vec![],
+        );
         first.portal_runner_adr = portal_runner_helper as *const () as i64;
         first.index = Some(0);
         let idx0 = meta.register_jitdriver_sd(first);
         assert_eq!(idx0, 0);
         meta.finish_setup_descrs_for_jitdrivers();
 
-        let key = gk(0x7e15);
+        let code: usize = 0x7e15;
+        let pc: usize = 0;
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let hash = crate::green_key_from_code_ptr(code, pc);
         let mut token = majit_backend::JitCellToken::new(75);
         token.outermost_jitdriver_index = Some(99);
         let token = std::sync::Arc::new(token);
@@ -25019,14 +25062,10 @@ mod metainterp_static_data_tests {
             .set_confirm_enter_jit(Some(allow));
 
         let decided = {
-            let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(0);
-            meta.on_back_edge_typed_decision_on_driver(
-                idx0,
-                key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+            let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(code);
+            let resolved = meta.resolve_jit_cell_on_driver(idx0, hash, &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(idx0, resolved, _zbh_pin.save(), pc, &[])
+                .0
         };
         assert!(
             matches!(decided, crate::warmstate::HotResult::RunCompiled),
@@ -27261,9 +27300,24 @@ mod metainterp_static_data_tests {
             )
         };
         assert!(
-            matches!(primary_entry, BackEdgeAction::RunCompiled),
+            matches!(primary_entry, BackEdgeAction::StartedTracing),
+            "commit is bound_reached steps 4-5"
+        );
+        assert!(
+            crate::warmstate::GreenRefPin::with(&key, |__p, __l| meta
+                .warm_state_for_driver(0)
+                .lookup_chain_with_key(__p, __l))
+            .is_some_and(|cell| cell.is_tracing()),
             "a leftover secondary active_jitdriver_sd must not hide the primary compiled cell"
         );
+        assert!(
+            crate::warmstate::GreenRefPin::with(&key, |__p, __l| meta
+                .warm_state_for_driver(idx1)
+                .lookup_chain_with_key(__p, __l))
+            .is_some_and(|cell| !cell.is_tracing()),
+            "the leftover secondary cell is not the bound_reached cell"
+        );
+        meta.abort_trace(false);
         let secondary_entry = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_slices(&key.values, &key.types);
             meta.force_start_tracing(
@@ -27276,7 +27330,14 @@ mod metainterp_static_data_tests {
             )
         };
         assert!(
-            matches!(secondary_entry, BackEdgeAction::RunCompiled),
+            matches!(secondary_entry, BackEdgeAction::StartedTracing),
+            "commit is bound_reached steps 4-5"
+        );
+        assert!(
+            crate::warmstate::GreenRefPin::with(&key, |__p, __l| meta
+                .warm_state_for_driver(idx1)
+                .lookup_chain_with_key(__p, __l))
+            .is_some_and(|cell| cell.is_tracing()),
             "a secondary descriptor must find the token attached on that warmstate"
         );
         assert!(
@@ -27947,14 +28008,22 @@ mod metainterp_static_data_tests {
         assert!(
             matches!(
                 {
-                    let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(0);
-                    meta.on_back_edge_typed_decision_on_driver(
+                    let _zbh_pin =
+                        crate::warmstate::GreenRefPin::pin_slices(&key.values, &key.types);
+                    let resolved = meta.resolve_jit_cell_on_driver(
                         idx1,
                         key.get_uhash(),
+                        &key.values,
+                        &key.types,
+                    );
+                    meta.maybe_compile_and_run_step_on_driver(
+                        idx1,
+                        resolved,
                         _zbh_pin.save(),
                         0,
                         &[],
                     )
+                    .0
                 },
                 crate::warmstate::HotResult::RunCompiled
             ),
@@ -27963,8 +28032,16 @@ mod metainterp_static_data_tests {
         assert!(
             !matches!(
                 {
-                    let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(0);
-                    meta.on_back_edge_typed_decision(key.get_uhash(), _zbh_pin.save(), 0, &[])
+                    let _zbh_pin =
+                        crate::warmstate::GreenRefPin::pin_slices(&key.values, &key.types);
+                    let resolved = meta.resolve_jit_cell_on_driver(
+                        0,
+                        key.get_uhash(),
+                        &key.values,
+                        &key.types,
+                    );
+                    meta.maybe_compile_and_run_step_on_driver(0, resolved, _zbh_pin.save(), 0, &[])
+                        .0
                 },
                 crate::warmstate::HotResult::RunCompiled
             ),
@@ -35757,13 +35834,20 @@ mod tests {
         assert!(matches!(forced, BackEdgeAction::AlreadyTracing));
         let decided = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(inner_code);
-            meta.on_back_edge_typed_decision_on_driver(
+            let resolved = meta.resolve_jit_cell_on_driver(
                 0,
                 inner_key,
+                &inner_typed.values,
+                &inner_typed.types,
+            );
+            meta.maybe_compile_and_run_step_on_driver(
+                0,
+                resolved,
                 _zbh_pin.save(),
                 inner_pc,
                 &[Value::Int(1)],
             )
+            .0
         };
         assert!(matches!(decided, crate::warmstate::HotResult::StartTracing));
         assert!(meta.tracing.is_none(), "the parked attempt stays parked");

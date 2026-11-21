@@ -7095,6 +7095,7 @@ impl<S: JitState> JitDriver<S> {
                     target_pc,
                     state,
                     env,
+                    None,
                 ),
                 None => self.commit_start_tracing(
                     green_key_hash,
@@ -7103,6 +7104,7 @@ impl<S: JitState> JitDriver<S> {
                     target_pc,
                     state,
                     env,
+                    None,
                 ),
             }
         {
@@ -7569,7 +7571,7 @@ impl<S: JitState> JitDriver<S> {
         // `can_enter_jit!` sites are that shape. Re-entry cannot loop: the next
         // pass returns at the `is_tracing()` guard opening this function.
         // Occupied bucket, no enterable token: the typed comparekey walk
-        // (`on_back_edge_typed_decision`) ticks the cell the greens own.
+        // (`maybe_compile_and_run_step_on_driver`) ticks the cell the greens own.
         // Frontend snapshot work stays behind `StartTracing`.
         let started = match pin_live {
             Some((pin, live)) => {
@@ -8828,6 +8830,23 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        self.force_start_tracing_with_cell(
+            green_key, greenargs, code_slot, target_pc, state, env, None,
+        )
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5. `matched` is the cell the
+    /// one comparekey walk returned.
+    pub fn force_start_tracing_with_cell(
+        &mut self,
+        green_key: u64,
+        greenargs: Option<(&[i64], &[GreenType])>,
+        code_slot: usize,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+    ) {
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         majit_gc::ensure_type_registry_closed();
         self.republish_state_field_fvc();
@@ -8869,13 +8888,14 @@ impl<S: JitState> JitDriver<S> {
         let greenargs_live = owned_live
             .as_ref()
             .map(|live| (live.values.as_slice(), live.types.as_slice()));
-        let started = self.meta.force_start_tracing(
+        let started = self.meta.force_start_tracing_cell(
             green_key,
             pin.save(),
             target_pc,
             greenargs_live,
             descriptor,
             &live_values,
+            matched,
         );
         if let BackEdgeAction::StartedTracing = started {
             if spdiag_enabled() {
@@ -8911,6 +8931,20 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        self.bound_reached_with_cell(green_key, code_slot, target_pc, state, env, None)
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
+    /// `matched` is the cell the one comparekey walk returned.
+    pub fn bound_reached_with_cell(
+        &mut self,
+        green_key: u64,
+        code_slot: usize,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+    ) {
         if self.meta.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key);
             return;
@@ -8940,13 +8974,14 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        if let BackEdgeAction::StartedTracing = self.meta.bound_reached(
+        if let BackEdgeAction::StartedTracing = self.meta.bound_reached_cell(
             green_key,
             pin.save(),
             target_pc,
             None,
             descriptor,
             &live_values,
+            matched,
         ) {
             if spdiag_enabled() {
                 eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
@@ -9006,18 +9041,42 @@ impl<S: JitState> JitDriver<S> {
             }
         };
         let decision_slot = decision_pin.save();
-        match self.meta.on_back_edge_typed_decision_on_driver(
-            self.index().unwrap_or(0),
-            green_key,
-            decision_slot,
-            target_pc,
-            &confirm_reds,
-        ) {
+        let jd_no = self.index().unwrap_or(0);
+        let resolved = if had_caller_pin || had_greenargs {
+            decision_pin.reload(decision_live);
+            let hash = decision_live.get_uhash();
+            decision_pin.reload(decision_live);
+            self.resolve_jit_cell(
+                hash,
+                decision_live.values.as_slice(),
+                decision_live.types.as_slice(),
+            )
+        } else {
+            match self.meta.warm_state_ref_for_driver(jd_no).and_then(|warm| {
+                warm.cell_by_key(green_key)
+                    .map(|cell| (warm.bucket_of(green_key), cell))
+            }) {
+                Some((hash, cell)) => ResolvedJitCell::matched(cell, hash),
+                None => ResolvedJitCell::miss(green_key),
+            }
+        };
+        let matched = resolved.cell.clone();
+        match self
+            .meta
+            .maybe_compile_and_run_step_on_driver(
+                jd_no,
+                resolved,
+                decision_slot,
+                target_pc,
+                &confirm_reds,
+            )
+            .0
+        {
             HotResult::StartTracing => {
                 // Overflow of a sibling while another trace is live. Incremental
                 // drivers have no `NestedTraceGuard`; `bound_reached` refuses
                 // the start so the outer attempt is not clobbered. The tick
-                // already ran in `on_back_edge_typed_decision`.
+                // already ran in `maybe_compile_and_run_step`.
                 decision_pin.reload(decision_live);
                 if had_caller_pin || had_greenargs {
                     self.commit_start_tracing(
@@ -9027,9 +9086,10 @@ impl<S: JitState> JitDriver<S> {
                         target_pc,
                         state,
                         env,
+                        matched,
                     )
                 } else {
-                    self.commit_start_tracing(green_key, None, None, target_pc, state, env)
+                    self.commit_start_tracing(green_key, None, None, target_pc, state, env, matched)
                 }
             }
             _ => false,
@@ -9103,6 +9163,7 @@ impl<S: JitState> JitDriver<S> {
             target_pc,
             state,
             env,
+            None,
         )
     }
 
@@ -9120,6 +9181,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
+        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
     ) -> bool {
         if spdiag_enabled() {
             eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
@@ -9228,6 +9290,7 @@ impl<S: JitState> JitDriver<S> {
             commit_values,
             descriptor.as_deref(),
             &live_values,
+            matched,
         );
         match started {
             BackEdgeAction::Interpret => {
@@ -9249,13 +9312,7 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.begin_trace_session(meta);
                 true
             }
-            BackEdgeAction::AlreadyTracing => {
-                self.restore_trace_vable_ptr(saved_vable_ptr);
-                false
-            }
-            // `RunCompiled` is this door declining: execute_assembler is a
-            // different entry that seeds its own `*args`.
-            BackEdgeAction::RunCompiled => {
+            BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => {
                 self.restore_trace_vable_ptr(saved_vable_ptr);
                 false
             }
@@ -11221,6 +11278,7 @@ impl<S: JitState> JitDriver<S> {
                 live.types.as_slice(),
             ),
         };
+        let matched = resolved.cell.clone();
         let cell_key = resolved.cell_key().unwrap_or(resolved.hash);
         pin.reload(&mut live);
         let step = if already_ticked {
@@ -11261,13 +11319,14 @@ impl<S: JitState> JitDriver<S> {
                 // `function_entry_step` already ticked. Incremental drivers
                 // have no `NestedTraceGuard`; `MetaInterp::force_start_tracing`
                 // refuses the start when an outer attempt is live.
-                self.force_start_tracing(
+                self.force_start_tracing_with_cell(
                     cell_key,
                     Some((live.values.as_slice(), live.types.as_slice())),
                     pin.save(),
                     target_pc,
                     state,
                     env,
+                    matched,
                 );
                 None
             }
@@ -19101,7 +19160,7 @@ mod tests {
 
     /// `warmstate.py maybe_compile_and_run`: a sibling cell still ticks while
     /// another cell traces. Occupied (ii) path: `back_edge_or_run_compiled`
-    /// → `maybe_start_tracing` → `on_back_edge_typed_decision`. Incremental
+    /// → `maybe_start_tracing` → `maybe_compile_and_run_step_on_driver`. Incremental
     /// drivers have no `NestedTraceGuard`, so overflow refuses the start.
     #[test]
     fn back_edge_or_run_compiled_ticks_a_sibling_while_another_cell_traces() {

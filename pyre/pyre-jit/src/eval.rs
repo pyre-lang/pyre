@@ -8885,7 +8885,7 @@ fn drive_portal_metatrace(
     // whose `cell_key` equals the bucket hash. This door has no prior
     // decision, so it tests the matched cell the same way
     // `drive_tuple_hash_trace` does.
-    if matched_cell.is_some_and(|cell| cell.is_tracing()) {
+    if matched_cell.as_ref().is_some_and(|cell| cell.is_tracing()) {
         return None;
     }
     // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
@@ -8949,13 +8949,14 @@ fn drive_portal_metatrace(
         frame_root.frame().get_is_being_profiled(),
         pycode_root.get() as u64,
     );
-    driver.force_start_tracing(
+    driver.force_start_tracing_with_cell(
         green_key,
         Some((&greenargs, majit_ir::PYPYJIT_GREEN_TYPES.as_slice())),
         pycode_root.save(),
         loop_header_pc,
         &mut jit_state,
         env,
+        matched_cell,
     );
     if !driver.is_tracing() {
         return None;
@@ -9144,7 +9145,7 @@ fn unpack_merge_point_jit(
     // `unpackiterable_driver`'s `jitdriver_sd.warmstate`: `lookup_chain`,
     // then `jitcounter.tick`; `bound_reached` / `EnterJitAssembler` are
     // `drive_unpack_iterable_trace`.
-    let (hot, green_key) = {
+    let (hot, green_key, matched_cell) = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
         let (_save_point, root_base, _items_slot) = pyre_jit_trace::unpack_state::jd1_root_base();
@@ -9161,24 +9162,31 @@ fn unpack_merge_point_jit(
             &greenargs,
             &majit_ir::PYPYJIT_GREEN_TYPES,
         );
+        let matched_cell = resolved.cell.clone();
         let green_key = resolved.cell_key().unwrap_or(hash);
         let hot = driver
             .meta_interp_mut()
             .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
             .0;
-        (hot, green_key)
+        (hot, green_key, matched_cell)
     };
-    if !matches!(
-        hot,
-        majit_metainterp::warmstate::HotResult::StartTracing
-            | majit_metainterp::warmstate::HotResult::RunCompiled
-    ) {
-        return;
-    }
+    let tracing = match hot {
+        majit_metainterp::warmstate::HotResult::StartTracing => true,
+        majit_metainterp::warmstate::HotResult::RunCompiled => false,
+        majit_metainterp::warmstate::HotResult::NotHot
+        | majit_metainterp::warmstate::HotResult::AlreadyTracing => return,
+    };
     if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
         eprintln!("[jd1] counter fired for green_key={green_key}");
     }
-    drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
+    drive_unpack_iterable_trace(
+        green_key,
+        greenkey,
+        w_iterator,
+        items,
+        matched_cell,
+        tracing,
+    );
 }
 
 /// `generator.py` `get_printable_location_genentry`.
@@ -9244,6 +9252,7 @@ fn genentry_merge_point_jit(
         driver
             .meta_interp()
             .resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types);
+    let matched_cell = resolved.cell.clone();
     let green_key = resolved.cell_key().unwrap_or(hash);
     // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
     // `_find_shadow`). Re-read every pycode/w_gen/w_arg from the pins.
@@ -9267,13 +9276,12 @@ fn genentry_merge_point_jit(
             .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
             .0
     };
-    if !matches!(
-        hot,
-        majit_metainterp::warmstate::HotResult::StartTracing
-            | majit_metainterp::warmstate::HotResult::RunCompiled
-    ) {
-        return None;
-    }
+    let tracing = match hot {
+        majit_metainterp::warmstate::HotResult::StartTracing => true,
+        majit_metainterp::warmstate::HotResult::RunCompiled => false,
+        majit_metainterp::warmstate::HotResult::NotHot
+        | majit_metainterp::warmstate::HotResult::AlreadyTracing => return None,
+    };
     let pycode = pin.get() as pyre_object::PyObjectRef;
     let w_gen = roots.get(base + 1);
     let w_arg = roots.get(base + 2);
@@ -9283,7 +9291,7 @@ fn genentry_merge_point_jit(
             get_printable_location_genentry(pycode)
         );
     }
-    let driven = drive_generatorentry_trace(green_key, pycode, w_gen, w_arg);
+    let driven = drive_generatorentry_trace(green_key, pycode, w_gen, w_arg, matched_cell, tracing);
     // The note is scoped to the walk: whatever it recorded is either
     // consumed by the abort fallback or dropped here.
     pyre_interpreter::call::genentry_resume_note_reset();
@@ -9299,14 +9307,16 @@ fn genentry_merge_point_jit(
 /// yielded value.
 ///
 /// `send_ex` has no back edge. `CloseLoop` is kept so a merge-point
-/// `goto` still compiles. `RunCompiled` enters the assembler here
-/// (`execute_assembler`); `StartedTracing` returns the value the walk
-/// already produced.
+/// `goto` still compiles. The door's `RunCompiled` arm enters the assembler
+/// before this walk; `StartedTracing` returns the value the walk already
+/// produced.
 fn drive_generatorentry_trace(
     green_key: u64,
     pycode: pyre_object::PyObjectRef,
     w_gen: pyre_object::PyObjectRef,
     w_arg: pyre_object::PyObjectRef,
+    matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
+    tracing: bool,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
     use majit_metainterp::BackEdgeAction;
 
@@ -9345,6 +9355,13 @@ fn drive_generatorentry_trace(
         .unwrap_or(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX);
     // `genentry_merge_point_jit` already ran `maybe_compile_and_run` on the
     // matched cell (`AlreadyTracing` never reaches this door).
+    // `RunCompiled` is EnterJitAssembler: no NestedTraceGuard / bound_reached.
+    if !tracing {
+        let w_gen = roots.get(base + 1);
+        let w_arg = roots.get(base + 2);
+        let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
+        return run_compiled_generatorentry(green_key, &live_values, dbg);
+    }
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
     // NestedTraceGuard::enter.
     let pycode = roots.get(base);
@@ -9382,19 +9399,19 @@ fn drive_generatorentry_trace(
         let pycode = pin.get() as pyre_object::PyObjectRef;
         let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
         let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
-        meta.force_start_tracing(
+        meta.force_start_tracing_cell(
             green_key,
             pin.save(),
             0,
             Some((&gk.values, &gk.types)),
             Some(std::sync::Arc::new(descriptor)),
             &live_values,
+            matched_cell,
         )
     };
     let pycode = roots.get(base);
     let w_gen = roots.get(base + 1);
     let w_arg = roots.get(base + 2);
-    let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
     if dbg {
         let name = match action {
             BackEdgeAction::Interpret => "Interpret",
@@ -9404,28 +9421,13 @@ fn drive_generatorentry_trace(
         };
         eprintln!("[jd2] force_start_tracing -> {name}");
     }
-    if matches!(action, BackEdgeAction::StartedTracing) {
-        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
-        driver.arm_close_on_drop(starting_tracing_key);
-    } else {
-        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
-        // nested MetaInterp. Restore now so the compiled enter below sees
-        // the outer attempt. `compile_and_run_once` returns here and Drop
-        // restores; jd2 still has that arm in this function.
-        driver.restore_parked_outer();
-    }
-    // `maybe_compile_and_run` raises `EnterJitAssembler` once the cell
-    // has a real procedure token. Run that loop and resume its guards
-    // before the portal body.
-    if matches!(action, BackEdgeAction::RunCompiled) {
-        // NestedTraceGuard still holds the driver; drop it before the
-        // compiled runner re-acquires `driver_pair()`.
-        drop(driver);
-        return run_compiled_generatorentry(green_key, &live_values, dbg);
-    }
     if !matches!(action, BackEdgeAction::StartedTracing) {
+        // Nested MetaInterp AlreadyTracing: restore the outer attempt.
+        driver.restore_parked_outer();
         return None;
     }
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
     let meta = driver.meta_interp_mut();
     // `JitDriver::force_start_tracing` opens the frontend envelope that
     // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
@@ -10126,8 +10128,6 @@ fn tuple_hash_function_entry_jit(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            // The door already applied `JC_TRACING` to the matched cell.
-            // A miss must not look `hash` up as a cell key.
             drive_tuple_hash_trace(cell_key, matched_cell, w_type, w_tuple, len, acc, i)
         }
         FunctionEntryStep::NotHot => None,
@@ -10141,8 +10141,8 @@ fn tuple_hash_function_entry_jit(
 /// `jit_merge_point` runs the xxHash loop; a `Finish` is the accumulator.
 ///
 /// `hash_driver` has a back edge. `CloseLoop` compiles that loop.
-/// `RunCompiled` enters the assembler here (`execute_assembler`);
-/// `StartedTracing` returns the value the walk already produced, if any.
+/// The door's `RunCompiled` arm enters the assembler before this function;
+/// `StartedTracing` walks here and returns the value the walk already produced.
 fn drive_tuple_hash_trace(
     green_key: u64,
     matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
@@ -10185,7 +10185,7 @@ fn drive_tuple_hash_trace(
     let jd_no = jitcode
         .jitdriver_sd()
         .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
-    if matched_cell.is_some_and(|cell| cell.is_tracing()) {
+    if matched_cell.as_ref().is_some_and(|cell| cell.is_tracing()) {
         return None;
     }
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
@@ -10228,20 +10228,18 @@ fn drive_tuple_hash_trace(
         let live_values = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
             len as i64, acc as i64, i as i64, w_tuple,
         );
-        meta.force_start_tracing(
+        meta.force_start_tracing_cell(
             green_key,
             pin.save(),
             0,
             Some((&gk.values, &gk.types)),
             Some(std::sync::Arc::new(descriptor)),
             &live_values,
+            matched_cell,
         )
     };
     let w_type = roots.get(base);
     let w_tuple = roots.get(base + 1);
-    let live_values = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
-        len as i64, acc as i64, i as i64, w_tuple,
-    );
     if majit_metainterp::majit_log_enabled() {
         let name = match action {
             BackEdgeAction::Interpret => "Interpret",
@@ -10251,28 +10249,13 @@ fn drive_tuple_hash_trace(
         };
         eprintln!("[tuple.hash] force_start_tracing -> {name}");
     }
-    if matches!(action, BackEdgeAction::StartedTracing) {
-        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
-        driver.arm_close_on_drop(starting_tracing_key);
-    } else {
-        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
-        // nested MetaInterp. Restore now so the compiled enter below sees
-        // the outer attempt. `compile_and_run_once` returns here and Drop
-        // restores; jd3 still has that arm in this function.
-        driver.restore_parked_outer();
-    }
-    // `maybe_compile_and_run` raises `EnterJitAssembler` once the cell
-    // has a real procedure token. Run that loop and resume its guards
-    // before the portal body.
-    if matches!(action, BackEdgeAction::RunCompiled) {
-        // NestedTraceGuard still holds the driver; drop it before the
-        // compiled runner re-acquires `driver_pair()`.
-        drop(driver);
-        return run_compiled_tuple_hash(green_key, &live_values);
-    }
     if !matches!(action, BackEdgeAction::StartedTracing) {
+        // Nested MetaInterp AlreadyTracing: restore the outer attempt.
+        driver.restore_parked_outer();
         return None;
     }
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
     let meta = driver.meta_interp_mut();
     // `JitDriver::force_start_tracing` opens the frontend envelope that
     // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
@@ -10932,6 +10915,147 @@ fn drain_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError
     (!stop).then_some(err)
 }
 
+/// `warmstate.py maybe_compile_and_run` EnterJitAssembler arm for jd1.
+fn run_compiled_unpack_iterable(
+    green_key: u64,
+    live_values: &[Value],
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+    dbg: bool,
+) {
+    let (driver, _) = driver_pair();
+    let meta = driver.meta_interp_mut();
+    // Root the shared reds across the compiled run (it may collect). The
+    // scope guard truncates both entries on the way out; `pin_root` without
+    // one grows `ln`'s shadow stack by two per jd1 crossing.
+    let _enter_roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_iterator, items]);
+    let items = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let before = unsafe { pyre_object::listobject::w_list_len(items) };
+    // A drain-time error that is not the loop-exit StopIteration has to
+    // travel out of the unpack; `ln` cannot re-derive it, because calling
+    // `next()` a second time re-enters an iterator that has already raised
+    // (a generator is closed by then, and a plain `__next__` need not be
+    // exhaustion-stable — both report StopIteration and the real error is
+    // lost). Parked here and re-raised by the `drain_jit_pending_exception`
+    // at `ln`'s very next call dispatch, before `__next__` re-runs.
+    // `warmspot.py` propagates the same `ExitFrameWithExceptionRef`
+    // by re-raising out of `ll_portal_runner`; jd1 is entered from a
+    // merge-point hook with no return value, so the slot carries it.
+    let mut pending_err: Option<pyre_interpreter::error::PyError> = None;
+    loop {
+        // Extract owned copies so the `&mut meta` borrow held by the
+        // `CompileResult` is released before the blackhole resume (which
+        // re-acquires `driver_pair()`).
+        let Some((is_finish, is_exception_exit, has_storage, mut values, descr_arc, guard_exc)) =
+            meta.run_compiled_detailed_with_values_on_driver(1, green_key, live_values, 0)
+                .map(|r| {
+                    (
+                        r.is_finish,
+                        // Off the result: a finish exit carries no guard descr,
+                        // and the flag is this word.
+                        r.is_exit_frame_with_exception,
+                        r.descr_arc
+                            .as_ref()
+                            .and_then(majit_metainterp::resume::get_resumestorage)
+                            .is_some(),
+                        majit_metainterp::raw_exit_values(&r.typed_values),
+                        r.descr_arc.clone(),
+                        r.exception.exc_value,
+                    )
+                })
+        else {
+            // No compiled loop / backend refused — leave the rest to `ln`.
+            break;
+        };
+        if is_finish {
+            // A finish exit can be the compiled drain's own
+            // `exit_frame_with_exception` (`finish_and_compile` publishes an
+            // `ExitFrameWithExceptionRef` trace as the loop for this green
+            // key, so the next crossing lands here). `compile.py`
+            // takes the value from result slot 0, not from `jf_guard_exc`.
+            if is_exception_exit {
+                pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
+            }
+            break;
+        }
+        // A guard exit that carries no resume storage cannot be
+        // blackhole-resumed; hand the rest to `ln` rather than panic in
+        // the resume decoder.
+        if !has_storage {
+            break;
+        }
+        // A guard exit already carrying a non-StopIteration exception is
+        // the drain's `return Err(e)` arm. Resuming it would only walk the
+        // drain's re-raise tail to re-derive the same error, so take it
+        // here; the iteration is over either way.
+        if let Some(err) = drain_error_from_exc_ref(guard_exc) {
+            pending_err = Some(err);
+            break;
+        }
+        // compile.py:710-716 resume_in_blackhole: complete the in-flight
+        // `next()`/`append` and run forward to the next merge point.
+        let bh = resume_in_blackhole(
+            &mut values,
+            descr_arc
+                .as_ref()
+                .expect("a guard exit carrying resume storage carries its descr"),
+            guard_exc,
+            // jd1 is novable: it has no virtualizable to force.
+            true,
+            None,
+        );
+        match bh {
+            // Merge point reached: re-enter the compiled drain.
+            crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => continue,
+            crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
+                // StopIteration = drain complete; `ln` re-derives its own
+                // loop-exit StopIteration on its next `next()`.
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if !stop {
+                    pending_err = Some(err);
+                }
+                break;
+            }
+            crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
+            // Clean bail: the frame already carries the stamped resume pc.
+            crate::call_jit::BlackholeResult::BailToInterpreter => break,
+        }
+    }
+    if dbg {
+        let after = unsafe { pyre_object::listobject::w_list_len(items) };
+        eprintln!(
+            "[jd1] enter: drained {} items ({}→{})",
+            after - before,
+            before,
+            after
+        );
+    }
+    // Clear the compiled-side slots so `ln` re-derives its own loop-exit
+    // StopIteration rather than seeing the drain's. A real error already
+    // parked by `park_jit_pending_error` is promoted instead of discarded;
+    // an exit that already picked one keeps it, since that one is the
+    // earlier failure. The prologue stack check does not write this slot.
+    if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        let (stop, err) = err.matches_stop_iteration_keep();
+        if !stop {
+            pending_err.get_or_insert(err);
+        }
+    }
+    // The backend `_store_exception` cells are a compiled-side slot too:
+    // a guard exit that carried the drain's exception leaves them set even
+    // after the two clears above. See the walk's finish arm for what a
+    // survivor does to the next compiled trace.
+    crate::call_jit::drain_backend_jit_exc();
+    // Parked last, so the clears above cannot swallow it.
+    if let Some(err) = pending_err {
+        pyre_interpreter::stack_check::park_jit_pending_error(err);
+    }
+}
+
 /// Drive one jd1 trace of `unpackiterable_portal`. The tracer executes
 /// each residual (`self.next`, `items.append`) concretely on the shared reds,
 /// so this advances the live iterator and grows the live list in place; the
@@ -10945,6 +11069,8 @@ fn drive_unpack_iterable_trace(
     greenkey_raw: pyre_object::PyObjectRef,
     w_iterator: pyre_object::PyObjectRef,
     items: pyre_object::PyObjectRef,
+    matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
+    tracing: bool,
 ) {
     use majit_metainterp::BackEdgeAction;
 
@@ -11026,6 +11152,16 @@ fn drive_unpack_iterable_trace(
         .unwrap_or(pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX);
     // `unpack_merge_point_jit` already ran `maybe_compile_and_run` on the
     // matched cell (`AlreadyTracing` never reaches this door).
+    // `RunCompiled` is EnterJitAssembler: no NestedTraceGuard / bound_reached.
+    if !tracing {
+        if jd1_enter_enabled() {
+            let w_iterator = roots.get(base + 1);
+            let items = roots.get(base + 2);
+            let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
+            run_compiled_unpack_iterable(green_key, &live_values, w_iterator, items, dbg);
+        }
+        return;
+    }
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
     // NestedTraceGuard::enter.
     let greenkey = [roots.get(base) as i64];
@@ -11042,8 +11178,6 @@ fn drive_unpack_iterable_trace(
     // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
     let greenkey_raw = roots.get(base);
-    let w_iterator = roots.get(base + 1);
-    let items = roots.get(base + 2);
 
     // Extracted merge-point reds: save_point, root_base, items_slot.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
@@ -11067,13 +11201,15 @@ fn drive_unpack_iterable_trace(
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
-    let action = driver.meta_interp_mut().force_start_tracing(
+    let greenkey = [pin.get() as i64];
+    let action = driver.meta_interp_mut().force_start_tracing_cell(
         green_key,
         pin.save(),
         0,
-        None,
+        Some((greenkey.as_slice(), green_types.as_slice())),
         Some(std::sync::Arc::new(descriptor)),
         &live_values,
+        matched_cell,
     );
     if dbg {
         let name = match action {
@@ -11084,164 +11220,14 @@ fn drive_unpack_iterable_trace(
         };
         eprintln!("[jd1] force_start_tracing -> {name}");
     }
-    if matches!(action, BackEdgeAction::StartedTracing) {
-        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
-        driver.arm_close_on_drop(starting_tracing_key);
-    } else {
-        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
-        // nested MetaInterp. Restore now so the compiled enter below sees
-        // the outer attempt. `compile_and_run_once` returns here and Drop
-        // restores; jd1 still has that arm in this function.
-        driver.restore_parked_outer();
-    }
-    let meta = driver.meta_interp_mut();
-    // Live-path enter (on by default; see `jd1_enter_enabled`): on RunCompiled,
-    // run the compiled drain loop with the shared `(w_iterator, items)` reds so
-    // it drains `items` in compiled code (residual `next`/`append` executed on
-    // the live path). `items` is a shared heap list, so the drain lands in
-    // place. A guard failure is resumed in the blackhole interpreter
-    // (compile.py:710-716) so the in-flight iteration completes instead of being
-    // dropped; `ContinueRunningNormally` re-enters the compiled loop, and the
-    // drain ends at the StopIteration guard exit. The interp `ln` loop then
-    // exits on its own next `next()` (StopIteration). Uses the values-based
-    // runner + the frameless `resume_in_blackhole` because jd1
-    // is novable with raw `(w_iterator, items)` reds, not a PyFrame the
-    // frame-projecting `execute_assembler`/`handle_fail` path expects.
-    if matches!(action, BackEdgeAction::RunCompiled) && jd1_enter_enabled() {
-        // Root the shared reds across the compiled run (it may collect). The
-        // scope guard truncates both entries on the way out; `pin_root` without
-        // one grows `ln`'s shadow stack by two per jd1 crossing.
-        let _enter_roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[w_iterator, items]);
-        let items = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        let before = unsafe { pyre_object::listobject::w_list_len(items) };
-        // A drain-time error that is not the loop-exit StopIteration has to
-        // travel out of the unpack; `ln` cannot re-derive it, because calling
-        // `next()` a second time re-enters an iterator that has already raised
-        // (a generator is closed by then, and a plain `__next__` need not be
-        // exhaustion-stable — both report StopIteration and the real error is
-        // lost). Parked here and re-raised by the `drain_jit_pending_exception`
-        // at `ln`'s very next call dispatch, before `__next__` re-runs.
-        // `warmspot.py` propagates the same `ExitFrameWithExceptionRef`
-        // by re-raising out of `ll_portal_runner`; jd1 is entered from a
-        // merge-point hook with no return value, so the slot carries it.
-        let mut pending_err: Option<pyre_interpreter::error::PyError> = None;
-        loop {
-            // Extract owned copies so the `&mut meta` borrow held by the
-            // `CompileResult` is released before the blackhole resume (which
-            // re-acquires `driver_pair()`).
-            let Some((is_finish, is_exception_exit, has_storage, mut values, descr_arc, guard_exc)) =
-                meta.run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
-                    .map(|r| {
-                        (
-                            r.is_finish,
-                            // Off the result: a finish exit carries no guard descr,
-                            // and the flag is this word.
-                            r.is_exit_frame_with_exception,
-                            r.descr_arc
-                                .as_ref()
-                                .and_then(majit_metainterp::resume::get_resumestorage)
-                                .is_some(),
-                            majit_metainterp::raw_exit_values(&r.typed_values),
-                            r.descr_arc.clone(),
-                            r.exception.exc_value,
-                        )
-                    })
-            else {
-                // No compiled loop / backend refused — leave the rest to `ln`.
-                break;
-            };
-            if is_finish {
-                // A finish exit can be the compiled drain's own
-                // `exit_frame_with_exception` (`finish_and_compile` publishes an
-                // `ExitFrameWithExceptionRef` trace as the loop for this green
-                // key, so the next crossing lands here). `compile.py`
-                // takes the value from result slot 0, not from `jf_guard_exc`.
-                if is_exception_exit {
-                    pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
-                }
-                break;
-            }
-            // A guard exit that carries no resume storage cannot be
-            // blackhole-resumed; hand the rest to `ln` rather than panic in
-            // the resume decoder.
-            if !has_storage {
-                break;
-            }
-            // A guard exit already carrying a non-StopIteration exception is
-            // the drain's `return Err(e)` arm. Resuming it would only walk the
-            // drain's re-raise tail to re-derive the same error, so take it
-            // here; the iteration is over either way.
-            if let Some(err) = drain_error_from_exc_ref(guard_exc) {
-                pending_err = Some(err);
-                break;
-            }
-            // compile.py:710-716 resume_in_blackhole: complete the in-flight
-            // `next()`/`append` and run forward to the next merge point.
-            let bh = resume_in_blackhole(
-                &mut values,
-                descr_arc
-                    .as_ref()
-                    .expect("a guard exit carrying resume storage carries its descr"),
-                guard_exc,
-                // jd1 is novable: it has no virtualizable to force.
-                true,
-                None,
-            );
-            match bh {
-                // Merge point reached: re-enter the compiled drain.
-                crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => continue,
-                crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
-                    // StopIteration = drain complete; `ln` re-derives its own
-                    // loop-exit StopIteration on its next `next()`.
-                    let (stop, err) = err.matches_stop_iteration_keep();
-                    if !stop {
-                        pending_err = Some(err);
-                    }
-                    break;
-                }
-                crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
-                | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
-                | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
-                | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
-                // Clean bail: the frame already carries the stamped resume pc.
-                crate::call_jit::BlackholeResult::BailToInterpreter => break,
-            }
-        }
-        if dbg {
-            let after = unsafe { pyre_object::listobject::w_list_len(items) };
-            eprintln!(
-                "[jd1] enter: drained {} items ({}→{})",
-                after - before,
-                before,
-                after
-            );
-        }
-        // Clear the compiled-side slots so `ln` re-derives its own loop-exit
-        // StopIteration rather than seeing the drain's. A real error already
-        // parked by `park_jit_pending_error` is promoted instead of discarded;
-        // an exit that already picked one keeps it, since that one is the
-        // earlier failure. The prologue stack check does not write this slot.
-        if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-            let (stop, err) = err.matches_stop_iteration_keep();
-            if !stop {
-                pending_err.get_or_insert(err);
-            }
-        }
-        // The backend `_store_exception` cells are a compiled-side slot too:
-        // a guard exit that carried the drain's exception leaves them set even
-        // after the two clears above. See the walk's finish arm for what a
-        // survivor does to the next compiled trace.
-        crate::call_jit::drain_backend_jit_exc();
-        // Parked last, so the clears above cannot swallow it.
-        if let Some(err) = pending_err {
-            pyre_interpreter::stack_check::park_jit_pending_error(err);
-        }
-        return;
-    }
     if !matches!(action, BackEdgeAction::StartedTracing) {
+        // Nested MetaInterp AlreadyTracing: restore the outer attempt.
+        driver.restore_parked_outer();
         return;
     }
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
+    let meta = driver.meta_interp_mut();
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
     // the type object; reds are save_point, root_base, items_slot.
@@ -14236,6 +14222,7 @@ fn maybe_compile_and_run(
     // another key or driver must not suppress enter or the counter tick.
     // `JC_TEMPORARY` ticks toward compiling the real loop. The enter
     // predicate is this cell's `get_procedure_token()`.
+    let matched = resolved.cell.clone();
     let green_key = resolved.cell_key().unwrap_or(resolved.hash);
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
@@ -14269,12 +14256,8 @@ fn maybe_compile_and_run(
     }
     // The decision alone, without the `cell.flags |= JC_TRACING` that
     // warmstate.py makes with it: upstream marks the cell in the same
-    // `bound_reached` that runs the trace, and pyre marks it there too —
-    // `MetaInterp::bound_reached` reaches the cell through
-    // `force_start_tracing_for_key`. Marking it here as well makes that call
-    // read this door's own mark and decline with `AlreadyTracing`, so the
-    // trace this door just decided on never starts and the counter it reset
-    // never re-arms the location.
+    // `bound_reached` that runs the trace, and pyre marks that same cell
+    // in `start_tracing_cell`.
     // `warmstate.py maybe_compile_and_run` looks up the cell and ticks.
     // The frame-shape walk and `liveness_for` are not on that path: they
     // run only once the counter has reached `bound_reached`, or when a
@@ -14299,6 +14282,7 @@ fn maybe_compile_and_run(
                 info,
                 env,
                 pycode_root,
+                matched,
             )
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
@@ -15369,6 +15353,7 @@ fn compile_and_run_once(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
     pycode_root: &PortalPycodeRoot,
+    matched: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
 ) -> Option<LoopResult> {
     // The caller's hashed slot stays live across NestedTraceGuard /
     // descr-pool install (`gctransform/shadowstack.py`). Re-pushing a
@@ -15457,22 +15442,24 @@ fn compile_and_run_once(
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     match start {
         CompileOnceStart::BackEdge => {
-            driver.bound_reached(
+            driver.bound_reached_with_cell(
                 green_key,
                 pycode_root.save(),
                 target_pc,
                 &mut jit_state,
                 env,
+                matched,
             );
         }
         CompileOnceStart::FunctionEntry => {
-            driver.force_start_tracing(
+            driver.force_start_tracing_with_cell(
                 green_key,
                 None,
                 pycode_root.save(),
                 target_pc,
                 &mut jit_state,
                 env,
+                matched,
             );
         }
     }
@@ -15777,6 +15764,7 @@ fn bound_reached(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
     pycode_root: &PortalPycodeRoot,
+    matched: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
 ) -> Option<LoopResult> {
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame).len().min(5))
@@ -15829,6 +15817,7 @@ fn bound_reached(
         info,
         env,
         pycode_root,
+        matched,
     )
 }
 
@@ -15982,6 +15971,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
+    let matched = resolved.cell.clone();
     let green_key = resolved.cell_key().unwrap_or(green_key_hash);
 
     // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
@@ -16235,6 +16225,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         info,
         &env,
         &pycode_root,
+        matched,
     ) {
         Some(LoopResult::Done(result)) => Some(result),
         // warmspot.py:998-1005: a walk that ended in an uncaught raise, or a
