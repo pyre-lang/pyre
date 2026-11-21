@@ -4660,6 +4660,20 @@ fn note_body_crate_root_into(
     fields.note_foreign_body_callable(root, &stripped);
 }
 
+/// A callee reached through its real Rust ABI: `dont_look_inside`, or
+/// no loaded crate extracted its body (`extfunc.py`). The one predicate
+/// for every site that picks between the word and the address of a
+/// borrowed scalar (`call.py` `guess_call_kind` follows the target graph).
+fn fun_decl_is_residual_callee(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    dont_look_inside: &std::collections::HashSet<String>,
+    fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> bool {
+    fun_decl_is_dont_look_inside(llbc, fd, dont_look_inside)
+        || !fun_decl_has_body_in_loaded_crate(fd, fields, llbc)
+}
+
 /// True when this FunDecl has an Unstructured body here, or another
 /// loaded crate recorded one on [`StructFieldRegistry::foreign_callables`].
 /// An Opaque FunDecl of another local crate is an import of a graph
@@ -10812,8 +10826,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             keep_zst_self,
             program_oopspec,
             value_type_by_id,
+            Some(struct_fields),
         )?;
-        lo.struct_fields = Some(struct_fields);
         lo.struct_layouts = struct_layouts.clone();
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
         if builder_mode {
@@ -10880,8 +10894,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         keep_zst_self,
         program_oopspec,
         value_type_by_id,
+        Some(struct_fields),
     )?;
-    lo.struct_fields = Some(struct_fields);
     lo.struct_layouts = struct_layouts.clone();
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
     if builder_mode {
@@ -10934,8 +10948,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 keep_zst_self,
                 program_oopspec,
                 value_type_by_id,
+                Some(struct_fields),
             )?;
-            lo.struct_fields = Some(struct_fields);
             lo.struct_layouts = struct_layouts.clone();
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
             if builder_mode {

@@ -1591,6 +1591,7 @@ impl<'a> Lowering<'a> {
             keep_zst_self,
             empty_program_oopspec(),
             None,
+            None,
         )
     }
 
@@ -1612,6 +1613,7 @@ impl<'a> Lowering<'a> {
         keep_zst_self: bool,
         program_oopspec: &'a std::collections::HashSet<String>,
         value_type_by_id: Option<&'a std::cell::RefCell<Vec<Option<ValueType>>>>,
+        struct_fields: Option<&'a crate::front::semantic::StructFieldRegistry>,
     ) -> Result<Self, LowerError> {
         let gc_mut_ref_params = gc_mut_ref_param_locals(
             &body.locals,
@@ -1970,6 +1972,7 @@ impl<'a> Lowering<'a> {
             &forward_reached,
             dont_look_inside,
             &oopspec_fns,
+            struct_fields,
         );
         let function_scope_plan = collect_function_scope_spill_cells(
             llbc,
@@ -1979,6 +1982,7 @@ impl<'a> Lowering<'a> {
             &forward_reached,
             dont_look_inside,
             &oopspec_fns,
+            struct_fields,
             &cell_plan.locals,
         );
         let function_scope_start = n_slots;
@@ -2280,7 +2284,7 @@ impl<'a> Lowering<'a> {
         Ok(Self {
             graph,
             llbc,
-            struct_fields: None,
+            struct_fields,
             struct_layouts: Default::default(),
             raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
             dont_look_inside,
