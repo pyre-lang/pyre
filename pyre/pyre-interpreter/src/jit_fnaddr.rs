@@ -142,6 +142,93 @@ extern "C" fn shadow_stack_slot_word() -> i64 {
     shadow_stack_slot_as_raw(majit_gc::shadow_stack::shadow_stack_slot())
 }
 
+/// One-word C-ABI entry for `warn::warn_deprecation`.
+///
+/// `space_index` records `inline_call_r_v` of that graph. The source is
+/// `fn(&str) -> Result<(), PyError>`: `&str` is one rstr Ref word
+/// (`is_shared_rstr_ref` / `rstr_payload`) and `Result` is void plus
+/// `last_exc`. `get_jitcode` / `patch_constants_i_fnaddrs` store this
+/// address on `JitCode.fnaddr` so `bhimpl_inline_call_r_v` can
+/// `cpu.bh_call_v` it (`getfunctionptr(graph)`).
+extern "C" fn warn_deprecation_jit_abi(msg: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::warn_deprecation_jit_abi");
+    let payload = unsafe { majit_ir::helper_fnaddr::rstr_payload(msg) };
+    let s = unsafe { core::str::from_utf8_unchecked(payload) };
+    match crate::warn::warn_deprecation(s) {
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
+    }
+}
+
+/// Residual ABI for the `__majit_stringbuilder_build` marker when rtyper did
+/// not lower it to `ll_build`. One receiver: the builder word `ll_new` returned.
+extern "C" fn majit_stringbuilder_build_jit_abi(builder: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::majit_stringbuilder_build_jit_abi");
+    pyre_object::rbuilder::rbuilder_runtime::ll_build(
+        builder,
+        pyre_object::rbuilder::rbuilder_runtime::STR_ITEM_SIZE,
+    )
+}
+
+/// Residual ABI for the `__majit_stringbuilder_append` marker when rtyper did
+/// not lower it to `getattr` + `append`. Receiver and piece are builder/str
+/// words (`flowspace_adapter` `__majit_stringbuilder_append`).
+extern "C" fn majit_stringbuilder_append_jit_abi(builder: i64, ll_str: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::majit_stringbuilder_append_jit_abi");
+    pyre_object::rbuilder::rbuilder_runtime::ll_append(builder, ll_str);
+}
+
+/// Residual ABI for `gc_alloc_young_storage_box<T>`.
+///
+/// HELPER_FNADDRS skips Generic; `specialize:argtype(0)` names each
+/// payload shape `leaf__inst_<T>` (`residual_inst_suffix`). The by-value
+/// `T` is one residual Ref word (pointer to the constructed payload) plus
+/// the `tid` integer.
+extern "C" fn gc_alloc_young_storage_box_jit_abi<T: 'static>(value: i64, tid: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::gc_alloc_young_storage_box_jit_abi");
+    // SAFETY: residual_call_ir_r passes a live `T` as one Ref word.
+    let value = unsafe { std::ptr::read(value as *const T) };
+    pyre_object::gc_storage::gc_alloc_young_storage_box(value, tid as u32) as usize as i64
+}
+
+/// Residual ABI for `rordereddict::replace_value`. Generic DLI free
+/// function; residual path is `replace_value__inst_<V>`. `V` is one
+/// residual word (`PyObjectRef`).
+extern "C" fn replace_value_word_jit_abi<V: Copy>(slot: i64, value: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::replace_value_word_jit_abi");
+    debug_assert!(std::mem::size_of::<V>() <= std::mem::size_of::<i64>());
+    let slot = unsafe { &mut *(slot as *mut V) };
+    let value: V = unsafe { std::ptr::read(&value as *const i64 as *const V) };
+    let old = std::mem::replace(slot, value);
+    let mut out = 0i64;
+    unsafe {
+        std::ptr::write(&mut out as *mut i64 as *mut V, old);
+    }
+    out
+}
+
+/// Residual ABI for `core::ptr::write_bytes`. HELPER_FNADDRS skips the
+/// generic item; residual CALL is three words (dest, fill, count).
+extern "C" fn write_bytes_word_jit_abi(ptr: i64, val: i64, n: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::write_bytes_word_jit_abi");
+    unsafe {
+        std::ptr::write_bytes(ptr as *mut u8, val as u8, n as usize);
+    }
+}
+
+/// Residual ABI for `alloc::alloc::handle_alloc_error`. After the Layout
+/// ctor rewrite the argument is a pointer to `{size, align}` words.
+extern "C" fn handle_alloc_error_word_jit_abi(layout: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::handle_alloc_error_word_jit_abi");
+    let size = unsafe { *(layout as *const usize) };
+    let align = unsafe { *((layout as *const usize).add(1)) };
+    let layout = std::alloc::Layout::from_size_align(size, align)
+        .unwrap_or_else(|_| std::alloc::Layout::from_size_align(1, 1).expect("1-byte layout"));
+    std::alloc::handle_alloc_error(layout);
+}
+
 /// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
 /// interpreter's traced frame-enter paths call it beside the write barrier.
 extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
@@ -488,15 +575,12 @@ pub(crate) extern "C" fn module_dict_getdictvalue_no_unwrapping_pure_word(
     .unwrap_or(pyre_object::PY_NULL) as usize as i64
 }
 
-/// Word-ABI residual for `hash_str_hooked_bytes`. Rebuilds the `&[u8]`
-/// window `rstr.py LLHelpers._ll_strhash` already passes as pointer and
-/// length words, then calls the slice entry.
-#[inline(never)]
-pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
-    majit_ir::icf_identity!("jit_fnaddr::hash_str_hooked_bytes_word");
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
-    pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
-}
+/// Word-ABI residual for `hash_str_hooked_bytes`.
+///
+/// `dont_look_inside` emits the pair-slice descr-word adapter
+/// (`ptr`, `len`) → `i64`; `merge_macro_helper_fnaddrs` publishes that
+/// adapter into the occupied slot (`getfunctionptr`).
+pub(crate) use pyre_object::dict_eq_hook::__majit_call_target_hash_str_hooked_bytes as hash_str_hooked_bytes_word;
 
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
@@ -1695,6 +1779,16 @@ macro_rules! p5_inst {
         p5!($e, interned_residual_inst_path($template, $types), $f);
     };
 }
+macro_rules! cpa2_inst {
+    ($e:expr, $template:expr, $alias:expr, $f:path, $types:expr $(,)?) => {
+        cpa2!(
+            $e,
+            interned_residual_inst_path($template, $types),
+            interned_residual_inst_path($alias, $types),
+            $f,
+        );
+    };
+}
 
 /// Publish an address whose signature the residual-call ABI **cannot**
 /// express.
@@ -2681,6 +2775,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
     );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::delitem_slot",
+        crate::opcode_ops::jit_baseobjspace_delitem_slot,
+    );
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filterfalse_next_w",
+        crate::opcode_ops::jit_baseobjspace_filterfalse_next_w,
+    );
     cp1!(
         &mut entries,
         "pyre_interpreter::opcode_ops::newlist_from_iter_hint",
@@ -2725,6 +2829,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value",
         pyframe_load_name_value_word,
+    );
+    // `space_index`'s void `inline_call_r_v` of `warn_deprecation`. The
+    // graph is `&str -> Result<(), PyError>`; this bridge is the one-word
+    // rstr / void / last_exc address blackhole calls.
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::warn::warn_deprecation",
+        warn_deprecation_jit_abi,
     );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
@@ -3672,6 +3784,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::is_true_lookup",
         "pyre_interpreter::is_true_lookup",
         crate::baseobjspace::is_true_lookup_jit_abi,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::dict_missing_or_key_error",
+        "pyre_interpreter::dict_missing_or_key_error",
+        crate::baseobjspace::dict_missing_or_key_error_jit_abi,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -5272,6 +5390,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_rlib::ll_raw_free",
         majit_rlib::rffi::ll_raw_free,
     );
+    // `alloc_entries` GC success path residualizes `core::ptr::write_bytes`
+    // (generic; HELPER_FNADDRS skips it). Word ABI matches residual_call.
+    cpa3!(
+        &mut entries,
+        "core::ptr::write_bytes",
+        "ptr::write_bytes",
+        write_bytes_word_jit_abi,
+    );
+    // Fallback `alloc_zeroed` OOM path. After the Layout ctor rewrite the
+    // argument is a pointer to `{size, align}` words.
+    cpa1!(
+        &mut entries,
+        "alloc::alloc::handle_alloc_error",
+        "handle_alloc_error",
+        handle_alloc_error_word_jit_abi,
+    );
 
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         (hooks.publish_fnaddrs)(&mut entries);
@@ -5288,6 +5422,19 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::rbuilder::ll_append_res0",
         "pyre_object::ll_append_res0",
         pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res0,
+    );
+    // Front markers the rtyper lowers to `newstringbuilder` / `ll_new` /
+    // `ll_append` / `ll_build`. A residual that still names a marker needs
+    // this address.
+    cp2!(
+        &mut entries,
+        "__majit_stringbuilder_append",
+        majit_stringbuilder_append_jit_abi,
+    );
+    cp1!(
+        &mut entries,
+        "__majit_stringbuilder_build",
+        majit_stringbuilder_build_jit_abi,
     );
     cpa4!(
         &mut entries,
@@ -5421,6 +5568,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `hash_str_hooked_bytes` is a slice entry; residual calls pass the
     // pointer/length words `rstr.py LLHelpers._ll_strhash` already has.
+    // Bind the pair-slice descr-word adapter (`getfunctionptr`).
     cpa2!(
         &mut entries,
         "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
@@ -6499,6 +6647,49 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         (),
         std::collections::hash_map::RandomState,
     >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::identitydict::IdentityKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
+    // `gc_alloc_young_storage_box` is the same Generic+DLI residual
+    // (`specialize:argtype(0)`), but the inst suffix is the payload `T`
+    // rather than `K,V,S`. Bind each storage shape the dict strategies
+    // construct; the word trampoline is the by-value `T` as one Ref.
+    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::IntDictStorage>(
+        &mut entries,
+    );
+    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::ObjectDictStorage>(
+        &mut entries,
+    );
+    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::BytesDictStorage>(
+        &mut entries,
+    );
+    register_gc_alloc_young_storage_box_inst::<pyre_object::identitydict::IdentityDictStorage>(
+        &mut entries,
+    );
+    register_gc_alloc_young_storage_box_inst::<pyre_object::kwargsdict::KwargsDictStorage>(
+        &mut entries,
+    );
+    register_gc_alloc_young_storage_box_inst::<pyre_object::celldict::ModuleDictStorage>(
+        &mut entries,
+    );
+    // Charon `spec_type_name` spells the kwargs payload as two
+    // `alloc::vec::Vec<*mut PyObject, Global>` rather than the
+    // `KwargsDictStorage` alias `type_name`.
+    {
+        let kwargs_charon = [
+            "(alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>, alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>)",
+        ];
+        cpa2_inst!(
+            &mut entries,
+            "pyre_object::gc_storage::gc_alloc_young_storage_box",
+            "gc_storage::gc_alloc_young_storage_box",
+            gc_alloc_young_storage_box_jit_abi::<pyre_object::kwargsdict::KwargsDictStorage>,
+            &kwargs_charon,
+        );
+    }
+    register_replace_value_inst(&mut entries);
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
@@ -6540,6 +6731,28 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     merge_macro_helper_fnaddrs(&mut entries, &abi_unsound_arguments);
 
     (entries, abi_unsound_arguments)
+}
+
+fn register_gc_alloc_young_storage_box_inst<T: 'static>(entries: &mut Vec<(&'static str, i64)>) {
+    let types = [std::any::type_name::<T>()];
+    cpa2_inst!(
+        entries,
+        "pyre_object::gc_storage::gc_alloc_young_storage_box",
+        "gc_storage::gc_alloc_young_storage_box",
+        gc_alloc_young_storage_box_jit_abi::<T>,
+        &types,
+    );
+}
+
+fn register_replace_value_inst(entries: &mut Vec<(&'static str, i64)>) {
+    let types = [std::any::type_name::<pyre_object::PyObjectRef>()];
+    cpa2_inst!(
+        entries,
+        "pyre_object::rordereddict::replace_value",
+        "rordereddict::replace_value",
+        replace_value_word_jit_abi::<pyre_object::PyObjectRef>,
+        &types,
+    );
 }
 
 fn register_rdict_dont_look_inside_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
@@ -6712,6 +6925,26 @@ fn merge_macro_helper_fnaddrs(
         .map(|(alias, _)| alias)
         .collect();
 
+    let mut remainder_owners: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (path, _, _) in &rows {
+        if let Some((_, rest)) = path.split_once("::") {
+            let leaf = rest.rsplit("::").next().unwrap_or(rest);
+            if rest != leaf {
+                remainder_owners.entry(rest).or_default().insert(*path);
+            }
+        }
+    }
+    let unique_remainders: HashSet<&str> = remainder_owners
+        .into_iter()
+        .filter(|(_, owners)| owners.len() == 1)
+        .map(|(rest, _)| rest)
+        .collect();
+
+    let mut addr_row_counts: HashMap<i64, usize> = HashMap::new();
+    for (_, addr, _) in &rows {
+        *addr_row_counts.entry(*addr).or_insert(0) += 1;
+    }
+
     for (full_path, addr, arity) in rows {
         let mut paths: Vec<&str> = vec![full_path];
         if let Some((crate_seg, rest)) = full_path.split_once("::") {
@@ -6720,6 +6953,9 @@ fn merge_macro_helper_fnaddrs(
                 let short = format!("{crate_seg}::{leaf}");
                 if unique_short_aliases.contains(&short) {
                     paths.push(intern_fnaddr_path(short));
+                } else if unique_remainders.contains(rest) && addr_row_counts.get(&addr) == Some(&1)
+                {
+                    paths.push(rest);
                 }
             }
         }
@@ -7774,21 +8010,23 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
-        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
-        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        finditem_str_named_word, gc_alloc_young_storage_box_jit_abi,
+        handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word, interned_residual_inst_path,
+        is_abi_unsound_argument_residual, is_exact_type_word, is_list_write_barrier,
+        is_plain_int1_word, is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
         jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
         ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
-        ll_list_obj_resize_ge_word, module_dict_getdictvalue_no_unwrapping_pure_word,
+        ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
-        pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, shadow_stack_get_word,
-        shadow_stack_push_word, shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, replace_value_word_jit_abi,
+        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
+        switch_to_correct_strategy_word, unicode_dict_getitem_str_hashed_word,
+        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
+        w_list_pop_end_word, w_module_dict_lookup_object_entries_word, write_bytes_word_jit_abi,
     };
     use std::collections::HashMap;
 
@@ -7910,6 +8148,10 @@ mod tests {
             bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
             get_and_call
         );
+        assert_eq!(
+            bindings["pyre_interpreter::get_and_call_function"],
+            get_and_call
+        );
         let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
         assert_ne!(
             get_and_call, raw_get,
@@ -7921,6 +8163,10 @@ mod tests {
         let call_impl = call_impl as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::call_function_impl_result"],
             call_impl
         );
         let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
@@ -8922,6 +9168,21 @@ mod tests {
         Some((crate_seg, name))
     }
 
+    /// rustc `type_name` omits default type arguments; Charon `spec_type_name`
+    /// writes them. After `residual_inst_suffix` those two renderer spellings
+    /// of one type differ by the encoded `,alloc::alloc::Global` of `Vec`'s
+    /// default allocator — the kwargs payload is `KwargsDictStorage` =
+    /// `(Vec<PyObjectRef>, Vec<PyObjectRef>)`. Stripping that default leaves
+    /// one residual-inst leaf, so `extends` accepts the pair as two spellings
+    /// of the same monomorph.
+    fn residual_inst_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+        const GLOBAL: &str = "_Malloc_Calloc_CGlobal";
+        if !path.contains(GLOBAL) {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        std::borrow::Cow::Owned(path.replace(GLOBAL, ""))
+    }
+
     /// `elidable_promote` renames the body to `_orig_<name>_unlikely_name`
     /// and publishes that spelling on the same trampoline as `<name>`
     /// (`rlib/jit.py` `_orig_func_unlikely_name`).
@@ -9005,8 +9266,10 @@ mod tests {
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
-        let a_norm = elidable_body_spelling(a);
-        let b_norm = elidable_body_spelling(b);
+        let a_elidable = elidable_body_spelling(a);
+        let b_elidable = elidable_body_spelling(b);
+        let a_norm = residual_inst_spelling(a_elidable.as_ref());
+        let b_norm = residual_inst_spelling(b_elidable.as_ref());
         let a = a_norm.as_ref();
         let b = b_norm.as_ref();
         if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
@@ -10166,8 +10429,7 @@ mod tests {
     }
 
     /// `space.newbytes(cdata[0])` is the 1-byte `jit_w_bytes_from_u8`
-    /// residual. `&[u8]` is two words, so the slice form declines the
-    /// `_CDataBase` convert descent.
+    /// residual.
     #[test]
     fn jit_trace_fnaddrs_covers_jit_w_bytes_from_u8() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
@@ -10180,6 +10442,128 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_object::jit_w_bytes_from_u8"], expected);
+    }
+
+    /// Residual CALL targets the walker recorded as `symbolic_fnaddr` hashes
+    /// until these word-ABI bridges were published.
+    #[test]
+    fn jit_trace_fnaddrs_covers_residual_call_word_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let filter =
+            crate::opcode_ops::jit_baseobjspace_filterfalse_next_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::filterfalse_next_w"],
+            filter
+        );
+        let delitem_slot =
+            crate::opcode_ops::jit_baseobjspace_delitem_slot as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::delitem_slot"],
+            delitem_slot
+        );
+        let sb_build = majit_stringbuilder_build_jit_abi as *const () as usize as i64;
+        assert_eq!(bindings["__majit_stringbuilder_build"], sb_build);
+        let sb_append = majit_stringbuilder_append_jit_abi as *const () as usize as i64;
+        assert_eq!(bindings["__majit_stringbuilder_append"], sb_append);
+        let call_impl: extern "C" fn(i64, i64) -> i64 =
+            crate::call::__majit_call_target_call_function_impl_result;
+        let call_impl = call_impl as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::call_function_impl_result"],
+            call_impl
+        );
+        let write_bytes = write_bytes_word_jit_abi as *const () as usize as i64;
+        assert_eq!(bindings["core::ptr::write_bytes"], write_bytes);
+        assert_eq!(bindings["ptr::write_bytes"], write_bytes);
+        let handle_alloc = handle_alloc_error_word_jit_abi as *const () as usize as i64;
+        assert_eq!(bindings["alloc::alloc::handle_alloc_error"], handle_alloc);
+        assert_eq!(bindings["handle_alloc_error"], handle_alloc);
+    }
+
+    /// `#[pyre_class]` `allocate` / `allocate_stable` emit a word-ABI
+    /// trampoline into HELPER_FNADDRS. The reloc in `w_range_iter_new` is
+    /// the crate-stripped spelling.
+    #[test]
+    fn jit_trace_fnaddrs_covers_range_iterator_allocate() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let allocate_full = "pyre_object::functional::W_IntRangeIterator::allocate";
+        let allocate_short = "functional::W_IntRangeIterator::allocate";
+        let stable_full = "pyre_object::functional::W_LongRangeIterator::allocate_stable";
+        let stable_short = "functional::W_LongRangeIterator::allocate_stable";
+        for path in [allocate_full, allocate_short, stable_full, stable_short] {
+            let addr = *bindings
+                .get(path)
+                .unwrap_or_else(|| panic!("missing {path}"));
+            assert_ne!(addr, 0, "{path} must be a real fnaddr");
+        }
+        assert_eq!(bindings[allocate_full], bindings[allocate_short]);
+        assert_eq!(bindings[stable_full], bindings[stable_short]);
+        assert_ne!(
+            bindings[allocate_full], bindings[stable_full],
+            "distinct icf_identity strings must keep the two constructors from folding"
+        );
+    }
+
+    /// `gc_alloc_young_storage_box` is Generic+DLI; each payload shape is
+    /// `leaf__inst_<T>`. The IntDict token must match the codewriter suffix.
+    #[test]
+    fn jit_trace_fnaddrs_covers_gc_alloc_young_storage_box_int_dict() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let types = [std::any::type_name::<
+            pyre_object::dictmultiobject::IntDictStorage,
+        >()];
+        let full = interned_residual_inst_path(
+            "pyre_object::gc_storage::gc_alloc_young_storage_box",
+            &types,
+        );
+        let short = interned_residual_inst_path("gc_storage::gc_alloc_young_storage_box", &types);
+        assert!(
+            full.contains("CRDict_Li64"),
+            "IntDictStorage type_name must encode as RDict<i64,...>, got {full}"
+        );
+        let expected = gc_alloc_young_storage_box_jit_abi::<
+            pyre_object::dictmultiobject::IntDictStorage,
+        > as *const () as usize as i64;
+        assert_eq!(bindings[full], expected, "full {full}");
+        assert_eq!(bindings[short], expected, "short {short}");
+    }
+
+    /// Kwargs storage is two `Vec<*mut PyObject, Global>`; Charon's
+    /// `spec_type_name` keeps that spelling, not the `KwargsDictStorage` alias.
+    #[test]
+    fn jit_trace_fnaddrs_covers_gc_alloc_young_storage_box_kwargs_vec_pair() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let types = [
+            "(alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>, alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>)",
+        ];
+        let short = interned_residual_inst_path("gc_storage::gc_alloc_young_storage_box", &types);
+        assert!(
+            short.contains("_Oalloc_Cvec_CVec_L_Pmut_Spyre__object_Cpyobject_CPyObject"),
+            "kwargs Charon token, got {short}"
+        );
+        let expected = gc_alloc_young_storage_box_jit_abi::<
+            pyre_object::kwargsdict::KwargsDictStorage,
+        > as *const () as usize as i64;
+        assert_eq!(bindings[short], expected, "short {short}");
+    }
+
+    /// DLI `replace_value` residualizes at `leaf__inst_<V>`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_replace_value_pyobject() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let types = [std::any::type_name::<pyre_object::PyObjectRef>()];
+        let short = interned_residual_inst_path("rordereddict::replace_value", &types);
+        assert!(
+            short.contains("_Pmut_Spyre__object_Cpyobject_CPyObject"),
+            "PyObjectRef token, got {short}"
+        );
+        let expected =
+            replace_value_word_jit_abi::<pyre_object::PyObjectRef> as *const () as usize as i64;
+        assert_eq!(bindings[short], expected, "short {short}");
     }
 
     /// `rgc.py` keeps `FinalizerQueue.register_finalizer` opaque with

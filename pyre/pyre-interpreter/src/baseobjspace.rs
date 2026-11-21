@@ -2645,6 +2645,21 @@ pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) ->
     ))
 }
 
+/// One-word residual-call ABI for [`dict_missing_or_key_error`].
+///
+/// `PyResult` is sret, so HELPER_FNADDRS skips the raw item (`ResultReturn`)
+/// and a CallMayForceR of the rust function reads one Ref word. The callee
+/// keeps its graph; this is the address `getfunctionptr` would have supplied.
+pub extern "C" fn dict_missing_or_key_error_jit_abi(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+) -> PyObjectRef {
+    match dict_missing_or_key_error(obj, index) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
 /// Get item by index: `obj[index]`.
 ///
 /// Dispatches based on the type of `obj`.
@@ -2895,8 +2910,9 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // acquire/release), so the `gil_ready == 0` arm's look-inside call is
     // what `grab_initial_jitcodes` uses to reach `w_list_getitem_inner`.
     // Publication fails the guard and the retrace takes the locked wrapper.
-    // The BINARY_SUBSCR walker descends that inner body by name
-    // (`list_getitem_jitcode`).
+    // The BINARY_SUBSCR walker descends this `getitem_list` body
+    // (`getitem_list_jitcode`) so a helper-innermost guard still runs
+    // the `match` that maps `None` to IndexError.
     let ready = pyre_object::gil_ready::gil_ready_word();
     let item = if ready != 0 {
         w_list_getitem(obj, idx)

@@ -348,7 +348,8 @@ impl crate::lltype::GcType for W_BytesObjectUser {
 /// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
 ///
 /// `dont_look_inside` (`rlib/jit.py`): the tracer cannot model the box
-/// allocation, so the JIT residualises the call.
+/// allocation, so the JIT residualises the call. The residual trampoline
+/// takes the host `&[u8]` as the `(ptr, len)` pair.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let data = alloc_bytes_block(bytes);
@@ -361,9 +362,7 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 1-byte payload.
 ///
 /// `space.newbytes(cdata[0])` (`ctypeprim.py W_CTypePrimitiveChar.convert_to_object`).
-/// `&[u8]` is two words, so the slice form residualizes as a symbolic hash
-/// on the `_CDataBase` call descent.  One `u8` is one word, the same
-/// seam as [`jit_w_bytes_from_u8x4`].
+/// One `u8` is one word, the same seam as [`jit_w_bytes_from_u8x4`].
 #[majit_macros::dont_look_inside]
 pub fn jit_w_bytes_from_u8(b0: u8) -> PyObjectRef {
     w_bytes_from_bytes(&[b0])
@@ -371,9 +370,7 @@ pub fn jit_w_bytes_from_u8(b0: u8) -> PyObjectRef {
 
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 4-byte payload.
 ///
-/// `&[u8]` is two words, so `ResidualSlot` rejects `w_bytes_from_bytes` and
-/// the walk would abort on a symbolic hash.  Four `u8` arguments are one
-/// word each.
+/// Four `u8` arguments are one word each.
 #[majit_macros::dont_look_inside]
 pub fn jit_w_bytes_from_u8x4(b0: u8, b1: u8, b2: u8, b3: u8) -> PyObjectRef {
     w_bytes_from_bytes(&[b0, b1, b2, b3])

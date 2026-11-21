@@ -87,9 +87,17 @@ impl UnicodeArray {
     }
 
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for ASCII text.
+    ///
+    /// `sizehint == 0` is rlist `ll_newemptylist`: the prebuilt empty
+    /// `GcArray` so `arraylen_gc` / `getfield_gc_r(ascii_items.block)` is
+    /// defined. `empty()` stays a null block for unused typed slots on a
+    /// list that is not in Ascii strategy.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
-            return Self::empty();
+            return Self {
+                block: crate::object_array::ll_prebuilt_empty_items_block(),
+                len: crate::object_array::length_cell(0),
+            };
         }
         let block = unsafe {
             crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
@@ -104,16 +112,19 @@ impl UnicodeArray {
     }
 
     #[must_use]
+    #[inline(always)]
     pub fn pin_block(&self) -> usize {
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.block as PyObjectRef);
         slot
     }
 
+    #[inline(always)]
     pub fn reload_block(&mut self, slot: usize) {
         self.block = crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock;
     }
 
+    #[inline(always)]
     pub fn install(&mut self, fresh: UnicodeArray) {
         let _roots = crate::gc_roots::push_roots();
         let slot = fresh.pin_block();
