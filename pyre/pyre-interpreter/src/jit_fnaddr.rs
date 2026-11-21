@@ -180,19 +180,6 @@ extern "C" fn majit_stringbuilder_append_jit_abi(builder: i64, ll_str: i64) {
     pyre_object::rbuilder::rbuilder_runtime::ll_append(builder, ll_str);
 }
 
-/// Residual ABI for `gc_alloc_young_storage_box<T>`.
-///
-/// HELPER_FNADDRS skips Generic; `specialize:argtype(0)` names each
-/// payload shape `leaf__inst_<T>` (`residual_inst_suffix`). The by-value
-/// `T` is one residual Ref word (pointer to the constructed payload) plus
-/// the `tid` integer.
-extern "C" fn gc_alloc_young_storage_box_jit_abi<T: 'static>(value: i64, tid: i64) -> i64 {
-    majit_ir::icf_identity!("jit_fnaddr::gc_alloc_young_storage_box_jit_abi");
-    // SAFETY: residual_call_ir_r passes a live `T` as one Ref word.
-    let value = unsafe { std::ptr::read(value as *const T) };
-    pyre_object::gc_storage::gc_alloc_young_storage_box(value, tid as u32) as usize as i64
-}
-
 /// Residual ABI for `rordereddict::replace_value`. Generic DLI free
 /// function; residual path is `replace_value__inst_<V>`. `V` is one
 /// residual word (`PyObjectRef`).
@@ -575,12 +562,15 @@ pub(crate) extern "C" fn module_dict_getdictvalue_no_unwrapping_pure_word(
     .unwrap_or(pyre_object::PY_NULL) as usize as i64
 }
 
-/// Word-ABI residual for `hash_str_hooked_bytes`.
-///
-/// `dont_look_inside` emits the pair-slice descr-word adapter
-/// (`ptr`, `len`) → `i64`; `merge_macro_helper_fnaddrs` publishes that
-/// adapter into the occupied slot (`getfunctionptr`).
-pub(crate) use pyre_object::dict_eq_hook::__majit_call_target_hash_str_hooked_bytes as hash_str_hooked_bytes_word;
+/// Word-ABI residual for `hash_str_hooked_bytes`. Rebuilds the `&[u8]`
+/// window `rstr.py LLHelpers._ll_strhash` already passes as pointer and
+/// length words, then calls the slice entry.
+#[inline(never)]
+pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::hash_str_hooked_bytes_word");
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
+    pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
+}
 
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
@@ -5568,7 +5558,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `hash_str_hooked_bytes` is a slice entry; residual calls pass the
     // pointer/length words `rstr.py LLHelpers._ll_strhash` already has.
-    // Bind the pair-slice descr-word adapter (`getfunctionptr`).
     cpa2!(
         &mut entries,
         "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
@@ -6652,43 +6641,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
-    // `gc_alloc_young_storage_box` is the same Generic+DLI residual
-    // (`specialize:argtype(0)`), but the inst suffix is the payload `T`
-    // rather than `K,V,S`. Bind each storage shape the dict strategies
-    // construct; the word trampoline is the by-value `T` as one Ref.
-    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::IntDictStorage>(
-        &mut entries,
-    );
-    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::ObjectDictStorage>(
-        &mut entries,
-    );
-    register_gc_alloc_young_storage_box_inst::<pyre_object::dictmultiobject::BytesDictStorage>(
-        &mut entries,
-    );
-    register_gc_alloc_young_storage_box_inst::<pyre_object::identitydict::IdentityDictStorage>(
-        &mut entries,
-    );
-    register_gc_alloc_young_storage_box_inst::<pyre_object::kwargsdict::KwargsDictStorage>(
-        &mut entries,
-    );
-    register_gc_alloc_young_storage_box_inst::<pyre_object::celldict::ModuleDictStorage>(
-        &mut entries,
-    );
-    // Charon `spec_type_name` spells the kwargs payload as two
-    // `alloc::vec::Vec<*mut PyObject, Global>` rather than the
-    // `KwargsDictStorage` alias `type_name`.
-    {
-        let kwargs_charon = [
-            "(alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>, alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>)",
-        ];
-        cpa2_inst!(
-            &mut entries,
-            "pyre_object::gc_storage::gc_alloc_young_storage_box",
-            "gc_storage::gc_alloc_young_storage_box",
-            gc_alloc_young_storage_box_jit_abi::<pyre_object::kwargsdict::KwargsDictStorage>,
-            &kwargs_charon,
-        );
-    }
     register_replace_value_inst(&mut entries);
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
@@ -6731,17 +6683,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     merge_macro_helper_fnaddrs(&mut entries, &abi_unsound_arguments);
 
     (entries, abi_unsound_arguments)
-}
-
-fn register_gc_alloc_young_storage_box_inst<T: 'static>(entries: &mut Vec<(&'static str, i64)>) {
-    let types = [std::any::type_name::<T>()];
-    cpa2_inst!(
-        entries,
-        "pyre_object::gc_storage::gc_alloc_young_storage_box",
-        "gc_storage::gc_alloc_young_storage_box",
-        gc_alloc_young_storage_box_jit_abi::<T>,
-        &types,
-    );
 }
 
 fn register_replace_value_inst(entries: &mut Vec<(&'static str, i64)>) {
@@ -8010,13 +7951,12 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        finditem_str_named_word, gc_alloc_young_storage_box_jit_abi,
-        handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word, interned_residual_inst_path,
-        is_abi_unsound_argument_residual, is_exact_type_word, is_list_write_barrier,
-        is_plain_int1_word, is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
-        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
-        ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
-        ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
+        finditem_str_named_word, handle_alloc_error_word_jit_abi, hash_str_hooked_bytes_word,
+        interned_residual_inst_path, is_abi_unsound_argument_residual, is_exact_type_word,
+        is_list_write_barrier, is_plain_int1_word, is_pyframe_operand_stack_accessor,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs, ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word,
+        ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
@@ -10506,49 +10446,6 @@ mod tests {
             bindings[allocate_full], bindings[stable_full],
             "distinct icf_identity strings must keep the two constructors from folding"
         );
-    }
-
-    /// `gc_alloc_young_storage_box` is Generic+DLI; each payload shape is
-    /// `leaf__inst_<T>`. The IntDict token must match the codewriter suffix.
-    #[test]
-    fn jit_trace_fnaddrs_covers_gc_alloc_young_storage_box_int_dict() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let types = [std::any::type_name::<
-            pyre_object::dictmultiobject::IntDictStorage,
-        >()];
-        let full = interned_residual_inst_path(
-            "pyre_object::gc_storage::gc_alloc_young_storage_box",
-            &types,
-        );
-        let short = interned_residual_inst_path("gc_storage::gc_alloc_young_storage_box", &types);
-        assert!(
-            full.contains("CRDict_Li64"),
-            "IntDictStorage type_name must encode as RDict<i64,...>, got {full}"
-        );
-        let expected = gc_alloc_young_storage_box_jit_abi::<
-            pyre_object::dictmultiobject::IntDictStorage,
-        > as *const () as usize as i64;
-        assert_eq!(bindings[full], expected, "full {full}");
-        assert_eq!(bindings[short], expected, "short {short}");
-    }
-
-    /// Kwargs storage is two `Vec<*mut PyObject, Global>`; Charon's
-    /// `spec_type_name` keeps that spelling, not the `KwargsDictStorage` alias.
-    #[test]
-    fn jit_trace_fnaddrs_covers_gc_alloc_young_storage_box_kwargs_vec_pair() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let types = [
-            "(alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>, alloc::vec::Vec<*mut pyre_object::pyobject::PyObject, alloc::alloc::Global>)",
-        ];
-        let short = interned_residual_inst_path("gc_storage::gc_alloc_young_storage_box", &types);
-        assert!(
-            short.contains("_Oalloc_Cvec_CVec_L_Pmut_Spyre__object_Cpyobject_CPyObject"),
-            "kwargs Charon token, got {short}"
-        );
-        let expected = gc_alloc_young_storage_box_jit_abi::<
-            pyre_object::kwargsdict::KwargsDictStorage,
-        > as *const () as usize as i64;
-        assert_eq!(bindings[short], expected, "short {short}");
     }
 
     /// DLI `replace_value` residualizes at `leaf__inst_<V>`.
