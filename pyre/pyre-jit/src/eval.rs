@@ -10016,7 +10016,20 @@ fn tuple_hash_merge_point_jit(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            drive_tuple_hash_trace(cell_key, w_type, w_tuple, len, acc, i)
+            // Loop-header tick used `cell_key` from
+            // `resolved_entry_procedure_token` (a miss is still the raw hash).
+            // `JC_TRACING` is only the matched cell (`maybe_compile_and_run`).
+            let greenargs = [pin.get() as i64];
+            let matched_cell = driver
+                .meta_interp()
+                .resolve_function_entry_cell_on_driver(
+                    jd_no,
+                    hash,
+                    &greenargs,
+                    pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
+                )
+                .cell;
+            drive_tuple_hash_trace(cell_key, matched_cell, w_type, w_tuple, len, acc, i)
         }
         majit_metainterp::warmstate::HotResult::RunCompiled => {
             if majit_metainterp::majit_log_enabled() {
@@ -10075,6 +10088,7 @@ fn tuple_hash_function_entry_jit(
     );
     let greenargs = [pin.get() as i64];
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
+    let matched_cell = resolved.cell.clone();
     let cell_key = resolved.cell_key().unwrap_or(hash);
     let step = driver.meta_interp_mut().function_entry_step_on_driver(
         jd_no,
@@ -10103,7 +10117,9 @@ fn tuple_hash_function_entry_jit(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            drive_tuple_hash_trace(cell_key, w_type, w_tuple, len, acc, i)
+            // The door already applied `JC_TRACING` to the matched cell.
+            // A miss must not look `hash` up as a cell key.
+            drive_tuple_hash_trace(cell_key, matched_cell, w_type, w_tuple, len, acc, i)
         }
         FunctionEntryStep::NotHot => None,
     }
@@ -10120,6 +10136,7 @@ fn tuple_hash_function_entry_jit(
 /// `StartedTracing` returns the value the walk already produced, if any.
 fn drive_tuple_hash_trace(
     green_key: u64,
+    matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
     w_type: pyre_object::PyObjectRef,
     w_tuple: pyre_object::PyObjectRef,
     len: usize,
@@ -10152,14 +10169,14 @@ fn drive_tuple_hash_trace(
     let base = roots.pin_roots(&[w_type, w_tuple]);
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let (driver, _) = driver_pair();
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A sibling jitdriver may `bound_reached` a nested
-    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
-    // `force_start_tracing` elects (`descriptor.index`).
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` is
+    // read only on the cell `comparekey` matched. A miss does not consult
+    // a foreign occupant whose `cell_key` equals the bucket hash. A sibling
+    // jitdriver may `bound_reached` a nested MetaInterp.
     let jd_no = jitcode
         .jitdriver_sd()
         .unwrap_or(pyre_jit_trace::tuplehash_state::TUPLEHASH_JD_INDEX);
-    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+    if matched_cell.is_some_and(|cell| cell.is_tracing()) {
         return None;
     }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer

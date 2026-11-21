@@ -10670,6 +10670,7 @@ impl<S: JitState> JitDriver<S> {
             env,
             false,
             caller_pin_save,
+            None,
         ))
     }
 
@@ -10706,28 +10707,34 @@ impl<S: JitState> JitDriver<S> {
         if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
         }
-        // The table `Ref` lives only for the cell-field reads and
-        // `get_procedure_token` (`warmstate.py`); `has_compiled_code` is
-        // on the owned token.
-        let (cell_key, token) = {
-            // `maybe_compile_and_run` reads `warmrunnerdesc.jitcounter`
-            // (`MetaInterp.jitcounter`), not `jitdrivers_sd[jd_no].warmstate`.
-            let head = self.meta.jitcounter.lookup_chain(hash)?;
-            let cell = std::cell::Ref::map(head, std::rc::Rc::as_ref);
-            // `isinstance(cell, JitCell)` — one subclass per driver.
-            if cell.jitdriver_sd == entry.jd_index && cell.comparekey(green_values, G::TYPES) {
-                Self::found_cell_entry(&cell)?
-            } else {
-                let next = cell.next.borrow().clone()?;
-                drop(cell);
-                let cell = self.compiled_function_token_chain(next, green_values, G::TYPES)?;
-                Self::found_cell_entry(&cell)?
-            }
-        };
+        let cell = self.matched_function_entry_cell(hash, green_values, G::TYPES)?;
+        let (cell_key, token) = Self::found_cell_entry(&cell)?;
         if !token.has_compiled_code() {
             return None;
         }
         Some((cell_key, token))
+    }
+
+    /// `maybe_compile_and_run`'s `lookup_chain` walk: `isinstance(cell, JitCell)`
+    /// (`cell.jitdriver_sd`) then `comparekey(*greenargs)`. Flags and the
+    /// procedure token are not read here.
+    #[inline(always)]
+    fn matched_function_entry_cell(
+        &self,
+        hash: u64,
+        green_values: &[i64],
+        green_types: &[GreenType],
+    ) -> Option<std::rc::Rc<BaseJitCell>> {
+        let jd_index = self.portal_entry.jd_index;
+        // `maybe_compile_and_run` reads `warmrunnerdesc.jitcounter`
+        // (`MetaInterp.jitcounter`), not `jitdrivers_sd[jd_no].warmstate`.
+        let head = self.meta.jitcounter.lookup_chain(hash)?;
+        if head.jitdriver_sd == jd_index && head.comparekey(green_values, green_types) {
+            return Some(std::rc::Rc::clone(&*head));
+        }
+        let next = head.next.borrow().clone()?;
+        drop(head);
+        self.compiled_function_token_chain(next, green_values, green_types)
     }
 
     #[inline(always)]
@@ -11071,11 +11078,15 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    /// `warmstate.py maybe_compile_and_run` `:465-480` with
-    /// `increment_function_threshold`: hash already in hand, `lookup_chain`
-    /// once, and if there is no enterable procedure token, `jitcounter.tick`
-    /// and return. A compiled token, a chained bucket, a dead token, or a
-    /// `JC_DONT_TRACE_HERE` cell continues into `function_entry_internal`.
+    /// `warmstate.py maybe_compile_and_run` with `increment_function_threshold`:
+    /// one `lookup_chain` walk, then `isinstance` / `comparekey(*greenargs)`.
+    /// A matched runnable token is entered here. A matched cell that is not
+    /// runnable continues into `function_entry_internal` with that cell. A
+    /// miss ticks `hash` (`tick_function_entry_empty_chain`); overflow is
+    /// `already_ticked` with `FunctionEntryResolved::miss(hash)`.
+    ///
+    /// A `confirm_enter_jit` hook is the `compiled_function_token` early-out:
+    /// this path does not enter assembler, and the occupied door confirms.
     ///
     /// `Some(resume)` means this IS that cold case — including `Some(None)`
     /// when the tick did not overflow. A True tick is already consumed here
@@ -11093,51 +11104,39 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         caller_pin_save: Option<usize>,
     ) -> Option<Option<usize>> {
-        if let Some((cell_key, token)) =
-            self.compiled_function_token(green_key_hash, green_values, green_spec)
-        {
-            return Some(
-                self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
-                    .and_then(|resume| self.resume_pc_recycling(resume)),
-            );
+        let _ = green_spec;
+        if self.portal_entry.confirm_enter_jit_ptr.get().is_some() {
+            return None;
         }
-        let jd_no = self.index().unwrap_or(0);
-        if let Some(cell) = self
-            .meta
-            .warm_state_ref_for_driver(jd_no)
-            .and_then(|warm| warm.lookup_chain(green_key_hash))
+        if let Some(cell) = self.matched_function_entry_cell(green_key_hash, green_values, G::TYPES)
         {
-            if cell.next.borrow().is_some() {
-                return None;
+            if let Some((cell_key, token)) = Self::found_cell_entry(&cell)
+                && token.has_compiled_code()
+            {
+                return Some(
+                    self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
+                        .and_then(|resume| self.resume_pc_recycling(resume)),
+                );
             }
-            if cell.cell_bucket.get() == green_key_hash {
-                if cell.is_compiled() {
-                    return None;
-                }
-                if cell.is_tracing() {
-                    // Slot 23/65/66 live on `function_entry_step`; keep them
-                    // on that walk so a JC_TRACING leak still tallies.
-                    return None;
-                }
-                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
-                    return None;
-                }
-                if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                    // Immediate-Proceed (never traced) vs tick-normally
-                    // (TRACING_OCCURRED) stay on the occupied door.
-                    return None;
-                }
-                if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
-                    return None;
-                }
-            }
-            // Occupant of this slot is a different green key. Same as empty
-            // for our hash: tick our hash, do not inspect the stranger
-            // (`warmstate.py:465-469` not-found arm).
+            // Matched, not a runnable token: JC_TRACING / JC_TEMPORARY /
+            // JC_DONT_TRACE_HERE / a dead token stay on the occupied door
+            // (`maybe_compile_and_run` after the comparekey match). Slots
+            // 23/65/66 live on `function_entry_step` of that cell.
+            return Some(self.function_entry_internal(
+                green_key_hash,
+                green_values,
+                G::TYPES,
+                target_pc,
+                state,
+                env,
+                false,
+                caller_pin_save,
+                Some(FunctionEntryResolved::matched(cell, green_key_hash)),
+            ));
         }
         if self
             .meta
-            .warm_state_for_driver(jd_no)
+            .warm_state_for_driver(self.index().unwrap_or(0))
             .tick_function_entry_empty_chain(green_key_hash)
         {
             return Some(self.function_entry_internal(
@@ -11149,6 +11148,7 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 true,
                 caller_pin_save,
+                Some(FunctionEntryResolved::miss(green_key_hash)),
             ));
         }
         Some(None)
@@ -11161,6 +11161,10 @@ impl<S: JitState> JitDriver<S> {
     /// would tick again) and takes the Proceed arm. RunCompiled, chained
     /// `resolve_function_entry_cell`, decay + `stack_almost_full` +
     /// `force_start_tracing` all stay here.
+    ///
+    /// `already_resolved` is the cell the caller's one `lookup_chain` /
+    /// `comparekey` walk already named (`FunctionEntryResolved::miss` on a
+    /// cold overflow). `None` walks here (`confirm_enter_jit` veto).
     #[inline(never)]
     fn function_entry_internal(
         &mut self,
@@ -11172,15 +11176,19 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         already_ticked: bool,
         caller_pin_save: Option<usize>,
+        already_resolved: Option<FunctionEntryResolved>,
     ) -> Option<usize> {
         let pin = door_ref_pin(state, green_values, green_types, caller_pin_save);
         let mut live = majit_ir::GreenKey::from_greenargs(green_values, green_types);
         pin.reload(&mut live);
-        let resolved = self.resolve_function_entry_cell(
-            green_key_hash,
-            live.values.as_slice(),
-            live.types.as_slice(),
-        );
+        let resolved = match already_resolved {
+            Some(resolved) => resolved,
+            None => self.resolve_function_entry_cell(
+                green_key_hash,
+                live.values.as_slice(),
+                live.types.as_slice(),
+            ),
+        };
         let cell_key = resolved.cell_key().unwrap_or(resolved.hash);
         pin.reload(&mut live);
         let step = if already_ticked {
@@ -14839,6 +14847,174 @@ mod tests {
                 .compiled_function_token(hash, &key_c.values, (GreenSlotInt, GreenSlotInt))
                 .is_none(),
             "a third key's greens match neither cell on the chain"
+        );
+    }
+
+    /// Closed-form `get_uhash` collision of two two-Int keys. Same pair as
+    /// `compiled_function_token_walks_a_comparekey_chain`.
+    fn colliding_two_int_keys() -> (GreenKey, GreenKey) {
+        let occupant = GreenKey::new(vec![1, 0]);
+        let miss = GreenKey::new(vec![2, 13080698639]);
+        assert_eq!(
+            occupant.get_uhash(),
+            miss.get_uhash(),
+            "fixture is a full-hash collision"
+        );
+        (occupant, miss)
+    }
+
+    fn function_entry_cold_tick_driver() -> JitDriver<CountingDoorState> {
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(2);
+        driver
+    }
+
+    fn cold_tick_for(
+        driver: &mut JitDriver<CountingDoorState>,
+        key: &GreenKey,
+    ) -> Option<Option<usize>> {
+        let mut state = CountingDoorState::default();
+        driver.try_function_entry_cold_tick(
+            key.get_uhash(),
+            &key.values,
+            (GreenSlotInt, GreenSlotInt),
+            0,
+            &mut state,
+            &(),
+            None,
+        )
+    }
+
+    /// `maybe_compile_and_run`: flags are read only after `comparekey` matches.
+    /// A lone occupant of our hash with a different green key is a miss, even
+    /// when that occupant is compiled / `JC_TEMPORARY` / `JC_DONT_TRACE_HERE`.
+    #[test]
+    fn try_function_entry_cold_tick_ticks_a_hash_occupied_by_a_foreign_cell() {
+        fn assert_miss_ticks(install: impl FnOnce(&mut JitDriver<CountingDoorState>, &GreenKey)) {
+            let mut driver = function_entry_cold_tick_driver();
+            let (occupant, miss) = colliding_two_int_keys();
+            install(&mut driver, &occupant);
+            {
+                let cell = driver
+                    .meta
+                    .jitcounter
+                    .lookup_chain(occupant.get_uhash())
+                    .expect("occupant filed the slot");
+                assert!(cell.next.borrow().is_none(), "fixture: a single occupant");
+                assert_eq!(cell.cell_bucket.get(), occupant.get_uhash());
+                assert!(
+                    !cell.comparekey(&miss.values, &miss.types),
+                    "fixture: occupant is a different green key"
+                );
+            }
+
+            let first = cold_tick_for(&mut driver, &miss);
+            assert!(
+                matches!(first, Some(None)),
+                "a comparekey miss ticks the hash and does not take the occupied door, got {first:?}"
+            );
+            assert!(
+                !driver.is_tracing(),
+                "function_threshold=2: the first miss is not overflow"
+            );
+
+            let second = cold_tick_for(&mut driver, &miss);
+            assert!(
+                matches!(second, Some(None)),
+                "the overflow miss is already_ticked bound_reached, got {second:?}"
+            );
+            assert!(
+                driver.is_tracing(),
+                "the second miss must fire increment_function_threshold"
+            );
+            let tracing_cell = crate::warmstate::GreenRefPin::with(&miss, |__p, __l| {
+                driver
+                    .meta
+                    .warm_state_ref_for_driver(0)
+                    .and_then(|warm| warm.get_cell_for_key(__p, __l))
+            });
+            assert!(
+                tracing_cell.is_some_and(
+                    |cell| cell.is_tracing() && cell.comparekey(&miss.values, &miss.types)
+                ),
+                "bound_reached installs JitCell(*greenargs) for the miss, not the occupant"
+            );
+        }
+
+        assert_miss_ticks(|driver, occupant| {
+            let token = std::sync::Arc::new(majit_backend::JitCellToken::new(301));
+            token.set_compiled(Box::new(()));
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .memory_manager
+                .keep_loop_alive(&token);
+            crate::warmstate::GreenRefPin::with(occupant, |__p, __l| {
+                driver
+                    .meta
+                    .warm_state_for_driver(0)
+                    .attach_procedure_to_interp_for_key(__p, __l, std::sync::Arc::clone(&token))
+            });
+        });
+        assert_miss_ticks(|driver, occupant| {
+            let token = std::sync::Arc::new(majit_backend::JitCellToken::new(302));
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .memory_manager
+                .keep_loop_alive(&token);
+            crate::warmstate::GreenRefPin::with(occupant, |__p, __l| {
+                let mut ws = driver.meta.warm_state_for_driver(0);
+                ws.ensure_cell_for_key(__p, __l);
+                let cell = ws.get_cell_for_key(__p, __l).expect("occupant");
+                cell.set_procedure_token(std::sync::Arc::clone(&token), true);
+            });
+        });
+        assert_miss_ticks(|driver, occupant| {
+            crate::warmstate::GreenRefPin::with(occupant, |__p, __l| {
+                driver
+                    .meta
+                    .warm_state_for_driver(0)
+                    .disable_noninlinable_function_for_key(__p, __l)
+            });
+        });
+    }
+
+    /// `cell_is_tracing` is `get_cell(cell_key)`. A miss whose `get_uhash`
+    /// equals an occupant's `cell_key` therefore sees that occupant's
+    /// `JC_TRACING`. `drive_tuple_hash_trace` must not consult this on a miss.
+    #[test]
+    fn cell_is_tracing_on_a_colliding_hash_names_the_occupant() {
+        let mut driver = function_entry_cold_tick_driver();
+        let (occupant, miss) = colliding_two_int_keys();
+        let hash = occupant.get_uhash();
+        let mut state = CountingDoorState::default();
+        {
+            let _zbh_pin =
+                crate::warmstate::GreenRefPin::pin_slices(&occupant.values, &occupant.types);
+            driver.force_start_tracing(
+                hash,
+                Some((&occupant.values, &occupant.types)),
+                _zbh_pin.save(),
+                0,
+                &mut state,
+                &(),
+            );
+        }
+        assert!(driver.cell_is_tracing(hash), "occupant carries JC_TRACING");
+        assert_eq!(miss.get_uhash(), hash);
+        assert!(
+            driver.cell_is_tracing(miss.get_uhash()),
+            "get_cell(hash) names the occupant whose cell_key is the hash"
+        );
+        let resolved = driver.resolve_function_entry_cell(hash, &miss.values, &miss.types);
+        assert!(
+            resolved.cell.is_none(),
+            "comparekey does not match the occupant"
         );
     }
 
