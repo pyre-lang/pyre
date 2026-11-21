@@ -6430,10 +6430,13 @@ pub(in crate::front::mir) fn deref_write_base_local(place: &Place) -> Option<usi
 /// `mem::replace` writes whatever place the borrow names.
 /// A place `mem::replace` can read and write. `Index` is an `index_mut`
 /// result: the element value is already the local, and the write is the
-/// `Deref` arm of [`Lowering::emit_projection_write`].
+/// `Deref` arm of [`Lowering::emit_projection_write`]. `FieldInterior` is
+/// a field-only `InteriorPtrRepr` temp: getfield/setfield of the owner
+/// Variable at the use.
 pub(in crate::front::mir) enum MemSlot {
     Place(Place),
     Index(usize),
+    FieldInterior(usize),
 }
 
 /// One field of a multi-word `mem::replace` / `swap` / `take`.

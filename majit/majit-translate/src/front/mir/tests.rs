@@ -37915,6 +37915,10 @@ pub(in crate::front::mir) fn interior_i64() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})
 }
 
+fn interior_f64() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Float": "F64"}})
+}
+
 pub(in crate::front::mir) fn interior_usize() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
 }
@@ -38283,6 +38287,10 @@ pub(in crate::front::mir) fn interior_assign(
 
 fn interior_const_i64(text: &str, ty: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Const": [{"Integer": {"Signed": ["I64", text]}}, ty]})
+}
+
+fn interior_const_f64(text: &str, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Const": [{"Float": {"value": text, "ty": "F64"}}, ty]})
 }
 
 fn interior_const_usize(text: &str, ty: &serde_json::Value) -> serde_json::Value {
@@ -42103,12 +42111,617 @@ fn parent_read_and_write_of_cell_backed_wrapper_field() {
     );
 }
 
+/// `q = &raw mut *p` / `q = &mut *p` of `p: *mut Wrap(i64)`, then either
+/// return `q` or `*q`. `cast_ptr_to_adr` keeps pointer identity: the
+/// reborrow is `p` (no RawLoad); a later `*q` is `rewrite_op_raw_load`.
+fn wrap_ptr_reborrow_graph(raw: bool, load_after: bool) -> crate::model::FunctionGraph {
+    let i64_ty = interior_i64();
+    let wrap_ty = interior_adt(0);
+    let ptr_ty = interior_raw_mut(wrap_ty.clone());
+    let mut_wrap = serde_json::json!({"Ref": [null, wrap_ty.clone(), "Mut"]});
+    let q_ty = if raw { ptr_ty.clone() } else { mut_wrap };
+    let ret_ty = if load_after {
+        wrap_ty.clone()
+    } else {
+        q_ty.clone()
+    };
+    let deref_p = interior_deref(1, &ptr_ty, &wrap_ty);
+    let reborrow = if raw {
+        serde_json::json!({"RawPtr": {"place": deref_p, "kind": "Mut", "ptr_metadata": null}})
+    } else {
+        serde_json::json!({"Ref": {"place": deref_p, "kind": "Mut", "ptr_metadata": null}})
+    };
+    let q_place = interior_place(2, &q_ty);
+    let mut stmts = vec![interior_assign(q_place.clone(), reborrow)];
+    if load_after {
+        stmts.push(interior_assign(
+            interior_place(0, &wrap_ty),
+            interior_use(interior_deref(2, &q_ty, &wrap_ty)),
+        ));
+    } else {
+        stmts.push(interior_assign(
+            interior_place(0, &q_ty),
+            interior_use(q_place),
+        ));
+    }
+    let caller = interior_caller(
+        "reborrow_wrap",
+        1,
+        vec![ptr_ty.clone()],
+        ret_ty.clone(),
+        vec![
+            interior_local(0, None, &ret_ty),
+            interior_local(1, Some("p"), &ptr_ty),
+            interior_local(2, Some("q"), &q_ty),
+        ],
+        vec![interior_bb(stmts, interior_return())],
+    );
+    let wrap_decl = interior_struct(0, &["fixture", "Wrap"], &[("inner", i64_ty)], 8, &[0], true);
+    let llbc = llbc_with_types("fixture", vec![wrap_decl], vec![caller]);
+    crate::test_support::lower_function(&llbc, "reborrow_wrap").unwrap_or_else(|err| {
+        panic!("lower wrap-ptr reborrow raw={raw} load_after={load_after}: {err:?}")
+    })
+}
+
+fn returned_word(graph: &crate::model::FunctionGraph) -> Option<&Variable> {
+    graph
+        .block(graph.startblock)
+        .exits
+        .iter()
+        .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        .flatten()
+        .and_then(LinkArg::as_variable)
+}
+
+fn assert_reborrow_is_address(graph: &crate::model::FunctionGraph, label: &str) {
+    let ops = graph_ops(graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    let ret = returned_word(graph).expect("startblock exits to returnblock with the returned word");
+    assert!(
+        ops.iter()
+            .all(|op| !matches!(op.kind, OpKind::RawLoad { .. })),
+        "{label}: reborrow of *mut Wrap must not RawLoad; ops={ops:?}"
+    );
+    assert_eq!(
+        ret,
+        p,
+        "{label}: q must be p itself; ops={ops:?} graph={}",
+        graph.dump()
+    );
+}
+
+fn assert_deref_after_reborrow_is_raw_load(graph: &crate::model::FunctionGraph, label: &str) {
+    let ops = graph_ops(graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawLoad { base, .. } if base == p
+        )),
+        "{label}: *q after the reborrow must RawLoad through p; ops={ops:?}"
+    );
+}
+
+/// `&raw mut *p` of `p: *mut Wrap(i64)` is `p`; `*q` is a RawLoad.
+#[test]
+fn raw_mut_deref_reborrow_of_transparent_wrapper_ptr_is_address() {
+    assert_reborrow_is_address(
+        &wrap_ptr_reborrow_graph(true, false),
+        "&raw mut *p of *mut Wrap(i64)",
+    );
+    assert_deref_after_reborrow_is_raw_load(
+        &wrap_ptr_reborrow_graph(true, true),
+        "*q after &raw mut *p of *mut Wrap(i64)",
+    );
+}
+
+/// `&mut *p` of `p: *mut Wrap(i64)` is `p`; `*q` is a RawLoad.
+#[test]
+fn mut_deref_reborrow_of_transparent_wrapper_ptr_is_address() {
+    assert_reborrow_is_address(
+        &wrap_ptr_reborrow_graph(false, false),
+        "&mut *p of *mut Wrap(i64)",
+    );
+    assert_deref_after_reborrow_is_raw_load(
+        &wrap_ptr_reborrow_graph(false, true),
+        "*q after &mut *p of *mut Wrap(i64)",
+    );
+}
+
+/// Parent `w.0 = 2.5` / `w.0` after capturing `&mut Wrap(f64)`. The
+/// cell descr follows `tyref_primitive_or_transparent_primitive_node`;
+/// the field store is `rewrite_op_raw_store` of a Float.
+#[test]
+fn parent_read_and_write_of_cell_backed_float_wrapper_field() {
+    let f64_ty = interior_f64();
+    let wrap_ty = interior_adt(1);
+    let mut_wrap = serde_json::json!({"Ref": [null, wrap_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let w_place = interior_place(1, &wrap_ty);
+    let borrow_place = interior_place(2, &mut_wrap);
+    let env_place = interior_place(3, &env_ty);
+    let recv_place = interior_place(4, &mut_env);
+    let w0 = interior_local_field(1, &wrap_ty, &f64_ty, 0);
+    let caller = interior_caller(
+        "observe_w",
+        0,
+        vec![],
+        f64_ty.clone(),
+        vec![
+            interior_local(0, None, &f64_ty),
+            interior_local(1, Some("w"), &wrap_ty),
+            interior_local(2, Some("borrow"), &mut_wrap),
+            interior_local(3, Some("env"), &env_ty),
+            interior_local(4, Some("recv"), &mut_env),
+            interior_local(5, Some("call_ret"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        w_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [1, null, null]},
+                                [interior_const_f64("1.0", &f64_ty)]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        borrow_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": w_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        env_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": borrow_place.clone()}]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        recv_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": env_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![serde_json::json!({"Move": recv_place})],
+                    interior_place(5, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        w0.clone(),
+                        serde_json::json!({
+                            "Use": [interior_const_f64("2.5", &f64_ty), "No"]
+                        }),
+                    ),
+                    interior_assign(interior_place(0, &f64_ty), interior_use(w0)),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("w", mut_wrap.clone())], 1);
+    let wrap_decl = interior_struct(1, &["fixture", "Wrap"], &[("inner", f64_ty)], 8, &[0], true);
+    let call_mut = interior_opaque(1, &["fixture", "call_mut"], vec![mut_env], unit);
+    let llbc = llbc_with_types("fixture", vec![env_decl, wrap_decl], vec![caller, call_mut]);
+    let graph = crate::test_support::lower_function(&llbc, "observe_w")
+        .expect("lower parent that writes and reads w.0 of a captured Wrap(f64) cell");
+    let ops = graph_ops(&graph);
+    let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let cell_ptr =
+        cell_ptr.unwrap_or_else(|| panic!("parent must allocate a Char-varsize cell; ops={ops:?}"));
+    let call_idx = ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::Call { .. }))
+        .unwrap_or_else(|| panic!("call_mut must be present; ops={ops:?}"));
+    let after = &ops[call_idx + 1..];
+    let live_cell = |base: &Variable| {
+        *base == cell_ptr
+            || graph
+                .blocks
+                .iter()
+                .any(|block| block.inputargs.iter().any(|ia| ia == base))
+    };
+    assert!(
+        after.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore { base, item_ty: ValueType::Float, .. } if live_cell(base)
+        )),
+        "w.0 = 2.5 after the call must RawStore a Float through the cell; ops={ops:?}"
+    );
+    assert!(
+        after.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawLoad { base, item_ty: ValueType::Float, .. } if live_cell(base)
+        )),
+        "read of w.0 must RawLoad a Float from the cell; ops={ops:?}"
+    );
+}
+
+/// Closure body `(*(*env).w).0` of a captured `&mut Wrap(f64)` cell.
+#[test]
+fn closure_body_read_and_write_of_transparent_float_wrapper_cell_field() {
+    let f64_ty = interior_f64();
+    let wrap_ty = interior_adt(1);
+    let mut_wrap = serde_json::json!({"Ref": [null, wrap_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let w_deref = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(1, &mut_env, &env_ty, &mut_wrap, 0),
+                "Deref"
+            ]
+        },
+        "ty": wrap_ty.clone()
+    });
+    let w0 = serde_json::json!({
+        "kind": {
+            "Projection": [
+                w_deref,
+                {"Field": [null, 0]}
+            ]
+        },
+        "ty": f64_ty.clone()
+    });
+    let mut callee = interior_caller(
+        "call_mut",
+        1,
+        vec![mut_env.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("env"), &mut_env),
+            interior_local(2, Some("tmp"), &f64_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(interior_place(2, &f64_ty), interior_use(w0.clone())),
+                interior_assign(
+                    w0,
+                    serde_json::json!({
+                        "Use": [interior_const_f64("2.5", &f64_ty), "No"]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    callee["def_id"] = serde_json::json!(1);
+    let env_decl = interior_closure_env(0, "Env", &[("w", mut_wrap)], 1);
+    let wrap_decl = interior_struct(1, &["fixture", "Wrap"], &[("inner", f64_ty)], 8, &[0], true);
+    let llbc = llbc_with_types("fixture", vec![env_decl, wrap_decl], vec![callee]);
+    let graph = crate::test_support::lower_function(&llbc, "call_mut")
+        .expect("lower closure body that reads and writes captured Wrap(f64).0");
+    let ops = graph_ops(&graph);
+    let field_read_results: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "w" => op.result.clone(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !field_read_results.is_empty(),
+        "callee must getfield the env cell-address field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawLoad { base, item_ty: ValueType::Float, .. }
+                if field_read_results.contains(base)
+        )),
+        "callee read of w.0 must RawLoad a Float through the env field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore { base, item_ty: ValueType::Float, .. }
+                if field_read_results.contains(base)
+        )),
+        "callee write of w.0 must RawStore a Float through the env field; ops={ops:?}"
+    );
+}
+
+/// A non-captured by-value `Wrap(f64)` field store/read is the inner
+/// float word (`IntegerRepr` of a one-word newtype).
+#[test]
+fn by_value_transparent_float_wrapper_field_is_the_word() {
+    let f64_ty = interior_f64();
+    let wrap_ty = interior_adt(0);
+    let w0 = interior_local_field(1, &wrap_ty, &f64_ty, 0);
+    let caller = interior_caller(
+        "set_and_get",
+        2,
+        vec![wrap_ty.clone(), f64_ty.clone()],
+        f64_ty.clone(),
+        vec![
+            interior_local(0, None, &f64_ty),
+            interior_local(1, Some("w"), &wrap_ty),
+            interior_local(2, Some("v"), &f64_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(w0.clone(), interior_use(interior_place(2, &f64_ty))),
+                interior_assign(interior_place(0, &f64_ty), interior_use(w0)),
+            ],
+            interior_return(),
+        )],
+    );
+    let wrap_decl = interior_struct(0, &["fixture", "Wrap"], &[("inner", f64_ty)], 8, &[0], true);
+    let llbc = llbc_with_types("fixture", vec![wrap_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "set_and_get")
+        .expect("lower by-value Wrap(f64) field store/read");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().all(|op| !matches!(
+            op.kind,
+            OpKind::FieldWrite { .. } | OpKind::FieldRead { .. }
+        )),
+        "by-value Wrap(f64).0 is the float word, not a field access; ops={ops:?}"
+    );
+    let v = graph
+        .block(graph.startblock)
+        .inputargs
+        .get(1)
+        .expect("v is the second inputarg");
+    let ret =
+        returned_word(&graph).expect("startblock exits to returnblock with the returned word");
+    assert_eq!(
+        ret,
+        v,
+        "w.0 = v; w.0 must return v; ops={ops:?} graph={}",
+        graph.dump()
+    );
+}
+
+fn mut_capture_wrapper_parent_graph(
+    wrap_adt_id: u64,
+    wrap_ty: serde_json::Value,
+    wrap_decls: Vec<serde_json::Value>,
+    inner_ty: serde_json::Value,
+    fill: serde_json::Value,
+) -> crate::model::FunctionGraph {
+    let mut_wrap = serde_json::json!({"Ref": [null, wrap_ty.clone(), "Mut"]});
+    let env_ty = interior_adt(0);
+    let mut_env = serde_json::json!({"Ref": [null, env_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let w_place = interior_place(1, &wrap_ty);
+    let borrow_place = interior_place(2, &mut_wrap);
+    let env_place = interior_place(3, &env_ty);
+    let recv_place = interior_place(4, &mut_env);
+    let caller = interior_caller(
+        "observe_w",
+        0,
+        vec![],
+        inner_ty.clone(),
+        vec![
+            interior_local(0, None, &inner_ty),
+            interior_local(1, Some("w"), &wrap_ty),
+            interior_local(2, Some("borrow"), &mut_wrap),
+            interior_local(3, Some("env"), &env_ty),
+            interior_local(4, Some("recv"), &mut_env),
+            interior_local(5, Some("call_ret"), &unit),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        w_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [wrap_adt_id, null, null]},
+                                [fill]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        borrow_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": w_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    interior_assign(
+                        env_place.clone(),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": borrow_place.clone()}]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        recv_place.clone(),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": env_place.clone(),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![serde_json::json!({"Move": recv_place})],
+                    interior_place(5, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &inner_ty),
+                    interior_use(interior_local_field(1, &wrap_ty, &inner_ty, 0)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let env_decl = interior_closure_env(0, "Env", &[("w", mut_wrap)], 1);
+    let call_mut = interior_opaque(1, &["fixture", "call_mut"], vec![mut_env], unit);
+    let mut types = vec![env_decl];
+    types.extend(wrap_decls);
+    let llbc = llbc_with_types("fixture", types, vec![caller, call_mut]);
+    crate::test_support::lower_function(&llbc, "observe_w")
+        .expect("lower parent that captures &mut wrapper into a closure env")
+}
+
+fn assert_captured_wrapper_is_raw_cell(graph: &crate::model::FunctionGraph, label: &str) {
+    let ops = graph_ops(graph);
+    let cell_ptr = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_CELL_OWNER => {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let cell_ptr = cell_ptr.unwrap_or_else(|| {
+        panic!("{label}: parent must allocate a Char-varsize cell; ops={ops:?}")
+    });
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+                ..
+            } if *v == cell_ptr
+        )),
+        "{label}: closure env must store the cell address as an int word; ops={ops:?}"
+    );
+    let call_idx = ops
+        .iter()
+        .position(|op| matches!(op.kind, OpKind::Call { .. }))
+        .unwrap_or_else(|| panic!("{label}: call_mut must be present; ops={ops:?}"));
+    let load_base = ops[call_idx + 1..].iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } => Some(base.clone()),
+        _ => None,
+    });
+    let load_base = load_base.unwrap_or_else(|| {
+        panic!(
+            "{label}: read of the wrapper after call_mut must be RawLoad of the cell; ops={ops:?}"
+        )
+    });
+    assert!(
+        load_base == cell_ptr
+            || graph
+                .blocks
+                .iter()
+                .any(|block| block.inputargs.iter().any(|ia| *ia == load_base)),
+        "{label}: RawLoad after call_mut must use the cell pointer; ops={ops:?}"
+    );
+}
+
+/// Capture `&mut Wrap<i64>`: the instance's generic argument is the
+/// primitive the cell descr needs.
+#[test]
+fn mut_capture_of_generic_transparent_wrapper_is_raw_cell() {
+    let i64_ty = interior_i64();
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let wrap_ty = named_adt(1, vec![i64_ty.clone()]);
+    let wrap_decl = interior_struct(
+        1,
+        &["fixture", "Wrap"],
+        &[("inner", typevar)],
+        8,
+        &[0],
+        true,
+    );
+    let graph = mut_capture_wrapper_parent_graph(
+        1,
+        wrap_ty,
+        vec![wrap_decl],
+        i64_ty.clone(),
+        interior_const_i64("1", &i64_ty),
+    );
+    assert_captured_wrapper_is_raw_cell(&graph, "Wrap<i64>");
+}
+
+/// Capture `&mut Outer(Wrap(i64))`: nested transparent wrappers are
+/// the inner primitive.
+#[test]
+fn mut_capture_of_nested_transparent_wrapper_is_raw_cell() {
+    let i64_ty = interior_i64();
+    let wrap_ty = interior_adt(1);
+    let outer_ty = interior_adt(2);
+    let wrap_decl = interior_struct(
+        1,
+        &["fixture", "Wrap"],
+        &[("inner", i64_ty.clone())],
+        8,
+        &[0],
+        true,
+    );
+    let outer_decl = interior_struct(
+        2,
+        &["fixture", "Outer"],
+        &[("inner", wrap_ty)],
+        8,
+        &[0],
+        true,
+    );
+    let graph = mut_capture_wrapper_parent_graph(
+        2,
+        outer_ty,
+        vec![wrap_decl, outer_decl],
+        i64_ty.clone(),
+        interior_const_i64("1", &i64_ty),
+    );
+    assert_captured_wrapper_is_raw_cell(&graph, "Outer(Wrap(i64))");
+}
+
 /// `let p = &mut obj.field; *p = v; let r = *p;`
 /// Documents whether the read after the write reuses the value captured
 /// when `p` was created (`atomic_ref_place` projection cache).
 /// `InstanceRepr.rtype_getattr` emits a fresh getfield.
 #[test]
-#[ignore = "atomic_ref_place projection cache returns the FieldRead captured when p was bound; InstanceRepr.rtype_getattr emits a fresh getfield"]
 fn deref_read_after_write_through_field_borrow_temp() {
     let i64_ty = interior_i64();
     let obj_ty = interior_adt(0);
@@ -42193,6 +42806,992 @@ fn deref_read_after_write_through_field_borrow_temp() {
         "read after write through the field borrow reused the pre-write FieldRead \
          (`atomic_ref_place` projection cache); InstanceRepr.rtype_getattr emits a \
          fresh getfield; ops={ops:?}"
+    );
+}
+
+/// Two live reads through `p` each emit a FieldRead of the owner
+/// (`InteriorPtrRepr.rtype_getattr` at each use).
+#[test]
+fn two_deref_reads_through_field_borrow_temp_each_getfield() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "two_reads",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("a"), &i64_ty),
+            interior_local(4, Some("b"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    interior_place(3, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+                interior_assign(
+                    interior_place(4, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    serde_json::json!({"BinaryOp": [
+                        "Add",
+                        interior_copy(interior_place(3, &i64_ty)),
+                        interior_copy(interior_place(4, &i64_ty))
+                    ]}),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "two_reads")
+        .expect("lower two *p reads through a field borrow");
+    let ops = graph_ops(&graph);
+    let reads: Vec<Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "each *p read must FieldRead the owner; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } if name == "add" => reads.contains(lhs) && reads.contains(rhs),
+            _ => false,
+        }),
+        "both FieldRead results must feed the Add; ops={ops:?}"
+    );
+}
+
+/// `*p` in a later block than the borrow: the owner flows through `p`
+/// (`InteriorPtrRepr` field-only `lowleveltype = parentptrtype`), so the
+/// Deref getfield does not `resolve_place` the owner MIR local.
+#[test]
+fn deref_read_through_field_borrow_temp_in_later_block() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "later_block_read",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("k"), &i64_ty),
+            interior_local(4, Some("a"), &i64_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        p_place,
+                        serde_json::json!({
+                            "Ref": {
+                                "place": field_place,
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    // Keep the bind block non-empty so `eliminate_empty_blocks`
+                    // cannot fold the Deref into the start block.
+                    interior_assign(
+                        interior_place(3, &i64_ty),
+                        serde_json::json!({
+                            "Use": [interior_const_i64("1", &i64_ty), "No"]
+                        }),
+                    ),
+                ],
+                interior_goto(1),
+            ),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(4, &i64_ty),
+                        interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        serde_json::json!({"BinaryOp": [
+                            "Add",
+                            interior_copy(interior_place(4, &i64_ty)),
+                            interior_copy(interior_place(3, &i64_ty))
+                        ]}),
+                    ),
+                ],
+                interior_goto(2),
+            ),
+            // `duplicate_return` inlines a Goto-to-Return predecessor. Keep
+            // the Deref off the start block by landing Return one hop later.
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "later_block_read")
+        .expect("lower *p in a later block than the field borrow");
+    let start = graph.startblock;
+    let start_has_field_read = graph
+        .block(start)
+        .operations
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "field"));
+    assert!(
+        !start_has_field_read,
+        "bind of p is the owner, not a bind-time FieldRead; graph={}",
+        graph.dump()
+    );
+    let mut found = false;
+    for block in &graph.blocks {
+        if block.id == start {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::FieldRead { field, base, .. } = &op.kind else {
+                continue;
+            };
+            if field.name != "field" {
+                continue;
+            }
+            assert!(
+                block.inputargs.iter().any(|ia| ia == base),
+                "later-block getfield base must be the owner flowing through p; \
+                 inputargs={:?} graph={}",
+                block.inputargs,
+                graph.dump()
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "Deref in the successor must FieldRead the owner; graph={}",
+        graph.dump()
+    );
+}
+
+/// A residual call taking `&mut obj.field` receives the field value (or
+/// the cell that spills that value), never the GC owner
+/// (`ann_cast_ptr_to_adr`).
+#[test]
+fn residual_call_of_field_borrow_temp_receives_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let mut_i64 = serde_json::json!({"Ref": [null, i64_ty.clone(), "Mut"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &mut_i64);
+    let caller = interior_caller(
+        "call_touch",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    p_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &mut_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let touch = interior_opaque(1, &["fixture", "touch"], vec![mut_i64], i64_ty);
+    let llbc = llbc_with_types("fixture", vec![obj_decl], vec![caller, touch]);
+    let graph = crate::test_support::lower_function(&llbc, "call_touch")
+        .expect("lower residual touch(&mut obj.field)");
+    let ops = graph_ops(&graph);
+    let field_reads: Vec<&Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !field_reads.is_empty(),
+        "call must getfield the owner at the use; ops={ops:?}"
+    );
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("touch") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("touch call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("touch arg0 {other:?}; ops={ops:?}"),
+    };
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    assert_ne!(
+        arg0, obj,
+        "residual must not receive the GC owner; ops={ops:?}"
+    );
+    let stored_field = ops.iter().any(|op| match &op.kind {
+        OpKind::RawStore { value, .. } => field_reads.contains(&value),
+        OpKind::FieldWrite {
+            value: LinkArg::Value(v),
+            ..
+        } => field_reads.contains(&v),
+        _ => false,
+    });
+    assert!(
+        field_reads.contains(&arg0) || stored_field,
+        "residual must receive the field value or a cell of that value; ops={ops:?}"
+    );
+}
+
+/// `let p = &obj.field; Env { p }` of a GC scalar field: the Aggregate
+/// payload is getattr at the use (`InteriorPtrRepr.rtype_getattr`), the
+/// same value-consumer rule as a residual call arg
+/// (`ann_cast_ptr_to_adr`). `append_right` captures `&deque.len` this way.
+#[test]
+fn aggregate_of_field_borrow_temp_receives_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let env_ty = interior_adt(1);
+    let mut_obj = serde_json::json!({"Ref": [null, obj_ty.clone(), "Mut"]});
+    let shared_i64 = interior_shared(i64_ty.clone());
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(2, &shared_i64);
+    let env_place = interior_place(0, &env_ty);
+    let caller = interior_caller(
+        "capture_field",
+        1,
+        vec![mut_obj.clone()],
+        env_ty.clone(),
+        vec![
+            interior_local(0, None, &env_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &shared_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    p_place.clone(),
+                    serde_json::json!({
+                        "Ref": {
+                            "place": field_place,
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                ),
+                interior_assign(
+                    env_place,
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [
+                                {
+                                    "id": 1,
+                                    "generics": {
+                                        "regions": [],
+                                        "types": [],
+                                        "const_generics": [],
+                                        "trait_refs": []
+                                    },
+                                    "builtin": null
+                                },
+                                null,
+                                null
+                            ]},
+                            [{"Move": interior_place(2, &shared_i64)}]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let obj_decl = interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", i64_ty.clone())],
+        8,
+        &[0],
+        false,
+    );
+    let env_decl = interior_struct(
+        1,
+        &["fixture", "Env"],
+        &[("captured", shared_i64)],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![obj_decl, env_decl], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "capture_field")
+        .expect("lower Env { p } of p = &obj.field");
+    let ops = graph_ops(&graph);
+    let field_reads: Vec<&Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "field" => op.result.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !field_reads.is_empty(),
+        "Aggregate must getfield the owner at the use; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    let stored_field = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldWrite {
+            value: LinkArg::Value(v),
+            ..
+        } => field_reads.contains(&v),
+        _ => false,
+    });
+    assert!(
+        stored_field,
+        "Env payload must be the field value, not the GC owner; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::FieldWrite {
+                value: LinkArg::Value(v),
+                ..
+            } => v == obj,
+            _ => false,
+        }),
+        "Env payload must not be the GC owner; ops={ops:?}"
+    );
+}
+
+fn gc_obj_i64_field_decl() -> serde_json::Value {
+    interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("field", interior_i64())],
+        8,
+        &[0],
+        false,
+    )
+}
+
+fn gc_obj_xy_decl() -> serde_json::Value {
+    let i64_ty = interior_i64();
+    interior_struct(
+        0,
+        &["fixture", "Obj"],
+        &[("x", i64_ty.clone()), ("y", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    )
+}
+
+fn mut_ref(ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, ty.clone(), "Mut"]})
+}
+
+fn shared_ref(ty: &serde_json::Value) -> serde_json::Value {
+    interior_shared(ty.clone())
+}
+
+fn assign_mut_field_borrow(
+    dest: serde_json::Value,
+    field_place: serde_json::Value,
+) -> serde_json::Value {
+    interior_assign(
+        dest,
+        serde_json::json!({
+            "Ref": {
+                "place": field_place,
+                "kind": "Mut",
+                "ptr_metadata": null
+            }
+        }),
+    )
+}
+
+fn assign_shared_field_borrow(
+    dest: serde_json::Value,
+    field_place: serde_json::Value,
+) -> serde_json::Value {
+    interior_assign(
+        dest,
+        serde_json::json!({
+            "Ref": {
+                "place": field_place,
+                "kind": "Shared",
+                "ptr_metadata": null
+            }
+        }),
+    )
+}
+
+fn assign_raw_const_field(
+    dest: serde_json::Value,
+    field_place: serde_json::Value,
+) -> serde_json::Value {
+    interior_assign(
+        dest,
+        serde_json::json!({
+            "RawPtr": {
+                "place": field_place,
+                "kind": "Const",
+                "ptr_metadata": null
+            }
+        }),
+    )
+}
+
+fn field_reads_named<'a>(ops: &'a [&SpaceOperation], name: &str) -> Vec<&'a Variable> {
+    ops.iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == name => op.result.as_ref(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `p = &obj.field; q = p; return *q`. `Rvalue::Use` copies the owner
+/// Variable (`InteriorPtrRepr` `lowleveltype = parentptrtype`); the
+/// destination must inherit the source's field path
+/// (`atomic_ref_place`) so getattr at the use still fires
+/// (`InteriorPtrRepr.rtype_getattr`).
+#[test]
+fn copy_of_field_borrow_temp_deref_getfields() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let mut_i64 = mut_ref(&i64_ty);
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let caller = interior_caller(
+        "copy_then_deref",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("q"), &mut_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_mut_field_borrow(interior_place(2, &mut_i64), field_place),
+                interior_assign(
+                    interior_place(3, &mut_i64),
+                    interior_use(interior_place(2, &mut_i64)),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(3, &mut_i64, &i64_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![gc_obj_i64_field_decl()], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "copy_then_deref")
+        .expect("lower p = &obj.field; q = p; *q");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert_eq!(
+        reads.len(),
+        1,
+        "*q after q = p must FieldRead the owner; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    let ret = returned_word(&graph).expect("startblock returns *q");
+    assert_eq!(
+        ret, reads[0],
+        "*q must return the FieldRead, not the GC owner; ops={ops:?}"
+    );
+    assert_ne!(ret, obj, "*q must not return the GC owner; ops={ops:?}");
+}
+
+/// `p = &a.field; p = &b.field; return *p`. `p` is multiply assigned, so
+/// `atomic_ref_place` does not record a field path. Binding the owner
+/// without that path disagrees with the representation; pre-r36 reads
+/// the field at each bind (`PtrRepr.rtype_getattr`) and `*p` is that
+/// value. Same-field merges with a merged parent pointer
+/// (`InteriorPtrRepr.__init__` plus `mergeblock`) are out of scope.
+#[test]
+fn multiply_assigned_field_borrow_temp_reads_the_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let mut_i64 = mut_ref(&i64_ty);
+    let field_a = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let field_b = interior_field(2, &mut_obj, &obj_ty, &i64_ty, 0);
+    let p_place = interior_place(3, &mut_i64);
+    let caller = interior_caller(
+        "rebind_then_deref",
+        2,
+        vec![mut_obj.clone(), mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("a"), &mut_obj),
+            interior_local(2, Some("b"), &mut_obj),
+            interior_local(3, Some("p"), &mut_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_mut_field_borrow(p_place.clone(), field_a),
+                assign_mut_field_borrow(p_place, field_b),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(3, &mut_i64, &i64_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![gc_obj_i64_field_decl()], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "rebind_then_deref")
+        .expect("lower p = &a.field; p = &b.field; *p");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert!(
+        !reads.is_empty(),
+        "multiply-assigned p must read the field value at bind; ops={ops:?}"
+    );
+    let inputs = &graph.block(graph.startblock).inputargs;
+    let ret = returned_word(&graph).expect("startblock returns *p");
+    assert!(
+        reads.iter().any(|r| *r == ret),
+        "*p must be a FieldRead result, not an owner pointer; ops={ops:?}"
+    );
+    assert!(
+        !inputs.iter().any(|v| v == ret),
+        "*p must not return a GC owner; ops={ops:?}"
+    );
+}
+
+/// `p = &block.capacity; return *p` of a declared two-field GcArray
+/// wrapper. Ordinary getattr of that header is `getarraysize`
+/// (`PtrRepr.rtype_len`); the interior use must emit the same ArrayLen
+/// (`InteriorPtrRepr.rtype_getattr` shares that getattr).
+#[test]
+fn deref_through_gcarray_header_borrow_is_arraylen() {
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty.clone()), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let block_ty = interior_adt(0);
+    let mut_block = mut_ref(&block_ty);
+    let shared_usize = shared_ref(&usize_ty);
+    let field_place = interior_field(1, &mut_block, &block_ty, &usize_ty, 0);
+    let caller = interior_caller(
+        "borrow_typed_items_block_capacity",
+        1,
+        vec![mut_block.clone()],
+        usize_ty.clone(),
+        vec![
+            interior_local(0, None, &usize_ty),
+            interior_local(1, Some("block"), &mut_block),
+            interior_local(2, Some("p"), &shared_usize),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_shared_field_borrow(interior_place(2, &shared_usize), field_place),
+                interior_assign(
+                    interior_place(0, &usize_ty),
+                    interior_use(interior_deref(2, &shared_usize, &usize_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_declared_gc("fixture", vec![block], vec![caller], &[0]);
+    let graph = crate::test_support::lower_function(&llbc, "borrow_typed_items_block_capacity")
+        .expect("lower p = &block.capacity; *p");
+    let ops = graph_ops(&graph);
+    let len = ops.iter().copied().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::ArrayLen {
+                array_type_id: Some(id),
+                nolength: false,
+                ..
+            } if id == super::LIST_INT_ITEMS_ARRAY
+        )
+    });
+    assert!(
+        len.is_some(),
+        "borrowed GcArray length header must be ArrayLen(GcArray<i64>); ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "capacity"
+        )),
+        "borrowed header must not be a named FieldRead; ops={ops:?}"
+    );
+}
+
+fn opaque_gc_obj_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["dep", "OpaqueObj"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[0], false)
+    })
+}
+
+/// Ordinary getattr of an opaque owner's scalar field uses the layout
+/// word (`opaque_scalar_field`). A borrow of that field must not fail
+/// with "Field projection has no Adt field"; the shared getattr emits
+/// the same scalar-word FieldRead at the use
+/// (`InteriorPtrRepr.rtype_getattr`).
+#[test]
+fn deref_through_opaque_owner_scalar_field_borrow() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let mut_i64 = mut_ref(&i64_ty);
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let ordinary = interior_caller(
+        "read_opaque_field",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &i64_ty),
+                interior_use(field_place.clone()),
+            )],
+            interior_return(),
+        )],
+    );
+    let borrow = interior_caller(
+        "borrow_opaque_field",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &mut_i64),
+            interior_local(3, Some("k"), &i64_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    assign_mut_field_borrow(interior_place(2, &mut_i64), field_place),
+                    interior_assign(
+                        interior_place(3, &i64_ty),
+                        serde_json::json!({
+                            "Use": [interior_const_i64("1", &i64_ty), "No"]
+                        }),
+                    ),
+                ],
+                interior_goto(1),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(2, &mut_i64, &i64_ty)),
+                )],
+                interior_goto(2),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_declared_gc(
+        "fixture",
+        vec![opaque_gc_obj_decl()],
+        vec![ordinary, borrow],
+        &[0],
+    );
+    let ordinary_graph = crate::test_support::lower_function(&llbc, "read_opaque_field")
+        .expect("ordinary opaque scalar field read");
+    let ordinary_ops = graph_ops(&ordinary_graph);
+    assert!(
+        ordinary_ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.scalar_word.is_some()
+        )),
+        "ordinary opaque field read must use the layout word; ops={ordinary_ops:?}"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "borrow_opaque_field")
+        .expect("lower p = &opaque.field; *p");
+    let start = graph.startblock;
+    let start_has_field_read = graph.block(start).operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.scalar_word.is_some()
+        )
+    });
+    assert!(
+        !start_has_field_read,
+        "bind of p is the owner, not a bind-time FieldRead; graph={}",
+        graph.dump()
+    );
+    let mut found = false;
+    for block in &graph.blocks {
+        if block.id == start {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::FieldRead { field, base, .. } = &op.kind else {
+                continue;
+            };
+            if field.scalar_word.is_none() {
+                continue;
+            }
+            assert!(
+                block.inputargs.iter().any(|ia| ia == base),
+                "later-block opaque getfield base must be the owner flowing through p; \
+                 inputargs={:?} graph={}",
+                block.inputargs,
+                graph.dump()
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "Deref in the successor must FieldRead the opaque layout word; graph={}",
+        graph.dump()
+    );
+}
+
+/// `&raw const obj.x` / `&raw const obj.y` are not the GC owner.
+/// `ann_cast_ptr_to_adr` refuses an interior pointer as an address;
+/// RawPtr of a GC field keeps the pre-r36 field-value lowering.
+#[test]
+fn raw_const_of_two_gc_fields_are_not_the_owner() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let raw_i64 = serde_json::json!({"RawPtr": [i64_ty.clone(), "Const"]});
+    let x_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let y_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 1);
+    let caller = interior_caller(
+        "raw_const_two_fields",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("px"), &raw_i64),
+            interior_local(3, Some("py"), &raw_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_raw_const_field(interior_place(2, &raw_i64), x_place),
+                assign_raw_const_field(interior_place(3, &raw_i64), y_place),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    serde_json::json!({"BinaryOp": [
+                        "Add",
+                        interior_copy(interior_place(2, &raw_i64)),
+                        interior_copy(interior_place(3, &raw_i64))
+                    ]}),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![gc_obj_xy_decl()], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "raw_const_two_fields")
+        .expect("lower &raw const of two fields");
+    let ops = graph_ops(&graph);
+    let xs = field_reads_named(&ops, "x");
+    let ys = field_reads_named(&ops, "y");
+    assert_eq!(
+        xs.len(),
+        1,
+        "&raw const obj.x must FieldRead x (pre-r36 value); ops={ops:?}"
+    );
+    assert_eq!(
+        ys.len(),
+        1,
+        "&raw const obj.y must FieldRead y (pre-r36 value); ops={ops:?}"
+    );
+    assert_ne!(
+        xs[0], ys[0],
+        "two &raw const of different fields must be distinct operands; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    assert_ne!(xs[0], obj, "&raw const obj.x must not be the GC owner");
+    assert_ne!(ys[0], obj, "&raw const obj.y must not be the GC owner");
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } if name == "add" => lhs == xs[0] && rhs == ys[0],
+            _ => false,
+        }),
+        "Add must consume the two field values; ops={ops:?}"
+    );
+}
+
+/// `p = &raw const obj.field; q = p; return *q`. A RawPtr dest is not a
+/// field-only interior (`field_interior_access`); Use must not inherit
+/// `atomic_ref_place`. `*q` is `rewrite_op_raw_load` of the captured
+/// field value, the pre-r36 copy.
+#[test]
+fn copy_of_raw_const_field_does_not_inherit_interior() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let raw_i64 = serde_json::json!({"RawPtr": [i64_ty.clone(), "Const"]});
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let caller = interior_caller(
+        "copy_raw_const_field",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &raw_i64),
+            interior_local(3, Some("q"), &raw_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_raw_const_field(interior_place(2, &raw_i64), field_place),
+                interior_assign(
+                    interior_place(3, &raw_i64),
+                    interior_use(interior_place(2, &raw_i64)),
+                ),
+                interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(3, &raw_i64, &i64_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![gc_obj_i64_field_decl()], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "copy_raw_const_field")
+        .expect("lower q = copy of &raw const obj.field; *q");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert_eq!(
+        reads.len(),
+        1,
+        "&raw const obj.field must FieldRead once; ops={ops:?}"
+    );
+    let loads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+        .collect();
+    assert_eq!(
+        loads.len(),
+        1,
+        "*q of a copied RawPtr is rewrite_op_raw_load, not an inherited interior; ops={ops:?}"
+    );
+    let loaded = loads[0].result.as_ref().expect("RawLoad writes a result");
+    let ret = returned_word(&graph).expect("startblock returns *q");
+    assert_eq!(
+        ret, loaded,
+        "*q must return the RawLoad, not the FieldRead; ops={ops:?}"
+    );
+    assert_ne!(
+        ret, reads[0],
+        "copied RawPtr must not alias the field value as an interior; ops={ops:?}"
     );
 }
 

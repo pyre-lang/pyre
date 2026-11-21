@@ -3541,6 +3541,26 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Whether `_i = &place` / `&raw place` records `place` on
+    /// [`Self::atomic_ref_place`]. Cell reborrows stay recorded across a
+    /// later assign; every other borrow is single-assignment, the same
+    /// restriction [`Self::const_discriminant_locals`] carries. Field-only
+    /// `InteriorPtrRepr` binds the owner only when this is true, so the
+    /// representation and its field path agree (`rptr.py`
+    /// `InteriorPtrRepr.__init__`).
+    pub(in crate::front::mir) fn records_atomic_ref_place(
+        &self,
+        dest_local: usize,
+        place: &Place,
+    ) -> bool {
+        let cell_reborrow = self
+            .reborrow_cell_param(place)
+            .or_else(|| self.deref_cell_param_local(place))
+            .is_some();
+        self.raw_primitive_reborrow_inner(place).is_none()
+            && (cell_reborrow || !self.multi_assigned_locals.contains(&dest_local))
+    }
+
     pub(in crate::front::mir) fn lower_assign(
         &mut self,
         mir_bb: usize,
@@ -3725,18 +3745,21 @@ impl<'a> Lowering<'a> {
                 // before `build_rvalue` consumes the rvalue.
                 if let Some(place) = borrowed_place_referent(&rvalue) {
                     let local = i as usize;
-                    let cell_reborrow = self
-                        .reborrow_cell_param(&place)
-                        .or_else(|| self.deref_cell_param_local(&place))
-                        .is_some();
                     // `&raw const *p` is the address `p`, not the loaded
                     // word. Recording that local as a scalar alias makes
                     // the later `*q` skip `RawLoad`. A cell reborrow is
                     // recorded even when the local is assigned again.
-                    if self.raw_primitive_reborrow_inner(&place).is_none()
-                        && (cell_reborrow || !self.multi_assigned_locals.contains(&local))
-                    {
+                    // `&mut *p` of a raw pointer is that same address
+                    // (`cast_ptr_to_adr`); `*q` is `rewrite_op_raw_load`,
+                    // like a call-returned `&T` on `scalar_address_locals`.
+                    let reborrow = self.raw_primitive_reborrow_inner(&place);
+                    if self.records_atomic_ref_place(local, &place) {
                         self.atomic_ref_place.insert(local, place);
+                    } else if reborrow.is_some()
+                        && !self.multi_assigned_locals.contains(&local)
+                        && !self.scalar_address_locals.contains(&local)
+                    {
+                        self.scalar_address_locals.push(local);
                     }
                 }
                 if !self.multi_assigned_locals.contains(&(i as usize))
@@ -3749,6 +3772,18 @@ impl<'a> Lowering<'a> {
                     // is that same address (`Rvalue::Use` aliases the
                     // Variable), so `*_j` still has to `RawLoad`.
                     self.scalar_address_locals.push(i as usize);
+                }
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && let Some((src_place, ..)) = self.field_interior_access(src_local as usize)
+                    && self.records_atomic_ref_place(i as usize, &src_place)
+                {
+                    // `_j = copy _i` of a field-only interior. The offsets
+                    // are part of the repr (`InteriorPtrRepr.__init__`);
+                    // the copy inherits the source's field path. A RawPtr
+                    // source is not a field-only interior
+                    // (`field_interior_access`).
+                    self.atomic_ref_place.insert(i as usize, src_place);
                 }
                 if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
                     && let Some(alias) = self.fused_copy_struct_get_place_alias(src)
@@ -3886,7 +3921,8 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.is_cell_local(dest_local) {
-                    let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                    let (op, result_var) =
+                        self.build_rvalue(mir_bb, rvalue, &dest_ty, Some(dest_local))?;
                     if let Some(op) = op {
                         let bb_id = self.emit_bb(mir_bb);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3922,7 +3958,8 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
-                let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                let (op, result_var) =
+                    self.build_rvalue(mir_bb, rvalue, &dest_ty, Some(dest_local))?;
                 if let Some(op) = op {
                     let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -4006,7 +4043,7 @@ impl<'a> Lowering<'a> {
                         LinkArg::Const(crate::flowspace::model::Constant::new(const_value))
                     }
                     None => {
-                        let (op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                        let (op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty, None)?;
                         // If `build_rvalue` produced an op, emit it first
                         // so `value_var` is bound before the write reads
                         // it.

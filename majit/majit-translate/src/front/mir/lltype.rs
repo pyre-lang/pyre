@@ -4065,24 +4065,30 @@ pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
 /// whose unique non-ZST field is that primitive (`Wrap(i64)`). A
 /// transparent GCREF newtype is not a primitive and stays out.
 ///
+/// Instance generics are substituted through
+/// [`type_node_peel_one_transparent_field`]; nested transparent wrappers
+/// (`Outer(Wrap(i64))`) peel until a Scalar. A borrow is not a primitive
+/// (`strip_ty_indirections` leaves `Ref` in place).
+///
 /// [`tyref_transparent_inner_value_type`] answers the register bank
 /// (and the external-scalar table); this is the Charon Scalar node
 /// the cell descr / exclusive-borrow pointee need.
-pub(in crate::front::mir) fn tyref_primitive_or_transparent_primitive_node<'l>(
-    ty: &'l TyRef,
-    llbc: &'l Llbc,
-) -> Option<&'l serde_json::Value> {
-    let node = tyref_node(ty, llbc)?;
-    if let Some(prim) = tyref_primitive_node(node, llbc) {
-        return Some(prim);
+pub(in crate::front::mir) fn tyref_primitive_or_transparent_primitive_node(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let mut current = tyref_node(ty, llbc)?.clone();
+    for _ in 0..8 {
+        if let Some(prim) = tyref_primitive_node(&current, llbc) {
+            return Some(prim.clone());
+        }
+        let inner = {
+            let stripped = strip_ty_indirections(&current, llbc).unwrap_or(&current);
+            type_node_peel_one_transparent_field(stripped, llbc)?
+        };
+        current = inner;
     }
-    let (index, _) = tyref_transparent_nonzst_field(ty, llbc)?;
-    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
-    let TypeDeclKind::Struct(fields) = &decl.kind else {
-        return None;
-    };
-    let field = fields.get(index)?;
-    tyref_node(&field.ty, llbc).and_then(|inner| tyref_primitive_node(inner, llbc))
+    None
 }
 
 /// Pointee of an exclusive borrow of a primitive (`&mut bool`, `&mut u8`),
@@ -4098,7 +4104,7 @@ pub(in crate::front::mir) fn tyref_exclusive_borrow_primitive_pointee(
     let node = tyref_node(ty, llbc)?;
     let pointee = type_node_mut_ref_pointee(node, llbc)?;
     let pointee_ty = TyRef::Other(pointee.clone().into());
-    tyref_primitive_or_transparent_primitive_node(&pointee_ty, llbc).cloned()
+    tyref_primitive_or_transparent_primitive_node(&pointee_ty, llbc)
 }
 
 /// Closure-env field whose declared type is an exclusive borrow of a
