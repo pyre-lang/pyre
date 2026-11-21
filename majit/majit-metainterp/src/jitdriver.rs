@@ -11181,6 +11181,7 @@ impl<S: JitState> JitDriver<S> {
             live.values.as_slice(),
             live.types.as_slice(),
         );
+        let cell_key = resolved.cell_key().unwrap_or(resolved.hash);
         pin.reload(&mut live);
         let step = if already_ticked {
             FunctionEntryStep::Proceed
@@ -11196,7 +11197,6 @@ impl<S: JitState> JitDriver<S> {
                 &confirm_reds,
             )
         };
-        let cell_key = resolved.cell_key.unwrap_or(resolved.hash);
         match step {
             FunctionEntryStep::RunCompiled(token) => self
                 .run_confirmed_entry(cell_key, token, target_pc, state, env)
