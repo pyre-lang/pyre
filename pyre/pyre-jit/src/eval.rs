@@ -18587,10 +18587,11 @@ fn decode_pending_value(
 /// deferred SETFIELD_GC / SETARRAYITEM_GC stored in `rd_pendingfields`.
 ///
 /// Iterate the tagged `GuardPendingFieldEntry` list, not
-/// `exit_pending_field_layouts`. Decode the value first so a virtual
-/// `allocate` can collect, decode the target (`decode_ref` on
-/// `target_tagged`), then `setfield` / `setarrayitem` which decode the
-/// value again from the tag. TAGCONST Refs are
+/// `exit_pending_field_layouts`. Decode the target first
+/// (`struct = decode_ref(num)`), then `setfield` / `setarrayitem` which
+/// decode the value and re-read the target from its rooted slot after
+/// that decode (`virtuals_cache.concrete_roots` / TAGBOX `failarg_refs` /
+/// TAGCONST `rd_consts`). TAGCONST Refs are
 /// `rd_consts[ci].getref_base()` at use (`ResumeDataDirectReader.decode_ref`).
 fn replay_pending_fields(
     dead_frame_typed: &[Value],
@@ -18643,22 +18644,39 @@ fn replay_pending_fields(
             pf.target_tagged,
             pf.value_tagged,
         );
-        // Decode the value first so materializing a virtual value can
-        // collect before we capture the target pointer. resume.py
-        // ResumeDataDirectReader._prepare_pendingfields does
-        // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
-        // every ref is GC-tracked so ordering does not matter. `setfield`
-        // / `setarrayitem` then decode the value again from the tag
-        // (`ResumeDataDirectReader.decode_ref`). The decoded struct is
-        // the SETFIELD_GC / SETARRAYITEM_GC target
+        // resume.py `_prepare_pendingfields`:
+        //   struct = self.decode_ref(num)
+        //   if itemindex < 0: self.setfield(struct, fieldnum, descr)
+        //   else: self.setarrayitem(struct, itemindex, fieldnum, descr)
+        // The decoded struct is the SETFIELD_GC / SETARRAYITEM_GC target
         // (`heap.py force_lazy_sets_for_guard`, `_add_pending_fields`)
-        // and is never NULL.
+        // and is never NULL. `setfield`/`setarrayitem` decode the value;
+        // re-read the target from its rooted slot after that decode
+        // (`abstract_virtual_struct_info_setfields` after
+        // `decode_field_source`).
+        let struct_ptr = decode_ref(
+            pf.target_tagged,
+            dead_frame_typed,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+            Some(&failarg_refs),
+        );
+        assert!(
+            !struct_ptr.is_null(),
+            "resume.py `_prepare_pendingfields`: pending-field target \
+             decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+            pf.target_tagged,
+            pf.item_index,
+            field_descr,
+        );
         let (addr, value_type, value_size, target_ptr, value_raw) = if pf.item_index < 0 {
             let fd = field_descr.as_field_descr().expect(
                 "resume.py `_prepare_pendingfields`: setfield pending field \
                  must carry a FieldDescr",
             );
-            let _ = decode_pending_value(
+            let value_raw = decode_pending_value(
                 pf.value_tagged,
                 fd.field_type(),
                 dead_frame_typed,
@@ -18670,24 +18688,6 @@ fn replay_pending_fields(
             );
             let struct_ptr = decode_ref(
                 pf.target_tagged,
-                dead_frame_typed,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-                Some(&failarg_refs),
-            );
-            assert!(
-                !struct_ptr.is_null(),
-                "resume.py `_prepare_pendingfields`: pending-field target \
-                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
-                pf.target_tagged,
-                pf.item_index,
-                field_descr,
-            );
-            let value_raw = decode_pending_value(
-                pf.value_tagged,
-                fd.field_type(),
                 dead_frame_typed,
                 num_failargs,
                 rd_consts,
@@ -18708,7 +18708,7 @@ fn replay_pending_fields(
                 "resume.py `_prepare_pendingfields`: setarrayitem pending \
                  field must carry an ArrayDescr",
             );
-            let _ = decode_pending_value(
+            let value_raw = decode_pending_value(
                 pf.value_tagged,
                 ad.item_type(),
                 dead_frame_typed,
@@ -18720,24 +18720,6 @@ fn replay_pending_fields(
             );
             let struct_ptr = decode_ref(
                 pf.target_tagged,
-                dead_frame_typed,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-                Some(&failarg_refs),
-            );
-            assert!(
-                !struct_ptr.is_null(),
-                "resume.py `_prepare_pendingfields`: pending-field target \
-                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
-                pf.target_tagged,
-                pf.item_index,
-                field_descr,
-            );
-            let value_raw = decode_pending_value(
-                pf.value_tagged,
-                ad.item_type(),
                 dead_frame_typed,
                 num_failargs,
                 rd_consts,
