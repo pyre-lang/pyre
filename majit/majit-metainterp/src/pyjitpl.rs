@@ -13801,13 +13801,12 @@ impl<M: Clone> MetaInterp<M> {
     /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
     pub fn function_entry_step(
         &mut self,
-        cell_key: u64,
-        green_key_hash: u64,
+        resolved: crate::warmstate::FunctionEntryResolved,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.function_entry_step_on_driver(0, cell_key, green_key_hash, code_slot, pc, None, reds)
+        self.function_entry_step_on_driver(0, resolved, code_slot, pc, None, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` with
@@ -13815,41 +13814,29 @@ impl<M: Clone> MetaInterp<M> {
     pub fn function_entry_step_on_driver(
         &mut self,
         jd_no: usize,
-        cell_key: u64,
-        green_key_hash: u64,
+        resolved: crate::warmstate::FunctionEntryResolved,
         code_slot: usize,
         pc: usize,
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
-        let has_this = self.has_this_driver_compiled_procedure(jd_no, cell_key);
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            return warm_state.function_entry_step(cell_key, None, || has_this, reds);
+            return warm_state.function_entry_step(resolved, None, reds);
         }
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         if let Some((values, types)) = greenargs {
             let key = majit_ir::GreenKey::from_greenargs(values, types);
             let mut live = pin.live_clone(&key);
-            return warm_state.function_entry_step(
-                cell_key,
-                Some((&pin, &mut live)),
-                || has_this,
-                reds,
-            );
+            return warm_state.function_entry_step(resolved, Some((&pin, &mut live)), reds);
         }
-        match Self::with_typed_decision_key(green_key_hash, code_slot, pc, |key, typed_pin| {
+        match Self::with_typed_decision_key(resolved.hash, code_slot, pc, |key, typed_pin| {
             let mut live = typed_pin.live_clone(key);
-            warm_state.function_entry_step(
-                cell_key,
-                Some((typed_pin, &mut live)),
-                || has_this,
-                reds,
-            )
+            warm_state.function_entry_step(resolved, Some((typed_pin, &mut live)), reds)
         }) {
             Some(step) => step,
-            None => warm_state.function_entry_step(cell_key, None, || has_this, reds),
+            None => warm_state.function_entry_step(resolved, None, reds),
         }
     }
 
@@ -15278,6 +15265,22 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state_ref_for_driver(jd_no) {
             Some(warm) => warm.resolve_cell_key_with_greenargs(green_key_hash, greenargs, types),
             None => green_key_hash,
+        }
+    }
+
+    /// `JitCell.get_jitcell(*greenargs)` for the function-entry door on that
+    /// driver's WarmEnterState. A miss is `None`, not the raw hash.
+    #[inline]
+    pub fn resolve_function_entry_cell_on_driver(
+        &self,
+        jd_no: usize,
+        green_key_hash: u64,
+        greenargs: &[i64],
+        types: &[majit_ir::GreenType],
+    ) -> crate::warmstate::FunctionEntryResolved {
+        match self.warm_state_ref_for_driver(jd_no) {
+            Some(warm) => warm.resolve_function_entry_cell(green_key_hash, greenargs, types),
+            None => crate::warmstate::FunctionEntryResolved::miss(green_key_hash),
         }
     }
 
@@ -24685,7 +24688,12 @@ mod metainterp_static_data_tests {
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-                meta.function_entry_step(0xD015, 0xD015, _zbh_pin.save(), 0, &[])
+                meta.function_entry_step(
+                    crate::warmstate::FunctionEntryResolved::miss(0xD015),
+                    _zbh_pin.save(),
+                    0,
+                    &[],
+                )
             },
             crate::warmstate::FunctionEntryStep::NotHot
         ));
@@ -27734,15 +27742,10 @@ mod metainterp_static_data_tests {
         });
 
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let on_entry = meta.function_entry_step_on_driver(
-            idx1,
-            key.get_uhash(),
-            key.get_uhash(),
-            _zbh_pin.save(),
-            0,
-            None,
-            &[],
-        );
+        let resolved =
+            crate::warmstate::FunctionEntryResolved::matched(key.get_uhash(), key.get_uhash());
+        let on_entry =
+            meta.function_entry_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, None, &[]);
         assert!(
             matches!(
                 on_entry,
@@ -27751,15 +27754,8 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let on_portal = meta.function_entry_step_on_driver(
-            0,
-            key.get_uhash(),
-            key.get_uhash(),
-            _zbh_pin.save(),
-            0,
-            None,
-            &[],
-        );
+        let on_portal =
+            meta.function_entry_step_on_driver(0, resolved, _zbh_pin.save(), 0, None, &[]);
         assert!(
             !matches!(
                 on_portal,
@@ -35240,7 +35236,12 @@ mod tests {
             matches!(
                 {
                     let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-                    meta.function_entry_step(green_key, green_key, _zbh_pin.save(), 0, &[])
+                    meta.function_entry_step(
+                        crate::warmstate::FunctionEntryResolved::matched(green_key, green_key),
+                        _zbh_pin.save(),
+                        0,
+                        &[],
+                    )
                 },
                 crate::warmstate::FunctionEntryStep::NotHot
             ),
@@ -37278,7 +37279,12 @@ mod loop_side_table_tests {
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(raw.0);
-                meta.function_entry_step(cell_key, hash, _zbh_pin.save(), raw.1, &[])
+                meta.function_entry_step(
+                    crate::warmstate::FunctionEntryResolved::matched(cell_key, hash),
+                    _zbh_pin.save(),
+                    raw.1,
+                    &[],
+                )
             },
             crate::warmstate::FunctionEntryStep::NotHot,
         ));

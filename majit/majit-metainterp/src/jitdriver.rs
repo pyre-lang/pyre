@@ -973,7 +973,8 @@ use crate::pyjitpl::{
 };
 use crate::virtualizable::VirtualizableInfo;
 use crate::warmstate::{
-    BaseJitCell, DoorCell, FunctionEntryStep, HotResult, JcFlags, WarmEnterState,
+    BaseJitCell, DoorCell, FunctionEntryResolved, FunctionEntryStep, HotResult, JcFlags,
+    WarmEnterState,
 };
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
@@ -10498,30 +10499,24 @@ impl<S: JitState> JitDriver<S> {
 
     /// The function-entry door's whole answer, from one walk of the cell chain.
     ///
-    /// `MetaInterp::function_entry_step` joins `is_tracing` with the cell
-    /// read [`crate::warmstate::WarmEnterState::function_entry_step`] performs.
-    /// `is_tracing` is not a chain walk, so that read is the only walk the
-    /// door pays for.
-    ///
-    /// `cell_key` must already name one cell; `green_key_hash` and
-    /// `green_key_raw` reconstruct its structured greens only when the
-    /// optional veto is installed.
+    /// `resolved` is the one `JitCell.get_jitcell` / `lookup_chain` walk
+    /// [`Self::resolve_function_entry_cell`] already did. `green_key_hash` on
+    /// that value reconstructs structured greens only when the optional veto
+    /// is installed.
     ///
     /// `warmstate.py maybe_compile_and_run` with
     /// `increment_function_threshold` is bound on this driver's
     /// WarmEnterState (`JitDriver::index`).
     pub fn function_entry_step(
         &mut self,
-        cell_key: u64,
-        green_key_hash: u64,
+        resolved: FunctionEntryResolved,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> FunctionEntryStep {
         self.meta.function_entry_step_on_driver(
             self.index().unwrap_or(0),
-            cell_key,
-            green_key_hash,
+            resolved,
             code_slot,
             pc,
             None,
@@ -11164,7 +11159,7 @@ impl<S: JitState> JitDriver<S> {
     /// `already_ticked` is the empty-chain overflow: the counter already
     /// returned True, so this skips [`Self::function_entry_step`] (which
     /// would tick again) and takes the Proceed arm. RunCompiled, chained
-    /// `resolve_cell_key`, decay + `stack_almost_full` +
+    /// `resolve_function_entry_cell`, decay + `stack_almost_full` +
     /// `force_start_tracing` all stay here.
     #[inline(never)]
     fn function_entry_internal(
@@ -11181,7 +11176,7 @@ impl<S: JitState> JitDriver<S> {
         let pin = door_ref_pin(state, green_values, green_types, caller_pin_save);
         let mut live = majit_ir::GreenKey::from_greenargs(green_values, green_types);
         pin.reload(&mut live);
-        let cell_key = self.resolve_cell_key_with_greenargs(
+        let resolved = self.resolve_function_entry_cell(
             green_key_hash,
             live.values.as_slice(),
             live.types.as_slice(),
@@ -11194,14 +11189,14 @@ impl<S: JitState> JitDriver<S> {
             pin.reload(&mut live);
             self.meta.function_entry_step_on_driver(
                 self.index().unwrap_or(0),
-                cell_key,
-                green_key_hash,
+                resolved,
                 pin.save(),
                 target_pc,
                 Some((live.values.as_slice(), live.types.as_slice())),
                 &confirm_reds,
             )
         };
+        let cell_key = resolved.cell_key.unwrap_or(resolved.hash);
         match step {
             FunctionEntryStep::RunCompiled(token) => self
                 .run_confirmed_entry(cell_key, token, target_pc, state, env)
@@ -11275,6 +11270,23 @@ impl<S: JitState> JitDriver<S> {
         types: &[majit_ir::GreenType],
     ) -> u64 {
         self.meta.resolve_cell_key_with_greenargs_on_driver(
+            self.index().unwrap_or(0),
+            green_key_hash,
+            greenargs,
+            types,
+        )
+    }
+
+    /// `JitCell.get_jitcell(*greenargs)` for the function-entry door.
+    /// A miss is `None`, not the raw hash standing in as a cell key.
+    #[inline]
+    pub fn resolve_function_entry_cell(
+        &self,
+        green_key_hash: u64,
+        greenargs: &[i64],
+        types: &[majit_ir::GreenType],
+    ) -> FunctionEntryResolved {
+        self.meta.resolve_function_entry_cell_on_driver(
             self.index().unwrap_or(0),
             green_key_hash,
             greenargs,
