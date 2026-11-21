@@ -260,7 +260,7 @@ fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &OopspecFns<'_>) -> bool {
     oopspec_fns.contains(&strip_crate_prefix(fd.item_meta.name_path_str()))
 }
 
-fn call_substituted_inputs(
+pub(in crate::front::mir) fn call_substituted_inputs(
     fd: &FunDecl,
     generics: &serde_json::Value,
     llbc: &Llbc,

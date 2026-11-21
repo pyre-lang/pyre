@@ -637,6 +637,29 @@ impl<'a> Lowering<'a> {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        // Look-inside callee formals (`fun_decl_is_residual` is false).
+        // A residual `&T` keeps the address (`ResidualSlot`); a
+        // look-inside `&T` is the scalar word (`input_param_value_type`).
+        let call_look_inside_formals: Vec<TyRef> = match &call.func {
+            CallFunc::Regular(RegularCall {
+                kind: CallKind::Fun(FunId::Regular { id }),
+                generics,
+            }) => self
+                .llbc
+                .fn_by_id(*id)
+                .and_then(|fd| {
+                    if fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
+                        None
+                    } else {
+                        Some(
+                            call_substituted_inputs(fd, generics, self.llbc)
+                                .unwrap_or_else(|| fd.signature.inputs.clone()),
+                        )
+                    }
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
         // against the destination type.
@@ -868,7 +891,8 @@ impl<'a> Lowering<'a> {
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
                 continue;
             }
-            args.push(self.resolve_call_arg_value(mir_bb, op)?);
+            let expected = call_look_inside_formals.get(index);
+            args.push(self.resolve_call_arg_value(mir_bb, op, expected)?);
         }
         // A pair-slice Index argument forks the emit cursor
         // (`fork_in_bounds`); later ops and the close belong on that tail.

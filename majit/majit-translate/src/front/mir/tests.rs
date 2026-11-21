@@ -43795,6 +43795,251 @@ fn copy_of_raw_const_field_does_not_inherit_interior() {
     );
 }
 
+/// `p = &mut block.capacity; *p = n` of a declared two-field GcArray
+/// wrapper. Ordinary setattr of that header is rejected (`PtrRepr.rtype_len`
+/// / `ll_fixed_length`); the interior store must share that rejection
+/// (`InteriorPtrRepr.rtype_setattr` goes through the same setattr).
+#[test]
+fn store_through_gcarray_header_borrow_is_unsupported() {
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty.clone()), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let block_ty = interior_adt(0);
+    let mut_block = mut_ref(&block_ty);
+    let mut_usize = mut_ref(&usize_ty);
+    let unit = interior_unit_ty();
+    let field_place = interior_field(1, &mut_block, &block_ty, &usize_ty, 0);
+    let caller = interior_caller(
+        "store_typed_items_block_capacity",
+        2,
+        vec![mut_block.clone(), usize_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("block"), &mut_block),
+            interior_local(2, Some("n"), &usize_ty),
+            interior_local(3, Some("p"), &mut_usize),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_mut_field_borrow(interior_place(3, &mut_usize), field_place),
+                interior_assign(
+                    interior_deref(3, &mut_usize, &usize_ty),
+                    interior_use(interior_place(2, &usize_ty)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_declared_gc("fixture", vec![block], vec![caller], &[0]);
+    let err = crate::test_support::lower_function(&llbc, "store_typed_items_block_capacity")
+        .expect_err("interior store of a GcArray length header must be reported");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert!(
+                msg.contains("GcArray length header"),
+                "expected length-header write report, got {msg}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `q = &*p` of `p: *mut i64` passed to a look-inside helper whose `&i64`
+/// param is the scalar word (`input_param_value_type`). The reborrow is
+/// the address (`scalar_address_locals`); `callparse` converts at the
+/// boundary (`rewrite_op_raw_load`).
+#[test]
+fn look_inside_of_raw_ptr_reborrow_receives_the_word() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty.clone());
+    let shared_i64 = shared_ref(&i64_ty);
+    let deref_p = interior_deref(1, &ptr_ty, &i64_ty);
+    let q_place = interior_place(2, &shared_i64);
+    let caller = interior_caller(
+        "call_load",
+        1,
+        vec![ptr_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr_ty),
+            interior_local(2, Some("q"), &shared_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    q_place,
+                    serde_json::json!({
+                        "Ref": {
+                            "place": deref_p,
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }
+                    }),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &shared_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let mut helper = interior_caller(
+        "load_word",
+        1,
+        vec![shared_i64.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &shared_i64),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &i64_ty),
+                interior_use(interior_deref(1, &shared_i64, &i64_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    helper["def_id"] = serde_json::json!(1);
+    let llbc = llbc_with_types("fixture", vec![], vec![caller, helper]);
+    let graph = crate::test_support::lower_function(&llbc, "call_load")
+        .expect("lower look-inside load_word(&*p) of *mut i64");
+    let ops = graph_ops(&graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == p => op.result.clone(),
+        _ => None,
+    });
+    let loaded =
+        loaded.unwrap_or_else(|| panic!("look-inside arg must RawLoad through p; ops={ops:?}"));
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("load_word") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("load_word call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("load_word arg0 {other:?}; ops={ops:?}"),
+    };
+    assert_eq!(
+        arg0, &loaded,
+        "look-inside `&i64` must receive the loaded word, not the address; ops={ops:?}"
+    );
+    assert_ne!(
+        arg0, p,
+        "look-inside `&i64` must not receive the raw address; ops={ops:?}"
+    );
+}
+
+/// `p = &obj.field; holder.reference = p`. Projection assignment uses
+/// `build_rvalue(..., None)`, so the operand must yield the field value
+/// (`PtrRepr.rtype_setattr`), not the owner without its field path.
+#[test]
+fn projection_assign_of_field_borrow_temp_stores_the_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let holder_ty = interior_adt(1);
+    let mut_obj = mut_ref(&obj_ty);
+    let mut_holder = mut_ref(&holder_ty);
+    let shared_i64 = shared_ref(&i64_ty);
+    let unit = interior_unit_ty();
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let reference_place = interior_field(2, &mut_holder, &holder_ty, &shared_i64, 0);
+    let caller = interior_caller(
+        "store_reference",
+        2,
+        vec![mut_obj.clone(), mut_holder.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("holder"), &mut_holder),
+            interior_local(3, Some("p"), &shared_i64),
+        ],
+        vec![interior_bb(
+            vec![
+                assign_shared_field_borrow(interior_place(3, &shared_i64), field_place),
+                interior_assign(
+                    reference_place,
+                    interior_use(interior_place(3, &shared_i64)),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let holder_decl = interior_struct(
+        1,
+        &["fixture", "Holder"],
+        &[("reference", shared_i64)],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![gc_obj_i64_field_decl(), holder_decl],
+        vec![caller],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "store_reference")
+        .expect("lower holder.reference = p of p = &obj.field");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert_eq!(
+        reads.len(),
+        1,
+        "projection assign must getfield the owner; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ..
+            } if field.name == "reference" => v == reads[0],
+            _ => false,
+        }),
+        "holder.reference must store the field value; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(v),
+                ..
+            } if field.name == "reference" => v == obj,
+            _ => false,
+        }),
+        "holder.reference must not store the GC owner; ops={ops:?}"
+    );
+}
+
 /// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through
 /// `Option<&mut Handle>` of a one-word GC handle. The Some payload and
 /// the TwoPhaseMut reborrow inherit the MutRef cell, so `*p = fresh` is

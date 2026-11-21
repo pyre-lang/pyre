@@ -1616,22 +1616,6 @@ impl<'a> Lowering<'a> {
                     // move must not overwrite the class word.
                     let store_rstr_attr = self.exception_disc_info_for_ty(&field_base_ty).is_some()
                         && tyref_is_by_value_alloc_string(dest_ty, self.llbc);
-                    // GcArray length is immutable after allocation
-                    // (`lltype.py` `Array.getlength`; `rlist.py`
-                    // `ll_fixed_length`). A FieldWrite of the offset-0
-                    // integer of a declared two-field `{integer, [T; 0]}`
-                    // wrapper is a producer bug. Prefix fields of a
-                    // `GcStruct` with `_arrayfld`, and an ordinary
-                    // two-field struct that is not a declared `GcArray`,
-                    // stay ordinary stores.
-                    if self
-                        .flexible_gcarray_header_array_type_id(&field_base_ty, field_payload)
-                        .is_some()
-                    {
-                        return Err(LowerError::Unsupported(format!(
-                            "bb{mir_bb}: write of a GcArray length header (immutable after allocation)"
-                        )));
-                    }
                     // Same seam for a by-value `Vec<String>`: one list word,
                     // not a leaf copy of `{cap, ptr, len}` over the class word.
                     let store_list_of_str =
@@ -2489,13 +2473,12 @@ impl<'a> Lowering<'a> {
                 if let Some(dest_local) = dest_local
                     && let Some(src_local) = operand_local(Some(&operand))
                     && let Some((src_place, ..)) = self.field_interior_access(src_local)
-                    && !self.records_atomic_ref_place(dest_local, &src_place)
+                    && self.records_atomic_ref_place(dest_local, &src_place)
                 {
-                    // Dest will not carry the field path: copy the field
-                    // value (`PtrRepr.rtype_getattr`), the pre-r36 bind.
-                    if let Some(v) = self.field_interior_value_at_use(mir_bb, src_local)? {
-                        return Ok((None, v));
-                    }
+                    // Dest carries the field path (`InteriorPtrRepr`
+                    // `lowleveltype = parentptrtype`): bind the owner.
+                    let v = self.defined_local(mir_bb, src_local)?;
+                    return Ok((None, v));
                 }
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // Plain use — reuse the operand's Variable without
@@ -3924,7 +3907,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .nth(index)
                             .expect("aggregate_shape checked the operand index");
-                        let value = self.resolve_call_arg_value(mir_bb, operand)?;
+                        let value = self.resolve_call_arg_value(mir_bb, operand, None)?;
                         // `GcRef(p as usize)`: the operand is the address integer
                         // from `cast_ptr_to_int` + `r_uint`, but the list item
                         // kind is the `GcRef::NULL` `ConstRefNull`
@@ -4031,7 +4014,7 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
-                            arg_vars.push(self.resolve_call_arg_value(mir_bb, op)?);
+                            arg_vars.push(self.resolve_call_arg_value(mir_bb, op, None)?);
                             pair_lens.push(None);
                         }
                         if pair_lens.iter().any(Option::is_some)
@@ -5301,28 +5284,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         op: Operand,
     ) -> Result<Variable, LowerError> {
-        match op {
-            Operand::Copy(place) => self.resolve_place(mir_bb, place),
-            Operand::Move(place) => {
-                // A `move c` of a builder-mode accumulator is its single
-                // `ll_build` materialisation point
-                // (`accumulator_materialization_site_count == 1`). Emit the
-                // `__majit_stringbuilder_build` marker
-                // (`flowspace_adapter` → getattr("build") + simple_call →
-                // `SomeString`) instead of moving the concat accumulator out.
-                // Only a bare `Local(c)` move qualifies; a projection falls
-                // through. Inert unless this function selected builder mode and
-                // the local is an accumulator (read from the per-body table).
-                if let PlaceKind::Local(i) = place.kind
-                    && self.builder_mode
-                    && self.accumulator_is_builder_mode(i as usize)
-                {
-                    return self.resolve_builder_build(mir_bb, i as usize);
-                }
-                self.resolve_place(mir_bb, place)
-            }
-            Operand::Const(value) => self.emit_constant(mir_bb, &value),
-        }
+        self.resolve_call_arg_value(mir_bb, op, None)
     }
 
     /// Emit the `__majit_stringbuilder_build(c)` marker for the terminal
@@ -7789,7 +7751,8 @@ impl<'a> Lowering<'a> {
     /// Ordinary Adt `Field` setattr after the base Variable is known
     /// (`PtrRepr.rtype_setattr` / `InstanceRepr.rtype_setattr`). Field-only
     /// interior uses this with the owner Variable as base
-    /// (`InteriorPtrRepr.rtype_setattr`).
+    /// (`InteriorPtrRepr.rtype_setattr`). Length headers are not a
+    /// settable field (`PtrRepr.rtype_len` / `ll_fixed_length`).
     fn emit_resolved_adt_field_write(
         &mut self,
         mir_bb: usize,
@@ -7799,6 +7762,18 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         mut value: LinkArg,
     ) -> Result<(), LowerError> {
+        // Length header of a declared two-field `GcArray` wrapper
+        // (`lltype.py` `Array.getlength`; `rlist.py` `ll_fixed_length`).
+        // The word is not a settable field. Ordinary projection writes
+        // and field-only interior stores share this rejection.
+        if self
+            .flexible_gcarray_header_array_type_id(&inner.ty, field_payload)
+            .is_some()
+        {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: write of a GcArray length header (immutable after allocation)"
+            )));
+        }
         let bb_id = self.emit_bb(mir_bb);
         let field_base_ty = clone_tyref(&inner.ty);
         let base_is_deref = inner.is_deref_projection();
@@ -7987,22 +7962,72 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Value consumer of a field-interior temp: getfield so a residual call
-    /// arg or an Aggregate payload receives the field value
-    /// (`ann_cast_ptr_to_adr` refuses a GC interior address). A Use-copy of
-    /// the temp still copies the parent (`InteriorPtrRepr` field-only
-    /// `lowleveltype = parentptrtype`).
+    /// Represented VALUE of an operand. A field-interior local yields
+    /// getfield (`InteriorPtrRepr.rtype_getattr`). A `scalar_address_locals`
+    /// reborrow yields RawLoad when `expected_ty` is a look-inside
+    /// scalar-word `&T` (`input_param_value_type` /
+    /// `tyref_scalar_pointee_value_type`; `callparse` / `rewrite_op_raw_load`).
+    /// Deref / `mem_slot` / a Use-copy that records the path skip this
+    /// and read the owner or address. `expected_ty` None keeps a
+    /// scalar-address as the live address (residual `&T` ABI).
     pub(in crate::front::mir) fn resolve_call_arg_value(
         &mut self,
         mir_bb: usize,
         op: Operand,
+        expected_ty: Option<&TyRef>,
     ) -> Result<Variable, LowerError> {
-        if let Some(local) = operand_local(Some(&op))
-            && let Some(v) = self.field_interior_value_at_use(mir_bb, local)?
-        {
-            return Ok(v);
+        if let Some(local) = operand_local(Some(&op)) {
+            if let Some(v) = self.field_interior_value_at_use(mir_bb, local)? {
+                return Ok(v);
+            }
+            if self.scalar_address_locals.contains(&local)
+                && expected_ty.is_some_and(|ty| {
+                    raw_scalar_address_value_type(ty, self.llbc).is_none()
+                        && tyref_scalar_pointee_value_type(ty, self.llbc).is_some()
+                })
+                && let Some(local_ty) = self.mir_local_ty(local)
+            {
+                let pointee = tyref_peel_one_ref_node(&local_ty, self.llbc)
+                    .map(|node| TyRef::Other(node.clone().into()))
+                    .unwrap_or(local_ty);
+                if let Some((item_ty, itemsize, is_item_signed)) =
+                    function_local_primitive_cell_descr(&pointee, self.llbc)
+                {
+                    let ptr = self.defined_local(mir_bb, local)?;
+                    let bb = self.emit_bb(mir_bb);
+                    return Ok(emit_raw_cell_load(
+                        &mut self.graph,
+                        bb,
+                        ptr,
+                        item_ty,
+                        itemsize,
+                        is_item_signed,
+                    ));
+                }
+            }
         }
-        self.resolve_operand(mir_bb, op)
+        match op {
+            Operand::Copy(place) => self.resolve_place(mir_bb, place),
+            Operand::Move(place) => {
+                // A `move c` of a builder-mode accumulator is its single
+                // `ll_build` materialisation point
+                // (`accumulator_materialization_site_count == 1`). Emit the
+                // `__majit_stringbuilder_build` marker
+                // (`flowspace_adapter` → getattr("build") + simple_call →
+                // `SomeString`) instead of moving the concat accumulator out.
+                // Only a bare `Local(c)` move qualifies; a projection falls
+                // through. Inert unless this function selected builder mode and
+                // the local is an accumulator (read from the per-body table).
+                if let PlaceKind::Local(i) = place.kind
+                    && self.builder_mode
+                    && self.accumulator_is_builder_mode(i as usize)
+                {
+                    return self.resolve_builder_build(mir_bb, i as usize);
+                }
+                self.resolve_place(mir_bb, place)
+            }
+            Operand::Const(value) => self.emit_constant(mir_bb, &value),
+        }
     }
 
     /// `&T` of a transparent scalar is the word, so the field read stays a
