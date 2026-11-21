@@ -6897,7 +6897,21 @@ impl<M: Clone> MetaInterp<M> {
             .preserve_nested_overflow(hash);
     }
 
-    /// Force-start tracing for a green key, bypassing the hot counter.
+    /// `warmstate.py bound_reached` steps 1-3 on this driver's warm state.
+    pub fn bound_reached_prelude(
+        &mut self,
+        jd_no: usize,
+        greens: &[i64],
+        green_types: &[majit_ir::GreenType],
+        reds: &[Value],
+    ) -> bool {
+        self.warm_state_for_driver(jd_no)
+            .bound_reached_prelude(greens, green_types, reds)
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5: install the cell if needed
+    /// and mark `JC_TRACING | JC_TRACING_OCCURRED`. Confirm, decay, and
+    /// stack ran in [`Self::bound_reached_prelude`].
     ///
     /// `code_slot` is the live pin of the portal `W_Code` (or the first
     /// Ref green). Reload after collecting calls
@@ -7124,12 +7138,11 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// RPython warmstate.py `bound_reached` parity.
+    /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
+    /// Confirm, decay, and stack ran in [`Self::bound_reached_prelude`].
     ///
     /// Like `on_back_edge_typed` but bypasses the counter tick — the
     /// caller (can_enter_jit_hook) already verified the counter fired.
-    /// This allows decay_counters() to be called before tracing starts
-    /// without the internal tick check blocking the trace.
     ///
     /// `code_slot` is the live pin of the portal `W_Code`.
     pub fn bound_reached(
@@ -7144,10 +7157,6 @@ impl<M: Clone> MetaInterp<M> {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
-        }
-        self.decay_counters();
-        if Self::stack_almost_full() {
-            return BackEdgeAction::Interpret;
         }
 
         let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
@@ -7296,8 +7305,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Commit a `StartTracing` answer from
     /// [`Self::on_back_edge_typed_decision_on_driver`] and consume the expensive tracing
-    /// arguments.  `bound_reached` re-runs the cell policy without ticking the
-    /// counter, then marks the cell and sets up the trace.
+    /// arguments. The caller ran [`Self::bound_reached_prelude`]; this is
+    /// steps 4-5 plus `setup_tracing`.
     pub(crate) fn start_back_edge_trace(
         &mut self,
         green_key: u64,
@@ -7336,14 +7345,24 @@ impl<M: Clone> MetaInterp<M> {
             live_values,
         ) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => self.start_back_edge_trace(
-                green_key,
-                code_slot,
-                target_pc,
-                green_key_values,
-                driver_descriptor,
-                live_values,
-            ),
+            HotResult::StartTracing => {
+                let (greens, types): (&[i64], &[majit_ir::GreenType]) =
+                    match green_key_values.as_ref() {
+                        Some(k) => (&k.values, &k.types),
+                        None => (&[], &[]),
+                    };
+                if !self.bound_reached_prelude(jd_no, greens, types, live_values) {
+                    return BackEdgeAction::Interpret;
+                }
+                self.start_back_edge_trace(
+                    green_key,
+                    code_slot,
+                    target_pc,
+                    green_key_values,
+                    driver_descriptor,
+                    live_values,
+                )
+            }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
@@ -13801,13 +13820,12 @@ impl<M: Clone> MetaInterp<M> {
     /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
     pub fn function_entry_step(
         &mut self,
-        cell_key: u64,
-        green_key_hash: u64,
+        resolved: crate::warmstate::FunctionEntryResolved,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.function_entry_step_on_driver(0, cell_key, green_key_hash, code_slot, pc, None, reds)
+        self.function_entry_step_on_driver(0, resolved, code_slot, pc, None, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` with
@@ -13815,41 +13833,29 @@ impl<M: Clone> MetaInterp<M> {
     pub fn function_entry_step_on_driver(
         &mut self,
         jd_no: usize,
-        cell_key: u64,
-        green_key_hash: u64,
+        resolved: crate::warmstate::FunctionEntryResolved,
         code_slot: usize,
         pc: usize,
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
-        let has_this = self.has_this_driver_compiled_procedure(jd_no, cell_key);
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            return warm_state.function_entry_step(cell_key, None, || has_this, reds);
+            return warm_state.function_entry_step(resolved, None, reds);
         }
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         if let Some((values, types)) = greenargs {
             let key = majit_ir::GreenKey::from_greenargs(values, types);
             let mut live = pin.live_clone(&key);
-            return warm_state.function_entry_step(
-                cell_key,
-                Some((&pin, &mut live)),
-                || has_this,
-                reds,
-            );
+            return warm_state.function_entry_step(resolved, Some((&pin, &mut live)), reds);
         }
-        match Self::with_typed_decision_key(green_key_hash, code_slot, pc, |key, typed_pin| {
+        match Self::with_typed_decision_key(resolved.hash, code_slot, pc, |key, typed_pin| {
             let mut live = typed_pin.live_clone(key);
-            warm_state.function_entry_step(
-                cell_key,
-                Some((typed_pin, &mut live)),
-                || has_this,
-                reds,
-            )
+            warm_state.function_entry_step(resolved.clone(), Some((typed_pin, &mut live)), reds)
         }) {
             Some(step) => step,
-            None => warm_state.function_entry_step(cell_key, None, || has_this, reds),
+            None => warm_state.function_entry_step(resolved, None, reds),
         }
     }
 
@@ -15278,6 +15284,22 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state_ref_for_driver(jd_no) {
             Some(warm) => warm.resolve_cell_key_with_greenargs(green_key_hash, greenargs, types),
             None => green_key_hash,
+        }
+    }
+
+    /// `JitCell.get_jitcell(*greenargs)` for the function-entry door on that
+    /// driver's WarmEnterState. A miss is `None`, not the raw hash.
+    #[inline]
+    pub fn resolve_function_entry_cell_on_driver(
+        &self,
+        jd_no: usize,
+        green_key_hash: u64,
+        greenargs: &[i64],
+        types: &[majit_ir::GreenType],
+    ) -> crate::warmstate::FunctionEntryResolved {
+        match self.warm_state_ref_for_driver(jd_no) {
+            Some(warm) => warm.resolve_function_entry_cell(green_key_hash, greenargs, types),
+            None => crate::warmstate::FunctionEntryResolved::miss(green_key_hash),
         }
     }
 
@@ -24685,7 +24707,12 @@ mod metainterp_static_data_tests {
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-                meta.function_entry_step(0xD015, 0xD015, _zbh_pin.save(), 0, &[])
+                meta.function_entry_step(
+                    crate::warmstate::FunctionEntryResolved::miss(0xD015),
+                    _zbh_pin.save(),
+                    0,
+                    &[],
+                )
             },
             crate::warmstate::FunctionEntryStep::NotHot
         ));
@@ -27734,15 +27761,11 @@ mod metainterp_static_data_tests {
         });
 
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let on_entry = meta.function_entry_step_on_driver(
-            idx1,
-            key.get_uhash(),
-            key.get_uhash(),
-            _zbh_pin.save(),
-            0,
-            None,
-            &[],
-        );
+        let hash = key.get_uhash();
+        let resolved_entry =
+            meta.resolve_function_entry_cell_on_driver(idx1, hash, &key.values, &key.types);
+        let on_entry =
+            meta.function_entry_step_on_driver(idx1, resolved_entry, _zbh_pin.save(), 0, None, &[]);
         assert!(
             matches!(
                 on_entry,
@@ -27751,15 +27774,10 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let on_portal = meta.function_entry_step_on_driver(
-            0,
-            key.get_uhash(),
-            key.get_uhash(),
-            _zbh_pin.save(),
-            0,
-            None,
-            &[],
-        );
+        let resolved_portal =
+            meta.resolve_function_entry_cell_on_driver(0, hash, &key.values, &key.types);
+        let on_portal =
+            meta.function_entry_step_on_driver(0, resolved_portal, _zbh_pin.save(), 0, None, &[]);
         assert!(
             !matches!(
                 on_portal,
@@ -35240,7 +35258,14 @@ mod tests {
             matches!(
                 {
                     let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-                    meta.function_entry_step(green_key, green_key, _zbh_pin.save(), 0, &[])
+                    let resolved = {
+                        let cell = meta
+                            .warm_state_for_driver(0)
+                            .cell_by_key(green_key)
+                            .expect("tmp callback cell");
+                        crate::warmstate::FunctionEntryResolved::matched(cell, green_key)
+                    };
+                    meta.function_entry_step(resolved, _zbh_pin.save(), 0, &[])
                 },
                 crate::warmstate::FunctionEntryStep::NotHot
             ),
@@ -36032,6 +36057,10 @@ mod tests {
         let green_key = crate::green_key_from_code_ptr(code, pc);
         {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((code) as usize);
+            assert!(
+                meta.bound_reached_prelude(0, &[], &[], &[Value::Int(0)]),
+                "warmstate.py bound_reached steps 1-3"
+            );
             meta.bound_reached(green_key, _zbh_pin.save(), pc, None, None, &[Value::Int(0)])
         };
         assert!(meta.tracing.is_some(), "bound_reached must start tracing");
@@ -36078,6 +36107,10 @@ mod tests {
         let green_key = crate::green_key_from_code_ptr(code, pc);
         {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((code) as usize);
+            assert!(
+                meta.bound_reached_prelude(0, &[], &[], &[Value::Int(0)]),
+                "warmstate.py bound_reached steps 1-3"
+            );
             meta.bound_reached(green_key, _zbh_pin.save(), pc, None, None, &[Value::Int(0)])
         };
         assert!(meta.tracing.is_some(), "bound_reached must start tracing");
@@ -37278,7 +37311,14 @@ mod loop_side_table_tests {
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(raw.0);
-                meta.function_entry_step(cell_key, hash, _zbh_pin.save(), raw.1, &[])
+                let resolved = {
+                    let cell = meta
+                        .warm_state_for_driver(0)
+                        .cell_by_key(cell_key)
+                        .expect("runnable portal cell");
+                    crate::warmstate::FunctionEntryResolved::matched(cell, hash)
+                };
+                meta.function_entry_step(resolved, _zbh_pin.save(), raw.1, &[])
             },
             crate::warmstate::FunctionEntryStep::NotHot,
         ));
