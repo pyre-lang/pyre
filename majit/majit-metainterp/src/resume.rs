@@ -349,18 +349,24 @@ impl SnapshotBox {
             self.cached = None;
             return;
         }
-        self.cached = Some(
-            cache
-                .get(self.opref.raw() as usize)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "rebind_iter_cache: TraceIterator._get({:?}) is None (cache_len={})",
-                        self.opref,
-                        cache.len(),
-                    )
-                }),
-        );
+        let entry = cache
+            .get(self.opref.raw() as usize)
+            .and_then(|slot| slot.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "rebind_iter_cache: TraceIterator._get({:?}) is None (cache_len={})",
+                    self.opref,
+                    cache.len(),
+                )
+            });
+        if self
+            .cached
+            .as_ref()
+            .is_some_and(|held| held.is_same_box(entry))
+        {
+            return;
+        }
+        self.cached = Some(entry.clone());
     }
 }
 

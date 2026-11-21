@@ -828,14 +828,20 @@ pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -
             SnapshotBox::typed(*opref, tp)
         }
         crate::recorder::SnapshotTagged::Const(val, tp) => {
-            // `Type::Ref` stores a const_ptr_table index. Resolve at the use.
-            let bits = if *tp == majit_ir::Type::Ref {
-                majit_ir::const_ptr_table::resolve(*val as u32).0 as i64
+            // `Type::Ref` payload is a const_ptr_table index
+            // (`SnapshotTagged::const_ref` / history.py `ConstPtr`).
+            // `Operand::from_opref(OpRef::ConstPtr(idx))` stores
+            // `WideStored::Ref(idx)` without intern. Index 0 is null
+            // (`const_ref(0)` / intern(NULL) → 0) and stays NullRef.
+            if *tp == majit_ir::Type::Ref {
+                if *val == 0 {
+                    SnapshotBox::from_cached(Operand::const_from_value(Value::Ref(GcRef::NULL)))
+                } else {
+                    SnapshotBox::from_cached(Operand::from_opref(OpRef::ConstPtr(*val as u32)))
+                }
             } else {
-                *val
-            };
-            let value = heap_value_for(*tp, bits);
-            SnapshotBox::from_cached(Operand::const_from_value(value))
+                SnapshotBox::from_cached(Operand::const_from_value(heap_value_for(*tp, *val)))
+            }
         }
     }
 }
@@ -1071,14 +1077,16 @@ fn snapshot_map_from_byte_recorder(
     SnapshotBoxes,
     SnapshotFramePcs,
 ) {
-    let n = recorder.snapshot_offset_count();
+    let positions = recorder.captured_resume_positions();
+    let n = positions.len();
+    let frame_count = recorder.captured_frame_count_from_positions(&positions);
     let mut box_map = Vec::with_capacity(n);
     let mut size_map = SnapshotFrameSizes::with_capacity(n, 0);
-    size_map.reserve_frames(recorder.captured_frame_count());
+    size_map.reserve_frames(frame_count);
     let mut vable_map = Vec::with_capacity(n);
     let mut vref_map = Vec::with_capacity(n);
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
-    frame_pcs_map.reserve_frames(recorder.captured_frame_count());
+    frame_pcs_map.reserve_frames(frame_count);
     let tagged_to_box =
         |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
     recorder.for_each_captured_snapshot_arrays(|offset, it| {
@@ -1596,7 +1604,7 @@ fn translate_trace_iter_box_map(
             // parent-loop cache box, and after the map the slot is in the
             // fresh-iterator namespace.
             boxref.rebind_iter_cache(cache);
-            *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
+            boxref.opref = translate_trace_iter_opref(boxref.opref, cache);
         }
     }
     box_map

@@ -665,7 +665,7 @@ impl Trace {
         self.captured_resume_positions().len()
     }
 
-    fn captured_resume_positions(&self) -> Vec<usize> {
+    pub(crate) fn captured_resume_positions(&self) -> Vec<usize> {
         let Some(trb) = self.trb.as_ref() else {
             return Vec::new();
         };
@@ -686,15 +686,19 @@ impl Trace {
         out
     }
 
-    pub(crate) fn captured_frame_count(&self) -> usize {
+    pub(crate) fn captured_frame_count_from_positions(&self, positions: &[usize]) -> usize {
         let Some(trb) = self.trb.as_ref() else {
             return 0;
         };
         let mut n = 0;
-        for offset in self.captured_resume_positions() {
+        for &offset in positions {
             n += trb.get_snapshot_iter(offset).framestack.len();
         }
         n
+    }
+
+    pub fn captured_frame_count(&self) -> usize {
+        self.captured_frame_count_from_positions(&self.captured_resume_positions())
     }
 
     fn encode_jitcode_index(idx: u32) -> i64 {
@@ -3273,6 +3277,8 @@ mod tests {
             rec.captured_resume_positions(),
             vec![off0 as usize, off2 as usize]
         );
+        assert_eq!(rec.snapshot_offset_count(), 2);
+        assert_eq!(rec.captured_frame_count(), 2);
     }
 
     #[test]

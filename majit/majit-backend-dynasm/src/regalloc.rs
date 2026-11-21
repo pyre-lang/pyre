@@ -1478,10 +1478,22 @@ impl<'a> RegAlloc<'a> {
         // not alias, so one manager's queue flushes before the other's.
         // `pending_moves` is the out-of-line immediate materialisation from
         // `gc_offset_loc`, queued after those operand moves.
-        let rm_moves: Vec<_> = self.rm.spill_moves.drain(..).collect();
-        let xrm_moves: Vec<_> = self.xrm.spill_moves.drain(..).collect();
-        let pending: Vec<_> = self.pending_moves.drain(..).collect();
-        for (src, dst) in rm_moves.into_iter().chain(xrm_moves).chain(pending) {
+        // `regalloc_mov` only emits (assembler.rs `regalloc_mov`); it does
+        // not queue onto these vectors, so each drain can feed the
+        // assembler directly.
+        for (src, dst) in self.rm.spill_moves.drain(..) {
+            if majit_ir::debug::have_debug_prints() {
+                majit_ir::debug::log_one("jit-backend", &format!("move: {src:?} → {dst:?}"));
+            }
+            asm.regalloc_mov(&src, &dst);
+        }
+        for (src, dst) in self.xrm.spill_moves.drain(..) {
+            if majit_ir::debug::have_debug_prints() {
+                majit_ir::debug::log_one("jit-backend", &format!("move: {src:?} → {dst:?}"));
+            }
+            asm.regalloc_mov(&src, &dst);
+        }
+        for (src, dst) in self.pending_moves.drain(..) {
             if majit_ir::debug::have_debug_prints() {
                 majit_ir::debug::log_one("jit-backend", &format!("move: {src:?} → {dst:?}"));
             }
