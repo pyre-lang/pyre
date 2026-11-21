@@ -13833,7 +13833,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         match Self::with_typed_decision_key(resolved.hash, code_slot, pc, |key, typed_pin| {
             let mut live = typed_pin.live_clone(key);
-            warm_state.function_entry_step(resolved, Some((typed_pin, &mut live)), reds)
+            warm_state.function_entry_step(resolved.clone(), Some((typed_pin, &mut live)), reds)
         }) {
             Some(step) => step,
             None => warm_state.function_entry_step(resolved, None, reds),
@@ -27742,10 +27742,11 @@ mod metainterp_static_data_tests {
         });
 
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let resolved =
-            crate::warmstate::FunctionEntryResolved::matched(key.get_uhash(), key.get_uhash());
+        let hash = key.get_uhash();
+        let resolved_entry =
+            meta.resolve_function_entry_cell_on_driver(idx1, hash, &key.values, &key.types);
         let on_entry =
-            meta.function_entry_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, None, &[]);
+            meta.function_entry_step_on_driver(idx1, resolved_entry, _zbh_pin.save(), 0, None, &[]);
         assert!(
             matches!(
                 on_entry,
@@ -27754,8 +27755,10 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
+        let resolved_portal =
+            meta.resolve_function_entry_cell_on_driver(0, hash, &key.values, &key.types);
         let on_portal =
-            meta.function_entry_step_on_driver(0, resolved, _zbh_pin.save(), 0, None, &[]);
+            meta.function_entry_step_on_driver(0, resolved_portal, _zbh_pin.save(), 0, None, &[]);
         assert!(
             !matches!(
                 on_portal,
@@ -35236,12 +35239,14 @@ mod tests {
             matches!(
                 {
                     let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-                    meta.function_entry_step(
-                        crate::warmstate::FunctionEntryResolved::matched(green_key, green_key),
-                        _zbh_pin.save(),
-                        0,
-                        &[],
-                    )
+                    let resolved = {
+                        let cell = meta
+                            .warm_state_for_driver(0)
+                            .cell_by_key(green_key)
+                            .expect("tmp callback cell");
+                        crate::warmstate::FunctionEntryResolved::matched(cell, green_key)
+                    };
+                    meta.function_entry_step(resolved, _zbh_pin.save(), 0, &[])
                 },
                 crate::warmstate::FunctionEntryStep::NotHot
             ),
@@ -37279,12 +37284,14 @@ mod loop_side_table_tests {
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(raw.0);
-                meta.function_entry_step(
-                    crate::warmstate::FunctionEntryResolved::matched(cell_key, hash),
-                    _zbh_pin.save(),
-                    raw.1,
-                    &[],
-                )
+                let resolved = {
+                    let cell = meta
+                        .warm_state_for_driver(0)
+                        .cell_by_key(cell_key)
+                        .expect("runnable portal cell");
+                    crate::warmstate::FunctionEntryResolved::matched(cell, hash)
+                };
+                meta.function_entry_step(resolved, _zbh_pin.save(), raw.1, &[])
             },
             crate::warmstate::FunctionEntryStep::NotHot,
         ));

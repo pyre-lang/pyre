@@ -125,7 +125,7 @@ pub fn tuple_hash_green_hash(w_type: PyObjectRef) -> u64 {
 /// `JitCell.get_jitcell(*greenargs)` compares the live greens in place, so
 /// this builds no [`GreenKey`]. Function-entry uses
 /// `resolve_function_entry_cell` (`eval.rs` `tuple_hash_function_entry_jit`),
-/// which reports a miss as `None` rather than the raw hash.
+/// which carries the matched cell or `None` rather than the raw hash.
 #[inline]
 pub fn tuple_hash_resolved_cell_key(
     warm: &majit_metainterp::warmstate::WarmEnterState,

@@ -10075,6 +10075,7 @@ fn tuple_hash_function_entry_jit(
     );
     let greenargs = [pin.get() as i64];
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
+    let cell_key = resolved.cell_key().unwrap_or(hash);
     let step = driver.meta_interp_mut().function_entry_step_on_driver(
         jd_no,
         resolved,
@@ -10086,7 +10087,6 @@ fn tuple_hash_function_entry_jit(
         )),
         &[],
     );
-    let cell_key = resolved.cell_key.unwrap_or(hash);
     let w_type = pin.get() as pyre_object::PyObjectRef;
     let w_tuple = roots.get(base + 1);
     match step {
@@ -15943,7 +15943,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
-    let green_key = resolved.cell_key.unwrap_or(green_key_hash);
+    let green_key = resolved.cell_key().unwrap_or(green_key_hash);
 
     // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
     // the cell the chain walk found (`function_entry_step` → AlreadyTracing,
