@@ -973,8 +973,7 @@ use crate::pyjitpl::{
 };
 use crate::virtualizable::VirtualizableInfo;
 use crate::warmstate::{
-    BaseJitCell, DoorCell, FunctionEntryResolved, FunctionEntryStep, HotResult, JcFlags,
-    WarmEnterState,
+    BaseJitCell, DoorCell, FunctionEntryStep, HotResult, JcFlags, ResolvedJitCell, WarmEnterState,
 };
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
@@ -10486,22 +10485,24 @@ impl<S: JitState> JitDriver<S> {
             })
     }
 
-    /// The back-edge door's whole answer from the warm-state policy that owns
-    /// both trace-start and compiled-entry decisions.
+    /// The back-edge door's whole answer, from one walk of the cell chain.
     ///
-    /// `warmstate.py maybe_compile_and_run` is bound on this driver's
-    /// WarmEnterState (`JitDriver::index`).
+    /// `resolved` is the one `JitCell.get_jitcell` / `lookup_chain` walk
+    /// [`Self::resolve_jit_cell`] already did.
+    ///
+    /// `warmstate.py maybe_compile_and_run` with `increment_threshold` is
+    /// bound on this driver's WarmEnterState (`JitDriver::index`).
     #[inline]
     pub fn maybe_compile_and_run_step(
         &mut self,
-        green_key: u64,
+        resolved: ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.meta.maybe_compile_and_run_step_on_driver(
             self.index().unwrap_or(0),
-            green_key,
+            resolved,
             code_slot,
             pc,
             reds,
@@ -10511,7 +10512,7 @@ impl<S: JitState> JitDriver<S> {
     /// The function-entry door's whole answer, from one walk of the cell chain.
     ///
     /// `resolved` is the one `JitCell.get_jitcell` / `lookup_chain` walk
-    /// [`Self::resolve_function_entry_cell`] already did. `green_key_hash` on
+    /// [`Self::resolve_jit_cell`] already did. `green_key_hash` on
     /// that value reconstructs structured greens only when the optional veto
     /// is installed.
     ///
@@ -10520,7 +10521,7 @@ impl<S: JitState> JitDriver<S> {
     /// WarmEnterState (`JitDriver::index`).
     pub fn function_entry_step(
         &mut self,
-        resolved: FunctionEntryResolved,
+        resolved: ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
@@ -11094,7 +11095,7 @@ impl<S: JitState> JitDriver<S> {
     /// A matched runnable token is entered here. A matched cell that is not
     /// runnable continues into `function_entry_internal` with that cell. A
     /// miss ticks `hash` (`tick_function_entry_empty_chain`); overflow is
-    /// `already_ticked` with `FunctionEntryResolved::miss(hash)`.
+    /// `already_ticked` with `ResolvedJitCell::miss(hash)`.
     ///
     /// A `confirm_enter_jit` hook is the `compiled_function_token` early-out:
     /// this path does not enter assembler, and the occupied door confirms.
@@ -11142,7 +11143,7 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 false,
                 caller_pin_save,
-                Some(FunctionEntryResolved::matched(cell, green_key_hash)),
+                Some(ResolvedJitCell::matched(cell, green_key_hash)),
             ));
         }
         if self
@@ -11159,7 +11160,7 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 true,
                 caller_pin_save,
-                Some(FunctionEntryResolved::miss(green_key_hash)),
+                Some(ResolvedJitCell::miss(green_key_hash)),
             ));
         }
         Some(None)
@@ -11170,11 +11171,11 @@ impl<S: JitState> JitDriver<S> {
     /// `already_ticked` is the empty-chain overflow: the counter already
     /// returned True, so this skips [`Self::function_entry_step`] (which
     /// would tick again) and takes the Proceed arm. RunCompiled, chained
-    /// `resolve_function_entry_cell`, confirm + decay + `stack_almost_full` +
+    /// `resolve_jit_cell`, confirm + decay + `stack_almost_full` +
     /// `force_start_tracing` all stay here.
     ///
     /// `already_resolved` is the cell the caller's one `lookup_chain` /
-    /// `comparekey` walk already named (`FunctionEntryResolved::miss` on a
+    /// `comparekey` walk already named (`ResolvedJitCell::miss` on a
     /// cold overflow). `None` walks here (`confirm_enter_jit` veto).
     ///
     /// `FunctionEntryStep::Proceed` is `warmstate.py bound_reached`:
@@ -11191,14 +11192,14 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         already_ticked: bool,
         caller_pin_save: Option<usize>,
-        already_resolved: Option<FunctionEntryResolved>,
+        already_resolved: Option<ResolvedJitCell>,
     ) -> Option<usize> {
         let pin = door_ref_pin(state, green_values, green_types, caller_pin_save);
         let mut live = majit_ir::GreenKey::from_greenargs(green_values, green_types);
         pin.reload(&mut live);
         let resolved = match already_resolved {
             Some(resolved) => resolved,
-            None => self.resolve_function_entry_cell(
+            None => self.resolve_jit_cell(
                 green_key_hash,
                 live.values.as_slice(),
                 live.types.as_slice(),
@@ -11305,16 +11306,16 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// `JitCell.get_jitcell(*greenargs)` for the function-entry door.
+    /// `JitCell.get_jitcell(*greenargs)` for a `maybe_compile_and_run` door.
     /// A miss is `None`, not the raw hash standing in as a cell key.
     #[inline]
-    pub fn resolve_function_entry_cell(
+    pub fn resolve_jit_cell(
         &self,
         green_key_hash: u64,
         greenargs: &[i64],
         types: &[majit_ir::GreenType],
-    ) -> FunctionEntryResolved {
-        self.meta.resolve_function_entry_cell_on_driver(
+    ) -> ResolvedJitCell {
+        self.meta.resolve_jit_cell_on_driver(
             self.index().unwrap_or(0),
             green_key_hash,
             greenargs,
@@ -15166,7 +15167,7 @@ mod tests {
             driver.cell_is_tracing(miss.get_uhash()),
             "get_cell(hash) names the occupant whose cell_key is the hash"
         );
-        let resolved = driver.resolve_function_entry_cell(hash, &miss.values, &miss.types);
+        let resolved = driver.resolve_jit_cell(hash, &miss.values, &miss.types);
         assert!(
             resolved.cell.is_none(),
             "comparekey does not match the occupant"

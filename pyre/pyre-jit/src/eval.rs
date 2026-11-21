@@ -7762,11 +7762,12 @@ impl PyPyJitDriver {
         let env = PyreEnv;
         let (driver, info) = driver_pair();
         let green_key_hash = make_green_key(pycode_root.get(), next_instr, is_being_profiled);
-        let green_key = driver.resolve_cell_key_with_greenargs(
+        let resolved = driver.resolve_jit_cell(
             green_key_hash,
             &majit_ir::pypyjit_greenargs(next_instr, is_being_profiled, pycode_root.get() as u64),
             &majit_ir::PYPYJIT_GREEN_TYPES,
         );
+        let green_key = resolved.cell_key().unwrap_or(green_key_hash);
         // Safe to tally here and nowhere upstream of it: `jtransform` rewrites
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
@@ -7788,7 +7789,7 @@ impl PyPyJitDriver {
         let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
         let Some(loop_result) = maybe_compile_and_run(
             &mut frame_root,
-            green_key,
+            resolved,
             next_instr,
             &pycode_root,
             driver,
@@ -9100,12 +9101,15 @@ fn unpack_merge_point_jit(
     // (`pc = 0`, novable — no bytecode offset). The jd1 driver has no
     // `is_being_profiled` green, so its pypyjit-shaped key uses false.
     let pin = majit_metainterp::GreenRefPin::pin_one(greenkey as usize);
-    let green_key = make_green_key(pin.get() as *const (), 0, false);
+    // The jd1 driver has no `is_being_profiled` green, so its pypyjit-shaped
+    // key uses false. Hash once (`get_uhash`); one `lookup_chain` /
+    // `comparekey` walk (`resolve_jit_cell_on_driver`) yields the matched
+    // cell or `None`; then the back-edge step decides on that value.
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `unpackiterable_driver`'s `jitdriver_sd.warmstate`: `lookup_chain`,
     // then `jitcounter.tick`; `bound_reached` / `EnterJitAssembler` are
     // `drive_unpack_iterable_trace`.
-    let hot = {
+    let (hot, green_key) = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
         let (_save_point, root_base, _items_slot) = pyre_jit_trace::unpack_state::jd1_root_base();
@@ -9114,11 +9118,20 @@ fn unpack_merge_point_jit(
             jd_no,
             pyre_jit_trace::unpack_state::jd1_live_values_at(root_base),
         );
-        let green_key = make_green_key(pin.get() as *const (), 0, false);
-        driver
+        let greenargs = majit_ir::pypyjit_greenargs(0, false, pin.get() as u64);
+        let hash = make_green_key(pin.get() as *const (), 0, false);
+        let resolved = driver.meta_interp().resolve_jit_cell_on_driver(
+            jd_no,
+            hash,
+            &greenargs,
+            &majit_ir::PYPYJIT_GREEN_TYPES,
+        );
+        let green_key = resolved.cell_key().unwrap_or(hash);
+        let hot = driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(jd_no, green_key, pin.save(), 0, &reds)
-            .0
+            .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
+            .0;
+        (hot, green_key)
     };
     if !matches!(
         hot,
@@ -9183,30 +9196,20 @@ fn genentry_merge_point_jit(
     // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
     // distinguishes yields.
     let pycode = pin.get() as pyre_object::PyObjectRef;
-    let green_key = match genentry_resolved_cell_key(pycode) {
-        Some(key) => {
-            // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING`
-            // is read only when a cell was found.
-            let (driver, _) = driver_pair();
-            let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
-            if driver.cell_is_tracing_on_driver(jd_no, key) {
-                return None;
-            }
-            key
-        }
-        None => {
-            // warmstate.py maybe_compile_and_run: a miss ticks
-            // `JitCell.get_uhash(*greenargs)` and does not create a cell.
-            // A tokenless cell (`BaseJitCell::new_for_driver_with_greens`,
-            // flags empty) would take `cleanup_chain` and never go hot.
-            let mut live = pyre_jit_trace::genentry_state::genentry_green_key(
-                pin.get() as pyre_object::PyObjectRef
-            );
-            let hash = live.get_uhash();
-            pin.reload(&mut live);
-            hash
-        }
-    };
+    // warmstate.py maybe_compile_and_run: a miss ticks
+    // `JitCell.get_uhash(*greenargs)` and does not create a cell.
+    // `cell.flags & JC_TRACING` is read only when a cell was found
+    // (`back_edge_step` → AlreadyTracing).
+    let mut live = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
+    let hash = live.get_uhash();
+    pin.reload(&mut live);
+    let (driver, _) = driver_pair();
+    let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+    let resolved =
+        driver
+            .meta_interp()
+            .resolve_jit_cell_on_driver(jd_no, hash, &live.values, &live.types);
+    let green_key = resolved.cell_key().unwrap_or(hash);
     // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
     // `_find_shadow`). Re-read every pycode/w_gen/w_arg from the pins.
     let _pycode = pin.get() as pyre_object::PyObjectRef;
@@ -9226,7 +9229,7 @@ fn genentry_merge_point_jit(
         );
         driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(jd_no, green_key, pin.save(), 0, &reds)
+            .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
             .0
     };
     if !matches!(
@@ -9250,19 +9253,6 @@ fn genentry_merge_point_jit(
     // consumed by the abort fallback or dropped here.
     pyre_interpreter::call::genentry_resume_note_reset();
     driven
-}
-
-/// Cell key for `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. Resolved on that
-/// driver's `WarmEnterState` (`warmstate.py JitCell.get_jitcell`,
-/// `create=False`). `None` is a miss.
-fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> Option<u64> {
-    let (driver, _) = driver_pair();
-    pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        &driver
-            .meta_interp_mut()
-            .warm_state_for_driver(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX),
-        pycode,
-    )
 }
 
 /// Enter the `generatorentry` portal. The registered main jitcode is
@@ -9981,10 +9971,9 @@ fn tuple_hash_merge_point_jit(
         return None;
     }
     // Green is `w_type` (`tupleobject.py` `greens=['w_type']`).
-    // `warmstate.py maybe_compile_and_run`: one cell-chain walk yields the
-    // procedure token (`EnterJitAssembler`) or falls through to the tick.
-    // jd0's compiled function-entry door is
-    // `resolved_entry_procedure_token` then `poll_raw_int_finish_raw`.
+    // `warmstate.py maybe_compile_and_run` with `increment_threshold`:
+    // one `lookup_chain` / `comparekey` walk yields the matched cell or
+    // `None`; then the back-edge step decides on that value.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[w_type, w_tuple]);
     // `GreenRefPin` walks `majit_gc::shadow_stack`, which is not `gc_roots`
@@ -9996,32 +9985,20 @@ fn tuple_hash_merge_point_jit(
         pin.get() as pyre_object::PyObjectRef
     );
     let greenargs = [pin.get() as i64];
-    let (cell_key, token) = driver
-        .meta_interp()
-        .resolved_entry_procedure_token_on_driver(
-            jd_no,
-            hash,
-            Some((
-                &greenargs,
-                pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
-            )),
-        );
+    let resolved = driver.meta_interp().resolve_jit_cell_on_driver(
+        jd_no,
+        hash,
+        &greenargs,
+        pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
+    );
     // `get_uhash` / `cell_key_for` can collect (`id_or_identityhash` /
     // `_find_shadow`). Re-read every w_type/w_tuple from the pins.
-    let w_tuple = roots.get(base + 1);
-    if let Some(token) = token
-        && token.outermost_jitdriver_index == Some(jd_no)
-    {
-        let raw = pyre_jit_trace::tuplehash_state::tuple_hash_raw_reds(
-            len as i64, acc as i64, i as i64, w_tuple,
-        );
-        return enter_compiled_tuple_hash(cell_key, token, &raw, w_tuple, len, acc, i);
-    }
+    let matched_cell = resolved.cell.clone();
+    let cell_key = resolved.cell_key().unwrap_or(hash);
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
-    let hot = driver
+    let (hot, compiled_key) = driver
         .meta_interp_mut()
-        .maybe_compile_and_run_step_on_driver(jd_no, cell_key, pin.save(), 0, &[])
-        .0;
+        .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &[]);
     let w_type = pin.get() as pyre_object::PyObjectRef;
     let w_tuple = roots.get(base + 1);
     match hot {
@@ -10029,29 +10006,20 @@ fn tuple_hash_merge_point_jit(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            // Loop-header tick used `cell_key` from
-            // `resolved_entry_procedure_token` (a miss is still the raw hash).
-            // `JC_TRACING` is only the matched cell (`maybe_compile_and_run`).
-            let greenargs = [pin.get() as i64];
-            let matched_cell = driver
-                .meta_interp()
-                .resolve_function_entry_cell_on_driver(
-                    jd_no,
-                    hash,
-                    &greenargs,
-                    pyre_jit_trace::tuplehash_state::TUPLE_HASH_GREEN_TYPES.as_slice(),
-                )
-                .cell;
             drive_tuple_hash_trace(cell_key, matched_cell, w_type, w_tuple, len, acc, i)
         }
         majit_metainterp::warmstate::HotResult::RunCompiled => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            let live = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+            let token = matched_cell
+                .as_ref()
+                .and_then(|cell| cell.get_procedure_token())
+                .expect("RunCompiled names the matched cell's token");
+            let raw = pyre_jit_trace::tuplehash_state::tuple_hash_raw_reds(
                 len as i64, acc as i64, i as i64, w_tuple,
             );
-            run_compiled_tuple_hash(cell_key, &live)
+            enter_compiled_tuple_hash(compiled_key, token, &raw, w_tuple, len, acc, i)
         }
         majit_metainterp::warmstate::HotResult::NotHot
         | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
@@ -10061,7 +10029,7 @@ fn tuple_hash_merge_point_jit(
 /// `warmspot.py ll_portal_runner`: `maybe_compile_and_run` with
 /// `increment_function_threshold`. Hash once (`get_uhash`); one
 /// `JitCell.get_jitcell` / `lookup_chain` walk
-/// (`resolve_function_entry_cell_on_driver`) yields the matched cell or
+/// (`resolve_jit_cell_on_driver`) yields the matched cell or
 /// `None`; then `function_entry_step` decides on that value. A compiled
 /// token is `EnterJitAssembler`; a counter fire is `bound_reached`.
 /// `NotHot` returns `None` so the runner continues at `portal_ptr`.
@@ -10093,7 +10061,7 @@ fn tuple_hash_function_entry_jit(
     // `id_or_identityhash` / `_find_shadow` can collect. Rebuild the Ref
     // green from the pin; the identity hash is move-stable.
     let greenargs = [pin.get() as i64];
-    let resolved = driver.meta_interp().resolve_function_entry_cell_on_driver(
+    let resolved = driver.meta_interp().resolve_jit_cell_on_driver(
         jd_no,
         hash,
         &greenargs,
@@ -14225,7 +14193,7 @@ fn pypyjit_confirm_reds(driver: &JitDriver<PyreJitState>, frame: &mut PyFrame) -
 #[majit_macros::dont_look_inside]
 fn maybe_compile_and_run(
     frame_root: &mut FrameRoot,
-    green_key: u64,
+    resolved: majit_metainterp::warmstate::ResolvedJitCell,
     loop_header_pc: usize,
     pycode_root: &PortalPycodeRoot,
     driver: &mut JitDriver<PyreJitState>,
@@ -14242,25 +14210,13 @@ fn maybe_compile_and_run(
     // portal wrapper. Do not nest another `FrameRoot` on top
     // (`gctransform/shadowstack.py`).
 
-    // warmstate.py: `cell.flags & JC_TRACING` → skip this key only.
-    // A live session on another key or driver must not suppress enter
-    // or the counter tick here.
-    if driver.cell_is_tracing(green_key) {
-        return None;
-    }
-    // warmstate.py: procedure_token exists → EnterJitAssembler.
-    // RPython enters assembler unconditionally when a compiled loop is
-    // available for this green_key. Pyre gates on `has_runnable_compiled_loop`
-    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token
-    // (`JC_TEMPORARY`) falls through to the counter tick below instead of
-    // entering `execute_assembler`. The tmp cell then re-ticks until the
-    // real loop compiles. The enter predicate is the cell's procedure token.
-    // Why a compiled loop for this green key is or is not enterable, per
-    // back-edge.  `has_runnable_compiled_loop` is the cell's non-temporary
-    // procedure token compiled for this driver. A pruned cell reads
-    // `cell_present=false state=NotHot`, an invalidated token reads
-    // `seen_token=true has_token=false`.  Separating them is what distinguishes
-    // a cell the warmstate dropped from a token something revoked.
+    // `warmstate.py maybe_compile_and_run`: `cell.flags & JC_TRACING` is
+    // read only on the cell the one `lookup_chain` / `comparekey` walk
+    // matched (`back_edge_step` → AlreadyTracing). A live session on
+    // another key or driver must not suppress enter or the counter tick.
+    // `JC_TEMPORARY` ticks toward compiling the real loop. The enter
+    // predicate is this cell's `get_procedure_token()`.
+    let green_key = resolved.cell_key().unwrap_or(resolved.hash);
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
@@ -14291,12 +14247,6 @@ fn maybe_compile_and_run(
             has_token,
         );
     }
-    // `WarmEnterState::maybe_compile_decision_with_key` is the port of warmstate.py's
-    // complete JitCell decision: token lookup, DONT_TRACE_HERE retry,
-    // dead-token cleanup, and counter tick. Keeping that policy in one symbol
-    // prevents the eval entry point from assigning different semantics to its
-    // flags.
-    //
     // The decision alone, without the `cell.flags |= JC_TRACING` that
     // warmstate.py makes with it: upstream marks the cell in the same
     // `bound_reached` that runs the trace, and pyre marks it there too —
@@ -14311,7 +14261,7 @@ fn maybe_compile_and_run(
     // compiled token is about to be entered.
     let reds = pypyjit_confirm_reds(driver, frame_root.frame());
     let step =
-        driver.maybe_compile_and_run_step(green_key, pycode_root.save(), loop_header_pc, &reds);
+        driver.maybe_compile_and_run_step(resolved, pycode_root.save(), loop_header_pc, &reds);
     match step {
         (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
             if !backedge_frame_may_trace(frame_root.frame(), loop_header_pc, pycode_root.get()) {
@@ -15904,7 +15854,7 @@ fn tick_function_entry_from_portal(frame_root: &mut FrameRoot) {
     let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
     let green_key_hash = make_green_key(pycode_root.get(), entry_pc, is_being_profiled);
     let pair = driver_pair();
-    let resolved = pair.0.resolve_function_entry_cell(
+    let resolved = pair.0.resolve_jit_cell(
         green_key_hash,
         &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,
@@ -16007,7 +15957,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `pycode_root` is the PyCode object `frame.pycode` holds, which is the
     // green `interp_jit.PyPyJitDriver` carries, so the greens compared here
     // name the cell `green_key_hash` hashes.
-    let resolved = pair.0.resolve_function_entry_cell(
+    let resolved = pair.0.resolve_jit_cell(
         green_key_hash,
         &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64),
         &majit_ir::PYPYJIT_GREEN_TYPES,

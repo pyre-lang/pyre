@@ -13796,7 +13796,9 @@ mod tests {
             meta.abort_trace_live(false);
             let (step, _) = {
                 let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
-                meta.maybe_compile_and_run_step(portal_hash, _zbh_pin.save(), 7, &[])
+                let resolved =
+                    meta.resolve_jit_cell_on_driver(0, portal_hash, &portal.values, &portal.types);
+                meta.maybe_compile_and_run_step(resolved, _zbh_pin.save(), 7, &[])
             };
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
@@ -13928,7 +13930,9 @@ mod tests {
             meta.abort_trace_live(false);
             let (step, _) = {
                 let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
-                meta.maybe_compile_and_run_step(portal_hash, _zbh_pin.save(), 7, &[])
+                let resolved =
+                    meta.resolve_jit_cell_on_driver(0, portal_hash, &portal.values, &portal.types);
+                meta.maybe_compile_and_run_step(resolved, _zbh_pin.save(), 7, &[])
             };
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),

@@ -13739,80 +13739,47 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// The back-edge door's whole answer, including the frontend half of
-    /// pyre's runnable-loop predicate, from the warm state's typed policy.
+    /// The back-edge door's whole answer, from one walk of the cell chain
+    /// — see [`crate::warmstate::WarmEnterState::back_edge_step`].
     pub fn maybe_compile_and_run_step(
         &mut self,
-        green_key: u64,
+        resolved: crate::warmstate::ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
-        self.maybe_compile_and_run_step_on_driver(0, green_key, code_slot, pc, reds)
+        self.maybe_compile_and_run_step_on_driver(0, resolved, code_slot, pc, reds)
     }
 
-    /// `warmstate.py maybe_compile_and_run` on that driver's WarmEnterState.
+    /// `warmstate.py maybe_compile_and_run` with `increment_threshold`, bound
+    /// on that driver's WarmEnterState.
+    ///
+    /// `resolved` is the one `JitCell.get_jitcell` / `lookup_chain` walk
+    /// [`Self::resolve_jit_cell_on_driver`] already did. A miss ticks `hash`
+    /// and never consults another cell. A hit reads
+    /// `cell.get_procedure_token()` once; a FINISH-only row is still that
+    /// compiled procedure (`compile_done_with_this_frame` →
+    /// `ResumeFromInterpDescr`). Nested `compile_and_run_once` parks the
+    /// outer attempt first; only this cell's `JC_TRACING` returns.
     pub fn maybe_compile_and_run_step_on_driver(
         &mut self,
         jd_no: usize,
-        green_key: u64,
+        resolved: crate::warmstate::ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.make_enter_function(jd_no);
-        // `warmstate.py maybe_compile_and_run` enters assembler when that
-        // driver's cell still has a non-temporary procedure token whose
-        // outermost_jitdriver_sd is this driver. Nested `compile_and_run_once`
-        // parks the outer attempt first; only this cell's `JC_TRACING` returns.
-        // A FINISH-only row is still that compiled procedure
-        // (`compile_done_with_this_frame` → `ResumeFromInterpDescr`);
-        // excluding it here ticked the cell like uncompiled, so every
-        // back-edge retraced the same FINISH (`getframe` L=13→75,
-        // `trace_too_long` abort_ceiling_refused with threshold=1).
-        // JUMP entry-bridges and FINISH function-entry traces stay
-        // runnable the same way. Guard failures replace a FINISH stub
-        // through `compile_trace` / `compile_loop`, not by retracing
-        // from the back-edge door.
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            let has = warm_state.get_procedure_token(green_key).is_some_and(|t| {
-                t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
-            });
-            let step = warm_state.maybe_compile_decision_with_meta(green_key, |_| has, &[], reds);
-            return (step, green_key);
+            return warm_state.back_edge_step(resolved, None, reds);
         }
-        match Self::with_typed_decision_key(green_key, code_slot, pc, |key, pin| {
-            let has = warm_state
-                .cell_key_for(pin, key)
-                .and_then(|cell_key| warm_state.get_procedure_token(cell_key))
-                .is_some_and(|t| {
-                    t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
-                });
-            let step = warm_state.maybe_compile_decision_with_key(pin, key, |_| has, reds);
-            let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
-                warm_state.cell_key_for(pin, key).unwrap_or(green_key)
-            } else {
-                green_key
-            };
-            (step, resolved_key)
+        match Self::with_typed_decision_key(resolved.hash, code_slot, pc, |key, typed_pin| {
+            let mut live = typed_pin.live_clone(key);
+            warm_state.back_edge_step(resolved.clone(), Some((typed_pin, &mut live)), reds)
         }) {
             Some(step) => step,
-            None => {
-                drop(warm_state);
-                let types = self
-                    .staticdata
-                    .jitdrivers_sd
-                    .get(jd_no)
-                    .map(|d| d.green_args_spec())
-                    .unwrap_or_default();
-                let has = self.has_this_driver_compiled_procedure(jd_no, green_key);
-                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-                (
-                    warm_state.maybe_compile_decision_with_meta(green_key, |_| has, &types, reds),
-                    green_key,
-                )
-            }
+            None => warm_state.back_edge_step(resolved, None, reds),
         }
     }
 
@@ -13820,7 +13787,7 @@ impl<M: Clone> MetaInterp<M> {
     /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
     pub fn function_entry_step(
         &mut self,
-        resolved: crate::warmstate::FunctionEntryResolved,
+        resolved: crate::warmstate::ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         reds: &[Value],
@@ -13833,7 +13800,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn function_entry_step_on_driver(
         &mut self,
         jd_no: usize,
-        resolved: crate::warmstate::FunctionEntryResolved,
+        resolved: crate::warmstate::ResolvedJitCell,
         code_slot: usize,
         pc: usize,
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
@@ -15287,19 +15254,19 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `JitCell.get_jitcell(*greenargs)` for the function-entry door on that
-    /// driver's WarmEnterState. A miss is `None`, not the raw hash.
+    /// `JitCell.get_jitcell(*greenargs)` for a `maybe_compile_and_run` door
+    /// on that driver's WarmEnterState. A miss is `None`, not the raw hash.
     #[inline]
-    pub fn resolve_function_entry_cell_on_driver(
+    pub fn resolve_jit_cell_on_driver(
         &self,
         jd_no: usize,
         green_key_hash: u64,
         greenargs: &[i64],
         types: &[majit_ir::GreenType],
-    ) -> crate::warmstate::FunctionEntryResolved {
+    ) -> crate::warmstate::ResolvedJitCell {
         match self.warm_state_ref_for_driver(jd_no) {
-            Some(warm) => warm.resolve_function_entry_cell(green_key_hash, greenargs, types),
-            None => crate::warmstate::FunctionEntryResolved::miss(green_key_hash),
+            Some(warm) => warm.resolve_jit_cell(green_key_hash, greenargs, types),
+            None => crate::warmstate::ResolvedJitCell::miss(green_key_hash),
         }
     }
 
@@ -24708,7 +24675,7 @@ mod metainterp_static_data_tests {
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
                 meta.function_entry_step(
-                    crate::warmstate::FunctionEntryResolved::miss(0xD015),
+                    crate::warmstate::ResolvedJitCell::miss(0xD015),
                     _zbh_pin.save(),
                     0,
                     &[],
@@ -24892,13 +24859,9 @@ mod metainterp_static_data_tests {
 
         let (on_entry, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
-                idx1,
-                key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+            let resolved =
+                meta.resolve_jit_cell_on_driver(idx1, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
@@ -24906,7 +24869,9 @@ mod metainterp_static_data_tests {
         );
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), _zbh_pin.save(), 0, &[])
+            let resolved =
+                meta.resolve_jit_cell_on_driver(0, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
@@ -24915,12 +24880,11 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn maybe_compile_and_run_step_on_driver_ignores_a_sibling_drivers_procedure_token() {
-        // history.py JitCellToken.outermost_jitdriver_sd (pyre:
-        // outermost_jitdriver_index, set by make_jitcell_token) is what
-        // distinguishes a sibling driver's token. A token compiled for
-        // driver 1 and attached to driver 0's cell must not make
-        // maybe_compile_and_run on driver 0 return RunCompiled.
+    fn maybe_compile_and_run_step_on_driver_enters_this_drivers_cell_token() {
+        // `warmstate.py maybe_compile_and_run` reads
+        // `cell.get_procedure_token()` after `comparekey` matched this
+        // driver's cell. `history.py JitCellToken.outermost_jitdriver_sd`
+        // is not consulted again; the token on this cell is entered.
         // Threshold must be nonzero: `maybe_compile_and_run` returns NotHot
         // at once when `increment_threshold == 0` ("jit is off").
         let mut meta = MetaInterp::<()>::new(1);
@@ -24958,11 +24922,13 @@ mod metainterp_static_data_tests {
 
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), _zbh_pin.save(), 0, &[])
+            let resolved =
+                meta.resolve_jit_cell_on_driver(0, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
-            !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
-            "a token whose outermost_jitdriver_index is a sibling is not entered on driver 0"
+            matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
+            "a token on this driver's comparekey-matched cell is entered"
         );
     }
 
@@ -27577,13 +27543,9 @@ mod metainterp_static_data_tests {
 
         let (on_entry, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
-                idx1,
-                key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+            let resolved =
+                meta.resolve_jit_cell_on_driver(idx1, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
@@ -27591,7 +27553,9 @@ mod metainterp_static_data_tests {
         );
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), _zbh_pin.save(), 0, &[])
+            let resolved =
+                meta.resolve_jit_cell_on_driver(0, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
@@ -27642,7 +27606,9 @@ mod metainterp_static_data_tests {
 
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), _zbh_pin.save(), 0, &[])
+            let resolved =
+                meta.resolve_jit_cell_on_driver(0, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
@@ -27696,13 +27662,9 @@ mod metainterp_static_data_tests {
         );
         let (on_entry, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
-                idx1,
-                key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+            let resolved =
+                meta.resolve_jit_cell_on_driver(idx1, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
@@ -27710,13 +27672,9 @@ mod metainterp_static_data_tests {
         );
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
-                idx0,
-                key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+            let resolved =
+                meta.resolve_jit_cell_on_driver(idx0, key.get_uhash(), &key.values, &key.types);
+            meta.maybe_compile_and_run_step_on_driver(idx0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
@@ -27762,8 +27720,7 @@ mod metainterp_static_data_tests {
 
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
         let hash = key.get_uhash();
-        let resolved_entry =
-            meta.resolve_function_entry_cell_on_driver(idx1, hash, &key.values, &key.types);
+        let resolved_entry = meta.resolve_jit_cell_on_driver(idx1, hash, &key.values, &key.types);
         let on_entry =
             meta.function_entry_step_on_driver(idx1, resolved_entry, _zbh_pin.save(), 0, None, &[]);
         assert!(
@@ -27774,8 +27731,7 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-        let resolved_portal =
-            meta.resolve_function_entry_cell_on_driver(0, hash, &key.values, &key.types);
+        let resolved_portal = meta.resolve_jit_cell_on_driver(0, hash, &key.values, &key.types);
         let on_portal =
             meta.function_entry_step_on_driver(0, resolved_portal, _zbh_pin.save(), 0, None, &[]);
         assert!(
@@ -30402,9 +30358,11 @@ mod metainterp_static_data_tests {
                 .attach_procedure_to_interp_for_key(__p, __l, std::sync::Arc::clone(&token))
         });
         let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((portal_code) as usize);
+        let resolved =
+            meta.resolve_jit_cell_on_driver(idx, portal_hash, &portal.values, &portal.types);
         let (step, _) = meta.maybe_compile_and_run_step_on_driver(
             idx,
-            portal_hash,
+            resolved,
             _zbh_pin.save(),
             portal_pc,
             &[],
@@ -30502,7 +30460,9 @@ mod metainterp_static_data_tests {
 
         let (step, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((portal_code) as usize);
-            meta.maybe_compile_and_run_step(portal_hash, _zbh_pin.save(), portal_pc, &[])
+            let resolved =
+                meta.resolve_jit_cell_on_driver(0, portal_hash, &portal.values, &portal.types);
+            meta.maybe_compile_and_run_step(resolved, _zbh_pin.save(), portal_pc, &[])
         };
         assert!(
             matches!(step, crate::warmstate::HotResult::RunCompiled),
@@ -35194,13 +35154,13 @@ mod tests {
         );
         let (on_entry, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
+            let resolved = meta.resolve_jit_cell_on_driver(
                 idx1,
                 green_key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+                &green_key.values,
+                &green_key.types,
+            );
+            meta.maybe_compile_and_run_step_on_driver(idx1, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
@@ -35208,13 +35168,13 @@ mod tests {
         );
         let (on_portal, _) = {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((0) as usize);
-            meta.maybe_compile_and_run_step_on_driver(
+            let resolved = meta.resolve_jit_cell_on_driver(
                 idx0,
                 green_key.get_uhash(),
-                _zbh_pin.save(),
-                0,
-                &[],
-            )
+                &green_key.values,
+                &green_key.types,
+            );
+            meta.maybe_compile_and_run_step_on_driver(idx0, resolved, _zbh_pin.save(), 0, &[])
         };
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
@@ -35263,7 +35223,7 @@ mod tests {
                             .warm_state_for_driver(0)
                             .cell_by_key(green_key)
                             .expect("tmp callback cell");
-                        crate::warmstate::FunctionEntryResolved::matched(cell, green_key)
+                        crate::warmstate::ResolvedJitCell::matched(cell, green_key)
                     };
                     meta.function_entry_step(resolved, _zbh_pin.save(), 0, &[])
                 },
@@ -37289,14 +37249,15 @@ mod loop_side_table_tests {
 
     #[test]
     fn the_back_edge_policy_keeps_interpreting_when_the_entry_hook_refuses() {
-        let (mut meta, _key, hash, _cell_key, raw) = meta_with_runnable_portal_cell();
+        let (mut meta, key, hash, _cell_key, raw) = meta_with_runnable_portal_cell();
         meta.warm_state_for_driver(0)
             .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
 
         assert!(matches!(
             {
                 let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(raw.0);
-                meta.maybe_compile_and_run_step(hash, _zbh_pin.save(), raw.1, &[])
+                let resolved = meta.resolve_jit_cell_on_driver(0, hash, &key.values, &key.types);
+                meta.maybe_compile_and_run_step(resolved, _zbh_pin.save(), raw.1, &[])
             },
             (crate::warmstate::HotResult::NotHot, _),
         ));
@@ -37316,7 +37277,7 @@ mod loop_side_table_tests {
                         .warm_state_for_driver(0)
                         .cell_by_key(cell_key)
                         .expect("runnable portal cell");
-                    crate::warmstate::FunctionEntryResolved::matched(cell, hash)
+                    crate::warmstate::ResolvedJitCell::matched(cell, hash)
                 };
                 meta.function_entry_step(resolved, _zbh_pin.save(), raw.1, &[])
             },
