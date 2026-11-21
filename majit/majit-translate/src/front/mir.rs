@@ -3401,6 +3401,12 @@ impl CrateLoweringState {
         // collected without those tombstones would intern `Layout` for
         // both `alloc::layout::Layout` and `typeobject::Layout`.
         tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
+        // Cell instantiation keys use this same set
+        // (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`). Harvest ran
+        // with an empty set, so a duplicated payload leaf would publish
+        // `cell::RefCell<Payload>` while lowering requests
+        // `cell::RefCell<module::Payload>`.
+        register_std_cell_instantiation_rows(llbc, &mut struct_fields, &tombstoned_leaves);
 
         // Per-instantiation enum-variant pre-registration source (#100): a
         // reference-payload generic enum constructor (`Result<Tuple>::Ok`)
@@ -9292,6 +9298,10 @@ impl<'a> LowerContext<'a> {
         for fd in llbc.iter_local_fns() {
             note_body_crate_root_into(fd, &mut struct_fields);
         }
+        let tombstoned_leaves = tombstoned_leaves_of(llbc).clone();
+        // Same cell-instantiation pass [`CrateLoweringState::new`] runs
+        // after the artefact's tombstone set is final.
+        register_std_cell_instantiation_rows(llbc, &mut struct_fields, &tombstoned_leaves);
         Self {
             llbc,
             struct_field_attrs,
@@ -9301,7 +9311,7 @@ impl<'a> LowerContext<'a> {
             func_hints: crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(
                 llbc,
             )),
-            tombstoned_leaves: tombstoned_leaves_of(llbc).clone(),
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
             immutable_fields,

@@ -5,47 +5,7 @@ use super::std_call::{
     rewrite_interior_index_slots,
 };
 use super::*;
-
-/// `core::cell::...` or Charon dropping the `core::` crate prefix
-/// (`cell::Cell::get`, the same spelling `FOREIGN_STDLIB_EXTERNALS` keys).
-/// User and nestedscope `Cell` keep a crate prefix and stay residual.
-fn is_std_cell_module_path(path: &str) -> bool {
-    path.starts_with("core::cell::")
-        || path.starts_with("std::cell::")
-        || path.starts_with("cell::Cell::")
-        || path.starts_with("cell::<Impl>::")
-}
-
-#[cfg(test)]
-mod std_cell_module_path_tests {
-    use super::is_std_cell_module_path;
-
-    #[test]
-    fn accepts_core_std_and_charon_short_cell_get() {
-        for path in [
-            "core::cell::Cell::get",
-            "std::cell::Cell::get",
-            "cell::Cell::get",
-            "cell::Cell::<Impl>::get",
-            "cell::<Impl>::get",
-            "core::cell::<Impl>::get",
-        ] {
-            assert!(is_std_cell_module_path(path), "{path}");
-        }
-    }
-
-    #[test]
-    fn rejects_user_and_nestedscope_cell() {
-        for path in [
-            "fixture::Cell::get",
-            "my_crate::Cell::get",
-            "pyre_object::nestedscope::Cell::get",
-            "pyre_object::nestedscope::w_cell_get",
-        ] {
-            assert!(!is_std_cell_module_path(path), "{path}");
-        }
-    }
-}
+use crate::front::std_identity::is_std_cell_module_path;
 
 impl<'a> Lowering<'a> {
     /// Wrap class-backed arguments of a stored fn-ptr call the way
@@ -572,7 +532,19 @@ impl<'a> Lowering<'a> {
             (ValueType::Ref(Some(declared)), Some(narrowed))
                 if declared == narrowed
                     && narrowed.rsplit("::").next() != Some("ModuleDictStrategy")
-                    && !majit_ir::descr::is_list_container_spelling(narrowed) =>
+                    && !majit_ir::descr::is_list_container_spelling(narrowed)
+                    // `valuetype_to_someshell(Ref)` is classdef-less, and a
+                    // looked-into getter of a `RefCell<Vec<_>>` field can
+                    // return `SomeRustVec`. Identity recast intern's the
+                    // cell class so `RefCell::borrow` FieldRead of `value`
+                    // (`std_identity.rs`) resolves. Same helper as the
+                    // value / attr / Input paint.
+                    && tyref_std_cell_class_root(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                    )
+                    .is_none() =>
             {
                 let producer_is_untyped_null = match &call.func {
                     CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
@@ -8957,7 +8929,17 @@ impl<'a> Lowering<'a> {
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
-        let identity_layout = if matches!(
+        // A std cell whose `value` is a pointer to T (`Ref` / `RefMut`)
+        // occupies T's bank (`tyref_std_cell_class_root` is None). Passing
+        // that layout would FieldRead the NonNull word. Opaque cells
+        // already have no field list. `RefCell` keeps the layout so
+        // `borrow` FieldReads inline T.
+        let identity_layout = if first_arg_ty.as_ref().is_some_and(|ty| {
+            tyref_is_std_cell_wrapper(ty, self.llbc)
+                && tyref_std_cell_class_root(ty, self.llbc, self.tombstoned_leaves).is_none()
+        }) {
+            None
+        } else if matches!(
             &op_kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },

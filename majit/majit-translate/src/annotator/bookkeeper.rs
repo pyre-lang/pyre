@@ -6584,8 +6584,19 @@ impl Bookkeeper {
         // (`nestedscope.py CellFamily.ever_mutated`). Charon spells the
         // wrapper as `cell::UnsafeCell<RBigInt>`; a prefix-only peel
         // intern's that name as ClassDef and setattr of the cell word
-        // unions `RBigInt ∪ UnsafeCell`.
+        // unions `RBigInt ∪ UnsafeCell`. A layout-present `RefCell<T>`
+        // is the cell class (`MutRef<T>` intern shape): `RefCell::borrow`
+        // FieldRead of `value` (`std_identity.rs`) resolves on it. An
+        // opaque or pointer-valued std cell occupies T's bank
+        // (`tyref_std_cell_payload_value_type`).
         if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
+            return self.project_struct_field_type(inner);
+        }
+        let peeled_cell = peel_std_cell_payload_if_not_layout_present(
+            stripped,
+            self.struct_fields.borrow().as_deref(),
+        );
+        if let Some(inner) = peeled_cell {
             return self.project_struct_field_type(inner);
         }
         if let Some(inner) = strip_generic_one(stripped, "Cow<") {
@@ -6762,15 +6773,17 @@ impl Bookkeeper {
         // instantiation (`get_ll_dict` builds one `DICT` per key/value
         // holding `Ptr(DICTENTRYARRAY)`; `bookkeeper.py`
         // `getuniqueclassdef`). Keep the substituted spelling so the
-        // field resolves to that classdef. Every other registered
-        // struct still interns the bare template.
+        // field resolves to that classdef. A layout-present std cell
+        // (`is_std_cell_wrapper_path` and a `value` row that holds T
+        // inline; MutRef intern shape) is the same: template rows name
+        // `??TypeVar`, and `project_struct_rows` substitutes from the
+        // suffix. Every other registered struct still interns the bare
+        // template.
         let class_spelling = if stripped.contains('<')
-            && self
-                .struct_fields
-                .borrow()
-                .as_ref()
-                .is_some_and(|reg| reg.template_holds_split_entry_family(stripped))
-        {
+            && self.struct_fields.borrow().as_ref().is_some_and(|reg| {
+                reg.template_holds_split_entry_family(stripped)
+                    || intern_rows_declare_value_field(reg, stripped)
+            }) {
             std::borrow::Cow::Borrowed(stripped)
         } else {
             named_root
@@ -8690,6 +8703,23 @@ fn collect_referenced_struct_names(
         collect_referenced_struct_names(inner, reg, out);
         return;
     }
+    // Layout-present std cell: std-cell path identity and a `value`
+    // row that holds T inline (`tyref_std_cell_class_root` / MutRef
+    // intern shape). Intern the cell; template rows name type vars, so
+    // the type-string generic args still walk T. A pointer-valued
+    // `value` (`Ref` / `RefMut`) occupies T's bank: walk T, do not
+    // intern the guard.
+    if collect_layout_present_cell_class(stripped, reg, out) {
+        return;
+    }
+    // Opaque std cell: no intern rows, so the cell class path above
+    // does not run. Walk T the way `tyref_std_cell_payload_value_type`
+    // peels an Opaque cell (`bookkeeper.py` `immutablevalue` of the
+    // payload).
+    if let Some(inner) = peel_std_cell_payload_if_not_layout_present(stripped, Some(reg)) {
+        collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
     for wrapper in ["Vec<", "VecDeque<", "HashSet<", "BTreeSet<", "IndexSet<"] {
         if let Some(inner) = strip_generic_one(stripped, wrapper) {
             collect_referenced_struct_names(inner, reg, out);
@@ -9216,7 +9246,9 @@ fn is_thin_arrow_gt(bytes: &[u8], i: usize) -> bool {
 
 /// Inner of a one-arg transparent slot wrapper, including a qualified
 /// path (`cell::UnsafeCell<RBigInt>`). The wrapper is the slot, not a
-/// ClassDef (`nestedscope.py CellFamily.ever_mutated`).
+/// ClassDef (`nestedscope.py CellFamily.ever_mutated`). `RefCell<T>` is
+/// not in this list: it is the cell class `RefCell::borrow` FieldReads
+/// (`std_identity.rs` layout-present; same intern as `MutRef<T>`).
 fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
     crate::fat_ptr_layout::wrapper_inner(
         field_ty,
@@ -9224,7 +9256,6 @@ fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
             "Rc",
             "Arc",
             "Box",
-            "RefCell",
             "Cell",
             "Pin",
             "NonNull",
@@ -9236,6 +9267,88 @@ fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
             "Reverse",
         ],
     )
+}
+
+/// Std-cell intern spelling whose harvested `value` row holds T inline
+/// — the same tests [`tyref_std_cell_class_root`] uses
+/// (`is_std_cell_wrapper_path`, a `value` field, and that field is not
+/// a pointer to T).
+fn intern_rows_declare_value_field(
+    reg: &crate::front::StructFieldRegistry,
+    spelling: &str,
+) -> bool {
+    crate::front::std_identity::is_std_cell_wrapper_path(spelling)
+        && reg
+            .intern_field_rows(spelling)
+            .is_some_and(intern_rows_value_holds_payload_inline)
+}
+
+/// Payload T of a std cell that does not intern as the cell class:
+/// opaque (no intern rows) or a pointer-valued `value` (`Ref` /
+/// `RefMut`). Same layout verdict [`tyref_std_cell_payload_value_type`]
+/// uses: intern rows, not the wrapper name. A layout-present `RefCell`
+/// (inline `value`) returns None so the caller intern's the cell class.
+fn peel_std_cell_payload_if_not_layout_present<'a>(
+    spelling: &'a str,
+    reg: Option<&crate::front::StructFieldRegistry>,
+) -> Option<&'a str> {
+    if !crate::front::std_identity::is_std_cell_wrapper_path(spelling) {
+        return None;
+    }
+    if reg.is_some_and(|r| intern_rows_declare_value_field(r, spelling)) {
+        return None;
+    }
+    crate::fat_ptr_layout::wrapper_inner(spelling, &["RefCell", "RefMut", "Ref"])
+}
+
+/// `true` when intern rows include a `value` field that is T itself
+/// (`UnsafeCell<T>` / T), not a pointer to T (`NonNull<T>`).
+fn intern_rows_value_holds_payload_inline(rows: &[crate::front::semantic::FieldRow]) -> bool {
+    rows.iter().any(|row| {
+        row.name == "value"
+            && !row.is_rustc_pointer_niche
+            && !crate::front::mir::is_rustc_pointer_niche_spelling(&row.ty)
+            && !registry_ty_is_raw_ptr(&row.ty)
+    })
+}
+
+/// Intern a layout-present std cell (`is_std_cell_wrapper_path` and a
+/// `value` field that holds T inline) and still walk T. A pointer-valued
+/// `value` walks T without intern'ing the guard.
+///
+/// Harvest of the TypeDecl stores template rows whose payload is a type
+/// var, so the type-string generic args are the instantiation T pass-1
+/// must pre-intern.
+fn collect_layout_present_cell_class(
+    stripped: &str,
+    reg: &crate::front::StructFieldRegistry,
+    out: &mut Vec<String>,
+) -> bool {
+    if !crate::front::std_identity::is_std_cell_wrapper_path(stripped) {
+        return false;
+    }
+    let Some(rows) = reg.intern_field_rows(stripped) else {
+        return false;
+    };
+    if !rows.iter().any(|row| row.name == "value") {
+        return false;
+    }
+    if intern_rows_value_holds_payload_inline(rows) {
+        out.push(stripped.to_string());
+    }
+    for row in rows {
+        collect_referenced_struct_names(&row.ty, reg, out);
+    }
+    let Some((_, rest)) = stripped.split_once('<') else {
+        return true;
+    };
+    if !rest.ends_with('>') {
+        return true;
+    }
+    for part in split_generic_args(&rest[..rest.len() - 1]) {
+        collect_referenced_struct_names(part, reg, out);
+    }
+    true
 }
 
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
@@ -9980,6 +10093,291 @@ mod tests {
                 SomeValue::Integer(_)
             ),
             "UnsafeCell<i64> is the integer word"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_struct_names_reaches_payload_through_cell_value_row() {
+        use crate::front::StructFieldRegistry;
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                ("borrow".to_string(), "i64".to_string()),
+                (
+                    "value".to_string(),
+                    "cell::UnsafeCell<HiddenOnlyViaCell>".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenOnlyViaCell".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        let mut out = Vec::new();
+        collect_referenced_struct_names("cell::RefCell<HiddenOnlyViaCell>", &reg, &mut out);
+        assert!(
+            out.iter().any(|n| n == "cell::RefCell<HiddenOnlyViaCell>"),
+            "cell class intern's; out={out:?}"
+        );
+        assert!(
+            out.iter().any(|n| n == "HiddenOnlyViaCell"),
+            "value: UnsafeCell<T> peels to T; out={out:?}"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_struct_names_reaches_payload_through_cell_type_args() {
+        use crate::front::StructFieldRegistry;
+        let mut reg = StructFieldRegistry::default();
+        // Harvest of the generic TypeDecl stores type-var rows; T lives
+        // only in the field spelling's instantiation suffix.
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                ("borrow".to_string(), "i64".to_string()),
+                ("value".to_string(), "cell::UnsafeCell<v0>".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenOnlyViaCellArgs".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        let mut out = Vec::new();
+        collect_referenced_struct_names("cell::RefCell<HiddenOnlyViaCellArgs>", &reg, &mut out);
+        assert!(
+            out.iter()
+                .any(|n| n == "cell::RefCell<HiddenOnlyViaCellArgs>"),
+            "cell class intern's; out={out:?}"
+        );
+        assert!(
+            out.iter().any(|n| n == "HiddenOnlyViaCellArgs"),
+            "type-string generic args reach T when template rows name a type var; out={out:?}"
+        );
+    }
+
+    #[test]
+    fn collect_pointer_value_ref_walks_payload_without_interning_the_guard() {
+        use crate::front::StructFieldRegistry;
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::Ref".to_string(),
+            vec![
+                (
+                    "value".to_string(),
+                    "ptr::non_null::NonNull<HiddenOnlyViaRef>".to_string(),
+                ),
+                ("borrow".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenOnlyViaRef".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        let mut out = Vec::new();
+        collect_referenced_struct_names("cell::Ref<HiddenOnlyViaRef>", &reg, &mut out);
+        assert!(
+            !out.iter()
+                .any(|n| n == "cell::Ref<HiddenOnlyViaRef>" || n.starts_with("cell::Ref<")),
+            "pointer-valued Ref is not a cell class; out={out:?}"
+        );
+        assert!(
+            out.iter().any(|n| n == "HiddenOnlyViaRef"),
+            "NonNull<T> peels to T; out={out:?}"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_does_not_keep_pointer_value_ref_instantiation() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::Ref".to_string(),
+            vec![
+                (
+                    "value".to_string(),
+                    "ptr::non_null::NonNull<HiddenRefPayload>".to_string(),
+                ),
+                ("borrow".to_string(), "i64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenRefPayload".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        match bk.project_struct_field_type("cell::Ref<HiddenRefPayload>") {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .expect("payload intern's")
+                    .borrow()
+                    .name
+                    .clone();
+                assert!(
+                    name.contains("HiddenRefPayload") && !name.contains("cell::Ref"),
+                    "pointer-valued Ref field is the payload, got {name}"
+                );
+            }
+            other => panic!("pointer-valued Ref field projects the payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_payload_reached_only_through_cell_field() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Owner".to_string(),
+            vec![(
+                "active".to_string(),
+                "cell::RefCell<HiddenOnlyViaOwner>".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                ("borrow".to_string(), "i64".to_string()),
+                ("value".to_string(), "cell::UnsafeCell<v0>".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenOnlyViaOwner".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.getuniqueclassdef_for_struct_root("Owner")
+            .expect("Owner intern's");
+        let hidden = bk
+            .getuniqueclassdef_for_struct_root("HiddenOnlyViaOwner")
+            .expect("payload reachable only through the cell field intern's");
+        assert!(
+            hidden.borrow().attrs.contains_key("x"),
+            "payload rows project after intern through the cell field"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_keeps_layout_present_cell_class() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                ("borrow".to_string(), "i64".to_string()),
+                (
+                    "value".to_string(),
+                    "cell::UnsafeCell<HiddenCellPayload>".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "HiddenCellPayload".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        match bk.project_struct_field_type("cell::RefCell<HiddenCellPayload>") {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .expect("cell class intern's")
+                    .borrow()
+                    .name
+                    .clone();
+                assert!(
+                    name.contains("RefCell") && name.contains("HiddenCellPayload"),
+                    "field of a layout-present cell is the cell class, got {name}"
+                );
+            }
+            other => panic!("layout-present cell field intern's the cell class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_struct_field_type_opaque_refcell_yields_payload_annotation() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // No RefCell rows: an opaque cell occupies T's bank
+        // (`tyref_std_cell_payload_value_type`).
+        reg.fields.insert(
+            "HiddenOpaquePayload".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg.clone()));
+        match bk.project_struct_field_type("cell::RefCell<Vec<u8>>") {
+            SomeValue::List(_) | SomeValue::RustVec(_) => {}
+            other => panic!("opaque RefCell<Vec<u8>> is the vec payload, got {other:?}"),
+        }
+        match bk.project_struct_field_type("cell::RefCell<HiddenOpaquePayload>") {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .expect("payload intern's")
+                    .borrow()
+                    .name
+                    .clone();
+                assert!(
+                    name.contains("HiddenOpaquePayload") && !name.contains("RefCell"),
+                    "opaque RefCell field is the payload, got {name}"
+                );
+            }
+            other => panic!("opaque RefCell field is the payload, got {other:?}"),
+        }
+        let mut out = Vec::new();
+        collect_referenced_struct_names("cell::RefCell<HiddenOpaquePayload>", &reg, &mut out);
+        assert!(
+            !out.iter().any(|n| n.contains("RefCell")),
+            "opaque cell is not interned; out={out:?}"
+        );
+        assert!(
+            out.iter().any(|n| n == "HiddenOpaquePayload"),
+            "opaque cell collect reaches T; out={out:?}"
+        );
+    }
+
+    #[test]
+    fn generic_holder_with_value_field_keeps_template_intern_and_collect() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Holder".to_string(),
+            vec![("value".to_string(), "v0".to_string())],
+        );
+        reg.fields.insert(
+            "HolderPayload".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg.clone()));
+        match bk.project_struct_field_type("Holder<HolderPayload>") {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .expect("template intern's")
+                    .borrow()
+                    .name
+                    .clone();
+                assert!(
+                    name.contains("Holder") && !name.contains("HolderPayload"),
+                    "non-std generic struct intern's the bare template, got {name}"
+                );
+            }
+            other => panic!("expected Instance of Holder, got {other:?}"),
+        }
+        let mut out = Vec::new();
+        collect_referenced_struct_names("Holder<HolderPayload>", &reg, &mut out);
+        assert!(
+            !out.iter()
+                .any(|n| n.contains("HolderPayload") || n.contains('<')),
+            "collect does not walk T through a non-std value field; out={out:?}"
         );
     }
 

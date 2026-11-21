@@ -41,6 +41,33 @@ fn is_std_type_path(path: Option<&str>) -> bool {
     path.is_some_and(|p| p.split("::").next().is_some_and(is_std_crate))
 }
 
+/// `core::cell::...` or Charon dropping the `core::` crate prefix
+/// (`cell::Cell::get`, the same spelling `FOREIGN_STDLIB_EXTERNALS` keys).
+/// User and nestedscope `Cell` keep a crate prefix and stay residual.
+pub(crate) fn is_std_cell_module_path(path: &str) -> bool {
+    path.starts_with("core::cell::")
+        || path.starts_with("std::cell::")
+        || path.starts_with("cell::Cell::")
+        || path.starts_with("cell::<Impl>::")
+}
+
+/// Type spelling of `core::cell::{Ref, RefMut, RefCell}` (and the
+/// `std::cell` re-export), including the crate-stripped intern key
+/// `cell::RefCell<T>`. Same identity `tyref_is_std_cell_wrapper`
+/// reads off the TypeDecl path. A user type that shares a leaf name
+/// does not match.
+pub(crate) fn is_std_cell_wrapper_path(path: &str) -> bool {
+    let template = majit_ir::descr::strip_generic_args(path.trim());
+    let segs: Vec<&str> = template.split("::").collect();
+    let Some((leaf, prefix)) = segs.split_last() else {
+        return false;
+    };
+    if !matches!(*leaf, "Ref" | "RefMut" | "RefCell") {
+        return false;
+    }
+    matches!(prefix, ["core", "cell"] | ["std", "cell"] | ["cell"])
+}
+
 fn path_leaf(path: Option<&str>) -> Option<&str> {
     path.map(|p| p.rsplit("::").next().unwrap_or(p))
 }
@@ -381,6 +408,16 @@ pub(crate) fn lower_std_primitive_op(
                     .iter()
                     .find(|(name, _)| name == "value" || name == "data")
             {
+                // Layout-present `Ref` / `RefMut`: `value` is `NonNull<T>`,
+                // so the wrapper occupies T's bank
+                // (`tyref_std_cell_payload_value_type`). Deref is identity
+                // when the banks agree, same as the Opaque arm.
+                if is_std_cell_ref_deref_target(target, receiver_path) {
+                    if banks_agree {
+                        return same_as(operand, result_ty.clone());
+                    }
+                    return op_kind;
+                }
                 return payload_field_read(operand, name, owner, result_ty.clone());
             }
             return op_kind;
@@ -1271,8 +1308,12 @@ mod tests {
     }
 
     #[test]
-    fn ref_deref_reads_value_field_not_the_guard() {
+    fn ref_deref_aliases_the_payload_when_value_is_a_pointer() {
         let v = dummy_var();
+        let layout = [
+            ("value".into(), ValueType::Ref(Some("Vec".into()))),
+            ("borrow".into(), ValueType::Ref(None)),
+        ];
         let deref = lower_std_primitive_op(
             call(
                 path(&["core", "cell", "Ref", "deref"]),
@@ -1285,18 +1326,19 @@ mod tests {
             None,
             false,
             true,
-            Some(&[
-                ("value".into(), ValueType::Ref(Some("Vec".into()))),
-                ("borrow".into(), ValueType::Ref(None)),
-            ]),
+            Some(&layout),
             false,
         );
         match deref {
-            OpKind::FieldRead { field, base, .. } => {
-                assert_eq!(field.name, "value");
-                assert_eq!(base, v);
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
             }
-            other => panic!("expected a field read of Ref.value, got {other:?}"),
+            other => panic!("layout-present Ref::deref is the inner value, got {other:?}"),
         }
 
         let peeled = lower_std_primitive_op(
@@ -1316,19 +1358,40 @@ mod tests {
             None,
             false,
             true,
-            Some(&[
-                ("value".into(), ValueType::Ref(Some("Vec".into()))),
-                ("borrow".into(), ValueType::Ref(None)),
-            ]),
+            Some(&layout),
             false,
         );
         match peeled {
-            OpKind::FieldRead { field, base, .. } => {
-                assert_eq!(field.name, "value");
-                assert_eq!(base, v);
+            OpKind::UnaryOp {
+                ref op,
+                ref operand,
+                ..
+            } => {
+                assert_eq!(op, "same_as");
+                assert_eq!(operand, &v);
             }
-            other => panic!("peeled cell::Ref::deref should read value, got {other:?}"),
+            other => panic!("peeled cell::Ref::deref is the inner value, got {other:?}"),
         }
+
+        let disagree = lower_std_primitive_op(
+            call(
+                path(&["core", "cell", "Ref", "deref"]),
+                vec![v],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some(&layout),
+            false,
+        );
+        assert!(
+            matches!(disagree, OpKind::Call { .. }),
+            "layout-present Ref::deref keeps the residual Call when banks disagree, got {disagree:?}"
+        );
     }
 
     #[test]
@@ -1889,5 +1952,58 @@ mod tests {
             is_default_target(&ptr_default),
             crate::front::mir::is_core_default_path("core::ptr::mut_ptr::<Impl>::default")
         );
+    }
+
+    #[test]
+    fn accepts_core_std_and_charon_short_cell_get() {
+        for path in [
+            "core::cell::Cell::get",
+            "std::cell::Cell::get",
+            "cell::Cell::get",
+            "cell::Cell::<Impl>::get",
+            "cell::<Impl>::get",
+            "core::cell::<Impl>::get",
+        ] {
+            assert!(is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_user_and_nestedscope_cell() {
+        for path in [
+            "fixture::Cell::get",
+            "my_crate::Cell::get",
+            "pyre_object::nestedscope::Cell::get",
+            "pyre_object::nestedscope::w_cell_get",
+        ] {
+            assert!(!is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn wrapper_path_accepts_std_cell_class_spellings() {
+        for path in [
+            "core::cell::RefCell",
+            "std::cell::RefCell<Vec<*mut X>>",
+            "cell::RefCell<Hidden>",
+            "core::cell::Ref",
+            "cell::RefMut<T>",
+        ] {
+            assert!(is_std_cell_wrapper_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn wrapper_path_rejects_user_holder_and_other_cell_types() {
+        for path in [
+            "Holder<T>",
+            "Holder<HolderPayload>",
+            "fixture::RefCell<T>",
+            "core::cell::UnsafeCell<T>",
+            "core::cell::Cell<T>",
+            "cell::Cell<T>",
+        ] {
+            assert!(!is_std_cell_wrapper_path(path), "{path}");
+        }
     }
 }

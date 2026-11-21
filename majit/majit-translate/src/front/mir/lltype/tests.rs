@@ -15,8 +15,9 @@ use super::{
     tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family,
     tyref_is_void_zst, tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_std_cell_class_root,
+    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+    unique_unsafecell_slice_deref_field_index,
 };
 use crate::front::mir::tests::assert_graph_operands_defined;
 use crate::front::mir::tests::interior_adt;
@@ -52,8 +53,9 @@ use crate::front::mir::tests::{
     struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
     type_decl_alias, type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr,
     usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
-    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
-    window_shared_slice, window_slice, window_span, window_usize,
+    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice,
+    window_opaque_fun, window_place, window_shared_slice, window_slice, window_span,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 #[test]
@@ -1986,6 +1988,865 @@ fn std_cell_ref_wrappers_type_as_generic0() {
         ValueType::Ref(None),
         "a user cell::Ref is not the std wrapper"
     );
+}
+
+/// Diagnostic of the `is_resolving` wall: `tyref_to_value_type`
+/// (`lltype.rs`) peeled a Struct `RefCell<Vec<_>>` to the Vec Int bank
+/// via `tyref_std_cell_payload_value_type`, while `tyref_to_attr_value_type`
+/// did not call that helper (`Ref(None)`). `RefCell::borrow` still emits
+/// FieldRead `"value"` (`std_identity.rs` layout-present). House rule:
+/// both paths use that helper; Opaque and a pointer-valued `value` peel
+/// to T, a Struct whose `value` holds T inline keeps the cell class.
+#[test]
+fn std_cell_struct_with_value_field_keeps_the_cell_on_value_and_attr() {
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": vec_ty.clone(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(2, &["fixture", "Host"], vec![]),
+        ],
+        vec![],
+    );
+    let refcell_vec = TyRef::Other(named_adt(0, vec![vec_ty.clone()]).into());
+    let value = tyref_to_value_type(&refcell_vec, &llbc);
+    let attr = tyref_to_attr_value_type(&refcell_vec, &llbc);
+    assert_eq!(
+        value, attr,
+        "field vs return/arg of RefCell<Vec<_>> must agree; value={value:?} attr={attr:?}"
+    );
+    match value {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.starts_with("cell::RefCell<") && root.contains("Vec<"),
+                "Struct RefCell with a value field is the cell class, got {root}"
+            );
+        }
+        other => {
+            panic!("Struct RefCell with a value field must keep the cell class, got {other:?}")
+        }
+    }
+
+    let borrowed = TyRef::Other(
+        serde_json::json!({
+            "Ref": ["Erased", named_adt(0, vec![vec_ty]), "Shared"]
+        })
+        .into(),
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed, &llbc),
+        tyref_to_attr_value_type(&borrowed, &llbc),
+        "&RefCell<Vec<_>> value vs attr"
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed, &llbc),
+        tyref_to_value_type(&refcell_vec, &llbc),
+        "&RefCell and RefCell share the cell class"
+    );
+    let ValueType::Ref(Some(cell_root)) = tyref_to_value_type(&borrowed, &llbc) else {
+        panic!("&RefCell must paint Ref(Some(cell class))");
+    };
+    assert_eq!(
+        tyref_ref_param_class_root(&borrowed, &llbc, no_tombstoned_leaves(), None).as_deref(),
+        Some(cell_root.as_str()),
+        "Input class_root of &RefCell is the same cell class the value path paints"
+    );
+}
+
+/// `is_resolving` shape: a fn returning `&RefCell<Vec<GCREF-ish>>`
+/// then `.borrow()`, and the field-access shape of the same storage.
+/// The borrowed Vec is the function result so the intercept FieldRead
+/// of `"value"` stays live (an unused dest is dropped; a dummy write
+/// of local 0 in the borrow block was jump-threaded to returnblock).
+///
+/// Annotate is the argument arrival (`&RefCell` Input): intern of the
+/// cell class plus FieldRead `"value"` of borrow, no `SomeRustVec.getattr`.
+/// Return and field graphs assert the same FieldRead and that a getter
+/// dest is the cell class (`tyref_std_cell_payload_value_type`), not the
+/// Vec Int bank.
+#[test]
+fn std_cell_refcell_vec_gcref_borrow_any_annotates() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt.clone(), "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let owner_adt = named_adt(3, vec![]);
+    let owner_ref = serde_json::json!({"Ref": ["Erased", owner_adt.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let owner_decl = type_decl_struct(
+        3,
+        &["fixture", "Owner"],
+        vec![serde_json::json!({
+            "name": "active",
+            "ty": refcell_ty.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })],
+    );
+
+    let owner_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &owner_ref),
+            "Deref"
+        ]}),
+        &owner_adt,
+    );
+    let active_place = window_place(
+        serde_json::json!({"Projection": [
+            owner_deref,
+            {"Field": [null, 0]}
+        ]}),
+        &refcell_ty,
+    );
+    let borrow_call = |arg_ty: &serde_json::Value, arg_local: u64, target: u64| {
+        serde_json::json!({"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 2},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Read": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}]
+        }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+            "target": target, "on_unwind": 1}})
+    };
+
+    let getter = window_opaque_fun(
+        1,
+        &["fixture", "Owner", "active_cell"],
+        vec![owner_ref.clone()],
+        refcell_ref.clone(),
+    );
+    let borrow = window_opaque_fun(
+        2,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        vec_ty.clone(),
+    );
+    let getter_caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "getter_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &owner_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind.clone(),
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 3)}
+                },
+                ret.clone()
+            ]
+        }}
+    });
+    let field_caller = serde_json::json!({
+        "def_id": 3,
+        "item_meta": window_meta(&["fixture", "field_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [owner_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &owner_ref),
+                window_local(2, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &refcell_ref),
+                            {"Ref": {
+                                "place": active_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 2, 2)}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let arg_caller = serde_json::json!({
+        "def_id": 4,
+        "item_meta": window_meta(&["fixture", "arg_borrow_any"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [refcell_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &refcell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": borrow_call(&refcell_ref, 1, 2)}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+
+    let llbc = window_llbc(
+        vec![refcell_decl, vec_decl, host_decl, owner_decl],
+        vec![getter_caller, getter, borrow, field_caller, arg_caller],
+    );
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+
+    let has_value_field = |graph: &crate::model::FunctionGraph| {
+        graph_ops(graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "value"
+            )
+        })
+    };
+    let cell_call_dest = |graph: &crate::model::FunctionGraph| {
+        graph_ops(graph).iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                result_ty,
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("active_cell") => {
+                Some(result_ty.clone())
+            }
+            _ => None,
+        })
+    };
+
+    let getter_graph = crate::front::mir::lower_function(&llbc, "getter_borrow_any")
+        .unwrap_or_else(|e| panic!("lower getter_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&getter_graph),
+        "getter_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        getter_graph.dump()
+    );
+    match cell_call_dest(&getter_graph) {
+        Some(ValueType::Ref(Some(root)))
+            if root.starts_with("cell::RefCell<") && root.contains("Vec<") => {}
+        other => panic!(
+            "getter dest must be the cell class, not the Vec bank; got {other:?}; graph={}",
+            getter_graph.dump()
+        ),
+    }
+
+    let field_graph = crate::front::mir::lower_function(&llbc, "field_borrow_any")
+        .unwrap_or_else(|e| panic!("lower field_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&field_graph),
+        "field_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        field_graph.dump()
+    );
+
+    let graph = crate::front::mir::lower_function(&llbc, "arg_borrow_any")
+        .unwrap_or_else(|e| panic!("lower arg_borrow_any: {e:?}"));
+    assert!(
+        has_value_field(&graph),
+        "arg_borrow_any: RefCell::borrow must FieldRead value; graph={}",
+        graph.dump()
+    );
+    let input_root = graph_ops(&graph).iter().find_map(|op| match &op.kind {
+        OpKind::Input {
+            class_root: Some(root),
+            ..
+        } => Some(root.as_str()),
+        _ => None,
+    });
+    assert!(
+        input_root.is_some_and(|root| root.starts_with("cell::RefCell<") && root.contains("Vec<")),
+        "arg_borrow_any Input class_root is the cell class; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .unwrap_or_else(|e| panic!("lift arg_borrow_any: {e:?}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("arg_borrow_any inputcells: {e:?}"));
+    assert!(
+        cells.iter().any(|cell| matches!(cell, SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        }))),
+        "arg_borrow_any Input must intern the cell class; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("arg_borrow_any annotate: {e}"));
+}
+
+/// `Ref<'b, T>` is `{ value: NonNull<T>, borrow }` — a pointer to T —
+/// so it occupies T's bank. `RefCell<T>` holds T inline and stays the
+/// cell class. Field / return / argument / class_root share that verdict.
+#[test]
+fn std_cell_ref_guard_types_as_payload_not_cell_class() {
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let nonnull_ty = named_adt(3, vec![vec_ty.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": vec_ty.clone(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(2, &["fixture", "Host"], vec![]),
+            opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]),
+            type_decl_struct(
+                4,
+                &["core", "cell", "Ref"],
+                vec![
+                    serde_json::json!({
+                        "name": "value",
+                        "ty": nonnull_ty,
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "borrow",
+                        "ty": i64_ty(),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let refcell = TyRef::Other(named_adt(0, vec![vec_ty.clone()]).into());
+    let cell_ref = TyRef::Other(named_adt(4, vec![vec_ty.clone()]).into());
+    let vec = TyRef::Other(vec_ty.clone().into());
+    let tombstoned = no_tombstoned_leaves();
+
+    match tyref_std_cell_class_root(&refcell, &llbc, tombstoned) {
+        Some(root) if root.starts_with("cell::RefCell<") && root.contains("Vec<") => {}
+        other => panic!("RefCell with inline value is the cell class, got {other:?}"),
+    }
+    assert_eq!(
+        tyref_std_cell_class_root(&cell_ref, &llbc, tombstoned),
+        None,
+        "Ref with NonNull value is not a cell class"
+    );
+
+    let vec_vt = tyref_to_value_type(&vec, &llbc);
+    let ref_vt = tyref_to_value_type(&cell_ref, &llbc);
+    let ref_attr = tyref_to_attr_value_type(&cell_ref, &llbc);
+    assert_eq!(
+        ref_vt, vec_vt,
+        "Ref<Vec> occupies Vec's bank; ref={ref_vt:?} vec={vec_vt:?}"
+    );
+    assert_eq!(
+        ref_vt, ref_attr,
+        "field vs return of Ref<Vec> must agree; value={ref_vt:?} attr={ref_attr:?}"
+    );
+
+    let borrowed_ref = TyRef::Other(
+        serde_json::json!({
+            "Ref": ["Erased", named_adt(4, vec![vec_ty.clone()]), "Shared"]
+        })
+        .into(),
+    );
+    assert_eq!(
+        tyref_to_value_type(&borrowed_ref, &llbc),
+        ref_vt,
+        "&Ref peels to the same bank as Ref"
+    );
+    assert_eq!(
+        tyref_ref_param_class_root(&borrowed_ref, &llbc, tombstoned, None),
+        tyref_ref_param_class_root(&vec, &llbc, tombstoned, None),
+        "Input class_root of &Ref<Vec> is Vec's class, not the guard"
+    );
+}
+
+/// Opaque std `RefCell<Vec<i64>>` rendered from its TypeDecl carries the
+/// `cell::` module path, so a harvested reference field projects the vec
+/// payload (`bookkeeper.py` `Bookkeeper.immutablevalue`).
+#[test]
+fn harvested_opaque_std_refcell_vec_i64_field_projects_payload() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let i64 = i64_ty();
+    let vec_ty = named_adt(1, vec![i64.clone()]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let borrowed = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            opaque_type_decl(0, &["core", "cell", "RefCell"]),
+            type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(
+                2,
+                &["fixture", "Holder"],
+                vec![named_copy_field("borrowed", borrowed)],
+            ),
+            opaque_type_decl(3, &["fixture", "user", "RefCell"]),
+        ],
+        vec![],
+    );
+    let adt = serde_json::json!({
+        "id": 0,
+        "generics": {"types": [vec_ty.clone()]}
+    });
+    let rendered = super::charon_adt_to_ast_string(
+        adt.as_object().unwrap(),
+        &llbc,
+        0,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        rendered, "cell::RefCell<Vec<i64>>",
+        "std RefCell TypeDecl render carries the cell module path"
+    );
+    let user = serde_json::json!({"id": 3, "generics": {"types": []}});
+    assert_eq!(
+        super::charon_adt_to_ast_string(
+            user.as_object().unwrap(),
+            &llbc,
+            0,
+            &std::collections::HashSet::new(),
+        ),
+        "RefCell",
+        "a user RefCell keeps the TypeDecl leaf"
+    );
+
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    let harvested = fields
+        .field_type("Holder", "borrowed")
+        .expect("Holder.borrowed harvested")
+        .to_string();
+    assert!(
+        harvested.contains("cell::RefCell<Vec<i64>>"),
+        "harvested reference field carries the std cell path, got {harvested}"
+    );
+
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(fields));
+    match bk.project_struct_field_type(&harvested) {
+        SomeValue::List(_) | SomeValue::RustVec(_) => {}
+        other => panic!("opaque std RefCell<Vec<i64>> field is the vec payload, got {other:?}"),
+    }
+}
+
+/// `Ref<'_, RefCell<Payload>>` as the only occurrence of that cell
+/// instantiation still publishes `cell::RefCell<Payload>`
+/// (`classdesc.py` `ClassDesc.getuniqueclassdef`).
+#[test]
+fn register_std_cell_instantiation_rows_walks_ref_of_refcell_input() {
+    let payload_ty = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_ty.clone()]);
+    let cell_ref_ty = named_adt(2, vec![refcell_ty.clone()]);
+    let nonnull_ty = named_adt(3, vec![payload_ty.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64_ty()),
+                    named_copy_field("value", payload_ty.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "Payload"],
+                vec![named_copy_field("x", i64_ty())],
+            ),
+            type_decl_struct(
+                2,
+                &["core", "cell", "Ref"],
+                vec![
+                    named_copy_field("value", nonnull_ty),
+                    named_copy_field("borrow", i64_ty()),
+                ],
+            ),
+            opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["fixture", "takes_ref_of_cell"],
+            vec![cell_ref_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let input = TyRef::Other(cell_ref_ty.into());
+    let tomb = no_tombstoned_leaves();
+    let requested = super::tyref_input_class_root(&input, &llbc, tomb)
+        .expect("Ref<RefCell<Payload>> Input names the cell class");
+    assert!(
+        requested.starts_with("cell::RefCell<") && requested.contains("Payload"),
+        "input class_root is the nested cell, got {requested}"
+    );
+    assert_eq!(
+        super::tyref_std_cell_class_root(&input, &llbc, tomb),
+        None,
+        "the outer Ref is not itself a layout-present cell"
+    );
+
+    let (_, _, mut fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &std::collections::HashSet::new(),
+        &[],
+    );
+    assert!(
+        !fields.fields.contains_key(&requested),
+        "harvest of whole signature types must not already hold {requested}"
+    );
+    super::register_std_cell_instantiation_rows(&llbc, &mut fields, tomb);
+    assert!(
+        fields.fields.contains_key(&requested),
+        "nested Ref<RefCell<Payload>> must register {requested}; keys={:?}",
+        fields
+            .fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Duplicate `Payload` leaves paint the payload with the real tombstone
+/// set; registration after that set is final uses the same key lowering
+/// requests (`bookkeeper.py` `Bookkeeper.getuniqueclassdef`).
+#[test]
+fn register_std_cell_instantiation_keys_match_lowering_after_duplicate_payload_leaf() {
+    let payload_a = named_adt(1, vec![]);
+    let refcell_ty = named_adt(0, vec![payload_a.clone()]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["core", "cell", "RefCell"],
+                vec![
+                    named_copy_field("borrow", i64_ty()),
+                    named_copy_field("value", payload_a.clone()),
+                ],
+            ),
+            type_decl_struct(
+                1,
+                &["fixture", "mod_a", "Payload"],
+                vec![named_copy_field("x", i64_ty())],
+            ),
+            type_decl_struct(
+                2,
+                &["fixture", "mod_b", "Payload"],
+                vec![named_copy_field("y", i64_ty())],
+            ),
+        ],
+        vec![window_opaque_fun(
+            0,
+            &["fixture", "takes_cell"],
+            vec![refcell_ty.clone()],
+            i64_ty(),
+        )],
+    );
+    let cell = TyRef::Other(refcell_ty.into());
+    let tomb = super::tombstoned_leaves_of(&llbc);
+    assert!(
+        tomb.contains("Payload"),
+        "two Payload declarations withdraw the leaf; tomb={tomb:?}"
+    );
+    let requested = super::tyref_input_class_root(&cell, &llbc, tomb)
+        .expect("layout-present RefCell Input names the cell class");
+    let value_root = super::tyref_std_cell_class_root(&cell, &llbc, tomb)
+        .expect("layout-present RefCell is a cell class");
+    assert_eq!(requested, value_root);
+    let early = super::tyref_std_cell_class_root(&cell, &llbc, no_tombstoned_leaves())
+        .expect("empty-tombstone cell root");
+    assert_ne!(
+        early, requested,
+        "duplicate payload leaf must change the instantiation key"
+    );
+    assert!(
+        requested.starts_with("cell::RefCell<") && requested.contains("mod_a::Payload"),
+        "lowering key qualifies the payload, got {requested}"
+    );
+
+    let ctx = crate::front::mir::LowerContext::new(&llbc);
+    let reg = ctx.struct_field_registry();
+    assert!(
+        reg.fields.contains_key(&requested),
+        "registered key must equal the lowering root {requested}; keys={:?}",
+        reg.fields
+            .keys()
+            .filter(|k| k.contains("RefCell"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !reg.fields.contains_key(&early),
+        "empty-tombstone key {early} must not remain after disambiguation"
+    );
+}
+
+/// `RefCell::borrow` dest is `Ref<Vec<_>>`. The FieldRead of inline
+/// `value` is the Vec; the dest must not recast onto `cell::Ref<…>`.
+#[test]
+fn std_cell_borrow_dest_ref_does_not_recast_onto_the_guard() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+    use std::rc::Rc;
+
+    let host_adt = named_adt(2, vec![]);
+    let host_ptr = serde_json::json!({"RawPtr": [host_adt, "Mut"]});
+    let vec_ty = named_adt(1, vec![host_ptr]);
+    let refcell_ty = named_adt(0, vec![vec_ty.clone()]);
+    let ref_adt = named_adt(4, vec![vec_ty.clone()]);
+    let nonnull_ty = named_adt(3, vec![vec_ty.clone()]);
+    let refcell_ref = serde_json::json!({"Ref": ["Erased", refcell_ty.clone(), "Shared"]});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+
+    let refcell_decl = type_decl_struct(
+        0,
+        &["core", "cell", "RefCell"],
+        vec![
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "value",
+                "ty": vec_ty.clone(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let vec_decl = type_decl_struct(1, &["alloc", "vec", "Vec"], vec![]);
+    let host_decl = type_decl_struct(2, &["fixture", "Host"], vec![]);
+    let nonnull_decl = opaque_type_decl(3, &["core", "ptr", "non_null", "NonNull"]);
+    let ref_decl = type_decl_struct(
+        4,
+        &["core", "cell", "Ref"],
+        vec![
+            serde_json::json!({
+                "name": "value",
+                "ty": nonnull_ty,
+                "attr_info": null
+            }),
+            serde_json::json!({
+                "name": "borrow",
+                "ty": i64_ty(),
+                "attr_info": null
+            }),
+        ],
+    );
+    let borrow = window_opaque_fun(
+        1,
+        &["core", "cell", "RefCell", "borrow"],
+        vec![refcell_ref.clone()],
+        ref_adt.clone(),
+    );
+    let deref = window_opaque_fun(
+        2,
+        &["core", "cell", "Ref", "deref"],
+        vec![ref_adt.clone()],
+        vec_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "arg_borrow_deref"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [refcell_ref.clone()],
+            "output": vec_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &vec_ty),
+                window_local(1, &refcell_ref),
+                window_local(2, &ref_adt)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 1}), &refcell_ref)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 2}), &ref_adt),
+                        "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Read": window_place(serde_json::json!({"Local": 2}), &ref_adt)}]
+                    }, "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty),
+                        "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+
+    let llbc = window_llbc(
+        vec![refcell_decl, vec_decl, host_decl, nonnull_decl, ref_decl],
+        vec![caller, borrow, deref],
+    );
+    let harvested = Rc::new(crate::front::mir::LowerContext::new(&llbc).struct_field_registry());
+    let graph = crate::front::mir::lower_function(&llbc, "arg_borrow_deref")
+        .unwrap_or_else(|e| panic!("lower arg_borrow_deref: {e:?}"));
+    assert!(
+        graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "value"
+            )
+        }),
+        "borrow must FieldRead value; graph={}",
+        graph.dump()
+    );
+    let cast_roots: Vec<&str> = graph_ops(&graph)
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        !cast_roots
+            .iter()
+            .any(|root| root.starts_with("cell::Ref<") || root.contains("::Ref<")),
+        "borrow dest must not recast onto the Ref guard; roots={cast_roots:?}; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    ann.bookkeeper.set_struct_fields(harvested);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .unwrap_or_else(|e| panic!("lift arg_borrow_deref: {e:?}"));
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .unwrap_or_else(|e| panic!("arg_borrow_deref inputcells: {e:?}"));
+    assert!(
+        cells.iter().any(|cell| matches!(cell, SomeValue::Instance(inst) if inst.classdef.as_ref().is_some_and(|cd| {
+            let name = cd.borrow().name.clone();
+            name.starts_with("cell::RefCell<") && name.contains("Vec<")
+        }))),
+        "arg_borrow_deref Input must intern the cell class; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .unwrap_or_else(|e| panic!("arg_borrow_deref annotate: {e}"));
 }
 
 #[test]

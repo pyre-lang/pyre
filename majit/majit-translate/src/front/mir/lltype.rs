@@ -3364,12 +3364,11 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     {
         return inner;
     }
-    // Opaque `core::cell::Ref` / `RefMut` / `RefCell` have no `value`
-    // field in this artefact. RPython has no RefCell: a single-owner
-    // interpreter field is a direct getattr, and the dynamic borrow flag
-    // has no lltype counterpart, so the wrapper word is T
-    // (`Adt.generics.types[0]`). Mapping here is what lets
-    // `RefCell::borrow` and `Ref::deref` pass `banks_agree` as identities.
+    // Std `Ref` / `RefMut` / `RefCell` (`tyref_std_cell_payload_value_type`):
+    // Opaque wrappers and a pointer-valued `value` (`Ref` / `RefMut`,
+    // `NonNull<T>`) occupy T's bank. A Struct whose `value` holds T inline
+    // (`RefCell`) is the cell class, so `RefCell::borrow` FieldRead of
+    // `value` (`std_identity.rs` layout-present path) resolves on the cell.
     if let Some(inner) = tyref_std_cell_payload_value_type(
         ty,
         llbc,
@@ -5869,6 +5868,20 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     {
         return inner;
     }
+    // Matching [`tyref_to_value_type`]: the same std-cell helper, so a
+    // field, a return, and an argument of `&RefCell<T>` / `RefCell<T>` /
+    // `Ref<T>` carry one ValueType. Opaque and a pointer-valued `value`
+    // peel to T; a Struct whose `value` holds T inline is the cell class
+    // `RefCell::borrow` FieldReads.
+    if let Some(cell) = tyref_std_cell_payload_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return cell;
+    }
     // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
     // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
     // `int`). Layout and the register bank keep that Int. FORCE does not
@@ -8061,6 +8074,23 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     {
         return Some(closure_env_class_identity(td, tombstoned));
     }
+    // Same intern key [`tyref_std_cell_payload_value_type`] paints.
+    // `adt_node_class_root_identity` declines generic core structs, so
+    // without this seed a `&RefCell<T>` Input is classdef-less and
+    // `getattr` of `value` walls. A pointer-valued guard (`Ref` /
+    // `RefMut`) occupies T's bank: seed T's class, not the guard, via
+    // the same Input helper a `T` / `&T` param uses (list spelling,
+    // shaped tuple, then this function). Nested `Ref<RefCell<T>>` uses
+    // the same walk [`register_std_cell_instantiation_rows`] does
+    // (`classdesc.py` `ClassDesc.getuniqueclassdef`).
+    if tyref_is_std_cell_wrapper(ty, llbc) {
+        if let Some(root) = tyref_std_cell_class_root_nested(ty, llbc, tombstoned) {
+            return Some(root);
+        }
+        if let Some(inner) = tyref_adt_generics_type_arg(ty, 0, llbc) {
+            return tyref_ref_param_class_root(&inner, llbc, tombstoned, None);
+        }
+    }
     tyref_class_root_with(ty, llbc, tombstoned)
 }
 
@@ -8217,12 +8247,21 @@ pub(in crate::front::mir) fn tyref_atomic_inner_value_type(
     }
 }
 
-/// Inner [`ValueType`] of an Opaque std `Ref` / `RefMut` / `RefCell`.
+/// [`ValueType`] of a std `Ref` / `RefMut` / `RefCell`.
 ///
-/// Charon records those ADTs as `TypeDeclKind::Opaque` (no `value`
-/// field). RPython has no RefCell: `ec.<attr>` is a direct getattr, and
-/// the borrow flag has no lltype counterpart, so the wrapper occupies
-/// T's register bank. Keyed on the ADT path plus generic 0.
+/// RPython has no borrow guard: `ec.<attr>` is a direct getattr, and the
+/// borrow flag has no lltype counterpart. [`tyref_std_cell_class_root`]
+/// is the one layout verdict this helper consumes:
+///
+/// * Some: `value` holds T inline (`RefCell`). The cell class, so the
+///   layout-present borrow FieldRead of `value` resolves on the cell,
+///   not on T. Same intern shape as `MutRef<T>`.
+/// * None: Opaque, or `value` is a pointer to T (`Ref` / `RefMut`,
+///   `NonNull<T>`). The wrapper occupies T's register bank
+///   (`Adt.generics.types[0]`). `RefCell::borrow` / `Ref::deref` then
+///   pass `banks_agree` as `same_as` (`std_identity.rs`).
+///
+/// Value sites, attr sites, and Input `class_root` share this helper.
 pub(in crate::front::mir) fn tyref_std_cell_payload_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -8232,6 +8271,9 @@ pub(in crate::front::mir) fn tyref_std_cell_payload_value_type(
 ) -> Option<ValueType> {
     if !tyref_is_std_cell_wrapper(ty, llbc) {
         return None;
+    }
+    if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned) {
+        return Some(ValueType::Ref(Some(root)));
     }
     let inner = tyref_adt_generics_type_arg(ty, 0, llbc)?;
     Some(tyref_to_value_type_with(
@@ -8243,10 +8285,141 @@ pub(in crate::front::mir) fn tyref_std_cell_payload_value_type(
     ))
 }
 
+/// Intern key of a std cell whose `value` field holds T inline.
+///
+/// Opaque cells have no field list. `Ref` / `RefMut` declare `value` as
+/// `NonNull<T>` — a pointer to the payload, not T itself — so they occupy
+/// T's bank instead ([`tyref_std_cell_payload_value_type`]). The identity
+/// is the crate-stripped TypeDecl path plus generic 0 (`MutRef<T>` / enum
+/// instantiation suffix), so intern finds the harvested `value` row
+/// of this instantiation.
+pub(in crate::front::mir) fn tyref_std_cell_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !tyref_is_std_cell_wrapper(ty, llbc) {
+        return None;
+    }
+    let td = tyref_type_decl(ty, llbc)?;
+    if matches!(td.kind, TypeDeclKind::Opaque)
+        || !adt_declares_field(td, "value")
+        || std_cell_value_field_points_at_payload(td, llbc)
+    {
+        return None;
+    }
+    let identity = super::class_identity_spelling(&td.item_meta.name_path_str(), tombstoned);
+    let inner = tyref_adt_generics_type_arg(ty, 0, llbc)?;
+    let inner_ast = tyref_to_ast_string_with(&inner, llbc, tombstoned);
+    Some(majit_ir::descr::with_instantiation_suffix(
+        &identity,
+        &format!("<{inner_ast}>"),
+    ))
+}
+
+/// Layout-present std-cell intern key of `ty`, walking through
+/// pointer-valued `Ref` / `RefMut` the same way [`tyref_input_class_root`]
+/// unwraps. `classdesc.py` `ClassDesc.getuniqueclassdef` does not depend
+/// on whether the class sat at the outermost signature type.
+fn tyref_std_cell_class_root_nested(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    fn walk(
+        ty: &TyRef,
+        llbc: &Llbc,
+        tombstoned: &std::collections::HashSet<String>,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 24 {
+            return None;
+        }
+        if let Some(root) = tyref_std_cell_class_root(ty, llbc, tombstoned) {
+            return Some(root);
+        }
+        if tyref_is_std_cell_wrapper(ty, llbc)
+            && let Some(inner) = tyref_adt_generics_type_arg(ty, 0, llbc)
+        {
+            return walk(&inner, llbc, tombstoned, depth + 1);
+        }
+        None
+    }
+    walk(ty, llbc, tombstoned, 0)
+}
+
+/// `true` when the std cell's `value` field is a pointer word to T
+/// (`Ref` / `RefMut`: `NonNull<T>`), not T sitting in the struct
+/// (`RefCell`: `UnsafeCell<T>`).
+fn std_cell_value_field_points_at_payload(td: &TypeDecl, llbc: &Llbc) -> bool {
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    let Some(field) = fields
+        .iter()
+        .find(|field| field.name.as_deref() == Some("value"))
+    else {
+        return false;
+    };
+    tyref_node(&field.ty, llbc).is_some_and(|node| one_level_pointer_pointee(node, llbc).is_some())
+}
+
+/// Publish per-instantiation field rows for a std cell whose `value`
+/// holds T inline. Harvest of the TypeDecl writes the unsuffixed
+/// template (`cell::RefCell`); [`tyref_std_cell_class_root`] paints
+/// `cell::RefCell<T>`. `derive_subject_inputcells` intern's a suffixed
+/// Input only when the registry has that exact key
+/// (`registered_struct_root_key`); without it the seed stays
+/// classdef-less and `getattr` of `value` walls. Same intern shape as
+/// `MutRef<T>`: the cell class, not T. A pointer-valued guard is not a
+/// cell class and does not get a row.
+pub(in crate::front::mir) fn register_std_cell_instantiation_rows(
+    llbc: &Llbc,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    tombstoned: &std::collections::HashSet<String>,
+) {
+    let mut roots = std::collections::BTreeSet::new();
+    for fd in llbc.iter_fun_decls() {
+        for ty in fd
+            .signature
+            .inputs
+            .iter()
+            .chain(std::iter::once(&fd.signature.output))
+        {
+            if let Some(root) = tyref_std_cell_class_root_nested(ty, llbc, tombstoned) {
+                roots.insert(root);
+            }
+        }
+    }
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        for field in fields {
+            if let Some(root) = tyref_std_cell_class_root_nested(&field.ty, llbc, tombstoned) {
+                roots.insert(root);
+            }
+        }
+    }
+    for root in roots {
+        if struct_fields.fields.contains_key(&root) {
+            continue;
+        }
+        let template = majit_ir::descr::strip_instantiation_suffix(&root);
+        let Some(rows) = struct_fields
+            .intern_field_rows(&template)
+            .map(|rows| rows.to_vec())
+        else {
+            continue;
+        };
+        struct_fields.fields.insert(root, rows);
+    }
+}
+
 /// `core::cell::{Ref, RefMut, RefCell}` (and the `std::cell` re-export),
 /// by value or behind one borrow. A user type that shares a leaf name
 /// does not match.
-fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
@@ -8256,28 +8429,7 @@ fn tyref_is_std_cell_wrapper(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(td) = llbc.type_by_id(id) else {
         return false;
     };
-    match td.item_meta.template_name().next_back() {
-        Some(NameSeg::Ident { ident: (s, _) })
-            if matches!(s.as_str(), "Ref" | "RefMut" | "RefCell") => {}
-        _ => return false,
-    }
-    let mut crate_ok = false;
-    let mut saw_cell = false;
-    for seg in td.item_meta.template_name() {
-        let NameSeg::Ident { ident: (id, _) } = seg else {
-            continue;
-        };
-        if !crate_ok && !saw_cell {
-            if !matches!(id.as_str(), "core" | "std") {
-                return false;
-            }
-            crate_ok = true;
-        }
-        if id == "cell" {
-            saw_cell = true;
-        }
-    }
-    crate_ok && saw_cell
+    crate::front::std_identity::is_std_cell_wrapper_path(td.item_meta.name_path_str())
 }
 
 /// The type argument `T` of a `core::sync::atomic::Atomic<T>`, resolved
@@ -16709,8 +16861,12 @@ fn marked_exception_ast_name(llbc: &Llbc, name_path: &str) -> Option<String> {
 /// CAST head of one ADT declaration path.
 ///
 /// A marked exception class is its intern key. A withdrawn duplicate leaf
-/// is the crate-stripped path [`tombstoned_owner_spelling`] paints. Every
-/// other ADT keeps the TypeDecl leaf.
+/// is the crate-stripped path [`tombstoned_owner_spelling`] paints. A std
+/// cell TypeDecl (`core::cell` / `std::cell` / crate-stripped `cell`,
+/// leaf `Ref` / `RefMut` / `RefCell`) keeps that module path so a
+/// harvested field spelling matches
+/// [`crate::front::std_identity::is_std_cell_wrapper_path`]. Every other
+/// ADT keeps the TypeDecl leaf.
 fn adt_ast_head(
     llbc: &Llbc,
     name_path: &str,
@@ -16718,6 +16874,9 @@ fn adt_ast_head(
 ) -> String {
     if let Some(key) = marked_exception_ast_name(llbc, name_path) {
         return key;
+    }
+    if crate::front::std_identity::is_std_cell_wrapper_path(name_path) {
+        return super::class_identity_spelling(name_path, tombstoned);
     }
     let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
     if tombstoned.contains(leaf) {
@@ -16787,7 +16946,8 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
 /// FieldRow.ty of a named by-value ADT: the crate-stripped TypeDecl
 /// path `resolve_adt_field` stamps on FieldWrite.owner_root
 /// (`class_identity_spelling`). `charon_adt_to_ast_string` is the ADT
-/// leaf; two TypeDecls that share that leaf (`module::struct::Code`
+/// leaf except a std cell, which keeps `cell::RefCell` / `cell::Ref` /
+/// `cell::RefMut`; two TypeDecls that share that leaf (`module::struct::Code`
 /// beside `eval::Code`) collide unless the row carries `name_path()`.
 /// `consider_struct` / `all_fielddescrs` / `get_field_descr` key on
 /// the STRUCT. An array-of-ADT layout qualifies the element the same
