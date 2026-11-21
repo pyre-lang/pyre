@@ -2796,6 +2796,7 @@ mod tests {
 
     #[test]
     fn obj_or_memory_error_passes_through_a_live_object() {
+        crate::module::thread::ensure_runtime_thread();
         let obj = w_int_new(1);
         let out = obj_or_memory_error(obj).expect("non-null is Ok");
         assert_eq!(out, obj);
@@ -2822,6 +2823,7 @@ mod tests {
 
     #[test]
     fn test_classify_callable_rejects_non_callable() {
+        crate::module::thread::ensure_runtime_thread();
         let err = classify_callable(w_int_new(3)).expect_err("non-callable dispatch should fail");
 
         assert!(matches!(err.kind, PyErrorKind::TypeError));
@@ -2830,6 +2832,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_helpers_share_iterator_semantics() {
+        crate::module::thread::ensure_runtime_thread();
         let iter = pyre_object::w_range_iter_new(1, 2, 1);
         assert!(range_iter_continues(iter).unwrap());
         let first = range_iter_next_or_null(iter).unwrap();
@@ -2844,6 +2847,7 @@ mod tests {
 
     #[test]
     fn test_jit_range_iter_helper_shares_iterator_semantics() {
+        crate::module::thread::ensure_runtime_thread();
         let iter = pyre_object::w_range_iter_new(1, 2, 1);
         let first = jit_range_iter_next_or_null(iter);
         let second = jit_range_iter_next_or_null(iter);
@@ -2857,6 +2861,7 @@ mod tests {
 
     #[test]
     fn test_jit_sequence_getitem_shares_runtime_sequence_semantics() {
+        crate::module::thread::ensure_runtime_thread();
         let tuple = pyre_object::w_tuple_new(vec![w_int_new(3), w_int_new(5)]);
         let item = jit_sequence_getitem(tuple, 1);
         unsafe {
@@ -2866,6 +2871,7 @@ mod tests {
 
     #[test]
     fn seq_iter_observes_list_growth_during_iteration() {
+        crate::module::thread::ensure_runtime_thread();
         // listiterator re-reads the live list size each step, so an append
         // during iteration is observed. range_iter_continues /
         // range_iter_next_or_null must read the CURRENT length, not the length
@@ -2888,6 +2894,7 @@ mod tests {
 
     #[test]
     fn seq_iter_over_str_payload_yields_codepoints_and_terminates() {
+        crate::module::thread::ensure_runtime_thread();
         // `iter(str)` through the builtin (baseobjspace::iter) makes a seq-iter
         // with a STR payload (the GET_ITER opcode instead materialises a char
         // list). range_iter_continues / range_iter_next_or_null must fetch and
@@ -2913,6 +2920,7 @@ mod tests {
 
     #[test]
     fn set_iter_uses_space_next_for_live_size_guard() {
+        crate::module::thread::ensure_runtime_thread();
         let set = pyre_object::w_set_new();
         let iter = pyre_object::w_set_iter_new(set);
         assert!(via_space_next(iter));

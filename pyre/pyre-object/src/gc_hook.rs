@@ -159,8 +159,17 @@ mod hook_test_owner {
     /// Take [`HOOK_TEST_LOCK`] and hide hook effects from every other thread
     /// until the guard drops. Drop clears the nursery and stable alloc hooks
     /// so a panic cannot leave them installed.
+    ///
+    /// A test thread keeps the GIL from its first runtime entry until it
+    /// exits, and tests take this lock both before and after that entry. A
+    /// contended wait therefore releases the GIL (`before_external_block`),
+    /// as every blocking wait does, so the owner can take the GIL it is
+    /// waiting for.
     pub fn hook_test_guard() -> HookTestGuard {
-        let lock = HOOK_TEST_LOCK.lock();
+        let lock = HOOK_TEST_LOCK.try_lock().unwrap_or_else(|| {
+            let _blocked = majit_gc::gc_sync::before_external_block();
+            HOOK_TEST_LOCK.lock()
+        });
         HOOK_TEST_OWNER.store(hook_test_thread_tag(), std::sync::atomic::Ordering::Release);
         HookTestGuard { _lock: lock }
     }
@@ -185,6 +194,17 @@ pub fn clear_gc_alloc_hook() {
     GC_ALLOC_HOOK.set(None);
 }
 
+/// Debug-only: a managed allocation is only legal while this thread may
+/// run as a mutator, once the GIL exists. A bare object build with no
+/// hook installed never reaches this.
+#[inline]
+fn assert_gil_held_for_alloc() {
+    debug_assert!(
+        !majit_gc::rgil::gil_is_initialized() || majit_gc::rgil::mutator_may_run(),
+        "pyre object allocated without the GIL: enter the runtime first (ensure_runtime_thread)"
+    );
+}
+
 /// Attempt a GC allocation via the installed hook. Returns `None`
 /// when no hook is installed, or `Some(null)` when the hook itself
 /// returned null.
@@ -199,7 +219,9 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
     if !hook_test_effects_visible() {
         return None;
     }
-    GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
+    let f = GC_ALLOC_HOOK.get()?;
+    assert_gil_held_for_alloc();
+    Some(f(type_id, payload_size))
 }
 
 // The `NoRoute` / `Failed` split is the allocator's contract, not this hook
@@ -229,6 +251,7 @@ pub fn try_gc_alloc_with_placement(
         return None;
     }
     if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
+        assert_gil_held_for_alloc();
         return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
     }
     *needs_write_barrier = true;
@@ -266,7 +289,9 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
     if !hook_test_effects_visible() {
         return None;
     }
-    GC_ALLOC_STABLE_HOOK.get().map(|f| f(type_id, payload_size))
+    let f = GC_ALLOC_STABLE_HOOK.get()?;
+    assert_gil_held_for_alloc();
+    Some(f(type_id, payload_size))
 }
 
 /// [`try_gc_alloc_stable`] narrowed to the one answer its callers can act on.
@@ -284,6 +309,9 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> GCREF {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return core::ptr::null_mut();
+    }
+    if GC_ALLOC_STABLE_HOOK.get().is_some() {
+        assert_gil_held_for_alloc();
     }
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
         .allocated_or_raise()
@@ -327,6 +355,7 @@ pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GC
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
+    assert_gil_held_for_alloc();
     GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
         .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
@@ -364,6 +393,7 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
+    assert_gil_held_for_alloc();
     GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
         .allocated_or_raise()
         .unwrap_or(core::ptr::null_mut())
@@ -383,6 +413,7 @@ pub fn try_gc_alloc_young_nonmoving_no_collect(type_id: u32, payload_size: usize
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable(type_id, payload_size);
     };
+    assert_gil_held_for_alloc();
     Some(hook(type_id, payload_size))
 }
 
@@ -418,6 +449,9 @@ pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> GCREF {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return core::ptr::null_mut();
+    }
+    if GC_ALLOC_HOOK.get().is_some() {
+        assert_gil_held_for_alloc();
     }
     GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
         .allocated_or_raise()
@@ -488,9 +522,11 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
         return None;
     }
     if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
+        assert_gil_held_for_alloc();
         return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
     let collecting = GC_ALLOC_COLLECTING_HOOK.get()?;
+    assert_gil_held_for_alloc();
     // Backends without placement reporting retain the conservative creation
     // barrier. MiniMark's rooted hook clears this for a nursery result.
     unsafe { *needs_write_barrier = true };

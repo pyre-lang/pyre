@@ -666,6 +666,10 @@ pub fn fetch_traceback_alloc_error() -> crate::PyError {
 mod tests {
     use super::*;
 
+    fn enter_runtime() {
+        crate::module::thread::ensure_runtime_thread();
+    }
+
     #[test]
     fn pytraceback_gc_type_id_matches_descr() {
         assert_eq!(PYTRACEBACK_GC_TYPE_ID, 44);
@@ -681,6 +685,7 @@ mod tests {
 
     #[test]
     fn pytraceback_alloc_and_accessors() {
+        enter_runtime();
         let tb = w_pytraceback_new(
             std::ptr::null_mut(),
             42,
@@ -710,6 +715,7 @@ mod tests {
     /// the negative values the constructor accepts.
     #[test]
     fn an_unresolvable_node_answers_none_and_a_stamped_line_answers_itself() {
+        enter_runtime();
         unsafe {
             let unresolvable = w_pytraceback_new(
                 std::ptr::null_mut(),
@@ -746,6 +752,7 @@ mod tests {
 
     #[test]
     fn pytraceback_set_next_self_loop_rejects() {
+        enter_runtime();
         let tb = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
         unsafe {
             assert!(w_pytraceback_set_w_next(tb, tb).is_err());
@@ -755,6 +762,7 @@ mod tests {
 
     #[test]
     fn pytraceback_set_next_chain_loop_rejects() {
+        enter_runtime();
         // Chain: outer -> inner -> outer should be rejected.
         let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
         let inner = w_pytraceback_new(std::ptr::null_mut(), 1, outer, 0, PY_NULL);
@@ -767,6 +775,7 @@ mod tests {
 
     #[test]
     fn pytraceback_set_next_chain_ok() {
+        enter_runtime();
         let inner = w_pytraceback_new(std::ptr::null_mut(), 1, PY_NULL, 0, PY_NULL);
         let outer = w_pytraceback_new(std::ptr::null_mut(), 0, PY_NULL, 0, PY_NULL);
         unsafe {
@@ -780,6 +789,7 @@ mod tests {
     /// `-2`.
     #[test]
     fn last_instr_sentinel_stays_minus_one() {
+        enter_runtime();
         let code = crate::compile_exec("pass\n").expect("compile");
         let w_code = crate::pycode::box_code_constant(&code).unwrap();
         let globals = pyre_object::w_dict_new();
