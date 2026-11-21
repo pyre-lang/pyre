@@ -2835,9 +2835,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// `std::sync::OnceLock::get_or_init` whose receiver is a
-    /// [`OpKind::ConstRefAddr`] taken from a `refs` row. Those rows register
-    /// the initialized object, not the `OnceLock` container, so the only
-    /// receivers that qualify are statics the host already initialized.
+    /// [`OpKind::ConstRefAddr`] taken from a `refs` row, or that
+    /// address wrapped as `__cast_instance_intrinsic` of the payload
+    /// STRUCT. Those rows register the initialized object, not the
+    /// `OnceLock` container, so the only receivers that qualify are
+    /// statics the host already initialized (`cache.py Cache.getorbuild`).
     pub(in crate::front::mir) fn is_prebuilt_once_lock_get_or_init(
         &self,
         reg: &RegularCall,
@@ -2850,17 +2852,46 @@ impl<'a> Lowering<'a> {
             let name = fd.item_meta.name_path_str();
             name.contains("::once_lock::") && name.rsplit("::").next() == Some("get_or_init")
         });
-        is_get_or_init
-            && self
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| {
-                    op.result.as_ref() == Some(recv)
-                        && matches!(op.kind, OpKind::ConstRefAddr(addr)
-                            if self.static_addrs.refs.iter().any(|(_, a)| *a == addr))
-                })
+        is_get_or_init && self.is_refs_payload_receiver(recv)
+    }
+
+    /// Receiver of a refs-keyed prebuilt: the `ConstRefAddr` itself, or
+    /// `__cast_instance_intrinsic` of that address when the payload `T`
+    /// is a STRUCT (`Bookkeeper.immutablevalue` of the memo result).
+    fn is_refs_payload_receiver(&self, recv: &Variable) -> bool {
+        if self.is_refs_row_const_ref_addr(recv) {
+            return true;
+        }
+        self.graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                op.result.as_ref() == Some(recv)
+                    && crate::model::cast_instance_root(&op.kind).is_some()
+                    && match &op.kind {
+                        OpKind::Call { args, .. } => args
+                            .first()
+                            .and_then(|arg| arg.as_variable())
+                            .is_some_and(|operand| self.is_refs_row_const_ref_addr(operand)),
+                        _ => false,
+                    }
+            })
+    }
+
+    fn is_refs_row_const_ref_addr(&self, var: &Variable) -> bool {
+        self.graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                op.result.as_ref() == Some(var)
+                    && matches!(
+                        op.kind,
+                        OpKind::ConstRefAddr(addr)
+                            if self.static_addrs.refs.iter().any(|(_, a)| *a == addr)
+                    )
+            })
     }
 
     /// `core::sync::atomic::Atomic*::new(v)` — the wrapper constructor over

@@ -7739,6 +7739,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
         ),
+        // `mapdict.py` shared `DictTerminator` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock`; the refs row is the initialized
+        // `TerminatorForDicts` payload / `get_or_init` return
+        // (`bookkeeper.py immutablevalue` of that object).
+        (
+            "objspace::std::mapdict::TERMINATOR_FOR_DICTS",
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr(),
+        ),
         (
             "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
             crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64,
@@ -9697,6 +9705,10 @@ mod tests {
         assert_eq!(
             bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
             crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["objspace::std::mapdict::TERMINATOR_FOR_DICTS"],
+            crate::objspace::std::mapdict::terminator_for_dicts_payload_addr()
         );
         assert_eq!(
             bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],

@@ -9694,30 +9694,39 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 // A `FnPtrCell<F>` static (`global_hook!`) or a
-                // `OnceLock<fn>` static (`oncelock_fn_static!`) is a
-                // raw host function address (`bookkeeper.py
-                // Bookkeeper.immutablevalue` / `llmemory.Address`).
-                // `raw_load` of that word is int-kinded, so the
-                // ConstRefAddr result is Address.
+                // `OnceLock<T>` static (`oncelock_fn_static!`,
+                // `define_prebuilt_dict_strategy_ref`) is a prebuilt
+                // constant (`bookkeeper.py Bookkeeper.immutablevalue`).
+                // The refs row is the initialized payload, not the
+                // container (`cache.py Cache.getorbuild` specialize:memo,
+                // `baseobjspace.py fromcache`).
                 //
-                // A refs-row `OnceLock<T>` whose payload is not a
-                // function pointer (`OnceLock<usize>` singletons:
-                // `define_prebuilt_dict_strategy_ref`, `w_none`) is
-                // the prebuilt GC object itself (`cache.py
-                // Cache.getorbuild`, `baseobjspace.py fromcache`).
-                // `rclass.py InstanceRepr.convert_const` turns that
-                // into a GC `Ptr` constant; there is never an integer
-                // stage. Leave the result typed as the ordinary
-                // refs-row ConstRefAddr (Unknown): the adapter last
-                // arm (`const_ref_addr_define_hlvalue`) then produces
-                // the GCREF constant.
+                // A STRUCT payload is the prebuilt instance of `T`
+                // (`immutablevalue` →
+                // `SomeInstance(getuniqueclassdef(cls))` /
+                // `rclass.py InstanceRepr.convert_const`). Same shape
+                // as the pytypes lane: `ConstRefAddr` +
+                // `__cast_instance_intrinsic[<T>]`. `OnceLock` itself
+                // is never the class root (`refs_static_struct_root`
+                // returns None for it).
+                //
+                // A function-pointer payload (`FnPtrCell<F>`,
+                // `OnceLock<fn>`) is a raw host function address
+                // (`llmemory.Address`): `raw_load` of that word is
+                // int-kinded, so the ConstRefAddr result is Address.
+                //
+                // Any other refs-row `OnceLock<T>` (`OnceLock<usize>`
+                // singletons: `define_prebuilt_dict_strategy_ref`,
+                // `w_none`) is the prebuilt GC object itself; there is
+                // never an integer stage. Leave the result typed as the
+                // ordinary refs-row ConstRefAddr (Unknown): the adapter
+                // last arm (`const_ref_addr_define_hlvalue`) then
+                // produces the GCREF constant.
                 //
                 // The cell is not a class instance: wrapping it in
-                // `__cast_instance_intrinsic` would mint
+                // `__cast_instance_intrinsic[OnceLock]` would mint
                 // `SomeInstance(OnceLock)` and drop the subsequent
-                // `get` / `get_or_init`. `OnceLock<fn>::get` is a load
-                // of `Option<Ptr(FuncType)>`; `get_or_init` of a
-                // refs-keyed singleton is the registered object.
+                // `get` / `get_or_init`.
                 // `refs_static_struct_root` already returns None for
                 // OnceLock; this lane must run before
                 // `tyref_class_root_with` re-wraps a harvested
@@ -9731,6 +9740,23 @@ impl<'a> Lowering<'a> {
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);
+                    if let Some(root) = self.oncelock_payload_struct_root(&place_ty) {
+                        let raw = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(raw.clone()),
+                            kind: op,
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: crate::model::cast_instance_call(root, raw),
+                        });
+                        return Ok(res);
+                    }
                     let stamp_fn_address = tyref_is_fnptrcell(&place_ty, self.llbc)
                         || tyref_is_oncelock_fn(&place_ty, self.llbc);
                     let res = self.graph.alloc_value_var_with_type(if stamp_fn_address {
@@ -11408,6 +11434,29 @@ impl<'a> Lowering<'a> {
             TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&path)),
             _ => None,
         }
+    }
+
+    /// Class root of `OnceLock<T>`'s payload `T` when `T` is a STRUCT.
+    /// A refs-keyed OnceLock is the initialized memo (`cache.py`
+    /// `Cache.getorbuild`); `immutablevalue` of a prebuilt instance is
+    /// `SomeInstance(getuniqueclassdef(cls))` (`bookkeeper.py
+    /// Bookkeeper.immutablevalue` / `rclass.py InstanceRepr.convert_const`).
+    /// Scalar payloads (`OnceLock<usize>` / `OnceLock<bool>`) have no
+    /// class root and keep the Address stamp.
+    ///
+    /// The root is the instantiated spelling ordinary value/input
+    /// lowering uses for `T`: [`tyref_std_cell_class_root`] for a
+    /// layout-present cell, [`tyref_class_root_with`] otherwise.
+    /// `InstanceRepr.convert_const` converts with the object's actual
+    /// class.
+    pub(in crate::front::mir) fn oncelock_payload_struct_root(&self, ty: &TyRef) -> Option<String> {
+        if !tyref_is_oncelock(ty, self.llbc) {
+            return None;
+        }
+        let payload = tyref_adt_generics_type_arg(ty, 0, self.llbc)?;
+        let _ = self.refs_static_struct_root(&payload)?;
+        tyref_std_cell_class_root(&payload, self.llbc, self.tombstoned_leaves)
+            .or_else(|| tyref_class_root_with(&payload, self.llbc, self.tombstoned_leaves))
     }
 
     /// Class root of a harvested `_alloc_flavor_ = "raw"` STRUCT static
