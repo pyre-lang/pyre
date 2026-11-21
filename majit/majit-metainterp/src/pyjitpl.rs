@@ -7278,13 +7278,12 @@ impl<M: Clone> MetaInterp<M> {
         let typed = {
             let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
             Self::with_typed_decision_key(green_key, code_slot, pc, |key, pin| {
-                let has = warm_state
-                    .cell_key_for(pin, key)
-                    .and_then(|cell_key| warm_state.get_procedure_token(cell_key))
-                    .is_some_and(|t| {
-                        t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
-                    });
-                warm_state.maybe_compile_decision_with_key(pin, key, |_| has, reds)
+                warm_state.maybe_compile_decision_with_key(
+                    pin,
+                    key,
+                    |t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no),
+                    reds,
+                )
             })
         };
         match typed {
@@ -7296,9 +7295,13 @@ impl<M: Clone> MetaInterp<M> {
                     .get(jd_no)
                     .map(|d| d.green_args_spec())
                     .unwrap_or_default();
-                let has = self.has_this_driver_compiled_procedure(jd_no, green_key);
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-                warm_state.maybe_compile_decision_with_meta(green_key, |_| has, &types, reds)
+                warm_state.maybe_compile_decision_with_meta(
+                    green_key,
+                    |t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no),
+                    &types,
+                    reds,
+                )
             }
         }
     }
@@ -7346,10 +7349,19 @@ impl<M: Clone> MetaInterp<M> {
         ) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                let reconstructed;
                 let (greens, types): (&[i64], &[majit_ir::GreenType]) =
                     match green_key_values.as_ref() {
                         Some(k) => (&k.values, &k.types),
-                        None => (&[], &[]),
+                        None => {
+                            reconstructed = self.reconstructed_greenkey_without_greenargs(
+                                jd_no, green_key, code_slot, target_pc,
+                            );
+                            match reconstructed.as_slices() {
+                                Some((values, types)) => (values, types),
+                                None => (&[], &[]),
+                            }
+                        }
                     };
                 if !self.bound_reached_prelude(jd_no, greens, types, live_values) {
                     return BackEdgeAction::Interpret;
@@ -7371,6 +7383,25 @@ impl<M: Clone> MetaInterp<M> {
 
 fn live_greenkey_after_collect(pin: &crate::warmstate::GreenRefPin, key: &mut majit_ir::GreenKey) {
     pin.reload(key);
+}
+
+/// `*greenargs` recovered when a tracing door did not pass them.
+pub(crate) enum GreensWithoutGreenargs {
+    /// Live portal pin: `[pc, profiled, pycode]`.
+    Portal(majit_ir::GreenKey),
+    /// Installed cell greens matching the driver's `_green_args_spec`.
+    Installed(majit_ir::GreenKey),
+    /// Empty spec, or no greens to recover (Int-only tests with no cell).
+    Empty,
+}
+
+impl GreensWithoutGreenargs {
+    pub(crate) fn as_slices(&self) -> Option<(&[i64], &[majit_ir::GreenType])> {
+        match self {
+            Self::Portal(key) | Self::Installed(key) => Some((&key.values, &key.types)),
+            Self::Empty => None,
+        }
+    }
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -7441,33 +7472,19 @@ impl<M: Clone> MetaInterp<M> {
         majit_ir::GreenKey,
         Option<crate::warmstate::GreenRefPin>,
     ) {
-        if let Some(pair) =
-            Self::with_typed_decision_key(green_key, code_slot, target_pc, |key, typed_pin| {
-                let mut live = typed_pin.live_clone(key);
+        match self.reconstructed_greenkey_without_greenargs(jd_no, green_key, code_slot, target_pc)
+        {
+            GreensWithoutGreenargs::Portal(key) => {
+                let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
+                let mut live = pin.live_clone(&key);
                 let hot = self
                     .warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(typed_pin, &mut live, live_values);
-                (hot, live)
-            })
-        {
-            return (pair.0, pair.1, None);
-        }
-        let types = self
-            .staticdata
-            .jitdrivers_sd
-            .get(jd_no)
-            .map(|d| d.green_args_spec())
-            .unwrap_or_default();
-        let installed = self
-            .warm_state_for_driver(jd_no)
-            .cell_by_key(green_key)
-            .map(|c| c.current_greens());
-        match installed {
-            Some(greens)
-                if greens.len() == types.len()
-                    && types.iter().any(|t| *t == majit_ir::GreenType::Ref) =>
+                    .force_start_tracing_for_key(&pin, &mut live, live_values);
+                (hot, live, None)
+            }
+            GreensWithoutGreenargs::Installed(key)
+                if key.types.iter().any(|t| *t == majit_ir::GreenType::Ref) =>
             {
-                let key = majit_ir::GreenKey::with_types(greens.to_vec(), types);
                 let fallback = crate::warmstate::GreenRefPin::pin(&key);
                 let mut live = fallback.live_clone(&key);
                 let hot = self
@@ -7475,16 +7492,20 @@ impl<M: Clone> MetaInterp<M> {
                     .force_start_tracing_for_key(&fallback, &mut live, live_values);
                 (hot, live, Some(fallback))
             }
-            _ => {
+            other => {
+                let types = self
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|d| d.green_args_spec())
+                    .unwrap_or_default();
                 let hot = self.warm_state_for_driver(jd_no).force_start_tracing(
                     green_key,
                     &types,
                     live_values,
                 );
-                let live = match installed {
-                    Some(greens) if greens.len() == types.len() => {
-                        majit_ir::GreenKey::with_types(greens.to_vec(), types)
-                    }
+                let live = match other {
+                    GreensWithoutGreenargs::Installed(key) => key,
                     _ => majit_ir::GreenKey::with_types(
                         Vec::<i64>::new(),
                         Vec::<majit_ir::GreenType>::new(),
@@ -7493,6 +7514,46 @@ impl<M: Clone> MetaInterp<M> {
                 (hot, live, None)
             }
         }
+    }
+
+    /// Reconstruct `*greenargs` when a door did not pass them.
+    ///
+    /// `confirm_enter_jit(*args)` is greens then reds (`bound_reached`).
+    /// A live portal pin is `[pc, profiled, pycode]`. An installed cell
+    /// whose stored greens match the driver's `_green_args_spec` is those
+    /// fields. Empty spec (and Int-only tests with no matching cell) is
+    /// [`GreensWithoutGreenargs::Empty`].
+    pub(crate) fn reconstructed_greenkey_without_greenargs(
+        &self,
+        jd_no: usize,
+        green_key: u64,
+        code_slot: usize,
+        target_pc: usize,
+    ) -> GreensWithoutGreenargs {
+        if let Some(key) =
+            Self::with_typed_decision_key(green_key, code_slot, target_pc, |key, _pin| key.clone())
+        {
+            return GreensWithoutGreenargs::Portal(key);
+        }
+        let types = self
+            .staticdata
+            .jitdrivers_sd
+            .get(jd_no)
+            .map(|d| d.green_args_spec())
+            .unwrap_or_default();
+        if types.is_empty() {
+            return GreensWithoutGreenargs::Empty;
+        }
+        let Some(greens) = self
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|w| w.cell_by_key(green_key).map(|c| c.current_greens()))
+        else {
+            return GreensWithoutGreenargs::Empty;
+        };
+        if greens.len() != types.len() {
+            return GreensWithoutGreenargs::Empty;
+        }
+        GreensWithoutGreenargs::Installed(majit_ir::GreenKey::with_types(greens.to_vec(), types))
     }
 
     /// pyjitpl.py `MetaInterp.__init__` attempt fields.
@@ -15073,14 +15134,6 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<std::sync::Arc<JitCellToken>> {
         self.get_procedure_token_on_driver(jd_no, green_key)
             .filter(|token| token.has_compiled_code())
-    }
-
-    /// warmstate.py maybe_compile_and_run: enter when this driver's cell
-    /// still has a non-invalidated procedure token with compiled code,
-    /// and that token's outermost_jitdriver_sd is this driver.
-    fn has_this_driver_compiled_procedure(&self, jd_no: usize, cell_key: u64) -> bool {
-        self.get_procedure_token_on_driver(jd_no, cell_key)
-            .is_some_and(|t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no))
     }
 
     /// [`Self::resolve_cell_key`] and [`Self::entry_procedure_token`] from one
@@ -35490,6 +35543,52 @@ mod tests {
             .is_some(),
             "production back-edge cell must carry a typed comparekey"
         );
+    }
+
+    /// `confirm_enter_jit(*args)` is greens then reds (`bound_reached`).
+    /// A back-edge without explicit `green_key_values` still reconstructs
+    /// the portal `[pc, profiled, pycode]` for the prelude.
+    #[test]
+    fn confirm_enter_jit_on_a_back_edge_without_explicit_greens_sees_the_portal_tuple() {
+        static SEEN0: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN1: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SEEN3: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn record(args: &[Value]) -> bool {
+            SEEN_LEN.store(args.len(), std::sync::atomic::Ordering::Relaxed);
+            SEEN0.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN1.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN2.store(
+                args[2].as_ref().as_usize(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            SEEN3.store(args[3].as_int(), std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(record));
+        let code: usize = 0x6100;
+        let pc: usize = 17;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        let live = [Value::Int(9)];
+        for _ in 0..4 {
+            {
+                let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(code);
+                meta.on_back_edge_typed(green_key, _zbh_pin.save(), pc, None, None, &live);
+            }
+            if SEEN_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                break;
+            }
+        }
+        assert_eq!(SEEN_LEN.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(SEEN0.load(std::sync::atomic::Ordering::Relaxed), pc as i64);
+        assert_eq!(SEEN1.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(SEEN2.load(std::sync::atomic::Ordering::Relaxed), code);
+        assert_eq!(SEEN3.load(std::sync::atomic::Ordering::Relaxed), 9);
     }
 
     #[test]

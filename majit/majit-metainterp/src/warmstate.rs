@@ -1089,9 +1089,10 @@ impl WarmEnterState {
     /// up `cell`, choose `hash` / `increment` / the veto greens, and map the
     /// result; this body is the order.
     ///
-    /// `procedure_token` is `cell.get_procedure_token()` already read by the
-    /// caller. `maybe_compile_and_run` assigns that value once and uses it for
-    /// both the `is None` arm and `EnterJitAssembler`.
+    /// `cell.get_procedure_token()` is read once, after the
+    /// `JC_TRACING | JC_TEMPORARY` gate (`maybe_compile_and_run`). That
+    /// same owned handle is `EnterJitAssembler.procedure_token` when
+    /// `is_runnable` accepts it.
     #[expect(
         clippy::too_many_arguments,
         reason = "greenargs/types/reds are the portal *args split make_entry_point passes as confirm_enter_jit(*args)"
@@ -1104,16 +1105,15 @@ impl WarmEnterState {
         greenargs: Option<&[i64]>,
         green_types: &[GreenType],
         reds: &[Value],
-        is_runnable: bool,
-        procedure_token: Option<&Arc<JitCellToken>>,
+        is_runnable: impl FnOnce(&JitCellToken) -> bool,
         door: WarmEntryDoor,
-    ) -> HotResult {
+    ) -> (HotResult, Option<Arc<JitCellToken>>) {
         let function_entry = match door {
             WarmEntryDoor::BackEdge => false,
             WarmEntryDoor::FunctionEntry => true,
         };
         if increment == 0.0 {
-            return HotResult::NotHot;
+            return (HotResult::NotHot, None);
         }
 
         fn tick_result(state: &mut WarmEnterState, hash: u64, increment: f64) -> HotResult {
@@ -1128,7 +1128,7 @@ impl WarmEnterState {
             if function_entry {
                 crate::mc_diag_bump(25);
             }
-            return tick_result(self, hash, increment);
+            return (tick_result(self, hash, increment), None);
         };
 
         let flags = cell.flags.get();
@@ -1148,15 +1148,16 @@ impl WarmEnterState {
                         crate::mc_diag_bump(66);
                     }
                 }
-                return HotResult::AlreadyTracing;
+                return (HotResult::AlreadyTracing, None);
             }
             if function_entry {
                 crate::mc_diag_bump(25);
             }
-            return tick_result(self, hash, increment);
+            return (tick_result(self, hash, increment), None);
         }
 
-        if procedure_token.is_none() {
+        // warmstate.py maybe_compile_and_run: after JC_TRACING | JC_TEMPORARY.
+        let Some(procedure_token) = cell.get_procedure_token() else {
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
                 if self.should_start_dont_trace_here_trace(
@@ -1168,23 +1169,23 @@ impl WarmEnterState {
                     if function_entry && flags.contains(JcFlags::JC_TRACING_OCCURRED) {
                         crate::mc_diag_bump(25);
                     }
-                    return HotResult::StartTracing;
+                    return (HotResult::StartTracing, None);
                 }
-                return HotResult::NotHot;
+                return (HotResult::NotHot, None);
             }
             if function_entry {
                 crate::mc_diag_bump(24);
             }
             self.cleanup_chain(hash);
-            return HotResult::NotHot;
-        }
+            return (HotResult::NotHot, None);
+        };
 
-        if is_runnable {
+        if is_runnable(&procedure_token) {
             // warmstate.py maybe_compile_and_run: confirm_enter_jit before EnterJitAssembler.
             if !self.confirm_enter_jit_if_available(greenargs, green_types, reds) {
-                return HotResult::NotHot;
+                return (HotResult::NotHot, None);
             }
-            return HotResult::RunCompiled;
+            return (HotResult::RunCompiled, Some(procedure_token));
         }
         // `has_compiled_meta` is a pending upstream mismatch (`warmstate.py maybe_compile_and_run` enters on any non-temporary procedure token).
         let not_hot = if function_entry {
@@ -1195,9 +1196,9 @@ impl WarmEnterState {
             flags.contains(JcFlags::JC_DONT_TRACE_HERE)
         };
         if not_hot {
-            return HotResult::NotHot;
+            return (HotResult::NotHot, None);
         }
-        tick_result(self, hash, increment)
+        (tick_result(self, hash, increment), None)
     }
 
     /// `warmstate.py bound_reached` steps 1-3: `confirm_enter_jit(*args)`
@@ -1310,8 +1311,6 @@ impl WarmEnterState {
         reds: &[Value],
     ) -> bool {
         let cell = self.cell_by_key(cell_key);
-        let procedure_token = cell.as_ref().and_then(|c| c.get_procedure_token());
-        let is_runnable = cell.as_ref().is_some_and(|c| c.is_compiled());
         let hash = self.bucket_of(cell_key);
         let greens = if self.has_confirm_enter_jit() {
             cell.as_ref().map(|c| c.current_greens())
@@ -1326,10 +1325,10 @@ impl WarmEnterState {
                 greens.as_deref(),
                 green_types,
                 reds,
-                is_runnable,
-                procedure_token.as_ref(),
+                |_| true,
                 WarmEntryDoor::BackEdge,
-            ),
+            )
+            .0,
             HotResult::StartTracing
         )
     }
@@ -1357,15 +1356,11 @@ impl WarmEnterState {
     pub(crate) fn maybe_compile_decision_with_meta(
         &mut self,
         cell_key: u64,
-        has_compiled_meta: impl FnOnce(u64) -> bool,
+        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         green_types: &[GreenType],
         reds: &[Value],
     ) -> HotResult {
         let cell = self.cell_by_key(cell_key);
-        let procedure_token = cell.as_ref().and_then(|c| c.get_procedure_token());
-        let is_runnable = cell
-            .as_ref()
-            .is_some_and(|c| c.is_compiled() && has_compiled_meta(cell_key));
         let hash = self.bucket_of(cell_key);
         let greens = if self.has_confirm_enter_jit() {
             cell.as_ref().map(|c| c.current_greens())
@@ -1379,10 +1374,10 @@ impl WarmEnterState {
             greens.as_deref(),
             green_types,
             reds,
-            is_runnable,
-            procedure_token.as_ref(),
+            has_compiled_meta,
             WarmEntryDoor::BackEdge,
         )
+        .0
     }
 
     /// Compatibility form for callers whose compiled-loop metadata is wholly
@@ -1467,7 +1462,7 @@ impl WarmEnterState {
         &mut self,
         pin: &GreenRefPin,
         key: &GreenKey,
-        has_compiled_meta: impl FnOnce(u64) -> bool,
+        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         reds: &[Value],
     ) -> HotResult {
         let (hash, mut live) = pin.live_after_hash(key);
@@ -1479,21 +1474,11 @@ impl WarmEnterState {
         pin: &GreenRefPin,
         hash: u64,
         live: &mut GreenKey,
-        has_compiled_meta: impl FnOnce(u64) -> bool,
+        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         reds: &[Value],
     ) -> HotResult {
         pin.reload(live);
         let cell = self.lookup_chain_with_greenargs(hash, &live.values, &live.types);
-        let procedure_token = cell.as_ref().and_then(|c| c.get_procedure_token());
-        let is_runnable = cell.as_ref().is_some_and(|c| {
-            // The procedure token is filed under this cell's assigned key.
-            // `install_new_cell` mints `BaseJitCell::cell_key` when
-            // `get_uhash` is already taken, and `maybe_compile_and_run_step`
-            // resolves that same number with `cell_key_for` after
-            // `RunCompiled`. The raw hash names the bucket's first cell.
-            let cell_key = c.cell_key.get().unwrap_or(hash);
-            c.is_compiled() && has_compiled_meta(cell_key)
-        });
         pin.reload(live);
         self.maybe_compile_and_run_decision(
             cell.as_deref(),
@@ -1502,10 +1487,10 @@ impl WarmEnterState {
             Some(&live.values),
             &live.types,
             reds,
-            is_runnable,
-            procedure_token.as_ref(),
+            has_compiled_meta,
             WarmEntryDoor::BackEdge,
         )
+        .0
     }
 
     /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
@@ -2404,23 +2389,10 @@ impl WarmEnterState {
         };
         // `warmstate.py maybe_compile_and_run` keeps the matched `cell` from
         // the one `lookup_chain` walk. Holding the `Rc` is the analog of
-        // holding that object across `confirm_enter_jit`.
+        // holding that object across `confirm_enter_jit`. The decision reads
+        // `cell.get_procedure_token()` once after `JC_TRACING | JC_TEMPORARY`
+        // and raises `EnterJitAssembler` with that same token.
         let cell = resolved.cell.as_deref();
-        // `maybe_compile_and_run` reads `procedure_token =
-        // cell.get_procedure_token()` once, decides on it, and raises
-        // `EnterJitAssembler` with that same token. A FINISH-only row is
-        // still that compiled procedure (`compile_done_with_this_frame` →
-        // `ResumeFromInterpDescr`); `get_procedure_token` Some is the
-        // runnable answer, so `has_compiled_code` /
-        // `outermost_jitdriver_index` are not consulted again.
-        let procedure_token = cell.and_then(|c| c.get_procedure_token());
-        debug_assert!(
-            procedure_token.is_none()
-                || cell.is_some_and(|c| {
-                    c.flags.get().contains(JcFlags::JC_TEMPORARY) || c.is_compiled()
-                }),
-            "get_procedure_token Some restates is_compiled after JC_TEMPORARY"
-        );
         let (greenargs, green_types) = match pin_live {
             Some((pin, live)) => {
                 pin.reload(live);
@@ -2428,18 +2400,16 @@ impl WarmEnterState {
             }
             None => (None, [].as_slice()),
         };
-        let result = self.maybe_compile_and_run_decision(
+        self.maybe_compile_and_run_decision(
             cell,
             resolved.hash,
             increment,
             greenargs,
             green_types,
             reds,
-            procedure_token.is_some(),
-            procedure_token.as_ref(),
+            |_| true,
             door,
-        );
-        (result, procedure_token)
+        )
     }
 
     /// Typed-key form of [`Self::should_trace_function_entry`].
@@ -2458,7 +2428,6 @@ impl WarmEnterState {
         let (hash, hashed) = pin.live_after_hash(live);
         *live = hashed;
         let cell = self.lookup_chain_with_greenargs(hash, &live.values, &live.types);
-        let procedure_token = cell.as_ref().and_then(|c| c.get_procedure_token());
         pin.reload(live);
         matches!(
             self.maybe_compile_and_run_decision(
@@ -2468,10 +2437,10 @@ impl WarmEnterState {
                 Some(&live.values),
                 &live.types,
                 &[],
-                false,
-                procedure_token.as_ref(),
+                |_| false,
                 WarmEntryDoor::FunctionEntry,
-            ),
+            )
+            .0,
             HotResult::StartTracing
         )
     }
@@ -6277,6 +6246,93 @@ mod tests {
         );
     }
 
+    /// `warmstate.py maybe_compile_and_run` handles `JC_TEMPORARY` before
+    /// `cell.get_procedure_token()`. A dead weakref plus `JC_DONT_TRACE_HERE`
+    /// would `cleanup_chain` if the token were read first; the flag path ticks.
+    #[test]
+    fn a_temporary_cell_with_a_dead_token_ticks_without_reading_it() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![0x70, 0xCE]);
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        let cell_key = GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("ensure_cell_for_key installed a cell");
+        {
+            let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+            token.set_compiled(Box::new(()));
+            let cell = ws.cell_by_key(cell_key).expect("installed cell");
+            cell.set_procedure_token(token, true);
+            cell.flags
+                .set(cell.flags.get() | JcFlags::JC_DONT_TRACE_HERE);
+        }
+        assert!(ws.cell_by_key(cell_key).is_some_and(|cell| {
+            cell.has_seen_a_procedure_token()
+                && cell.get_procedure_token().is_none()
+                && cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+        }));
+        assert!(
+            matches!(
+                ws.function_entry_step(fe_resolved(&ws, cell_key), None, &[]),
+                FunctionEntryStep::Proceed
+            ),
+            "JC_TEMPORARY ticks before get_procedure_token"
+        );
+        assert!(
+            ws.cell_by_key(cell_key).is_some(),
+            "the flag path must not cleanup_chain a temporary cell"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run` returns on `JC_TRACING` before
+    /// `cell.get_procedure_token()`. A dead weakref plus `JC_DONT_TRACE_HERE`
+    /// would `cleanup_chain` if the token were read first.
+    #[test]
+    fn a_tracing_cell_with_a_dead_token_returns_without_reading_it() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![0x71, 0xCE]);
+        GreenRefPin::with(&key, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        let cell_key = GreenRefPin::with(&key, |__p, __l| ws.cell_key_for(__p, __l))
+            .expect("ensure_cell_for_key installed a cell");
+        {
+            let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+            token.set_compiled(Box::new(()));
+            let cell = ws.cell_by_key(cell_key).expect("installed cell");
+            cell.set_procedure_token(token, false);
+            cell.flags
+                .set(cell.flags.get() | JcFlags::JC_TRACING | JcFlags::JC_DONT_TRACE_HERE);
+        }
+        assert!(ws.cell_by_key(cell_key).is_some_and(|cell| {
+            cell.has_seen_a_procedure_token()
+                && cell.get_procedure_token().is_none()
+                && cell.is_tracing()
+        }));
+        assert!(
+            matches!(
+                ws.function_entry_step(fe_resolved(&ws, cell_key), None, &[]),
+                FunctionEntryStep::NotHot
+            ),
+            "JC_TRACING returns before get_procedure_token"
+        );
+        assert!(
+            ws.cell_by_key(cell_key)
+                .is_some_and(|cell| cell.is_tracing()),
+            "the flag path must not cleanup_chain a tracing cell"
+        );
+        assert!(
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                    __p,
+                    __l,
+                    |_| true,
+                    &[]
+                )),
+                HotResult::AlreadyTracing
+            ),
+            "the back-edge wrapper returns on JC_TRACING with a dead token"
+        );
+    }
+
     #[test]
     fn test_set_param_roundtrip() {
         let mut ws = WarmEnterState::new(100);
@@ -8047,11 +8103,10 @@ mod tests {
     }
 
     /// Two typed keys share `get_uhash()`. The second cell's compiled token
-    /// is reachable only through the key `install_new_cell` minted for it.
-    /// `maybe_compile_and_run_step` asks `has_compiled_meta` with that key
-    /// and then reads it back with `cell_key_for`. A decision that hands
-    /// the raw hash to the callback misses the token and falls through to
-    /// the counter.
+    /// is the one `maybe_compile_and_run_decision` reads after
+    /// `JC_TRACING | JC_TEMPORARY`. `has_compiled_meta` sees that token, not
+    /// the bucket hash. A walk that answered the head cell would have no
+    /// token and would tick.
     #[test]
     fn maybe_compile_decision_with_key_runs_the_colliding_cell_under_its_minted_key() {
         let mut ws = WarmEnterState::new(100);
@@ -8088,7 +8143,7 @@ mod tests {
                 GreenRefPin::with(&second, |__p, __l| ws.maybe_compile_decision_with_key(
                     __p,
                     __l,
-                    |cell_key| cell_key == minted,
+                    |t| t.has_compiled_code(),
                     &[]
                 )),
                 HotResult::RunCompiled

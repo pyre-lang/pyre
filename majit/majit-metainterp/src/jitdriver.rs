@@ -9116,7 +9116,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         green_key: u64,
         greenargs: Option<(&[i64], &[GreenType])>,
-        pin_live: Option<(&crate::warmstate::GreenRefPin, &mut majit_ir::GreenKey)>,
+        mut pin_live: Option<(&crate::warmstate::GreenRefPin, &mut majit_ir::GreenKey)>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -9171,17 +9171,33 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let jd_no = self.index().unwrap_or(0);
-        let (greens, types): (&[i64], &[GreenType]) = match pin_live.as_ref() {
-            Some((_, live)) => (live.values.as_slice(), live.types.as_slice()),
-            None => match greenargs {
-                Some((values, types)) => (values, types),
-                None => (&[], &[]),
-            },
+        // `sync_before` / `build_meta` / `extract_live_values` can collect
+        // and move a Ref green (`gctransform/shadowstack.py`). Reload
+        // before `confirm_enter_jit(*args)` reads `live.values`.
+        if let Some((pin, live)) = pin_live.as_mut() {
+            pin.reload(*live);
+        }
+        let reconstructed;
+        let prelude_ok = {
+            let (greens, types): (&[i64], &[GreenType]) = match pin_live.as_ref() {
+                Some((_, live)) => (live.values.as_slice(), live.types.as_slice()),
+                None => match greenargs {
+                    Some((values, types)) => (values, types),
+                    None => {
+                        reconstructed = self.meta.reconstructed_greenkey_without_greenargs(
+                            jd_no, green_key, 0, target_pc,
+                        );
+                        match reconstructed.as_slices() {
+                            Some((values, types)) => (values, types),
+                            None => (&[], &[]),
+                        }
+                    }
+                },
+            };
+            self.meta
+                .bound_reached_prelude(jd_no, greens, types, &live_values)
         };
-        if !self
-            .meta
-            .bound_reached_prelude(jd_no, greens, types, &live_values)
-        {
+        if !prelude_ok {
             self.restore_trace_vable_ptr(saved_vable_ptr);
             return false;
         }

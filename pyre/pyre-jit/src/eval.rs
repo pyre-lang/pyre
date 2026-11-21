@@ -8874,6 +8874,26 @@ fn drive_portal_metatrace(
     if driver.cell_is_tracing(green_key) {
         return None;
     }
+    // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
+    // in its own slot before `PortalPycodeRoot` pushes `W_Code` above it.
+    let mut frame_root = FrameRoot::new(unsafe { &mut *frame });
+    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter. confirm_enter_jit(*args) is greens then reds.
+    let reds = pypyjit_confirm_reds(driver, frame_root.frame());
+    let greenargs = majit_ir::pypyjit_greenargs(
+        loop_header_pc,
+        frame_root.frame().get_is_being_profiled(),
+        pycode_root.get() as u64,
+    );
+    if !driver.meta_interp_mut().bound_reached_prelude(
+        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+        &greenargs,
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+        &reds,
+    ) {
+        return None;
+    }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
@@ -8902,20 +8922,22 @@ fn drive_portal_metatrace(
     let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
         (*canonical).clone(),
     ));
-    // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
-    // in its own slot before `PortalPycodeRoot` pushes `W_Code` above it,
-    // and read the frame through that slot (`can_enter_jit`).
-    let mut frame_root = FrameRoot::new(unsafe { &mut *frame });
-    let pycode_root = PortalPycodeRoot::pin(frame_root.frame().pycode);
     let profiled = i64::from(frame_root.frame().get_is_being_profiled());
     let ec = pyre_interpreter::call::getexecutioncontext();
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
+    // `publish_kind0_descrs` / NestedTraceGuard can collect. Reload the
+    // portal greens from the pinned W_Code (`gctransform/shadowstack.py`).
+    let greenargs = majit_ir::pypyjit_greenargs(
+        loop_header_pc,
+        frame_root.frame().get_is_being_profiled(),
+        pycode_root.get() as u64,
+    );
     driver.force_start_tracing(
         green_key,
-        None,
+        Some((&greenargs, majit_ir::PYPYJIT_GREEN_TYPES.as_slice())),
         pycode_root.save(),
         loop_header_pc,
         &mut jit_state,
