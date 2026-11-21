@@ -2482,9 +2482,21 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         rvalue: Rvalue,
         dest_ty: &TyRef,
+        dest_local: Option<usize>,
     ) -> Result<(Option<OpKind>, Variable), LowerError> {
         match rvalue {
             Rvalue::Use(operand, _) => {
+                if let Some(dest_local) = dest_local
+                    && let Some(src_local) = operand_local(Some(&operand))
+                    && let Some((src_place, ..)) = self.field_interior_access(src_local)
+                    && !self.records_atomic_ref_place(dest_local, &src_place)
+                {
+                    // Dest will not carry the field path: copy the field
+                    // value (`PtrRepr.rtype_getattr`), the pre-r36 bind.
+                    if let Some(v) = self.field_interior_value_at_use(mir_bb, src_local)? {
+                        return Ok((None, v));
+                    }
+                }
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
@@ -3444,8 +3456,12 @@ impl<'a> Lowering<'a> {
                 // Field-only `InteriorPtrRepr`: `PtrRepr.rtype_getattr` of an
                 // interior result returns the parent (`hop.inputarg(self, 0)`).
                 // The field path stays in `atomic_ref_place`; getfield is at
-                // each use (`InteriorPtrRepr.rtype_getattr`).
-                if let Some((inner, _)) = self.scalar_gc_field_interior_parts(&place) {
+                // each use (`InteriorPtrRepr.rtype_getattr`). Bind the owner
+                // only when the dest will carry that path; otherwise keep
+                // the field value (`records_atomic_ref_place`).
+                if let Some((inner, _)) = self.scalar_gc_field_interior_parts(&place)
+                    && dest_local.is_some_and(|local| self.records_atomic_ref_place(local, &place))
+                {
                     let owner = self.resolve_place(mir_bb, clone_place(inner))?;
                     return Ok((None, owner));
                 }
@@ -3483,10 +3499,9 @@ impl<'a> Lowering<'a> {
                 if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
                     return Ok((None, address));
                 }
-                if let Some((inner, _)) = self.scalar_gc_field_interior_parts(&place) {
-                    let owner = self.resolve_place(mir_bb, clone_place(inner))?;
-                    return Ok((None, owner));
-                }
+                // Owner representation is `Rvalue::Ref` only
+                // (`ann_cast_ptr_to_adr` refuses an interior pointer as
+                // an address). RawPtr of a GC field keeps the field value.
                 let address = self.place_borrow_takes_address(&place, dest_ty);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -7226,27 +7241,38 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         ) != Some(true)
         {
-            return None;
+            // Opaque owners have no Struct/Enum field list
+            // (`declared_adt_struct_id`); the shared getattr still
+            // emits their layout word (`opaque_scalar_field`).
+            self.opaque_scalar_field(&inner.ty, &place.ty, field_payload)?;
         }
         Some((inner.as_ref(), field_payload))
     }
 
-    /// Field-only interior identity: the recorded Field place's inner
-    /// (GC owner) and field payload (`scalar_gc_field_interior_parts`).
-    fn field_interior_access(&self, local: usize) -> Option<(Place, serde_json::Value, TyRef)> {
+    /// Field-only interior identity: the recorded Field place, its inner
+    /// (GC owner), and field payload (`scalar_gc_field_interior_parts`).
+    /// The dest local is a `Ref` (`InteriorPtrRepr` `parentptrtype`); a
+    /// `RawPtr` dest keeps the captured field value.
+    pub(in crate::front::mir) fn field_interior_access(
+        &self,
+        local: usize,
+    ) -> Option<(Place, Place, serde_json::Value, TyRef)> {
+        let dest_ty = self.mir_local_ty(local)?;
+        tyref_peel_one_ref_node(&dest_ty, self.llbc)?;
         let recorded = self.atomic_ref_place.get(&local).map(clone_place)?;
         let (inner, field_payload) = self.scalar_gc_field_interior_parts(&recorded)?;
-        Some((
-            clone_place(inner),
-            field_payload.clone(),
-            clone_tyref(&recorded.ty),
-        ))
+        let inner = clone_place(inner);
+        let field_payload = field_payload.clone();
+        let place_ty = clone_tyref(&recorded.ty);
+        Some((recorded, inner, field_payload, place_ty))
     }
 
     /// Ordinary Adt `Field` getattr after the base Variable is known
     /// (`PtrRepr.rtype_getattr` / `InstanceRepr.rtype_getattr`). Field-only
     /// interior uses this with the owner Variable as base
-    /// (`InteriorPtrRepr.rtype_getattr`).
+    /// (`InteriorPtrRepr.rtype_getattr`). Length headers and opaque
+    /// scalar words share this emission (`PtrRepr.rtype_len` /
+    /// `opaque_scalar_field`).
     fn emit_resolved_adt_field_read(
         &mut self,
         mir_bb: usize,
@@ -7255,9 +7281,58 @@ impl<'a> Lowering<'a> {
         field_payload: &serde_json::Value,
         place_ty: &TyRef,
     ) -> Result<Variable, LowerError> {
+        // Length header of a declared two-field `GcArray`
+        // wrapper (`lltype.py`): offset-0 integer immediately
+        // before the `[T; 0]` tail. That word is `getarraysize`
+        // / `ll_fixed_length` (`rlist.py`), not `getattr` of a
+        // named field. Found by the `GcType` declaration plus
+        // the two-field layout, never by the Rust field name
+        // (`capacity` / `length`). A `GcStruct` with extra
+        // prefix fields, and an ordinary struct with an
+        // `_arrayfld` tail, keep those as `getattr`.
+        if let Some(array_type_id) =
+            self.flexible_gcarray_header_array_type_id(&inner.ty, field_payload)
+        {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::ArrayLen {
+                    base,
+                    array_type_id: Some(array_type_id),
+                    array: None,
+                    nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
+                },
+            });
+            return Ok(res);
+        }
         let Some((owner_root, field_name, field_ty, owner_id, host_index)) =
             self.resolve_adt_field(&inner.ty, field_payload)
         else {
+            if let Some((owner, name, ty, word)) =
+                self.opaque_scalar_field(&inner.ty, place_ty, field_payload)
+            {
+                let base_is_deref = inner.is_deref_projection();
+                let bb_id = self.emit_bb(mir_bb);
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(concretetype_for_field(&ty));
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind: OpKind::FieldRead {
+                        base,
+                        field: FieldDescriptor::new(name, Some(owner))
+                            .with_base_is_deref(base_is_deref)
+                            .with_scalar_word(word),
+                        ty,
+                        pure: false,
+                    },
+                });
+                return Ok(res);
+            }
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Field projection has no Adt field"
             )));
@@ -7880,7 +7955,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         local: usize,
     ) -> Result<Option<Variable>, LowerError> {
-        let Some((inner, field_payload, place_ty)) = self.field_interior_access(local) else {
+        let Some((_, inner, field_payload, place_ty)) = self.field_interior_access(local) else {
             return Ok(None);
         };
         let owner = self.defined_local(mir_bb, local)?;
@@ -7897,7 +7972,7 @@ impl<'a> Lowering<'a> {
         local: usize,
         value: LinkArg,
     ) -> Result<bool, LowerError> {
-        let Some((inner, field_payload, place_ty)) = self.field_interior_access(local) else {
+        let Some((_, inner, field_payload, place_ty)) = self.field_interior_access(local) else {
             return Ok(false);
         };
         let owner = self.defined_local(mir_bb, local)?;
@@ -8735,35 +8810,6 @@ impl<'a> Lowering<'a> {
                     )? {
                         return Ok(res);
                     }
-                    // Length header of a declared two-field `GcArray`
-                    // wrapper (`lltype.py`): offset-0 integer immediately
-                    // before the `[T; 0]` tail. That word is `getarraysize`
-                    // / `ll_fixed_length` (`rlist.py`), not `getattr` of a
-                    // named field. Found by the `GcType` declaration plus
-                    // the two-field layout, never by the Rust field name
-                    // (`capacity` / `length`). A `GcStruct` with extra
-                    // prefix fields, and an ordinary struct with an
-                    // `_arrayfld` tail, keep those as `getattr`.
-                    if let Some(array_type_id) =
-                        self.flexible_gcarray_header_array_type_id(&inner.ty, field_payload)
-                    {
-                        let base = self.resolve_place(mir_bb, *inner)?;
-                        let bb_id = self.emit_bb(mir_bb);
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::ArrayLen {
-                                base,
-                                array_type_id: Some(array_type_id),
-                                array: None,
-                                nolength: false,
-                                gckind: crate::model::ArrayGcKind::Gc,
-                            },
-                        });
-                        return Ok(res);
-                    }
                     if let Some((owner, flat_name, owner_id)) =
                         self.flatten_list_storage_field(&inner, &elem)
                     {
@@ -9490,30 +9536,22 @@ impl<'a> Lowering<'a> {
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
-                    && let Some((owner, name, ty, word)) =
-                        self.opaque_scalar_field(&inner.ty, &place_ty, field_payload)
+                    && self
+                        .opaque_scalar_field(&inner.ty, &place_ty, field_payload)
+                        .is_some()
                 {
                     // `(*p).field` of an opaque dependency struct. The
                     // declaration has no field list, and the place type is
                     // the scalar, so the load is that layout word.
-                    let base_is_deref = inner.is_deref_projection();
+                    let inner_place = clone_place(&inner);
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.emit_bb(mir_bb);
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(concretetype_for_field(&ty));
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::FieldRead {
-                            base,
-                            field: FieldDescriptor::new(name, Some(owner))
-                                .with_base_is_deref(base_is_deref)
-                                .with_scalar_word(word),
-                            ty,
-                            pure: false,
-                        },
-                    });
-                    return Ok(res);
+                    return self.emit_resolved_adt_field_read(
+                        mir_bb,
+                        base,
+                        &inner_place,
+                        field_payload,
+                        &place_ty,
+                    );
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(offset) = v.get("Offset")

@@ -1388,8 +1388,12 @@ impl<'a> Lowering<'a> {
         let Some(kind) = self.option_none_aggregate_kind(dest_ty) else {
             return Ok(None);
         };
-        let (op, var) =
-            self.build_rvalue(mir_bb, Rvalue::Aggregate(kind.into(), Vec::new()), dest_ty)?;
+        let (op, var) = self.build_rvalue(
+            mir_bb,
+            Rvalue::Aggregate(kind.into(), Vec::new()),
+            dest_ty,
+            None,
+        )?;
         if let Some(op) = op {
             let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -1533,10 +1537,10 @@ impl<'a> Lowering<'a> {
 
     pub(in crate::front::mir) fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
         let local = local?;
+        if self.field_interior_access(local).is_some() {
+            return Some(MemSlot::FieldInterior(local));
+        }
         if let Some(place) = self.atomic_ref_place.get(&local).map(clone_place) {
-            if self.scalar_gc_field_interior_parts(&place).is_some() {
-                return Some(MemSlot::FieldInterior(local));
-            }
             return Some(MemSlot::Place(place));
         }
         if self.index_elem_alias.contains_key(&local)
