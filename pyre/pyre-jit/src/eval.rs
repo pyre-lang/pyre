@@ -7767,6 +7767,7 @@ impl PyPyJitDriver {
             &majit_ir::pypyjit_greenargs(next_instr, is_being_profiled, pycode_root.get() as u64),
             &majit_ir::PYPYJIT_GREEN_TYPES,
         );
+        let matched_cell = resolved.cell.clone();
         let green_key = resolved.cell_key().unwrap_or(green_key_hash);
         // Safe to tally here and nowhere upstream of it: `jtransform` rewrites
         // the `can_enter_jit` call into the `loop_header` operation, so this
@@ -7779,6 +7780,7 @@ impl PyPyJitDriver {
             info,
             &env,
             green_key,
+            matched_cell,
             next_instr,
             frame_root.frame() as *mut PyFrame,
         ) {
@@ -8840,6 +8842,7 @@ fn portal_metatrace_maybe(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
     green_key: u64,
+    matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
     next_instr: usize,
     frame: *mut PyFrame,
 ) -> Option<LoopResult> {
@@ -8848,7 +8851,15 @@ fn portal_metatrace_maybe(
             >= portal_metatrace_skip()
         && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        drive_portal_metatrace(driver, info, env, green_key, next_instr, frame)
+        drive_portal_metatrace(
+            driver,
+            info,
+            env,
+            green_key,
+            matched_cell,
+            next_instr,
+            frame,
+        )
     } else {
         None
     }
@@ -8862,16 +8873,19 @@ fn drive_portal_metatrace(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
     green_key: u64,
+    matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
     loop_header_pc: usize,
     frame: *mut PyFrame,
 ) -> Option<LoopResult> {
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A live session on another key or driver may still
-    // `bound_reached` a nested MetaInterp.
-    if driver.cell_is_tracing(green_key) {
+    // `warmstate.py maybe_compile_and_run` reads `JC_TRACING` only on the
+    // cell `comparekey` matched. A miss does not consult a foreign occupant
+    // whose `cell_key` equals the bucket hash. This door has no prior
+    // decision, so it tests the matched cell the same way
+    // `drive_tuple_hash_trace` does.
+    if matched_cell.is_some_and(|cell| cell.is_tracing()) {
         return None;
     }
     // `FrameView::reload` reads the TOP shadow-stack entry. Pin the frame
@@ -9111,9 +9125,8 @@ fn unpack_merge_point_jit(
     // `bhimpl_jit_merge_point` (ContinueRunningNormally / recursive portal
     // runner) and never this hook. A residual that reaches the interpreted
     // portal goes through `ll_portal_runner` / this insert, which may start
-    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
-    // `trace_attempt_in_progress()` inside `drive_unpack_iterable_trace`, not a
-    // blackhole-running flag (none exists upstream).
+    // a trace — the same as PyPy. Same-green reentry is the door's
+    // `maybe_compile_and_run` answer (`AlreadyTracing` on the matched cell).
 
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
@@ -9278,11 +9291,12 @@ fn genentry_merge_point_jit(
 }
 
 /// Enter the `generatorentry` portal. The registered main jitcode is
-/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. `JC_TRACING` on
-/// this cell returns without nesting; a live session on another key parks
-/// via [`NestedTraceGuard`] and may `bound_reached`. The machine walk from
-/// `jit_merge_point` runs `generator_send_ex_body` through the generator
-/// frame to the yield, which finishes with the yielded value.
+/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. The caller
+/// already ran `maybe_compile_and_run` on the matched cell; a live session
+/// on another key parks via [`NestedTraceGuard`] and may `bound_reached`.
+/// The machine walk from `jit_merge_point` runs `generator_send_ex_body`
+/// through the generator frame to the yield, which finishes with the
+/// yielded value.
 ///
 /// `send_ex` has no back edge. `CloseLoop` is kept so a merge-point
 /// `goto` still compiles. `RunCompiled` enters the assembler here
@@ -9326,19 +9340,11 @@ fn drive_generatorentry_trace(
     let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let (driver, _) = driver_pair();
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A sibling jitdriver may `bound_reached` a nested
-    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
-    // `force_start_tracing` elects (`descriptor.index`).
     let jd_no = jitcode
         .jitdriver_sd()
         .unwrap_or(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX);
-    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
-        if dbg {
-            eprintln!("[jd2] bail: cell JC_TRACING");
-        }
-        return None;
-    }
+    // `genentry_merge_point_jit` already ran `maybe_compile_and_run` on the
+    // matched cell (`AlreadyTracing` never reaches this door).
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
     // NestedTraceGuard::enter.
     let pycode = roots.get(base);
@@ -11015,19 +11021,11 @@ fn drive_unpack_iterable_trace(
     let base = roots.pin_roots(&[greenkey_raw, w_iterator, items]);
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let (driver, _) = driver_pair();
-    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
-    // this key only. A sibling jitdriver may `bound_reached` a nested
-    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
-    // `force_start_tracing` elects (`descriptor.index`).
     let jd_no = jitcode
         .jitdriver_sd()
         .unwrap_or(pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX);
-    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
-        if dbg {
-            eprintln!("[jd1] bail: cell JC_TRACING");
-        }
-        return;
-    }
+    // `unpack_merge_point_jit` already ran `maybe_compile_and_run` on the
+    // matched cell (`AlreadyTracing` never reaches this door).
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
     // NestedTraceGuard::enter.
     let greenkey = [roots.get(base) as i64];

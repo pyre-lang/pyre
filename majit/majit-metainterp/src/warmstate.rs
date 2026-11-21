@@ -1091,8 +1091,7 @@ impl WarmEnterState {
     ///
     /// `cell.get_procedure_token()` is read once, after the
     /// `JC_TRACING | JC_TEMPORARY` gate (`maybe_compile_and_run`). That
-    /// same owned handle is `EnterJitAssembler.procedure_token` when
-    /// `is_runnable` accepts it.
+    /// same owned handle is `EnterJitAssembler.procedure_token`.
     #[expect(
         clippy::too_many_arguments,
         reason = "greenargs/types/reds are the portal *args split make_entry_point passes as confirm_enter_jit(*args)"
@@ -1105,7 +1104,6 @@ impl WarmEnterState {
         greenargs: Option<&[i64]>,
         green_types: &[GreenType],
         reds: &[Value],
-        is_runnable: impl FnOnce(&JitCellToken) -> bool,
         door: WarmEntryDoor,
     ) -> (HotResult, Option<Arc<JitCellToken>>) {
         let function_entry = match door {
@@ -1180,25 +1178,22 @@ impl WarmEnterState {
             return (HotResult::NotHot, None);
         };
 
-        if is_runnable(&procedure_token) {
-            // warmstate.py maybe_compile_and_run: confirm_enter_jit before EnterJitAssembler.
-            if !self.confirm_enter_jit_if_available(greenargs, green_types, reds) {
-                return (HotResult::NotHot, None);
-            }
-            return (HotResult::RunCompiled, Some(procedure_token));
-        }
-        // `has_compiled_meta` is a pending upstream mismatch (`warmstate.py maybe_compile_and_run` enters on any non-temporary procedure token).
-        let not_hot = if function_entry {
-            crate::mc_diag_bump(23);
-            crate::mc_diag_bump(64);
-            true
-        } else {
-            flags.contains(JcFlags::JC_DONT_TRACE_HERE)
-        };
-        if not_hot {
+        // warmstate.py maybe_compile_and_run: confirm_enter_jit before EnterJitAssembler.
+        if !self.confirm_enter_jit_if_available(greenargs, green_types, reds) {
             return (HotResult::NotHot, None);
         }
-        (tick_result(self, hash, increment), None)
+        (HotResult::RunCompiled, Some(procedure_token))
+    }
+
+    /// After `JC_TRACING | JC_TEMPORARY`, a live `get_procedure_token()` is
+    /// `EnterJitAssembler`, not `bound_reached` (`maybe_compile_and_run`).
+    fn cell_would_run_compiled(cell: Option<&BaseJitCell>) -> bool {
+        cell.is_some_and(|cell| {
+            let flags = cell.flags.get();
+            !flags.contains(JcFlags::JC_TRACING)
+                && !flags.contains(JcFlags::JC_TEMPORARY)
+                && cell.get_procedure_token().is_some()
+        })
     }
 
     /// `warmstate.py bound_reached` steps 1-3: `confirm_enter_jit(*args)`
@@ -1325,7 +1320,6 @@ impl WarmEnterState {
                 greens.as_deref(),
                 green_types,
                 reds,
-                |_| true,
                 WarmEntryDoor::BackEdge,
             )
             .0,
@@ -1356,7 +1350,6 @@ impl WarmEnterState {
     pub(crate) fn maybe_compile_decision_with_meta(
         &mut self,
         cell_key: u64,
-        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         green_types: &[GreenType],
         reds: &[Value],
     ) -> HotResult {
@@ -1374,7 +1367,6 @@ impl WarmEnterState {
             greens.as_deref(),
             green_types,
             reds,
-            has_compiled_meta,
             WarmEntryDoor::BackEdge,
         )
         .0
@@ -1393,7 +1385,7 @@ impl WarmEnterState {
         cell_key: u64,
         green_types: &[GreenType],
     ) -> HotResult {
-        self.maybe_compile_decision_with_meta(cell_key, |_| true, green_types, &[])
+        self.maybe_compile_decision_with_meta(cell_key, green_types, &[])
     }
 
     /// [`Self::maybe_compile_decision`] followed by the mark that
@@ -1439,7 +1431,7 @@ impl WarmEnterState {
     /// the typed path's full lifecycle self-consistent on its own buckets.
     pub fn maybe_compile_with_key(&mut self, pin: &GreenRefPin, key: &mut GreenKey) -> HotResult {
         let (hash, mut live) = pin.live_after_hash(key);
-        match self.maybe_compile_decision_with_live(pin, hash, &mut live, |_| true, &[]) {
+        match self.maybe_compile_decision_with_live(pin, hash, &mut live, &[]) {
             HotResult::StartTracing => {
                 pin.reload(&mut live);
                 if !self.bound_reached_prelude(&live.values, &live.types, &[]) {
@@ -1453,20 +1445,15 @@ impl WarmEnterState {
     }
 
     /// The typed cell-policy decision without marking a tracing start.
-    /// `has_compiled_meta` is the caller's check that this driver's cell
-    /// still holds a procedure token compiled for this driver
-    /// (`warmstate.py maybe_compile_and_run`); keeping it inside this
-    /// decision prevents an entry door from bypassing that veto with an
-    /// earlier fast path.
+    /// `warmstate.py maybe_compile_and_run` after `comparekey` matched.
     pub fn maybe_compile_decision_with_key(
         &mut self,
         pin: &GreenRefPin,
         key: &GreenKey,
-        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         reds: &[Value],
     ) -> HotResult {
         let (hash, mut live) = pin.live_after_hash(key);
-        self.maybe_compile_decision_with_live(pin, hash, &mut live, has_compiled_meta, reds)
+        self.maybe_compile_decision_with_live(pin, hash, &mut live, reds)
     }
 
     fn maybe_compile_decision_with_live(
@@ -1474,7 +1461,6 @@ impl WarmEnterState {
         pin: &GreenRefPin,
         hash: u64,
         live: &mut GreenKey,
-        has_compiled_meta: impl FnOnce(&JitCellToken) -> bool,
         reds: &[Value],
     ) -> HotResult {
         pin.reload(live);
@@ -1487,7 +1473,6 @@ impl WarmEnterState {
             Some(&live.values),
             &live.types,
             reds,
-            has_compiled_meta,
             WarmEntryDoor::BackEdge,
         )
         .0
@@ -2312,6 +2297,12 @@ impl WarmEnterState {
             Some(cell) => ResolvedJitCell::matched(cell, hash),
             None => ResolvedJitCell::miss(hash),
         };
+        // After `JC_TRACING | JC_TEMPORARY`, a live token is
+        // `EnterJitAssembler`, not a trace start. This query must not run
+        // `confirm_enter_jit` as a side effect (`maybe_compile_and_run`).
+        if Self::cell_would_run_compiled(resolved.cell.as_deref()) {
+            return false;
+        }
         matches!(
             self.function_entry_step(resolved, None, &[]),
             FunctionEntryStep::Proceed
@@ -2407,7 +2398,6 @@ impl WarmEnterState {
             greenargs,
             green_types,
             reds,
-            |_| true,
             door,
         )
     }
@@ -2429,6 +2419,12 @@ impl WarmEnterState {
         *live = hashed;
         let cell = self.lookup_chain_with_greenargs(hash, &live.values, &live.types);
         pin.reload(live);
+        // After `JC_TRACING | JC_TEMPORARY`, a live token is
+        // `EnterJitAssembler`, not a trace start. This query must not run
+        // `confirm_enter_jit` as a side effect (`maybe_compile_and_run`).
+        if Self::cell_would_run_compiled(cell.as_deref()) {
+            return false;
+        }
         matches!(
             self.maybe_compile_and_run_decision(
                 cell.as_deref(),
@@ -2437,7 +2433,6 @@ impl WarmEnterState {
                 Some(&live.values),
                 &live.types,
                 &[],
-                |_| false,
                 WarmEntryDoor::FunctionEntry,
             )
             .0,
@@ -5813,6 +5808,42 @@ mod tests {
         );
     }
 
+    /// A miss whose `get_uhash` equals a tracing occupant's `cell_key` ticks.
+    /// `cell_is_tracing(hash)` would read the occupant; the decision does not.
+    #[test]
+    fn back_edge_miss_does_not_inherit_a_tracing_occupants_flag() {
+        let mut ws = WarmEnterState::new(1);
+        let occupant = GreenKey::new(vec![2100, 2200]);
+        let miss = GreenKey::new(vec![2300, colliding_last_green(&occupant, 2300)]);
+        let hash = occupant.get_uhash();
+        assert_eq!(
+            miss.get_uhash(),
+            hash,
+            "fixture: the two keys must share get_uhash()",
+        );
+        GreenRefPin::with(&occupant, |__p, __l| ws.ensure_cell_for_key(__p, __l));
+        GreenRefPin::with(&occupant, |__p, __l| {
+            ws.mark_as_being_traced_for_key(__p, __l)
+        });
+        assert!(
+            GreenRefPin::with(&occupant, |__p, __l| ws.lookup_chain_with_key(__p, __l))
+                .is_some_and(|c| c.is_tracing()),
+            "fixture: the occupant carries JC_TRACING"
+        );
+        let resolved = ws.resolve_jit_cell(hash, &miss.values, &miss.types);
+        assert!(
+            resolved.cell.is_none(),
+            "comparekey does not match the occupant"
+        );
+        assert!(
+            matches!(
+                ws.back_edge_step(resolved, None, &[]).0,
+                HotResult::StartTracing
+            ),
+            "a comparekey miss ticks; it does not inherit the occupant's JC_TRACING"
+        );
+    }
+
     /// Two green keys share `get_uhash()`. The first occupies the bucket
     /// with `cell_key == hash`. The second misses `comparekey`.
     /// `warmstate.py maybe_compile_and_run` ticks that miss; it does not
@@ -5940,7 +5971,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -5951,7 +5981,6 @@ mod tests {
                 GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                     __p,
                     __l,
-                    |_| true,
                     &[]
                 )),
                 HotResult::NotHot
@@ -5962,7 +5991,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::StartTracing
@@ -5976,7 +6004,6 @@ mod tests {
             GreenRefPin::with(&compiled, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -6008,7 +6035,6 @@ mod tests {
             GreenRefPin::with(&aborted, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -6037,7 +6063,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::AlreadyTracing
@@ -6079,7 +6104,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -6088,7 +6112,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::StartTracing
@@ -6324,7 +6347,6 @@ mod tests {
                 GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                     __p,
                     __l,
-                    |_| true,
                     &[]
                 )),
                 HotResult::AlreadyTracing
@@ -7274,7 +7296,7 @@ mod tests {
         ws.set_confirm_enter_jit(Some(allow));
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_meta(hash, |_| true, &key.types, &[]),
+            ws.maybe_compile_decision_with_meta(hash, &key.types, &[]),
             HotResult::RunCompiled
         ));
         assert!(matches!(
@@ -7286,6 +7308,74 @@ mod tests {
             1,
             "compiled-entry confirm is maybe_compile_and_run_decision; \
              force_start_tracing is bound_reached steps 4-5",
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: a live `get_procedure_token()` is
+    /// `confirm_enter_jit` then `EnterJitAssembler`. There is no compiled-code
+    /// or `outermost_jitdriver_sd` filter on that token. Production attach
+    /// (`attach_procedure_to_interp`) runs after `compile_loop`; tests may
+    /// still attach a token before `set_compiled`.
+    #[test]
+    fn back_edge_decision_enters_a_live_token_without_compiled_code() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_args: &[Value]) -> bool {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![0xF1, 0xA1]);
+        let mut token = JitCellToken::new(1);
+        token.outermost_jitdriver_index = Some(99);
+        let token = attach_alive_for_key(&mut ws, &key, token);
+        assert!(
+            !token.has_compiled_code(),
+            "fixture: the cell holds a token with no compiled blob"
+        );
+        assert_ne!(token.outermost_jitdriver_index, Some(0));
+        ws.set_confirm_enter_jit(Some(allow));
+        assert!(
+            matches!(
+                GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
+                    __p,
+                    __l,
+                    &[]
+                )),
+                HotResult::RunCompiled
+            ),
+            "a live procedure token is entered after confirm_enter_jit"
+        );
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "confirm_enter_jit ran once before RunCompiled"
+        );
+    }
+
+    /// `should_trace_function_entry_for_key` asks whether the door would start
+    /// a trace. A live token is `EnterJitAssembler`, so the answer is false
+    /// and `confirm_enter_jit` must not run as a query side effect.
+    #[test]
+    fn should_trace_function_entry_for_key_does_not_confirm_a_live_token() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_args: &[Value]) -> bool {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![0xC0, 0xDE]);
+        attach_alive_for_key(&mut ws, &key, JitCellToken::new(1));
+        ws.set_confirm_enter_jit(Some(allow));
+        assert!(!GreenRefPin::with(&key, |__p, __l| ws
+            .should_trace_function_entry_for_key(__p, __l)));
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the query must not run confirm_enter_jit on a live token"
         );
     }
 
@@ -8104,9 +8194,8 @@ mod tests {
 
     /// Two typed keys share `get_uhash()`. The second cell's compiled token
     /// is the one `maybe_compile_and_run_decision` reads after
-    /// `JC_TRACING | JC_TEMPORARY`. `has_compiled_meta` sees that token, not
-    /// the bucket hash. A walk that answered the head cell would have no
-    /// token and would tick.
+    /// `JC_TRACING | JC_TEMPORARY`. A walk that answered the head cell would
+    /// have no token and would tick.
     #[test]
     fn maybe_compile_decision_with_key_runs_the_colliding_cell_under_its_minted_key() {
         let mut ws = WarmEnterState::new(100);
@@ -8143,7 +8232,6 @@ mod tests {
                 GreenRefPin::with(&second, |__p, __l| ws.maybe_compile_decision_with_key(
                     __p,
                     __l,
-                    |t| t.has_compiled_code(),
                     &[]
                 )),
                 HotResult::RunCompiled
@@ -8933,7 +9021,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -8946,7 +9033,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -8955,7 +9041,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::NotHot
@@ -8964,7 +9049,6 @@ mod tests {
             GreenRefPin::with(&key, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::StartTracing
@@ -8978,7 +9062,6 @@ mod tests {
             GreenRefPin::with(&dnt, |__p, __l| ws.maybe_compile_decision_with_key(
                 __p,
                 __l,
-                |_| true,
                 &[]
             )),
             HotResult::StartTracing

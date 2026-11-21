@@ -7278,12 +7278,7 @@ impl<M: Clone> MetaInterp<M> {
         let typed = {
             let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
             Self::with_typed_decision_key(green_key, code_slot, pc, |key, pin| {
-                warm_state.maybe_compile_decision_with_key(
-                    pin,
-                    key,
-                    |t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no),
-                    reds,
-                )
+                warm_state.maybe_compile_decision_with_key(pin, key, reds)
             })
         };
         match typed {
@@ -7296,12 +7291,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|d| d.green_args_spec())
                     .unwrap_or_default();
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-                warm_state.maybe_compile_decision_with_meta(
-                    green_key,
-                    |t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no),
-                    &types,
-                    reds,
-                )
+                warm_state.maybe_compile_decision_with_meta(green_key, &types, reds)
             }
         }
     }
@@ -24982,6 +24972,70 @@ mod metainterp_static_data_tests {
         assert!(
             matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "a token on this driver's comparekey-matched cell is entered"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: `on_back_edge_typed_decision`
+    /// enters a live procedure token after `confirm_enter_jit`. The token
+    /// need not answer `has_compiled_code()`, and `outermost_jitdriver_sd`
+    /// is not a second filter — the cell lives on this driver's warmstate.
+    #[test]
+    fn on_back_edge_typed_decision_enters_a_live_token_without_compiled_code() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_args: &[majit_ir::Value]) -> bool {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        // `gk` is one Int green. The hash fallback of
+        // `on_back_edge_typed_decision_on_driver` packs `confirm_enter_jit`
+        // from `_green_args_spec` (`warmstate.py`).
+        let mut first =
+            crate::jitdriver::JitDriverStaticData::new(vec![("g", majit_ir::Type::Int)], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        assert_eq!(idx0, 0);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = gk(0x7e15);
+        let mut token = majit_backend::JitCellToken::new(75);
+        token.outermost_jitdriver_index = Some(99);
+        let token = std::sync::Arc::new(token);
+        assert!(!token.has_compiled_code());
+        meta.warm_state_for_driver(idx0)
+            .memory_manager
+            .keep_loop_alive(&token);
+        crate::warmstate::GreenRefPin::with(&key, |__p, __l| {
+            meta.warm_state_for_driver(idx0)
+                .attach_procedure_to_interp_for_key(__p, __l, std::sync::Arc::clone(&token))
+        });
+        meta.warm_state_for_driver(idx0)
+            .set_confirm_enter_jit(Some(allow));
+
+        let decided = {
+            let _zbh_pin = crate::warmstate::GreenRefPin::pin_one(0);
+            meta.on_back_edge_typed_decision_on_driver(
+                idx0,
+                key.get_uhash(),
+                _zbh_pin.save(),
+                0,
+                &[],
+            )
+        };
+        assert!(
+            matches!(decided, crate::warmstate::HotResult::RunCompiled),
+            "a live token on this driver's matched cell is RunCompiled"
+        );
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "confirm_enter_jit ran once before RunCompiled"
         );
     }
 
