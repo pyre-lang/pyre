@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=20
 # str subscripts resolve a code point index, not a byte offset, for every
 # payload width, and a slice keeps that indexing under negative and skipping
 # steps. bytes/bytearray iterate their live buffer as ordinals, so a bytearray

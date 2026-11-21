@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=12
 # A callee raises TWO different exception classes into a hot try/except loop.
 # The loop trace records the raising iteration's GUARD_EXCEPTION(class-A); the
 # no-raise iterations chronically fail that guard WITHOUT a pending exception,
