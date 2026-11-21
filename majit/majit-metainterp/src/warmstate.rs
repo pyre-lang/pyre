@@ -1198,32 +1198,38 @@ impl WarmEnterState {
         tick_result(self, hash, increment)
     }
 
-    /// `warmstate.py` `bound_reached` — the veto, then the mark.
+    /// `warmstate.py bound_reached` steps 1-3: `confirm_enter_jit(*args)`
+    /// first (false has no side effect), then `jitcounter.decay_all_counters`,
+    /// then `rstack.stack_almost_full`.
     ///
-    /// Every tracing start in this module funnels through here or through its
-    /// typed twin: `maybe_compile_with_key` reaches it from its own decision,
-    /// and `force_start_tracing*` (which is what `MetaInterp::bound_reached`
-    /// calls) reaches it after theirs. That makes this the one position at
-    /// which the hook fires exactly once per start, which is what upstream
-    /// gets by having a single `bound_reached`.
-    ///
-    /// The hash form names an already-installed cell. A tracing start
-    /// without one needs greens — use [`Self::start_tracing_cell_for_key`]
-    /// (`warmstate.py` `bound_reached` `JitCell(*greenargs)`).
-    fn start_tracing_cell(
+    /// A counter-fire door calls this once, then
+    /// [`Self::force_start_tracing`] / [`Self::force_start_tracing_for_key`]
+    /// for steps 4-5. Tests that call force-start to set up state may skip it.
+    pub fn bound_reached_prelude(
         &mut self,
-        cell_key: u64,
+        greens: &[i64],
         green_types: &[GreenType],
         reds: &[Value],
-    ) -> HotResult {
+    ) -> bool {
+        if !self.confirm_enter_jit(greens, green_types, reds) {
+            return false;
+        }
+        self.decay_counters();
+        if crate::stack_almost_full() {
+            return false;
+        }
+        true
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5: the hash form names an
+    /// already-installed cell, then `JC_TRACING | JC_TRACING_OCCURRED`.
+    /// A tracing start without a cell needs greens — use
+    /// [`Self::start_tracing_cell_for_key`] (`JitCell(*greenargs)`).
+    fn start_tracing_cell(&mut self, cell_key: u64) -> HotResult {
         let cell = self.cell_by_key(cell_key).expect(
             "the hash form names an installed cell; a tracing start without one needs greens, \
              warmstate.py bound_reached JitCell(*greenargs)",
         );
-        let greens = cell.current_greens();
-        if !self.confirm_enter_jit_if_available(Some(&greens[..]), green_types, reds) {
-            return HotResult::NotHot;
-        }
         self.counter.reset(self.bucket_of(cell_key));
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
@@ -1410,7 +1416,7 @@ impl WarmEnterState {
     #[cfg(test)]
     pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
         match self.maybe_compile_decision(cell_key, &[]) {
-            HotResult::StartTracing => self.start_tracing_cell(cell_key, &[], &[]),
+            HotResult::StartTracing => self.start_tracing_cell(cell_key),
             other => other,
         }
     }
@@ -1438,6 +1444,10 @@ impl WarmEnterState {
         let (hash, mut live) = pin.live_after_hash(key);
         match self.maybe_compile_decision_with_live(pin, hash, &mut live, |_| true, &[]) {
             HotResult::StartTracing => {
+                pin.reload(&mut live);
+                if !self.bound_reached_prelude(&live.values, &live.types, &[]) {
+                    return HotResult::NotHot;
+                }
                 pin.reload(&mut live);
                 self.start_tracing_cell_for_key(pin, &mut live, &[])
             }
@@ -1521,15 +1531,13 @@ impl WarmEnterState {
         live: &mut GreenKey,
         reds: &[Value],
     ) -> HotResult {
+        let _ = reds;
         pin.reload(live);
         let hash = live.get_uhash();
         pin.reload(live);
-        // `warmstate.py` `bound_reached` — see `start_tracing_cell`, whose
-        // position this is the typed twin of.
-        if !self.confirm_enter_jit(&live.values, &live.types, reds) {
-            return HotResult::NotHot;
-        }
-        pin.reload(live);
+        // `warmstate.py bound_reached` steps 4-5: install if None, then
+        // `JC_TRACING | JC_TRACING_OCCURRED`. Confirm / decay / stack ran
+        // in [`Self::bound_reached_prelude`].
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
@@ -1590,7 +1598,9 @@ impl WarmEnterState {
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
     }
 
-    /// Force-start tracing for a green key, bypassing the hot counter.
+    /// `warmstate.py bound_reached` steps 4-5: install the cell if needed
+    /// and mark `JC_TRACING | JC_TRACING_OCCURRED`. Confirm, decay, and
+    /// stack ran in [`Self::bound_reached_prelude`].
     ///
     /// Used by function-entry tracing where the caller has already
     /// determined that tracing should begin.
@@ -1600,12 +1610,9 @@ impl WarmEnterState {
         green_types: &[GreenType],
         reds: &[Value],
     ) -> HotResult {
+        let _ = (green_types, reds);
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
-                let greens = cell.current_greens();
-                if !self.confirm_enter_jit_if_available(Some(&greens[..]), green_types, reds) {
-                    return HotResult::NotHot;
-                }
                 return HotResult::RunCompiled;
             }
             if cell.is_tracing() {
@@ -1625,7 +1632,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell(cell_key, green_types, reds)
+        self.start_tracing_cell(cell_key)
     }
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
@@ -1639,14 +1646,11 @@ impl WarmEnterState {
         live: &mut GreenKey,
         reds: &[Value],
     ) -> HotResult {
+        let _ = reds;
         let (hash, hashed) = pin.live_after_hash(live);
         *live = hashed;
         if let Some(cell) = self.lookup_chain_with_greenargs(hash, &live.values, &live.types) {
             if cell.is_compiled() {
-                pin.reload(live);
-                if !self.confirm_enter_jit(&live.values, &live.types, reds) {
-                    return HotResult::NotHot;
-                }
                 return HotResult::RunCompiled;
             }
             if cell.is_tracing() {
@@ -1661,7 +1665,7 @@ impl WarmEnterState {
         }
 
         pin.reload(live);
-        self.start_tracing_cell_for_key(pin, live, reds)
+        self.start_tracing_cell_for_key(pin, live, &[])
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -7066,10 +7070,11 @@ mod tests {
                     __l,
                     &[]
                 )),
-                HotResult::NotHot
+                HotResult::RunCompiled
             ),
-            "the force-start door must not turn an already-compiled cell into \
-             an unchecked compiled entry",
+            "force_start_tracing is bound_reached steps 4-5; a compiled cell \
+             stays RunCompiled. Compiled-entry confirm lives in \
+             maybe_compile_and_run_decision",
         );
     }
 
@@ -7102,8 +7107,9 @@ mod tests {
         ));
         assert_eq!(
             CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "both compiled-entry doors must call the permissive hook",
+            1,
+            "compiled-entry confirm is maybe_compile_and_run_decision; \
+             force_start_tracing is bound_reached steps 4-5",
         );
     }
 
@@ -7143,10 +7149,9 @@ mod tests {
     /// The hook fires once per tracing start, not once per decision.
     ///
     /// Upstream has a single `bound_reached` and calls it there
-    /// (`warmstate.py`). Here the decision and the start are two calls —
-    /// `maybe_compile_decision` answers, and `MetaInterp::bound_reached`
-    /// reaches the cell through `force_start_tracing_for_key` — so a veto
-    /// placed in both would consult a user callback twice for one entry.
+    /// (`warmstate.py`). Here the decision, the prelude, and the mark are
+    /// separate: `maybe_compile_decision` answers, `bound_reached_prelude`
+    /// is steps 1-3, and `force_start_tracing_for_key` is steps 4-5.
     #[test]
     fn the_confirm_enter_jit_hook_fires_once_per_tracing_start() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -7177,9 +7182,13 @@ mod tests {
         assert_eq!(
             CALLS.load(std::sync::atomic::Ordering::Relaxed),
             0,
-            "the decision must not consult the hook; the start does",
+            "the decision must not consult the hook; the prelude does",
         );
 
+        assert!(
+            ws.bound_reached_prelude(&key.values, &key.types, &[]),
+            "permissive confirm_enter_jit lets the prelude through"
+        );
         assert!(matches!(
             GreenRefPin::with(&key, |__p, __l| ws.force_start_tracing_for_key(
                 __p,

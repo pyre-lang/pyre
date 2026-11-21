@@ -6897,7 +6897,21 @@ impl<M: Clone> MetaInterp<M> {
             .preserve_nested_overflow(hash);
     }
 
-    /// Force-start tracing for a green key, bypassing the hot counter.
+    /// `warmstate.py bound_reached` steps 1-3 on this driver's warm state.
+    pub fn bound_reached_prelude(
+        &mut self,
+        jd_no: usize,
+        greens: &[i64],
+        green_types: &[majit_ir::GreenType],
+        reds: &[Value],
+    ) -> bool {
+        self.warm_state_for_driver(jd_no)
+            .bound_reached_prelude(greens, green_types, reds)
+    }
+
+    /// `warmstate.py bound_reached` steps 4-5: install the cell if needed
+    /// and mark `JC_TRACING | JC_TRACING_OCCURRED`. Confirm, decay, and
+    /// stack ran in [`Self::bound_reached_prelude`].
     ///
     /// `code_slot` is the live pin of the portal `W_Code` (or the first
     /// Ref green). Reload after collecting calls
@@ -7124,12 +7138,11 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// RPython warmstate.py `bound_reached` parity.
+    /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
+    /// Confirm, decay, and stack ran in [`Self::bound_reached_prelude`].
     ///
     /// Like `on_back_edge_typed` but bypasses the counter tick — the
     /// caller (can_enter_jit_hook) already verified the counter fired.
-    /// This allows decay_counters() to be called before tracing starts
-    /// without the internal tick check blocking the trace.
     ///
     /// `code_slot` is the live pin of the portal `W_Code`.
     pub fn bound_reached(
@@ -7144,10 +7157,6 @@ impl<M: Clone> MetaInterp<M> {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
-        }
-        self.decay_counters();
-        if Self::stack_almost_full() {
-            return BackEdgeAction::Interpret;
         }
 
         let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
@@ -7296,8 +7305,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Commit a `StartTracing` answer from
     /// [`Self::on_back_edge_typed_decision_on_driver`] and consume the expensive tracing
-    /// arguments.  `bound_reached` re-runs the cell policy without ticking the
-    /// counter, then marks the cell and sets up the trace.
+    /// arguments. The caller ran [`Self::bound_reached_prelude`]; this is
+    /// steps 4-5 plus `setup_tracing`.
     pub(crate) fn start_back_edge_trace(
         &mut self,
         green_key: u64,
@@ -7336,14 +7345,24 @@ impl<M: Clone> MetaInterp<M> {
             live_values,
         ) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => self.start_back_edge_trace(
-                green_key,
-                code_slot,
-                target_pc,
-                green_key_values,
-                driver_descriptor,
-                live_values,
-            ),
+            HotResult::StartTracing => {
+                let (greens, types): (&[i64], &[majit_ir::GreenType]) =
+                    match green_key_values.as_ref() {
+                        Some(k) => (&k.values, &k.types),
+                        None => (&[], &[]),
+                    };
+                if !self.bound_reached_prelude(jd_no, greens, types, live_values) {
+                    return BackEdgeAction::Interpret;
+                }
+                self.start_back_edge_trace(
+                    green_key,
+                    code_slot,
+                    target_pc,
+                    green_key_values,
+                    driver_descriptor,
+                    live_values,
+                )
+            }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
@@ -36038,6 +36057,10 @@ mod tests {
         let green_key = crate::green_key_from_code_ptr(code, pc);
         {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((code) as usize);
+            assert!(
+                meta.bound_reached_prelude(0, &[], &[], &[Value::Int(0)]),
+                "warmstate.py bound_reached steps 1-3"
+            );
             meta.bound_reached(green_key, _zbh_pin.save(), pc, None, None, &[Value::Int(0)])
         };
         assert!(meta.tracing.is_some(), "bound_reached must start tracing");
@@ -36084,6 +36107,10 @@ mod tests {
         let green_key = crate::green_key_from_code_ptr(code, pc);
         {
             let _zbh_pin = crate::warmstate::GreenRefPin::pin_one((code) as usize);
+            assert!(
+                meta.bound_reached_prelude(0, &[], &[], &[Value::Int(0)]),
+                "warmstate.py bound_reached steps 1-3"
+            );
             meta.bound_reached(green_key, _zbh_pin.save(), pc, None, None, &[Value::Int(0)])
         };
         assert!(meta.tracing.is_some(), "bound_reached must start tracing");

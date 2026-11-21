@@ -9327,6 +9327,19 @@ fn drive_generatorentry_trace(
         }
         return None;
     }
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter.
+    let pycode = roots.get(base);
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
+    let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
+    let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
+    if !driver
+        .meta_interp_mut()
+        .bound_reached_prelude(jd_no, &gk.values, &gk.types, &live_values)
+    {
+        return None;
+    }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
@@ -10179,6 +10192,21 @@ fn drive_tuple_hash_trace(
     if matched_cell.is_some_and(|cell| cell.is_tracing()) {
         return None;
     }
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter. confirm_enter_jit is vacuous on
+    // hash_driver (`pypyjit_confirm_reds` absent).
+    let w_type = roots.get(base);
+    let w_tuple = roots.get(base + 1);
+    let gk = pyre_jit_trace::tuplehash_state::tuple_hash_green_key(w_type);
+    let live_values = pyre_jit_trace::tuplehash_state::tuple_hash_live_values(
+        len as i64, acc as i64, i as i64, w_tuple,
+    );
+    if !driver
+        .meta_interp_mut()
+        .bound_reached_prelude(jd_no, &gk.values, &gk.types, &live_values)
+    {
+        return None;
+    }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
@@ -11008,6 +11036,17 @@ fn drive_unpack_iterable_trace(
         if dbg {
             eprintln!("[jd1] bail: cell JC_TRACING");
         }
+        return;
+    }
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter.
+    let greenkey = [roots.get(base) as i64];
+    let green_types = [majit_ir::GreenType::Ref];
+    let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
+    if !driver
+        .meta_interp_mut()
+        .bound_reached_prelude(jd_no, &greenkey, &green_types, &live_values)
+    {
         return;
     }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
@@ -15790,14 +15829,27 @@ fn bound_reached(
             locals,
         );
     }
-    // warmstate.py bound_reached: `jitcounter.decay_all_counters()` and
-    // then `rstack.stack_almost_full()` run inside `MetaInterp::bound_reached`
-    // (`compile_and_run_once` → `JitDriver::bound_reached`), in that order.
+    // warmstate.py bound_reached steps 1-3 before MetaInterp() /
+    // NestedTraceGuard::enter (`compile_and_run_once`).
     // Do not build a `PyreJitState` or `FrameRoot` here: those belong to
     // `compile_and_run_once` / `execute_assembler`. Holding them across the
     // call blocked the tail call and allocated a second virtualizable root
     // on every too-long abort (`trace_too_long_effect_replay`).
     frame.set_last_instr_from_next_instr(loop_header_pc);
+    let reds = pypyjit_confirm_reds(driver, frame);
+    let greenargs = majit_ir::pypyjit_greenargs(
+        loop_header_pc,
+        frame.get_is_being_profiled(),
+        pycode_root.get() as u64,
+    );
+    if !driver.meta_interp_mut().bound_reached_prelude(
+        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+        &greenargs,
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+        &reds,
+    ) {
+        return None;
+    }
     compile_and_run_once(
         frame,
         green_key,
@@ -16184,13 +16236,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             function_threshold,
         );
     }
-    // warmstate.py bound_reached:
-    //   if not confirm_enter_jit(*args): return
-    //   jitcounter.decay_all_counters()
-    //   if rstack.stack_almost_full(): return
-    //   metainterp.compile_and_run_once(jitdriver_sd, *args)
-    driver.meta_interp_mut().decay_counters();
-    if stack_almost_full() {
+    // warmstate.py bound_reached steps 1-3, then compile_and_run_once (4-5).
+    let greenargs =
+        majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, pycode_root.get() as u64);
+    if !driver.meta_interp_mut().bound_reached_prelude(
+        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+        &greenargs,
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+        &reds,
+    ) {
         return None;
     }
     let env = PyreEnv;

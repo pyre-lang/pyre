@@ -8861,28 +8861,23 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        let started = match greenargs {
-            Some((values, types)) => {
-                let mut live = majit_ir::GreenKey::from_greenargs(values, types);
-                pin.reload(&mut live);
-                self.meta.force_start_tracing(
-                    green_key,
-                    pin.save(),
-                    target_pc,
-                    Some((live.values.as_slice(), live.types.as_slice())),
-                    descriptor,
-                    &live_values,
-                )
-            }
-            None => self.meta.force_start_tracing(
-                green_key,
-                pin.save(),
-                target_pc,
-                None,
-                descriptor,
-                &live_values,
-            ),
-        };
+        let mut owned_live = None;
+        if let Some((values, types)) = greenargs {
+            let mut live = majit_ir::GreenKey::from_greenargs(values, types);
+            pin.reload(&mut live);
+            owned_live = Some(live);
+        }
+        let greenargs_live = owned_live
+            .as_ref()
+            .map(|live| (live.values.as_slice(), live.types.as_slice()));
+        let started = self.meta.force_start_tracing(
+            green_key,
+            pin.save(),
+            target_pc,
+            greenargs_live,
+            descriptor,
+            &live_values,
+        );
         if let BackEdgeAction::StartedTracing = started {
             if spdiag_enabled() {
                 eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
@@ -8901,11 +8896,11 @@ impl<S: JitState> JitDriver<S> {
 
     #[cold]
     #[inline(never)]
-    /// RPython warmstate.py bound_reached parity.
+    /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
+    /// Confirm, decay, and stack ran in `bound_reached_prelude`.
     ///
     /// Called when the counter threshold has ALREADY fired (from eval_loop_jit).
-    /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
-    /// to be called before tracing starts.
+    /// Bypasses counter.tick() inside maybe_compile.
     ///
     /// `code_slot` is the live pin of the portal `W_Code`. Never
     /// `state.code_ptr()` (`gctransform/shadowstack.py`).
@@ -9172,6 +9167,22 @@ impl<S: JitState> JitDriver<S> {
             state.state_field_layout().total_live_values(),
         ) {
             crate::mc_diag_bump(63); // mst_live_values_mismatch
+            self.restore_trace_vable_ptr(saved_vable_ptr);
+            return false;
+        }
+
+        let jd_no = self.index().unwrap_or(0);
+        let (greens, types): (&[i64], &[GreenType]) = match pin_live.as_ref() {
+            Some((_, live)) => (live.values.as_slice(), live.types.as_slice()),
+            None => match greenargs {
+                Some((values, types)) => (values, types),
+                None => (&[], &[]),
+            },
+        };
+        if !self
+            .meta
+            .bound_reached_prelude(jd_no, greens, types, &live_values)
+        {
             self.restore_trace_vable_ptr(saved_vable_ptr);
             return false;
         }
@@ -11159,12 +11170,16 @@ impl<S: JitState> JitDriver<S> {
     /// `already_ticked` is the empty-chain overflow: the counter already
     /// returned True, so this skips [`Self::function_entry_step`] (which
     /// would tick again) and takes the Proceed arm. RunCompiled, chained
-    /// `resolve_function_entry_cell`, decay + `stack_almost_full` +
+    /// `resolve_function_entry_cell`, confirm + decay + `stack_almost_full` +
     /// `force_start_tracing` all stay here.
     ///
     /// `already_resolved` is the cell the caller's one `lookup_chain` /
     /// `comparekey` walk already named (`FunctionEntryResolved::miss` on a
     /// cold overflow). `None` walks here (`confirm_enter_jit` veto).
+    ///
+    /// `FunctionEntryStep::Proceed` is `warmstate.py bound_reached`:
+    /// `confirm_enter_jit` first (no side effects on a refusal), then
+    /// `decay_all_counters`, then `stack_almost_full`, then the mark.
     #[inline(never)]
     fn function_entry_internal(
         &mut self,
@@ -11213,11 +11228,16 @@ impl<S: JitState> JitDriver<S> {
                 if !state.can_trace() {
                     return None;
                 }
-                // warmstate.py bound_reached: decay, then refuse a nearly
-                // full stack, then start the function-entry trace.
-                // `force_start_tracing` republishes the frame decoder.
-                self.meta.decay_counters();
-                if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
+                // warmstate.py bound_reached steps 1-3, then 4-5.
+                // A refusal has no side effects. The RunCompiled confirm
+                // (before EnterJitAssembler) lives in function_entry_step.
+                let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
+                pin.reload(&mut live);
+                let jd_no = self.index().unwrap_or(0);
+                if !self
+                    .meta
+                    .bound_reached_prelude(jd_no, &live.values, &live.types, &confirm_reds)
+                {
                     return None;
                 }
                 pin.reload(&mut live);
@@ -14093,6 +14113,141 @@ mod tests {
             SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed),
             x,
             "the hook sees the declared green value"
+        );
+    }
+
+    /// `warmstate.py bound_reached`: `confirm_enter_jit` runs before
+    /// `decay_all_counters`. A refusal leaves every other cell's counter
+    /// as it was, and the hook fires once (the mark does not consult it
+    /// again).
+    #[test]
+    fn a_confirm_enter_jit_veto_on_function_entry_does_not_decay_counters() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn refuse(_args: &[Value]) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(1);
+        driver.meta.set_trace_eagerness(2);
+        driver.meta.warm_state_for_driver(0).set_param_decay(1000);
+        let guard_hash = driver.meta.warm_state_for_driver(0).fetch_next_hash();
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .tick_guard_failure(guard_hash)
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(refuse));
+
+        let key = majit_ir::GreenKey::single(0xA11);
+        let hash = key.get_uhash();
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .function_entry_structured(
+                    hash,
+                    &key.values,
+                    (GreenSlotInt,),
+                    0,
+                    &mut state,
+                    &(),
+                    None
+                )
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "a refused confirm_enter_jit must not start tracing"
+        );
+        assert_eq!(
+            CONFIRMS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the tracing-start veto fires once (warmstate.py bound_reached)"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .tick_guard_failure(guard_hash),
+            "a refused confirm_enter_jit must not decay_all_counters"
+        );
+    }
+
+    /// Permissive `confirm_enter_jit` on the function-entry tracing start
+    /// still fires once: decay ran (the other cell's tick is gone) and the
+    /// mark did not consult the hook a second time.
+    #[test]
+    fn confirm_enter_jit_runs_once_on_function_entry_tracing_start() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_args: &[Value]) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(1);
+        driver.meta.set_trace_eagerness(2);
+        driver.meta.warm_state_for_driver(0).set_param_decay(1000);
+        let guard_hash = driver.meta.warm_state_for_driver(0).fetch_next_hash();
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .tick_guard_failure(guard_hash)
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(allow));
+
+        let key = majit_ir::GreenKey::single(0xA12);
+        let hash = key.get_uhash();
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .function_entry_structured(
+                    hash,
+                    &key.values,
+                    (GreenSlotInt,),
+                    0,
+                    &mut state,
+                    &(),
+                    None
+                )
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "a permissive confirm_enter_jit must start tracing"
+        );
+        assert_eq!(
+            CONFIRMS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "confirm_enter_jit runs once per function-entry tracing start"
+        );
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .tick_guard_failure(guard_hash),
+            "a confirmed start must decay_all_counters"
         );
     }
 
