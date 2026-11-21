@@ -268,11 +268,19 @@ impl W_BufferedRandom {
             this.read_end as usize
         };
         let length = this.buffer_size as usize - start;
-        // `_bufferedreader_fill_buffer` reads into `self->buffer + start`.
-        let dest = unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data_mut(this.buffer)[start..].as_mut_ptr()
-        };
-        let size = this.raw_read(this.buffer, dest, length)?;
+        // `_raw_read` FileIO path: `get_raw_address()` then `ptradd(..., start)`
+        // and `keepalive_until_here(buffer)`.
+        let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(this.buffer);
+        let dest = super::interp_bufferedio::bytearray_nonmoving_dest(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            start,
+        )?;
+        let size = Self::from_slot(slot).raw_read(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            dest,
+            length,
+        )?;
         if size > 0 {
             let this = Self::from_slot(slot);
             this.read_end = (start + size) as i64;

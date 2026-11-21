@@ -11550,6 +11550,16 @@ pub(in crate::front::mir) fn tyref_is_fixed_u8_list(ty: &TyRef, llbc: &Llbc) -> 
     })
 }
 
+/// A host `&[u8]` item is an integer byte. Deduplicated `u8` place
+/// types can fall back to `Ref`; keep the load in the int bank so a
+/// `match bytes[0]` SwitchInt stays `'i'`.
+pub(in crate::front::mir) fn u8_pair_item_ty(item_ty: &ValueType) -> ValueType {
+    match item_ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => item_ty.clone(),
+        _ => ValueType::Unsigned,
+    }
+}
+
 /// Host `&[u8]` / `&mut [u8]` / `*const [u8]` / `*mut [u8]`, including
 /// `Option` of those. Independent of pair-slice classification: a
 /// BytesBlock-backed `[u8]` view is still this element type.

@@ -177,6 +177,23 @@ impl RegisterBank {
         self.len() == 0
     }
 
+    /// Forward ConstPtr values and live-box `_resref` in this bank
+    /// (`pyjitpl.py` `walk_active_trace_refs` over `MIFrame.registers_r`).
+    pub(crate) fn walk_roots(
+        &self,
+        owner: majit_metainterp::FrontendResrefOwner,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some(slots) = self.0.as_ref() else {
+            return;
+        };
+        for slot in slots.iter() {
+            let mut value = slot.get();
+            walk_frontend_box(&mut value, owner, visitor);
+            slot.set(value);
+        }
+    }
+
     pub fn get(&self, index: usize) -> Option<OpRef> {
         self.0.as_ref()?.get(index).map(Cell::get)
     }

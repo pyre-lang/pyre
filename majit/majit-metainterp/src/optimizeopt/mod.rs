@@ -10500,6 +10500,9 @@ mod ensure_ptr_info_arg0_tests {
         fn type_id(&self) -> u32 {
             self.index
         }
+        fn vtable(&self) -> usize {
+            self.index as usize
+        }
         fn is_immutable(&self) -> bool {
             false
         }
@@ -10732,6 +10735,40 @@ mod ensure_ptr_info_arg0_tests {
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
         assert!(matches!(&*pi, PtrInfo::Instance(_)));
+    }
+
+    /// shortpreamble.py `use_box` + info.py `InstancePtrInfo.make_guards`:
+    /// GETFIELD of an object field upgrades the InputArg receiver to
+    /// Instance (no `known_class`); `use_box` then emits `GUARD_SUBCLASS`
+    /// of that InputArg before the GETFIELD
+    /// (`test_guards_before_getfields_in_short_preamble`). A jump that
+    /// binds the InputArg to a ConstPtr of another class then hits
+    /// rewrite.py `optimize_GUARD_SUBCLASS` rather than compiling the
+    /// GETFIELD of that const.
+    #[test]
+    fn collect_use_box_guards_emits_guard_subclass_of_instance_getfield_receiver() {
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let parent = instance_parent_descr();
+        // `use_box` snapshots `get_forwarded` on the GETFIELD receiver box.
+        // `with_inputarg_types` holds that InputArg; plant Instance on it
+        // so `make_guards` names it.
+        let receiver = ctx.inputargs[0].clone();
+        let descr: DescrRef = Arc::new(TestFieldDescr {
+            index: 0,
+            parent: parent.clone(),
+        });
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[receiver], descr);
+        op.pos().set(OpRef::int_op(1));
+        let _ = ctx.ensure_ptr_info_arg0(&op);
+        let op = OpRc::new(op);
+        let (arg_guards, _result_guards) = ctx
+            .collect_use_box_guards(&op)
+            .expect("use_box guards of an Instance GETFIELD receiver");
+        assert!(
+            arg_guards.iter().any(|g| g.opcode == OpCode::GuardSubclass
+                && g.arg(0).to_opref() == OpRef::input_arg_ref(0)),
+            "expected GUARD_SUBCLASS of the GETFIELD receiver, got {arg_guards:?}"
+        );
     }
 
     /// optimizer.py:485-487 ARRAYLEN_GC branch → `info.ArrayPtrInfo(descr)`.

@@ -16316,6 +16316,263 @@ fn unique_chars_field_does_not_rebind_foreign_from_raw_parts() {
     );
 }
 
+/// `from_raw_parts(header, header.length)` with no chars-offset peel
+/// (`rffi.py` `charpsize2str` copies from `cp`; a STR header pointer
+/// addresses the hash/length prefix, not `s.chars`).
+fn header_ptr_from_raw_parts_without_offset_llbc(name: &str) -> Llbc {
+    let header_ptr = bytes_block_header_ptr_ty();
+    let n = window_usize();
+    let dest_ty = ptr_ty();
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let locals = vec![
+        window_local(0, &dest_ty),
+        window_local(1, &header_ptr),
+        window_local(2, &n),
+    ];
+    let len_place = bytes_block_field_place(1, &header_ptr, 0, &n);
+    let statements = vec![serde_json::json!({
+        "span": window_span(),
+        "kind": {"Assign": [
+            window_place(serde_json::json!({"Local": 2}), &n),
+            {"Use": [{"Read": len_place}, "No"]}
+        ]}
+    })];
+    let from_raw = window_opaque_fun(
+        1,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![header_ptr.clone(), n.clone()],
+        dest_ty.clone(),
+    );
+    let call_term = serde_json::json!({"Call": {"call": {
+        "func": {"Regular": {
+            "kind": {"Fun": 1},
+            "generics": window_empty_generics()
+        }},
+        "args": [
+            {"Read": window_place(serde_json::json!({"Local": 1}), &header_ptr)},
+            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty), "target": 2, "on_unwind": 1}});
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", name], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [header_ptr.clone()],
+            "output": dest_ty
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": locals},
+            "body": [
+                {
+                    "statements": statements,
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_term}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    window_llbc(vec![bytes_block_type_decl()], vec![caller, from_raw])
+}
+
+#[test]
+fn from_raw_parts_header_ptr_without_offset_is_not_rewritten() {
+    let llbc = header_ptr_from_raw_parts_without_offset_llbc(
+        "from_raw_parts_header_ptr_without_offset_is_not_rewritten",
+    );
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "from_raw_parts_header_ptr_without_offset_is_not_rewritten",
+    )
+    .expect("header-ptr from_raw_parts still lowers");
+    assert!(
+        graph_calls_leaf(&graph, "from_raw_parts"),
+        "from_raw_parts of the STR header (no chars offset) must stay residual; graph: {graph:#?}"
+    );
+    assert!(
+        !graph_return_aliases_start_input(&graph, 0),
+        "header ptr without offset must not alias dest to the header; graph: {graph:#?}"
+    );
+}
+
+/// `from_raw_parts{,_mut}(header.add(CHARS_OFFSET), live_len)`: the dest is
+/// `direct_arrayitems` of `STR.chars` (`lltype.py`) plus the supplied live
+/// prefix, not the header itself (`rstr.py` `STR`; live length may be
+/// below capacity).
+fn live_prefix_chars_from_raw_parts_llbc(name: &str, mut_dest: bool) -> Llbc {
+    let offset_n = window_usize();
+    let dest_ty = if mut_dest {
+        window_mut_slice()
+    } else {
+        window_shared_slice()
+    };
+    let u8_ptr = if mut_dest {
+        window_mut_u8_ptr()
+    } else {
+        window_const_u8_ptr()
+    };
+    let add_path: &[&str] = if mut_dest {
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"]
+    } else {
+        &["core", "ptr", "const_ptr", "<Impl>", "add"]
+    };
+    let frp_path: &[&str] = if mut_dest {
+        &["core", "slice", "raw", "from_raw_parts_mut"]
+    } else {
+        &["core", "slice", "raw", "from_raw_parts"]
+    };
+    let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let header_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": window_empty_generics()}
+    });
+    let header_ptr =
+        serde_json::json!({"RawPtr": [header_adt.clone(), if mut_dest { "Mut" } else { "Const" }]});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": isize_t, "attr_info": null},
+            {"name": "length", "ty": offset_n, "attr_info": null}
+        ]},
+        "layout": null
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let add = window_opaque_fun(
+        1,
+        add_path,
+        vec![u8_ptr.clone(), offset_n.clone()],
+        u8_ptr.clone(),
+    );
+    let from_raw = window_opaque_fun(
+        2,
+        frp_path,
+        vec![u8_ptr.clone(), offset_n.clone()],
+        dest_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": true, "inputs": [header_ptr, offset_n], "output": dest_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &dest_ty),
+                window_local(1, &header_ptr),
+                window_local(2, &offset_n),
+                window_local(3, &u8_ptr),
+                window_local(4, &u8_ptr)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &u8_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                {"Move": window_place(serde_json::json!({"Local": 1}), &header_ptr)}
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 3}), &u8_ptr)},
+                            {"Read": window_place(serde_json::json!({"Global": {
+                                "generics": window_empty_generics(),
+                                "id": 1
+                            }}), &offset_n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 4}), &u8_ptr), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 4}), &u8_ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &offset_n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    window_llbc_with_globals(
+        vec![utf8],
+        vec![caller, add, from_raw],
+        vec![
+            serde_json::Value::Null,
+            chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET"),
+        ],
+    )
+}
+
+fn assert_live_prefix_chars_view(graph: &crate::model::FunctionGraph, frp_leaf: &str) {
+    use crate::model::OpKind;
+    assert!(
+        !graph_calls_leaf(graph, frp_leaf),
+        "live-prefix chars view must inline from_raw_parts; graph: {graph:#?}"
+    );
+    assert!(
+        !graph_return_aliases_start_input(graph, 0),
+        "live-prefix dest must not alias to the STR header; graph: {graph:#?}"
+    );
+    let offset = super::lowlevel_string_chars_byte_offset() as i64;
+    let consts: Vec<i64> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(v) => Some(*v),
+            OpKind::ConstUInt(v) => i64::try_from(*v).ok(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        consts.contains(&offset),
+        "chars view keeps STR.chars offset; consts={consts:?} graph: {graph:#?}"
+    );
+}
+
+#[test]
+fn from_raw_parts_live_prefix_len_is_chars_array_view() {
+    let llbc = live_prefix_chars_from_raw_parts_llbc(
+        "from_raw_parts_live_prefix_len_is_chars_array_view",
+        false,
+    );
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "from_raw_parts_live_prefix_len_is_chars_array_view",
+    )
+    .expect("lower live-prefix from_raw_parts");
+    assert_live_prefix_chars_view(&graph, "from_raw_parts");
+}
+
+#[test]
+fn from_raw_parts_mut_live_prefix_len_is_chars_array_view() {
+    let llbc = live_prefix_chars_from_raw_parts_llbc(
+        "from_raw_parts_mut_live_prefix_len_is_chars_array_view",
+        true,
+    );
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "from_raw_parts_mut_live_prefix_len_is_chars_array_view",
+    )
+    .expect("lower live-prefix from_raw_parts_mut");
+    assert_live_prefix_chars_view(&graph, "from_raw_parts_mut");
+}
+
 /// A unique address-taken array field is not `direct_arrayitems` of a
 /// different pointer (`lltype.py` `direct_arrayitems` uses `arrayptr`).
 #[test]
@@ -27850,9 +28107,8 @@ fn rbuilder_ll_grow_by_ovfchecks_lift_to_add_ovf() {
 /// `bytes_block_chars` is `rstr.py` `ll_chars`: the
 /// `from_raw_parts(chars, length)` view must fold to the managed `STR`
 /// header instead of surviving as an opaque Rust call. Loads the real
-/// pyre-object LLBC, so ignored by default.
+/// pyre-object LLBC.
 #[test]
-#[ignore]
 fn bytes_block_chars_folds_header_length_view() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(

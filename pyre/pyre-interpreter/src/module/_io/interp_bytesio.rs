@@ -4,6 +4,15 @@ use pyre_object::*;
 
 const AT_END: i64 = -1;
 
+/// `space.newbytes` of a `w_bytearray_data` slice.
+///
+/// `rStringIO.py read` copies `self.__bigbuffer[p:p+count]` via
+/// `''.join(...)`. The result is a new bytes object of that char range,
+/// not a wrap of the interior pointer as a [`BytesBlock`] header.
+macro_rules! bytes_from_buffer_slice {
+    ($slice:expr) => {{ w_bytes_from_bytes($slice) }};
+}
+
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BytesIO heap spec.
 #[crate::pyre_class("_io.BytesIO", cpython_heaptype, user_layout, weakrefable)]
@@ -98,15 +107,20 @@ impl W_BytesIO {
         self.pos = position;
     }
 
-    fn read_bytes(&mut self, size: i64) -> Vec<u8> {
+    /// rStringIO.py `read`: slice the buffer then `''.join(...)`. Wrap
+    /// lives in this graph so a residual call returns a bytes object,
+    /// not an interior `&[u8]` fat pointer.
+    fn read_slice(&mut self, size: i64) -> PyObjectRef {
         // rpython/rlib/rStringIO.py:129-149.
         let p = self.pos;
         if p == 0 && size < 0 {
             self.pos = AT_END;
-            return unsafe { pyre_object::bytearrayobject::w_bytearray_data(self.buffer).to_vec() };
+            let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(self.buffer) };
+            let n = unsafe { pyre_object::bytearrayobject::w_bytearray_len(self.buffer) };
+            return bytes_from_buffer_slice!(&data[0..n]);
         }
         if p == AT_END || size == 0 {
-            return Vec::new();
+            return w_bytes_from_bytes(b"");
         }
         let mysize = self.getsize();
         let mut count = mysize - p;
@@ -114,30 +128,35 @@ impl W_BytesIO {
             count = count.min(size);
         }
         if count <= 0 {
-            return Vec::new();
+            return w_bytes_from_bytes(b"");
         }
         if p == 0 && count == mysize {
             self.pos = AT_END;
         } else {
             self.pos = p + count;
         }
-        unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data(self.buffer)
+        let slice = unsafe {
+            &pyre_object::bytearrayobject::w_bytearray_data(self.buffer)
                 [p as usize..(p + count) as usize]
-                .to_vec()
-        }
+        };
+        bytes_from_buffer_slice!(slice)
     }
 
-    fn readline_bytes(&mut self, size: i64) -> Vec<u8> {
+    fn read_bytes(&mut self, size: i64) -> Vec<u8> {
+        unsafe { pyre_object::bytesobject::w_bytes_data(self.read_slice(size)).to_vec() }
+    }
+
+    /// rStringIO.py `readline`: slice through the newline then join.
+    fn readline_slice(&mut self, size: i64) -> PyObjectRef {
         // rpython/rlib/rStringIO.py:151-176.
         let p = self.pos;
         if p == AT_END || size == 0 {
-            return Vec::new();
+            return w_bytes_from_bytes(b"");
         }
         let length = self.getsize();
         let count = length - p;
         if count <= 0 {
-            return Vec::new();
+            return w_bytes_from_bytes(b"");
         }
         let mut end = length;
         if size >= 0 && size < count {
@@ -150,10 +169,10 @@ impl W_BytesIO {
             end = newline + 1;
         }
         self.pos = end;
-        unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data(self.buffer)[p as usize..end as usize]
-                .to_vec()
-        }
+        let slice = unsafe {
+            &pyre_object::bytearrayobject::w_bytearray_data(self.buffer)[p as usize..end as usize]
+        };
+        bytes_from_buffer_slice!(slice)
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> Result<i64, crate::PyError> {
@@ -161,7 +180,7 @@ impl W_BytesIO {
             return Ok(0);
         }
         if self.pos == AT_END {
-            let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
+            let mut vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
             let old_len = vec.len();
             // rStringIO.py:69-72 `__fast_write` appends to a StringBuilder,
             // whose growth is amortized across the run.  An exact reservation
@@ -170,7 +189,7 @@ impl W_BytesIO {
             vec.try_reserve(data.len())
                 .map_err(|_| crate::PyError::memory_error(""))?;
             vec.extend_from_slice(data);
-            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
+            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_len) };
             return Ok(data.len() as i64);
         }
 
@@ -183,7 +202,7 @@ impl W_BytesIO {
         if end > i64::MAX as usize {
             return Err(crate::PyError::overflow_error("new position too large"));
         }
-        let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
+        let mut vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
         let old_len = vec.len();
         if end > old_len {
             // `__slow_write` extends `self.__bigbuffer` with `+=`, amortized
@@ -194,9 +213,9 @@ impl W_BytesIO {
                 vec.resize(p, 0);
             }
             vec.resize(end, 0);
-            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
+            unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_len) };
         }
-        vec[p..end].copy_from_slice(data);
+        vec.copy_from_slice_at(p, data);
         self.pos = if end > old_len { AT_END } else { end as i64 };
         Ok(data.len() as i64)
     }
@@ -204,12 +223,12 @@ impl W_BytesIO {
     fn truncate_to(&mut self, size: i64) {
         // rpython/rlib/rStringIO.py:178-200 never enlarges and always seeks
         // to the resulting end using the AT_END sentinel.
-        let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
+        let mut vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
         let old_len = vec.len();
         if size < vec.len() as i64 {
             vec.truncate(size as usize);
         }
-        unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
+        unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_len) };
         self.pos = AT_END;
     }
 
@@ -367,9 +386,9 @@ impl W_BytesIO {
         let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
         let this = Self::from_slot(slot);
         this.check_closed()?;
-        Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &this.read_bytes(size),
-        ))
+        // `space.newbytes(self.read(size))`. `read_slice` is RStringIO.read
+        // (slice + join); a residual of it returns bytes, not a fat slice.
+        Ok(this.read_slice(size))
     }
 
     fn read1(
@@ -397,9 +416,7 @@ impl W_BytesIO {
         let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
         let this = Self::from_slot(slot);
         this.check_closed()?;
-        Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &this.readline_bytes(limit),
-        ))
+        Ok(this.readline_slice(limit))
     }
 
     fn readinto(&mut self, w_buffer: PyObjectRef) -> Result<i64, crate::PyError> {
@@ -518,8 +535,9 @@ impl W_BytesIO {
         let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
         let this = Self::from_slot(slot);
         this.check_closed()?;
+        let n = unsafe { pyre_object::bytearrayobject::w_bytearray_len(this.buffer) };
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data(this.buffer)
+            &pyre_object::bytearrayobject::w_bytearray_data(this.buffer)[..n]
         }))
     }
 
@@ -776,5 +794,24 @@ mod tests {
             }
         });
         assert_eq!(W_BytesIO::from_obj(obj).unwrap().getsize(), 1000);
+    }
+
+    /// `rStringIO.py read` copies `__bigbuffer[p:p+count]`. A wrap of the
+    /// interior `chars+pos` pointer as a BytesBlock header would read
+    /// payload bytes as the length word when `p > 0`.
+    #[test]
+    fn bytesio_read_slice_from_nonzero_position_copies_range() {
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            let obj = W_BytesIO::allocate_stable(W_BytesIO::default());
+            let inst = W_BytesIO::from_obj(obj).unwrap();
+            inst.buffer = pyre_object::bytearrayobject::w_bytearray_from_bytes(b"abcdef");
+            inst.pos = 0;
+            inst.seek_pos(2, 0);
+            let got = inst.read_slice(3);
+            assert_eq!(pyre_object::bytesobject::w_bytes_data(got), b"cde");
+            let rest = inst.read_slice(-1);
+            assert_eq!(pyre_object::bytesobject::w_bytes_data(rest), b"f");
+        }
     }
 }

@@ -78,6 +78,20 @@ pub(super) fn raw_readinto_size(
     Ok(size as usize)
 }
 
+/// `buffer.get_raw_address() + start` after the items array is non-moving.
+///
+/// The buffer object must already be rooted (`keepalive_until_here`).
+pub(super) fn bytearray_nonmoving_dest(
+    buffer: PyObjectRef,
+    start: usize,
+) -> Result<*mut u8, crate::PyError> {
+    let addr = unsafe { pyre_object::bytearrayobject::w_bytearray_raw_address(buffer) };
+    if addr == 0 {
+        return Err(crate::PyError::memory_error(""));
+    }
+    Ok((addr as *mut u8).wrapping_add(start))
+}
+
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedReader heap spec.
 #[crate::pyre_class("_io.BufferedReader", cpython_heaptype, user_layout, weakrefable)]
@@ -336,11 +350,19 @@ impl W_BufferedReader {
             this.read_end as usize
         };
         let length = this.buffer_size as usize - start;
-        // `_bufferedreader_fill_buffer` reads into `self->buffer + start`.
-        let dest = unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data_mut(this.buffer)[start..].as_mut_ptr()
-        };
-        let size = this.raw_read(this.buffer, dest, length)?;
+        // `_raw_read` FileIO path: `get_raw_address()` then `ptradd(..., start)`
+        // and `keepalive_until_here(buffer)`. Non-FileIO still gets a raw
+        // window; once the block is non-moving and the bytearray is rooted,
+        // `readinto` writes into live storage.
+        let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(this.buffer);
+        let dest =
+            bytearray_nonmoving_dest(pyre_object::gc_roots::shadow_stack_get(buffer_slot), start)?;
+        let size = Self::from_slot(slot).raw_read(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            dest,
+            length,
+        )?;
         if size > 0 {
             let this = Self::from_slot(slot);
             this.read_end = (start + size) as i64;

@@ -109,6 +109,9 @@ impl ArrayDescr for PyreStrDescr {
     fn type_id(&self) -> u32 {
         lowlevel_str_gc_type_id()
     }
+    fn cache_key(&self) -> u64 {
+        majit_ir::descr::array_identity_hash("rpy_string")
+    }
     fn item_type(&self) -> Type {
         Type::Int
     }
@@ -132,6 +135,9 @@ impl ArrayDescr for PyreUnicodeDescr {
     fn type_id(&self) -> u32 {
         W_UNICODE_GC_TYPE_ID as u32
     }
+    fn cache_key(&self) -> u64 {
+        majit_ir::descr::array_identity_hash("rpy_unicode")
+    }
     fn item_type(&self) -> Type {
         Type::Int
     }
@@ -153,8 +159,28 @@ pub struct PyreCpu(DefaultCpu);
 
 impl PyreCpu {
     pub fn new() -> Self {
+        publish_str_unicode_array_identities();
         Self(DefaultCpu)
     }
+}
+
+/// `cpu.arraydescrof(STR)` / `UNICODE`: publish the descrs into
+/// `_cache_array` under their `array_identity_hash` so EffectInfo
+/// members resolve (`descr.py get_array_descr`).
+fn publish_str_unicode_array_identities() {
+    use majit_ir::descr::{LLType, gc_cache};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut gc = gc_cache().lock();
+        gc.register_keyed_array(
+            LLType::Array(majit_ir::descr::array_identity_hash("rpy_string")),
+            Arc::new(PyreStrDescr),
+        );
+        gc.register_keyed_array(
+            LLType::Array(majit_ir::descr::array_identity_hash("rpy_unicode")),
+            Arc::new(PyreUnicodeDescr),
+        );
+    });
 }
 
 impl Default for PyreCpu {
@@ -186,9 +212,11 @@ impl Cpu for PyreCpu {
     }
 
     fn str_descr(&self) -> Option<&dyn ArrayDescr> {
+        publish_str_unicode_array_identities();
         Some(&PYRE_STR_DESCR)
     }
     fn unicode_descr(&self) -> Option<&dyn ArrayDescr> {
+        publish_str_unicode_array_identities();
         Some(&PYRE_UNICODE_DESCR)
     }
 
