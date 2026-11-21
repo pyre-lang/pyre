@@ -4881,141 +4881,6 @@ pub(crate) fn record_executed_pure_call_result<Sym: WalkSym>(
     folded
 }
 
-/// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
-/// **checked** `PY_NULL` sentinel — a slot the helper tests before use, so a
-/// concrete NULL there is the operand's normal shape.  `nargs` is the callee's
-/// argument count, for the trailing-slot entry.
-///
-/// Read by `try_execute_residual_call_via_executor_inner`, which leaves a
-/// non-sentinel NULL-Ref call symbolic rather than invoking it.  A sentinel
-/// NULL is executed: declining it drops the recording iteration's call exactly
-/// once (`g(i, d=4)` in a hot loop summed to n-1, with the callee run n-1
-/// times).
-///
-/// * `CallFn` / `CallKw` arg 1 — `null_or_self`: `bh_call_fn_impl` /
-///   `bh_call_kw_N` prepend it as arg0 only when non-null, so NULL is the
-///   ordinary plain-call shape.
-/// * `CallFunctionEx` args 1 and 3 — `self_or_null` and `kwargs_or_null`: NULL
-///   is the ordinary `f(*args)` / no-`**` shape.
-/// * `StoreDeref` arg 1 — `value`: DELETE_DEREF lowers to
-///   `store_deref_value(cell, none)` after its own bound check
-///   (`codewriter.rs` `Instruction::DeleteDeref`) and the helper hands the NULL
-///   straight to `w_cell_set` unread.  Declining it left the clear-the-cell
-///   half of every `del <cellvar>` and every `except E as e` cleanup recorded
-///   but UNEXECUTED, which marks the walk unjournaled — the walk-end flush then
-///   declines and the caller replays the region on top of residuals the walk
-///   already ran concretely.
-/// * `WithExceptStart` arg 1 — `exit_self`: `with_except_start_values` prepends
-///   it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL for every
-///   already-bound `__exit__`, which is the common `with` shape.  Declining it
-///   as symbolic refuses every bridge out of a `with` handler.
-/// * `LoadGlobal` arg 0 — `namespace_ptr`: the helper discards it and resolves
-///   the namespace from the executing frame or the callee's own promoted
-///   `w_code`, because an inlined / chained callee's frame register aliases an
-///   outer frame; the operand survives only as the cell-fold recogniser's hint.
-///   A nested function's `LOAD_GLOBAL` folds it to the NULL constant.
-/// * `RaiseVarargs` trailing arg — `cause`: `normalize_raise_varargs` carries it
-///   as the `raise X` (no `from`) sentinel, never dereferenced when null.
-/// * a registered leaf the effect info gives no kind for — see
-///   [`null_ref_sentinel_of_registered_leaf`].
-pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
-    helper: majit_ir::RuntimeHelperKind,
-    target: i64,
-    arg_index: usize,
-    nargs: usize,
-) -> bool {
-    use majit_ir::RuntimeHelperKind as K;
-    match helper {
-        K::CallFn | K::CallKw | K::StoreDeref | K::WithExceptStart => arg_index == 1,
-        K::CallFunctionEx => arg_index == 1 || arg_index == 3,
-        K::LoadGlobal => arg_index == 0,
-        K::RaiseVarargs => arg_index + 1 == nargs,
-        _ => null_ref_sentinel_of_registered_leaf(target, arg_index, nargs),
-    }
-}
-
-/// Whether Ref argument `arg_index` of the registered leaf at `target` is a
-/// checked `PY_NULL` sentinel.
-///
-/// A plain `dont_look_inside*` body has no `RuntimeHelperKind`, so the table
-/// above cannot name it and the funcptr is the only coordinate the call
-/// carries; resolve it against the published registry the way
-/// `records_inside_transparent_helper` does.
-fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: usize) -> bool {
-    if target <= 0 {
-        return false;
-    }
-    pyre_interpreter::jit_trace_fnaddrs()
-        .iter()
-        .any(|(path, registered)| {
-            *registered == target
-                && path.rsplit("::").next().is_some_and(|leaf| {
-                    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
-                    match leaf {
-                        // `dict_get_slow(dict, key, default, nargs)` — the same
-                        // padding reaches `default`, and a concrete NULL there
-                        // is itself the proof the word is unread: the wrapper
-                        // leaves it `PY_NULL` only for a call of one or two
-                        // words and passes that same length as `nargs`, while
-                        // every arm that moves `default` on is guarded by
-                        // `nargs >= 3`.  Nothing dereferences it even then —
-                        // it is copied into the slice `dict_method_get`
-                        // rejects on arity.
-                        "dict_get_slow" => arg_index == 2 && nargs == 4,
-                        // `jit_portal_call_3(callable, null_or_self, a0, a1, a2)`
-                        // — `bh_call_fn_impl`'s layout. `null_or_self` is
-                        // `PY_NULL` for a plain call; the body tests
-                        // `is_null()` and does not pass that word to
-                        // `call_function_impl_result`. The codewriter leaves
-                        // `runtime_helper` empty, so the `CallFn` row above
-                        // does not see the slot.
-                        "jit_portal_call_3" => arg_index == 1 && nargs == 5,
-                        // `RootScope::pin_root(&self, root)` stores `root` on
-                        // the shadow stack and normalizes the slot.
-                        // `gc_current_object_address_in_window` returns a null
-                        // word unchanged, so a null root is a real pin, not a
-                        // deref. Declining it marks the walk unjournaled and
-                        // the end flush keeps the legacy loop-entry replay,
-                        // which runs the traced iteration's add a second time.
-                        "pin_root" => arg_index == 1 && nargs == 2,
-                        // `rlist.py ll_alloc_and_set(length, init)` writes
-                        // `init` into every slot and does not dereference it.
-                        // `vec![PY_NULL; n]` lowers to this helper; a NULL
-                        // fill is the empty rest-args vector `W_CData.call`
-                        // copies `args_w[1:]` into.
-                        "ll_vec_alloc_and_set_r" => arg_index == 1 && nargs == 2,
-                        // `sort_list_in_place_obj(list, key, reverse_obj)` —
-                        // `__majit_wrap_list_descr_sort` passes the gateway
-                        // Signature's `PY_NULL` holes for an absent `key=` /
-                        // `reverse=`, and the body tests `is_null()` on both
-                        // before reading them.  Declining it dropped the
-                        // recording iteration's `lst.sort()`, leaving the list
-                        // unsorted.
-                        "sort_list_in_place_obj" => {
-                            (arg_index == 1 || arg_index == 2) && nargs == 3
-                        }
-                        // `isclose_slow(a, b, rel_tol, abs_tol)` — the two-word
-                        // `math.isclose(a, b)` arm of `__majit_wrap_math_isclose`
-                        // passes `PY_NULL` for both tolerances, and `isclose`
-                        // reads every slot through its `bound(i)` null filter.
-                        "isclose_slow" => nargs == 4,
-                        // `make_pyerror(kind, message, exc_object, attach_tb,
-                        // context_recorded, reraise_lasti, w_name_context,
-                        // w_obj_context, w_type)` — `alloc_pyerror_object`
-                        // stores `exc_object` and the two context words
-                        // without reading them and tests `w_type.is_null()`
-                        // before the `kind` class lookup.  A fresh
-                        // `OverflowError` from `int_pow` carries `PY_NULL` in
-                        // all four.  Declining it marked the walk unjournaled,
-                        // and the legacy loop-entry replay then delivered a
-                        // FOR_ITER item a second time.
-                        "make_pyerror" => matches!(arg_index, 2 | 6 | 7 | 8) && nargs == 9,
-                        _ => false,
-                    }
-                })
-        })
-}
-
 /// Diagnostic (`PYRE_FBW_DEBUG_ABORT`): dump the Python coordinate and per-arg
 /// provenance behind a ValueUnavailable residual decline — the resume py_pc,
 /// the decoded Python opcode, the declined arg's OpRef and whether it is a
@@ -5985,13 +5850,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             }
         }
     }
-    // NULL-Ref-arg refusal. Pyre's
-    // optimizer emits `guard_nonnull` after this walker fold, so a NULL
-    // receiver dereferences before that guard exists; leave the call
-    // recorded and let the optimizer's guard emission handle it at compile
-    // time.  `mayforce_null_ref_arg_is_checked_sentinel` names slots the
-    // helper tests before use (`bh_call_fn_N`'s `null_or_self`, …), so a
-    // concrete NULL there is executed.
     let helper = call_descr.get_extra_info().runtime_helper;
     // `bh_load_method_self_fn` dereferences `attr` (`is_method`) before it
     // looks at `obj`. A null or unaligned word is not a PyObject — a
@@ -6006,37 +5864,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         if object_arg_unusable {
             return Ok(decline_symbolic_or_pure(cannot_raise_pure, call_opcode));
         }
-    }
-    for (i, &arg) in args.iter().enumerate() {
-        if arg != 0 || !matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) {
-            continue;
-        }
-        // The funcbox coordinate the sentinel table needs to name a leaf the
-        // effect info gives no `RuntimeHelperKind` for, resolved on this arm
-        // alone so the ordinary residual path never reads the registry.
-        let target = match allboxes.first().and_then(|&b| ctx.trace_ctx.box_value(b)) {
-            Some(majit_ir::Value::Int(addr)) => addr,
-            _ => 0,
-        };
-        if mayforce_null_ref_arg_is_checked_sentinel(helper, target, i, args.len()) {
-            continue;
-        }
-        // The refusal names the helper and slot it fired on, because the
-        // repair for a helper that does check its NULL is a row in
-        // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
-        // both coordinates.
-        if fbw_debug_abort_enabled() {
-            let name = pyre_interpreter::jit_trace_fnaddrs()
-                .into_iter()
-                .find(|&(_, addr)| addr == target)
-                .map_or("-", |(name, _)| name);
-            eprintln!(
-                "[nullref-refusal] helper={helper:?} target={name}/{target:#x} \
-                 arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
-                args.len()
-            );
-        }
-        return Ok(decline_symbolic_or_pure(cannot_raise_pure, call_opcode));
     }
     // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
     // body's `acc += delta` is a bare `NB_INPLACE_*` `BinaryOp` residual (args
