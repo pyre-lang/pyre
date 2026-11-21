@@ -228,6 +228,10 @@ pub fn map_set_update_error(err: pyre_object::setobject::SetUpdateError) -> PyEr
 /// explicit full collection.
 #[majit_macros::dont_look_inside]
 pub fn clear_method_cache() {
+    // With the GIL off nothing fills the cache (`_cached_lookup_where_name`).
+    if majit_gc::rgil::gil_disabled() {
+        return;
+    }
     // SAFETY: the GIL is held, and nothing here runs Python code.
     let cache = unsafe { method_cache_mut() };
     for entry in cache.entries.iter_mut() {
@@ -12290,7 +12294,9 @@ unsafe impl Sync for MethodCacheCell {}
 #[inline]
 unsafe fn method_cache_mut() -> &'static mut MethodCache {
     debug_assert!(
-        !majit_gc::rgil::gil_is_initialized() || majit_gc::rgil::am_i_holding_the_gil(),
+        !majit_gc::rgil::gil_is_initialized()
+            || majit_gc::rgil::am_i_holding_the_gil()
+            || majit_gc::gc_sync::mutators_quiesced(),
         "the method cache is guarded by the GIL",
     );
     // SAFETY: the GIL excludes every other thread from reaching this cell.
@@ -12645,6 +12651,14 @@ unsafe fn _cached_lookup_where_name(
     name: &Wtf8,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
+    // The cache is one process-wide table that only the GIL serialises. With
+    // the GIL off the lookup takes the uncached MRO walk, `_lookup_where`, as
+    // `W_TypeObject.lookup_where_with_method_cache` does when `version_tag()`
+    // is None.
+    if majit_gc::rgil::gil_disabled() {
+        return lookup_where_pair_wtf8(w_type, name)
+            .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    }
     let h = method_hash(version_tag, name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = {

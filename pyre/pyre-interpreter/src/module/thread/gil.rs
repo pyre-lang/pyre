@@ -99,7 +99,7 @@ pub(super) fn walk_action_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// that folded the zero.
 pub fn setup_threads(ec: &mut ExecutionContext) -> bool {
     debug_assert!(
-        majit_gc::rgil::am_i_holding_the_gil(),
+        majit_gc::rgil::mutator_may_run(),
         "setup_threads needs the GIL"
     );
     let first = !pyre_object::gil_ready::gil_ready_is_set();

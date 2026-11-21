@@ -9168,7 +9168,7 @@ fn unpack_merge_point_jit(
             );
         }
     }
-    if !jd1_experiment_enabled() {
+    if !jd1_experiment_enabled() || jit_is_off() {
         return;
     }
     // Untranslated body of the `can_enter_jit` that `rewrite_can_enter_jits`
@@ -9270,6 +9270,11 @@ fn genentry_merge_point_jit(
     w_arg: pyre_object::PyObjectRef,
     pycode: pyre_object::PyObjectRef,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
+    // `warmstate.py maybe_compile_and_run`: `increment_threshold == 0`
+    // returns before hashing greens (`jit_is_off`).
+    if jit_is_off() {
+        return None;
+    }
     if w_gen.is_null() || pycode.is_null() {
         return None;
     }
@@ -10051,6 +10056,11 @@ fn tuple_hash_merge_point_jit(
     acc: u64,
     i: usize,
 ) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    // `warmstate.py maybe_compile_and_run`: `increment_threshold == 0`
+    // returns before hashing greens (`jit_is_off`).
+    if jit_is_off() {
+        return None;
+    }
     if w_type.is_null() || w_tuple.is_null() {
         return None;
     }
@@ -10122,6 +10132,11 @@ fn tuple_hash_function_entry_jit(
     acc: u64,
     i: usize,
 ) -> Option<Result<u64, pyre_interpreter::error::PyError>> {
+    // `warmstate.py maybe_compile_and_run`: `increment_threshold == 0`
+    // returns before hashing greens (`jit_is_off`).
+    if jit_is_off() {
+        return None;
+    }
     if w_type.is_null() || w_tuple.is_null() {
         return None;
     }
@@ -14136,13 +14151,13 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
-/// `PYRE_NO_JIT` off switch, resolved once. `warmstate.py
+/// `PYRE_NO_JIT` / `rgil::gil_disabled` off switch. `warmstate.py
 /// maybe_compile_and_run` returns before hashing when
 /// `increment_threshold == 0`; this is that same first test.
 #[inline]
 fn jit_is_off() -> bool {
     static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NO_JIT.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some())
+    *NO_JIT.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) || majit_gc::rgil::gil_disabled()
 }
 
 /// `warmstate.py` `maybe_compile_and_run` looks the cell up and ticks.
@@ -15965,7 +15980,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `threshold` to -1; `rpython/jit/metainterp/counter.py`
     // `JitCounter.compute_threshold` then returns 0.0.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_JIT_FN.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
+    // JIT under `rgil::gil_disabled` is a later phase.
+    if *NO_JIT_FN.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some())
+        || majit_gc::rgil::gil_disabled()
+    {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };

@@ -1051,6 +1051,10 @@ fn real_main(binary_name: &str) {
     pyre_module::register();
 
     if !is_interact {
+        // `PYRE_GIL=0` turns the GIL off before `init_jit_hooks` builds the
+        // collector and registers the main thread: no user code and no other
+        // thread has started, which is what `disable_gil` requires.
+        pyre_interpreter::module::thread::apply_gil_env();
         // Eagerly install pyre-jit's hooks into pyre-interpreter so that
         // sys.settrace / set_jit_param routing is live from the very first
         // user statement, not only after the first JIT-traced bytecode.

@@ -216,7 +216,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6a2 — Default-OFF experiments (3)
+### §6a2 — Default-OFF experiments (4)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.
@@ -231,6 +231,7 @@ driver is no longer suppressed: `maybe_compile_and_run` reads
 | PYRE_GUARD_RESUME_PC | prints the coordinate every walker-emitted guard resumes at (`resume_snapshot.rs guard_resume_pc_probe_enabled`); a guard whose `py_pc` is not the opcode it was emitted under re-executes the wrong bytecode on deopt, which reads as a livelock or a corrupted local rather than as a crash | the resume coordinate is covered by an ordinary test |
 | PYRE_WASM_COMPILE_CENSUS | reports every cranelift compile of a trace module separately (`main.rs jit_compile_trace`) — the bytes handed over, the wall time it took, and whether the request was a first compile or the re-emission of an owner that took a merge.  The stats line carries only the run's totals, which cannot separate a re-emission's cost from a first compile's nor say whether the per-module cost is linear in the bytes | trace compilation stops being on the critical path, or the two questions are answered and the answers stop moving |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
+| PYRE_GIL | `PYRE_GIL=0` turns the GIL off at startup (`thread/mod.rs gil_env_disabled` / `apply_gil_env`, called from `pyrex real_main` before `init_jit_hooks`); `sys._is_gil_enabled()` and `sys.flags.gil` report it, and the JIT entry doors stay closed while the GIL is off. Any other value, or none, keeps the GIL.  `-X gil` and `PYTHON_GIL` are not read | the free-threaded build accepts `-X gil=0` / `PYTHON_GIL=0` itself |
 
 ### §6b — VALUE knobs (15): config, not gates
 

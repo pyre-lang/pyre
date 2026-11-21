@@ -2298,7 +2298,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         );
         let _flag_roots = pyre_object::gc_roots::push_roots();
         let gil_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(i64::from(
+            !crate::module::thread::gil_env_disabled(),
+        )));
         let inherit_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
         let warn_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2349,7 +2351,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             flags_type,
             fields.take(),
             vec![
-                // The interpreter holds a GIL, so `-X gil=0` is not available.
+                // `-X gil` is not accepted; the value reflects the internal
+                // `PYRE_GIL` switch (`gil_env_disabled` / `apply_gil_env`).
                 ("gil", pyre_object::gc_roots::shadow_stack_get(gil_slot)),
                 (
                     "thread_inherit_context",
@@ -3761,11 +3764,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "_is_gil_enabled",
         // Whether the interpreter is *currently* running with the lock on,
         // which is a separate question from the `t` ABI `sysconfig` publishes.
-        // pyre runs bytecode under `rgil` (majit-gc/src/rgil.rs:21-31): one
-        // process-wide lock, taken when a thread starts and dropped only around
-        // external calls, so a thread holds it across arbitrarily many
-        // bytecodes.  That is a GIL, and it is never off.
-        make_builtin_function_with_arity("_is_gil_enabled", |_| Ok(w_bool_from(true)), 0),
+        // Live `!rgil::gil_disabled`: on until `rgil::disable_gil` turns it
+        // off for the process (`apply_gil_env` on `PYRE_GIL=0`).
+        make_builtin_function_with_arity(
+            "_is_gil_enabled",
+            |_| Ok(w_bool_from(!majit_gc::rgil::gil_disabled())),
+            0,
+        ),
     );
     module_ns_store(
         roots.get(ns_slot),
