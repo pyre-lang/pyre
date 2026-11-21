@@ -6674,7 +6674,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     register_gc_alloc_young_storage_box_inst::<pyre_object::celldict::ModuleDictStorage>(
         &mut entries,
     );
-    register_gc_alloc_young_storage_box_inst::<String>(&mut entries);
     // Charon `spec_type_name` spells the kwargs payload as two
     // `alloc::vec::Vec<*mut PyObject, Global>` rather than the
     // `KwargsDictStorage` alias `type_name`.
