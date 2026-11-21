@@ -311,37 +311,36 @@ pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
     sqrt_from_double(try_get_double(args[0])?)
 }
 
-/// Arity / keyword / domain residual of `sqrt`. The positional-count check is
-/// the one `py_checked_arity_fn` used to run before this body.
+/// interp_math.py `math1` residual: the gateway (`__majit_wrap_math_sqrt`)
+/// owns arity via `check_declared_positional_arity`; the body takes `w_x`.
 #[majit_macros::dont_look_inside]
-fn sqrt_slow(args: &[PyObjectRef]) -> PyResult {
-    pyre_interpreter::gateway::check_declared_positional_arity("sqrt", 1, args)?;
-    sqrt(args)
+fn sqrt_slow(w_x: PyObjectRef) -> PyResult {
+    sqrt(&[w_x])
 }
 
 /// interp_math.py `sqrt` = `math1(space, math.sqrt, w_x)`; ll_math.py `ll_math_sqrt`.
 pub fn __majit_wrap_math_sqrt(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 1 {
-        let w_x = args[0];
-        let x =
-            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
-            {
-                Some(unsafe { pyre_object::w_float_get_value(w_x) })
-            } else if unsafe {
-                pyre_object::is_exact_builtin_instance(w_x)
-                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-            } {
-                // `_get_double` coerces via `space.float`; a machine int's `i64 as f64`
-                // is that value. NaN cannot appear. A non-finite result is ±inf.
-                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-            } else {
-                None
-            };
-        if let Some(x) = x {
-            return sqrt_from_double(x);
-        }
+    if args.len() != 1 {
+        pyre_interpreter::gateway::check_declared_positional_arity("sqrt", 1, args)?;
     }
-    sqrt_slow(args)
+    let w_x = args[0];
+    let x = if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+    {
+        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+    } else if unsafe {
+        pyre_object::is_exact_builtin_instance(w_x)
+            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+    } {
+        // `_get_double` coerces via `space.float`; a machine int's `i64 as f64`
+        // is that value. NaN cannot appear. A non-finite result is ±inf.
+        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+    } else {
+        None
+    };
+    if let Some(x) = x {
+        return sqrt_from_double(x);
+    }
+    sqrt_slow(w_x)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -364,39 +363,41 @@ macro_rules! majit_math1_gateway {
     };
     (@emit $name:ident, $x:ident, $fast:stmt) => {
         ::paste::paste! {
+            // interp_math.py `math1`: the gateway owns arity via
+            // `check_declared_positional_arity`; the body takes `w_x`.
             #[majit_macros::dont_look_inside]
-            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
-                pyre_interpreter::gateway::check_declared_positional_arity(
-                    stringify!($name),
-                    1,
-                    args,
-                )?;
-                $name(args)
+            fn [<$name _slow>](w_x: PyObjectRef) -> PyResult {
+                $name(&[w_x])
             }
 
             /// interp_math.py `math1`: exact float, or a machine int/bool read
             /// as `f64`. Outside the domain the original body runs.
             pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
-                if args.len() == 1 {
-                    let w_x = args[0];
-                    let $x = if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x)
-                            && pyre_object::is_float(w_x)
-                    } {
-                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
-                    } else if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x)
-                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-                    } {
-                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-                    } else {
-                        None
-                    };
-                    if let Some($x) = $x {
-                        $fast
-                    }
+                if args.len() != 1 {
+                    pyre_interpreter::gateway::check_declared_positional_arity(
+                        stringify!($name),
+                        1,
+                        args,
+                    )?;
                 }
-                [<$name _slow>](args)
+                let w_x = args[0];
+                let $x = if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x)
+                        && pyre_object::is_float(w_x)
+                } {
+                    Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                } else if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x)
+                        && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                } {
+                    Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                } else {
+                    None
+                };
+                if let Some($x) = $x {
+                    $fast
+                }
+                [<$name _slow>](w_x)
             }
 
             pyre_interpreter::builtin_wrapper_descriptor!(
@@ -441,44 +442,44 @@ macro_rules! majit_math1_raw_gateway {
     ($name:ident, $raw:path, $leaf:path, |$x:ident, $y:ident| $guard:expr) => {
         ::paste::paste! {
             #[majit_macros::dont_look_inside]
-            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
-                pyre_interpreter::gateway::check_declared_positional_arity(
-                    stringify!($name),
-                    1,
-                    args,
-                )?;
-                $name(args)
+            fn [<$name _slow>](w_x: PyObjectRef) -> PyResult {
+                $name(&[w_x])
             }
 
             /// interp_math.py `math1`: exact float, or a machine int/bool read
             /// as `f64`. A non-finite operand or raw result runs `$name`.
             /// The finite arm calls `$leaf` so the boxing leaf is a jitcode.
             pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
-                if args.len() == 1 {
-                    let w_x = args[0];
-                    let $x = if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x)
-                            && pyre_object::is_float(w_x)
-                    } {
-                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
-                    } else if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x)
-                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-                    } {
-                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-                    } else {
-                        None
-                    };
-                    if let Some($x) = $x {
-                        if $x.is_finite() {
-                            let $y = $raw($x);
-                            if $guard {
-                                return $leaf($x);
-                            }
+                if args.len() != 1 {
+                    pyre_interpreter::gateway::check_declared_positional_arity(
+                        stringify!($name),
+                        1,
+                        args,
+                    )?;
+                }
+                let w_x = args[0];
+                let $x = if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x)
+                        && pyre_object::is_float(w_x)
+                } {
+                    Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                } else if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x)
+                        && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                } {
+                    Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                } else {
+                    None
+                };
+                if let Some($x) = $x {
+                    if $x.is_finite() {
+                        let $y = $raw($x);
+                        if $guard {
+                            return $leaf($x);
                         }
                     }
                 }
-                [<$name _slow>](args)
+                [<$name _slow>](w_x)
             }
 
             pyre_interpreter::builtin_wrapper_descriptor!(
@@ -517,48 +518,48 @@ macro_rules! majit_math2_gateway {
     ($name:ident, |$x:ident, $y:ident| $fast:block) => {
         ::paste::paste! {
             #[majit_macros::dont_look_inside]
-            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
-                pyre_interpreter::gateway::check_declared_positional_arity(
-                    stringify!($name),
-                    2,
-                    args,
-                )?;
-                $name(args)
+            fn [<$name _slow>](w_x: PyObjectRef, w_y: PyObjectRef) -> PyResult {
+                $name(&[w_x, w_y])
             }
 
             pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
-                if args.len() == 2 {
-                    let w_x = args[0];
-                    let w_y = args[1];
-                    let $x = if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
-                    } {
-                        Some(unsafe { pyre_object::w_float_get_value(w_x) })
-                    } else if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x)
-                            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-                    } {
-                        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-                    } else {
-                        None
-                    };
-                    let $y = if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_y) && pyre_object::is_float(w_y)
-                    } {
-                        Some(unsafe { pyre_object::w_float_get_value(w_y) })
-                    } else if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_y)
-                            && (pyre_object::is_int(w_y) || pyre_object::is_bool(w_y))
-                    } {
-                        Some(unsafe { pyre_object::w_int_get_value(w_y) } as f64)
-                    } else {
-                        None
-                    };
-                    if let (Some($x), Some($y)) = ($x, $y) {
-                        $fast
-                    }
+                if args.len() != 2 {
+                    pyre_interpreter::gateway::check_declared_positional_arity(
+                        stringify!($name),
+                        2,
+                        args,
+                    )?;
                 }
-                [<$name _slow>](args)
+                let w_x = args[0];
+                let w_y = args[1];
+                let $x = if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
+                } {
+                    Some(unsafe { pyre_object::w_float_get_value(w_x) })
+                } else if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x)
+                        && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+                } {
+                    Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+                } else {
+                    None
+                };
+                let $y = if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_y) && pyre_object::is_float(w_y)
+                } {
+                    Some(unsafe { pyre_object::w_float_get_value(w_y) })
+                } else if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_y)
+                        && (pyre_object::is_int(w_y) || pyre_object::is_bool(w_y))
+                } {
+                    Some(unsafe { pyre_object::w_int_get_value(w_y) } as f64)
+                } else {
+                    None
+                };
+                if let (Some($x), Some($y)) = ($x, $y) {
+                    $fast
+                }
+                [<$name _slow>](w_x, w_y)
             }
 
             pyre_interpreter::builtin_wrapper_descriptor!(
@@ -629,30 +630,30 @@ macro_rules! majit_math_round_gateway {
     ($name:ident, $leaf:path) => {
         ::paste::paste! {
             #[majit_macros::dont_look_inside]
-            fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
-                pyre_interpreter::gateway::check_declared_positional_arity(
-                    stringify!($name),
-                    1,
-                    args,
-                )?;
-                $name(args)
+            fn [<$name _slow>](w_x: PyObjectRef) -> PyResult {
+                $name(&[w_x])
             }
 
             pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
-                if args.len() == 1 {
-                    let w_x = args[0];
-                    if unsafe {
-                        pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
-                    } {
-                        let x = unsafe { pyre_object::w_float_get_value(w_x) };
-                        const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
-                        const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
-                        if x >= SIGNED_MIN_AS_FLOAT && x < SIGNED_LIMIT_AS_FLOAT {
-                            return $leaf(x);
-                        }
+                if args.len() != 1 {
+                    pyre_interpreter::gateway::check_declared_positional_arity(
+                        stringify!($name),
+                        1,
+                        args,
+                    )?;
+                }
+                let w_x = args[0];
+                if unsafe {
+                    pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x)
+                } {
+                    let x = unsafe { pyre_object::w_float_get_value(w_x) };
+                    const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+                    const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+                    if x >= SIGNED_MIN_AS_FLOAT && x < SIGNED_LIMIT_AS_FLOAT {
+                        return $leaf(x);
                     }
                 }
-                [<$name _slow>](args)
+                [<$name _slow>](w_x)
             }
 
             pyre_interpreter::builtin_wrapper_descriptor!(
@@ -667,35 +668,35 @@ majit_math_round_gateway!(floor, _int_from_floor);
 majit_math_round_gateway!(ceil, _int_from_ceil);
 majit_math_round_gateway!(trunc, _int_from_trunc);
 
-/// Arity / keyword / domain residual of `fabs`.
+/// Arity / keyword / domain residual of `fabs`. Word ABI so the residual
+/// has a real fnaddr (`dict_get_slow`).
 #[majit_macros::dont_look_inside]
-fn fabs_slow(args: &[PyObjectRef]) -> PyResult {
-    pyre_interpreter::gateway::check_declared_positional_arity("fabs", 1, args)?;
-    fabs(args)
+fn fabs_slow(w_x: PyObjectRef) -> PyResult {
+    fabs(&[w_x])
 }
 
 /// interp_math.py `fabs` = `math1` of `math.fabs`. Every exact float or
 /// machine int/bool is in domain; `ll_math_fabs` raises for none of them.
 pub fn __majit_wrap_math_fabs(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 1 {
-        let w_x = args[0];
-        let x =
-            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
-            {
-                Some(unsafe { pyre_object::w_float_get_value(w_x) })
-            } else if unsafe {
-                pyre_object::is_exact_builtin_instance(w_x)
-                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-            } {
-                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-            } else {
-                None
-            };
-        if let Some(x) = x {
-            return pyre_interpreter::objspace::descroperation::_float_abs(x);
-        }
+    if args.len() != 1 {
+        pyre_interpreter::gateway::check_declared_positional_arity("fabs", 1, args)?;
     }
-    fabs_slow(args)
+    let w_x = args[0];
+    let x = if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+    {
+        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+    } else if unsafe {
+        pyre_object::is_exact_builtin_instance(w_x)
+            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+    } {
+        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+    } else {
+        None
+    };
+    if let Some(x) = x {
+        return pyre_interpreter::objspace::descroperation::_float_abs(x);
+    }
+    fabs_slow(w_x)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -704,18 +705,30 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 );
 
 /// `log` keeps its optional base, so this residual is the original body
-/// rather than a fixed arity-1 check.
+/// rather than a fixed arity-1 check. Word ABI so the residual has a real
+/// fnaddr (`dict_get_slow`); `nargs` is the flat length.
 #[majit_macros::dont_look_inside]
-fn log_slow(args: &[PyObjectRef]) -> PyResult {
-    log(args)
+fn log_slow(w_x: PyObjectRef, w_base: PyObjectRef, nargs: i64) -> PyResult {
+    if nargs == 1 {
+        log(&[w_x])
+    } else if nargs == 2 {
+        log(&[w_x, w_base])
+    } else if nargs <= 0 {
+        log(&[])
+    } else {
+        Err(pyre_interpreter::PyError::type_error(format!(
+            "log expected at most 2 arguments, got {nargs}"
+        )))
+    }
 }
 
 /// interp_math.py `log` = `loghelper` of one operand (`ll_math_log`) when the
 /// value is finite and strictly positive. A base, a non-positive input, or a
 /// non-machine number stays in `log`.
 pub fn __majit_wrap_math_log(args: &[PyObjectRef]) -> PyResult {
+    let w_x = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let w_base = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     if args.len() == 1 {
-        let w_x = args[0];
         let x =
             if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
             {
@@ -735,7 +748,7 @@ pub fn __majit_wrap_math_log(args: &[PyObjectRef]) -> PyResult {
             return _float_log(x);
         }
     }
-    log_slow(args)
+    log_slow(w_x, w_base, args.len() as i64)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -745,57 +758,56 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 
 /// `ldexp` off its exact arm: a zero, subnormal or non-finite `x`, an
 /// exponent outside the normal range, or a result that would round,
-/// overflow or underflow.
+/// overflow or underflow. Word ABI so the residual has a real fnaddr.
 #[majit_macros::dont_look_inside]
-fn ldexp_slow(args: &[PyObjectRef]) -> PyResult {
-    pyre_interpreter::gateway::check_declared_positional_arity("ldexp", 2, args)?;
-    ldexp(args)
+fn ldexp_slow(w_x: PyObjectRef, w_i: PyObjectRef) -> PyResult {
+    ldexp(&[w_x, w_i])
 }
 
 /// interp_math.py `ldexp`. A bool exponent, a non-int, or an overflowing
 /// scale stays in `ldexp`.
 pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 2 {
-        let w_x = args[0];
-        let w_i = args[1];
-        let x =
-            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
-            {
-                Some(unsafe { pyre_object::w_float_get_value(w_x) })
-            } else if unsafe {
-                pyre_object::is_exact_builtin_instance(w_x)
-                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
-            } {
-                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
-            } else {
-                None
-            };
-        let exp = if unsafe {
-            pyre_object::is_exact_builtin_instance(w_i)
-                && pyre_object::is_int(w_i)
-                && !pyre_object::is_bool(w_i)
-        } {
-            Some(unsafe { pyre_object::w_int_get_value(w_i) })
-        } else {
-            None
-        };
-        if let (Some(x), Some(exp)) = (x, exp) {
-            // ll_math.py `ll_math_ldexp` where scaling is exact: a normal
-            // `x` and a normal `2**exp` whose product stays normal, i.e. the
-            // frexp exponent `e` of `x` has `-1021 <= e + exp <= 1024`.
-            if x.is_finite()
-                && (x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE)
-                && exp >= -1022
-                && exp <= 1023
-            {
-                let e = _int_frexp_exponent_raw(x) + exp;
-                if e >= -1021 && e <= 1024 {
-                    return _float_ldexp(x, exp);
-                }
+    if args.len() != 2 {
+        pyre_interpreter::gateway::check_declared_positional_arity("ldexp", 2, args)?;
+    }
+    let w_x = args[0];
+    let w_i = args[1];
+    let x = if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+    {
+        Some(unsafe { pyre_object::w_float_get_value(w_x) })
+    } else if unsafe {
+        pyre_object::is_exact_builtin_instance(w_x)
+            && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+    } {
+        Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+    } else {
+        None
+    };
+    let exp = if unsafe {
+        pyre_object::is_exact_builtin_instance(w_i)
+            && pyre_object::is_int(w_i)
+            && !pyre_object::is_bool(w_i)
+    } {
+        Some(unsafe { pyre_object::w_int_get_value(w_i) })
+    } else {
+        None
+    };
+    if let (Some(x), Some(exp)) = (x, exp) {
+        // ll_math.py `ll_math_ldexp` where scaling is exact: a normal
+        // `x` and a normal `2**exp` whose product stays normal, i.e. the
+        // frexp exponent `e` of `x` has `-1021 <= e + exp <= 1024`.
+        if x.is_finite()
+            && (x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE)
+            && exp >= -1022
+            && exp <= 1023
+        {
+            let e = _int_frexp_exponent_raw(x) + exp;
+            if e >= -1021 && e <= 1024 {
+                return _float_ldexp(x, exp);
             }
         }
     }
-    ldexp_slow(args)
+    ldexp_slow(w_x, w_i)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -804,30 +816,31 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 );
 
 /// `isqrt` on an exact positive machine int below `2**53`. Zero, a bool,
-/// a long and a negative stay in `isqrt`.
+/// a long and a negative stay in `isqrt`. Word ABI so the residual has a
+/// real fnaddr.
 #[majit_macros::dont_look_inside]
-fn isqrt_slow(args: &[PyObjectRef]) -> PyResult {
-    pyre_interpreter::gateway::check_declared_positional_arity("isqrt", 1, args)?;
-    isqrt(args)
+fn isqrt_slow(w_n: PyObjectRef) -> PyResult {
+    isqrt(&[w_n])
 }
 
 /// app_math.py `isqrt` on a `W_IntObject` that fits an exact `f64`.
 pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 1 {
-        let w_n = args[0];
-        if unsafe {
-            pyre_object::is_exact_builtin_instance(w_n)
-                && pyre_object::is_int(w_n)
-                && !pyre_object::is_bool(w_n)
-        } {
-            let n = unsafe { pyre_object::w_int_get_value(w_n) };
-            const EXACT_FLOAT_INT: i64 = 1 << 53;
-            if n >= 1 && n < EXACT_FLOAT_INT {
-                return _int_isqrt(n);
-            }
+    if args.len() != 1 {
+        pyre_interpreter::gateway::check_declared_positional_arity("isqrt", 1, args)?;
+    }
+    let w_n = args[0];
+    if unsafe {
+        pyre_object::is_exact_builtin_instance(w_n)
+            && pyre_object::is_int(w_n)
+            && !pyre_object::is_bool(w_n)
+    } {
+        let n = unsafe { pyre_object::w_int_get_value(w_n) };
+        const EXACT_FLOAT_INT: i64 = 1 << 53;
+        if n >= 1 && n < EXACT_FLOAT_INT {
+            return _int_isqrt(n);
         }
     }
-    isqrt_slow(args)
+    isqrt_slow(w_n)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -839,25 +852,29 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 /// named it for discovery; that hub is behind `dont_look_inside`
 /// `complex_abs`. This wrapper is the replacement seed.
 pub fn __majit_wrap_int_abs(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 1 {
-        let mut w_n = args[0];
-        if unsafe {
-            pyre_object::is_exact_builtin_instance(w_n)
-                && pyre_object::is_int(w_n)
-                && !pyre_object::is_bool(w_n)
-        } {
-            let n = unsafe { pyre_object::w_int_get_value(w_n) };
-            if n != i64::MIN {
-                return pyre_object::with_roots!(w_n => _int_abs(n));
-            }
+    if args.len() != 1 {
+        pyre_interpreter::gateway::check_declared_positional_arity(
+            "__majit_wrap_int_abs",
+            1,
+            args,
+        )?;
+    }
+    let mut w_n = args[0];
+    if unsafe {
+        pyre_object::is_exact_builtin_instance(w_n)
+            && pyre_object::is_int(w_n)
+            && !pyre_object::is_bool(w_n)
+    } {
+        let n = unsafe { pyre_object::w_int_get_value(w_n) };
+        if n != i64::MIN {
+            return pyre_object::with_roots!(w_n => _int_abs(n));
         }
     }
-    int_abs_seed_slow(args)
+    int_abs_seed_slow(w_n)
 }
 
 #[majit_macros::dont_look_inside]
-fn int_abs_seed_slow(args: &[PyObjectRef]) -> PyResult {
-    pyre_interpreter::gateway::check_declared_positional_arity("__majit_wrap_int_abs", 1, args)?;
+fn int_abs_seed_slow(_w_n: PyObjectRef) -> PyResult {
     _int_abs(0)
 }
 
