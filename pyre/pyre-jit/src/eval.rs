@@ -9154,8 +9154,11 @@ fn unpack_merge_point_jit(
             jd_no,
             pyre_jit_trace::unpack_state::jd1_live_values_at(root_base),
         );
-        let greenargs = majit_ir::pypyjit_greenargs(0, false, pin.get() as u64);
+        // `hash_whatever(Ref)` may collect (`incminimark.py _find_shadow`).
+        // Re-read the pin for `*greenargs` after hashing
+        // (`gctransform/shadowstack.py`).
         let hash = make_green_key(pin.get() as *const (), 0, false);
+        let greenargs = majit_ir::pypyjit_greenargs(0, false, pin.get() as u64);
         let resolved = driver.meta_interp().resolve_jit_cell_on_driver(
             jd_no,
             hash,
@@ -11201,12 +11204,16 @@ fn drive_unpack_iterable_trace(
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     let pin = majit_metainterp::GreenRefPin::pin_one(roots.get(base) as usize);
-    let greenkey = [pin.get() as i64];
+    // `warmstate.py bound_reached` `JitCell(*greenargs)`: the same three
+    // greens the jd1 door hashed and `lookup_chain` compared
+    // (`pypyjit_greenargs` / `PYPYJIT_GREEN_TYPES`). The prelude above
+    // still passes the single-Ref greenkey.
+    let greenargs = majit_ir::pypyjit_greenargs(0, false, pin.get() as u64);
     let action = driver.meta_interp_mut().force_start_tracing_cell(
         green_key,
         pin.save(),
         0,
-        Some((greenkey.as_slice(), green_types.as_slice())),
+        Some((&greenargs, majit_ir::PYPYJIT_GREEN_TYPES.as_slice())),
         Some(std::sync::Arc::new(descriptor)),
         &live_values,
         matched_cell,

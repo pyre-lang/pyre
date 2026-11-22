@@ -9239,12 +9239,32 @@ impl<S: JitState> JitDriver<S> {
         if let Some((pin, live)) = pin_live.as_mut() {
             pin.reload(*live);
         }
+        // `bound_reached_prelude` runs `confirm_enter_jit` and can collect.
+        // Pin `*greenargs` first so the prelude reads the live slots and a
+        // later reload recovers the forwarded words
+        // (`gctransform/shadowstack.py`).
+        let mut owned_commit_pin = None;
+        let mut owned_commit_key = None;
+        if pin_live.is_none() {
+            match greenargs {
+                Some((values, types)) => {
+                    let pin = crate::warmstate::GreenRefPin::pin_slices(values, types);
+                    let mut key = GreenKey::from_greenargs(values, types);
+                    pin.reload(&mut key);
+                    owned_commit_pin = Some(pin);
+                    owned_commit_key = Some(key);
+                }
+                None => {
+                    owned_commit_pin = Some(crate::warmstate::GreenRefPin::pin_one(0));
+                }
+            }
+        }
         let reconstructed;
         let prelude_ok = {
             let (greens, types): (&[i64], &[GreenType]) = match pin_live.as_ref() {
                 Some((_, live)) => (live.values.as_slice(), live.types.as_slice()),
-                None => match greenargs {
-                    Some((values, types)) => (values, types),
+                None => match owned_commit_key.as_ref() {
+                    Some(key) => (key.values.as_slice(), key.types.as_slice()),
                     None => {
                         reconstructed = self.meta.reconstructed_greenkey_without_greenargs(
                             jd_no, green_key, 0, target_pc,
@@ -9264,23 +9284,22 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
-        let owned_commit_pin;
         let (commit_slot, commit_values) = match pin_live {
             Some((pin, live)) => {
                 pin.reload(live);
                 (pin.save(), Some(live.clone()))
             }
             None => {
-                owned_commit_pin = match greenargs {
-                    Some((values, types)) => {
-                        crate::warmstate::GreenRefPin::pin_slices(values, types)
+                let pin = owned_commit_pin
+                    .as_ref()
+                    .expect("pin_live None created an owned pin");
+                match owned_commit_key.as_mut() {
+                    Some(key) => {
+                        pin.reload(key);
+                        (pin.save(), Some(key.clone()))
                     }
-                    None => crate::warmstate::GreenRefPin::pin_one(0),
-                };
-                (
-                    owned_commit_pin.save(),
-                    greenargs.map(|(values, types)| GreenKey::from_greenargs(values, types)),
-                )
+                    None => (pin.save(), None),
+                }
             }
         };
         let started = self.meta.start_back_edge_trace(
@@ -14395,6 +14414,59 @@ mod tests {
         assert!(
             crate::mc_diag(61) > before,
             "mst_entered did not move on the back edge that started tracing"
+        );
+    }
+
+    /// `bound_reached_prelude` runs `confirm_enter_jit` and can collect.
+    /// `commit_start_tracing` pins `*greenargs` before that prelude so a
+    /// moved Ref is reloaded into `commit_values`
+    /// (`gctransform/shadowstack.py`).
+    #[test]
+    fn commit_start_tracing_pins_greenargs_before_the_prelude() {
+        const ORIGINAL: usize = 0xCAFE;
+        const MOVED: usize = 0xBEEF;
+        fn rewrite_ref(_args: &[Value]) -> bool {
+            let slot = majit_gc::shadow_stack::shadow_stack_slot();
+            let depth = slot.depth();
+            for i in 0..depth {
+                if slot.get(i).0 == ORIGINAL {
+                    slot.set(i, majit_ir::GcRef(MOVED));
+                }
+            }
+            true
+        }
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(rewrite_ref));
+        let values = [0i64, 0, ORIGINAL as i64];
+        let types = [GreenType::Int, GreenType::Int, GreenType::Ref];
+        let key = GreenKey::from_greenargs(&values, &types);
+        let mut state = TypedRestoreState::default();
+        assert!(
+            driver.commit_start_tracing(
+                key.get_uhash(),
+                Some((&values, types.as_slice())),
+                None,
+                0,
+                &mut state,
+                &(),
+                None,
+            ),
+            "bound_reached commit must start tracing"
+        );
+        let stored = driver
+            .meta
+            .trace_ctx()
+            .and_then(|ctx| ctx.green_key_values().cloned())
+            .expect("started trace stores green_key_values");
+        assert_eq!(
+            stored.values.get(2).copied(),
+            Some(MOVED as i64),
+            "commit_values must reload the Ref after the prelude"
         );
     }
 
