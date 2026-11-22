@@ -1603,14 +1603,44 @@ pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
     out
 }
 
+/// Parameter locals `1..=arg_count` have an incoming definition
+/// (`FlowContext.STORE_FAST`). A later body assign does not replace that
+/// incoming value for earlier uses.
+pub(in crate::front::mir) fn is_parameter_local(body: &Unstructured, local: usize) -> bool {
+    let arg_count = body.locals.arg_count as usize;
+    local >= 1 && local <= arg_count
+}
+
+/// [`is_parameter_local`] dests that a body Assign or Call also names.
+/// Incoming `STORE_FAST` plus this later definition means a use can
+/// see a recorded alias; an un-reassigned parameter's incoming
+/// definition dominates every use.
+pub(in crate::front::mir) fn compute_body_assigned_parameters(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    for_each_assigned_place(llbc, body, |place| {
+        if let PlaceKind::Local(i) = place.kind {
+            let i = i as usize;
+            if is_parameter_local(body, i) {
+                out.insert(i);
+            }
+        }
+    });
+    out
+}
+
 /// Locals whose every body use, other than a defining `Assign` / Call dest
 /// of the local itself, is as the root of a place whose first projection
 /// is `Deref` (`*q`, `*q = v`, `(*q).f`). Multiply assigned locals are
-/// excluded. Construction records the new representations only for a dest
-/// in this set (`is_field_interior_local` / `scalar_address_locals`); any
-/// other use keeps the value read at the borrow (`InteriorPtrRepr` /
-/// `callparse`). `Return` uses `_0`. `StorageLive` / `StorageDead` /
-/// `PlaceMention` / `Drop` are ignored, as in [`dest_deref_census`].
+/// excluded. [`is_parameter_local`] locals are excluded, so a later body
+/// assign cannot reinterpret the incoming value. Construction records the
+/// new representations only for a dest in this set (`is_field_interior_local`
+/// / `scalar_address_locals`); any other use keeps the value read at the
+/// borrow (`InteriorPtrRepr` / `callparse`). `Return` uses `_0`.
+/// `StorageLive` / `StorageDead` / `PlaceMention` / `Drop` are ignored,
+/// as in [`dest_deref_census`].
 pub(in crate::front::mir) fn compute_deref_only_locals(
     llbc: &Llbc,
     body: &Unstructured,
@@ -1660,7 +1690,7 @@ pub(in crate::front::mir) fn compute_deref_only_locals(
         }
     }
     (0..n)
-        .filter(|&i| !disqualified[i] && !multi.contains(&i))
+        .filter(|&i| !is_parameter_local(body, i) && !disqualified[i] && !multi.contains(&i))
         .collect()
 }
 

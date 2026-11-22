@@ -83,6 +83,15 @@ pub(in crate::front::mir) enum InteriorHeader {
     },
 }
 
+/// Kind of deref-only representation a definition installs.
+/// `Rvalue::Ref` only (`ann_cast_ptr_to_adr` refuses an interior
+/// pointer as an address); a `RawPtr` dest keeps main's recorded
+/// place (`direct_fieldptr`).
+enum DerefOnlyRepresentation {
+    FieldInterior(Place),
+    ScalarAddress,
+}
+
 /// A `ptr::add` whose result is used only as `(*dest).field`. The field
 /// itself is known at the use, so the add records the header and index
 /// and aliases the destination to the item pointer for every other consumer.
@@ -473,6 +482,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     pub(in crate::front::mir) multi_assigned_locals: std::collections::HashSet<usize>,
+    /// [`is_parameter_local`] dests that a body Assign or Call names
+    /// ([`compute_body_assigned_parameters`]). Incoming
+    /// `FlowContext.STORE_FAST` plus this later definition means a use
+    /// can see a recorded alias; ScalarAddress refuses those inners.
+    pub(in crate::front::mir) body_assigned_parameters: std::collections::HashSet<usize>,
     /// Locals whose value the body can change through a mutable borrow of
     /// the local itself (`&mut l` / `&raw mut l`).  Whole-body set from
     /// [`compute_mutably_borrowed_locals`]; no `Assign` names the local
@@ -484,6 +498,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// recorded only for a dest in this set, at construction
     /// ([`Self::is_field_interior_local`] / [`Self::scalar_address_locals`]).
     pub(in crate::front::mir) deref_only_locals: std::collections::HashSet<usize>,
+    /// Locals whose unique `Ref` / `RawPtr` definition records a place
+    /// alias. Construction only: one forward-reachable scan of unique
+    /// borrow definitions, then the least fixpoint of the "inner
+    /// pointer is recorded" rule (every local starts unrecorded and is
+    /// added while the rule holds). A reborrow cycle stays unrecorded,
+    /// matching main's lowering of the first member (`cast_ptr_to_adr`).
+    /// Emission reads the live `atomic_ref_place`.
+    pub(in crate::front::mir) recorded_alias_locals: std::collections::HashSet<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -2386,10 +2408,12 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
+            body_assigned_parameters: compute_body_assigned_parameters(llbc, body),
             mutably_borrowed_locals: compute_mutably_borrowed_locals(llbc, body)
                 .into_iter()
                 .collect(),
             deref_only_locals: compute_deref_only_locals(llbc, body),
+            recorded_alias_locals: std::collections::HashSet::new(),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()
@@ -2461,6 +2485,7 @@ impl<'a> Lowering<'a> {
             gc_root_effects: None,
             gc_root_only_dropped: None,
         };
+        lowering.install_recorded_alias_locals();
         lowering.install_deref_only_representations();
         Ok(lowering)
     }
@@ -3571,13 +3596,187 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|place| self.scalar_gc_field_interior_parts(place).is_some())
     }
 
+    /// Whether this Assign dest gets a deref-only representation.
+    /// Shared by construction install and [`Self::records_atomic_ref_place`]
+    /// so a RawPtr dest cannot lose the recorded place without receiving
+    /// a replacement (`InteriorPtrRepr.__init__` / `cast_ptr_to_adr`).
+    fn deref_only_representation(
+        &self,
+        dest: usize,
+        rvalue: &Rvalue,
+    ) -> Option<DerefOnlyRepresentation> {
+        if !self.deref_only_locals.contains(&dest) {
+            return None;
+        }
+        let Rvalue::Ref {
+            place: referent, ..
+        } = rvalue
+        else {
+            return None;
+        };
+        if self.scalar_gc_field_interior_parts(referent).is_some() {
+            return Some(DerefOnlyRepresentation::FieldInterior(clone_place(
+                referent,
+            )));
+        }
+        let inner = self.raw_primitive_deref_inner(referent)?;
+        // Same gate `resolve_place` uses for `*p` of a typed-items
+        // accessor (`PtrRepr.rtype_getitem`): that Deref is ArrayRead,
+        // not `rewrite_op_raw_load`, so the reborrow is not an address.
+        if matches!(
+            &inner.kind,
+            PlaceKind::Local(local)
+                if raw_ptr_typed_items_element(&inner.ty, self.llbc).is_some()
+                    && base_traces_to_typed_items_block_accessor(
+                        self.body,
+                        *local as usize,
+                        self.llbc,
+                    )
+        ) {
+            return None;
+        }
+        // `q = &*p` is an address only when emission cannot see `p`
+        // recorded at the reborrow (`cast_ptr_to_adr` /
+        // `rewrite_op_raw_load`). Emission reads the live
+        // `atomic_ref_place`. A body-assigned parameter
+        // ([`Self::body_assigned_parameters`], `FlowContext.STORE_FAST`
+        // plus a later def), a multiply assigned local, or a member of
+        // [`Self::recorded_alias_locals`] can be recorded at a later
+        // use. Every other `p` has a single definition that dominates
+        // every use (an un-reassigned parameter's incoming value), so
+        // the static set is exact: ScalarAddress here means the
+        // dynamic check is unrecorded too.
+        if matches!(
+            &inner.kind,
+            PlaceKind::Local(local)
+                if self.body_assigned_parameters.contains(&(*local as usize))
+                    || self.multi_assigned_locals.contains(&(*local as usize))
+                    || self.recorded_alias_locals.contains(&(*local as usize))
+        ) {
+            return None;
+        }
+        Some(DerefOnlyRepresentation::ScalarAddress)
+    }
+
+    /// Unique forward-reachable `Ref` / `RawPtr` Assign of each local.
+    /// A second definition, a Call dest, a non-borrow Assign, or an
+    /// incoming parameter (`FlowContext.STORE_FAST`,
+    /// [`is_parameter_local`]) drops the local.
+    fn unique_borrow_places(&self) -> Vec<(usize, Place)> {
+        let n = self.body.locals.locals.len();
+        let mut found: Vec<Option<Place>> = vec![None; n];
+        let mut invalid = vec![false; n];
+        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+            if !self.forward_reached.get(bb_idx).copied().unwrap_or(false) {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(i) = place.kind else {
+                    continue;
+                };
+                let i = i as usize;
+                if i >= n || invalid[i] {
+                    continue;
+                }
+                if is_parameter_local(self.body, i) || self.multi_assigned_locals.contains(&i) {
+                    invalid[i] = true;
+                    found[i] = None;
+                    continue;
+                }
+                let referent = match rvalue {
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
+                    _ => {
+                        invalid[i] = true;
+                        found[i] = None;
+                        continue;
+                    }
+                };
+                if found[i].is_some() {
+                    invalid[i] = true;
+                    found[i] = None;
+                    continue;
+                }
+                found[i] = Some(clone_place(referent));
+            }
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc)
+                && let PlaceKind::Local(i) = call.dest.kind
+            {
+                let i = i as usize;
+                if i < n {
+                    invalid[i] = true;
+                    found[i] = None;
+                }
+            }
+        }
+        found
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, place)| {
+                if invalid[i] {
+                    None
+                } else {
+                    place.map(|p| (i, p))
+                }
+            })
+            .collect()
+    }
+
+    /// One forward-reachable scan of unique borrow definitions, then the
+    /// least fixpoint of [`Self::would_record_borrow`]: every local
+    /// starts unrecorded and is added while the rule holds. A reborrow
+    /// cycle stays unrecorded (main lowers the first member against an
+    /// empty `atomic_ref_place`).
+    fn install_recorded_alias_locals(&mut self) {
+        let unique = self.unique_borrow_places();
+        self.recorded_alias_locals.clear();
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for (local, place) in &unique {
+                if self.recorded_alias_locals.contains(local) {
+                    continue;
+                }
+                if self.would_record_borrow(*local, place) {
+                    self.recorded_alias_locals.insert(*local);
+                    progress = true;
+                }
+            }
+        }
+    }
+
+    /// Filters of the construction fixpoint after the unique-borrow
+    /// scan. Records when the place is not a raw-primitive reborrow of
+    /// an unrecorded pointer, and `cell_reborrow || !multi`
+    /// (`PtrRepr.rtype_getattr`). The inner-pointer test reads
+    /// [`Self::recorded_alias_locals`]. Emission uses the live
+    /// `atomic_ref_place` (`raw_primitive_reborrow_inner`).
+    fn would_record_borrow(&self, dest_local: usize, place: &Place) -> bool {
+        if let Some(inner) = self.raw_primitive_deref_inner(place) {
+            let inner_recorded = match inner.kind {
+                PlaceKind::Local(p) => self.recorded_alias_locals.contains(&(p as usize)),
+                _ => false,
+            };
+            if !inner_recorded {
+                return false;
+            }
+        }
+        let cell_reborrow = self
+            .reborrow_cell_param(place)
+            .or_else(|| self.deref_cell_param_local(place))
+            .is_some();
+        cell_reborrow || !self.multi_assigned_locals.contains(&dest_local)
+    }
+
     /// Prefill the new representations from the same forward-reachable
     /// body scan that built [`Self::deref_only_locals`]. A deref-only
-    /// local whose single definition is `&` / `&mut` of a scalar GC
-    /// field place records that place (`InteriorPtrRepr.__init__`); a
-    /// deref-only `Rvalue::Ref` of `*p` for a raw primitive pointer
-    /// enters [`Self::scalar_address_locals`] (`cast_ptr_to_adr`).
-    /// Block-lowering order does not install this metadata.
+    /// `Rvalue::Ref` of a scalar GC field place records that place
+    /// (`InteriorPtrRepr.__init__`); a deref-only `Rvalue::Ref` of `*p`
+    /// for a raw primitive pointer enters [`Self::scalar_address_locals`]
+    /// (`cast_ptr_to_adr`). Block-lowering order does not install this
+    /// metadata.
     fn install_deref_only_representations(&mut self) {
         let forward_blocks = forward_reachable_mask(self.llbc, self.body);
         for (bb_idx, bb) in self.body.body.iter().enumerate() {
@@ -3592,21 +3791,16 @@ impl<'a> Lowering<'a> {
                     continue;
                 };
                 let dest = *dest as usize;
-                if !self.deref_only_locals.contains(&dest) {
-                    continue;
-                }
-                let Rvalue::Ref {
-                    place: referent, ..
-                } = rvalue
-                else {
-                    continue;
-                };
-                if self.scalar_gc_field_interior_parts(referent).is_some() {
-                    self.atomic_ref_place.insert(dest, clone_place(referent));
-                } else if self.raw_primitive_deref_inner(referent).is_some()
-                    && !self.scalar_address_locals.contains(&dest)
-                {
-                    self.scalar_address_locals.push(dest);
+                match self.deref_only_representation(dest, rvalue) {
+                    Some(DerefOnlyRepresentation::FieldInterior(referent)) => {
+                        self.atomic_ref_place.insert(dest, referent);
+                    }
+                    Some(DerefOnlyRepresentation::ScalarAddress) => {
+                        if !self.scalar_address_locals.contains(&dest) {
+                            self.scalar_address_locals.push(dest);
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -3614,20 +3808,25 @@ impl<'a> Lowering<'a> {
 
     /// Whether `_i = &place` / `&raw place` records `place` on
     /// [`Self::atomic_ref_place`] during [`Self::lower_assign`].
-    /// Field-only interior for a deref-only dest is recorded at
-    /// construction (`is_field_interior_local`); a raw-primitive
-    /// reborrow is the address (`scalar_address_locals`). A
-    /// non-deref-only field borrow keeps main's filters so
-    /// `mem_slot` / `mem::replace` expand as `PtrRepr.rtype_getattr`.
-    /// An ordinary `&mut local` still records the slot under the same
-    /// dest filters as before deref-only (`_0`, mutably borrowed,
-    /// multiply assigned); a cell reborrow still records a multiply
-    /// assigned dest.
+    /// A dest that [`Self::deref_only_representation`] classifies is
+    /// recorded at construction. A RawPtr field borrow is not that
+    /// representation, so it keeps main's filters (`direct_fieldptr`).
+    /// A non-deref-only field borrow and an ordinary `&mut local` use
+    /// main's predicate: not a raw-primitive reborrow of a currently
+    /// unrecorded pointer (`raw_primitive_reborrow_inner` /
+    /// `atomic_ref_place`), and `cell_reborrow || !multi`
+    /// (`PtrRepr.rtype_getattr` / `rtype_setitem`). `_0` /
+    /// `mutably_borrowed_locals` applied only to the field-interior
+    /// owner, which deref-only now covers.
     pub(in crate::front::mir) fn records_atomic_ref_place(
         &self,
         dest_local: usize,
+        rvalue: &Rvalue,
         place: &Place,
     ) -> bool {
+        if self.deref_only_representation(dest_local, rvalue).is_some() {
+            return false;
+        }
         if self.raw_primitive_reborrow_inner(place).is_some() {
             return false;
         }
@@ -3635,17 +3834,7 @@ impl<'a> Lowering<'a> {
             .reborrow_cell_param(place)
             .or_else(|| self.deref_cell_param_local(place))
             .is_some();
-        if self.scalar_gc_field_interior_parts(place).is_some() {
-            if self.deref_only_locals.contains(&dest_local) {
-                return false;
-            }
-            return cell_reborrow || !self.multi_assigned_locals.contains(&dest_local);
-        }
-        if dest_local == 0 || self.mutably_borrowed_locals.contains(&dest_local) {
-            false
-        } else {
-            cell_reborrow || !self.multi_assigned_locals.contains(&dest_local)
-        }
+        cell_reborrow || !self.multi_assigned_locals.contains(&dest_local)
     }
 
     pub(in crate::front::mir) fn lower_assign(
@@ -3836,7 +4025,7 @@ impl<'a> Lowering<'a> {
                     // addresses are recorded at construction. Ordinary
                     // `&mut local` and a non-deref-only field borrow
                     // still record here (`PtrRepr.rtype_getattr`).
-                    if self.records_atomic_ref_place(local, &place) {
+                    if self.records_atomic_ref_place(local, &rvalue, &place) {
                         self.atomic_ref_place.insert(local, place);
                     }
                 }

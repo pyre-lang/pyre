@@ -3421,10 +3421,11 @@ impl<'a> Lowering<'a> {
                 // Produce the address only when construction classified
                 // the dest as that address (`scalar_address_locals`);
                 // otherwise load the pointee (`rewrite_op_raw_load`).
-                // A `RawPtr` dest is an address by type and does not
-                // use this gate.
-                if let Some(inner) = self.raw_primitive_reborrow_inner(&place)
-                    && dest_local.is_some_and(|local| self.scalar_address_locals.contains(&local))
+                // Construction refuses ScalarAddress when emission could
+                // see `p` recorded (`body_assigned_parameters`, multiply
+                // assigned, or `recorded_alias_locals`).
+                if dest_local.is_some_and(|local| self.scalar_address_locals.contains(&local))
+                    && let Some(inner) = self.raw_primitive_deref_inner(&place)
                 {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
