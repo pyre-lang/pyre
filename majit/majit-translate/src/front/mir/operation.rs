@@ -7974,7 +7974,7 @@ impl<'a> Lowering<'a> {
     /// getfield (`InteriorPtrRepr.rtype_getattr`). A `scalar_address_locals`
     /// reborrow yields RawLoad when `expected_ty` is a look-inside
     /// scalar-word `&T` (`input_param_value_type` /
-    /// `tyref_scalar_pointee_value_type`; `callparse` / `rewrite_op_raw_load`).
+    /// `function_local_primitive_cell_descr`; `callparse` / `rewrite_op_raw_load`).
     /// Deref / `mem_slot` / a Use-copy that records the path skip this
     /// and read the owner or address. `expected_ty` None keeps a
     /// scalar-address as the live address (residual `&T` ABI).
@@ -7991,7 +7991,13 @@ impl<'a> Lowering<'a> {
             if self.scalar_address_locals.contains(&local)
                 && expected_ty.is_some_and(|ty| {
                     raw_scalar_address_value_type(ty, self.llbc).is_none()
-                        && tyref_scalar_pointee_value_type(ty, self.llbc).is_some()
+                        && tyref_peel_one_ref_node(ty, self.llbc)
+                            .map(|node| TyRef::Other(node.clone().into()))
+                            .as_ref()
+                            .and_then(|pointee| {
+                                function_local_primitive_cell_descr(pointee, self.llbc)
+                            })
+                            .is_some()
                 })
                 && let Some(local_ty) = self.mir_local_ty(local)
             {

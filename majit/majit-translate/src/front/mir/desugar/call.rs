@@ -641,7 +641,7 @@ impl<'a> Lowering<'a> {
         // operands are consumed — `reflexive_into_alias` compares it
         // against the destination type. A Trait look-inside formal list
         // uses the same receiver to resolve the impl
-        // (`deref_callee_fun_decl`).
+        // (`deref_callee_fun_decl_and_generics`).
         let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
@@ -650,28 +650,23 @@ impl<'a> Lowering<'a> {
         // A residual `&T` keeps the address (`ResidualSlot`); a
         // look-inside `&T` is the scalar word (`input_param_value_type`).
         // A Trait call that names a concrete impl uses that impl's
-        // formals (`deref_callee_fun_decl` / `trait_impl_method`). A
-        // dynamic fn-pointer / dyn call has no FunDecl and stays residual.
+        // formals and the generics resolution returned
+        // (`deref_callee_fun_decl_and_generics` / `trait_impl_method`).
+        // A dynamic fn-pointer / dyn call has no FunDecl and stays residual.
         let call_look_inside_formals: Vec<TyRef> = match &call.func {
             CallFunc::Regular(reg) => {
-                let fd = match &reg.kind {
-                    CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id),
-                    CallKind::Trait(_) => {
-                        deref_callee_fun_decl(reg, first_arg_ty.as_ref(), self.llbc)
-                    }
-                    _ => None,
-                };
-                fd.and_then(|fd| {
-                    if fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
-                        None
-                    } else {
-                        Some(
-                            call_substituted_inputs(fd, &reg.generics, self.llbc)
-                                .unwrap_or_else(|| fd.signature.inputs.clone()),
-                        )
-                    }
-                })
-                .unwrap_or_default()
+                deref_callee_fun_decl_and_generics(reg, first_arg_ty.as_ref(), self.llbc)
+                    .and_then(|(fd, generics)| {
+                        if fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
+                            None
+                        } else {
+                            Some(
+                                call_substituted_inputs(fd, &generics, self.llbc)
+                                    .unwrap_or_else(|| fd.signature.inputs.clone()),
+                            )
+                        }
+                    })
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         };

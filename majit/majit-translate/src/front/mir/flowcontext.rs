@@ -474,6 +474,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     pub(in crate::front::mir) multi_assigned_locals: std::collections::HashSet<usize>,
+    /// Locals whose value the body can change through a mutable borrow of
+    /// the local itself (`&mut l` / `&raw mut l`).  Whole-body set from
+    /// [`compute_mutably_borrowed_locals`]; no `Assign` names the local
+    /// for such a write, so these locals have no single definition.
+    pub(in crate::front::mir) mutably_borrowed_locals: std::collections::HashSet<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -2376,6 +2381,9 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
+            mutably_borrowed_locals: compute_mutably_borrowed_locals(llbc, body)
+                .into_iter()
+                .collect(),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()
@@ -3547,12 +3555,21 @@ impl<'a> Lowering<'a> {
     /// restriction [`Self::const_discriminant_locals`] carries. Field-only
     /// `InteriorPtrRepr` binds the owner only when this is true, so the
     /// representation and its field path agree (`rptr.py`
-    /// `InteriorPtrRepr.__init__`).
+    /// `InteriorPtrRepr.__init__`). `_0` is the return local: the caller
+    /// cannot see this field path (`getrresult`). A dest
+    /// [`Self::mutably_borrowed_locals`] can overwrite has no single
+    /// definition either (`write_mem_slot`).
     pub(in crate::front::mir) fn records_atomic_ref_place(
         &self,
         dest_local: usize,
         place: &Place,
     ) -> bool {
+        if dest_local == 0 {
+            return false;
+        }
+        if self.mutably_borrowed_locals.contains(&dest_local) {
+            return false;
+        }
         let cell_reborrow = self
             .reborrow_cell_param(place)
             .or_else(|| self.deref_cell_param_local(place))

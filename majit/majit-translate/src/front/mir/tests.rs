@@ -44454,6 +44454,396 @@ fn nested_deref_of_field_borrow_alias_getfields() {
     assert_ne!(ret, obj, "**q must not return the GC owner; ops={ops:?}");
 }
 
+/// `q = &*p` of `p: *mut Wrap<i64>` passed to a look-inside helper whose
+/// `&Wrap<i64>` formal is the scalar word (`input_param_value_type` /
+/// `function_local_primitive_cell_descr`). The reborrow is the address;
+/// `callparse` converts at the boundary with the same wrapper peel the
+/// reborrow uses (`tyref_primitive_or_transparent_primitive_node`).
+#[test]
+fn look_inside_of_wrap_ptr_reborrow_receives_the_word() {
+    let i64_ty = interior_i64();
+    let wrap_ty = interior_adt(0);
+    let ptr_ty = interior_raw_mut(wrap_ty.clone());
+    let shared_wrap = shared_ref(&wrap_ty);
+    let caller = interior_caller(
+        "call_load",
+        1,
+        vec![ptr_ty.clone()],
+        wrap_ty.clone(),
+        vec![
+            interior_local(0, None, &wrap_ty),
+            interior_local(1, Some("p"), &ptr_ty),
+            interior_local(2, Some("q"), &shared_wrap),
+        ],
+        vec![
+            interior_bb(
+                vec![assign_shared_deref_reborrow(
+                    interior_place(2, &shared_wrap),
+                    interior_deref(1, &ptr_ty, &wrap_ty),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &shared_wrap))],
+                    interior_place(0, &wrap_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let mut helper = interior_caller(
+        "load_wrap",
+        1,
+        vec![shared_wrap.clone()],
+        wrap_ty.clone(),
+        vec![
+            interior_local(0, None, &wrap_ty),
+            interior_local(1, Some("x"), &shared_wrap),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &wrap_ty),
+                interior_use(interior_deref(1, &shared_wrap, &wrap_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    helper["def_id"] = serde_json::json!(1);
+    let wrap_decl = interior_struct(0, &["fixture", "Wrap"], &[("inner", i64_ty)], 8, &[0], true);
+    let llbc = llbc_with_types("fixture", vec![wrap_decl], vec![caller, helper]);
+    let graph = crate::test_support::lower_function(&llbc, "call_load")
+        .expect("lower look-inside load_wrap(&*p) of *mut Wrap<i64>");
+    let ops = graph_ops(&graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == p => op.result.clone(),
+        _ => None,
+    });
+    let loaded = loaded
+        .unwrap_or_else(|| panic!("look-inside `&Wrap<i64>` must RawLoad through p; ops={ops:?}"));
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("load_wrap") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("load_wrap call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("load_wrap arg0 {other:?}; ops={ops:?}"),
+    };
+    assert_eq!(
+        arg0, &loaded,
+        "look-inside `&Wrap<i64>` must receive the loaded word, not the address; ops={ops:?}"
+    );
+    assert_ne!(
+        arg0, p,
+        "look-inside `&Wrap<i64>` must not receive the raw address; ops={ops:?}"
+    );
+}
+
+/// Trait call of `q = &*p` resolved to a generic look-inside impl whose
+/// `&T` formal is instantiated as `&i64` (`trait_impl_method` generics /
+/// `callparse`). Formals use those resolved substitutions, not the
+/// call's empty `reg.generics`.
+#[test]
+fn look_inside_generic_trait_impl_of_raw_ptr_reborrow_receives_the_word() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty.clone());
+    let type_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let shared_t = shared_ref(&type_var);
+    let shared_i64 = shared_ref(&i64_ty);
+    let impl_generics = serde_json::json!({
+        "regions": [],
+        "types": [i64_ty.clone()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let trait_ref = serde_json::json!({
+        "kind": {"TraitImpl": {
+            "id": 0,
+            "generics": impl_generics
+        }}
+    });
+    let caller = interior_caller(
+        "call_load",
+        1,
+        vec![ptr_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("p"), &ptr_ty),
+            interior_local(2, Some("q"), &shared_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![assign_shared_deref_reborrow(
+                    interior_place(2, &shared_i64),
+                    interior_deref(1, &ptr_ty, &i64_ty),
+                )],
+                interior_trait_call(
+                    trait_ref,
+                    vec![interior_copy(interior_place(2, &shared_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let mut helper = interior_caller(
+        "load_word",
+        1,
+        vec![shared_t.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &shared_t),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &i64_ty),
+                interior_use(interior_deref(1, &shared_t, &type_var)),
+            )],
+            interior_return(),
+        )],
+    );
+    helper["def_id"] = serde_json::json!(1);
+    let llbc = llbc_with_types_impls(
+        "fixture",
+        vec![],
+        vec![caller, helper],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 1}}],
+            "impl_trait": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            },
+            "implied_trait_refs": []
+        })],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "call_load")
+        .expect("lower look-inside generic trait impl load_word(&*p)");
+    let ops = graph_ops(&graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == p => op.result.clone(),
+        _ => None,
+    });
+    let loaded = loaded
+        .unwrap_or_else(|| panic!("generic trait impl arg must RawLoad through p; ops={ops:?}"));
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call { args, .. } => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args =
+        call_args.unwrap_or_else(|| panic!("generic trait impl call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("generic trait impl arg0 {other:?}; ops={ops:?}"),
+    };
+    assert_eq!(
+        arg0, &loaded,
+        "look-inside generic trait `&T` as `&i64` must receive the loaded word; ops={ops:?}"
+    );
+    assert_ne!(
+        arg0, p,
+        "look-inside generic trait `&T` as `&i64` must not receive the raw address; ops={ops:?}"
+    );
+}
+
+/// `p = &a.field; old = mem::replace(&mut p, &b.field); return *p`.
+/// `&mut p` mutates `p` through a mem-slot write, so the owner
+/// representation is not recorded (`records_atomic_ref_place` /
+/// `compute_mutably_borrowed_locals`). Binding reads the field value;
+/// `*p` is `b.field`, not a FieldRead whose base is that scalar.
+#[test]
+fn replace_of_mutably_borrowed_field_borrow_temp_reads_the_new_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let shared_i64 = shared_ref(&i64_ty);
+    let mut_p_ty = mut_ref(&shared_i64);
+    let field_a = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let field_b = interior_field(2, &mut_obj, &obj_ty, &i64_ty, 0);
+    let caller = interior_caller(
+        "replace_then_deref",
+        2,
+        vec![mut_obj.clone(), mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("a"), &mut_obj),
+            interior_local(2, Some("b"), &mut_obj),
+            interior_local(3, Some("p"), &shared_i64),
+            interior_local(4, Some("mut_p"), &mut_p_ty),
+            interior_local(5, Some("new_ref"), &shared_i64),
+            interior_local(6, Some("old"), &shared_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    assign_shared_field_borrow(interior_place(3, &shared_i64), field_a),
+                    interior_assign(
+                        interior_place(4, &mut_p_ty),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": interior_place(3, &shared_i64),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                    assign_shared_field_borrow(interior_place(5, &shared_i64), field_b),
+                ],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(4, &mut_p_ty)),
+                        interior_copy(interior_place(5, &shared_i64)),
+                    ],
+                    interior_place(6, &shared_i64),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &i64_ty),
+                    interior_use(interior_deref(3, &shared_i64, &i64_ty)),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let replace = interior_opaque(
+        1,
+        &["core", "mem", "replace"],
+        vec![mut_p_ty, shared_i64],
+        shared_ref(&i64_ty),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![gc_obj_i64_field_decl()],
+        vec![caller, replace],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "replace_then_deref")
+        .expect("lower p = &a.field; replace(&mut p, &b.field); *p");
+    let ops = graph_ops(&graph);
+    let inputs = &graph.block(graph.startblock).inputargs;
+    let a = inputs.first().expect("a is the first inputarg");
+    let b = inputs.get(1).expect("b is the second inputarg");
+    let reads_from_b: Vec<&Variable> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { base, field, .. } if field.name == "field" && base == b => {
+                op.result.as_ref()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !reads_from_b.is_empty(),
+        "replace must getfield b.field; ops={ops:?}"
+    );
+    let ret = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.exits)
+        .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        .flatten()
+        .and_then(LinkArg::as_variable)
+        .expect("a block returns *p");
+    assert!(
+        reads_from_b.iter().any(|r| *r == ret),
+        "*p after replace must be b.field's value; ops={ops:?}"
+    );
+    assert_ne!(ret, a, "*p must not return owner a; ops={ops:?}");
+    assert_ne!(ret, b, "*p must not return owner b; ops={ops:?}");
+    assert!(
+        ops.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { base, .. } => ops.iter().all(|other| {
+                !matches!(&other.kind, OpKind::FieldRead { .. })
+                    || other.result.as_ref() != Some(base)
+            }),
+            _ => true,
+        }),
+        "*p must not FieldRead a scalar FieldRead base; ops={ops:?}"
+    );
+}
+
+/// `fn f(o: &O) -> &i64 { &o.field }`. `_0` is the return local; the
+/// caller cannot see the callee's field path (`getrresult`). The owner
+/// representation is not recorded (`records_atomic_ref_place`), so the
+/// return is the field value.
+#[test]
+fn returned_field_borrow_is_the_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let shared_obj = shared_ref(&obj_ty);
+    let shared_i64 = shared_ref(&i64_ty);
+    let field_place = interior_field(1, &shared_obj, &obj_ty, &i64_ty, 0);
+    let caller = interior_caller(
+        "return_field",
+        1,
+        vec![shared_obj.clone()],
+        shared_i64.clone(),
+        vec![
+            interior_local(0, None, &shared_i64),
+            interior_local(1, Some("o"), &shared_obj),
+        ],
+        vec![interior_bb(
+            vec![assign_shared_field_borrow(
+                interior_place(0, &shared_i64),
+                field_place,
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![gc_obj_i64_field_decl()], vec![caller]);
+    let graph = crate::test_support::lower_function(&llbc, "return_field")
+        .expect("lower fn f(o: &O) -> &i64 { &o.field }");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert_eq!(
+        reads.len(),
+        1,
+        "return of &o.field must getfield the owner; ops={ops:?}"
+    );
+    let o = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("o is the first inputarg");
+    let ret = returned_word(&graph).expect("startblock returns &o.field");
+    assert_eq!(
+        ret, reads[0],
+        "return must be the FieldRead, not the GC owner; ops={ops:?}"
+    );
+    assert_ne!(ret, o, "return must not be the GC owner; ops={ops:?}");
+}
+
 /// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through
 /// `Option<&mut Handle>` of a one-word GC handle. The Some payload and
 /// the TwoPhaseMut reborrow inherit the MutRef cell, so `*p = fresh` is

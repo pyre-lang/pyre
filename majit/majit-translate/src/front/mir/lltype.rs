@@ -7751,6 +7751,36 @@ pub(in crate::front::mir) fn node_is_string_value(node: &serde_json::Value, llbc
         .is_some_and(|td| is_rstr_str_layout_declaration(td.item_meta.name_path_str()))
 }
 
+/// FunDecl a `deref` / `deref_mut` call names, plus the generics that
+/// instantiate its signature (`callparse` / `FunctionDesc.cachedgraph`).
+///
+/// A Fun Regular call is that callee and `reg.generics`. A Trait call is
+/// the unique impl `description.py` `ClassDesc.lookup` selects:
+/// `trait_impl_method` when the payload already names a TraitImpl (those
+/// generics), else [`trait_impl_match_for_receiver`] when the receiver
+/// ADT is known. Bodyless impls still have a FunDecl (`Box::deref`); the
+/// caller decides identity vs `cast_pointer`.
+pub(in crate::front::mir) fn deref_callee_fun_decl_and_generics<'a>(
+    reg: &RegularCall,
+    first_arg_ty: Option<&TyRef>,
+    llbc: &'a Llbc,
+) -> Option<(&'a FunDecl, serde_json::Value)> {
+    match &reg.kind {
+        CallKind::Fun(FunId::Regular { id }) => {
+            Some((llbc.fn_by_id(*id)?, reg.generics.as_ref().clone()))
+        }
+        CallKind::Trait(payload) => {
+            let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, llbc)
+                .or_else(|| {
+                    trait_impl_match_for_receiver(first_arg_ty?, payload, llbc)
+                        .map(|(_, id, g)| (id, g))
+                })?;
+            Some((llbc.fn_by_id(fn_id)?, generics))
+        }
+        _ => None,
+    }
+}
+
 /// FunDecl a `deref` / `deref_mut` call names.
 ///
 /// A Fun Regular call is that callee. A Trait call is the unique impl
@@ -7764,16 +7794,7 @@ pub(in crate::front::mir) fn deref_callee_fun_decl<'a>(
     first_arg_ty: Option<&TyRef>,
     llbc: &'a Llbc,
 ) -> Option<&'a FunDecl> {
-    let fn_id = match &reg.kind {
-        CallKind::Fun(FunId::Regular { id }) => *id,
-        CallKind::Trait(payload) => crate::front::clause_spec::trait_impl_method(payload, llbc)
-            .map(|(id, _)| id)
-            .or_else(|| {
-                trait_impl_match_for_receiver(first_arg_ty?, payload, llbc).map(|(_, id, _)| id)
-            })?,
-        _ => return None,
-    };
-    llbc.fn_by_id(fn_id)
+    deref_callee_fun_decl_and_generics(reg, first_arg_ty, llbc).map(|(fd, _)| fd)
 }
 
 /// Declared `name_path` of the trait this FunDecl's impl implements,
