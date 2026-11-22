@@ -10029,7 +10029,7 @@ fn tuple_hash_merge_point_jit(
     let matched_cell = resolved.cell.clone();
     let cell_key = resolved.cell_key().unwrap_or(hash);
     // No confirm_enter_jit on `hash_driver` (`pypyjit_confirm_reds`).
-    let (hot, compiled_key) = driver
+    let (hot, compiled_key, procedure_token) = driver
         .meta_interp_mut()
         .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &[]);
     let w_type = pin.get() as pyre_object::PyObjectRef;
@@ -10045,10 +10045,8 @@ fn tuple_hash_merge_point_jit(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[tuple.hash] {}", get_printable_location_tuple_hash(w_type));
             }
-            let token = matched_cell
-                .as_ref()
-                .and_then(|cell| cell.get_procedure_token())
-                .expect("RunCompiled names the matched cell's token");
+            // `EnterJitAssembler(procedure_token)`: the token the decision read.
+            let token = procedure_token.expect("RunCompiled carries the decision's token");
             let raw = pyre_jit_trace::tuplehash_state::tuple_hash_raw_reds(
                 len as i64, acc as i64, i as i64, w_tuple,
             );
@@ -14273,7 +14271,7 @@ fn maybe_compile_and_run(
     let step =
         driver.maybe_compile_and_run_step(resolved, pycode_root.save(), loop_header_pc, &reds);
     match step {
-        (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
+        (majit_metainterp::warmstate::HotResult::StartTracing, _, _) => {
             if !backedge_frame_may_trace(frame_root.frame(), loop_header_pc, pycode_root.get()) {
                 return None;
             }
@@ -14292,7 +14290,7 @@ fn maybe_compile_and_run(
                 matched,
             )
         }
-        (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
+        (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key, _) => {
             if !backedge_vsd_matches(frame_root.frame(), loop_header_pc, pycode_root.get()) {
                 return None;
             }
@@ -14305,8 +14303,8 @@ fn maybe_compile_and_run(
                 env,
             )
         }
-        (majit_metainterp::warmstate::HotResult::NotHot, _) => None,
-        (majit_metainterp::warmstate::HotResult::AlreadyTracing, _) => None,
+        (majit_metainterp::warmstate::HotResult::NotHot, _, _) => None,
+        (majit_metainterp::warmstate::HotResult::AlreadyTracing, _, _) => None,
     }
 }
 
@@ -15807,14 +15805,22 @@ fn bound_reached(
         frame.get_is_being_profiled(),
         pycode_root.get() as u64,
     );
-    if !driver.meta_interp_mut().bound_reached_prelude(
-        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
-        &greenargs,
-        &majit_ir::PYPYJIT_GREEN_TYPES,
-        &reds,
-    ) {
-        return None;
-    }
+    // `confirm_enter_jit` can collect: root the frame across the prelude and
+    // hand `compile_and_run_once` the reloaded address
+    // (`gctransform/shadowstack.py`). The root is popped before the call.
+    let frame: *mut PyFrame = {
+        let mut prelude_root = FrameRoot::new(frame);
+        if !driver.meta_interp_mut().bound_reached_prelude(
+            pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+            &greenargs,
+            &majit_ir::PYPYJIT_GREEN_TYPES,
+            &reds,
+        ) {
+            return None;
+        }
+        prelude_root.frame() as *mut PyFrame
+    };
+    let frame = unsafe { &mut *frame };
     compile_and_run_once(
         frame,
         green_key,

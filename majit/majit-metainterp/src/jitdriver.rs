@@ -10591,7 +10591,11 @@ impl<S: JitState> JitDriver<S> {
         code_slot: usize,
         pc: usize,
         reds: &[Value],
-    ) -> (crate::warmstate::HotResult, u64) {
+    ) -> (
+        crate::warmstate::HotResult,
+        u64,
+        Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    ) {
         self.meta.maybe_compile_and_run_step_on_driver(
             self.index().unwrap_or(0),
             resolved,

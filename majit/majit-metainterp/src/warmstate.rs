@@ -2318,14 +2318,15 @@ impl WarmEnterState {
     /// Same body as [`Self::function_entry_step`]; only the increment
     /// differs. A miss ticks `hash`. A hit reads
     /// `cell.get_procedure_token()` once. `RunCompiled` returns the matched
-    /// cell's key.
+    /// cell's key and that token, which `EnterJitAssembler(procedure_token)`
+    /// carries to execution.
     pub fn back_edge_step(
         &mut self,
         resolved: ResolvedJitCell,
         pin_live: Option<(&GreenRefPin, &mut GreenKey)>,
         reds: &[Value],
-    ) -> (HotResult, u64) {
-        let (result, _) =
+    ) -> (HotResult, u64, Option<Arc<JitCellToken>>) {
+        let (result, procedure_token) =
             self.maybe_compile_and_run_step(&resolved, pin_live, reds, WarmEntryDoor::BackEdge);
         let key = match result {
             HotResult::RunCompiled => resolved
@@ -2333,7 +2334,7 @@ impl WarmEnterState {
                 .expect("RunCompiled names the matched cell"),
             _ => resolved.cell_key().unwrap_or(resolved.hash),
         };
-        (result, key)
+        (result, key, procedure_token)
     }
 
     /// `warmstate.py maybe_compile_and_run(increment_threshold, *args)`.
@@ -5998,12 +5999,12 @@ mod tests {
             );
             let first = ws.back_edge_step(resolved.clone(), None, &[]);
             assert!(
-                matches!(first, (HotResult::NotHot, _)),
+                matches!(first, (HotResult::NotHot, _, _)),
                 "a miss ticks rather than taking the foreign cell"
             );
             let second = ws.back_edge_step(resolved, None, &[]);
             assert!(
-                matches!(second, (HotResult::StartTracing, _)),
+                matches!(second, (HotResult::StartTracing, _, _)),
                 "the second miss fires the back-edge counter"
             );
         }
@@ -7469,6 +7470,22 @@ mod tests {
             CALLS.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "confirm_enter_jit ran once before RunCompiled"
+        );
+    }
+
+    /// `EnterJitAssembler(procedure_token)`: the back-edge step returns the
+    /// token the decision read, so execution does not read the cell again.
+    #[test]
+    fn back_edge_step_returns_the_token_the_decision_read() {
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![0xF2, 0xA2]);
+        let token = attach_alive_for_key(&mut ws, &key, JitCellToken::new(2));
+        let resolved = ws.resolve_jit_cell(key.get_uhash(), &key.values, &key.types);
+        let (result, _, procedure_token) = ws.back_edge_step(resolved, None, &[]);
+        assert!(matches!(result, HotResult::RunCompiled));
+        assert!(
+            procedure_token.is_some_and(|t| Arc::ptr_eq(&t, &token)),
+            "RunCompiled carries the matched cell's token"
         );
     }
 

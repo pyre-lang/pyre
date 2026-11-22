@@ -13794,7 +13794,7 @@ mod tests {
         {
             let meta = pair.0.meta_interp_mut();
             meta.abort_trace_live(false);
-            let (step, _) = {
+            let (step, _, _) = {
                 let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
                 let resolved =
                     meta.resolve_jit_cell_on_driver(0, portal_hash, &portal.values, &portal.types);
@@ -13928,7 +13928,7 @@ mod tests {
             // pyjitpl.py `blackhole_if_trace_too_long` raises SwitchToBlackhole;
             // the live TraceCtx is gone before the next maybe_compile_and_run.
             meta.abort_trace_live(false);
-            let (step, _) = {
+            let (step, _, _) = {
                 let _zbh_pin = majit_metainterp::GreenRefPin::pin_one((0xC0DE) as usize);
                 let resolved =
                     meta.resolve_jit_cell_on_driver(0, portal_hash, &portal.values, &portal.types);
