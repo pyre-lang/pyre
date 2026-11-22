@@ -11,9 +11,10 @@ use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer,
-    CastWhateverError, GCREF, GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget,
-    WEAKREF_PTR, cast_int_to_ptr, cast_opaque_ptr, cast_pointer, container_value_as_ptr,
-    direct_arrayitems, direct_fieldptr, direct_ptradd, normalizeptr, nullptr, parentlink,
+    CastWhateverError, FixedSizeArray, GCREF, GcKind, LowLevelType, LowLevelValue, MallocFlavor,
+    NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr, cast_opaque_ptr,
+    cast_pointer, container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd,
+    malloc, normalizeptr, nullptr, parentlink,
 };
 
 /// RPython `class fakeaddress(object)` (llmemory.py).
@@ -179,8 +180,21 @@ pub fn ann_raw_malloc_usage() -> Result<(), TyperError> {
     Err(deferred("ann_raw_malloc_usage"))
 }
 
-pub fn raw_memclear() -> Result<(), TyperError> {
-    Err(deferred("raw_memclear"))
+/// `llmemory.raw_memclear(adr, size)` (llmemory.py).
+///
+/// ```python
+/// def raw_memclear(adr, size):
+///     if not isinstance(size, AddressOffset):
+///         raise NotImplementedError(size)
+///     assert lltype.typeOf(adr) == Address
+///     zeroadr = size._raw_malloc([], zero=True)
+///     size.raw_memcopy(zeroadr, adr)
+/// ```
+///
+/// `size` is already an [`AddressOffset`]; `adr` is already an Address.
+pub fn raw_memclear(adr: &_address, size: &AddressOffset) -> Result<(), String> {
+    let zeroadr = size._raw_malloc(&[], true)?;
+    size.raw_memcopy(&zeroadr, adr)
 }
 
 pub fn ann_raw_memclear() -> Result<(), TyperError> {
@@ -203,13 +217,7 @@ pub fn raw_memmove_no_free() -> Result<(), TyperError> {
     Err(deferred("raw_memmove_no_free"))
 }
 
-fn _reccopy_lazy() -> Result<(), TyperError> {
-    Err(deferred("_reccopy_lazy"))
-}
-
-fn _reccopy() -> Result<(), TyperError> {
-    Err(deferred("_reccopy"))
-}
+// `_reccopy_lazy` / `_reccopy` (llmemory.py) sit with `AddressOffset.raw_memcopy`.
 
 /// `class SomeAddress(SomeObject)` (llmemory.py).
 /// Annotation for low-level Address values. `immutable = True`.
@@ -312,11 +320,10 @@ impl SomeObjectTrait for SomeTypedAddressAccess {
 }
 
 /// `class Symbolic` (llmemory.py) → `class AddressOffset(Symbolic)`
-/// (llmemory.py) and its subclasses. The runtime `ref` / `_raw_malloc`
-/// / `raw_memcopy` methods operate on the `fakeaddress` simulator, which
-/// pyre does not model; what flows through the annotator and rtyper is
-/// the rtyping-level structure — variant identity, `known_nonneg`,
-/// symbolic arithmetic, and `lltype() == Signed`.
+/// (llmemory.py) and its subclasses. `ref`, `_raw_malloc`, and
+/// `raw_memcopy` run on `_address::Fake`. Annotator/rtyper still see
+/// variant identity, `known_nonneg`, symbolic arithmetic, and
+/// `lltype() == Signed`.
 ///
 /// `GCHeaderOffset` / `GCHeaderAntiOffset` (llmemory.py) are
 /// omitted (blocker: GC transform not run). They carry a `gcheaderbuilder`
@@ -554,6 +561,58 @@ impl AddressOffset {
             AddressOffset::ArrayLengthOffset(offset) => array_length_offset_ref(&offset.0, ptr),
         }
     }
+
+    /// `AddressOffset._raw_malloc(self, rest, zero)` (llmemory.py).
+    pub fn _raw_malloc(&self, rest: &[AddressOffset], zero: bool) -> Result<_address, String> {
+        self._raw_malloc_ex(rest, None, zero)
+    }
+
+    /// `FieldOffset` / `ArrayItemsOffset` `_raw_malloc(..., parenttype=)`.
+    fn _raw_malloc_ex(
+        &self,
+        rest: &[AddressOffset],
+        parenttype: Option<&LowLevelType>,
+        zero: bool,
+    ) -> Result<_address, String> {
+        match self {
+            AddressOffset::ItemOffset(offset) => item_offset_raw_malloc(offset, rest, zero),
+            AddressOffset::FieldOffset(offset) => {
+                field_offset_raw_malloc(offset, rest, parenttype, zero)
+            }
+            AddressOffset::CompositeOffset(offset) => {
+                composite_offset_raw_malloc(offset, rest, zero)
+            }
+            AddressOffset::ArrayItemsOffset(offset) => {
+                array_items_offset_raw_malloc(offset, rest, parenttype, zero)
+            }
+            AddressOffset::ArrayLengthOffset(_) => not_implemented_raw_malloc(self, rest),
+        }
+    }
+
+    /// `AddressOffset.raw_memcopy(self, srcadr, dstadr)` (llmemory.py).
+    pub fn raw_memcopy(&self, srcadr: &_address, dstadr: &_address) -> Result<(), String> {
+        match self {
+            AddressOffset::ItemOffset(offset) => item_offset_raw_memcopy(offset, srcadr, dstadr),
+            AddressOffset::FieldOffset(offset) => field_offset_raw_memcopy(offset, srcadr, dstadr),
+            AddressOffset::CompositeOffset(offset) => {
+                composite_offset_raw_memcopy(offset, srcadr, dstadr)
+            }
+            AddressOffset::ArrayItemsOffset(_) => array_items_offset_raw_memcopy(srcadr, dstadr),
+            AddressOffset::ArrayLengthOffset(_) => not_implemented_raw_memcopy(self),
+        }
+    }
+}
+
+/// `fakeaddress.__add__` (llmemory.py): `AddressOffset` →
+/// `fakeaddress(offset.ref(self.ptr))`; NULL raises `NullAddressError`.
+pub fn fakeaddress_add(addr: &_address, offset: &AddressOffset) -> Result<_address, String> {
+    if !addr.nonzero() {
+        return Err("NullAddressError: offset from NULL address".to_string());
+    }
+    let _address::Fake(ptr) = addr else {
+        return Err("fakeaddress.__add__: address has no ptr".to_string());
+    };
+    Ok(_address::Fake(Box::new(offset.r#ref(ptr)?)))
 }
 
 /// `ItemOffset.ref(firstitemptr)` (llmemory.py), array-of-containers
@@ -634,6 +693,474 @@ fn item_offset_ref(ty: &LowLevelType, repeat: i64, firstitemptr: &_ptr) -> Resul
         .ok_or_else(|| format!("ItemOffset::ref item {index} out of range"))?;
     container_value_as_ptr(&item, true)
         .ok_or_else(|| "ItemOffset::ref: item is not a container".into())
+}
+
+/// `AddressOffset._raw_malloc` (llmemory.py):
+/// `raise NotImplementedError("_raw_malloc(%r, %r)" % (self, rest))`.
+fn not_implemented_raw_malloc(
+    offset: &AddressOffset,
+    rest: &[AddressOffset],
+) -> Result<_address, String> {
+    Err(format!(
+        "NotImplementedError: _raw_malloc({offset:?}, {rest:?})"
+    ))
+}
+
+/// `AddressOffset.raw_memcopy` (llmemory.py):
+/// `raise NotImplementedError("raw_memcopy(%r)" % (self,))`.
+fn not_implemented_raw_memcopy(offset: &AddressOffset) -> Result<(), String> {
+    Err(format!("NotImplementedError: raw_memcopy({offset:?})"))
+}
+
+fn address_ptr(adr: &_address) -> Result<&_ptr, String> {
+    match adr {
+        _address::Fake(ptr) => Ok(ptr),
+        _address::Null => Err("NullAddressError: address has no ptr".into()),
+        _address::IntCast(_) => Err("fakeaddress has no ptr".into()),
+    }
+}
+
+/// `ItemOffset._raw_malloc(self, rest, zero)` (llmemory.py).
+fn item_offset_raw_malloc(
+    offset: &ItemOffset,
+    rest: &[AddressOffset],
+    zero: bool,
+) -> Result<_address, String> {
+    if !rest.is_empty() {
+        return Err(format!(
+            "ItemOffset._raw_malloc: assert not rest, got {rest:?}"
+        ));
+    }
+    if offset.TYPE.is_container_type() && offset.TYPE._gckind() == GcKind::Gc {
+        if offset.repeat != 1 {
+            return Err(format!(
+                "ItemOffset._raw_malloc: assert repeat == 1, got {}",
+                offset.repeat
+            ));
+        }
+        // `lltype.malloc(self.TYPE, flavor='raw', zero=zero, track_allocation=False)`.
+        // pyre's `malloc` always `_defl()`s (`zero=True`).
+        let _ = zero;
+        let p = malloc(offset.TYPE.clone(), None, MallocFlavor::Raw, false)?;
+        return Ok(cast_ptr_to_adr(&p));
+    }
+    let length = usize::try_from(offset.repeat)
+        .map_err(|_| format!("ItemOffset._raw_malloc: negative repeat {}", offset.repeat))?;
+    // `T = lltype.FixedSizeArray(self.TYPE, self.repeat)` then
+    // `lltype.malloc(T, flavor='raw', zero=zero, track_allocation=False)`.
+    // `FixedSizeArray` is a `Struct` (lltype.py) so upstream malloc takes it;
+    // pyre's `malloc` enum arm does not. `_container_example` is
+    // `initialization='example'` (`zero=True`).
+    let _ = zero;
+    let T =
+        LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(offset.TYPE.clone(), length)));
+    let o = match &T {
+        LowLevelType::FixedSizeArray(fa) => _ptr_obj::Array(fa._container_example()),
+        _ => unreachable!("T is FixedSizeArray"),
+    };
+    let p = _ptr::new_with_solid(Ptr::from_container_type(T.clone())?, Ok(Some(o)), true);
+    let array_adr = cast_ptr_to_adr(&p);
+    fakeaddress_add(
+        &array_adr,
+        &AddressOffset::ArrayItemsOffset(ArrayItemsOffset(T)),
+    )
+}
+
+/// `ItemOffset.raw_memcopy(self, srcadr, dstadr)` (llmemory.py).
+fn item_offset_raw_memcopy(
+    offset: &ItemOffset,
+    srcadr: &_address,
+    dstadr: &_address,
+) -> Result<(), String> {
+    let mut repeat = offset.repeat;
+    if repeat == 0 {
+        return Ok(());
+    }
+    if offset.TYPE == *GCREF {
+        return item_offset_raw_memcopy_gcrefs(offset, srcadr, dstadr);
+    }
+    let PTR = if offset.TYPE.is_container_type() {
+        Ptr::from_container_type(offset.TYPE.clone())?
+    } else {
+        Ptr::from_container_type(LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(
+            offset.TYPE.clone(),
+            1,
+        ))))?
+    };
+    let step = AddressOffset::ItemOffset(ItemOffset {
+        TYPE: offset.TYPE.clone(),
+        repeat: 1,
+    });
+    let mut srcadr = srcadr.clone();
+    let mut dstadr = dstadr.clone();
+    let mut steps = Vec::new();
+    loop {
+        let src = cast_adr_to_ptr(&srcadr, &PTR)?;
+        let dst = cast_adr_to_ptr(&dstadr, &PTR)?;
+        _reccopy_lazy(&src, &dst, &mut steps)?;
+        repeat -= 1;
+        if repeat <= 0 {
+            break;
+        }
+        srcadr = fakeaddress_add(&srcadr, &step)?;
+        dstadr = fakeaddress_add(&dstadr, &step)?;
+    }
+    for step in steps {
+        step.run()?;
+    }
+    Ok(())
+}
+
+/// `ItemOffset._raw_memcopy_gcrefs` (llmemory.py). `srcadr.address[0]`
+/// is `_address_fakeaccessor.read_from_ptr` / `write_into_ptr`.
+fn item_offset_raw_memcopy_gcrefs(
+    offset: &ItemOffset,
+    srcadr: &_address,
+    dstadr: &_address,
+) -> Result<(), String> {
+    let step = AddressOffset::ItemOffset(ItemOffset {
+        TYPE: offset.TYPE.clone(),
+        repeat: 1,
+    });
+    let mut srcadr = srcadr.clone();
+    let mut data_list = Vec::new();
+    let mut repeat = offset.repeat;
+    loop {
+        data_list.push(read_address_at_zero(&srcadr)?);
+        repeat -= 1;
+        if repeat <= 0 {
+            break;
+        }
+        srcadr = fakeaddress_add(&srcadr, &step)?;
+    }
+    let mut dstadr = dstadr.clone();
+    for (i, data) in data_list.iter().enumerate() {
+        if i > 0 {
+            dstadr = fakeaddress_add(&dstadr, &step)?;
+        }
+        write_address_at_zero(&dstadr, data)?;
+    }
+    Ok(())
+}
+
+/// `_address_fakeaccessor.read_from_ptr` (llmemory.py) at index 0.
+fn read_address_at_zero(adr: &_address) -> Result<_address, String> {
+    match address_ptr(adr)?.getitem(0)? {
+        LowLevelValue::Ptr(p) => Ok(cast_ptr_to_adr(&p)),
+        LowLevelValue::Address(a) => Ok(a),
+        other => Err(format!("TypeError({other:?})")),
+    }
+}
+
+/// `_address_fakeaccessor.write_into_ptr` (llmemory.py) at index 0.
+fn write_address_at_zero(adr: &_address, value: &_address) -> Result<(), String> {
+    let mut ptr = address_ptr(adr)?.clone();
+    let of = array_of_type(&LowLevelType::from(ptr._TYPE.TO.clone()))?;
+    let stored = if of == LowLevelType::Address {
+        LowLevelValue::Address(value.clone())
+    } else if let LowLevelType::Ptr(expected) = of {
+        LowLevelValue::Ptr(Box::new(cast_adr_to_ptr(value, &expected)?))
+    } else {
+        return Err(format!("TypeError({of:?})"));
+    };
+    ptr.setitem(0, stored)
+}
+
+/// `FieldOffset._raw_malloc` (llmemory.py).
+fn field_offset_raw_malloc(
+    offset: &FieldOffset,
+    rest: &[AddressOffset],
+    parenttype: Option<&LowLevelType>,
+    zero: bool,
+) -> Result<_address, String> {
+    if !field_offset_is_arrayfld(offset) {
+        return not_implemented_raw_malloc(&AddressOffset::FieldOffset(offset.clone()), rest);
+    }
+    if rest.is_empty() {
+        return Err("FieldOffset._raw_malloc: assert rest".into());
+    }
+    let parent = parenttype.unwrap_or(&offset.TYPE);
+    rest[0]._raw_malloc_ex(&rest[1..], Some(parent), zero)
+}
+
+/// `FieldOffset.raw_memcopy` (llmemory.py).
+fn field_offset_raw_memcopy(
+    offset: &FieldOffset,
+    srcadr: &_address,
+    dstadr: &_address,
+) -> Result<(), String> {
+    if !field_offset_is_arrayfld(offset) {
+        return not_implemented_raw_memcopy(&AddressOffset::FieldOffset(offset.clone()));
+    }
+    let PTR = Ptr::from_container_type(offset.TYPE.clone())?;
+    let src = cast_adr_to_ptr(srcadr, &PTR)?;
+    let dst = cast_adr_to_ptr(dstadr, &PTR)?;
+    _reccopy(&src, &dst)
+}
+
+fn field_offset_is_arrayfld(offset: &FieldOffset) -> bool {
+    match &offset.TYPE {
+        LowLevelType::Struct(st) => st._arrayfld.as_deref() == Some(offset.fldname.as_str()),
+        _ => false,
+    }
+}
+
+/// `CompositeOffset._raw_malloc` (llmemory.py).
+fn composite_offset_raw_malloc(
+    offset: &CompositeOffset,
+    rest: &[AddressOffset],
+    zero: bool,
+) -> Result<_address, String> {
+    let mut combined: Vec<AddressOffset> = offset.offsets[1..].to_vec();
+    combined.extend_from_slice(rest);
+    offset.offsets[0]._raw_malloc(&combined, zero)
+}
+
+/// `CompositeOffset.raw_memcopy` (llmemory.py): copy each prefix offset,
+/// walk `srcadr`/`dstadr` by it, then copy the last offset.
+fn composite_offset_raw_memcopy(
+    offset: &CompositeOffset,
+    srcadr: &_address,
+    dstadr: &_address,
+) -> Result<(), String> {
+    let mut srcadr = srcadr.clone();
+    let mut dstadr = dstadr.clone();
+    let last = offset.offsets.len() - 1;
+    for o in &offset.offsets[..last] {
+        o.raw_memcopy(&srcadr, &dstadr)?;
+        srcadr = fakeaddress_add(&srcadr, o)?;
+        dstadr = fakeaddress_add(&dstadr, o)?;
+    }
+    offset.offsets[last].raw_memcopy(&srcadr, &dstadr)
+}
+
+/// `ArrayItemsOffset._raw_malloc` (llmemory.py).
+fn array_items_offset_raw_malloc(
+    offset: &ArrayItemsOffset,
+    rest: &[AddressOffset],
+    parenttype: Option<&LowLevelType>,
+    zero: bool,
+) -> Result<_address, String> {
+    let count = if rest.is_empty() {
+        0
+    } else {
+        if rest.len() != 1 {
+            return Err(format!(
+                "ArrayItemsOffset._raw_malloc: assert len(rest)==1, got {rest:?}"
+            ));
+        }
+        let AddressOffset::ItemOffset(item) = &rest[0] else {
+            return Err(format!(
+                "ArrayItemsOffset._raw_malloc: assert isinstance(rest[0], ItemOffset), got {:?}",
+                rest[0]
+            ));
+        };
+        let of = array_of_type(&offset.0)?;
+        if of != item.TYPE {
+            return Err(format!(
+                "ArrayItemsOffset._raw_malloc: assert TYPE.OF == rest[0].TYPE ({of:?} vs {:?})",
+                item.TYPE
+            ));
+        }
+        item.repeat
+    };
+    let count = usize::try_from(count)
+        .map_err(|_| format!("ArrayItemsOffset._raw_malloc: negative count {count}"))?;
+    let T = parenttype.cloned().unwrap_or_else(|| offset.0.clone());
+    let immortal = offset.0._gckind() == GcKind::Raw;
+    let n = match &T {
+        LowLevelType::Array(_) => Some(count),
+        LowLevelType::Struct(st) if st._arrayfld.is_some() => Some(count),
+        _ => None,
+    };
+    // `lltype.malloc(..., zero=zero, track_allocation=False)`. pyre's
+    // `malloc` always `_defl()`s.
+    let _ = zero;
+    let p = malloc(T, n, MallocFlavor::Gc, immortal)?;
+    Ok(cast_ptr_to_adr(&p))
+}
+
+/// `ArrayItemsOffset.raw_memcopy` (llmemory.py) — copy the length field.
+fn array_items_offset_raw_memcopy(srcadr: &_address, dstadr: &_address) -> Result<(), String> {
+    let src_obj = address_ptr(srcadr)?
+        ._obj()
+        .map_err(|_| "ArrayItemsOffset.raw_memcopy: delayed src".to_string())?;
+    let dst_obj = address_ptr(dstadr)?
+        ._obj()
+        .map_err(|_| "ArrayItemsOffset.raw_memcopy: delayed dst".to_string())?;
+    let srclen = obj_getlength(&src_obj)?;
+    let dstlen = obj_getlength(&dst_obj)?;
+    if dstlen != srclen {
+        if dstlen < srclen {
+            return Err("can't increase the length".into());
+        }
+        let _ptr_obj::Array(a) = dst_obj else {
+            return Err("ArrayItemsOffset.raw_memcopy: dest has no shrinklength".into());
+        };
+        a.shrinklength(srclen);
+    }
+    Ok(())
+}
+
+enum ReccopyStep {
+    SetItem {
+        dest: _ptr,
+        i: usize,
+        llvalue: LowLevelValue,
+    },
+    SetField {
+        dest: _ptr,
+        name: String,
+        llvalue: LowLevelValue,
+    },
+}
+
+impl ReccopyStep {
+    fn run(self) -> Result<(), String> {
+        match self {
+            ReccopyStep::SetItem { dest, i, llvalue } => {
+                let obj = dest._obj().map_err(|_| "delayed pointer".to_string())?;
+                if !obj_setitem(&obj, i, llvalue) {
+                    return Err(format!("_reccopy_lazy setitem({i}) failed"));
+                }
+                Ok(())
+            }
+            ReccopyStep::SetField {
+                dest,
+                name,
+                llvalue,
+            } => {
+                let obj = dest._obj().map_err(|_| "delayed pointer".to_string())?;
+                let _ptr_obj::Struct(s) = obj else {
+                    return Err(format!("_reccopy_lazy setattr on non-struct {obj:?}"));
+                };
+                if !s._setattr(&name, llvalue) {
+                    return Err(format!("_reccopy_lazy setattr({name:?}) failed"));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn obj_getitem(obj: &_ptr_obj, i: usize) -> Option<LowLevelValue> {
+    match obj {
+        _ptr_obj::Array(a) => a.getitem(i),
+        _ptr_obj::Subarray(s) => s.getitem(i),
+        _ => None,
+    }
+}
+
+fn obj_setitem(obj: &_ptr_obj, i: usize, val: LowLevelValue) -> bool {
+    match obj {
+        _ptr_obj::Array(a) => a.setitem(i, val),
+        _ptr_obj::Subarray(s) => s.setitem(i, val),
+        _ => false,
+    }
+}
+
+fn obj_getlength(obj: &_ptr_obj) -> Result<usize, String> {
+    match obj {
+        _ptr_obj::Array(a) => Ok(a.getlength()),
+        _ptr_obj::Subarray(s) => Ok(s.getlength()),
+        other => Err(format!("{other:?} has no getlength")),
+    }
+}
+
+/// `_reccopy_lazy(source, dest, steps)` (llmemory.py).
+fn _reccopy_lazy(source: &_ptr, dest: &_ptr, steps: &mut Vec<ReccopyStep>) -> Result<(), String> {
+    let T = LowLevelType::from(source._TYPE.TO.clone());
+    let dest_t = LowLevelType::from(dest._TYPE.TO.clone());
+    if T != dest_t {
+        return Err(format!("_reccopy_lazy: {T:?} != {dest_t:?}"));
+    }
+    let src_obj = source
+        ._obj()
+        .map_err(|_| "delayed source pointer".to_string())?;
+    let dst_obj = dest
+        ._obj()
+        .map_err(|_| "delayed dest pointer".to_string())?;
+    match &T {
+        LowLevelType::Array(_) | LowLevelType::FixedSizeArray(_) => {
+            let itemtype = array_of_type(&T)?;
+            let sourcelgt = obj_getlength(&src_obj)?;
+            let destlgt = obj_getlength(&dst_obj)?;
+            let lgt = sourcelgt.min(destlgt);
+            for i in 0..lgt {
+                if itemtype.is_container_type() {
+                    let subsrc = obj_getitem(&src_obj, i)
+                        .ok_or_else(|| format!("_reccopy_lazy getitem({i})"))?;
+                    let subdst = obj_getitem(&dst_obj, i)
+                        .ok_or_else(|| format!("_reccopy_lazy dest getitem({i})"))?;
+                    let subsrc = container_value_as_ptr(&subsrc, true)
+                        .ok_or_else(|| "_reccopy_lazy: item is not a container".to_string())?;
+                    let subdst = container_value_as_ptr(&subdst, true)
+                        .ok_or_else(|| "_reccopy_lazy: dest item is not a container".to_string())?;
+                    _reccopy_lazy(&subsrc, &subdst, steps)?;
+                } else {
+                    let llvalue = obj_getitem(&src_obj, i)
+                        .ok_or_else(|| format!("_reccopy_lazy getitem({i})"))?;
+                    steps.push(ReccopyStep::SetItem {
+                        dest: dest.clone(),
+                        i,
+                        llvalue,
+                    });
+                }
+            }
+            Ok(())
+        }
+        LowLevelType::Struct(st) => {
+            let _ptr_obj::Struct(src_s) = &src_obj else {
+                return Err(format!("_reccopy_lazy expected struct, got {src_obj:?}"));
+            };
+            let _ptr_obj::Struct(dst_s) = &dst_obj else {
+                return Err(format!(
+                    "_reccopy_lazy expected dest struct, got {dst_obj:?}"
+                ));
+            };
+            for name in &st._names {
+                let fieldtype = st
+                    ._flds
+                    .get(name)
+                    .ok_or_else(|| format!("_reccopy_lazy: {} has no field {name}", st._name))?;
+                if fieldtype.is_container_type() {
+                    let subsrc = src_s
+                        ._getattr(name)
+                        .ok_or_else(|| format!("_reccopy_lazy getattr({name:?})"))?;
+                    let subdst = dst_s
+                        ._getattr(name)
+                        .ok_or_else(|| format!("_reccopy_lazy dest getattr({name:?})"))?;
+                    let subsrc = container_value_as_ptr(&subsrc, true)
+                        .ok_or_else(|| "_reccopy_lazy: field is not a container".to_string())?;
+                    let subdst = container_value_as_ptr(&subdst, true).ok_or_else(|| {
+                        "_reccopy_lazy: dest field is not a container".to_string()
+                    })?;
+                    _reccopy_lazy(&subsrc, &subdst, steps)?;
+                } else {
+                    let llvalue = src_s
+                        ._getattr(name)
+                        .ok_or_else(|| format!("_reccopy_lazy getattr({name:?})"))?;
+                    steps.push(ReccopyStep::SetField {
+                        dest: dest.clone(),
+                        name: name.clone(),
+                        llvalue,
+                    });
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("TypeError({other:?})")),
+    }
+}
+
+/// `_reccopy(source, dest)` (llmemory.py).
+fn _reccopy(source: &_ptr, dest: &_ptr) -> Result<(), String> {
+    let mut steps = Vec::new();
+    _reccopy_lazy(source, dest, &mut steps)?;
+    for step in steps {
+        step.run()?;
+    }
+    Ok(())
 }
 
 /// `FieldOffset.ref(struct)` (llmemory.py), container-field arm:
@@ -1442,10 +1969,6 @@ mod tests {
         let err = raw_memmove().expect_err("raw memmove is deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("raw_memmove"));
-
-        let err = _reccopy().expect_err("recursive copy is deferred");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("_reccopy"));
     }
 
     #[test]
@@ -2046,5 +2569,63 @@ mod tests {
         let env = crate::layout::target_env();
         assert_eq!(sizeof_wchar_t(), sizeof_wchar_t_for(os, arch, env));
         assert_eq!(sizeof_longfloat(), sizeof_longfloat_for(os, arch, env));
+    }
+
+    #[test]
+    fn item_offset_raw_memclear_zeros_primitive_items() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelValue, MallocFlavor, malloc,
+        };
+
+        // `fakeaddress.__add__(ArrayItemsOffset)` then
+        // `ItemOffset(Signed, 3).raw_memclear` (llmemory.py).
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let mut arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
+        for i in 0..3 {
+            arrayptr.setitem(i, LowLevelValue::Signed(9)).unwrap();
+        }
+        let items = fakeaddress_add(&cast_ptr_to_adr(&arrayptr), &array_items(array_ty)).unwrap();
+        raw_memclear(&items, &item(LowLevelType::Signed, 3)).unwrap();
+        for i in 0..3 {
+            assert_eq!(arrayptr.getitem(i).unwrap(), LowLevelValue::Signed(0));
+        }
+    }
+
+    #[test]
+    fn item_offset_raw_memclear_zeros_struct_items() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelValue, MallocFlavor, Struct, malloc,
+        };
+
+        // `ItemOffset(STRUCT, 2)` over `GcArray(Struct{a: Signed, b: Char})`
+        // (`ItemOffset._raw_malloc` + `ItemOffset.raw_memcopy` / `_reccopy_lazy`).
+        let item_ty = LowLevelType::Struct(Box::new(Struct::new(
+            "Item",
+            vec![
+                ("a".into(), LowLevelType::Signed),
+                ("b".into(), LowLevelType::Char),
+            ],
+        )));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
+        let arrayptr = malloc(array_ty.clone(), Some(2), MallocFlavor::Gc, true).unwrap();
+
+        let item0 = array_items(array_ty.clone()).r#ref(&arrayptr).unwrap();
+        let mut i0 = item0.clone();
+        i0.setattr("a", LowLevelValue::Signed(9)).unwrap();
+        i0.setattr("b", LowLevelValue::Char('x')).unwrap();
+        let mut i1 = item(item_ty.clone(), 1).r#ref(&item0).unwrap();
+        i1.setattr("a", LowLevelValue::Signed(8)).unwrap();
+        i1.setattr("b", LowLevelValue::Char('y')).unwrap();
+
+        let dest =
+            fakeaddress_add(&cast_ptr_to_adr(&arrayptr), &array_items(array_ty.clone())).unwrap();
+        raw_memclear(&dest, &item(item_ty.clone(), 2)).unwrap();
+
+        let item0 = array_items(array_ty).r#ref(&arrayptr).unwrap();
+        assert_eq!(item0.getattr("a").unwrap(), LowLevelValue::Signed(0));
+        assert_eq!(item0.getattr("b").unwrap(), LowLevelValue::Char('\0'));
+        let item1 = item(item_ty, 1).r#ref(&item0).unwrap();
+        assert_eq!(item1.getattr("a").unwrap(), LowLevelValue::Signed(0));
+        assert_eq!(item1.getattr("b").unwrap(), LowLevelValue::Char('\0'));
     }
 }

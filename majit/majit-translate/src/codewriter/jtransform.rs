@@ -18464,15 +18464,30 @@ fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
     Some((id, nolength))
 }
 
-/// ARRAY identity of a rich `__array_repeat`.
-///
-/// A lifted graph reaches `rtype_alloc_and_set`, which folds `LIST`
-/// into `ll_alloc_and_set`. This spine never met the rtyper, so the
-/// item comes from a shaped `Array<T;N>` result or from an
-/// `ArrayRead` / `ArrayWrite` of the result (`LinkClasses`: the front
-/// threads the value through every block as a fresh inputarg). A
-/// headerless reader, a nested item, or two consumers that name
-/// different items stay the residual call.
+/// ARRAY of a skip-spine fixed list, keyed by the identity
+/// [`fixed_list_reader`] already published (`slice_array_type_id`, then
+/// `canonical_array_type_id`). `rstr.py CHAR_ARRAY` is `[u8]`;
+/// `rlist.py` list items are `GcArray(Signed)` / `GcArray(Float)`;
+/// `rmodel.py externalvsinternal(..., gcref=True)` stores object items
+/// as `GcArray(GCREF)`.
+fn gc_array_for_fixed_list_id(
+    array_type_id: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+    let mut inner = array_type_id.trim();
+    while let Some(rest) = crate::front::typestr::peel_pointer_prefix(inner) {
+        inner = rest;
+    }
+    let id = crate::front::typestr::canonical_array_type_id(inner);
+    match id.as_ref() {
+        LIST_INT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Signed)),
+        LIST_FLOAT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Float)),
+        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID => Some(Array::gc((*GCREF).clone())),
+        "[u8]" | "GcArray<u8>" => Some(crate::codewriter::call::gcarray_char()),
+        _ => None,
+    }
+}
+
 fn fixed_repeat_identity(
     graph: &FunctionGraph,
     result: &crate::flowspace::model::Variable,
@@ -18480,19 +18495,22 @@ fn fixed_repeat_identity(
 ) -> Option<crate::codewriter::alloc_and_set::FixedArrayRepeat> {
     let classes = crate::codewriter::getslice::LinkClasses::of(graph);
     let mut consumer_item: Option<String> = None;
+    let mut consumer_array: Option<crate::translator::rtyper::lltypesystem::lltype::Array> = None;
     for block in &graph.blocks {
         for op in &block.operations {
-            let (base, array_type_id) = match &op.kind {
+            let (base, array_type_id, array) = match &op.kind {
                 OpKind::ArrayRead {
                     base,
                     array_type_id,
+                    array,
                     ..
                 }
                 | OpKind::ArrayWrite {
                     base,
                     array_type_id,
+                    array,
                     ..
-                } => (base, array_type_id),
+                } => (base, array_type_id, array),
                 _ => continue,
             };
             if !classes.same(base, result) {
@@ -18506,6 +18524,13 @@ fn fixed_repeat_identity(
                 Some(seen) if seen != &item => return None,
                 Some(_) => {}
                 None => consumer_item = Some(item),
+            }
+            if let Some(arr) = array {
+                match &consumer_array {
+                    Some(seen) if seen != arr => return None,
+                    Some(_) => {}
+                    None => consumer_array = Some(arr.clone()),
+                }
             }
         }
     }
@@ -18528,9 +18553,14 @@ fn fixed_repeat_identity(
     if nolength {
         return None;
     }
+    let array = match consumer_array {
+        Some(arr) => arr,
+        None => gc_array_for_fixed_list_id(&array_type_id)?,
+    };
     Some(crate::codewriter::alloc_and_set::FixedArrayRepeat {
         item_ty: crate::front::mir::tuple_field_value_type(&item),
         array_type_id,
+        array,
         clears: fixed_list_clears(&item),
     })
 }
@@ -42396,6 +42426,45 @@ mod tests {
             assert_residual(&ops);
         }
 
+        // Names-only `[u8]`: `slice_array_type_id` publishes `[u8]`, the
+        // same identity as `rstr.py CHAR_ARRAY` (`gcarray_char`). The
+        // fallback does not invert `lltype_item_spelling` onto `UCHAR`.
+        {
+            let graph = repeat_graph(
+                "repeat_u8",
+                Some("Array<u8;4>"),
+                OpKind::ConstInt(1),
+                Some(OpKind::ConstInt(4)),
+            );
+            let (ops, cc) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[u8]");
+            assert_redirect(&ops, &names.outer);
+            let fill = crate::translator::rtyper::lltypesystem::rbuilder::ll_arrayfill_helper_name(
+                cc.intern_array(&crate::codewriter::call::gcarray_char()),
+            );
+            let arr = registered_ops(&cc, &fill)
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::ArrayLen {
+                        array: Some(arr), ..
+                    }
+                    | OpKind::ArrayWrite {
+                        array: Some(arr), ..
+                    } => Some(arr.clone()),
+                    _ => None,
+                })
+                .expect("ll_arrayfill carries ARRAY");
+            assert_eq!(arr, crate::codewriter::call::gcarray_char());
+            assert_eq!(
+                arr.OF,
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char
+            );
+            assert_ne!(
+                arr.OF,
+                (*crate::translator::rtyper::lltypesystem::rffi::UCHAR).clone()
+            );
+        }
+
         // Headerless `[u32]`, a nested item, and a 1-arg call stay residual.
         {
             let graph = repeat_graph(
@@ -42427,6 +42496,44 @@ mod tests {
             let (ops, _) = transform_with_cc(&graph);
             assert_residual(&ops);
         }
+    }
+
+    /// Skip-spine ARRAY follows the published identity
+    /// (`slice_array_type_id` / `canonical_array_type_id`), not an
+    /// inverse of `lltype_item_spelling`.
+    #[test]
+    fn skip_spine_repeat_array_follows_published_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+        assert_eq!(
+            gc_array_for_fixed_list_id("[u8]"),
+            Some(crate::codewriter::call::gcarray_char())
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[i64]"),
+            Some(Array::gc(LowLevelType::Signed))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id(LIST_INT_ITEMS_ARRAY),
+            Some(Array::gc(LowLevelType::Signed))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[f64]"),
+            Some(Array::gc(LowLevelType::Float))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[str]"),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("&[str]"),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert!(gc_array_for_fixed_list_id("[u32]").is_none());
+        assert!(gc_array_for_fixed_list_id("[i8]").is_none());
     }
 
     /// Allocation and every read of a fixed array share the `&[T]` reader's

@@ -17850,7 +17850,17 @@ pub(crate) fn effect_graph_from_rtyped_helper(
     let start_id = out.startblock;
     let start_inputs = out.block(start_id).inputargs.clone();
     for var in start_inputs {
-        let ty = effect_value_type_of(&var);
+        // `descr.py map_type_to_argclass`: `getkind(SingleFloat)` is `'int'`,
+        // but the call-descr class is `'S'`. Only the helper's own inputs
+        // keep `ValueType::SingleFloat`, so `declared_non_void_arg_classes`
+        // emits `S`; array items and results stay in the int bank
+        // (`history.py` `getkind`).
+        let ty = match var.concretetype() {
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::SingleFloat) => {
+                crate::model::ValueType::SingleFloat
+            }
+            _ => effect_value_type_of(&var),
+        };
         let name = if var.renamed() {
             var.name_prefix()
         } else {
@@ -18719,6 +18729,8 @@ fn effect_transduce_op(
                 result,
             );
         }
+        // `rgc.py ll_arrayfill` stores with `llop.bare_setarrayitem` after
+        // one `gc_writebarrier`.
         "setarrayitem" => {
             let base = effect_expect_var(&op.args[0]);
             let (array_type_id, array, nolength, gckind) = effect_array_op_facts(&base);
@@ -18741,6 +18753,20 @@ fn effect_transduce_op(
                     gckind,
                 },
                 false,
+            );
+        }
+        // `writeanalyze.py analyze_simple_operation` records an array
+        // write for `setarrayitem` only; `bare_setarrayitem` is
+        // `empty_set`. Keep the llop so analyzers read the opname.
+        "bare_setarrayitem" => {
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::LoweredBlackholeOp {
+                    opname: "bare_setarrayitem".to_string(),
+                    args: op.args.iter().map(effect_linkarg).collect(),
+                },
+                result,
             );
         }
         "gc_can_move" => {
@@ -19034,7 +19060,7 @@ fn effect_transduce_op(
                 false,
             );
         }
-        "raw_memcopy" => {
+        name @ ("raw_memcopy" | "raw_memclear") => {
             // `lloperation.py`: `LLOp(revdb_protect=True)`.
             // Generic llops keep the original argument list
             // (`SpaceOperation.args`); analyzers read the opname
@@ -19045,7 +19071,7 @@ fn effect_transduce_op(
             out.push_op_with_result_var(
                 block,
                 OpKind::LoweredBlackholeOp {
-                    opname: "raw_memcopy".to_string(),
+                    opname: name.to_string(),
                     args: op.args.iter().map(effect_linkarg).collect(),
                 },
                 result,
@@ -19960,6 +19986,22 @@ mod tests {
         );
         assert_eq!(ad.base_size(), array_items_base(word, item));
         assert!(!ad.is_item_signed());
+    }
+
+    /// `descr.py get_array_descr` over `GcArray(SingleFloat)`: the item is
+    /// four bytes and banks as an int (`history.py` `getkind`), so the
+    /// descriptor builds; only a helper's call-descr arg class is `S`.
+    #[test]
+    fn arraydescrof_gcarray_singlefloat_is_int_bank() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let cc = CallControl::new();
+        let arr = Array::gc(LowLevelType::SingleFloat);
+        let descr = cc.arraydescrof_array(&arr);
+        let ad = descr
+            .as_array_descr()
+            .expect("arraydescrof_array must answer an ArrayDescr");
+        assert_eq!(ad.item_size(), 4);
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
     }
 
     /// `rffi.UCHAR` / `USHORT` spell as `u8` / `u16`. `rffi.UINT` spells
@@ -34646,7 +34688,14 @@ mod tests {
         name: &str,
         graph: crate::flowspace::model::FunctionGraph,
     ) -> ReadWriteEffects {
-        let converted = effect_graph_from_rtyped_helper(&graph);
+        converted_readwrite_ref(name, &graph)
+    }
+
+    fn converted_readwrite_ref(
+        name: &str,
+        graph: &crate::flowspace::model::FunctionGraph,
+    ) -> ReadWriteEffects {
+        let converted = effect_graph_from_rtyped_helper(graph);
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments([name]), converted);
         cc.analyze_readwrite(
@@ -34654,6 +34703,54 @@ mod tests {
             &mut ReadWriteTracker::new(),
             &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
         )
+    }
+
+    /// `writeanalyze.py analyze_simple_operation` records an array write
+    /// for `setarrayitem` only. The registered `ll_arrayfill` helper
+    /// (`bare_setarrayitem`) has no array-write of the list's ARRAY;
+    /// `ll_arrayclear` (`raw_memclear`) also has none.
+    #[test]
+    fn ll_arrayfill_helper_effect_has_no_array_write() {
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        use crate::translator::rtyper::lltypesystem::rbuilder::{
+            build_ll_arrayclear_helper_graph_for_array, build_ll_arrayfill_helper_graph_for_array,
+        };
+        use crate::translator::rtyper::lltypesystem::rffi::SIGNEDCHAR;
+        let array = Array::gc((*SIGNEDCHAR).clone());
+        let fill = build_ll_arrayfill_helper_graph_for_array(0, &array).expect("fill");
+        let fill_effects = converted_readwrite_ref("ll_arrayfill", &fill.graph.borrow());
+        match &fill_effects {
+            ReadWriteEffects::Set(set) => {
+                assert!(
+                    set.keys().all(|key| key.tag != RwTag::Array),
+                    "ll_arrayfill has no array-write, got {set:?}"
+                );
+            }
+            ReadWriteEffects::Top => panic!("ll_arrayfill is not top"),
+        }
+        let clear = build_ll_arrayclear_helper_graph_for_array(0, &array).expect("clear");
+        let converted = effect_graph_from_rtyped_helper(&clear.graph.borrow());
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "raw_memclear"
+            )),
+            "ll_arrayclear contains raw_memclear: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        let clear_effects = converted_readwrite_ref("ll_arrayclear", &clear.graph.borrow());
+        match &clear_effects {
+            ReadWriteEffects::Set(set) => {
+                assert!(
+                    set.keys().all(|key| key.tag != RwTag::Array),
+                    "ll_arrayclear has no array-write, got {set:?}"
+                );
+            }
+            ReadWriteEffects::Top => panic!("ll_arrayclear is not top"),
+        }
     }
 
     fn rtyped_one_op_with_inputs(

@@ -17,6 +17,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory::{itemoffsetof, sizeof};
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
 };
@@ -5607,13 +5608,49 @@ pub fn build_ll_build_helper_graph(
     ))
 }
 
-/// `Ptr(GcArray(ITEM))` for an item lltype — the array pointer shape both
-/// `ll_arrayclear` and `ll_arrayfill` operate on (`p` is the array itself:
-/// `len(p)`, `p[i]`, `typeOf(p).TO`).
-fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
+/// `Ptr(ARRAY)` — the array pointer `rgc.py ll_arrayclear` / `ll_arrayfill`
+/// take (`p` is the array itself: `len(p)`, `p[i]`, `typeOf(p).TO`).
+fn array_ptr_of(array: Array) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
+        TO: PtrTarget::Array(array),
     }))
+}
+
+/// CallControl leaf of `rgc.ll_arrayclear` for one ARRAY.
+/// `lowlevel_helper_function_with_builder` keys by `(name, args, result)`;
+/// the skip-spine `CallControl` keys by path, so the leaf carries the
+/// ARRAY identity (`CallControl::intern_array`).
+pub fn ll_arrayclear_helper_name(intern_id: u64) -> String {
+    format!("ll_arrayclear__{intern_id}")
+}
+
+/// CallControl leaf of `rgc.ll_arrayfill` for one ARRAY.
+/// Same intern identity as [`ll_arrayclear_helper_name`].
+pub fn ll_arrayfill_helper_name(intern_id: u64) -> String {
+    format!("ll_arrayfill__{intern_id}")
+}
+
+/// `rgc.ll_arrayclear` graph keyed by the interned ARRAY identity.
+/// `rgc.py ll_arrayclear` is `@specialize.ll()`: one graph per
+/// `lltype.typeOf(p)`, so the body is `Ptr(ARRAY)` with item `ARRAY.OF`.
+pub fn build_ll_arrayclear_helper_graph_for_array(
+    intern_id: u64,
+    array: &Array,
+) -> Result<PyGraph, TyperError> {
+    build_ll_arrayclear_helper_graph_with_array(
+        &ll_arrayclear_helper_name(intern_id),
+        array.clone(),
+    )
+}
+
+/// `rgc.ll_arrayfill` graph keyed by the interned ARRAY identity.
+/// `rgc.py ll_arrayfill` is `@specialize.ll()`: one graph per
+/// `lltype.typeOf(p)`, so the body is `Ptr(ARRAY)` with item `ARRAY.OF`.
+pub fn build_ll_arrayfill_helper_graph_for_array(
+    intern_id: u64,
+    array: &Array,
+) -> Result<PyGraph, TyperError> {
+    build_ll_arrayfill_helper_graph_with_array(&ll_arrayfill_helper_name(intern_id), array.clone())
 }
 
 /// Synthesise `rgc.ll_arrayclear(p)` (`rpython/rlib/rgc.py`):
@@ -5640,56 +5677,31 @@ fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
 ///     keepalive_until_here(p)
 /// ```
 ///
-/// Three-block loop over the bare `Ptr(GcArray(ITEM))` operand: writes the
-/// null/zero element into every slot. Writing NULL never creates an
-/// old->young reference, so no write barrier is emitted. `@specialize.ll()`
-/// picks the two `isinstance(ARRAY.OF, Ptr)` arms per concrete item type;
-/// the Rust-side match on `item_lltype` folds that specialisation to one
-/// `ZERO` element constant (`nullptr` for a `Ptr` item, `0` otherwise). The
-/// `raw_memclear` fast path (the `must_split_gc_address_space()` `else`
-/// branch) is deferred as a translation-time concern, mirroring
-/// [`build_ll_arraycopy_helper_graph`](../../rlist.rs) which lowers the
-/// sibling `rgc.ll_arraycopy` to the `length <= 1` `copy_item` head plus
-/// the slowpath element loop and defers its `raw_memcopy` fast path
-/// (`rgc.py`); the `itemoffsetof` / `sizeof`
-/// / `cast_ptr_to_adr` / `raw_memclear` address machinery has no
-/// construction-side surface here.
+/// `must_split_gc_address_space()` (`rgc.py`) is False for every target
+/// pyre builds, so this graph is the `else` branch: `getarraysize`,
+/// `cast_ptr_to_adr` + `adr_add` of `itemoffsetof(ARRAY, 0)`, `int_mul`
+/// of `sizeof(ARRAY.OF)` and `length`, `raw_memclear`, then
+/// `keepalive`. Writing NULL never creates an old->young reference, so
+/// no write barrier is emitted. `@specialize.ll()` still keys one graph
+/// per `lltype.typeOf(p)`.
 pub fn build_ll_arrayclear_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let items_ptr = array_ptr_lltype(&item_lltype);
-    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let bool_case = |b: bool| {
-        Some(constant_with_lltype(
-            ConstValue::Bool(b),
-            LowLevelType::Bool,
-        ))
-    };
-    let none_void = || constant_with_lltype(ConstValue::None, LowLevelType::Void);
+    build_ll_arrayclear_helper_graph_with_array(name, Array::gc(item_lltype))
+}
 
-    // `ZERO`: the null pointer for a `Ptr` item, else the zero primitive.
-    let zero_value = match &item_lltype {
-        LowLevelType::Ptr(_) => constant_with_lltype(ConstValue::None, item_lltype.clone()),
-        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
-            constant_with_lltype(ConstValue::float(0.0), item_lltype.clone())
-        }
-        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
-            constant_with_lltype(ConstValue::UInt(0), item_lltype.clone())
-        }
-        LowLevelType::Number(n) => {
-            constant_with_lltype(ConstValue::rint(n._type, 0), item_lltype.clone())
-        }
-        LowLevelType::UnsignedLongLongLong => {
-            constant_with_lltype(ConstValue::UInt128(0), item_lltype.clone())
-        }
-        LowLevelType::SignedLongLongLong => {
-            constant_with_lltype(ConstValue::Int128(0), item_lltype.clone())
-        }
-        _ => constant_with_lltype(ConstValue::Int(0), item_lltype.clone()),
-    };
+fn build_ll_arrayclear_helper_graph_with_array(
+    name: &str,
+    array: Array,
+) -> Result<PyGraph, TyperError> {
+    let item_lltype = array.OF.clone();
+    let array_ty = LowLevelType::Array(Box::new(array.clone()));
+    let items_ptr = array_ptr_of(array);
+    let offset = itemoffsetof(&array_ty, 0).map_err(TyperError::message)?;
+    let item_size = sizeof(&item_lltype, None).map_err(TyperError::message)?;
 
-    let p = variable_with_lltype("p", items_ptr.clone());
+    let p = variable_with_lltype("p", items_ptr);
     let startblock = Block::shared(vec![Hlvalue::Variable(p.clone())]);
     let return_var = variable_with_lltype("result", LowLevelType::Void);
     let mut graph = FunctionGraph::with_return_var(
@@ -5698,96 +5710,60 @@ pub fn build_ll_arrayclear_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // Loop blocks carry (p, length, i) as fresh inputargs.
-    let p_c = variable_with_lltype("p", items_ptr.clone());
-    let len_c = variable_with_lltype("length", LowLevelType::Signed);
-    let i_c = variable_with_lltype("i", LowLevelType::Signed);
-    let block_cond = Block::shared(vec![
-        Hlvalue::Variable(p_c.clone()),
-        Hlvalue::Variable(len_c.clone()),
-        Hlvalue::Variable(i_c.clone()),
-    ]);
-
-    let p_b = variable_with_lltype("p", items_ptr.clone());
-    let len_b = variable_with_lltype("length", LowLevelType::Signed);
-    let i_b = variable_with_lltype("i", LowLevelType::Signed);
-    let block_body = Block::shared(vec![
-        Hlvalue::Variable(p_b.clone()),
-        Hlvalue::Variable(len_b.clone()),
-        Hlvalue::Variable(i_b.clone()),
-    ]);
-
-    // startblock: length = len(p); i = 0.
+    // `length = len(p)`
     let length = variable_with_lltype("length", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getarraysize",
         vec![Hlvalue::Variable(p.clone())],
         Hlvalue::Variable(length.clone()),
     ));
+    // `dest_addr = cast_ptr_to_adr(p) + itemoffsetof(ARRAY, 0)`
+    let adr = variable_with_lltype("adr", LowLevelType::Address);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(p.clone())],
+        Hlvalue::Variable(adr.clone()),
+    ));
+    let dest_addr = variable_with_lltype("dest_addr", LowLevelType::Address);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "adr_add",
+        vec![
+            Hlvalue::Variable(adr),
+            constant_with_lltype(ConstValue::AddressOffset(offset), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(dest_addr.clone()),
+    ));
+    // `nbytes = sizeof(ARRAY.OF) * length`
+    let nbytes = variable_with_lltype("nbytes", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_mul",
+        vec![
+            constant_with_lltype(item_size, LowLevelType::Signed),
+            Hlvalue::Variable(length),
+        ],
+        Hlvalue::Variable(nbytes.clone()),
+    ));
+    // `raw_memclear(dest_addr, nbytes)`
+    let cleared = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "raw_memclear",
+        vec![Hlvalue::Variable(dest_addr), Hlvalue::Variable(nbytes)],
+        Hlvalue::Variable(cleared),
+    ));
+    // `keepalive_until_here(p)`
+    let kept = variable_with_lltype("kept", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "keepalive",
+        vec![Hlvalue::Variable(p)],
+        Hlvalue::Variable(kept),
+    ));
     startblock.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(p), Hlvalue::Variable(length), signed(0)],
-            Some(block_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // block_cond: int_lt(i, length). True -> body; False -> return None.
-    let cond = variable_with_lltype("cond", LowLevelType::Bool);
-    block_cond.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![
-            Hlvalue::Variable(i_c.clone()),
-            Hlvalue::Variable(len_c.clone()),
-        ],
-        Hlvalue::Variable(cond.clone()),
-    ));
-    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
-    block_cond.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(p_c),
-                Hlvalue::Variable(len_c),
-                Hlvalue::Variable(i_c),
-            ],
-            Some(block_body.clone()),
-            bool_case(true),
-        )
-        .into_ref(),
-        Link::new(
-            vec![none_void()],
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
             Some(graph.returnblock.clone()),
-            bool_case(false),
-        )
-        .into_ref(),
-    ]);
-
-    // block_body: p[i] = ZERO; i += 1.
-    let store_void = variable_with_lltype("v", LowLevelType::Void);
-    block_body.borrow_mut().operations.push(SpaceOperation::new(
-        "setarrayitem",
-        vec![
-            Hlvalue::Variable(p_b.clone()),
-            Hlvalue::Variable(i_b.clone()),
-            zero_value,
-        ],
-        Hlvalue::Variable(store_void),
-    ));
-    let i_next = variable_with_lltype("i", LowLevelType::Signed);
-    block_body.borrow_mut().operations.push(SpaceOperation::new(
-        "int_add",
-        vec![Hlvalue::Variable(i_b), signed(1)],
-        Hlvalue::Variable(i_next.clone()),
-    ));
-    block_body.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(p_b),
-                Hlvalue::Variable(len_b),
-                Hlvalue::Variable(i_next),
-            ],
-            Some(block_cond),
             None,
         )
         .into_ref(),
@@ -5836,7 +5812,15 @@ pub fn build_ll_arrayfill_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let items_ptr = array_ptr_lltype(&item_lltype);
+    build_ll_arrayfill_helper_graph_with_array(name, Array::gc(item_lltype))
+}
+
+fn build_ll_arrayfill_helper_graph_with_array(
+    name: &str,
+    array: Array,
+) -> Result<PyGraph, TyperError> {
+    let item_lltype = array.OF.clone();
+    let items_ptr = array_ptr_of(array);
     let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
     let bool_case = |b: bool| {
         Some(constant_with_lltype(
@@ -7039,7 +7023,7 @@ pub fn rtype_newstringbuilder(hop: &HighLevelOp) -> RTypeResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, PtrTarget};
     use crate::translator::rtyper::rmodel::Repr;
 
     #[test]
@@ -8478,35 +8462,67 @@ mod tests {
     }
 
     #[test]
-    fn build_ll_arrayclear_zeroes_each_slot_in_a_bare_element_loop() {
+    fn arrayclear_arrayfill_helper_names_carry_the_array_identity() {
+        let intern_id = 7;
+        assert_eq!(
+            super::ll_arrayclear_helper_name(intern_id),
+            "ll_arrayclear__7"
+        );
+        assert_eq!(
+            super::ll_arrayfill_helper_name(intern_id),
+            "ll_arrayfill__7"
+        );
+        let array = Array::gc(LowLevelType::Signed);
+        let clear = super::build_ll_arrayclear_helper_graph_for_array(intern_id, &array)
+            .expect("keyed ll_arrayclear");
+        assert_eq!(clear.func.name, "ll_arrayclear__7");
+        let fill = super::build_ll_arrayfill_helper_graph_for_array(intern_id, &array)
+            .expect("keyed ll_arrayfill");
+        assert_eq!(fill.func.name, "ll_arrayfill__7");
+    }
+
+    #[test]
+    fn build_ll_arrayclear_emits_raw_memclear() {
         use super::Hlvalue;
         let helper = super::build_ll_arrayclear_helper_graph("ll_arrayclear", LowLevelType::Signed)
             .expect("build_ll_arrayclear_helper_graph");
         assert_eq!(helper.func.name, "ll_arrayclear");
         let inner = helper.graph.borrow();
 
-        // start: length = len(p); i = 0 (a single unconditional exit).
+        // start: length = len(p); dest_addr; nbytes; raw_memclear; keepalive.
         let startblock = inner.startblock.borrow();
         let start_ops: Vec<&str> = startblock
             .operations
             .iter()
             .map(|o| o.opname.as_str())
             .collect();
-        assert_eq!(start_ops, vec!["getarraysize"]);
+        assert_eq!(
+            start_ops,
+            vec![
+                "getarraysize",
+                "cast_ptr_to_adr",
+                "adr_add",
+                "int_mul",
+                "raw_memclear",
+                "keepalive",
+            ]
+        );
         assert_eq!(startblock.inputargs.len(), 1); // p
         assert_eq!(startblock.exits.len(), 1);
         drop(startblock);
 
         let (count, all_ops) = walk_ops(&inner.startblock);
-        // start, cond, body, returnblock.
-        assert_eq!(count, 4);
+        // start, returnblock.
+        assert_eq!(count, 2);
         let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
         assert_eq!(n("getarraysize"), 1);
-        assert_eq!(n("int_lt"), 1); // loop header
-        assert_eq!(n("setarrayitem"), 1); // p[i] = ZERO
-        assert_eq!(n("int_add"), 1); // i += 1
-        assert_eq!(n("gc_writebarrier"), 0); // NULL store needs no barrier
-        assert_eq!(n("raw_memclear"), 0); // fast path deferred
+        assert_eq!(n("cast_ptr_to_adr"), 1);
+        assert_eq!(n("adr_add"), 1);
+        assert_eq!(n("int_mul"), 1);
+        assert_eq!(n("raw_memclear"), 1);
+        assert_eq!(n("keepalive"), 1);
+        assert_eq!(n("setarrayitem"), 0);
+        assert_eq!(n("gc_writebarrier"), 0);
 
         // Void return.
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
@@ -8551,6 +8567,50 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    /// `rgc.py ll_arrayclear` / `ll_arrayfill` are `@specialize.ll()` on
+    /// `lltype.typeOf(p)`. A byte / short / single-float ARRAY keeps that
+    /// `ARRAY.OF`, not a word `Signed` or `Float`.
+    #[test]
+    fn array_helpers_for_array_keep_the_lists_array_of() {
+        use super::Hlvalue;
+        use crate::translator::rtyper::lltypesystem::rffi::{SIGNEDCHAR, UCHAR, size_and_sign};
+        fn array_of_p(helper: &crate::flowspace::pygraph::PyGraph) -> LowLevelType {
+            let inner = helper.graph.borrow();
+            let Hlvalue::Variable(p) = &inner.startblock.borrow().inputargs[0] else {
+                panic!("p is a Variable");
+            };
+            match p.concretetype() {
+                Some(LowLevelType::Ptr(ptr)) => match &ptr.TO {
+                    PtrTarget::Array(arr) => arr.OF.clone(),
+                    other => panic!("p is Ptr(ARRAY), got {other:?}"),
+                },
+                other => panic!("p is Ptr(ARRAY), got {other:?}"),
+            }
+        }
+        let cases: [(&str, Array, usize, bool); 3] = [
+            ("[i8]", Array::gc((*SIGNEDCHAR).clone()), 1, false),
+            ("[u8]", Array::gc((*UCHAR).clone()), 1, true),
+            ("[f32]", Array::gc(LowLevelType::SingleFloat), 4, false),
+        ];
+        for (id, array, size, unsigned) in cases {
+            let clear = super::build_ll_arrayclear_helper_graph_for_array(0, &array)
+                .expect("ll_arrayclear");
+            let fill =
+                super::build_ll_arrayfill_helper_graph_for_array(0, &array).expect("ll_arrayfill");
+            for helper in [&clear, &fill] {
+                let of = array_of_p(helper);
+                assert_eq!(
+                    size_and_sign(&of).expect("ARRAY.OF size"),
+                    (size, unsigned),
+                    "{id} ARRAY.OF {of:?}"
+                );
+                assert_ne!(of, LowLevelType::Signed, "{id} is not a word array");
+                assert_ne!(of, LowLevelType::Float, "{id} is not a double array");
+                assert_eq!(of, array.OF);
+            }
+        }
     }
 
     #[test]
