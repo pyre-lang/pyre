@@ -70,33 +70,6 @@ pub static BYTEARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytearray_
 pub static MEMORY_ITER_TYPE: PyType = crate::pyobject::new_pytype("memory_iterator");
 pub static ARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("array.arrayiterator");
 
-/// The Python-visible iterator type for a sequence iterator over `seq`.
-///
-/// 3.14 splits str iteration by storage: an all-ASCII str yields
-/// `str_ascii_iterator`, anything wider yields `str_iterator`.  Producers with
-/// no specialized type keep the shared `sequenceiterator`.
-fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
-    unsafe {
-        if crate::is_str(seq) {
-            if crate::unicodeobject::w_str_is_ascii(seq) {
-                &STR_ASCII_ITER_TYPE
-            } else {
-                &STR_ITER_TYPE
-            }
-        } else if crate::bytesobject::is_bytes(seq) {
-            &BYTES_ITER_TYPE
-        } else if crate::bytearrayobject::is_bytearray(seq) {
-            &BYTEARRAY_ITER_TYPE
-        } else if crate::memoryview::is_w_memoryview(seq) {
-            &MEMORY_ITER_TYPE
-        } else if crate::interp_array::is_array(seq) {
-            &ARRAY_ITER_TYPE
-        } else {
-            &SEQ_ITER_TYPE
-        }
-    }
-}
-
 /// `space.int_w` into a cursor: `Signed` is a machine word, so a Python int
 /// wider than `isize` does not fit.
 #[inline]
@@ -110,23 +83,83 @@ pub fn seq_index_to_i64(value: isize) -> i64 {
     value as i64
 }
 
-pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
-    let _roots = crate::gc_roots::push_roots();
-    let seq = crate::gc_roots::pin_root(seq);
-    let tp = seq_iter_type_for(seq);
-    let value = W_SeqIterObject {
-        ob: PyObject {
-            ob_type: tp as *const PyType,
-            w_class: crate::pyobject::get_instantiate(tp),
-        },
-        seq,
-        index: 0,
-        length: length as i64,
-        empty_kind: unsafe { if crate::is_str(seq) { 1 } else { 0 } },
+/// `gct_fv_gc_malloc` bracket (`framework.py`) for one `W_SeqIterObject`
+/// identity.  Each public constructor below inlines this with a literal
+/// type so `fuse_boxing_alloc` sees a constant `ob_type`/`w_class`
+/// (`rclass.py InstanceRepr.new_instance`).
+macro_rules! seq_iter_ctor {
+    ($(#[$meta:meta])* $name:ident, $ty:expr, $empty_kind:expr) => {
+        $(#[$meta])*
+        pub fn $name(seq: PyObjectRef, length: usize) -> PyObjectRef {
+            let _roots = crate::gc_roots::push_roots();
+            let seq = crate::gc_roots::pin_root(seq);
+            let value = W_SeqIterObject {
+                ob: PyObject {
+                    ob_type: &$ty as *const PyType,
+                    w_class: crate::pyobject::get_instantiate(&$ty),
+                },
+                seq,
+                index: 0,
+                length: length as i64,
+                empty_kind: $empty_kind,
+            };
+            crate::lltype::malloc_typed_stable(value) as PyObjectRef
+        }
     };
-    crate::lltype::malloc_typed_stable(value) as PyObjectRef
 }
+
+seq_iter_ctor!(
+    /// `iterobject.py W_SeqIterObject` / `StdObjSpace.newseqiter`.
+    w_seq_iter_new,
+    SEQ_ITER_TYPE,
+    0
+);
+
+seq_iter_ctor!(
+    /// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
+    /// 3.15-visible as `str_ascii_iterator` when the string is all ASCII.
+    w_str_ascii_iter_new,
+    STR_ASCII_ITER_TYPE,
+    1
+);
+
+seq_iter_ctor!(
+    /// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
+    /// 3.15-visible as `str_iterator` when the string is not all ASCII.
+    w_str_iter_new,
+    STR_ITER_TYPE,
+    1
+);
+
+seq_iter_ctor!(
+    /// `stringmethods.py StringMethods.descr_iter` → `W_StringIterObject` for bytes.
+    w_bytes_iter_new,
+    BYTES_ITER_TYPE,
+    0
+);
+
+seq_iter_ctor!(
+    /// `stringmethods.py StringMethods.descr_iter` → `W_StringIterObject` for bytearray.
+    w_bytearray_iter_new,
+    BYTEARRAY_ITER_TYPE,
+    0
+);
+
+seq_iter_ctor!(
+    /// `memoryobject.py` has no `descr_iter`; `descroperation.py iter` falls
+    /// through to `space.newseqiter`.  3.15-visible as `memory_iterator`.
+    w_memory_iter_new,
+    MEMORY_ITER_TYPE,
+    0
+);
+
+seq_iter_ctor!(
+    /// `interp_array.py W_ArrayBase.descr_iter` → `space.newseqiter(self)`.
+    /// 3.15-visible as `array.arrayiterator`.
+    w_array_iter_new,
+    ARRAY_ITER_TYPE,
+    0
+);
 
 pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
@@ -180,8 +213,8 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
-    // Every producer-specific identity minted by `seq_iter_type_for` carries
-    // the same `W_SeqIterObject` payload, so all of them answer yes here.
+    // Every producer-specific identity sharing the `W_SeqIterObject` payload
+    // (`W_AbstractSeqIterObject` layout) answers yes here.
     let tp = unsafe { (*obj).ob_type };
     std::ptr::eq(tp, &SEQ_ITER_TYPE)
         || std::ptr::eq(tp, &STR_ASCII_ITER_TYPE)
@@ -429,5 +462,38 @@ mod seq_iter_tests {
             <W_SeqIterObject as crate::lltype::GcType>::SIZE,
             W_SEQ_ITER_OBJECT_SIZE
         );
+    }
+
+    #[test]
+    fn constructors_stamp_their_own_constant_type() {
+        let seq = std::ptr::null_mut();
+        let cases: &[(&str, fn(PyObjectRef, usize) -> PyObjectRef, &PyType)] = &[
+            ("sequenceiterator", w_seq_iter_new, &SEQ_ITER_TYPE),
+            (
+                "str_ascii_iterator",
+                w_str_ascii_iter_new,
+                &STR_ASCII_ITER_TYPE,
+            ),
+            ("str_iterator", w_str_iter_new, &STR_ITER_TYPE),
+            ("bytes_iterator", w_bytes_iter_new, &BYTES_ITER_TYPE),
+            (
+                "bytearray_iterator",
+                w_bytearray_iter_new,
+                &BYTEARRAY_ITER_TYPE,
+            ),
+            ("memory_iterator", w_memory_iter_new, &MEMORY_ITER_TYPE),
+            ("array.arrayiterator", w_array_iter_new, &ARRAY_ITER_TYPE),
+        ];
+        for &(name, ctor, tp) in cases {
+            let it = ctor(seq, 0);
+            assert!(
+                std::ptr::eq(unsafe { (*it).ob_type }, tp),
+                "{name} constructor stamped a non-constant or wrong type"
+            );
+            assert_eq!(
+                unsafe { w_seq_iter_empty_kind(it) },
+                if name.starts_with("str") { 1 } else { 0 }
+            );
+        }
     }
 }

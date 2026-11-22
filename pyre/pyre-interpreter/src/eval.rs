@@ -4017,7 +4017,11 @@ impl IterOpcodeHandler for PyFrame {
             // (baseobjspace::iter takes the same shape).
             if pyre_object::bytesobject::is_bytes_like(iter) {
                 let len = pyre_object::bytesobject::bytes_like_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                let seq_iter = if pyre_object::bytearrayobject::is_bytearray(iter) {
+                    pyre_object::w_bytearray_iter_new(iter, len)
+                } else {
+                    pyre_object::w_bytes_iter_new(iter, len)
+                };
                 let tos = self.valuestackdepth - 1;
                 self.set_locals_w(tos, seq_iter);
                 return Ok(());
@@ -4053,7 +4057,7 @@ impl IterOpcodeHandler for PyFrame {
             // returns space.newseqiter(self)).
             if pyre_object::interp_array::is_array(iter) {
                 let len = pyre_object::interp_array::w_array_len(iter);
-                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                let seq_iter = pyre_object::w_array_iter_new(iter, len);
                 let tos = self.valuestackdepth - 1;
                 self.set_locals_w(tos, seq_iter);
                 return Ok(());

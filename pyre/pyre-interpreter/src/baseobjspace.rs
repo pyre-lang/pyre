@@ -19600,12 +19600,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::STR_TYPE)? {
                 return Ok(w_iter);
             }
-            // Code-point count (not byte count) seeds the sequence
-            // iterator, read straight from the cached length so a
-            // lone-surrogate backing does not panic.
+            // `unicodeobject.py W_UnicodeObject.descr_iter` returns
+            // `W_FastUnicodeIterObject`.  3.15 splits the visible type by
+            // storage; each constructor stamps a constant type word.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let len = w_str_len(obj);
-            return Ok(pyre_object::w_seq_iter_new(obj, len));
+            if pyre_object::unicodeobject::w_str_is_ascii(obj) {
+                return Ok(pyre_object::w_str_ascii_iter_new(obj, len));
+            }
+            return Ok(pyre_object::w_str_iter_new(obj, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let base = if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -19616,16 +19619,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, base)? {
                 return Ok(w_iter);
             }
-            // The cursor holds the bytes object itself, as the str arm above
-            // does: `space.iter` builds a sequence iterator over the sequence
-            // (`iterobject.py W_SeqIterObject`), it does not unpack it.  A
-            // materialised int list would make `iter(b)` cost O(len) before a
-            // single item is consumed, freeze a bytearray against
-            // mid-iteration mutation, and report the list rather than the
-            // bytes in `__reduce__`.
+            // `stringmethods.py StringMethods.descr_iter` returns
+            // `W_StringIterObject`.  3.15 names bytes vs bytearray
+            // separately; each constructor stamps a constant type word.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let len = pyre_object::bytesobject::bytes_like_len(obj);
-            return Ok(pyre_object::w_seq_iter_new(obj, len));
+            if pyre_object::bytearrayobject::is_bytearray(obj) {
+                return Ok(pyre_object::w_bytearray_iter_new(obj, len));
+            }
+            return Ok(pyre_object::w_bytes_iter_new(obj, len));
         }
         // dict → iterate over keys (`pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
@@ -19825,12 +19827,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `space.newseqiter(self)` (a fresh index cursor, not self).
         if pyre_object::interp_array::is_array(obj) {
             let len = pyre_object::interp_array::w_array_len(obj);
-            return Ok(pyre_object::w_seq_iter_new(obj, len));
+            return Ok(pyre_object::w_array_iter_new(obj, len));
         }
-        // `memoryview` — `memoryobject.py descr_iter` returns
-        // `space.newseqiter(self)`; the cursor fetches each element through
-        // `__getitem__`.  Element count is `memory_length`'s `shape[0]`, which
-        // is `length / itemsize` only while the view is one-dimensional.
+        // `memoryview` — `memoryobject.py` has no `descr_iter`;
+        // `descroperation.py iter` falls through to `space.newseqiter`.
+        // The cursor fetches each element through `__getitem__`.  Element
+        // count is `memory_length`'s `shape[0]`, which is
+        // `length / itemsize` only while the view is one-dimensional.
         if pyre_object::memoryview::is_w_memoryview(obj) {
             if pyre_object::memoryview::w_memoryview_released(obj) {
                 return Err(PyError::value_error(
@@ -19842,7 +19845,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 .copied()
                 .unwrap_or(0)
                 .max(0) as usize;
-            return Ok(pyre_object::w_seq_iter_new(obj, len));
+            return Ok(pyre_object::w_memory_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py `def iter(space, w_obj)`
         // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never

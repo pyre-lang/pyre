@@ -609,7 +609,7 @@ mod tests {
             let _roots = gc_roots::push_roots();
             let seq = gc_roots::pin_root(w_str_new("ab"));
             let iter_slot = gc_roots::shadow_stack_len();
-            let _ = gc_roots::pin_root(w_seq_iter_new(seq, 2));
+            let _ = gc_roots::pin_root(w_str_ascii_iter_new(seq, 2));
             assert!(std::ptr::eq(
                 (*gc_roots::shadow_stack_get(iter_slot)).ob_type,
                 &STR_ASCII_ITER_TYPE
