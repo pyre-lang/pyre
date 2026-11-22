@@ -3298,6 +3298,166 @@ fn oncelock_struct_payload_get_or_init_folds_to_prebuilt_instance() {
     );
 }
 
+fn payload_ptr_ty() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [payload_struct_ty(), "Const"]})
+}
+
+fn oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(
+    rvalue_cast: bool,
+) -> majit_charon_reader::Llbc {
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [usize_scalar()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell_ty, "Shared"]});
+    let usize_ref = serde_json::json!({"Ref": ["Erased", usize_scalar(), "Shared"]});
+    let dest_ty = payload_ptr_ty();
+    let init_ty = unit_fn_ptr();
+    let empty = empty_generics();
+    let usize_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Local": 3}, "ty": usize_ref},
+            "Deref"
+        ]},
+        "ty": usize_scalar()
+    });
+    let cast_rvalue = if rvalue_cast {
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Read": usize_place},
+            dest_ty.clone()
+        ]})
+    } else {
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [usize_scalar(), dest_ty.clone()]}},
+            {"Read": usize_place}
+        ]})
+    };
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [init_ty], "output": dest_ty.clone()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": dest_ty.clone()},
+                    {"index": 1, "name": "init", "span": span_json(), "ty": init_ty},
+                    {"index": 2, "name": "cell", "span": span_json(), "ty": cell_ty},
+                    {"index": 3, "name": "word", "span": span_json(), "ty": usize_ref.clone()}
+                ]},
+                "body": [
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 2}, "ty": cell_ty},
+                            {"Use": [{"Read": {
+                                "kind": {"Global": {"generics": empty.clone(), "id": 1}},
+                                "ty": cell_ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": empty}},
+                            "args": [
+                                {"Read": {"kind": {"Local": 2}, "ty": cell_ref}},
+                                {"Read": {"kind": {"Local": 1}, "ty": init_ty}}
+                            ]}, "dest": {"kind": {"Local": 3}, "ty": usize_ref},
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": dest_ty},
+                            cast_rvalue
+                        ]}
+                    }], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        {
+            let mut get_or_init = std_once_lock_unstructured_get_or_init(1);
+            get_or_init["signature"] = serde_json::json!({
+                "is_unsafe": false,
+                "inputs": [cell_ref, init_ty],
+                "output": usize_ref
+            });
+            get_or_init
+        },
+    ];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(
+                serde_json::json!({"Struct": [
+                    {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+                    {"name": "value", "ty": usize_scalar(), "attr_info": null}
+                ]}),
+                Some(oncelock_fn_value_layout()),
+            ),
+            payload_struct_type_decl(),
+        ],
+        funs,
+        globals,
+    )
+}
+
+/// A refs-keyed `OnceLock<usize>` payload is `llmemory.Address`.
+/// `*ONCE.get_or_init(f) as *const STRUCT` is `gen_cast` Address→Ptr
+/// (`rbuiltin.py` `cast_adr_to_ptr`) of that prebuilt address:
+/// `InstanceRepr.convert_const` / `__cast_instance_intrinsic[<T>]`.
+fn assert_oncelock_usize_cast_to_struct_ptr_is_instance(rvalue_cast: bool) {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(rvalue_cast);
+    assert!(llbc.has_body_under_crate_root("std"));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<usize> as *const STRUCT lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert_eq!(
+        cast_instance_roots(&graph),
+        vec!["Payload".to_string()],
+        "Address-stamped usize as *const STRUCT is SomeInstance(T): {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| !segments.iter().any(|s| s == "get_or_init")),
+        "get_or_init must fold to the refs row: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .all(|segments| segments.last().map(String::as_str) != Some("cast_int_to_ptr")),
+        "Address→Ptr is cast_adr_to_ptr / convert_const, not cast_int_to_ptr: {graph:?}"
+    );
+}
+
+#[test]
+fn oncelock_usize_unary_cast_to_struct_ptr_is_prebuilt_instance() {
+    assert_oncelock_usize_cast_to_struct_ptr_is_instance(false);
+}
+
+#[test]
+fn oncelock_usize_rvalue_cast_to_struct_ptr_is_prebuilt_instance() {
+    assert_oncelock_usize_cast_to_struct_ptr_is_instance(true);
+}
+
 fn generic_cell_payload_ty() -> serde_json::Value {
     serde_json::json!({"Adt": {"id": 2, "generics": empty_generics()}})
 }

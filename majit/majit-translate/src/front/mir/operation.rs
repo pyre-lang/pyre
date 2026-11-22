@@ -2866,17 +2866,27 @@ impl<'a> Lowering<'a> {
                     // (`lltype.py` `ann_cast_opaque_ptr`); aliasing would
                     // keep `SomePtr(GCREF)` on a `SomeInstance(PyObject)`
                     // slot (`pairtype(SomePtr, SomeObject).union`).
-                    if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
-                        match self.ptr_cast_marker(
-                            Some(&ValueType::Ref(None)),
-                            None,
-                            dest_ty,
-                            &arg,
-                            self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &arg),
-                            None,
-                        ) {
-                            Some((op, res)) => return Ok((Some(op), res)),
-                            None => return Ok((None, arg)),
+                    //
+                    // A scalar OnceLock payload is `llmemory.Address`
+                    // (`gen_cast` ORIG Address → `cast_adr_to_ptr`). A
+                    // classed dest is `InstanceRepr.convert_const` of the
+                    // object at that address.
+                    if matches!(dst_kind, ValueType::Ref(_)) {
+                        if let Some((op, res)) = self.address_to_classed_ptr(dest_ty, &arg, None) {
+                            return Ok((Some(op), res));
+                        }
+                        if src_is_prebuilt_once_value {
+                            match self.ptr_cast_marker(
+                                Some(&ValueType::Ref(None)),
+                                None,
+                                dest_ty,
+                                &arg,
+                                self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &arg),
+                                None,
+                            ) {
+                                Some((op, res)) => return Ok((Some(op), res)),
+                                None => return Ok((None, arg)),
+                            }
                         }
                     }
                     let src_width = match &operand {
@@ -3588,6 +3598,10 @@ impl<'a> Lowering<'a> {
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
                     || src_is_pointer_from_ty
                         .unwrap_or_else(|| self.cast_src_is_pointer(None, src_kind.as_ref(), &v));
+                if let Some((op, res)) = self.address_to_classed_ptr(&ty, &v, src_ty_owned.as_ref())
+                {
+                    return Ok((Some(op), res));
+                }
                 if cast_kind_is_unsize(&kind)
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
@@ -5952,10 +5966,12 @@ impl<'a> Lowering<'a> {
     ///   makes `is_(p, None)` of that word fold False (`binaryop.py`
     ///   `is__default`, `SomePtr.can_be_none` is false).
     ///
-    /// A `Ref` source is required for the narrow / address arms: an
-    /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
-    /// territory and must alias instead. Dest-Str is the STR exception
-    /// for a pointer source (`rbuiltin.py` `gen_cast`). Dest-Str restore
+    /// A `Ref` source is required for the narrow / address arms. A
+    /// Primitive `usize as *const Struct` is `cast_int_to_ptr`. An
+    /// Address-stamped word (`llmemory.Address`) is `gen_cast`
+    /// `cast_adr_to_ptr` ([`Self::address_to_classed_ptr`]). Dest-Str is
+    /// the STR exception for a pointer source (`rbuiltin.py` `gen_cast`).
+    /// Dest-Str restore
     /// also accepts a `Str` source — the same rstr `STR` header at a
     /// different pointer mutability (`*mut UnicodeValueStorage` →
     /// `*const UnicodeValueStorage`). Two-phase may seed that Input as
@@ -6006,6 +6022,38 @@ impl<'a> Lowering<'a> {
                 lltype_is_ccharp(ct)
                     || ct == &*crate::translator::rtyper::lltypesystem::lltype::GCREF
             })
+    }
+
+    /// `rbuiltin.py` `gen_cast` when `ORIG == llmemory.Address` and `TGT`
+    /// is a `Ptr` of a classed struct: `cast_adr_to_ptr` of a prebuilt
+    /// address is that object's `ConstPtr` (`bookkeeper.py`
+    /// `Bookkeeper.immutablevalue` / `rclass.py`
+    /// `InstanceRepr.convert_const`). Same shape as a STRUCT OnceLock
+    /// payload: `__cast_instance_intrinsic[<T>]` of the Address word.
+    /// A Primitive integer keeps `cast_int_to_ptr`.
+    pub(in crate::front::mir) fn address_to_classed_ptr(
+        &mut self,
+        dest_ty: &TyRef,
+        arg: &Variable,
+        src_ty: Option<&TyRef>,
+    ) -> Option<(OpKind, Variable)> {
+        if !matches!(
+            arg.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ) {
+            return None;
+        }
+        if !matches!(self.value_type_of(dest_ty), ValueType::Ref(_)) {
+            return None;
+        }
+        self.ptr_cast_marker(
+            Some(&ValueType::Ref(None)),
+            None,
+            dest_ty,
+            arg,
+            true,
+            src_ty,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

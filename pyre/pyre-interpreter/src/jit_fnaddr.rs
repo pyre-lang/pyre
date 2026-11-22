@@ -7747,6 +7747,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "objspace::std::mapdict::TERMINATOR_FOR_DICTS",
             crate::objspace::std::mapdict::terminator_for_dicts_payload_addr(),
         ),
+        // `nestedscope.py` `DUMMY_FAMILY` (`cache.py Cache.getorbuild`).
+        // The Global is a `OnceLock<usize>`; the refs row is the
+        // initialized `CellFamily` payload address / `get_or_init`
+        // return (`bookkeeper.py immutablevalue` of that object).
+        (
+            "nestedscope::dummy_family::DUMMY_FAMILY",
+            pyre_object::nestedscope::dummy_family_payload_addr(),
+        ),
         (
             "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
             crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64,
@@ -9709,6 +9717,10 @@ mod tests {
         assert_eq!(
             bindings["objspace::std::mapdict::TERMINATOR_FOR_DICTS"],
             crate::objspace::std::mapdict::terminator_for_dicts_payload_addr()
+        );
+        assert_eq!(
+            bindings["nestedscope::dummy_family::DUMMY_FAMILY"],
+            pyre_object::nestedscope::dummy_family_payload_addr()
         );
         assert_eq!(
             bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],

@@ -207,6 +207,15 @@ pub fn dummy_family() -> *const CellFamily {
     }) as *const CellFamily
 }
 
+/// Address of the initialized [`dummy_family`] payload
+/// (`nestedscope.py` `DUMMY_FAMILY`). The refs row is this object,
+/// not the `OnceLock` container (`cache.py` `Cache.getorbuild` /
+/// `bookkeeper.py` `Bookkeeper.immutablevalue`). The immortal never
+/// moves; relocation is the existing `StaticAddr` pairing.
+pub fn dummy_family_payload_addr() -> i64 {
+    dummy_family() as i64
+}
+
 /// Python cell object.
 ///
 /// Layout: `[ob_type: *const PyType | contents: PyObjectRef | family]`
@@ -527,6 +536,7 @@ mod tests {
             assert!((*dummy_family()).ever_mutated.get());
         }
         assert_eq!(dummy_family(), dummy_family());
+        assert_eq!(dummy_family_payload_addr(), dummy_family() as i64);
     }
 
     /// `nestedscope.py Cell.get` falls through to `w_value` when the family
