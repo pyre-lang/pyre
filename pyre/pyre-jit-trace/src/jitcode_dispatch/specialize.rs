@@ -19502,7 +19502,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         }
     }
 
-    let (Some(list_obj), Some(value_obj)) = (
+    let (Some(_), Some(_)) = (
         walker_concrete_ref_object(ctx, list_op),
         walker_concrete_ref_object(ctx, value_op),
     ) else {
@@ -19512,10 +19512,11 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         return Ok(None);
     };
     fbw_bump_executed_effect("store_journal");
-    // Overwrite is idempotent: a residual the sub-walk already executed
-    // wrote this same value.
-    let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };
-    debug_assert!(stored, "orthodox list setitem: in-bounds store failed");
+    // `execute_and_record` runs `executor.execute` then `_record_helper`.
+    // The lowered `list.{int,float,obj}_setitem` (`do_resizable_list_setitem`)
+    // is `setarrayitem_gc_via_heapcache` → `walker_execute_setarrayitem_gc`;
+    // a store that cannot run is `walker_gc_store_not_executed`, which
+    // declines the helper (`inline_subwalk`) instead of `SubReturn`.
     Ok(Some(()))
 }
 
