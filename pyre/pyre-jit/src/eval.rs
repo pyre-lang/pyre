@@ -2359,7 +2359,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         |gc: &mut MiniMarkGC,
          pytype_to_tid: &mut HashMap<usize, u32>,
          descr: &'static pyre_object::lltype::PyreClassDescriptor,
-         memory_pressure_offset: Option<usize>|
+         memory_pressure_offset: Option<usize>,
+         destructor: Option<majit_gc::trace::DestructorFn>|
          -> u32 {
             let tid = gc.get_type_id(GcTypeKey::of(descr.gc_type_id), || {
                 let parent_tid = if descr.mapdict_user_layout {
@@ -2387,6 +2388,11 @@ fn build_gc() -> Box<MiniMarkGC> {
                 };
                 if let Some(offset) = memory_pressure_offset {
                     type_info = type_info.with_memory_pressure_offset(offset);
+                }
+                // `encode_type_shape` / `make_destructor_funcptr_for_type`
+                // record the destructor on the TYPE_INFO row at construction.
+                if let Some(destructor) = destructor {
+                    type_info = type_info.with_destructor_fn(destructor);
                 }
                 type_info
             });
@@ -2417,7 +2423,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         |gc: &mut MiniMarkGC,
          pytype_to_tid: &mut HashMap<usize, u32>,
          descr: &'static pyre_object::lltype::PyreClassDescriptor|
-         -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
+         -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None, None) };
     // The GC types `pyre-module` owns, each declaring its own layout and sweep
     // destructor. They register after every interpreter class, so an
     // interpreter without the module hooks keeps the same ids for its own.
@@ -2434,15 +2440,13 @@ fn build_gc() -> Box<MiniMarkGC> {
                     ModuleGcLayout::PyreClass {
                         memory_pressure_offset,
                     } => {
-                        let tid = register_pyre_class_with_pressure(
+                        register_pyre_class_with_pressure(
                             gc,
                             pytype_to_tid,
                             descr,
                             memory_pressure_offset,
+                            ty.destructor,
                         );
-                        if let Some(destructor) = ty.destructor {
-                            gc.types.set_destructor(tid, destructor);
-                        }
                         continue;
                     }
                     ModuleGcLayout::Object => {
@@ -2720,27 +2724,28 @@ fn build_gc() -> Box<MiniMarkGC> {
     // field each: w_function) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop so the GC
     // walker reaches the inline descriptor refs.
-    let property_tid = register_pyre_class(
+    // All three own `QuasiImmutField`s, which the type census does not reach.
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::descriptor::W_Property as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(property_destructor),
     );
-    let staticmethod_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::StaticMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(staticmethod_destructor),
     );
-    let classmethod_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::ClassMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(classmethod_destructor),
     );
-    // All three own `QuasiImmutField`s, which the type census does not reach.
-    gc.types.set_destructor(property_tid, property_destructor);
-    gc.types
-        .set_destructor(staticmethod_tid, staticmethod_destructor);
-    gc.types
-        .set_destructor(classmethod_tid, classmethod_destructor);
     // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop because that
     // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,
@@ -4842,13 +4847,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_object::descriptor::W_SUPER_USER_PYRE_CLASS_DESCRIPTOR,
     );
-    let property_user_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::descriptor::W_PROPERTY_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(property_destructor),
     );
-    gc.types
-        .set_destructor(property_user_tid, property_destructor);
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -5021,22 +5026,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Parents are the builtin tids already registered above (20, 21).
     // `QuasiImmutField` reclamation is the base destructor: the user struct
     // is that payload as a prefix.
-    let staticmethod_user_tid = register_pyre_class(
+    let staticmethod_user_tid = register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::function::W_STATICMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(staticmethod_destructor),
     );
     assert_eq!(staticmethod_user_tid, 202);
-    gc.types
-        .set_destructor(staticmethod_user_tid, staticmethod_destructor);
-    let classmethod_user_tid = register_pyre_class(
+    let classmethod_user_tid = register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::function::W_CLASSMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(classmethod_destructor),
     );
     assert_eq!(classmethod_user_tid, 203);
-    gc.types
-        .set_destructor(classmethod_user_tid, classmethod_destructor);
     // `ModuleUser` (`typedef.py` `_getusercls`). Subclass instances are
     // traced as a module plus its mapdict storage. The trace walks
     // `W_MODULE_GC_PTR_OFFSETS`. The typed `w_dict` stays the namespace.

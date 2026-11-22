@@ -44,7 +44,7 @@ impl GcClock {
 }
 
 use crate::GcFlags;
-use crate::address_dict::AddressMap;
+use crate::address_dict::{AddressMap, AddressSet};
 use crate::header::{GcHeader, header_of};
 use crate::hook::GcHooks;
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
@@ -1820,10 +1820,13 @@ impl MiniMarkGC {
     ) -> GcRef {
         let (card_header_bytes, extra_flags) =
             self.card_header_and_flags(total_size, length, has_gc_ptrs_in_var, false);
+        // incminimark.py `external_malloc`: `threshold_reached` before the block exists.
+        let threshold_reached = self.threshold_reached(total_size);
         let ptr = self
             .oldgen
             .alloc_with_card_header(total_size, card_header_bytes);
-        let obj = self.finish_alloc_in_oldgen(type_id, total_size, ptr, extra_flags);
+        let obj =
+            self.finish_alloc_in_oldgen(type_id, total_size, ptr, extra_flags, threshold_reached);
         Self::raw_memclear(obj, total_size);
         obj
     }
@@ -3433,8 +3436,16 @@ impl MiniMarkGC {
     }
 
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        // incminimark.py `external_malloc`: `threshold_reached` before the block exists.
+        let threshold_reached = self.threshold_reached(total_size);
         let ptr = self.oldgen.alloc(total_size);
-        self.finish_alloc_in_oldgen(type_id, total_size, ptr, GcFlags::empty())
+        self.finish_alloc_in_oldgen(
+            type_id,
+            total_size,
+            ptr,
+            GcFlags::empty(),
+            threshold_reached,
+        )
     }
 
     /// `framework.py gct_do_malloc_fixedsize_clear`: the plain malloc
@@ -3511,8 +3522,16 @@ impl MiniMarkGC {
     /// Fallible old-gen allocation used by host allocation hooks. Upstream
     /// rawmalloc failure returns NULL so the caller can raise `MemoryError`.
     fn try_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> Option<GcRef> {
+        // incminimark.py `external_malloc`: `threshold_reached` before the block exists.
+        let threshold_reached = self.threshold_reached(total_size);
         let ptr = self.oldgen.try_alloc(total_size)?;
-        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr, GcFlags::empty()))
+        Some(self.finish_alloc_in_oldgen(
+            type_id,
+            total_size,
+            ptr,
+            GcFlags::empty(),
+            threshold_reached,
+        ))
     }
 
     /// `PYRE_GC_SIZE_AUDIT`: refuse a block too small for the type its header
@@ -3582,6 +3601,7 @@ impl MiniMarkGC {
         total_size: usize,
         ptr: *mut u8,
         extra_flags: GcFlags,
+        threshold_reached: bool,
     ) -> GcRef {
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
@@ -3603,7 +3623,7 @@ impl MiniMarkGC {
         if !Self::oldgen_birth_diagnostics_enabled()
             && ((type_id as usize) >= self.types.len() || self.type_alloc_is_plain(type_id))
         {
-            if self.threshold_reached(total_size) {
+            if threshold_reached {
                 arm_deferred_major_if_wanted();
             }
             return GcRef(obj_addr);
@@ -3654,6 +3674,13 @@ impl MiniMarkGC {
             total_size - GcHeader::SIZE,
             crate::BH_PROBE_ORIGIN_BORN_OLD,
         );
+        // incminimark.py `external_malloc` asks
+        // `threshold_reached(raw_malloc_usage(totalsize))` before the block
+        // exists. The caller computed `threshold_reached` then, because
+        // `oldgen.alloc` has already added the block to
+        // `get_total_memory_used()` by the time this function runs, and asking
+        // here would count it twice (once in the used total, once as `extra`).
+        //
         // Collecting entries already ran `maybe_collect_for_external_malloc`
         // before the block exists. A no-collect path still cannot root the
         // caller's native locals, so it only arms the eval-breaker for the
@@ -3663,7 +3690,7 @@ impl MiniMarkGC {
         // reached until a major completes, so arming past a consumer that
         // refuses re-arms on every following allocation.
         // See [`DEFERRED_MAJOR_REQUEST_PROBE`].
-        if self.threshold_reached(total_size) {
+        if threshold_reached {
             arm_deferred_major_if_wanted();
         }
         GcRef(obj_addr)
@@ -7948,20 +7975,19 @@ impl MiniMarkGC {
     /// them), prebuilt/static objects, and registered finalizers
     /// (`enumerate_all_root_values`).
     ///
-    /// Upstream keeps its seen set and pending stack as GC-side `AddressDict` /
-    /// `AddressStack` because it has no other allocator; here they are ordinary
-    /// Rust containers, which is the same structure without the bookkeeping.
-    /// The parent map is the same kind of container: each object records the
-    /// holder that reached it, so a slot that does not name an object can
+    /// The seen set and pending stack are `base.py`'s `_debug_seen =
+    /// AddressDict()` and `_debug_pending = self.AddressStack()`: the
+    /// collector's address-hashed [`AddressSet`] and the `Vec<usize>` it uses
+    /// for every `AddressStack`. The parent map is an [`AddressMap`]: each
+    /// object records the holder that reached it, so a slot that does not name an object can
     /// report that holder and the root the walk started from. `GCBase.trace`
     /// receives a typed pointer and would not load an integer; this walk
     /// validates before the load of the child header.
     fn debug_check_reachable(&self, site: &'static str) {
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen = AddressSet::default();
         let mut pending: Vec<usize> = Vec::new();
         // child -> (holder, slot address). A root has no entry.
-        let mut parent: std::collections::HashMap<usize, (usize, usize)> =
-            std::collections::HashMap::new();
+        let mut parent: AddressMap<(usize, usize)> = AddressMap::default();
         let labeled: Vec<(GcRef, &'static str)> = {
             let mut v = self.enumerate_labeled_root_walker_values();
             for root in self.enumerate_all_root_values() {
@@ -8163,10 +8189,7 @@ impl MiniMarkGC {
     }
 
     /// Walk the parent map to the object that entered the graph as a root.
-    fn debug_reach_root(
-        start: usize,
-        parent: &std::collections::HashMap<usize, (usize, usize)>,
-    ) -> usize {
+    fn debug_reach_root(start: usize, parent: &AddressMap<(usize, usize)>) -> usize {
         let mut addr = start;
         let limit = parent.len().saturating_add(1);
         for _ in 0..limit {
@@ -8255,7 +8278,7 @@ impl MiniMarkGC {
         holder_tid: u32,
         slot_addr: usize,
         value: usize,
-        parent: &std::collections::HashMap<usize, (usize, usize)>,
+        parent: &AddressMap<(usize, usize)>,
     ) -> ! {
         let offset = slot_addr.wrapping_sub(holder);
         let holder_type = self.debug_object_type_name(holder, holder_tid);
@@ -12309,6 +12332,25 @@ mod tests {
         })
     }
 
+    /// `incminimark.py` `malloc_zero_filled = False`: allocation sites
+    /// initialize GC-pointer fields. Tests that leave a slot unset write
+    /// null so a poisoned nursery is not traced as a referent.
+    fn write_null_gc_ptrs(gc: &MiniMarkGC, obj: GcRef) {
+        if obj.is_null() {
+            return;
+        }
+        let type_id = unsafe { (*header_of(obj.0)).type_id() };
+        if (type_id as usize) >= gc.types.len() {
+            return;
+        }
+        let info = gc.types.get(type_id);
+        unsafe {
+            for &offset in &info.gc_ptr_offsets {
+                *((obj.0 + offset) as *mut GcRef) = GcRef(0);
+            }
+        }
+    }
+
     /// The ring's front arena is installed on every minor collection, so a
     /// rotating allocator has no range that stays fixed for its lifetime and
     /// nothing for `publish_singleton_nursery` to capture.
@@ -13095,9 +13137,7 @@ mod tests {
     #[test]
     fn a_young_rawmalloced_object_is_generation_zero() {
         let mut gc = test_gc(4096);
-        let mut info = TypeInfo::simple(16);
-        info.is_object = true;
-        let tid = gc.register_type(info);
+        let tid = gc.register_type(TypeInfo::object(16));
         let large = gc.config.large_object_threshold + 64;
 
         let mut root = gc.alloc_with_type(tid, large);
@@ -13312,6 +13352,49 @@ mod tests {
 
         set_deferred_major_request_probe(None);
         majit_ir::eval_breaker_word::take_gc();
+    }
+
+    /// `external_malloc` (incminimark.py) asks
+    /// `threshold_reached(raw_malloc_usage(totalsize))` before the block
+    /// exists. Asking after `oldgen.alloc` has added the block to
+    /// `get_total_memory_used()` counts it twice — once in the used total,
+    /// once as `extra`.
+    #[test]
+    fn born_old_allocation_asks_threshold_reached_before_the_block_exists() {
+        let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
+        let _clear = ClearDeferredMajorProbe;
+        fn accept() -> bool {
+            true
+        }
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::object(64));
+        let size = GcHeader::SIZE + 64;
+        set_deferred_major_request_probe(Some(accept));
+        majit_ir::eval_breaker_word::take_gc();
+
+        // `total_memory_used + size` is just below the threshold: before birth
+        // `threshold_reached(size)` is false, but after the block is in the
+        // used total the same question would be true.
+        let used = gc.get_total_memory_used();
+        gc.set_next_major_collection_threshold((used + size) as f64);
+        assert!(!gc.threshold_reached(size));
+        gc.alloc_in_oldgen_clear(tid, size);
+        assert!(
+            !majit_ir::eval_breaker_word::take_gc(),
+            "a before-birth miss must not arm just because the new block is now in the used total"
+        );
+        assert!(
+            gc.threshold_reached(size),
+            "after birth the double-count question would have fired"
+        );
+
+        gc.set_next_major_collection_threshold(gc.get_total_memory_used() as f64);
+        assert!(gc.threshold_reached(size));
+        gc.alloc_in_oldgen_clear(tid, size);
+        assert!(majit_ir::eval_breaker_word::take_gc());
+
+        set_deferred_major_request_probe(None);
     }
 
     /// `external_malloc(..., alloc_young=True)` on the collecting path: the
@@ -13548,11 +13631,11 @@ mod tests {
     fn get_referents_looks_through_rpython_structs_and_stops_at_objects() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
-        let pair_info = || TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, ptr_size]);
-        let raw_tid = gc.register_type(pair_info());
-        let mut object_info = pair_info();
-        object_info.is_object = true;
-        let object_tid = gc.register_type(object_info);
+        let raw_tid = gc.register_type(TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, ptr_size]));
+        let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(
+            2 * ptr_size,
+            vec![0, ptr_size],
+        ));
 
         // holder -> raw -> {near, far}; `far` in turn points back at `holder`,
         // which must not be reported: the walk stops at the first object.
@@ -13560,6 +13643,10 @@ mod tests {
         let far = gc.alloc_with_type(object_tid, 2 * ptr_size);
         let raw = gc.alloc_with_type(raw_tid, 2 * ptr_size);
         let mut holder = gc.alloc_with_type(object_tid, 2 * ptr_size);
+        write_null_gc_ptrs(&gc, near);
+        write_null_gc_ptrs(&gc, far);
+        write_null_gc_ptrs(&gc, raw);
+        write_null_gc_ptrs(&gc, holder);
         unsafe {
             *(raw.0 as *mut GcRef) = near;
             *((raw.0 + ptr_size) as *mut GcRef) = far;
@@ -14854,9 +14941,7 @@ mod tests {
     #[test]
     fn freeze_keeps_objects_alive_until_unfreeze() {
         let mut gc = test_gc(4096);
-        let mut info = TypeInfo::simple(16);
-        info.is_object = true;
-        let tid = gc.register_type(info);
+        let tid = gc.register_type(TypeInfo::object(16));
         let mut obj = gc.alloc_with_type(tid, 16);
         unsafe { gc.roots.add(&mut obj) };
         gc.freeze();
@@ -14879,9 +14964,7 @@ mod tests {
     #[test]
     fn freeze_does_not_free_old_garbage_and_is_frozen_tracks_the_set() {
         let mut gc = test_gc(4096);
-        let mut info = TypeInfo::simple(16);
-        info.is_object = true;
-        let tid = gc.register_type(info);
+        let tid = gc.register_type(TypeInfo::object(16));
         let garbage = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut obj = gc.alloc_with_type(tid, 16);
         unsafe { gc.roots.add(&mut obj) };
@@ -15378,6 +15461,8 @@ mod tests {
         // Create two objects: parent -> child.
         let child = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
         let parent = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
+        write_null_gc_ptrs(&gc, child);
+        write_null_gc_ptrs(&gc, parent);
 
         // Write child's address into parent's first field.
         unsafe {
@@ -15416,6 +15501,7 @@ mod tests {
         ));
 
         let shared = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
+        write_null_gc_ptrs(&gc, shared);
         let mut root1 = shared;
         let mut root2 = shared;
 

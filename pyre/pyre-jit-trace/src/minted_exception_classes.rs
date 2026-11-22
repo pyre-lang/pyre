@@ -80,9 +80,10 @@ fn alloc_with_del_for_index(index: usize, vtable: usize) -> i64 {
 /// into the header.
 ///
 /// `parent` `None` uses `host_exc_tid`. A `Some` index must name an
-/// earlier row. A row with a destructor attaches it before registration
-/// (`young_objects_with_destructors` reads it at alloc) and again with
-/// `set_destructor`. Returns the tid of each row, in order.
+/// earlier row. A row with a destructor is registered through
+/// `TypeInfo::with_destructor_fn` (`encode_type_shape` /
+/// `make_destructor_funcptr_for_type`); `young_objects_with_destructors`
+/// reads it at alloc. Returns the tid of each row, in order.
 pub fn register_minted_exception_classes(
     gc: &mut MiniMarkGC,
     rows: &[MintedExceptionClass],
@@ -116,9 +117,6 @@ pub fn register_minted_exception_classes(
         let tid = gc.register_type(info);
         let pytype = row.pytype as *const pyre_object::PyType as usize;
         majit_gc::GcAllocator::register_vtable_for_type(gc, pytype, tid);
-        if let Some(destructor) = row.destructor {
-            gc.types.set_destructor(tid, destructor);
-        }
         tids.push(tid);
     }
     tids
@@ -602,15 +600,10 @@ mod tests {
 
         majit_gc::gc_sync::gc_op(|gc| {
             let object_size = std::mem::size_of::<pyre_object::PyObject>();
-            if gc.types.len() > tid as usize {
-                let info = gc.types.get(tid);
-                assert!(
-                    info.old_style_finalizer.is_none(),
-                    "minted tid {tid} already has an old-style finalizer; set_destructor cannot attach the counting destructor"
-                );
-                gc.types.set_destructor(tid, minted_raw_counting_destructor);
-                return;
-            }
+            assert!(
+                gc.types.len() <= tid as usize,
+                "minted tid {tid} already registered; destructor belongs on TypeInfo at registration"
+            );
             while gc.types.len() < tid as usize {
                 let id = gc.register_type(majit_gc::trace::TypeInfo::object(object_size));
                 assert!(id < tid);

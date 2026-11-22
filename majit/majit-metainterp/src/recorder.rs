@@ -1993,7 +1993,7 @@ impl Trace {
             let nops = pos._count.saturating_sub(n) as usize;
             self.slots.truncate(nops);
             let nvalues = pos._index.saturating_sub(n) as usize;
-            self.value_slots.truncate(nvalues);
+            self.truncate_value_slots(nvalues);
             self.op_count = pos._count;
             self.box_count = pos._index;
             self.ops.clear();
@@ -2001,10 +2001,20 @@ impl Trace {
         }
         self.ops.truncate(pos._pos);
         let n = self.max_num_inputargs;
-        self.value_slots
-            .truncate(pos._index.saturating_sub(n) as usize);
+        self.truncate_value_slots(pos._index.saturating_sub(n) as usize);
         self.op_count = pos._count;
         self.box_count = pos._index;
+    }
+
+    /// The value-slot half of `cut_at`: the recorder returns to the saved
+    /// position, so [`Self::young_ref_slots`] keeps only the slots that still
+    /// exist. A dropped index would otherwise name whatever box is recorded
+    /// at that position next, and list it a second time.
+    fn truncate_value_slots(&mut self, len: usize) {
+        self.value_slots.truncate(len);
+        self.young_ref_slots
+            .get_mut()
+            .retain(|&slot| (slot as usize) < len);
     }
 
     /// history.py `History.length`: `self.trace._count - len(self.trace.inputargs)`.
@@ -2405,10 +2415,8 @@ impl Trace {
     ) {
         let young = std::mem::take(&mut *self.young_ref_slots.borrow_mut());
         for slot in young {
-            // `Trace::cut` may have truncated `value_slots` past it.
-            let Some(vs) = self.value_slots.get(slot as usize) else {
-                continue;
-            };
+            // `Trace::cut` drops a listed slot together with the slot itself.
+            let vs = &self.value_slots[slot as usize];
             vs.young_listed.set(false);
             Self::settle_concrete_ref(vs, classify);
             if let Some(v) = vs.concrete.get()
@@ -2744,6 +2752,24 @@ mod tests {
         rec.cut(saved);
         assert_eq!(rec.num_ops(), 0);
         assert_eq!(rec.num_inputargs(), 1);
+    }
+
+    /// `cut_at` restores the recorder to the saved position: a slot listed
+    /// on `young_ref_slots` past that position leaves the list with it.
+    #[test]
+    fn cut_drops_young_ref_slots_past_the_position() {
+        let mut rec = Trace::new();
+        rec.record_input_arg(Type::Ref);
+        let kept = rec.record_op(OpCode::New, &[]);
+        let saved = rec.get_position();
+        let dropped = rec.record_op(OpCode::New, &[]);
+        let young = GcRef(0x1000);
+        assert!(rec.set_concrete_at(kept.raw(), Value::Ref(young)));
+        assert!(rec.set_concrete_at(dropped.raw(), Value::Ref(young)));
+        assert_eq!(rec.young_ref_slots.borrow().len(), 2);
+        rec.cut(saved);
+        let kept_slot = (kept.raw() - rec.box_prefix()) as u32;
+        assert_eq!(*rec.young_ref_slots.borrow(), vec![kept_slot]);
     }
 
     /// A flag set on a box, then `cut` before it, then a new box at the

@@ -23298,6 +23298,22 @@ mod tests {
         OpRc::new(o)
     }
 
+    /// `rewrite.py` `gen_initialize_tid`: `GcStore` of the constant tid at
+    /// offset `-GcHeader::SIZE`, width one word. `following_nursery_tid`
+    /// matches this as the op immediately after a nursery malloc.
+    fn gc_store_initialize_tid(obj: OpRef, tid: i64) -> majit_ir::OpRc {
+        mk_op(
+            OpCode::GcStore,
+            &[
+                obj,
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(tid),
+                OpRef::const_int(std::mem::size_of::<usize>() as i64),
+            ],
+            OpRef::NONE.raw(),
+        )
+    }
+
     fn compile_eval_breaker_poll_trace(
         trace_id: u64,
         word_addr: usize,
@@ -34408,7 +34424,7 @@ mod tests {
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
-        gc.register_type(TypeInfo::simple(payload_size));
+        let tid = gc.register_type(TypeInfo::simple(payload_size));
 
         let mut backend = backend_with_gc(gc);
 
@@ -34430,8 +34446,11 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
             mk_op(OpCode::CallMallocNursery, &[size_arg], 0),
+            gc_store_initialize_tid(OpRef::ref_op(0), tid as i64),
             mk_op(OpCode::CallMallocNursery, &[size_arg], 1),
+            gc_store_initialize_tid(OpRef::ref_op(1), tid as i64),
             mk_op(OpCode::CallMallocNursery, &[size_arg], 2), // overflows
+            gc_store_initialize_tid(OpRef::ref_op(2), tid as i64),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
@@ -34471,7 +34490,7 @@ mod tests {
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
-        gc.register_type(TypeInfo::simple(16));
+        let tid = gc.register_type(TypeInfo::simple(16));
 
         let mut backend = backend_with_gc(gc);
 
@@ -34480,6 +34499,7 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 0),
+            gc_store_initialize_tid(OpRef::ref_op(0), tid as i64),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::ref_op(0), OpRef::const_int(111)],
@@ -34487,6 +34507,7 @@ mod tests {
                 fd.clone(),
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32)], 1),
+            gc_store_initialize_tid(OpRef::ref_op(1), tid as i64),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::ref_op(1), OpRef::const_int(222)],
@@ -34494,6 +34515,7 @@ mod tests {
                 fd,
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
+            gc_store_initialize_tid(OpRef::ref_op(2), tid as i64),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::ref_op(0), OpRef::ref_op(1), OpRef::ref_op(2)],
@@ -34528,7 +34550,10 @@ mod tests {
         let young_node_tid = gc.register_type(TypeInfo::simple(16));
 
         let mut root = gc.alloc_with_type(old_root_tid, 8);
+        // `rewrite.py` `clear_gc_fields`: a GC-pointer slot the bump leaves
+        // untouched must be NULL before the object is traced.
         unsafe {
+            *(root.0 as *mut usize) = 0;
             gc.add_root(&mut root as *mut GcRef);
         }
         gc.collect_nursery();
@@ -34548,6 +34573,7 @@ mod tests {
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 1),
+            gc_store_initialize_tid(OpRef::ref_op(1), young_node_tid as i64),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::ref_op(1), OpRef::const_int(777)],
@@ -34561,6 +34587,7 @@ mod tests {
                 ref_fd,
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
+            gc_store_initialize_tid(OpRef::ref_op(2), young_node_tid as i64),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_ref(0)],
@@ -36212,7 +36239,7 @@ mod tests {
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
-        gc.register_type(TypeInfo::simple(16));
+        let tid = gc.register_type(TypeInfo::simple(16));
         let mut backend = backend_with_gc(gc);
         let args = [
             OpRef::input_arg_int(0),
@@ -36261,6 +36288,7 @@ mod tests {
                 5,
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 6),
+            gc_store_initialize_tid(OpRef::ref_op(6), tid as i64),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::ref_op(6), OpRef::const_int(99)],
@@ -36268,6 +36296,7 @@ mod tests {
                 field,
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 7),
+            gc_store_initialize_tid(OpRef::ref_op(7), tid as i64),
             fail,
             mk_op(OpCode::Finish, &[OpRef::ref_op(6)], OpRef::NONE.raw()),
         ];
@@ -36522,7 +36551,7 @@ mod tests {
             large_object_threshold: 1024,
             ..GcConfig::default()
         });
-        gc.register_type(TypeInfo::simple(16));
+        let tid = gc.register_type(TypeInfo::simple(16));
         let mut backend = backend_with_gc(gc);
         let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::input_arg_int(1);
@@ -36556,6 +36585,7 @@ mod tests {
         let bridge_ops = vec![
             mk_op(OpCode::IntAdd, &[i0, OpRef::const_int(1)], 2),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 4),
+            gc_store_initialize_tid(OpRef::ref_op(4), tid as i64),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
                 &[OpRef::ref_op(4), OpRef::const_int(99)],
@@ -36564,6 +36594,7 @@ mod tests {
             ),
             mk_op_with_descr(OpCode::Label, &[i1], OpRef::NONE.raw(), label_t),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 5),
+            gc_store_initialize_tid(OpRef::ref_op(5), tid as i64),
             fail,
             mk_op(OpCode::Finish, &[i1], OpRef::NONE.raw()),
         ];

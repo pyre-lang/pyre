@@ -4901,7 +4901,7 @@ mod tests {
         JF_FRAME_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, LENGTHOFS, SIGN_SIZE,
     };
     use majit_gc::collector::{GcConfig, MiniMarkGC};
-    use majit_gc::header::header_of;
+    use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
     use majit_ir::descr::SimpleArrayDescr;
     use majit_ir::operand::Operand;
@@ -4986,6 +4986,21 @@ mod tests {
         let op = Op::new(opcode, &bx);
         op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         OpRc::new(op)
+    }
+
+    /// `rewrite.py` `gen_initialize_tid`: `GcStore` of the constant tid at
+    /// offset `-GcHeader::SIZE`, width one word.
+    fn gc_store_initialize_tid(obj: OpRef, tid: i64) -> majit_ir::OpRc {
+        mk_op(
+            OpCode::GcStore,
+            &[
+                obj,
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(tid),
+                OpRef::const_int(std::mem::size_of::<usize>() as i64),
+            ],
+            OpRef::NONE.raw(),
+        )
     }
 
     fn make_plain_call_descr(arg_types: Vec<Type>, result_type: Type) -> DescrRef {
@@ -5458,7 +5473,7 @@ mod tests {
             ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
-        gc.register_type(TypeInfo::simple(24));
+        let tid = gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
@@ -5468,16 +5483,7 @@ mod tests {
         let inputargs = vec![];
         let ops = vec![
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
-            mk_op(
-                OpCode::GcStore,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::const_int(-8_i64),
-                    OpRef::const_int(1_i64),
-                    OpRef::const_int(8_i64),
-                ],
-                OpRef::NONE.raw(),
-            ),
+            gc_store_initialize_tid(OpRef::ref_op(0), tid as i64),
             mk_op(
                 OpCode::GcStore,
                 &[
@@ -5499,8 +5505,11 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 1),
+            gc_store_initialize_tid(OpRef::ref_op(1), tid as i64),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 2),
+            gc_store_initialize_tid(OpRef::ref_op(2), tid as i64),
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 3),
+            gc_store_initialize_tid(OpRef::ref_op(3), tid as i64),
             mk_op(
                 OpCode::Finish,
                 &[
