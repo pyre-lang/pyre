@@ -3561,6 +3561,20 @@ impl<'a> Lowering<'a> {
             && (cell_reborrow || !self.multi_assigned_locals.contains(&dest_local))
     }
 
+    /// Whether `_i = &*p` of a primitive pointer records `p` on
+    /// [`Self::scalar_address_locals`]. A `Ref` dest produces the address
+    /// only when this is true (`cast_ptr_to_adr`); a multiply assigned
+    /// dest loads the pointee (`rewrite_op_raw_load`). A `RawPtr` dest
+    /// is an address by type and does not consult this predicate.
+    pub(in crate::front::mir) fn records_scalar_address(
+        &self,
+        dest_local: usize,
+        place: &Place,
+    ) -> bool {
+        self.raw_primitive_reborrow_inner(place).is_some()
+            && !self.multi_assigned_locals.contains(&dest_local)
+    }
+
     pub(in crate::front::mir) fn lower_assign(
         &mut self,
         mir_bb: usize,
@@ -3752,11 +3766,9 @@ impl<'a> Lowering<'a> {
                     // `&mut *p` of a raw pointer is that same address
                     // (`cast_ptr_to_adr`); `*q` is `rewrite_op_raw_load`,
                     // like a call-returned `&T` on `scalar_address_locals`.
-                    let reborrow = self.raw_primitive_reborrow_inner(&place);
                     if self.records_atomic_ref_place(local, &place) {
                         self.atomic_ref_place.insert(local, place);
-                    } else if reborrow.is_some()
-                        && !self.multi_assigned_locals.contains(&local)
+                    } else if self.records_scalar_address(local, &place)
                         && !self.scalar_address_locals.contains(&local)
                     {
                         self.scalar_address_locals.push(local);

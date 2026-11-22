@@ -1921,6 +1921,17 @@ impl<'a> Lowering<'a> {
             residual_scalar_ref_callee(self.llbc, fd, self.dont_look_inside, &self.oopspec_fns);
         let mut spills = Vec::new();
         for (index, declared) in inputs.iter().enumerate() {
+            // A local on `scalar_address_locals` is already the residual
+            // `&T` / `*T` address (`cast_ptr_to_adr`). A spill cell would
+            // store that address as payload.
+            if arg_locals
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some_and(|local| self.scalar_address_locals.contains(&local))
+            {
+                continue;
+            }
             let residual_ref = residual_ref_callee
                 && declared_residual_scalar_ref(declared, self.llbc, self.gc_struct_ids);
             if raw_scalar_address_value_type(declared, self.llbc).is_none() && !residual_ref {

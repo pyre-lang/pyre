@@ -3428,8 +3428,13 @@ impl<'a> Lowering<'a> {
                     return Ok((None, v));
                 }
                 // `&mut *p` of a raw pointer is `p` (`cast_ptr_to_adr`).
-                // Same predicate as `Rvalue::RawPtr`.
-                if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
+                // Produce the address only when the dest records it
+                // (`records_scalar_address`); otherwise load the pointee
+                // (`rewrite_op_raw_load`). A `RawPtr` dest is an address
+                // by type and does not use this gate.
+                if let Some(inner) = self.raw_primitive_reborrow_inner(&place)
+                    && dest_local.is_some_and(|local| self.records_scalar_address(local, &place))
+                {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
@@ -3475,6 +3480,9 @@ impl<'a> Lowering<'a> {
                     let v = self.defined_local(mir_bb, cell)?;
                     return Ok((None, v));
                 }
+                // `&raw const/mut *p` is the address `p` by type
+                // (`cast_ptr_to_adr`), including a multiply assigned dest.
+                // `*q` is `rewrite_op_raw_load` from that pointer.
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -9299,7 +9307,15 @@ impl<'a> Lowering<'a> {
                         // A local is the slot `mem::replace` writes. A projection
                         // stays the borrowed value: re-resolving it would emit a
                         // fresh field or index read for every borrow.
-                        if matches!(followed.kind, PlaceKind::Local(_)) {
+                        // A recorded `Local(p)` whose target is field-interior
+                        // is `*p` (`InteriorPtrRepr.rtype_getattr` /
+                        // `getinteriorfieldargs`).
+                        if let PlaceKind::Local(followed_local) = followed.kind {
+                            if let Some(value) =
+                                self.field_interior_value_at_use(mir_bb, followed_local as usize)?
+                            {
+                                return Ok(value);
+                            }
                             return self.resolve_place(mir_bb, followed);
                         }
                         if let Some(cell) = self.deref_cell_param_local(&followed) {
