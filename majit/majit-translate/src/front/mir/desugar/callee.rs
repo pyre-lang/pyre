@@ -1603,6 +1603,53 @@ pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
     out
 }
 
+/// Locals whose address the body takes (`&l` / `&raw l`, shared or mut,
+/// or of a field or element of `l` reached without a deref). A dest in
+/// this set does not record a scalar-address representation
+/// (`records_scalar_address`): `&q` of `q = &*p` needs `q` to hold the
+/// loaded word so the nested borrow aliases that scalar.
+pub(in crate::front::mir) fn compute_borrowed_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> Vec<usize> {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    let mut out = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let place = match rvalue {
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
+                _ => continue,
+            };
+            let mut current = place;
+            let local = loop {
+                match &current.kind {
+                    PlaceKind::Projection(inner, elem) => {
+                        if matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
+                            break None;
+                        }
+                        current = inner;
+                    }
+                    PlaceKind::Local(i) => break Some(*i as usize),
+                    PlaceKind::Global { .. } | PlaceKind::Unknown => break None,
+                }
+            };
+            if let Some(i) = local
+                && !out.contains(&i)
+            {
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the
 /// interpreter's repr accumulator) or std `String` (the byte / leaf / module
 /// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a

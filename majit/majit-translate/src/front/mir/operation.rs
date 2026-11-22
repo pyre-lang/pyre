@@ -2480,7 +2480,14 @@ impl<'a> Lowering<'a> {
                     let v = self.defined_local(mir_bb, src_local)?;
                     return Ok((None, v));
                 }
-                let v = self.resolve_operand(mir_bb, operand)?;
+                // A scalar-address source keeps the address only when
+                // the dest records it (`records_copied_scalar_address`).
+                // Otherwise the converter loads (`rewrite_op_raw_load`).
+                let expected = match dest_local {
+                    Some(local) if self.records_copied_scalar_address(local) => None,
+                    _ => Some(dest_ty),
+                };
+                let v = self.resolve_call_arg_value(mir_bb, operand, expected)?;
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
                 // graph never has a redundant `same_as` between two
@@ -3915,7 +3922,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .nth(index)
                             .expect("aggregate_shape checked the operand index");
-                        let value = self.resolve_call_arg_value(mir_bb, operand, None)?;
+                        let value = self.resolve_call_arg_value(mir_bb, operand, Some(dest_ty))?;
                         // `GcRef(p as usize)`: the operand is the address integer
                         // from `cast_ptr_to_int` + `r_uint`, but the list item
                         // kind is the `GcRef::NULL` `ConstRefNull`
@@ -3936,6 +3943,17 @@ impl<'a> Lowering<'a> {
                         Ok(self.retag_error_carrier(dest_ty, value))
                     }
                     AggregateShape::Ctor(mut ctor) => {
+                        // Declared field types from the aggregate ADT
+                        // (`resolve_aggregate_adt`), the same rows
+                        // `adt_field_read_value_type` reads. Each operand
+                        // states that type so the converter loads a
+                        // scalar-word field (`InstanceRepr.rtype_setattr`).
+                        let field_expected: Vec<Option<TyRef>> = self
+                            .resolve_aggregate_adt(&kind, Some(dest_ty))
+                            .map(|(_, _, rows, _, _, _)| {
+                                rows.into_iter().map(|(_, _, ty)| ty).collect()
+                            })
+                            .unwrap_or_default();
                         // A pair-slice operand is its pointer here and its
                         // length beside it; the field stores both words.
                         // Owner → window is only for a window field
@@ -4022,7 +4040,12 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
-                            arg_vars.push(self.resolve_call_arg_value(mir_bb, op, None)?);
+                            let expected = field_expected.get(i).cloned().flatten();
+                            arg_vars.push(self.resolve_call_arg_value(
+                                mir_bb,
+                                op,
+                                expected.as_ref(),
+                            )?);
                             pair_lens.push(None);
                         }
                         if pair_lens.iter().any(Option::is_some)

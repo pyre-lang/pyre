@@ -479,6 +479,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// [`compute_mutably_borrowed_locals`]; no `Assign` names the local
     /// for such a write, so these locals have no single definition.
     pub(in crate::front::mir) mutably_borrowed_locals: std::collections::HashSet<usize>,
+    /// Locals whose address the body takes (`&l` / `&raw l`). Whole-body
+    /// set from [`compute_borrowed_locals`]. A dest in this set does not
+    /// record a scalar-address representation (`records_scalar_address`).
+    pub(in crate::front::mir) borrowed_locals: std::collections::HashSet<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -2384,6 +2388,7 @@ impl<'a> Lowering<'a> {
             mutably_borrowed_locals: compute_mutably_borrowed_locals(llbc, body)
                 .into_iter()
                 .collect(),
+            borrowed_locals: compute_borrowed_locals(llbc, body).into_iter().collect(),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()
@@ -3581,15 +3586,24 @@ impl<'a> Lowering<'a> {
     /// Whether `_i = &*p` of a primitive pointer records `p` on
     /// [`Self::scalar_address_locals`]. A `Ref` dest produces the address
     /// only when this is true (`cast_ptr_to_adr`); a multiply assigned
-    /// dest loads the pointee (`rewrite_op_raw_load`). A `RawPtr` dest
-    /// is an address by type and does not consult this predicate.
+    /// dest, or a dest whose address is taken (`&q` / `&raw q`), loads
+    /// the pointee (`rewrite_op_raw_load`). A `RawPtr` dest is an address
+    /// by type and does not consult this predicate.
     pub(in crate::front::mir) fn records_scalar_address(
         &self,
         dest_local: usize,
         place: &Place,
     ) -> bool {
         self.raw_primitive_reborrow_inner(place).is_some()
-            && !self.multi_assigned_locals.contains(&dest_local)
+            && self.records_copied_scalar_address(dest_local)
+            && !self.borrowed_locals.contains(&dest_local)
+    }
+
+    /// Dest of `_j = copy _i` of a scalar-address source records `_j` on
+    /// [`Self::scalar_address_locals`]. A multiply assigned dest loads
+    /// the pointee (`rewrite_op_raw_load`).
+    pub(in crate::front::mir) fn records_copied_scalar_address(&self, dest_local: usize) -> bool {
+        !self.multi_assigned_locals.contains(&dest_local)
     }
 
     pub(in crate::front::mir) fn lower_assign(
@@ -3791,7 +3805,7 @@ impl<'a> Lowering<'a> {
                         self.scalar_address_locals.push(local);
                     }
                 }
-                if !self.multi_assigned_locals.contains(&(i as usize))
+                if self.records_copied_scalar_address(i as usize)
                     && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
                     && let PlaceKind::Local(src_local) = src.kind
                     && self.scalar_address_locals.contains(&(src_local as usize))
