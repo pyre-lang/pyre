@@ -244,6 +244,7 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
     body: &Unstructured,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<Vec<usize>> {
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
@@ -276,6 +277,7 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
                 llbc,
                 gc_struct_ids,
                 &std::collections::HashSet::<String>::new(),
+                struct_fields,
             ) && index_mut_result_is_element(llbc, body, p as usize))
             || is_list_items_elem_ptr_add_parts(
                 reg,
@@ -294,6 +296,7 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
                 p as usize,
                 body,
                 llbc,
+                struct_fields,
             )
             || is_string_items_elem_ptr_add_parts(
                 reg,
@@ -409,6 +412,7 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
             gc_struct_ids,
             &empty_raw,
             tombstoned,
+            None,
         ) {
             (traced.header_local, traced.index_local)
         } else {

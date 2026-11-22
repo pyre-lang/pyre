@@ -1194,7 +1194,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &usize_ty,
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "Vec index fold must accept a usize index"
     );
@@ -1203,7 +1204,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &ty(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "Vec index fold must accept a signed index"
     );
@@ -1212,7 +1214,8 @@ fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
             &ty(serde_json::json!({ "Adt": { "id": 7  } })),
             &llbc,
             &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         ),
         "a Range index types as Ref and must stay rejected"
     );

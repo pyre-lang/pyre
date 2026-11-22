@@ -220,6 +220,15 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
+        // Stub FUNC.RESULT tokens read the harvested intern rows ordinary
+        // lowering uses (`std_cell_layout_present`). Collect after
+        // `CrateLoweringState::new` so the classifier sees one registry.
+        let (stubs, foreign) = self.collect_residual_stubs(
+            &llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            state.struct_fields(),
+        );
         let krate = self.wrap_crate(llbc, state);
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
         let mut program = krate.state.finish(functions);
@@ -229,6 +238,8 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        program.unsafe_fn_stubs = stubs;
+        program.foreign_opaque_method_externals = foreign;
         self.crates.push(krate);
         program
     }
@@ -259,6 +270,9 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
+        let empty_raw = HashSet::new();
+        let (stubs, foreign) =
+            self.collect_residual_stubs(&llbc, &gc_struct_ids, &empty_raw, state.struct_fields());
         let krate = self.wrap_crate(llbc, state);
         let functions = self.declare_crate(&krate, None, Some(&function_filter));
         let mut program = krate.state.finish(functions);
@@ -268,8 +282,47 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        program.unsafe_fn_stubs = stubs;
+        program.foreign_opaque_method_externals = foreign;
         self.crates.push(krate);
         program
+    }
+
+    /// Residual stub FUNC.RESULT after intern-row harvest
+    /// (`derive_program_metadata`). The collector reads the same
+    /// `struct_fields` ordinary lowering uses.
+    fn collect_residual_stubs(
+        &self,
+        llbc: &Llbc,
+        gc_struct_ids: &HashSet<majit_ir::descr::StructId>,
+        raw_alloc_flavor_structs: &HashSet<String>,
+        struct_fields: &crate::front::semantic::StructFieldRegistry,
+    ) -> (
+        Vec<crate::translator::rtyper::cutover::ResidualStubSpec>,
+        Vec<(
+            Vec<String>,
+            crate::flowspace::argument::Signature,
+            crate::model::ValueType,
+        )>,
+    ) {
+        self.tables.with_static_addrs(|static_addrs| {
+            let mut stubs = mir::collect_unsafe_fn_stubs_from_llbc(
+                llbc,
+                gc_struct_ids,
+                static_addrs.error_carrier,
+                raw_alloc_flavor_structs,
+                Some(struct_fields),
+            );
+            stubs.extend(mir::collect_policy_opaque_fn_stubs_from_llbc(
+                llbc,
+                gc_struct_ids,
+                static_addrs.error_carrier,
+                raw_alloc_flavor_structs,
+                Some(struct_fields),
+            ));
+            let foreign = mir::collect_foreign_opaque_method_externals(llbc, Some(struct_fields));
+            (stubs, foreign)
+        })
     }
 
     fn wrap_crate(&self, llbc: Llbc, mut state: CrateLoweringState) -> Rc<ProvidedCrate> {

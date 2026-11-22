@@ -349,6 +349,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         ))
     }
 
@@ -412,8 +413,13 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
     ) -> Option<String> {
         tyref_is_rbigint(dest_ty, self.llbc).then(|| {
-            tyref_input_class_root(dest_ty, self.llbc, self.tombstoned_leaves)
-                .unwrap_or_else(|| "RBigInt".to_string())
+            tyref_input_class_root(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.struct_fields,
+            )
+            .unwrap_or_else(|| "RBigInt".to_string())
         })
     }
 
@@ -525,6 +531,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .or_else(|| self.option_payload_instance_class_root(dest_ty))
     }
@@ -565,6 +572,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         // RPython has one string type. Every [`tyref_is_option_of_string_value`]
         // payload paints `Str` here (`&str` / `Utf8Str` / `Wtf8` / `Wtf8Buf`).
@@ -1018,6 +1026,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             err_payload_ty: tyref_enum_payload_value_type(
                 &err_ty,
@@ -1025,6 +1034,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
             err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
@@ -1415,6 +1425,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             err: adt_variant_payload_type(
                 recv_ty,
@@ -1423,6 +1434,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             continue_ty: adt_variant_payload_type(
                 dest_ty,
@@ -1431,6 +1443,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             break_ty: adt_variant_payload_type(
                 dest_ty,
@@ -1439,6 +1452,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             continue_vsid: self.stamp_variant_vsid(dest_ty, "Continue"),
             break_vsid: self.stamp_variant_vsid(dest_ty, "Break"),
@@ -1527,6 +1541,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             tyref_enum_payload_value_type(
                 &err_tyref,
@@ -1534,6 +1549,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             enum_payload_instance_class_root(&err_tyref, self.llbc, self.tombstoned_leaves),
         ))
@@ -1987,6 +2003,7 @@ impl<'a> Lowering<'a> {
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
                 )
             },
             ok_class_root: enum_payload_instance_class_root(
@@ -2000,6 +2017,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             err_class_root: enum_payload_instance_class_root(
                 &recv_err,
@@ -2012,6 +2030,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
             mapped_err_class_root: enum_payload_instance_class_root(
                 &dest_err,
@@ -2817,6 +2836,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             );
             let plan = self.classify_payload_eq(&field.ty, true, stack);
             let Some(plan) = plan else {

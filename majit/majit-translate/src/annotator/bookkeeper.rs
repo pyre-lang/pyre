@@ -6592,10 +6592,9 @@ impl Bookkeeper {
         if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
             return self.project_struct_field_type(inner);
         }
-        let peeled_cell = peel_std_cell_payload_if_not_layout_present(
-            stripped,
-            self.struct_fields.borrow().as_deref(),
-        );
+        let fields_guard = self.struct_fields.borrow();
+        let peeled_cell =
+            peel_std_cell_payload_if_not_layout_present(stripped, fields_guard.as_deref());
         if let Some(inner) = peeled_cell {
             return self.project_struct_field_type(inner);
         }
@@ -6782,7 +6781,7 @@ impl Bookkeeper {
         let class_spelling = if stripped.contains('<')
             && self.struct_fields.borrow().as_ref().is_some_and(|reg| {
                 reg.template_holds_split_entry_family(stripped)
-                    || intern_rows_declare_value_field(reg, stripped)
+                    || intern_rows_declare_value_field(Some(reg), stripped)
             }) {
             std::borrow::Cow::Borrowed(stripped)
         } else {
@@ -9270,24 +9269,21 @@ fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
 }
 
 /// Std-cell intern spelling whose harvested `value` row holds T inline
-/// — the same tests [`tyref_std_cell_class_root`] uses
-/// (`is_std_cell_wrapper_path`, a `value` field, and that field is not
-/// a pointer to T).
+/// — [`crate::front::std_identity::std_cell_layout_present`], the same
+/// verdict [`tyref_std_cell_class_root`] reads.
 fn intern_rows_declare_value_field(
-    reg: &crate::front::StructFieldRegistry,
+    reg: Option<&crate::front::StructFieldRegistry>,
     spelling: &str,
 ) -> bool {
-    crate::front::std_identity::is_std_cell_wrapper_path(spelling)
-        && reg
-            .intern_field_rows(spelling)
-            .is_some_and(intern_rows_value_holds_payload_inline)
+    crate::front::std_identity::std_cell_layout_present(spelling, reg)
 }
 
 /// Payload T of a std cell that does not intern as the cell class:
-/// opaque (no intern rows) or a pointer-valued `value` (`Ref` /
-/// `RefMut`). Same layout verdict [`tyref_std_cell_payload_value_type`]
-/// uses: intern rows, not the wrapper name. A layout-present `RefCell`
-/// (inline `value`) returns None so the caller intern's the cell class.
+/// no intern rows, or a pointer-valued `value` (`Ref` / `RefMut`).
+/// Same layout verdict [`tyref_std_cell_payload_value_type`] uses:
+/// intern rows of the nominal identity, not the TypeDecl kind. A
+/// layout-present `RefCell` (inline `value`) returns None so the
+/// caller intern's the cell class.
 fn peel_std_cell_payload_if_not_layout_present<'a>(
     spelling: &'a str,
     reg: Option<&crate::front::StructFieldRegistry>,
@@ -9295,7 +9291,7 @@ fn peel_std_cell_payload_if_not_layout_present<'a>(
     if !crate::front::std_identity::is_std_cell_wrapper_path(spelling) {
         return None;
     }
-    if reg.is_some_and(|r| intern_rows_declare_value_field(r, spelling)) {
+    if intern_rows_declare_value_field(reg, spelling) {
         return None;
     }
     crate::fat_ptr_layout::wrapper_inner(spelling, &["RefCell", "RefMut", "Ref"])
@@ -9304,12 +9300,7 @@ fn peel_std_cell_payload_if_not_layout_present<'a>(
 /// `true` when intern rows include a `value` field that is T itself
 /// (`UnsafeCell<T>` / T), not a pointer to T (`NonNull<T>`).
 fn intern_rows_value_holds_payload_inline(rows: &[crate::front::semantic::FieldRow]) -> bool {
-    rows.iter().any(|row| {
-        row.name == "value"
-            && !row.is_rustc_pointer_niche
-            && !crate::front::mir::is_rustc_pointer_niche_spelling(&row.ty)
-            && !registry_ty_is_raw_ptr(&row.ty)
-    })
+    crate::front::std_identity::intern_rows_hold_std_cell_payload_inline(Some(rows))
 }
 
 /// Intern a layout-present std cell (`is_std_cell_wrapper_path` and a
@@ -9354,8 +9345,7 @@ fn collect_layout_present_cell_class(
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
 /// wrapping a pointer is a different constructor and does not match.
 fn registry_ty_is_raw_ptr(ty: &str) -> bool {
-    let t = ty.trim();
-    t.starts_with("*mut ") || t.starts_with("*const ")
+    crate::front::std_identity::registry_ty_is_raw_ptr(ty)
 }
 
 /// Split a generic-args slice on top-level `,` boundaries, respecting

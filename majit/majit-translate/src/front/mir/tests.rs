@@ -25,6 +25,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -
         no_tombstoned_leaves(),
         &gc_struct_ids,
         &raw_alloc_flavor_structs,
+        None,
     )
 }
 
@@ -15421,6 +15422,7 @@ fn published_transparent_copy_peels_when_marker_is_path_phantomdata() {
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .is_none(),
         "a transparent scalar wrapper is the word, not inlined field leaves"
@@ -16978,14 +16980,14 @@ fn bytes_block_as_mut_utf8str_cast_result_is_strptr() {
     );
     assert!(
         matches!(
-            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor),
+            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor, None),
             crate::model::ValueType::Str
         ),
         "*const BytesBlock is ValueType::Str"
     );
     assert!(
         matches!(
-            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor),
+            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor, None),
             crate::model::ValueType::Str
         ),
         "*mut Utf8Str is ValueType::Str"
@@ -17954,6 +17956,7 @@ fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
             spec,
             &gc_struct_ids,
             &empty,
+            None,
         )
         .as_deref(),
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
@@ -17967,6 +17970,7 @@ fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
             &empty,
             &gc_struct_ids,
             &empty,
+            None,
         ),
         None,
         "GCREFOpaque must not intern a residual ClassDef"
@@ -40876,6 +40880,7 @@ fn closure_env_cell_address_field_descr_is_int_kinded() {
             &empty_ids,
             &empty_names,
             &empty_names,
+            None,
         );
         let (flag, intern_ty, _) = crate::codewriter::call::get_type_flag(&layout, &empty_names);
         assert_eq!(
@@ -47520,17 +47525,24 @@ fn one_word_handle_by_value_struct_decl_is_none() {
     let gc_struct_ids = std::collections::HashSet::new();
     let raw_alloc = std::collections::HashSet::<String>::new();
     assert!(
-        super::tyref_by_value_struct_decl(&handle_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
-            .is_none(),
+        super::tyref_by_value_struct_decl(
+            &handle_ty,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &raw_alloc,
+            None
+        )
+        .is_none(),
         "a unique sized pointer plus ZST markers is lltype.Ptr, not an inlined STRUCT"
     );
     assert_eq!(
-        super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        super::tyref_to_field_layout_string(&handle_ty, &llbc, &gc_struct_ids, &raw_alloc, None),
         "*mut *mut i64",
         "the enclosing field row must carry the selected pointer repr"
     );
     assert!(
-        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc, None)
             .is_some(),
         "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
     );
@@ -47589,6 +47601,7 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         tomb,
         &gc_struct_ids,
         &raw_alloc,
+        None,
     );
     assert_eq!(
         src_leaves
@@ -47604,6 +47617,7 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         tomb,
         &gc_struct_ids,
         &raw_alloc,
+        None,
     );
     assert_eq!(
         dest_leaves

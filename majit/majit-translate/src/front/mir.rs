@@ -3833,6 +3833,7 @@ impl<'l> CrateLowering<'l> {
                     self.llbc,
                     fd,
                     "rffi.llexternal declaration".to_string(),
+                    Some(&self.state.struct_fields),
                 ));
         }
         declared
@@ -3927,6 +3928,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.raw_alloc_flavor_structs,
             &self.state.tombstoned_leaves,
             &fn_path,
+            Some(&self.state.struct_fields),
         )
     }
 
@@ -3951,6 +3953,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             residual,
             &self.state.raw_alloc_flavor_structs,
+            Some(&self.state.struct_fields),
         );
         let option_cells = gc_mut_ref_option_param_locals(
             &locals,
@@ -3959,6 +3962,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             residual,
             &self.state.raw_alloc_flavor_structs,
+            Some(&self.state.struct_fields),
         );
         let block_u8 = unstructured_if_naked_pair_slice(fd, self.llbc)
             .as_ref()
@@ -3980,10 +3984,12 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
                 &self.state.raw_alloc_flavor_structs,
+                Some(&self.state.struct_fields),
             ),
             &self.state.raw_alloc_flavor_structs,
             &block_u8,
             self.static_addrs.error_carrier,
+            Some(&self.state.struct_fields),
         );
         let len_shadow = pair_len_shadows_of(
             &locals,
@@ -4005,6 +4011,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            Some(&self.state.struct_fields),
         );
         if declared_result_is_unit(
             &fd.signature.output,
@@ -4238,6 +4245,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.raw_alloc_flavor_structs,
             &self.state.tombstoned_leaves,
             &policy_fn_path,
+            Some(&self.state.struct_fields),
         );
         let segments = spec_segments(llbc, fd, &header.name);
         Some(DeclaredSpec {
@@ -4274,6 +4282,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             residual,
             &self.state.raw_alloc_flavor_structs,
+            Some(&self.state.struct_fields),
         );
         let option_cells = gc_mut_ref_option_param_locals(
             &spec.body.body.locals,
@@ -4282,6 +4291,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             residual,
             &self.state.raw_alloc_flavor_structs,
+            Some(&self.state.struct_fields),
         );
         let block_u8 = bytes_block_chars_view_locals(&spec.body.body, self.llbc);
         pygraph_initial_block(
@@ -4300,10 +4310,12 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
                 &self.state.raw_alloc_flavor_structs,
+                Some(&self.state.struct_fields),
             ),
             &self.state.raw_alloc_flavor_structs,
             &block_u8,
             self.static_addrs.error_carrier,
+            Some(&self.state.struct_fields),
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -4809,6 +4821,7 @@ impl SemanticFunctionHeader {
         raw_alloc_flavor_structs: &std::collections::HashSet<String>,
         tombstoned_leaves: &std::collections::HashSet<String>,
         policy_fn_path: &str,
+        struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
         let policy_leaf = policy_fn_path.rsplit("::").next().unwrap_or(policy_fn_path);
@@ -4916,6 +4929,7 @@ impl SemanticFunctionHeader {
             error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         let residual_return_type = signature_token.clone();
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
@@ -4924,6 +4938,7 @@ impl SemanticFunctionHeader {
             llbc,
             error_carrier,
             gc_struct_ids,
+            struct_fields,
         );
         // `dont_look_inside_return_token` spells a raw address word as
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
@@ -4978,6 +4993,7 @@ impl SemanticFunctionHeader {
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
@@ -5673,6 +5689,7 @@ fn published_struct_field_layout(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> String {
     let leaf = type_path.rsplit("::").next().unwrap_or(type_path);
     let is_rbigint = type_path == "rbigint::RBigInt" || type_path.ends_with("::rbigint::RBigInt");
@@ -5708,6 +5725,7 @@ fn published_struct_field_layout(
             gc_struct_ids,
             raw_alloc_flavor_structs,
             ambiguous_leaves,
+            struct_fields,
         )
     }
 }
@@ -5719,12 +5737,13 @@ fn published_struct_field_layout(
 /// set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`] writes
 /// `isize`, which annotates as `SomeInteger` and then `len` of the field
 /// raises `'int' has no length`.
-fn annotation_struct_field_type(
+pub(in crate::front::mir) fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
         Some(majit_ir::rvec::VecItemKind::Int) => {
@@ -5745,6 +5764,7 @@ fn annotation_struct_field_type(
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
                 ambiguous_leaves,
+                struct_fields,
             );
             field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
         }
@@ -6098,6 +6118,7 @@ fn publish_alias_spelling_keys(
                     llbc,
                     gc_struct_ids,
                     raw_alloc_flavor_structs,
+                    Some(&*struct_fields),
                 );
                 (fname, attr_ty)
             })
@@ -6559,6 +6580,7 @@ fn exception_class_declared_attr(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     ambiguous_leaves: &std::collections::HashSet<String>,
     bk: &std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
 ) -> ExceptionClassAttrDecl {
     let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
     let by_value_list_of_str = tyref_is_by_value_vec_string(&field.ty, llbc);
@@ -6572,6 +6594,7 @@ fn exception_class_declared_attr(
             gc_struct_ids,
             raw_alloc_flavor_structs,
             ambiguous_leaves,
+            Some(struct_fields),
         )
     };
     let kind = if by_value_string {
@@ -6623,6 +6646,7 @@ fn exception_class_declared_attr(
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
                 ambiguous_leaves,
+                Some(struct_fields),
             ),
             tyref_to_attr_value_type_with(
                 &field.ty,
@@ -6630,6 +6654,7 @@ fn exception_class_declared_attr(
                 no_tombstoned_leaves(),
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                Some(struct_fields),
             ),
             None,
         )
@@ -6650,6 +6675,7 @@ fn exception_class_declared_attr(
             llbc,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            Some(struct_fields),
         ),
         kind,
     }
@@ -6999,6 +7025,7 @@ fn register_exception_class_variant_fields(
                 raw_alloc_flavor_structs,
                 ambiguous_leaves,
                 &bk,
+                struct_fields,
             );
             if let Some(group) = groups
                 .iter_mut()
@@ -7224,6 +7251,7 @@ fn derive_program_metadata(
                                 gc_struct_ids,
                                 raw_alloc_flavor_structs,
                                 &ambiguous_leaves,
+                                Some(&struct_fields),
                             ),
                         };
                         let field_ty =
@@ -7329,6 +7357,7 @@ fn derive_program_metadata(
                                     llbc,
                                     gc_struct_ids,
                                     raw_alloc_flavor_structs,
+                                    Some(&struct_fields),
                                 )
                             })
                         } else {
@@ -7338,6 +7367,7 @@ fn derive_program_metadata(
                                 llbc,
                                 gc_struct_ids,
                                 raw_alloc_flavor_structs,
+                                Some(&struct_fields),
                             )
                         };
                         vec![(
@@ -7744,6 +7774,7 @@ fn derive_program_metadata(
                                         gc_struct_ids,
                                         raw_alloc_flavor_structs,
                                         &ambiguous_leaves,
+                                        Some(&struct_fields),
                                     ),
                                     tyref_to_attr_value_type_with(
                                         &f.ty,
@@ -7751,6 +7782,7 @@ fn derive_program_metadata(
                                         no_tombstoned_leaves(),
                                         gc_struct_ids,
                                         raw_alloc_flavor_structs,
+                                        Some(&struct_fields),
                                     ),
                                 )
                             };
@@ -10001,6 +10033,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         tombstoned_leaves,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        Some(struct_fields),
     );
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
@@ -10040,6 +10073,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            Some(struct_fields),
         );
         lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
             output,
@@ -10055,6 +10089,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
+            Some(struct_fields),
         );
         let expand_inline_struct = |owner: &str, field: &str| {
             inline_struct_field_leaves(
@@ -10064,6 +10099,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 owner,
                 field,
                 raw_alloc_flavor_structs,
+                Some(struct_fields),
             )
         };
         // MIR framestate argument threading must finish before adding native
@@ -10913,8 +10949,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             keep_zst_self,
             program_oopspec,
             value_type_by_id,
+            Some(struct_fields),
         )?;
-        lo.struct_fields = Some(struct_fields);
         lo.struct_layouts = struct_layouts.clone();
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
         if builder_mode {
@@ -10981,8 +11017,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         keep_zst_self,
         program_oopspec,
         value_type_by_id,
+        Some(struct_fields),
     )?;
-    lo.struct_fields = Some(struct_fields);
     lo.struct_layouts = struct_layouts.clone();
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
     if builder_mode {
@@ -11035,8 +11071,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 keep_zst_self,
                 program_oopspec,
                 value_type_by_id,
+                Some(struct_fields),
             )?;
-            lo.struct_fields = Some(struct_fields);
             lo.struct_layouts = struct_layouts.clone();
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
             if builder_mode {

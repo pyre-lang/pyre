@@ -854,6 +854,7 @@ fn token(llbc: &Llbc, name: &str) -> Option<String> {
         carrier_spec(),
         &HashSet::new(),
         &HashSet::new(),
+        None,
     )
 }
 
@@ -1823,7 +1824,7 @@ fn fn_ptr_result(
         })
         .into(),
     );
-    super::lltype::func_type_from_fn_ptr_ty(&ty, llbc, carrier_spec())
+    super::lltype::func_type_from_fn_ptr_ty(&ty, llbc, carrier_spec(), None)
         .expect("fn pointer")
         .result
 }

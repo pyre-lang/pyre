@@ -364,6 +364,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
     }
 
@@ -405,6 +406,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
         }) || reg
             .generics
@@ -418,6 +420,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
                 )
             });
         is_index && callsite_index_is_scalar
@@ -449,6 +452,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
     }
 
@@ -2166,6 +2170,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         let bb_id = self.emit_bb(mir_bb);
         for leaf in leaves {
@@ -3113,10 +3118,11 @@ impl<'a> Lowering<'a> {
             dest_local,
             self.body,
             self.llbc,
+            self.struct_fields,
         ) {
             return None;
         }
-        raw_ptr_typed_items_element(first_arg_ty?, self.llbc)
+        raw_ptr_typed_items_element(first_arg_ty?, self.llbc, self.struct_fields)
     }
 
     /// `*(&[u8]).as_ptr().add(i)` — `ll_stritem_nonneg` on a shared
@@ -6035,6 +6041,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         let res = self
             .graph
@@ -7772,6 +7779,7 @@ impl<'a> Lowering<'a> {
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
                 no_tombstoned_leaves(),
+                self.struct_fields,
             )
         } else {
             tyref_to_field_layout_string(
@@ -7779,6 +7787,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
         };
         type_spelling_is_fixed_object_array(&spelling)
@@ -8879,6 +8888,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         matches!(
             (inner, dest_vt),

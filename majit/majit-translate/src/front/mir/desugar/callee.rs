@@ -3465,6 +3465,7 @@ pub(in crate::front::mir) fn vec_index_regular_leaf_with_callsite(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<&'static str> {
     let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
     callsite_or_generic_index_is_scalar(
@@ -3473,6 +3474,7 @@ pub(in crate::front::mir) fn vec_index_regular_leaf_with_callsite(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
     .then_some(leaf)
 }
@@ -3489,6 +3491,7 @@ pub(in crate::front::mir) fn callsite_or_generic_index_is_scalar(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     let generic_index_is_scalar = reg
         .generics
@@ -3497,11 +3500,23 @@ pub(in crate::front::mir) fn callsite_or_generic_index_is_scalar(
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
         .is_some_and(|t| {
-            vec_index_type_is_scalar(&t, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+            vec_index_type_is_scalar(
+                &t,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                struct_fields,
+            )
         });
     generic_index_is_scalar
         || index_ty.is_some_and(|ty| {
-            vec_index_type_is_scalar(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+            vec_index_type_is_scalar(
+                ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                struct_fields,
+            )
         })
 }
 
@@ -3603,6 +3618,7 @@ pub(in crate::front::mir) fn vec_index_type_is_scalar(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     // `tyref_to_value_type` re-harvests every `GcType` fact in the crate.
     // This predicate runs on every call while lowering, so reuse the set
@@ -3613,7 +3629,8 @@ pub(in crate::front::mir) fn vec_index_type_is_scalar(
             llbc,
             no_tombstoned_leaves(),
             gc_struct_ids,
-            raw_alloc_flavor_structs
+            raw_alloc_flavor_structs,
+            struct_fields,
         ),
         ValueType::Int | ValueType::Unsigned
     )
@@ -3625,6 +3642,7 @@ pub(in crate::front::mir) fn is_vec_index_regular_with_callsite(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     vec_index_regular_leaf_with_callsite(
         reg,
@@ -3632,6 +3650,7 @@ pub(in crate::front::mir) fn is_vec_index_regular_with_callsite(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     )
     .is_some()
 }
@@ -3642,6 +3661,7 @@ pub(in crate::front::mir) fn is_vec_index_mut_call(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     vec_index_regular_leaf_with_callsite(
         reg,
@@ -3649,6 +3669,7 @@ pub(in crate::front::mir) fn is_vec_index_mut_call(
         llbc,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        struct_fields,
     ) == Some("index_mut")
 }
 
@@ -5127,10 +5148,11 @@ pub(in crate::front::mir) fn is_typed_items_elem_ptr_add_parts(
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
-        && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc).is_some())
+        && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc, struct_fields).is_some())
         && base_local
             .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
@@ -6635,9 +6657,17 @@ pub(in crate::front::mir) fn struct_field_vec_index_trace(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     tombstoned: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<StructFieldVecIndex> {
     if args_len != 2
-        || !is_vec_index_mut_call(reg, index_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        || !is_vec_index_mut_call(
+            reg,
+            index_ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            struct_fields,
+        )
     {
         return None;
     }

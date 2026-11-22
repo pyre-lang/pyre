@@ -794,6 +794,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     block_u8: &[bool],
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
@@ -846,6 +847,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         // A parameter with no runtime representation (`Arg<T>`'s
         // `PhantomData` marker is the case in point — rustc gives it no
@@ -912,6 +914,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         // `class_root` carries the param's named-ADT leaf so
         // `derive_subject_inputcells` can seed the receiver's
@@ -951,7 +954,13 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
-                        tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                        tyref_ref_param_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            generics,
+                            struct_fields,
+                        )
                     })
                     .or_else(|| {
                         // `Box` / `NonNull` of a flavor-raw ADT is
@@ -1489,6 +1498,7 @@ pub(in crate::front::mir) fn rewrite_exception_transformed_input_ops(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) {
     if spec.carrier_path.is_empty() {
         return;
@@ -1532,7 +1542,14 @@ pub(in crate::front::mir) fn rewrite_exception_transformed_input_ops(
         restamp.push((op_idx, ok_ty));
     }
     for (op_idx, ok_ty) in restamp {
-        let ty = tyref_to_value_type_with(&ok_ty, llbc, tombstoned, gc_struct_ids, raw_alloc);
+        let ty = tyref_to_value_type_with(
+            &ok_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc,
+            struct_fields,
+        );
         let ty = input_param_value_type(ty, &ok_ty, llbc, false, false, tombstoned);
         let class_root = exception_transformed_formal_class_root(
             &ok_ty,
@@ -1540,6 +1557,7 @@ pub(in crate::front::mir) fn rewrite_exception_transformed_input_ops(
             tombstoned,
             gc_struct_ids,
             raw_alloc,
+            struct_fields,
         );
         let Some(block) = graph.blocks.iter_mut().find(|block| block.id == start) else {
             continue;
@@ -1567,11 +1585,12 @@ fn exception_transformed_formal_class_root(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> Option<String> {
     tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc)
         .or_else(|| tyref_raw_ptr_to_str_family_spelling(ty, llbc))
         .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(ty, llbc))
-        .or_else(|| tyref_ref_param_class_root(ty, llbc, tombstoned, None))
+        .or_else(|| tyref_ref_param_class_root(ty, llbc, tombstoned, None, struct_fields))
         .or_else(|| tyref_char_class_root(ty, llbc))
         .or_else(|| tyref_fn_ptr_input_class_root(ty, llbc))
         .or_else(|| tyref_rust_vec_item_kind(ty, llbc).map(|_| tyref_to_ast_string(ty, llbc)))
@@ -1623,6 +1642,7 @@ impl<'a> Lowering<'a> {
             keep_zst_self,
             empty_program_oopspec(),
             None,
+            None,
         )
     }
 
@@ -1644,6 +1664,7 @@ impl<'a> Lowering<'a> {
         keep_zst_self: bool,
         program_oopspec: &'a std::collections::HashSet<String>,
         value_type_by_id: Option<&'a std::cell::RefCell<Vec<Option<ValueType>>>>,
+        struct_fields: Option<&'a crate::front::semantic::StructFieldRegistry>,
     ) -> Result<Self, LowerError> {
         let gc_mut_ref_params = gc_mut_ref_param_locals(
             &body.locals,
@@ -1652,6 +1673,7 @@ impl<'a> Lowering<'a> {
             gc_struct_ids,
             self_dont_look_inside,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         let gc_mut_ref_option_params = gc_mut_ref_option_param_locals(
             &body.locals,
@@ -1660,6 +1682,7 @@ impl<'a> Lowering<'a> {
             gc_struct_ids,
             self_dont_look_inside,
             raw_alloc_flavor_structs,
+            struct_fields,
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed, block_u8) =
@@ -1755,6 +1778,7 @@ impl<'a> Lowering<'a> {
                 tombstoned_leaves,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             );
             // A parameter with no runtime representation (`Arg<T>`'s
             // `PhantomData` marker is the case in point — rustc gives it no
@@ -1830,6 +1854,7 @@ impl<'a> Lowering<'a> {
                 tombstoned_leaves,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
+                struct_fields,
             );
             let class_root = if let Some((_, class_root)) = &cell_stamp {
                 Some(class_root.clone())
@@ -1846,7 +1871,13 @@ impl<'a> Lowering<'a> {
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
-                        tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                        tyref_ref_param_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            generics,
+                            struct_fields,
+                        )
                     }),
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no
@@ -2016,7 +2047,8 @@ impl<'a> Lowering<'a> {
         let function_scope_start = n_slots;
         n_slots += function_scope_plan.len();
         local_var.resize(n_slots, None);
-        let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
+        let mut extra_live =
+            compute_index_write_extra_live(body, llbc, gc_struct_ids, struct_fields);
         let interior_live =
             compute_interior_field_extra_live(body, llbc, gc_struct_ids, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
@@ -2313,7 +2345,7 @@ impl<'a> Lowering<'a> {
         let mut lowering = Self {
             graph,
             llbc,
-            struct_fields: None,
+            struct_fields,
             struct_layouts: Default::default(),
             raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
             dont_look_inside,
@@ -2510,6 +2542,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         if let (Some(cache), Some(id)) = (self.value_type_by_id, id) {
             let mut cache = cache.borrow_mut();
@@ -2636,6 +2669,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
     }
 
@@ -3627,7 +3661,7 @@ impl<'a> Lowering<'a> {
         if matches!(
             &inner.kind,
             PlaceKind::Local(local)
-                if raw_ptr_typed_items_element(&inner.ty, self.llbc).is_some()
+                if raw_ptr_typed_items_element(&inner.ty, self.llbc, self.struct_fields).is_some()
                     && base_traces_to_typed_items_block_accessor(
                         self.body,
                         *local as usize,

@@ -1171,6 +1171,7 @@ pub(in crate::front::mir) fn to_string_receiver_is_float(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
     matches!(
         tyref_deref_value_type_with(
@@ -1178,7 +1179,8 @@ pub(in crate::front::mir) fn to_string_receiver_is_float(
             llbc,
             tombstoned,
             gc_struct_ids,
-            raw_alloc_flavor_structs
+            raw_alloc_flavor_structs,
+            struct_fields,
         ),
         crate::model::ValueType::Float | crate::model::ValueType::SingleFloat
     )

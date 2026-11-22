@@ -425,6 +425,7 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
             self.tombstoned_leaves,
+            self.struct_fields,
         ) else {
             return Ok(false);
         };
@@ -702,6 +703,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
         };
         let res = self
@@ -921,6 +923,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         if !cell_primitive
             && !matches!(
@@ -1003,6 +1006,7 @@ impl<'a> Lowering<'a> {
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
                     )?;
                     // `all_fielddescrs` walks a GcStruct. An enum variant
                     // payload (`Result::Err.__pos_0`) is a nested getfield
@@ -1161,6 +1165,7 @@ impl<'a> Lowering<'a> {
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
                                 &self.raw_alloc_flavor_structs,
+                                self.struct_fields,
                             );
                             let op = link_arg_as_alias_op(&constant, &kind).ok_or_else(|| {
                                 LowerError::Unsupported(format!(
@@ -1292,6 +1297,7 @@ impl<'a> Lowering<'a> {
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
                 ));
         // `(*p).field = v` now projects `{"Field": [null, index]}` (or
         // `[variant, index]`). The read side resolves that index through
@@ -1484,7 +1490,7 @@ impl<'a> Lowering<'a> {
                 } else if let Some(local) = inner_local
                     && !self.index_elem_alias.contains_key(&local)
                     && let Some((item_ty, array_type_id)) =
-                        raw_ptr_typed_items_element(&field_base_ty, self.llbc)
+                        raw_ptr_typed_items_element(&field_base_ty, self.llbc, self.struct_fields)
                     && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
                 {
                     // `*(typed_items_block_items_base(..) as *mut i64) = v`
@@ -1679,6 +1685,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
                         )
                     {
                         let src = value.as_variable().cloned().ok_or_else(|| {
@@ -2077,6 +2084,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         {
@@ -2525,8 +2533,9 @@ impl<'a> Lowering<'a> {
                 // type before choosing the annotation shell: in particular,
                 // a `usize` subtraction is an unsigned/non-negative value by
                 // type, even though its MIR destination is a tuple.
-                let scalar_ty = tyref_checked_binop_value_type(dest_ty, self.llbc)
-                    .unwrap_or_else(|| self.value_type_of(dest_ty));
+                let scalar_ty =
+                    tyref_checked_binop_value_type(dest_ty, self.llbc, self.struct_fields)
+                        .unwrap_or_else(|| self.value_type_of(dest_ty));
                 let result_ty = match scalar_ty {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
@@ -2739,6 +2748,7 @@ impl<'a> Lowering<'a> {
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
                                     &self.raw_alloc_flavor_structs,
+                                    self.struct_fields,
                                 ))
                             }
                             Operand::Const(_) => None,
@@ -2961,7 +2971,8 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs
+                                &self.raw_alloc_flavor_structs,
+                                self.struct_fields
                             ),
                             ValueType::Unsigned
                         );
@@ -3013,7 +3024,8 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs
+                                &self.raw_alloc_flavor_structs,
+                                self.struct_fields
                             ),
                             ValueType::Int
                         )
@@ -3063,7 +3075,8 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs
+                                &self.raw_alloc_flavor_structs,
+                                self.struct_fields
                             ),
                             ValueType::Unsigned
                         )
@@ -5519,6 +5532,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         {
@@ -5658,7 +5672,8 @@ impl<'a> Lowering<'a> {
         let mut ll_fields = Vec::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
             let fname = field_decl_name(i, field);
-            let fty = overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids);
+            let fty =
+                overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids, self.struct_fields);
             ll_fields.push((fname, fty));
         }
         let mut body = Struct::registry_fields(&name, ll_fields, gckind);
@@ -7092,6 +7107,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         {
@@ -7280,6 +7296,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
         {
@@ -7522,6 +7539,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         let owner_declared_gc =
             self.container_owner_declared_gc(inner, value_type_is_int_bank(&field_vt));
@@ -7628,6 +7646,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             ),
         );
         if read_rstr_attr {
@@ -7651,6 +7670,7 @@ impl<'a> Lowering<'a> {
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
                 no_tombstoned_leaves(),
+                self.struct_fields,
             )
             .expect("raw-owned exception attr has a pointer row");
             ty = ValueType::Ref(Some(raw.class_root));
@@ -7726,8 +7746,20 @@ impl<'a> Lowering<'a> {
         }
         stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
         stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
-        stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
-        stamp_fn_ptr(&res, &field_ty, self.llbc, self.static_addrs.error_carrier);
+        stamp_fn_ptr(
+            &res,
+            &place_ty,
+            self.llbc,
+            self.static_addrs.error_carrier,
+            self.struct_fields,
+        );
+        stamp_fn_ptr(
+            &res,
+            &field_ty,
+            self.llbc,
+            self.static_addrs.error_carrier,
+            self.struct_fields,
+        );
         if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
             || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
             || tyref_is_u8_window(&field_ty, self.llbc)
@@ -7948,6 +7980,7 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
                         no_tombstoned_leaves(),
+                        self.struct_fields,
                     )
                     .expect("raw-owned exception attr has a pointer row");
                     ValueType::Unsigned
@@ -8108,6 +8141,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
+                self.struct_fields,
             )
             .is_none()
         {
@@ -8355,6 +8389,7 @@ impl<'a> Lowering<'a> {
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
+                    self.struct_fields,
                 )
                 .ok_or_else(|| {
                     LowerError::Unsupported(format!(
@@ -8601,6 +8636,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
                         );
                         if niche && cell.is_some() {
                             return self.resolve_place(mir_bb, *inner);
@@ -8673,6 +8709,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
                         )
                         .is_some()
                     {
@@ -8686,6 +8723,7 @@ impl<'a> Lowering<'a> {
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
                                     &self.raw_alloc_flavor_structs,
+                                    self.struct_fields,
                                 )
                                 .is_none()
                             }
@@ -8754,6 +8792,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
                         )
                         .is_some()
                         {
@@ -9117,6 +9156,7 @@ impl<'a> Lowering<'a> {
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
                     );
                     let res = self
                         .graph
@@ -9138,7 +9178,13 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
-                    stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
+                    stamp_fn_ptr(
+                        &res,
+                        &place_ty,
+                        self.llbc,
+                        self.static_addrs.error_carrier,
+                        self.struct_fields,
+                    );
                     return Ok(res);
                 }
                 // A `Field` projection whose base is a genuine Ref tuple
@@ -9239,6 +9285,7 @@ impl<'a> Lowering<'a> {
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
+                            self.struct_fields,
                         );
                         let res = self
                             .graph
@@ -9254,7 +9301,13 @@ impl<'a> Lowering<'a> {
                             },
                         });
                         stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
-                        stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
+                        stamp_fn_ptr(
+                            &res,
+                            &place_ty,
+                            self.llbc,
+                            self.static_addrs.error_carrier,
+                            self.struct_fields,
+                        );
                         return Ok(res);
                     }
                 }
@@ -9384,7 +9437,7 @@ impl<'a> Lowering<'a> {
                     && let Some(local) = deref_local
                     && !self.index_elem_alias.contains_key(&local)
                     && let Some((item_ty, array_type_id)) =
-                        raw_ptr_typed_items_element(&inner.ty, self.llbc)
+                        raw_ptr_typed_items_element(&inner.ty, self.llbc, self.struct_fields)
                     && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
                 {
                     let ptr = self.resolve_place(mir_bb, *inner)?;
@@ -9573,6 +9626,7 @@ impl<'a> Lowering<'a> {
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
+                        self.struct_fields,
                     )
                     .is_some()
                     && indexed_field_parts(field_payload)
@@ -10253,6 +10307,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         )
         .is_some()
             || self.ty_is_error_carrier(dest_ty)
@@ -10476,6 +10531,7 @@ impl<'a> Lowering<'a> {
                                 self.gc_struct_ids,
                                 &self.raw_alloc_flavor_structs,
                                 no_tombstoned_leaves(),
+                                self.struct_fields,
                             )
                             .map(|raw| raw.class_root)
                         })
@@ -10493,7 +10549,12 @@ impl<'a> Lowering<'a> {
                     }),
                     peeled_shared_primitive: declared_ty.is_some_and(|ty| {
                         tyref_is_closure_env(dest_ty, self.llbc)
-                            && tyref_shared_borrow_primitive_value(ty, self.llbc).is_some()
+                            && tyref_shared_borrow_primitive_value(
+                                ty,
+                                self.llbc,
+                                self.struct_fields,
+                            )
+                            .is_some()
                     }),
                 }
             })
@@ -10943,6 +11004,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         let (item, 0) = shaped_array_parts(&last_spelling)? else {
             return None;
@@ -10990,6 +11052,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            self.struct_fields,
         );
         crate::annotator::bookkeeper::flexible_gcarray_primitive_item(&last_spelling)
     }
@@ -11503,8 +11566,13 @@ impl<'a> Lowering<'a> {
         }
         let payload = tyref_adt_generics_type_arg(ty, 0, self.llbc)?;
         let _ = self.refs_static_struct_root(&payload)?;
-        tyref_std_cell_class_root(&payload, self.llbc, self.tombstoned_leaves)
-            .or_else(|| tyref_class_root_with(&payload, self.llbc, self.tombstoned_leaves))
+        tyref_std_cell_class_root(
+            &payload,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.struct_fields,
+        )
+        .or_else(|| tyref_class_root_with(&payload, self.llbc, self.tombstoned_leaves))
     }
 
     /// Class root of a harvested `_alloc_flavor_ = "raw"` STRUCT static
@@ -12453,9 +12521,25 @@ pub(in crate::front::mir) fn transmute_is_same_layout_bank(
     src: &TyRef,
     dst: &TyRef,
     llbc: &Llbc,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> bool {
-    let src_bank = value_type_bank(&tyref_to_value_type(src, llbc));
-    let dst_bank = value_type_bank(&tyref_to_value_type(dst, llbc));
+    let inputs = value_type_inputs(llbc);
+    let src_bank = value_type_bank(&tyref_to_value_type_with(
+        src,
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    ));
+    let dst_bank = value_type_bank(&tyref_to_value_type_with(
+        dst,
+        llbc,
+        no_tombstoned_leaves(),
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+        struct_fields,
+    ));
     matches!((src_bank, dst_bank), (0, 0) | (1, 1) | (2, 2))
         && matches!(
             (tyref_exact_layout_size(src, llbc), tyref_exact_layout_size(dst, llbc)),
@@ -12822,13 +12906,14 @@ pub(in crate::front::mir) fn overlay_field_lltype(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    struct_fields: Option<&crate::front::semantic::StructFieldRegistry>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, NONGCREF};
     let Some(node) = tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(|n| type_node_peel_aliases(n, llbc))
     else {
-        return tyref_to_external_lltype(ty, llbc);
+        return tyref_to_external_lltype(ty, llbc, struct_fields);
     };
     let pointee = node
         .as_object()
@@ -12857,7 +12942,7 @@ pub(in crate::front::mir) fn overlay_field_lltype(
         }
         return LowLevelType::Ptr(Box::new(NONGCREF.clone()));
     }
-    tyref_to_external_lltype(ty, llbc)
+    tyref_to_external_lltype(ty, llbc, struct_fields)
 }
 
 /// `lltype.cast_int_to_ptr(Ptr(STR), int)` then dest-Str restore for an

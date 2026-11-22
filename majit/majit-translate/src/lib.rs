@@ -461,27 +461,18 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
-                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
-                    &llbc,
-                    &gc_struct_ids,
-                    static_addrs.error_carrier,
-                    &raw_alloc_flavor_structs,
-                ));
-                foreign_opaque_method_externals
-                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                let prog = graph_bodies.lower_prelinked_crate(
+                // Stub FUNC.RESULT is computed after intern-row harvest
+                // inside `lower_prelinked_crate` so the classifier reads
+                // the same registry ordinary lowering uses.
+                let mut prog = graph_bodies.lower_prelinked_crate(
                     llbc,
                     module_paths,
                     &cross_tombstoned_leaves,
                     &gc_struct_ids,
                     &raw_alloc_flavor_structs,
                 );
+                unsafe_fn_stubs.append(&mut prog.unsafe_fn_stubs);
+                foreign_opaque_method_externals.append(&mut prog.foreign_opaque_method_externals);
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,

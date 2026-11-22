@@ -20,6 +20,7 @@
 //! (`getarrayitem_gc`/`setarrayitem_gc` or `getfield_gc`/`setfield_gc`).
 
 use crate::flowspace::model::Variable;
+use crate::front::semantic::{FieldRow, StructFieldRegistry};
 use crate::model::{CallTarget, FieldDescriptor, OpKind, ValueType};
 
 fn path_has(segments: &[String], needle: &str) -> bool {
@@ -66,6 +67,47 @@ pub(crate) fn is_std_cell_wrapper_path(path: &str) -> bool {
         return false;
     }
     matches!(prefix, ["core", "cell"] | ["std", "cell"] | ["cell"])
+}
+
+/// Layout-present std cell: the harvested intern rows of this identity
+/// hold T inline in `value`.
+///
+/// `bookkeeper.py` `Bookkeeper.getuniqueclassdef` keys one ClassDef on
+/// the class. The cell-vs-payload verdict is that identity (crate-stripped
+/// decl path plus instantiation) plus those rows, not the TypeDecl kind
+/// of the artefact that happens to mention the type. A `RefCell` whose
+/// `value` is `UnsafeCell<T>` / T intern's as the cell class. A `Ref` /
+/// `RefMut` whose `value` is `NonNull<T>`, or a spelling no artefact
+/// published rows for, occupies T's bank.
+pub(crate) fn std_cell_layout_present(spelling: &str, reg: Option<&StructFieldRegistry>) -> bool {
+    is_std_cell_wrapper_path(spelling)
+        && intern_rows_hold_std_cell_payload_inline(reg.and_then(|r| r.intern_field_rows(spelling)))
+}
+
+/// `true` when intern rows include a `value` field that is T itself,
+/// not a pointer to T.
+pub(crate) fn intern_rows_hold_std_cell_payload_inline(rows: Option<&[FieldRow]>) -> bool {
+    rows.is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.name == "value"
+                && !row.is_rustc_pointer_niche
+                && !crate::front::mir::is_rustc_pointer_niche_spelling(&row.ty)
+                && !registry_ty_is_raw_ptr(&row.ty)
+        })
+    })
+}
+
+/// Field-registry encoding of a Charon `RawPtr` node. A marker ADT
+/// wrapping a pointer is a different constructor. Harvest of a one-word
+/// `Vec` paints `*mut Vec<item>` (`annotation_struct_field_type` /
+/// `project_rust_vec`); that spelling is the list itself
+/// (`rlist.py` `ListRepr`), not a Charon RawPtr to T.
+pub(crate) fn registry_ty_is_raw_ptr(ty: &str) -> bool {
+    let t = ty.trim();
+    if !(t.starts_with("*mut ") || t.starts_with("*const ")) {
+        return false;
+    }
+    !majit_ir::descr::is_list_container_spelling(t)
 }
 
 fn path_leaf(path: Option<&str>) -> Option<&str> {
@@ -2005,5 +2047,61 @@ mod tests {
         ] {
             assert!(!is_std_cell_wrapper_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn layout_present_reads_intern_rows_of_the_nominal_identity() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "cell::RefCell".to_string(),
+            vec![
+                FieldRow::named("borrow", "i64"),
+                FieldRow::named("value", "cell::UnsafeCell<Vec<i64>>"),
+            ],
+        );
+        reg.fields.insert(
+            "cell::Ref".to_string(),
+            vec![
+                FieldRow::named("value", "NonNull<Vec<i64>>"),
+                FieldRow::named("borrow", "i64"),
+            ],
+        );
+        assert!(
+            std_cell_layout_present("cell::RefCell<Vec<i64>>", Some(&reg)),
+            "harvested inline value intern's as the cell class"
+        );
+        assert!(
+            !std_cell_layout_present("cell::Ref<Vec<i64>>", Some(&reg)),
+            "pointer-valued value occupies T's bank"
+        );
+        assert!(
+            !std_cell_layout_present("cell::RefCell<Vec<i64>>", None),
+            "no artefact published rows: peel"
+        );
+        assert!(!std_cell_layout_present(
+            "fixture::RefCell<Vec<i64>>",
+            Some(&reg)
+        ));
+        let mut raw = FieldRow::named("value", "*mut i64");
+        raw.is_rustc_pointer_niche = false;
+        assert!(!intern_rows_hold_std_cell_payload_inline(Some(&[
+            FieldRow::named("borrow", "i64"),
+            raw,
+        ])));
+        assert!(
+            intern_rows_hold_std_cell_payload_inline(Some(&[
+                FieldRow::named("borrow", "i64"),
+                FieldRow::named("value", "*mut Vec<i64>"),
+            ])),
+            "Vec header-pointer harvest is T inline"
+        );
+        let mut niche = FieldRow::named("value", "i64");
+        niche.is_rustc_pointer_niche = true;
+        assert!(!intern_rows_hold_std_cell_payload_inline(Some(&[niche])));
+        assert!(intern_rows_hold_std_cell_payload_inline(Some(&[
+            FieldRow::named("borrow", "i64"),
+            FieldRow::named("value", "Vec<i64>"),
+        ])));
+        assert!(!intern_rows_hold_std_cell_payload_inline(None));
     }
 }
