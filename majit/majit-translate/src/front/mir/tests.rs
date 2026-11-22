@@ -42112,8 +42112,9 @@ fn parent_read_and_write_of_cell_backed_wrapper_field() {
 }
 
 /// `q = &raw mut *p` / `q = &mut *p` of `p: *mut Wrap(i64)`, then either
-/// return `q` or `*q`. `cast_ptr_to_adr` keeps pointer identity: the
-/// reborrow is `p` (no RawLoad); a later `*q` is `rewrite_op_raw_load`.
+/// return `q` or `*q`. A RawPtr dest is the address `p` by type. A Ref
+/// dest is that address only when `q` is deref-only (`*q`); returning
+/// `q` copies it, so the Ref loads the pointee (`rewrite_op_raw_load`).
 fn wrap_ptr_reborrow_graph(raw: bool, load_after: bool) -> crate::model::FunctionGraph {
     let i64_ty = interior_i64();
     let wrap_ty = interior_adt(0);
@@ -42223,12 +42224,32 @@ fn raw_mut_deref_reborrow_of_transparent_wrapper_ptr_is_address() {
     );
 }
 
-/// `&mut *p` of `p: *mut Wrap(i64)` is `p`; `*q` is a RawLoad.
+/// `&mut *p` of `p: *mut Wrap(i64)`: returning `q` copies `q`, so `q` is
+/// not deref-only and the reborrow loads the pointee. `*q` is deref-only
+/// and RawLoads through `p`.
 #[test]
 fn mut_deref_reborrow_of_transparent_wrapper_ptr_is_address() {
-    assert_reborrow_is_address(
-        &wrap_ptr_reborrow_graph(false, false),
-        "&mut *p of *mut Wrap(i64)",
+    let graph = wrap_ptr_reborrow_graph(false, false);
+    let ops = graph_ops(&graph);
+    let p = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("p is the first inputarg");
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == p => op.result.clone(),
+        _ => None,
+    });
+    let loaded =
+        loaded.unwrap_or_else(|| panic!("return of `&mut *p` must RawLoad p; ops={ops:?}"));
+    let ret = returned_word(&graph).expect("startblock returns q");
+    assert_eq!(
+        ret, &loaded,
+        "returned `&mut *p` must be the loaded pointee; ops={ops:?}"
+    );
+    assert_ne!(
+        ret, p,
+        "returned `&mut *p` must not be the address; ops={ops:?}"
     );
     assert_deref_after_reborrow_is_raw_load(
         &wrap_ptr_reborrow_graph(false, true),
@@ -43123,10 +43144,10 @@ fn residual_call_of_field_borrow_temp_receives_field_value() {
     );
 }
 
-/// `let p = &obj.field; Env { p }` of a GC scalar field: the Aggregate
-/// payload is getattr at the use (`InteriorPtrRepr.rtype_getattr`), the
-/// same value-consumer rule as a residual call arg
-/// (`ann_cast_ptr_to_adr`). `append_right` captures `&deque.len` this way.
+/// `let p = &obj.field; Env { p }` of a GC scalar field. `p` is an
+/// aggregate operand, so it is not deref-only: the bind reads the field
+/// value (`PtrRepr.rtype_getattr`). `append_right` captures `&deque.len`
+/// this way.
 #[test]
 fn aggregate_of_field_borrow_temp_receives_field_value() {
     let i64_ty = interior_i64();
@@ -43332,11 +43353,9 @@ fn field_reads_named<'a>(ops: &'a [&SpaceOperation], name: &str) -> Vec<&'a Vari
         .collect()
 }
 
-/// `p = &obj.field; q = p; return *q`. `Rvalue::Use` copies the owner
-/// Variable (`InteriorPtrRepr` `lowleveltype = parentptrtype`); the
-/// destination must inherit the source's field path
-/// (`atomic_ref_place`) so getattr at the use still fires
-/// (`InteriorPtrRepr.rtype_getattr`).
+/// `p = &obj.field; q = p; return *q`. `p` is copied, so it is not
+/// deref-only: the bind reads the field value (`PtrRepr.rtype_getattr`).
+/// `*q` is that scalar.
 #[test]
 fn copy_of_field_borrow_temp_deref_getfields() {
     let i64_ty = interior_i64();
@@ -43853,9 +43872,9 @@ fn store_through_gcarray_header_borrow_is_unsupported() {
 }
 
 /// `q = &*p` of `p: *mut i64` passed to a look-inside helper whose `&i64`
-/// param is the scalar word (`input_param_value_type`). The reborrow is
-/// the address (`scalar_address_locals`); `callparse` converts at the
-/// boundary (`rewrite_op_raw_load`).
+/// param is the scalar word (`input_param_value_type`). `q` is a call
+/// argument, so it is not deref-only: the reborrow loads the pointee
+/// (`rewrite_op_raw_load`).
 #[test]
 fn look_inside_of_raw_ptr_reborrow_receives_the_word() {
     let i64_ty = interior_i64();
@@ -44072,10 +44091,10 @@ fn assign_raw_mut_deref_reborrow(
     )
 }
 
-/// Residual `read(q)` of `q = &*p` (`p: *mut i64`). `q` is already the
-/// address (`scalar_address_locals`); a residual `&T` takes that pointer
-/// (`cast_ptr_to_adr`). A second spill cell that stores the address as
-/// payload is a copy-in/copy-out of storage that already exists.
+/// Residual `read(q)` of `q = &*p` (`p: *mut i64`). `q` is a call
+/// argument, so it is not deref-only: the reborrow loads the pointee
+/// (`rewrite_op_raw_load`). Residual `&T` spills that word
+/// (`HighLevelOp.inputarg`).
 #[test]
 fn residual_call_of_raw_ptr_reborrow_receives_the_address() {
     let i64_ty = interior_i64();
@@ -44133,23 +44152,28 @@ fn residual_call_of_raw_ptr_reborrow_receives_the_address() {
         Some(LinkArg::Value(v)) => v,
         other => panic!("read arg0 {other:?}; ops={ops:?}"),
     };
-    assert_eq!(
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == p => op.result.clone(),
+        _ => None,
+    });
+    let loaded = loaded.unwrap_or_else(|| {
+        panic!("residual `&i64` of a non-deref-only reborrow must RawLoad p; ops={ops:?}")
+    });
+    assert_ne!(
         arg0, p,
-        "residual `&i64` of a recorded reborrow must receive the address; ops={ops:?}"
+        "residual must not receive the raw address; ops={ops:?}"
     );
+    let stored = ops.iter().any(|op| match &op.kind {
+        OpKind::RawStore { value, .. } => value == &loaded,
+        OpKind::FieldWrite {
+            value: LinkArg::Value(v),
+            ..
+        } => v == &loaded,
+        _ => false,
+    });
     assert!(
-        ops.iter().all(|op| !matches!(
-            &op.kind,
-            OpKind::RawMalloc { owner, .. } if owner == super::RAW_SCALAR_SPILL_OWNER
-        )),
-        "recorded address must not copy-in to a call-scoped spill cell; ops={ops:?}"
-    );
-    assert!(
-        ops.iter().all(|op| match &op.kind {
-            OpKind::RawStore { value, .. } => value != p,
-            _ => true,
-        }),
-        "recorded address must not be stored as a spill payload; ops={ops:?}"
+        arg0 == &loaded || stored,
+        "residual must receive the loaded word or a cell of that word; ops={ops:?}"
     );
 }
 
@@ -44268,8 +44292,9 @@ fn multiply_assigned_raw_ptr_reborrow_loads_from_the_pointer() {
 
 /// Trait call of `q = &*p` resolved to a look-inside impl whose `&i64`
 /// formal is the scalar word (`input_param_value_type` / `callparse`).
-/// Formals come from that resolved impl, the same FunDecl the call
-/// target uses (`trait_impl_method`).
+/// `q` is a call argument, so it is not deref-only: the reborrow loads
+/// the pointee. Formals come from that resolved impl
+/// (`trait_impl_method`).
 #[test]
 fn look_inside_trait_impl_of_raw_ptr_reborrow_receives_the_word() {
     let i64_ty = interior_i64();
@@ -44386,9 +44411,9 @@ fn look_inside_trait_impl_of_raw_ptr_reborrow_receives_the_word() {
     );
 }
 
-/// `p = &obj.field; q = &p; return **q`. `q` records `Local(p)`. A Deref
-/// through that alias is `*p` (`InteriorPtrRepr.rtype_getattr` /
-/// `getinteriorfieldargs`), so the extra Deref is the field value.
+/// `p = &obj.field; q = &p; return **q`. `&p` disqualifies `p`, so the
+/// bind reads the field value (`PtrRepr.rtype_getattr`). `**q` is that
+/// scalar.
 #[test]
 fn nested_deref_of_field_borrow_alias_getfields() {
     let i64_ty = interior_i64();
@@ -44456,9 +44481,9 @@ fn nested_deref_of_field_borrow_alias_getfields() {
 
 /// `q = &*p` of `p: *mut Wrap<i64>` passed to a look-inside helper whose
 /// `&Wrap<i64>` formal is the scalar word (`input_param_value_type` /
-/// `function_local_primitive_cell_descr`). The reborrow is the address;
-/// `callparse` converts at the boundary with the same wrapper peel the
-/// reborrow uses (`tyref_primitive_or_transparent_primitive_node`).
+/// `function_local_primitive_cell_descr`). `q` is a call argument, so it
+/// is not deref-only: the reborrow loads the pointee with the same
+/// wrapper peel (`tyref_primitive_or_transparent_primitive_node`).
 #[test]
 fn look_inside_of_wrap_ptr_reborrow_receives_the_word() {
     let i64_ty = interior_i64();
@@ -44552,8 +44577,8 @@ fn look_inside_of_wrap_ptr_reborrow_receives_the_word() {
 
 /// Trait call of `q = &*p` resolved to a generic look-inside impl whose
 /// `&T` formal is instantiated as `&i64` (`trait_impl_method` generics /
-/// `callparse`). Formals use those resolved substitutions, not the
-/// call's empty `reg.generics`.
+/// `callparse`). `q` is a call argument, so it is not deref-only: the
+/// reborrow loads the pointee. Formals use those resolved substitutions.
 #[test]
 fn look_inside_generic_trait_impl_of_raw_ptr_reborrow_receives_the_word() {
     let i64_ty = interior_i64();
@@ -44673,10 +44698,9 @@ fn look_inside_generic_trait_impl_of_raw_ptr_reborrow_receives_the_word() {
 }
 
 /// `p = &a.field; old = mem::replace(&mut p, &b.field); return *p`.
-/// `&mut p` mutates `p` through a mem-slot write, so the owner
-/// representation is not recorded (`records_atomic_ref_place` /
-/// `compute_mutably_borrowed_locals`). Binding reads the field value;
-/// `*p` is `b.field`, not a FieldRead whose base is that scalar.
+/// `&mut p` is a borrow of `p`, so `p` is not deref-only. Binding reads
+/// the field value; `*p` is `b.field`, not a FieldRead whose base is
+/// that scalar.
 #[test]
 fn replace_of_mutably_borrowed_field_borrow_temp_reads_the_new_field_value() {
     let i64_ty = interior_i64();
@@ -44844,10 +44868,9 @@ fn returned_field_borrow_is_the_field_value() {
     assert_ne!(ret, o, "return must not be the GC owner; ops={ops:?}");
 }
 
-/// `a = &*p; b = &*r; q = a; q = b; return *q`. `a`/`b` record the
-/// address (`scalar_address_locals`); `q` is multiply assigned, so the
-/// Use copy does not (`records_copied_scalar_address`). The converter
-/// loads (`rewrite_op_raw_load`); `*q` is the last loaded word.
+/// `a = &*p; b = &*r; q = a; q = b; return *q`. `a`/`b` are copied, so
+/// they are not deref-only: each reborrow loads the pointee
+/// (`rewrite_op_raw_load`). `*q` is the last loaded word.
 #[test]
 fn copy_of_raw_ptr_reborrow_into_multiply_assigned_dest_loads_the_pointee() {
     let i64_ty = interior_i64();
@@ -44905,10 +44928,8 @@ fn copy_of_raw_ptr_reborrow_into_multiply_assigned_dest_loads_the_pointee() {
 }
 
 /// `q = &*p; r = &q; f(r)` with look-inside `f(x: &&i64)`. `q` is
-/// borrowed, so the reborrow is not the address (`records_scalar_address`).
-/// `q` holds the loaded word; `r = &q` aliases it (`Rvalue::Ref`).
-/// `input_param_value_type` represents `&&i64` as that scalar
-/// (`callparse`).
+/// borrowed, so it is not deref-only: the reborrow loads the pointee.
+/// `r = &q` aliases that scalar (`input_param_value_type`).
 #[test]
 fn nested_ref_of_raw_ptr_reborrow_look_inside_receives_the_word() {
     let i64_ty = interior_i64();
@@ -45088,6 +45109,313 @@ fn closure_capture_of_raw_ptr_reborrow_stores_the_word() {
             _ => true,
         }),
         "closure env field must not store the raw address; ops={ops:?}"
+    );
+}
+
+/// `p = &obj.field; q = &p; load(q)` with look-inside `f(x: &&i64)`.
+/// `p` is borrowed, so it is not deref-only: the bind reads the field
+/// value (`PtrRepr.rtype_getattr`). `q = &p` aliases that scalar
+/// (`input_param_value_type`).
+#[test]
+fn nested_ref_of_field_borrow_look_inside_receives_the_field_value() {
+    let i64_ty = interior_i64();
+    let obj_ty = interior_adt(0);
+    let mut_obj = mut_ref(&obj_ty);
+    let shared_i64 = shared_ref(&i64_ty);
+    let nested_i64 = shared_ref(&shared_i64);
+    let field_place = interior_field(1, &mut_obj, &obj_ty, &i64_ty, 0);
+    let caller = interior_caller(
+        "call_load",
+        1,
+        vec![mut_obj.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("obj"), &mut_obj),
+            interior_local(2, Some("p"), &shared_i64),
+            interior_local(3, Some("q"), &nested_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    assign_shared_field_borrow(interior_place(2, &shared_i64), field_place),
+                    interior_assign(
+                        interior_place(3, &nested_i64),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": interior_place(2, &shared_i64),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(3, &nested_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let mut helper = interior_caller(
+        "load_word",
+        1,
+        vec![nested_i64.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &nested_i64),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &i64_ty),
+                interior_use(interior_deref(1, &nested_i64, &i64_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    helper["def_id"] = serde_json::json!(1);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![gc_obj_i64_field_decl()],
+        vec![caller, helper],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "call_load")
+        .expect("lower look-inside load_word(&p) of p = &obj.field");
+    let ops = graph_ops(&graph);
+    let reads = field_reads_named(&ops, "field");
+    assert_eq!(
+        reads.len(),
+        1,
+        "borrowed field-borrow dest must getfield the owner; ops={ops:?}"
+    );
+    let obj = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("obj is the first inputarg");
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("load_word") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("load_word call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("load_word arg0 {other:?}; ops={ops:?}"),
+    };
+    assert_eq!(
+        arg0, reads[0],
+        "look-inside `&&i64` must receive the field value, not the GC owner; ops={ops:?}"
+    );
+    assert_ne!(
+        arg0, obj,
+        "look-inside `&&i64` must not receive the GC owner; ops={ops:?}"
+    );
+}
+
+/// `a = &*raw; q = a; r = &q; load(r)` with look-inside `f(x: &&i64)`.
+/// `a` is copied, so it is not deref-only: the reborrow loads the
+/// pointee (`rewrite_op_raw_load`). `q` / `r` alias that scalar
+/// (`input_param_value_type`).
+#[test]
+fn copy_then_nested_ref_of_raw_ptr_reborrow_look_inside_receives_the_word() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty.clone());
+    let shared_i64 = shared_ref(&i64_ty);
+    let nested_i64 = shared_ref(&shared_i64);
+    let caller = interior_caller(
+        "call_load",
+        1,
+        vec![ptr_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("raw"), &ptr_ty),
+            interior_local(2, Some("a"), &shared_i64),
+            interior_local(3, Some("q"), &shared_i64),
+            interior_local(4, Some("r"), &nested_i64),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    assign_shared_deref_reborrow(
+                        interior_place(2, &shared_i64),
+                        interior_deref(1, &ptr_ty, &i64_ty),
+                    ),
+                    interior_assign(
+                        interior_place(3, &shared_i64),
+                        interior_use(interior_place(2, &shared_i64)),
+                    ),
+                    interior_assign(
+                        interior_place(4, &nested_i64),
+                        serde_json::json!({
+                            "Ref": {
+                                "place": interior_place(3, &shared_i64),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }
+                        }),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(4, &nested_i64))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let mut helper = interior_caller(
+        "load_word",
+        1,
+        vec![nested_i64.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &nested_i64),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &i64_ty),
+                interior_use(interior_deref(1, &nested_i64, &i64_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    helper["def_id"] = serde_json::json!(1);
+    let llbc = llbc_with_types("fixture", vec![], vec![caller, helper]);
+    let graph = crate::test_support::lower_function(&llbc, "call_load")
+        .expect("lower look-inside load_word(&q) of q = a = &*raw");
+    let ops = graph_ops(&graph);
+    let raw = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("raw is the first inputarg");
+    let loaded = ops.iter().find_map(|op| match &op.kind {
+        OpKind::RawLoad { base, .. } if base == raw => op.result.clone(),
+        _ => None,
+    });
+    let loaded = loaded
+        .unwrap_or_else(|| panic!("copied reborrow dest must RawLoad through raw; ops={ops:?}"));
+    let call_args = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("load_word") => Some(args.as_slice()),
+        _ => None,
+    });
+    let call_args = call_args.unwrap_or_else(|| panic!("load_word call missing; ops={ops:?}"));
+    let arg0 = match call_args.first() {
+        Some(LinkArg::Value(v)) => v,
+        other => panic!("load_word arg0 {other:?}; ops={ops:?}"),
+    };
+    assert_eq!(
+        arg0, &loaded,
+        "look-inside `&&i64` must receive the loaded word, not the address; ops={ops:?}"
+    );
+    assert_ne!(
+        arg0, raw,
+        "look-inside `&&i64` must not receive the raw address; ops={ops:?}"
+    );
+}
+
+/// `q = get_ref(); Holder { reference: q, tag: 0 }` of a call-returned
+/// `&i64`. Ordinary reference fields keep the pointer (`getfieldrepr` /
+/// `adt_field_read_value_type`); the aggregate operand must not load.
+#[test]
+fn aggregate_of_call_returned_ref_stores_the_address() {
+    let i64_ty = interior_i64();
+    let shared_i64 = shared_ref(&i64_ty);
+    let holder_ty = interior_adt(0);
+    let q_place = interior_place(1, &shared_i64);
+    let holder_place = interior_place(0, &holder_ty);
+    let caller = interior_caller(
+        "store_returned_ref",
+        0,
+        vec![],
+        holder_ty.clone(),
+        vec![
+            interior_local(0, None, &holder_ty),
+            interior_local(1, Some("q"), &shared_i64),
+        ],
+        vec![
+            interior_bb(vec![], interior_call(1, vec![], q_place.clone(), 2, 1)),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    holder_place,
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, null, null]},
+                            [
+                                {"Move": q_place},
+                                interior_const_i64("0", &i64_ty)
+                            ]
+                        ]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let holder_decl = interior_struct(
+        0,
+        &["fixture", "Holder"],
+        &[("reference", shared_i64.clone()), ("tag", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let get_ref = interior_opaque(1, &["fixture", "get_ref"], vec![], shared_i64);
+    let llbc = llbc_with_types("fixture", vec![holder_decl], vec![caller, get_ref]);
+    let graph = crate::test_support::lower_function(&llbc, "store_returned_ref")
+        .expect("lower Holder { reference: get_ref(), tag: 0 }");
+    let ops = graph_ops(&graph);
+    let call_res = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.last().map(String::as_str) == Some("get_ref") => op.result.clone(),
+        _ => None,
+    });
+    let call_res = call_res.unwrap_or_else(|| panic!("get_ref call missing; ops={ops:?}"));
+    let stored = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(v),
+            ..
+        } if field.name == "reference" => Some(v),
+        _ => None,
+    });
+    let stored =
+        stored.unwrap_or_else(|| panic!("Holder.reference FieldWrite missing; ops={ops:?}"));
+    let flowed = graph
+        .blocks
+        .iter()
+        .any(|block| block.inputargs.iter().any(|ia| ia == stored));
+    assert!(
+        stored == &call_res || flowed,
+        "Holder.reference must store the call-returned address; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .all(|op| !matches!(op.kind, OpKind::RawLoad { .. })),
+        "ordinary reference field must not RawLoad the call-returned address; ops={ops:?}"
     );
 }
 

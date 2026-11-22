@@ -2470,24 +2470,7 @@ impl<'a> Lowering<'a> {
     ) -> Result<(Option<OpKind>, Variable), LowerError> {
         match rvalue {
             Rvalue::Use(operand, _) => {
-                if let Some(dest_local) = dest_local
-                    && let Some(src_local) = operand_local(Some(&operand))
-                    && let Some((src_place, ..)) = self.field_interior_access(src_local)
-                    && self.records_atomic_ref_place(dest_local, &src_place)
-                {
-                    // Dest carries the field path (`InteriorPtrRepr`
-                    // `lowleveltype = parentptrtype`): bind the owner.
-                    let v = self.defined_local(mir_bb, src_local)?;
-                    return Ok((None, v));
-                }
-                // A scalar-address source keeps the address only when
-                // the dest records it (`records_copied_scalar_address`).
-                // Otherwise the converter loads (`rewrite_op_raw_load`).
-                let expected = match dest_local {
-                    Some(local) if self.records_copied_scalar_address(local) => None,
-                    _ => Some(dest_ty),
-                };
-                let v = self.resolve_call_arg_value(mir_bb, operand, expected)?;
+                let v = self.resolve_operand(mir_bb, operand)?;
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
                 // graph never has a redundant `same_as` between two
@@ -3922,7 +3905,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .nth(index)
                             .expect("aggregate_shape checked the operand index");
-                        let value = self.resolve_call_arg_value(mir_bb, operand, Some(dest_ty))?;
+                        let value = self.resolve_call_arg_value(mir_bb, operand, None)?;
                         // `GcRef(p as usize)`: the operand is the address integer
                         // from `cast_ptr_to_int` + `r_uint`, but the list item
                         // kind is the `GcRef::NULL` `ConstRefNull`
@@ -3943,17 +3926,6 @@ impl<'a> Lowering<'a> {
                         Ok(self.retag_error_carrier(dest_ty, value))
                     }
                     AggregateShape::Ctor(mut ctor) => {
-                        // Declared field types from the aggregate ADT
-                        // (`resolve_aggregate_adt`), the same rows
-                        // `adt_field_read_value_type` reads. Each operand
-                        // states that type so the converter loads a
-                        // scalar-word field (`InstanceRepr.rtype_setattr`).
-                        let field_expected: Vec<Option<TyRef>> = self
-                            .resolve_aggregate_adt(&kind, Some(dest_ty))
-                            .map(|(_, _, rows, _, _, _)| {
-                                rows.into_iter().map(|(_, _, ty)| ty).collect()
-                            })
-                            .unwrap_or_default();
                         // A pair-slice operand is its pointer here and its
                         // length beside it; the field stores both words.
                         // Owner → window is only for a window field
@@ -4040,12 +4012,7 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
-                            let expected = field_expected.get(i).cloned().flatten();
-                            arg_vars.push(self.resolve_call_arg_value(
-                                mir_bb,
-                                op,
-                                expected.as_ref(),
-                            )?);
+                            arg_vars.push(self.resolve_call_arg_value(mir_bb, op, None)?);
                             pair_lens.push(None);
                         }
                         if pair_lens.iter().any(Option::is_some)
@@ -7993,14 +7960,13 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Represented VALUE of an operand. A field-interior local yields
-    /// getfield (`InteriorPtrRepr.rtype_getattr`). A `scalar_address_locals`
-    /// reborrow yields RawLoad when `expected_ty` is a look-inside
-    /// scalar-word `&T` (`input_param_value_type` /
-    /// `function_local_primitive_cell_descr`; `callparse` / `rewrite_op_raw_load`).
-    /// Deref / `mem_slot` / a Use-copy that records the path skip this
-    /// and read the owner or address. `expected_ty` None keeps a
-    /// scalar-address as the live address (residual `&T` ABI).
+    /// Represented VALUE of an operand. A `scalar_address_locals`
+    /// call-returned `&T` yields RawLoad when `expected_ty` is a
+    /// look-inside scalar-word `&T` (`input_param_value_type` /
+    /// `function_local_primitive_cell_descr`; `callparse` /
+    /// `rewrite_op_raw_load`). `expected_ty` None keeps that address
+    /// (residual `&T` ABI). Field-interior owner and Ref reborrow
+    /// addresses are deref-only and do not appear as operands.
     pub(in crate::front::mir) fn resolve_call_arg_value(
         &mut self,
         mir_bb: usize,
@@ -8008,9 +7974,6 @@ impl<'a> Lowering<'a> {
         expected_ty: Option<&TyRef>,
     ) -> Result<Variable, LowerError> {
         if let Some(local) = operand_local(Some(&op)) {
-            if let Some(v) = self.field_interior_value_at_use(mir_bb, local)? {
-                return Ok(v);
-            }
             if self.scalar_address_locals.contains(&local)
                 && expected_ty.is_some_and(|ty| {
                     raw_scalar_address_value_type(ty, self.llbc).is_none()
@@ -9336,15 +9299,7 @@ impl<'a> Lowering<'a> {
                         // A local is the slot `mem::replace` writes. A projection
                         // stays the borrowed value: re-resolving it would emit a
                         // fresh field or index read for every borrow.
-                        // A recorded `Local(p)` whose target is field-interior
-                        // is `*p` (`InteriorPtrRepr.rtype_getattr` /
-                        // `getinteriorfieldargs`).
-                        if let PlaceKind::Local(followed_local) = followed.kind {
-                            if let Some(value) =
-                                self.field_interior_value_at_use(mir_bb, followed_local as usize)?
-                            {
-                                return Ok(value);
-                            }
+                        if let PlaceKind::Local(_) = followed.kind {
                             return self.resolve_place(mir_bb, followed);
                         }
                         if let Some(cell) = self.deref_cell_param_local(&followed) {

@@ -479,10 +479,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// [`compute_mutably_borrowed_locals`]; no `Assign` names the local
     /// for such a write, so these locals have no single definition.
     pub(in crate::front::mir) mutably_borrowed_locals: std::collections::HashSet<usize>,
-    /// Locals whose address the body takes (`&l` / `&raw l`). Whole-body
-    /// set from [`compute_borrowed_locals`]. A dest in this set does not
-    /// record a scalar-address representation (`records_scalar_address`).
-    pub(in crate::front::mir) borrowed_locals: std::collections::HashSet<usize>,
+    /// Locals whose every body use is a `Deref` of that local
+    /// ([`compute_deref_only_locals`]). Field-interior owner and
+    /// `Rvalue::Ref` reborrow address are recorded only for a dest in
+    /// this set (`records_atomic_ref_place` / `records_scalar_address`).
+    pub(in crate::front::mir) deref_only_locals: std::collections::HashSet<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -2388,7 +2389,7 @@ impl<'a> Lowering<'a> {
             mutably_borrowed_locals: compute_mutably_borrowed_locals(llbc, body)
                 .into_iter()
                 .collect(),
-            borrowed_locals: compute_borrowed_locals(llbc, body).into_iter().collect(),
+            deref_only_locals: compute_deref_only_locals(llbc, body),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()
@@ -3555,55 +3556,47 @@ impl<'a> Lowering<'a> {
     }
 
     /// Whether `_i = &place` / `&raw place` records `place` on
-    /// [`Self::atomic_ref_place`]. Cell reborrows stay recorded across a
-    /// later assign; every other borrow is single-assignment, the same
-    /// restriction [`Self::const_discriminant_locals`] carries. Field-only
-    /// `InteriorPtrRepr` binds the owner only when this is true, so the
-    /// representation and its field path agree (`rptr.py`
-    /// `InteriorPtrRepr.__init__`). `_0` is the return local: the caller
-    /// cannot see this field path (`getrresult`). A dest
-    /// [`Self::mutably_borrowed_locals`] can overwrite has no single
-    /// definition either (`write_mem_slot`).
+    /// [`Self::atomic_ref_place`]. Field-only `InteriorPtrRepr` binds the
+    /// owner only when the dest is deref-only, so nothing other than
+    /// Deref sees the owner (`rptr.py` `InteriorPtrRepr.__init__`). An
+    /// ordinary `&mut local` still records the slot (`mem_slot` /
+    /// `mem::replace`) under the same dest filters as before deref-only
+    /// (`_0`, mutably borrowed, multiply assigned); a cell reborrow
+    /// still records a multiply assigned dest. A raw-primitive reborrow
+    /// is the address (`records_scalar_address`).
     pub(in crate::front::mir) fn records_atomic_ref_place(
         &self,
         dest_local: usize,
         place: &Place,
     ) -> bool {
-        if dest_local == 0 {
+        if self.raw_primitive_reborrow_inner(place).is_some() {
             return false;
         }
-        if self.mutably_borrowed_locals.contains(&dest_local) {
-            return false;
+        if self.scalar_gc_field_interior_parts(place).is_some() {
+            self.deref_only_locals.contains(&dest_local)
+        } else if dest_local == 0 || self.mutably_borrowed_locals.contains(&dest_local) {
+            false
+        } else {
+            let cell_reborrow = self
+                .reborrow_cell_param(place)
+                .or_else(|| self.deref_cell_param_local(place))
+                .is_some();
+            cell_reborrow || !self.multi_assigned_locals.contains(&dest_local)
         }
-        let cell_reborrow = self
-            .reborrow_cell_param(place)
-            .or_else(|| self.deref_cell_param_local(place))
-            .is_some();
-        self.raw_primitive_reborrow_inner(place).is_none()
-            && (cell_reborrow || !self.multi_assigned_locals.contains(&dest_local))
     }
 
     /// Whether `_i = &*p` of a primitive pointer records `p` on
     /// [`Self::scalar_address_locals`]. A `Ref` dest produces the address
-    /// only when this is true (`cast_ptr_to_adr`); a multiply assigned
-    /// dest, or a dest whose address is taken (`&q` / `&raw q`), loads
-    /// the pointee (`rewrite_op_raw_load`). A `RawPtr` dest is an address
-    /// by type and does not consult this predicate.
+    /// only when the dest is deref-only (`cast_ptr_to_adr`); any other
+    /// use loads the pointee (`rewrite_op_raw_load`). A `RawPtr` dest is
+    /// an address by type and does not consult this predicate.
     pub(in crate::front::mir) fn records_scalar_address(
         &self,
         dest_local: usize,
         place: &Place,
     ) -> bool {
         self.raw_primitive_reborrow_inner(place).is_some()
-            && self.records_copied_scalar_address(dest_local)
-            && !self.borrowed_locals.contains(&dest_local)
-    }
-
-    /// Dest of `_j = copy _i` of a scalar-address source records `_j` on
-    /// [`Self::scalar_address_locals`]. A multiply assigned dest loads
-    /// the pointee (`rewrite_op_raw_load`).
-    pub(in crate::front::mir) fn records_copied_scalar_address(&self, dest_local: usize) -> bool {
-        !self.multi_assigned_locals.contains(&dest_local)
+            && self.deref_only_locals.contains(&dest_local)
     }
 
     pub(in crate::front::mir) fn lower_assign(
@@ -3790,13 +3783,11 @@ impl<'a> Lowering<'a> {
                 // before `build_rvalue` consumes the rvalue.
                 if let Some(place) = borrowed_place_referent(&rvalue) {
                     let local = i as usize;
-                    // `&raw const *p` is the address `p`, not the loaded
-                    // word. Recording that local as a scalar alias makes
-                    // the later `*q` skip `RawLoad`. A cell reborrow is
-                    // recorded even when the local is assigned again.
-                    // `&mut *p` of a raw pointer is that same address
-                    // (`cast_ptr_to_adr`); `*q` is `rewrite_op_raw_load`,
-                    // like a call-returned `&T` on `scalar_address_locals`.
+                    // A deref-only `Ref` dest of `&*p` records the address
+                    // (`records_scalar_address`); `*q` is then
+                    // `rewrite_op_raw_load`. A RawPtr dest is an address
+                    // by type and does not consult that predicate. A
+                    // call-returned `&T` is already on `scalar_address_locals`.
                     if self.records_atomic_ref_place(local, &place) {
                         self.atomic_ref_place.insert(local, place);
                     } else if self.records_scalar_address(local, &place)
@@ -3805,7 +3796,7 @@ impl<'a> Lowering<'a> {
                         self.scalar_address_locals.push(local);
                     }
                 }
-                if self.records_copied_scalar_address(i as usize)
+                if !self.multi_assigned_locals.contains(&(i as usize))
                     && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
                     && let PlaceKind::Local(src_local) = src.kind
                     && self.scalar_address_locals.contains(&(src_local as usize))
@@ -3815,18 +3806,6 @@ impl<'a> Lowering<'a> {
                     // is that same address (`Rvalue::Use` aliases the
                     // Variable), so `*_j` still has to `RawLoad`.
                     self.scalar_address_locals.push(i as usize);
-                }
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
-                    && let PlaceKind::Local(src_local) = src.kind
-                    && let Some((src_place, ..)) = self.field_interior_access(src_local as usize)
-                    && self.records_atomic_ref_place(i as usize, &src_place)
-                {
-                    // `_j = copy _i` of a field-only interior. The offsets
-                    // are part of the repr (`InteriorPtrRepr.__init__`);
-                    // the copy inherits the source's field path. A RawPtr
-                    // source is not a field-only interior
-                    // (`field_interior_access`).
-                    self.atomic_ref_place.insert(i as usize, src_place);
                 }
                 if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
                     && let Some(alias) = self.fused_copy_struct_get_place_alias(src)

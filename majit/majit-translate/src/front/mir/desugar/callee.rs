@@ -1603,51 +1603,111 @@ pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
     out
 }
 
-/// Locals whose address the body takes (`&l` / `&raw l`, shared or mut,
-/// or of a field or element of `l` reached without a deref). A dest in
-/// this set does not record a scalar-address representation
-/// (`records_scalar_address`): `&q` of `q = &*p` needs `q` to hold the
-/// loaded word so the nested borrow aliases that scalar.
-pub(in crate::front::mir) fn compute_borrowed_locals(
+/// Locals whose every body use, other than a defining `Assign` / Call dest
+/// of the local itself, is as the root of a place whose first projection
+/// is `Deref` (`*q`, `*q = v`, `(*q).f`). Multiply assigned locals are
+/// excluded. [`Lowering::records_atomic_ref_place`] and
+/// [`Lowering::records_scalar_address`] require this set: any other use
+/// keeps the value read at the borrow (`InteriorPtrRepr` /
+/// `callparse`). `Return` uses `_0`. `StorageLive` / `StorageDead` /
+/// `PlaceMention` / `Drop` are ignored, as in [`dest_deref_census`].
+pub(in crate::front::mir) fn compute_deref_only_locals(
     llbc: &Llbc,
     body: &Unstructured,
-) -> Vec<usize> {
+) -> std::collections::HashSet<usize> {
+    let multi = compute_multi_assigned_locals(llbc, body);
+    let n = body.locals.locals.len();
+    let mut disqualified = vec![false; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    let mut out = Vec::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
-                continue;
-            };
-            let place = match rvalue {
-                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
-                _ => continue,
-            };
-            let mut current = place;
-            let local = loop {
-                match &current.kind {
-                    PlaceKind::Projection(inner, elem) => {
-                        if matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
-                            break None;
-                        }
-                        current = inner;
-                    }
-                    PlaceKind::Local(i) => break Some(*i as usize),
-                    PlaceKind::Global { .. } | PlaceKind::Unknown => break None,
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_non_deref_uses(rvalue, &mut disqualified);
+                    note_write_place_non_deref(place, &mut disqualified);
                 }
-            };
-            if let Some(i) = local
-                && !out.contains(&i)
-            {
-                out.push(i);
+                Ok(StmtKind::Assert(assert)) => {
+                    note_operand_non_deref(&assert.cond, &mut disqualified);
+                }
+                _ => {}
             }
         }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => {
+                note_operand_non_deref(discr, &mut disqualified);
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op, _) = &call.func {
+                    note_operand_non_deref(op, &mut disqualified);
+                }
+                for arg in &call.args {
+                    note_operand_non_deref(arg, &mut disqualified);
+                }
+                note_write_place_non_deref(&call.dest, &mut disqualified);
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                note_operand_non_deref(&assert.cond, &mut disqualified);
+            }
+            Ok(TermKind::Return) => {
+                if n > 0 {
+                    disqualified[0] = true;
+                }
+            }
+            _ => {}
+        }
     }
-    out.sort_unstable();
-    out
+    (0..n)
+        .filter(|&i| !disqualified[i] && !multi.contains(&i))
+        .collect()
+}
+
+fn note_write_place_non_deref(place: &Place, disqualified: &mut [bool]) {
+    if matches!(place.kind, PlaceKind::Local(_)) {
+        return;
+    }
+    note_place_non_deref(place, disqualified);
+}
+
+fn note_operand_non_deref(op: &Operand, disqualified: &mut [bool]) {
+    if let Some(place) = operand_place(op) {
+        note_place_non_deref(place, disqualified);
+    }
+}
+
+fn note_place_non_deref(place: &Place, disqualified: &mut [bool]) {
+    let Some(root) = place_root_local(place) else {
+        return;
+    };
+    if root < disqualified.len() && place_deref_rooted_local(place) != Some(root) {
+        disqualified[root] = true;
+    }
+}
+
+fn scan_rvalue_non_deref_uses(rvalue: &Rvalue, disqualified: &mut [bool]) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat { operand: op, .. }
+        | Rvalue::ShallowInitBox(op, _) => note_operand_non_deref(op, disqualified),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            note_operand_non_deref(lhs, disqualified);
+            note_operand_non_deref(rhs, disqualified);
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawPtr { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => note_place_non_deref(place, disqualified),
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                note_operand_non_deref(op, disqualified);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
 }
 
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the
@@ -5037,6 +5097,21 @@ pub(in crate::front::mir) fn place_is_immediate_deref_of(place: &Place, dest: us
     };
     matches!(elem, ProjectionElem::Atom(s) if s == "Deref")
         && matches!(inner.kind, PlaceKind::Local(i) if i as usize == dest)
+}
+
+/// The local `q` of a place whose first projection from `q` is `Deref`
+/// (`*q`, `(*q).f`, `**q`).
+fn place_deref_rooted_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => match &inner.kind {
+            PlaceKind::Local(i) if matches!(elem, ProjectionElem::Atom(name) if name == "Deref") => {
+                Some(*i as usize)
+            }
+            PlaceKind::Projection(..) => place_deref_rooted_local(inner),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Classify how a read-position operand references `dest`.
