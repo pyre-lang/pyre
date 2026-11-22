@@ -19511,7 +19511,11 @@ unsafe fn builtin_iter_override(
             unsafe { obj_type_name(obj) }
         )));
     }
-    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+    // descroperation.py DescrOperation.iter: `space.get_and_call_function(w_descr, w_obj)`.
+    // Non-function descriptors are bound through `get` first.
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_type = crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    let w_iter = get_and_call_function(method, obj, w_type, &[])?;
     match iter_check_is_iterator(pyre_object::gc_roots::shadow_stack_get(obj_slot), w_iter) {
         Ok(w_iter) => Ok(Some(w_iter)),
         Err(err) => Err(err),
@@ -19823,9 +19827,17 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::operation::is_callable_iterator(obj) {
             return Ok(obj);
         }
-        // `array.array` — `interp_array.py descr_iter` returns
+        // `array.array` — `interp_array.py W_ArrayBase.descr_iter` returns
         // `space.newseqiter(self)` (a fresh index cursor, not self).
+        // A heap subtype may replace `__iter__`; dispatch that first
+        // (`descroperation.py iter` / `builtin_iter_override`).
         if pyre_object::interp_array::is_array(obj) {
+            if let Some(w_iter) =
+                builtin_iter_override(obj, &pyre_object::interp_array::ARRAY_TYPE)?
+            {
+                return Ok(w_iter);
+            }
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let len = pyre_object::interp_array::w_array_len(obj);
             return Ok(pyre_object::w_array_iter_new(obj, len));
         }
@@ -20707,9 +20719,18 @@ pub(crate) fn seq_iter_descr_next(obj: PyObjectRef) -> PyResult {
             if crate::importing::optional_module_hooks().is_some()
                 && idx < pyre_object::interp_array::w_array_len(seq) as isize
             {
-                // [3.14-spec] `arrayiter_next` at v3.14.6 advances its
-                // cursor as part of the getitem argument, even when an
-                // invalid unicode value makes that getitem raise.
+                // [3.15-spec] ours `array_w_getitem_hook` (direct storage
+                // getter) ↔ PyPy `W_SeqIterObject.descr_next` /
+                // `space.getitem` — the cursor advances as part of the
+                // getter argument even when an invalid unicode value
+                // makes that getter raise, and the getter bypasses a
+                // subclass `__getitem__`; evidence:
+                // `arraymodule.c arrayiter_next` at v3.15.0 (the pinned
+                // tag) does `return (*it->getitem)(ao, it->index++);`,
+                // unchanged at v3.15.2, and a
+                // 3.15.2t run of
+                // `class A(array.array): __getitem__ = lambda s, i: 99`
+                // then `list(iter(A("i", [1, 2])))` prints `[1, 2]`.
                 (*iter_ptr).index += 1;
                 return array_w_getitem_hook(seq, idx as usize);
             }
