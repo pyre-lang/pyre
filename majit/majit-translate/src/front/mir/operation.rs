@@ -3418,12 +3418,13 @@ impl<'a> Lowering<'a> {
                     return Ok((None, v));
                 }
                 // `&mut *p` of a raw pointer is `p` (`cast_ptr_to_adr`).
-                // Produce the address only when the dest records it
-                // (`records_scalar_address`); otherwise load the pointee
-                // (`rewrite_op_raw_load`). A `RawPtr` dest is an address
-                // by type and does not use this gate.
+                // Produce the address only when construction classified
+                // the dest as that address (`scalar_address_locals`);
+                // otherwise load the pointee (`rewrite_op_raw_load`).
+                // A `RawPtr` dest is an address by type and does not
+                // use this gate.
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place)
-                    && dest_local.is_some_and(|local| self.records_scalar_address(local, &place))
+                    && dest_local.is_some_and(|local| self.scalar_address_locals.contains(&local))
                 {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -3435,10 +3436,11 @@ impl<'a> Lowering<'a> {
                 // interior result returns the parent (`hop.inputarg(self, 0)`).
                 // The field path stays in `atomic_ref_place`; getfield is at
                 // each use (`InteriorPtrRepr.rtype_getattr`). Bind the owner
-                // only when the dest will carry that path; otherwise keep
-                // the field value (`records_atomic_ref_place`).
-                if let Some((inner, _)) = self.scalar_gc_field_interior_parts(&place)
-                    && dest_local.is_some_and(|local| self.records_atomic_ref_place(local, &place))
+                // only when construction classified the dest as that
+                // interior (`is_field_interior_local`); otherwise keep
+                // the field value.
+                if dest_local.is_some_and(|local| self.is_field_interior_local(local))
+                    && let Some((inner, _)) = self.scalar_gc_field_interior_parts(&place)
                 {
                     let owner = self.resolve_place(mir_bb, clone_place(inner))?;
                     return Ok((None, owner));
@@ -3905,7 +3907,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .nth(index)
                             .expect("aggregate_shape checked the operand index");
-                        let value = self.resolve_call_arg_value(mir_bb, operand, None)?;
+                        let value = self.resolve_operand(mir_bb, operand)?;
                         // `GcRef(p as usize)`: the operand is the address integer
                         // from `cast_ptr_to_int` + `r_uint`, but the list item
                         // kind is the `GcRef::NULL` `ConstRefNull`
@@ -4012,7 +4014,7 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
-                            arg_vars.push(self.resolve_call_arg_value(mir_bb, op, None)?);
+                            arg_vars.push(self.resolve_operand(mir_bb, op)?);
                             pair_lens.push(None);
                         }
                         if pair_lens.iter().any(Option::is_some)
@@ -5282,7 +5284,28 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         op: Operand,
     ) -> Result<Variable, LowerError> {
-        self.resolve_call_arg_value(mir_bb, op, None)
+        match op {
+            Operand::Copy(place) => self.resolve_place(mir_bb, place),
+            Operand::Move(place) => {
+                // A `move c` of a builder-mode accumulator is its single
+                // `ll_build` materialisation point
+                // (`accumulator_materialization_site_count == 1`). Emit the
+                // `__majit_stringbuilder_build` marker
+                // (`flowspace_adapter` → getattr("build") + simple_call →
+                // `SomeString`) instead of moving the concat accumulator out.
+                // Only a bare `Local(c)` move qualifies; a projection falls
+                // through. Inert unless this function selected builder mode and
+                // the local is an accumulator (read from the per-body table).
+                if let PlaceKind::Local(i) = place.kind
+                    && self.builder_mode
+                    && self.accumulator_is_builder_mode(i as usize)
+                {
+                    return self.resolve_builder_build(mir_bb, i as usize);
+                }
+                self.resolve_place(mir_bb, place)
+            }
+            Operand::Const(value) => self.emit_constant(mir_bb, &value),
+        }
     }
 
     /// Emit the `__majit_stringbuilder_build(c)` marker for the terminal
@@ -6834,16 +6857,11 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
-    /// would `RawLoad` a primitive.
-    ///
-    /// The rvalue's value is the address. A pointer recorded on
-    /// `atomic_ref_place` is a scalar alias, and resolving its deref
-    /// already yields that scalar, so this returns `None`.
-    pub(in crate::front::mir) fn raw_primitive_reborrow_inner(
-        &self,
-        place: &Place,
-    ) -> Option<Place> {
+    /// Type-only inner of `&*p` / `&raw *p` when that deref would
+    /// `RawLoad` a primitive (`cast_ptr_to_adr`). Does not consult
+    /// `atomic_ref_place`, so construction can classify a deref-only
+    /// `Rvalue::Ref` dest before lowering starts.
+    pub(in crate::front::mir) fn raw_primitive_deref_inner(&self, place: &Place) -> Option<Place> {
         let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) = &place.kind else {
             return None;
         };
@@ -6861,12 +6879,26 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
+        Some(clone_place(inner))
+    }
+
+    /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
+    /// would `RawLoad` a primitive.
+    ///
+    /// The rvalue's value is the address. A pointer recorded on
+    /// `atomic_ref_place` is a scalar alias, and resolving its deref
+    /// already yields that scalar, so this returns `None`.
+    pub(in crate::front::mir) fn raw_primitive_reborrow_inner(
+        &self,
+        place: &Place,
+    ) -> Option<Place> {
+        let inner = self.raw_primitive_deref_inner(place)?;
         if let PlaceKind::Local(local) = inner.kind
             && self.atomic_ref_place.contains_key(&(local as usize))
         {
             return None;
         }
-        Some(clone_place(inner))
+        Some(inner)
     }
 
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
@@ -7211,12 +7243,16 @@ impl<'a> Lowering<'a> {
 
     /// Field-only interior identity: the recorded Field place, its inner
     /// (GC owner), and field payload (`scalar_gc_field_interior_parts`).
-    /// The dest local is a `Ref` (`InteriorPtrRepr` `parentptrtype`); a
-    /// `RawPtr` dest keeps the captured field value.
+    /// The dest local is a deref-only `Ref` (`InteriorPtrRepr`
+    /// `parentptrtype`); a `RawPtr` dest keeps the captured field value.
+    /// A non-deref-only local recorded the main way is not an owner.
     pub(in crate::front::mir) fn field_interior_access(
         &self,
         local: usize,
     ) -> Option<(Place, Place, serde_json::Value, TyRef)> {
+        if !self.is_field_interior_local(local) {
+            return None;
+        }
         let dest_ty = self.mir_local_ty(local)?;
         tyref_peel_one_ref_node(&dest_ty, self.llbc)?;
         let recorded = self.atomic_ref_place.get(&local).map(clone_place)?;
@@ -7958,76 +7994,6 @@ impl<'a> Lowering<'a> {
             value,
         )?;
         Ok(true)
-    }
-
-    /// Represented VALUE of an operand. A `scalar_address_locals`
-    /// call-returned `&T` yields RawLoad when `expected_ty` is a
-    /// look-inside scalar-word `&T` (`input_param_value_type` /
-    /// `function_local_primitive_cell_descr`; `callparse` /
-    /// `rewrite_op_raw_load`). `expected_ty` None keeps that address
-    /// (residual `&T` ABI). Field-interior owner and Ref reborrow
-    /// addresses are deref-only and do not appear as operands.
-    pub(in crate::front::mir) fn resolve_call_arg_value(
-        &mut self,
-        mir_bb: usize,
-        op: Operand,
-        expected_ty: Option<&TyRef>,
-    ) -> Result<Variable, LowerError> {
-        if let Some(local) = operand_local(Some(&op)) {
-            if self.scalar_address_locals.contains(&local)
-                && expected_ty.is_some_and(|ty| {
-                    raw_scalar_address_value_type(ty, self.llbc).is_none()
-                        && tyref_peel_one_ref_node(ty, self.llbc)
-                            .map(|node| TyRef::Other(node.clone().into()))
-                            .as_ref()
-                            .and_then(|pointee| {
-                                function_local_primitive_cell_descr(pointee, self.llbc)
-                            })
-                            .is_some()
-                })
-                && let Some(local_ty) = self.mir_local_ty(local)
-            {
-                let pointee = tyref_peel_one_ref_node(&local_ty, self.llbc)
-                    .map(|node| TyRef::Other(node.clone().into()))
-                    .unwrap_or(local_ty);
-                if let Some((item_ty, itemsize, is_item_signed)) =
-                    function_local_primitive_cell_descr(&pointee, self.llbc)
-                {
-                    let ptr = self.defined_local(mir_bb, local)?;
-                    let bb = self.emit_bb(mir_bb);
-                    return Ok(emit_raw_cell_load(
-                        &mut self.graph,
-                        bb,
-                        ptr,
-                        item_ty,
-                        itemsize,
-                        is_item_signed,
-                    ));
-                }
-            }
-        }
-        match op {
-            Operand::Copy(place) => self.resolve_place(mir_bb, place),
-            Operand::Move(place) => {
-                // A `move c` of a builder-mode accumulator is its single
-                // `ll_build` materialisation point
-                // (`accumulator_materialization_site_count == 1`). Emit the
-                // `__majit_stringbuilder_build` marker
-                // (`flowspace_adapter` → getattr("build") + simple_call →
-                // `SomeString`) instead of moving the concat accumulator out.
-                // Only a bare `Local(c)` move qualifies; a projection falls
-                // through. Inert unless this function selected builder mode and
-                // the local is an accumulator (read from the per-body table).
-                if let PlaceKind::Local(i) = place.kind
-                    && self.builder_mode
-                    && self.accumulator_is_builder_mode(i as usize)
-                {
-                    return self.resolve_builder_build(mir_bb, i as usize);
-                }
-                self.resolve_place(mir_bb, place)
-            }
-            Operand::Const(value) => self.emit_constant(mir_bb, &value),
-        }
     }
 
     /// `&T` of a transparent scalar is the word, so the field read stays a

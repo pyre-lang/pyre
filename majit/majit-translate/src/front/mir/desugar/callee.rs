@@ -1606,9 +1606,9 @@ pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
 /// Locals whose every body use, other than a defining `Assign` / Call dest
 /// of the local itself, is as the root of a place whose first projection
 /// is `Deref` (`*q`, `*q = v`, `(*q).f`). Multiply assigned locals are
-/// excluded. [`Lowering::records_atomic_ref_place`] and
-/// [`Lowering::records_scalar_address`] require this set: any other use
-/// keeps the value read at the borrow (`InteriorPtrRepr` /
+/// excluded. Construction records the new representations only for a dest
+/// in this set (`is_field_interior_local` / `scalar_address_locals`); any
+/// other use keeps the value read at the borrow (`InteriorPtrRepr` /
 /// `callparse`). `Return` uses `_0`. `StorageLive` / `StorageDead` /
 /// `PlaceMention` / `Drop` are ignored, as in [`dest_deref_census`].
 pub(in crate::front::mir) fn compute_deref_only_locals(

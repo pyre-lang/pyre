@@ -1537,7 +1537,7 @@ impl<'a> Lowering<'a> {
 
     pub(in crate::front::mir) fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
         let local = local?;
-        if self.field_interior_access(local).is_some() {
+        if self.is_field_interior_local(local) {
             return Some(MemSlot::FieldInterior(local));
         }
         if let Some(place) = self.atomic_ref_place.get(&local).map(clone_place) {

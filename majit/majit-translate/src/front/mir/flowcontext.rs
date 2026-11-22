@@ -406,14 +406,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// are not `&mut T`, so [`Lowering::gc_mut_ref_param_root`] keeps
     /// naming only `&mut T`.
     pub(in crate::front::mir) gc_mut_ref_option_params: std::collections::HashSet<usize>,
-    /// MIR locals whose value is the address of a primitive, produced by a
-    /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
-    ///
-    /// `Rvalue::Ref` does not enter: that borrow aliases the scalar, and
-    /// [`Lowering::atomic_ref_place`] already names the place. A copy or
-    /// move of one of these locals carries the same address. Only locals
-    /// outside [`Lowering::multi_assigned_locals`] enter, for the same
-    /// reason as [`Lowering::atomic_ref_place`].
+    /// MIR locals whose value is the address of a primitive: a call that
+    /// returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`), and a
+    /// deref-only `Rvalue::Ref` of `*p` for a raw primitive pointer
+    /// (`cast_ptr_to_adr`), recorded at construction. A copy or move of
+    /// one of these locals carries the same address. Only locals outside
+    /// [`Lowering::multi_assigned_locals`] enter, for the same reason as
+    /// [`Lowering::atomic_ref_place`].
     pub(in crate::front::mir) scalar_address_locals: Vec<usize>,
     /// Function-local primitive scalars whose address is a raw scalar
     /// pointer argument. `local_var` holds the Char-varsize cell pointer;
@@ -480,9 +479,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// for such a write, so these locals have no single definition.
     pub(in crate::front::mir) mutably_borrowed_locals: std::collections::HashSet<usize>,
     /// Locals whose every body use is a `Deref` of that local
-    /// ([`compute_deref_only_locals`]). Field-interior owner and
-    /// `Rvalue::Ref` reborrow address are recorded only for a dest in
-    /// this set (`records_atomic_ref_place` / `records_scalar_address`).
+    /// ([`compute_deref_only_locals`]). The new representations
+    /// (field-interior owner; `Rvalue::Ref` raw-reborrow address) are
+    /// recorded only for a dest in this set, at construction
+    /// ([`Self::is_field_interior_local`] / [`Self::scalar_address_locals`]).
     pub(in crate::front::mir) deref_only_locals: std::collections::HashSet<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
@@ -2287,7 +2287,7 @@ impl<'a> Lowering<'a> {
                 block_entry_local_var[row].set(local_idx, var);
             }
         }
-        Ok(Self {
+        let mut lowering = Self {
             graph,
             llbc,
             struct_fields: None,
@@ -2460,7 +2460,9 @@ impl<'a> Lowering<'a> {
             erased_gc_root_locals,
             gc_root_effects: None,
             gc_root_only_dropped: None,
-        })
+        };
+        lowering.install_deref_only_representations();
+        Ok(lowering)
     }
 
     /// `tyref_to_value_type_with` over this lowering's sets, memoised per hash-cons id.
@@ -3555,15 +3557,72 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Whether `local` holds the field-only interior owner
+    /// (`InteriorPtrRepr`). True only for a deref-only local whose
+    /// single definition is `&` / `&mut` of a scalar GC field place,
+    /// recorded at construction. Every interior consumer consults this
+    /// predicate so a non-deref-only local recorded the main way is
+    /// never read as an owner.
+    pub(in crate::front::mir) fn is_field_interior_local(&self, local: usize) -> bool {
+        self.deref_only_locals.contains(&local)
+            && self
+                .atomic_ref_place
+                .get(&local)
+                .is_some_and(|place| self.scalar_gc_field_interior_parts(place).is_some())
+    }
+
+    /// Prefill the new representations from the same forward-reachable
+    /// body scan that built [`Self::deref_only_locals`]. A deref-only
+    /// local whose single definition is `&` / `&mut` of a scalar GC
+    /// field place records that place (`InteriorPtrRepr.__init__`); a
+    /// deref-only `Rvalue::Ref` of `*p` for a raw primitive pointer
+    /// enters [`Self::scalar_address_locals`] (`cast_ptr_to_adr`).
+    /// Block-lowering order does not install this metadata.
+    fn install_deref_only_representations(&mut self) {
+        let forward_blocks = forward_reachable_mask(self.llbc, self.body);
+        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = &place.kind else {
+                    continue;
+                };
+                let dest = *dest as usize;
+                if !self.deref_only_locals.contains(&dest) {
+                    continue;
+                }
+                let Rvalue::Ref {
+                    place: referent, ..
+                } = rvalue
+                else {
+                    continue;
+                };
+                if self.scalar_gc_field_interior_parts(referent).is_some() {
+                    self.atomic_ref_place.insert(dest, clone_place(referent));
+                } else if self.raw_primitive_deref_inner(referent).is_some()
+                    && !self.scalar_address_locals.contains(&dest)
+                {
+                    self.scalar_address_locals.push(dest);
+                }
+            }
+        }
+    }
+
     /// Whether `_i = &place` / `&raw place` records `place` on
-    /// [`Self::atomic_ref_place`]. Field-only `InteriorPtrRepr` binds the
-    /// owner only when the dest is deref-only, so nothing other than
-    /// Deref sees the owner (`rptr.py` `InteriorPtrRepr.__init__`). An
-    /// ordinary `&mut local` still records the slot (`mem_slot` /
-    /// `mem::replace`) under the same dest filters as before deref-only
-    /// (`_0`, mutably borrowed, multiply assigned); a cell reborrow
-    /// still records a multiply assigned dest. A raw-primitive reborrow
-    /// is the address (`records_scalar_address`).
+    /// [`Self::atomic_ref_place`] during [`Self::lower_assign`].
+    /// Field-only interior for a deref-only dest is recorded at
+    /// construction (`is_field_interior_local`); a raw-primitive
+    /// reborrow is the address (`scalar_address_locals`). A
+    /// non-deref-only field borrow keeps main's filters so
+    /// `mem_slot` / `mem::replace` expand as `PtrRepr.rtype_getattr`.
+    /// An ordinary `&mut local` still records the slot under the same
+    /// dest filters as before deref-only (`_0`, mutably borrowed,
+    /// multiply assigned); a cell reborrow still records a multiply
+    /// assigned dest.
     pub(in crate::front::mir) fn records_atomic_ref_place(
         &self,
         dest_local: usize,
@@ -3572,31 +3631,21 @@ impl<'a> Lowering<'a> {
         if self.raw_primitive_reborrow_inner(place).is_some() {
             return false;
         }
+        let cell_reborrow = self
+            .reborrow_cell_param(place)
+            .or_else(|| self.deref_cell_param_local(place))
+            .is_some();
         if self.scalar_gc_field_interior_parts(place).is_some() {
-            self.deref_only_locals.contains(&dest_local)
-        } else if dest_local == 0 || self.mutably_borrowed_locals.contains(&dest_local) {
+            if self.deref_only_locals.contains(&dest_local) {
+                return false;
+            }
+            return cell_reborrow || !self.multi_assigned_locals.contains(&dest_local);
+        }
+        if dest_local == 0 || self.mutably_borrowed_locals.contains(&dest_local) {
             false
         } else {
-            let cell_reborrow = self
-                .reborrow_cell_param(place)
-                .or_else(|| self.deref_cell_param_local(place))
-                .is_some();
             cell_reborrow || !self.multi_assigned_locals.contains(&dest_local)
         }
-    }
-
-    /// Whether `_i = &*p` of a primitive pointer records `p` on
-    /// [`Self::scalar_address_locals`]. A `Ref` dest produces the address
-    /// only when the dest is deref-only (`cast_ptr_to_adr`); any other
-    /// use loads the pointee (`rewrite_op_raw_load`). A `RawPtr` dest is
-    /// an address by type and does not consult this predicate.
-    pub(in crate::front::mir) fn records_scalar_address(
-        &self,
-        dest_local: usize,
-        place: &Place,
-    ) -> bool {
-        self.raw_primitive_reborrow_inner(place).is_some()
-            && self.deref_only_locals.contains(&dest_local)
     }
 
     pub(in crate::front::mir) fn lower_assign(
@@ -3783,17 +3832,12 @@ impl<'a> Lowering<'a> {
                 // before `build_rvalue` consumes the rvalue.
                 if let Some(place) = borrowed_place_referent(&rvalue) {
                     let local = i as usize;
-                    // A deref-only `Ref` dest of `&*p` records the address
-                    // (`records_scalar_address`); `*q` is then
-                    // `rewrite_op_raw_load`. A RawPtr dest is an address
-                    // by type and does not consult that predicate. A
-                    // call-returned `&T` is already on `scalar_address_locals`.
+                    // Deref-only field-interior and Ref raw-reborrow
+                    // addresses are recorded at construction. Ordinary
+                    // `&mut local` and a non-deref-only field borrow
+                    // still record here (`PtrRepr.rtype_getattr`).
                     if self.records_atomic_ref_place(local, &place) {
                         self.atomic_ref_place.insert(local, place);
-                    } else if self.records_scalar_address(local, &place)
-                        && !self.scalar_address_locals.contains(&local)
-                    {
-                        self.scalar_address_locals.push(local);
                     }
                 }
                 if !self.multi_assigned_locals.contains(&(i as usize))

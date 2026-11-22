@@ -639,37 +639,11 @@ impl<'a> Lowering<'a> {
         };
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
-        // against the destination type. A Trait look-inside formal list
-        // uses the same receiver to resolve the impl
-        // (`deref_callee_fun_decl_and_generics`).
+        // against the destination type.
         let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
-        // Look-inside callee formals (`fun_decl_is_residual` is false).
-        // A residual `&T` keeps the address (`ResidualSlot`); a
-        // look-inside `&T` is the scalar word (`input_param_value_type`).
-        // A Trait call that names a concrete impl uses that impl's
-        // formals and the generics resolution returned
-        // (`deref_callee_fun_decl_and_generics` / `trait_impl_method`).
-        // A dynamic fn-pointer / dyn call has no FunDecl and stays residual.
-        let call_look_inside_formals: Vec<TyRef> = match &call.func {
-            CallFunc::Regular(reg) => {
-                deref_callee_fun_decl_and_generics(reg, first_arg_ty.as_ref(), self.llbc)
-                    .and_then(|(fd, generics)| {
-                        if fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
-                            None
-                        } else {
-                            Some(
-                                call_substituted_inputs(fd, &generics, self.llbc)
-                                    .unwrap_or_else(|| fd.signature.inputs.clone()),
-                            )
-                        }
-                    })
-                    .unwrap_or_default()
-            }
-            _ => Vec::new(),
-        };
         // Captured before `call.args` is consumed. A constant word
         // (`RBigInt::from(1)`) has no place type; its `ty` is what the
         // constructor residual below classifies.
@@ -894,8 +868,7 @@ impl<'a> Lowering<'a> {
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
                 continue;
             }
-            let expected = call_look_inside_formals.get(index);
-            args.push(self.resolve_call_arg_value(mir_bb, op, expected)?);
+            args.push(self.resolve_operand(mir_bb, op)?);
         }
         // A pair-slice Index argument forks the emit cursor
         // (`fork_in_bounds`); later ops and the close belong on that tail.
