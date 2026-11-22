@@ -402,6 +402,7 @@ pub(crate) fn compute_blackhole_resume_facts(
         jitcode.code.as_slice(),
         pc,
         in_flight_callee_may_raise,
+        Some(jitcode),
     ) {
         None => BlackholeResumeFacts {
             switch_or_undecodable: true,

@@ -459,7 +459,20 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
     let SomeValue::Ptr(p) = s else {
         return None;
     };
-    let lltype::PtrTarget::Struct(st) = &p.ll_ptrtype.TO else {
+    let classdef = gc_class_root_classdef(&p.ll_ptrtype)?;
+    Some(SomeValue::Instance(SomeInstance::new(
+        Some(classdef),
+        true,
+        std::collections::BTreeMap::new(),
+    )))
+}
+
+/// Classdef whose `InstanceRepr.lowleveltype` is `ptrtype`: the pointee is
+/// a GC struct registered as a class root.
+fn gc_class_root_classdef(
+    ptrtype: &lltype::Ptr,
+) -> Option<std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>> {
+    let lltype::PtrTarget::Struct(st) = &ptrtype.TO else {
         return None;
     };
     if st._gckind != lltype::GcKind::Gc {
@@ -474,12 +487,31 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
     if !registered {
         return None;
     }
-    let classdef = bk.getuniqueclassdef_for_struct_root(&st._name).ok()?;
-    Some(SomeValue::Instance(SomeInstance::new(
-        Some(classdef),
-        true,
-        std::collections::BTreeMap::new(),
-    )))
+    bk.getuniqueclassdef_for_struct_root(&st._name).ok()
+}
+
+/// `SomePtr.setattr` stores a value only when its lowleveltype is the
+/// field type. A `SomeInstance` lowers to its classdef's
+/// `InstanceRepr.lowleveltype`, so it fits the GC class-root pointer field
+/// whose root is that classdef -- the field `getattr` reads back as the
+/// same `SomeInstance` (`highlevel_of_ptr_field_annotation`).
+///
+/// A `GCREF` field also takes the instance: a GC object reference field of
+/// an item struct (`PyObjectRef` in an rdict entry) projects to `GCREF`,
+/// and the stored word is the instance pointer `cast_instance_to_gcref`
+/// gives. Raw, function-pointer and other class-root fields reject it.
+fn instance_is_class_root_field_type(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
+    let (lltype::LowLevelType::Ptr(ptrtype), SomeValue::Instance(inst)) = (field_t, s_value) else {
+        return false;
+    };
+    let Some(classdef) = &inst.classdef else {
+        return false;
+    };
+    if field_t == &*lltype::GCREF {
+        return true;
+    }
+    gc_class_root_classdef(ptrtype)
+        .is_some_and(|field_classdef| std::rc::Rc::ptr_eq(classdef, &field_classdef))
 }
 
 /// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
@@ -755,6 +787,16 @@ impl SomeInteriorPtr {
         };
         let mut example = self.ll_ptrtype._example();
         if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
+            // `getattr` hands a GC class-root pointer field back as
+            // `SomeInstance` (`highlevel_of_ptr_field_annotation`); storing
+            // that annotation back is the `InstanceRepr.lowleveltype` word of
+            // the same class, which is the field type itself.
+            if matches!(s_value, SomeValue::Instance(_)) {
+                let field_t = interior_ptr_struct_field_type(&self.ll_ptrtype.TO, attr)?;
+                if instance_is_class_root_field_type(&field_t, s_value) {
+                    return Ok(SomeValue::Impossible);
+                }
+            }
             let v_lltype = annotation_to_lltype(s_value, None)?;
             example
                 .setattr(attr, v_lltype._defl())
@@ -1808,6 +1850,87 @@ mod tests {
                 || msg.contains("store through interior ptr"),
             "got {err:?}"
         );
+    }
+
+    /// `mark_deleted` stores `V::dummy()` (a nullable `SomeInstance`) into
+    /// `entry.value` through `entry_at_mut`'s interior pointer; the field's
+    /// getattr annotation is that instance, so the setattr accepts it.
+    #[test]
+    fn interior_setattr_accepts_only_the_class_root_instance_of_the_field() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::{SomeInstance, SomeString};
+        use crate::front::StructFieldRegistry;
+
+        let root = "test::WRoot";
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(root.to_string(), vec![("x".into(), "i64".into())]);
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(std::rc::Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root(root)
+            .expect("registered struct root has a classdef");
+
+        let root_ptr = lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::gc(
+                root,
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )),
+        }));
+        let entry = lltype::Struct::new(
+            "Entry",
+            vec![
+                ("value".into(), root_ptr),
+                ("gcref".into(), lltype::GCREF.clone()),
+                (
+                    "raw".into(),
+                    lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+                        TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                            "RawS",
+                            vec![("y".into(), lltype::LowLevelType::Signed)],
+                        )),
+                    })),
+                ),
+            ],
+        );
+        let ptr = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+                lltype::LowLevelType::Struct(Box::new(entry.clone())),
+            )))),
+            TO: Box::new(lltype::LowLevelType::Struct(Box::new(entry))),
+            offsets: vec![lltype::InteriorOffset::Index(0)],
+        });
+        let attr = |name: &str| {
+            let mut s_attr = SomeString::new(false, false);
+            s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(name)));
+            SomeValue::String(s_attr)
+        };
+        let instance = |classdef| {
+            SomeValue::Instance(SomeInstance::new(
+                classdef,
+                true,
+                std::collections::BTreeMap::new(),
+            ))
+        };
+
+        bk.enter(None);
+        let same_class = ptr.setattr(&attr("value"), &instance(Some(classdef.clone())));
+        let no_class = ptr.setattr(&attr("value"), &instance(None));
+        let into_gcref = ptr.setattr(&attr("gcref"), &instance(Some(classdef.clone())));
+        let object_into_gcref = ptr.setattr(&attr("gcref"), &instance(None));
+        let into_raw = ptr.setattr(&attr("raw"), &instance(Some(classdef)));
+        let gcref = ptr.setattr(&attr("gcref"), &lltype_to_annotation(lltype::GCREF.clone()));
+        bk.leave();
+
+        assert!(matches!(same_class, Ok(SomeValue::Impossible)));
+        assert!(no_class.is_err(), "instance without the field's classdef");
+        assert!(matches!(into_gcref, Ok(SomeValue::Impossible)));
+        assert!(
+            object_into_gcref.is_err(),
+            "classdef-less instance into GCREF"
+        );
+        assert!(into_raw.is_err(), "instance into a raw pointer field");
+        assert!(matches!(gcref, Ok(SomeValue::Impossible)));
     }
 
     #[test]

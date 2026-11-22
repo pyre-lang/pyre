@@ -1925,7 +1925,12 @@ fn blackhole_level_starts(
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts(
+                code,
+                start,
+                follow_callee,
+                Some(frame.jitcode.as_ref()),
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);

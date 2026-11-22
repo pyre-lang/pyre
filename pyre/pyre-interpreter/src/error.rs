@@ -3810,6 +3810,16 @@ pub extern "C" fn from_exc_object_method_jit_abi(obj: i64) -> i64 {
     unsafe { PyError::from_exc_object(obj as PyObjectRef).raw() as i64 }
 }
 
+/// One-word residual-call ABI for [`PyError::key_error_with_key`].
+///
+/// `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr)`; without a
+/// bound address the blackhole would interpret the body and reach its
+/// `dont_look_inside` allocators, whose addresses are unbound.
+pub extern "C" fn key_error_with_key_jit_abi(key: i64) -> i64 {
+    majit_ir::icf_identity!("error::key_error_with_key_jit_abi");
+    PyError::key_error_with_key(key as PyObjectRef).raw() as i64
+}
+
 impl PyError {
     pub fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
         match kind {

@@ -3516,7 +3516,27 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
 /// `None` when a reached instruction cannot be decoded or branches through a
 /// descr (`switch/id`), so the caller reads the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
-    reachable_starts_from_catch(code, pc, |_, _| true)
+    reachable_starts_from_catch(code, pc, |_, _| true, |_| None)
+}
+
+/// `bhimpl_switch` successors of a `switch/id` whose `d` operand is
+/// `descr_index` in `jitcode`: every `SwitchDictDescr.dict` target. The
+/// fallthrough (`KeyError` path) is the instruction's own next pc. `None` when
+/// the descr is not a switch table or a listed key does not resolve.
+pub(crate) fn switch_arm_targets(
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    descr_index: usize,
+) -> Option<Vec<usize>> {
+    match jitcode.descr_at(descr_index)?.as_bh_descr()? {
+        BhDescr::Switch {
+            dict,
+            const_keys_in_order,
+        } => const_keys_in_order
+            .iter()
+            .map(|key| dict.get(key).copied())
+            .collect(),
+        _ => None,
+    }
 }
 
 /// [`reachable_starts_from`] with a catch-handler policy.
@@ -3530,6 +3550,7 @@ pub fn reachable_starts_from_catch(
     code: &[u8],
     pc: usize,
     follow_catch: impl Fn(usize, &std::collections::BTreeSet<usize>) -> bool,
+    switch_targets: impl Fn(usize) -> Option<Vec<usize>>,
 ) -> Option<Vec<usize>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut work = vec![pc];
@@ -3540,9 +3561,6 @@ pub fn reachable_starts_from_catch(
                 continue;
             }
             let op = decode_op_at(code, pc)?;
-            if op.opname == "switch" {
-                return None;
-            }
             let mut cursor = pc + 1;
             if op.opname != "live" {
                 let mut chars = op.argcodes.chars();
@@ -3560,6 +3578,14 @@ pub fn reachable_starts_from_catch(
                             }
                         }
                         'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'd' if op.opname == "switch" => {
+                            // `bhimpl_switch` returns a `SwitchDictDescr.dict`
+                            // target or falls through on `KeyError`.
+                            let index = *code.get(cursor)? as usize
+                                | ((*code.get(cursor + 1)? as usize) << 8);
+                            work.extend(switch_targets(index)?);
+                            cursor += 2;
+                        }
                         'd' | 'j' => cursor += 2,
                         'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
                         '>' => {
@@ -3614,11 +3640,17 @@ pub fn blackhole_resume_reachable_starts(
     code: &[u8],
     pc: usize,
     in_flight_callee_may_raise: bool,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
 ) -> Option<Vec<usize>> {
-    reachable_starts_from_catch(code, pc, |catch_pc, seen| {
-        catch_predecessor_is_reachable(code, catch_pc, seen)
-            || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
-    })
+    reachable_starts_from_catch(
+        code,
+        pc,
+        |catch_pc, seen| {
+            catch_predecessor_is_reachable(code, catch_pc, seen)
+                || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
+        },
+        |descr_index| jitcode.and_then(|jitcode| switch_arm_targets(jitcode, descr_index)),
+    )
 }
 
 /// `handle_exception_in_frame` skips a leading `live` and then reads
@@ -3957,7 +3989,7 @@ pub(crate) fn blackhole_first_raising_opname_in(
     if in_flight_callee_may_raise && landing_catch_pc(code, pc).is_none() {
         return Some("<uncaught-callee>");
     }
-    match blackhole_resume_reachable_starts(code, pc, in_flight_callee_may_raise) {
+    match blackhole_resume_reachable_starts(code, pc, in_flight_callee_may_raise, None) {
         None => Some("<switch-or-undecodable>"),
         Some(starts) => {
             for &start in &starts {
@@ -6053,6 +6085,42 @@ mod tests {
         ]
     }
 
+    /// `bhimpl_switch` returns a `SwitchDictDescr.dict` target or the
+    /// fallthrough pc, so the scan follows every arm plus the next
+    /// instruction; an unresolved table still answers `None`.
+    #[test]
+    fn reachable_starts_follow_switch_arms() {
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        // 0: switch/id i0 d=7 / 4: void_return / 5: void_return
+        // 6: void_return / 7: int_add (arm)
+        let code = vec![
+            byte("switch/id"),
+            0,
+            7,
+            0,
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("int_add/ii>i"),
+            0,
+            0,
+            0,
+        ];
+        let arms = |index: usize| (index == 7).then(|| vec![7]);
+        assert_eq!(
+            reachable_starts_from_catch(&code, 0, |_, _| true, arms),
+            Some(vec![0, 4, 7]),
+        );
+        assert_eq!(
+            reachable_starts_from_catch(&code, 0, |_, _| true, |_| None),
+            None
+        );
+    }
+
     #[test]
     fn reachable_starts_from_follows_every_catch_label() {
         let code = catch_scan_fixture();
@@ -6063,7 +6131,7 @@ mod tests {
     fn blackhole_resume_innermost_does_not_follow_unreachable_catch() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, false),
+            blackhole_resume_reachable_starts(&code, 11, false, None),
             Some(vec![11, 14, 18]),
         );
     }
@@ -6072,7 +6140,7 @@ mod tests {
     fn blackhole_resume_non_innermost_follows_landing_catch_when_callee_may_raise() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, true),
+            blackhole_resume_reachable_starts(&code, 11, true, None),
             Some(vec![11, 14, 18, 22]),
         );
     }
@@ -6081,7 +6149,7 @@ mod tests {
     fn blackhole_resume_non_innermost_skips_landing_catch_when_callee_cannot_raise() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, false),
+            blackhole_resume_reachable_starts(&code, 11, false, None),
             Some(vec![11, 14, 18]),
         );
     }
@@ -6114,7 +6182,7 @@ mod tests {
         );
         let parent = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&parent, 11, callee_may_raise),
+            blackhole_resume_reachable_starts(&parent, 11, callee_may_raise, None),
             Some(vec![11, 14, 18]),
         );
     }
