@@ -519,7 +519,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// allocation. An old table that holds a young array is remembered so
     /// the next minor greys `d.entries` (`write_barrier`).
     #[inline]
-    pub(crate) fn barrier_entries(&self) {
+    fn barrier_entries(&self) {
         if !self.entries.is_null() {
             crate::gc_hook::try_gc_write_barrier(self.entries as crate::gc_hook::GCREF);
         }
@@ -1024,10 +1024,8 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     /// Overwrite `entries[slot].value`. The caller already proved `slot`.
-    /// Same shape as [`Self::slot_value`]: `d.entries[i].value = value`.
     pub fn set_slot_value(&mut self, slot: usize, value: V) {
-        self.barrier_entries();
-        unsafe { (*self.entry_ptr().add(slot)).value = value }
+        self.entry_at_mut(slot).value = value;
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {

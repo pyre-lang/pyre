@@ -664,12 +664,7 @@ pub unsafe fn dict_entries_value_set_at(
     index: usize,
     value: PyObjectRef,
 ) {
-    // `_ll_dict_setitem_lookup_done` overwrite: `entry.value = value`
-    // after `entry = d.entries[i]` (`rordereddict.py`). Native needs the
-    // write barrier; a virtual table's `setinteriorfield_gc` records the
-    // JIT one (`framework.py` `write_barrier`).
-    entries.barrier_entries();
-    unsafe { (*entries.entry_ptr().add(index)).value = value }
+    entries.set_slot_value(index, value);
 }
 
 /// `_ll_dict_setitem_lookup_done` (`rordereddict.py`) after lookup has
