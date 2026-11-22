@@ -4931,6 +4931,28 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(None);
                 }
+                // A non-dereferenced GC enum place is the translated
+                // `InstanceRepr` sum shell. Its synthetic field already
+                // contains the logical variant index (`rclass.py
+                // InstanceRepr.rtype_getattr`); the Rust host layout
+                // describes the source value, not that shell. A dereferenced
+                // enum still names host storage (`match *p`), so it keeps the
+                // decoder below. Raw inline fields were handled above.
+                let deref_host_storage = matches!(
+                    &place.kind,
+                    PlaceKind::Projection(_, ProjectionElem::Atom(elem)) if elem == "Deref"
+                );
+                if !deref_host_storage
+                    && container_declared_gc(
+                        &place.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        self.immutable_fields,
+                        &self.raw_alloc_flavor_structs,
+                    ) == Some(true)
+                {
+                    return Ok(None);
+                }
                 // A tag computed from the instantiated field types describes
                 // the host bytes behind a raw address. A value here is the
                 // explicit shell, whose `__discriminant` is the variant

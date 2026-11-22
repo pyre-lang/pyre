@@ -38415,6 +38415,94 @@ fn lower_interior(llbc: &Llbc, name: &str) -> FunctionGraph {
         .unwrap_or_else(|err| panic!("lower {name}: {err:?}"))
 }
 
+/// A translated GC enum is an `InstanceRepr` sum shell whose
+/// `__discriminant` field already contains the logical variant index.  Its
+/// Rust layout may still be niche encoded; that host layout must not decode
+/// the shell field a second time.
+#[test]
+fn gc_sum_shell_discriminant_uses_logical_tag() {
+    let enum_ty = interior_adt(0);
+    let usize_ty = interior_usize();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let field =
+        |ty: serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": null});
+    let outcome = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["fixture", "Outcome"], true),
+        "kind": {"Enum": [
+            {
+                "name": "Remaining",
+                "fields": [field(usize_ty.clone())],
+                "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}
+            },
+            {
+                "name": "Shape",
+                "fields": [field(usize_ty.clone())],
+                "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}
+            }
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "discriminator": {"Branch": {
+                    "offset": {"chosen": 0},
+                    "int_ty": {"Unsigned": "U8"},
+                    "children": [[
+                        {
+                            "start": {"Unsigned": ["U8", "6"]},
+                            "end": {"Unsigned": ["U8", "6"]}
+                        },
+                        {"Known": 0}
+                    ]],
+                    "fallback": {"Known": 1}
+                }},
+                "variant_layouts": [
+                    {"field_offsets": [0]},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let caller = interior_caller(
+        "outcome_discriminant",
+        1,
+        vec![enum_ty.clone()],
+        disc_ty.clone(),
+        vec![
+            interior_local(0, None, &disc_ty),
+            interior_local(1, Some("outcome"), &enum_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &disc_ty),
+                serde_json::json!({"Discriminant": interior_place(1, &enum_ty)}),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_declared_gc("fixture", vec![outcome], vec![caller], &[0]);
+    let graph = lower_interior(&llbc, "outcome_discriminant");
+    let ops = graph_ops(&graph);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            ))
+            .count(),
+        1,
+        "GC sum-shell discriminant is a direct instance field read; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { .. })),
+        "GC sum-shell discriminant must not pass through the host niche decoder; ops={ops:?}"
+    );
+}
+
 /// `*self = fresh` through `&mut Self` of type `types[0]` (`def_id` 0).
 fn lower_deref_store_mut_self(
     types: Vec<serde_json::Value>,

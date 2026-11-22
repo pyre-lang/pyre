@@ -3020,12 +3020,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
     // normalises its `bool` argument.
     pa0!(
         &mut entries,
-        "pyre_object::gc_roots::push_roots",
-        "pyre_object::push_roots",
-        pyre_object::gc_roots::push_roots,
-    );
-    pa0!(
-        &mut entries,
         "pyre_object::gc_roots::shadow_stack_len",
         "pyre_object::shadow_stack_len",
         pyre_object::gc_roots::shadow_stack_len,

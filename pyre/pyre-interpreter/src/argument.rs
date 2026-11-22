@@ -2410,7 +2410,11 @@ pub fn collect_keyword_args(
     let values_gc_slot = names_gc_slot + 1;
     let kwds_slot = names_gc_slot + 2;
     pyre_object::gc_roots::normalize_roots(names_gc_slot, 3);
-    let n = unsafe { (*gcarray_from_slot(names_gc_slot)).len() };
+    let n = unsafe {
+        (*(pyre_object::gc_roots::shadow_stack_get(names_gc_slot)
+            as *mut pyre_object::FixedObjectArray))
+            .len()
+    };
     let mut i = 0usize;
     while i < n {
         // argument.py `_collect_keyword_args`: `for j in kwds_mapping: if i == j: break`
@@ -2430,14 +2434,18 @@ pub fn collect_keyword_args(
             i += 1;
             continue;
         }
-        let w_key = unsafe { (&*gcarray_from_slot(names_gc_slot))[i] };
-        let w_value = unsafe { (&*gcarray_from_slot(values_gc_slot))[i] };
-        let pair = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_key);
-        let _ = pyre_object::gc_roots::pin_root(w_value);
+        // No collection point lies between these three reads and the
+        // `setitem` that consumes them, so the words are not pinned again:
+        // a `pin_root` per turn grows the published run inside the loop.
         let w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
-        let w_key = pyre_object::gc_roots::shadow_stack_get(pair);
-        let w_value = pyre_object::gc_roots::shadow_stack_get(pair + 1);
+        let w_key = unsafe {
+            (&*(pyre_object::gc_roots::shadow_stack_get(names_gc_slot)
+                as *mut pyre_object::FixedObjectArray))[i]
+        };
+        let w_value = unsafe {
+            (&*(pyre_object::gc_roots::shadow_stack_get(values_gc_slot)
+                as *mut pyre_object::FixedObjectArray))[i]
+        };
         // `kwargsdict.py KwargsDictStrategy.setitem`: exact-str key on
         // kwargs / empty-kwargs stays on the parallel lists; otherwise
         // `switch_to_object_strategy` + `w_dict.setitem`.
