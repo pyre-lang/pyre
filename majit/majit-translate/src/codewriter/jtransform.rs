@@ -5119,6 +5119,117 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
+    /// `jtransform.py Transformer.prepare_builtin_call`.
+    ///
+    /// `support.py builtin_func_for_spec` resolves `_ll_<n>_<oopspec>`,
+    /// then this emits `direct_call(c_func, *args)`.
+    fn prepare_builtin_call(
+        &mut self,
+        op: &SpaceOperation,
+        oopspec_name: &str,
+        args: &[crate::flowspace::model::Variable],
+        extra: Option<&[String]>,
+        extrakey: Option<&str>,
+    ) -> SpaceOperation {
+        let arg_types = resolve_non_void_arg_types_from_vars(args);
+        let result_ct = op
+            .result
+            .as_ref()
+            .map(FunctionGraph::concretetype_of)
+            .unwrap_or(crate::codewriter::type_state::ConcreteType::Void);
+        let result_ty = match result_ct {
+            crate::codewriter::type_state::ConcreteType::Signed => ValueType::Int,
+            crate::codewriter::type_state::ConcreteType::GcRef => ValueType::Ref(None),
+            crate::codewriter::type_state::ConcreteType::Float => ValueType::Float,
+            crate::codewriter::type_state::ConcreteType::Void => ValueType::Void,
+            crate::codewriter::type_state::ConcreteType::Unknown => ValueType::Int,
+        };
+        let result_ir_type = self
+            .resolve_call_result(op.result.as_ref(), &result_ty)
+            .ir_type;
+        let spec = crate::codewriter::support::builtin_func_for_spec(
+            self.callcontrol.as_deref(),
+            oopspec_name,
+            &arg_types,
+            result_ir_type,
+            extra,
+            extrakey,
+            None,
+        );
+        let target = CallTarget::function_path([spec.impl_name.as_str()]);
+        SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target,
+                args: crate::model::call_args(args.iter().cloned()),
+                result_ty,
+            },
+        }
+    }
+
+    /// `jtransform.py Transformer._do_builtin_call`.
+    ///
+    /// `rewrite_op_gc_identityhash` / `rewrite_op_gc_id` alias this.
+    /// `prepare_builtin_call` then `rewrite_op_direct_call`.
+    fn _do_builtin_call(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let (oopspec_name, args) = match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, args }
+                if opname == "gc_identityhash" || opname == "gc_id" =>
+            {
+                (opname.clone(), crate::model::call_arg_vars(args))
+            }
+            other => panic!(
+                "Transformer._do_builtin_call: expected gc_identityhash/gc_id, got {other:?}"
+            ),
+        };
+        self.stamp_value_kind(
+            graph,
+            op.result.clone(),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        for arg in &args {
+            self.stamp_value_kind(
+                graph,
+                Some(arg.clone()),
+                crate::codewriter::type_state::ConcreteType::GcRef,
+            );
+        }
+        let helper_leaf = format!("_ll_{}_{}", args.len(), oopspec_name.replace('.', "_"));
+        let helper_path = crate::parse::CallPath::from_segments([helper_leaf.as_str()]);
+        {
+            let cc = self.callcontrol.as_mut().expect(
+                "Transformer._do_builtin_call: CallControl is required \
+                 (support.py builtin_func_for_spec / setup_extra_builtin)",
+            );
+            // `support.py _ll_1_gc_identityhash` is `@elidable`.
+            // `_ll_1_gc_id` is not (`id(const)` must not fold).
+            if oopspec_name == "gc_identityhash" {
+                cc.mark_elidable(helper_path.clone());
+            }
+            // `lloperation.py` `gc_identityhash` / `gc_id` are `canmallocgc=True`.
+            cc.mark_canmallocgc(helper_path);
+        }
+        let call = self.prepare_builtin_call(op, &oopspec_name, &args, None, None);
+        let (target, call_args, result_ty) = match &call.kind {
+            OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } => (
+                target.clone(),
+                crate::model::call_arg_vars(args),
+                result_ty.clone(),
+            ),
+            other => panic!("Transformer.prepare_builtin_call emits direct_call, got {other:?}"),
+        };
+        self.rewrite_op_direct_call(&call, &target, &call_args, &result_ty, graph_name, graph)
+    }
+
     /// `history.getkind` of a raw-flavor `Ptr` is `'int'` (`rclass.py
     /// getgcflavor`). `rewrite_op_force_cast` sends int → raw-pointer
     /// through `_int_to_int_cast`, a no-op for same-size words;
@@ -8193,6 +8304,13 @@ impl<'a> Transformer<'a> {
                     _ => unreachable!("RawFree arm"),
                 };
                 self.rewrite_op_raw_free(graph, graph_name, ptr)
+            }
+            // `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`
+            // `rewrite_op_gc_id = _do_builtin_call`.
+            OpKind::LoweredBlackholeOp { opname, .. }
+                if opname == "gc_identityhash" || opname == "gc_id" =>
+            {
+                self._do_builtin_call(op, graph_name, graph)
             }
             _ => RewriteResult::Keep,
         }
@@ -31181,6 +31299,127 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
             "a candidate helper is not a residual call: {ops:?}"
+        );
+    }
+
+    fn transform_gc_identity_llop(
+        opname: &'static str,
+        helper: &'static str,
+        fnaddr: i64,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_fnaddr(crate::parse::CallPath::from_segments([helper]), fnaddr);
+
+        let mut graph = FunctionGraph::new(opname);
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::LoweredBlackholeOp {
+                    opname: opname.to_string(),
+                    args: crate::model::call_args(vec![ptr.clone()]),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        (
+            transformed.graph.block(graph.startblock).operations.clone(),
+            ptr,
+        )
+    }
+
+    fn residual_gc_identity_call(
+        ops: &[SpaceOperation],
+    ) -> (
+        &crate::call::CallDescriptor,
+        &[crate::flowspace::model::Variable],
+        char,
+    ) {
+        ops.iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    args_r,
+                    result_kind,
+                    ..
+                } => Some((descriptor, args_r.as_slice(), *result_kind)),
+                _ => None,
+            })
+            .expect("gc_identityhash/gc_id must rewrite to a residual helper call")
+    }
+
+    /// `rewrite_op_gc_identityhash = _do_builtin_call`. Residual
+    /// `_ll_1_gc_identityhash` is `@elidable`.
+    #[test]
+    fn gc_identityhash_rewrites_to_elidable_residual() {
+        let (ops, ptr) =
+            transform_gc_identity_llop("gc_identityhash", "_ll_1_gc_identityhash", 0x18401);
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_identityhash")
+            }),
+            "bare gc_identityhash must not survive: {ops:?}"
+        );
+        let (descriptor, args_r, result_kind) = residual_gc_identity_call(&ops);
+        assert_eq!(result_kind, 'i');
+        assert_eq!(args_r, &[ptr]);
+        assert!(
+            descriptor.extra_info.check_is_elidable(),
+            "support.py _ll_1_gc_identityhash is @elidable: {descriptor:?}"
+        );
+        assert!(
+            descriptor.extra_info.can_collect,
+            "lloperation.py gc_identityhash canmallocgc: {descriptor:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
+            "residual that can raise is followed by -live-: {ops:?}"
+        );
+    }
+
+    /// `rewrite_op_gc_id = _do_builtin_call`. Residual `_ll_1_gc_id` is
+    /// not `@elidable`.
+    #[test]
+    fn gc_id_rewrites_to_non_elidable_residual() {
+        let (ops, ptr) = transform_gc_identity_llop("gc_id", "_ll_1_gc_id", 0x18402);
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_id")
+            }),
+            "bare gc_id must not survive: {ops:?}"
+        );
+        let (descriptor, args_r, result_kind) = residual_gc_identity_call(&ops);
+        assert_eq!(result_kind, 'i');
+        assert_eq!(args_r, &[ptr]);
+        assert!(
+            !descriptor.extra_info.check_is_elidable(),
+            "support.py _ll_1_gc_id is not @elidable: {descriptor:?}"
+        );
+        assert!(
+            descriptor.extra_info.can_collect,
+            "lloperation.py gc_id canmallocgc: {descriptor:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
+            "residual that can raise is followed by -live-: {ops:?}"
         );
     }
 

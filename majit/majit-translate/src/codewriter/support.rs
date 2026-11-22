@@ -1014,13 +1014,10 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// `jtransform.rs::handle_builtin_call` mints fresh Variables for
 /// constant slots at the residual-call site.
 ///
-/// `gc_identityhash` / `gc_id`: pyre has no corresponding OpKind
-/// variant.  These ops would land alongside a port of
-/// `rpython/jit/codewriter/jtransform.py rewrite_op_gc_identityhash`
-/// / `rewrite_op_gc_id`; until the variants exist, the catch-all
-/// `_` arm panics with the upstream `ValueError(op.opname)` message
-/// shape so a future emitter that adds the variant trips here and
-/// the corresponding arm gets ported in lockstep.
+/// `gc_identityhash` / `gc_id` arrive as [`OpKind::LoweredBlackholeOp`]
+/// (`effect_graph_from_rtyped_helper`). The arms below delegate to
+/// [`get_identityhash_oopspec`] / [`get_gcid_oopspec`], matching
+/// `support.py decode_builtin_call`.
 ///
 /// **Panics** when the call has no registered oopspec — upstream's
 /// `parse_oopspec` raises `AttributeError` at `ll_func.oopspec` when
@@ -1092,16 +1089,13 @@ pub fn decode_builtin_call(
                 }
             }
         }
-        // `support.py:760-763`: gc_identityhash / gc_id branches.
-        //
-        // Pyre has no OpKind::GcIdentityHash / OpKind::GcId yet —
-        // those would land alongside a port of
-        // `rpython/jit/codewriter/jtransform.py rewrite_op_gc_identityhash`
-        // / `rewrite_op_gc_id`.  When the variants land, replace the
-        // catch-all panic with explicit arms that delegate to ported
-        // `get_identityhash_oopspec` / `get_gcid_oopspec` helpers.
-        //
-        // `support.py:765`: raise ValueError(op.opname)
+        // `support.py decode_builtin_call`: `gc_identityhash` /
+        // `gc_id` → `get_identityhash_oopspec` / `get_gcid_oopspec`.
+        OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_identityhash" => {
+            get_identityhash_oopspec(op)
+        }
+        OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_id" => get_gcid_oopspec(op),
+        // `support.py decode_builtin_call`: `raise ValueError(op.opname)`
         _ => panic!(
             "decode_builtin_call: ValueError(op.opname) — upstream \
              `support.py:765 raise ValueError(op.opname)`.  Pyre OpKind \
@@ -1109,6 +1103,32 @@ pub fn decode_builtin_call(
              op the corresponding `rewrite_op_<name>` must be ported and \
              an arm added here.",
             op.kind,
+        ),
+    }
+}
+
+/// `support.py get_identityhash_oopspec`: `('gc_identityhash', op.args)`.
+pub fn get_identityhash_oopspec(op: &SpaceOperation) -> (String, Vec<NormalizedArg>) {
+    (
+        "gc_identityhash".to_string(),
+        spaceop_args_as_normalized(op),
+    )
+}
+
+/// `support.py get_gcid_oopspec`: `('gc_id', op.args)`.
+pub fn get_gcid_oopspec(op: &SpaceOperation) -> (String, Vec<NormalizedArg>) {
+    ("gc_id".to_string(), spaceop_args_as_normalized(op))
+}
+
+/// `op.args` for a lowered llop (`OpKind::LoweredBlackholeOp`).
+fn spaceop_args_as_normalized(op: &SpaceOperation) -> Vec<NormalizedArg> {
+    match &op.kind {
+        OpKind::LoweredBlackholeOp { args, .. } => crate::model::call_arg_vars(args)
+            .into_iter()
+            .map(NormalizedArg::Pass)
+            .collect(),
+        other => panic!(
+            "get_identityhash_oopspec/get_gcid_oopspec: expected LoweredBlackholeOp, got {other:?}"
         ),
     }
 }
@@ -2219,6 +2239,38 @@ mod tests {
             },
         };
         let _ = decode_builtin_call(&op, &cc);
+    }
+
+    fn make_llop(opname: &str) -> (SpaceOperation, crate::flowspace::model::Variable) {
+        let arg = crate::flowspace::model::Variable::new();
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::LoweredBlackholeOp {
+                opname: opname.to_string(),
+                args: crate::model::call_args(vec![arg.clone()]),
+            },
+        };
+        (op, arg)
+    }
+
+    #[test]
+    fn decode_builtin_call_gc_identityhash_returns_oopspec_and_args() {
+        // `support.py get_identityhash_oopspec` → `('gc_identityhash', op.args)`.
+        let cc = CallControl::new();
+        let (op, arg) = make_llop("gc_identityhash");
+        let (name, opargs) = decode_builtin_call(&op, &cc);
+        assert_eq!(name, "gc_identityhash");
+        assert_eq!(opargs, vec![NormalizedArg::Pass(arg)]);
+    }
+
+    #[test]
+    fn decode_builtin_call_gc_id_returns_oopspec_and_args() {
+        // `support.py get_gcid_oopspec` → `('gc_id', op.args)`.
+        let cc = CallControl::new();
+        let (op, arg) = make_llop("gc_id");
+        let (name, opargs) = decode_builtin_call(&op, &cc);
+        assert_eq!(name, "gc_id");
+        assert_eq!(opargs, vec![NormalizedArg::Pass(arg)]);
     }
 
     // ── `parse_oopspec` + `normalize_opargs` pure-function ports ────

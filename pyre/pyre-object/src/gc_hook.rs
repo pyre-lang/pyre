@@ -1091,6 +1091,21 @@ pub fn gc_identity_hash(obj_addr: usize) -> usize {
     }
 }
 
+/// `support.py` `_ll_1_gc_identityhash`. `@elidable`; body is
+/// `lltype.identityhash`, MiniMark `id_or_identityhash`. Same entry
+/// [`gc_identity_hash`] that `ObjSpace.id` and `default_identity_hash`
+/// read (the Python hash then mangles).
+pub extern "C" fn _ll_1_gc_identityhash(x: i64) -> i64 {
+    gc_identity_hash(x as usize) as i64
+}
+
+/// `support.py` `_ll_1_gc_id`. Not `@elidable` (`id(const)` must not
+/// fold). Body is `llop.gc_id`, the same [`gc_identity_hash`]
+/// `ObjSpace.id` uses when there is no `immutable_unique_id`.
+pub extern "C" fn _ll_1_gc_id(ptr: i64) -> i64 {
+    gc_identity_hash(ptr as usize) as i64
+}
+
 /// Signature of the host-side write barrier callback. `obj` is the
 /// GC-managed object whose field is being updated with a possible young
 /// pointer. The backend decides whether `obj` is old enough to require
@@ -1778,5 +1793,15 @@ mod tests {
         clear_gc_write_barrier_hook();
         clear_gc_owns_object_hook();
         assert!(!try_gc_write_barrier_from_array(obj, 3));
+    }
+
+    #[test]
+    fn gc_identity_llop_helpers_delegate_to_gc_identity_hash() {
+        let addr = 0x1234_0000i64;
+        assert_eq!(
+            _ll_1_gc_identityhash(addr),
+            gc_identity_hash(addr as usize) as i64
+        );
+        assert_eq!(_ll_1_gc_id(addr), gc_identity_hash(addr as usize) as i64);
     }
 }
