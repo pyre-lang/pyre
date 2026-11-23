@@ -936,7 +936,7 @@ impl BlackholeInterpreter {
                 self.jitcode.num_regs_i(),
                 self.jitcode.num_regs_r(),
                 self.jitcode.num_regs_f(),
-                &code[start..position.min(code.len())],
+                code.get(start..position.min(code.len())).unwrap_or(&[]),
             );
         }
     }
