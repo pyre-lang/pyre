@@ -2953,17 +2953,16 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     offset: src.offset,
                                     value_local: call.args.get(arg0 + 1).and_then(operand_local),
                                 });
-                                let slice_ty = slice_ty_of(body, src.slice)?;
+                                // The mirrored `slice[i] = v` is the write
+                                // (`find_mirror_store`): it keeps its own
+                                // bounds check (`rlist.py`
+                                // `ll_setitem_nonneg`), and nothing between
+                                // this Set and that store reads the slice.
                                 let value = &args_json[arg0 + 1];
                                 let elem_ty = operand_json_ty(value)
                                     .or_else(|| cx.plan.as_ref().and_then(|p| p.slot_ty.clone()))
                                     .ok_or("set-slice-untyped")?;
-                                cx.ensure_slot_ty(elem_ty.clone());
-                                let offset = slice_offset_operand_json(&src, &slice_ty);
-                                stmts.push(assign_json(
-                                    index_place_json(src.slice, &slice_ty, offset, &elem_ty),
-                                    json!({ "Use": [copy_operand_json(value), "Yes"] }),
-                                ));
+                                cx.ensure_slot_ty(elem_ty);
                             }
                         } else {
                             let (k, relative, floor) = cx.slot_index_of(call, arg0)?;
@@ -4222,14 +4221,6 @@ fn leftover_dummy_k_index(
     }
 }
 
-fn slice_ty_of(body: &Unstructured, slice: usize) -> Result<Value, Refusal> {
-    body.locals
-        .locals
-        .get(slice)
-        .map(|loc| ty_ref_json(&loc.ty))
-        .ok_or("slice-local-missing")
-}
-
 /// One `shadow_stack_set` whose slot is a published incoming slice.
 struct SliceSetSite {
     bb: usize,
@@ -4237,28 +4228,6 @@ struct SliceSetSite {
     slice: usize,
     offset: SliceOff,
     value_local: Option<usize>,
-}
-
-fn slice_offset_operand_json(src: &SliceSrc, ty: &Value) -> Value {
-    match src.offset {
-        SliceOff::Const(k) => json!({
-            "Const": [{ "Integer": { "Unsigned": ["Usize", k.to_string()] } }, ty]
-        }),
-        SliceOff::Local(index) => json!({ "Read": local_place_json(index, ty) }),
-    }
-}
-
-fn index_place_json(slice: usize, slice_ty: &Value, offset: Value, elem_ty: &Value) -> Value {
-    let deref = json!({
-        "kind": { "Projection": [{ "kind": { "Local": slice }, "ty": slice_ty }, "Deref"] },
-        "ty": slice_ty
-    });
-    json!({
-        "kind": {
-            "Projection": [deref, { "Index": { "offset": offset, "from_end": false } }]
-        },
-        "ty": elem_ty
-    })
 }
 
 /// Unique `Use(Copy/Move(src))` and `Use(Const k)` origins of each local.
