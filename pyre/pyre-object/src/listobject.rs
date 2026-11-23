@@ -132,22 +132,37 @@ pub fn list_locks_after_fork_child() {
     LIST_LOCKS.after_fork_child();
 }
 
+/// `llmemory.itemoffsetof(ARRAY, 0)` of a length-prefixed `GcArray` whose
+/// item is `item_size` bytes: the length word rounded up to the item's
+/// alignment (a scalar or pointer aligns to its width, at most 8), the
+/// rule the codewriter's `arraydescrof` uses for the same ARRAY.
+const fn itemoffsetof(item_size: usize) -> usize {
+    let align = if item_size >= 8 {
+        8
+    } else {
+        item_size.next_power_of_two()
+    };
+    std::mem::size_of::<usize>().next_multiple_of(align)
+}
+
+const _: () = assert!(
+    itemoffsetof(std::mem::size_of::<PyObjectRef>())
+        == crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET
+);
+const _: () = assert!(itemoffsetof(8) == TYPED_ITEMS_BLOCK_ITEMS_OFFSET);
+
 /// Items and `len(p)` of one ARRAY. `rgc.py ll_arrayclear` /
 /// `ll_arrayfill` are `@specialize.ll()`: `len(p)` is the word at
 /// offset 0 (`TypeInfo.length_offset`), and items start at
-/// `llmemory.itemoffsetof(ARRAY, 0)`, a constant of the specialization:
-/// [`TYPED_ITEMS_BLOCK_ITEMS_OFFSET`] for the int/float item blocks and
-/// `object_array::ITEMS_BLOCK_ITEMS_OFFSET` for the object one (they differ
-/// on a 32-bit target, where the object block's header is one 4-byte word).
+/// `llmemory.itemoffsetof(ARRAY, 0)`, a constant of the specialization.
 /// Follow a forwarding word with `try_gc_current_object_address`.
-
 struct ArrayItems {
     address: usize,
     items: *mut u8,
     length: usize,
 }
 
-fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
+fn array_items(p: i64, item_size: usize) -> Option<ArrayItems> {
     if p == 0 {
         return None;
     }
@@ -157,7 +172,7 @@ fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
         return None;
     }
     let length = unsafe { *(address as *const usize) };
-    let items = unsafe { (address as *mut u8).add(items_offset) };
+    let items = unsafe { (address as *mut u8).add(itemoffsetof(item_size)) };
     Some(ArrayItems {
         address,
         items,
@@ -167,8 +182,8 @@ fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
 
 /// `rgc.py ll_arrayclear`: `raw_memclear` of `sizeof(ARRAY.OF) * length`.
 /// No write barrier: writing NULL never creates an old->young reference.
-fn ll_arrayclear_body(p: i64, items_offset: usize, item_size: usize) {
-    let Some(arr) = array_items(p, items_offset) else {
+fn ll_arrayclear_body(p: i64, item_size: usize) {
+    let Some(arr) = array_items(p, item_size) else {
         return;
     };
     let nbytes = arr
@@ -180,8 +195,8 @@ fn ll_arrayclear_body(p: i64, items_offset: usize, item_size: usize) {
 
 /// `rgc.py ll_arrayfill`: one `gc_writebarrier`, then
 /// `bare_setarrayitem` at `sizeof(T)` for every slot.
-fn ll_arrayfill_copy<T: Copy>(p: i64, items_offset: usize, item: T) {
-    let Some(arr) = array_items(p, items_offset) else {
+fn ll_arrayfill_copy<T: Copy>(p: i64, item: T) {
+    let Some(arr) = array_items(p, std::mem::size_of::<T>()) else {
         return;
     };
     unsafe {
@@ -201,79 +216,79 @@ fn ll_arrayfill_copy<T: Copy>(p: i64, items_offset: usize, item: T) {
 /// `rgc.py ll_arrayclear` for a 1-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i1(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 1);
+    ll_arrayclear_body(p, 1);
 }
 
 /// `rgc.py ll_arrayfill` for a 1-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 1-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i1(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u8);
+    ll_arrayfill_copy(p, item as u8);
 }
 
 /// `rgc.py ll_arrayclear` for a 2-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i2(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 2);
+    ll_arrayclear_body(p, 2);
 }
 
 /// `rgc.py ll_arrayfill` for a 2-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 2-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i2(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u16);
+    ll_arrayfill_copy(p, item as u16);
 }
 
 /// `rgc.py ll_arrayclear` for a 4-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i4(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+    ll_arrayclear_body(p, 4);
 }
 
 /// `rgc.py ll_arrayfill` for a 4-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 4-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i4(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u32);
+    ll_arrayfill_copy(p, item as u32);
 }
 
 /// `rgc.py ll_arrayclear` for an 8-byte integer ARRAY (`sizeof(ARRAY.OF)`).
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_i8(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+    ll_arrayclear_body(p, 8);
 }
 
 /// `rgc.py ll_arrayfill` for an 8-byte integer ARRAY: one `gc_writebarrier`
 /// then `bare_setarrayitem` at an 8-byte stride.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_i8(p: i64, item: i64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 /// `rgc.py ll_arrayclear` for `GcArray(Float)`.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_f(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+    ll_arrayclear_body(p, 8);
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(Float)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` for every slot.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_f(p: i64, item: f64) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 /// `rgc.py ll_arrayclear` for `GcArray(SingleFloat)`.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_s(p: i64) {
-    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+    ll_arrayclear_body(p, 4);
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(SingleFloat)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` at a 4-byte stride. The residual ABI is the
 /// call stub's C `float` (`descr.py CallDescr.create_call_stub` `'S'`).
 pub extern "C" fn ll_arrayfill_s(p: i64, item: f32) {
-    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+    ll_arrayfill_copy(p, item);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -304,22 +319,14 @@ fn register_ll_arrayfill_s() {
 /// zeroing.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayclear_r(p: i64) {
-    ll_arrayclear_body(
-        p,
-        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        std::mem::size_of::<PyObjectRef>(),
-    );
+    ll_arrayclear_body(p, std::mem::size_of::<PyObjectRef>());
 }
 
 /// `rgc.py ll_arrayfill` for `GcArray(OBJECTPTR)`: one `gc_writebarrier`
 /// then `bare_setarrayitem` for every slot.
 #[majit_macros::dont_look_inside]
 pub fn ll_arrayfill_r(p: i64, item: i64) {
-    ll_arrayfill_copy(
-        p,
-        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        item as usize as PyObjectRef,
-    );
+    ll_arrayfill_copy(p, item as usize as PyObjectRef);
 }
 
 #[repr(u8)]
