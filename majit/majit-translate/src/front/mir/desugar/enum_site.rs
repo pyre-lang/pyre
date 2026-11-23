@@ -3310,9 +3310,9 @@ impl<'a> Lowering<'a> {
             return None;
         }
         // `*(&mut x) = …` / `&raw mut x` / a field store through a
-        // deref does not rebind `x`. `compute_mutably_borrowed_locals`
-        // is the set of locals that can change that way.
-        if compute_mutably_borrowed_locals(self.llbc, self.body).contains(&local) {
+        // deref does not rebind `x`. `mutably_borrowed_locals` is the
+        // set of locals that can change that way.
+        if self.mutably_borrowed_locals.contains(&local) {
             return None;
         }
         let mut found = None;
@@ -3365,13 +3365,14 @@ impl<'a> Lowering<'a> {
     /// Compile-time Result discriminant of a single-assignment local,
     /// walking `Use` / shared `Ref` / const `RawPtr` aliases to a Result
     /// `Aggregate` or const ADT. A local that
-    /// `compute_mutably_borrowed_locals` can write, or a `Mut` /
+    /// `mutably_borrowed_locals` can write, or a `Mut` /
     /// `TwoPhaseMut` / `RawPtr` mut hop, is not a compile-time tag.
     fn result_local_const_disc(&self, start: usize) -> Option<i64> {
-        let mutably_borrowed = compute_mutably_borrowed_locals(self.llbc, self.body);
         let mut local = start;
         for _ in 0..8 {
-            if self.multi_assigned_locals.contains(&local) || mutably_borrowed.contains(&local) {
+            if self.multi_assigned_locals.contains(&local)
+                || self.mutably_borrowed_locals.contains(&local)
+            {
                 return None;
             }
             if let Some(&tag) = self.const_discriminant_locals.get(&local) {

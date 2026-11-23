@@ -1390,8 +1390,12 @@ impl<'a> Lowering<'a> {
         let Some(kind) = self.option_none_aggregate_kind(dest_ty) else {
             return Ok(None);
         };
-        let (op, var) =
-            self.build_rvalue(mir_bb, Rvalue::Aggregate(kind.into(), Vec::new()), dest_ty)?;
+        let (op, var) = self.build_rvalue(
+            mir_bb,
+            Rvalue::Aggregate(kind.into(), Vec::new()),
+            dest_ty,
+            None,
+        )?;
         if let Some(op) = op {
             let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -1534,8 +1538,11 @@ impl<'a> Lowering<'a> {
 
     pub(in crate::front::mir) fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
         let local = local?;
-        if let Some(place) = self.atomic_ref_place.get(&local) {
-            return Some(MemSlot::Place(place.clone()));
+        if self.is_field_interior_local(local) {
+            return Some(MemSlot::FieldInterior(local));
+        }
+        if let Some(place) = self.atomic_ref_place.get(&local).map(clone_place) {
+            return Some(MemSlot::Place(place));
         }
         if self.index_elem_alias.contains_key(&local)
             && self.local_var.get(local).and_then(Option::as_ref).is_some()
@@ -2398,6 +2405,13 @@ impl<'a> Lowering<'a> {
                     ))
                 })?
                 .one(),
+            MemSlot::FieldInterior(local) => self
+                .field_interior_value_at_use(mir_bb, *local)?
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: field-interior mem slot {local} lost its owner"
+                    ))
+                }),
         }
     }
 
@@ -2440,6 +2454,14 @@ impl<'a> Lowering<'a> {
                     &unit_tyref(),
                 )
             }
+            MemSlot::FieldInterior(local) => {
+                if !self.field_interior_store_at_use(mir_bb, local, LinkArg::Value(value))? {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: field-interior mem slot {local} lost its owner"
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2453,6 +2475,9 @@ impl<'a> Lowering<'a> {
         let vt = match slot {
             MemSlot::Place(place) => self.value_type_of(&place.ty),
             MemSlot::Index(local) => self.index_elem_alias.get(local)?.item_ty.clone(),
+            MemSlot::FieldInterior(local) => {
+                self.value_type_of(&self.atomic_ref_place.get(local)?.ty)
+            }
         };
         let bb_id = self.emit_bb(mir_bb);
         let kind = match vt {
