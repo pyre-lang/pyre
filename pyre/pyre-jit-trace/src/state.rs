@@ -993,11 +993,12 @@ fn walk_jitcode_code_roots_in(
     // nursery; the map still holds the birth address unless this walk
     // forwards it (`framework.py root_walker.walk_roots`; `malloc_fixedsize`).
     // Old-gen entries that no jitcode retains are left to the object graph
-    // so a major can reclaim them (`pycode_destructor` unmaps).
+    // so a major can reclaim them (`pycode_destructor` unmaps). "Young" is a
+    // nursery or a young rawmalloced object (`incminimark.py _trace_drag_out`).
     // `walk_all_live_code_wrappers` visits only the remembered young entries
     // in a minor collection.
     pyre_interpreter::pycode::walk_all_live_code_wrappers(&mut |wrapper| {
-        if !majit_gc::gc_is_nursery_object(*wrapper as usize) {
+        if !majit_ir::value::gc_is_young_object(*wrapper as usize) {
             return;
         }
         visit_one(wrapper);

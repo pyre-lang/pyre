@@ -4997,7 +4997,7 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
             *live = wrapper;
             // incminimark.py remember_young_pointer: a young value stored into this
             // old table is the only edge a minor walk must visit.
-            if majit_gc::gc_is_nursery_object(wrapper) {
+            if majit_ir::value::gc_is_young_object(wrapper) {
                 young.push(code_ptr as usize);
             }
         }
@@ -5005,7 +5005,7 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
             map.insert(code_ptr as usize, wrapper);
             // incminimark.py remember_young_pointer: a young value stored into this
             // old table is the only edge a minor walk must visit.
-            if majit_gc::gc_is_nursery_object(wrapper) {
+            if majit_ir::value::gc_is_young_object(wrapper) {
                 young.push(code_ptr as usize);
             }
         }

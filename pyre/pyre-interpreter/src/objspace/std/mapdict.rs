@@ -1370,8 +1370,8 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
         cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
         // incminimark.py remember_young_pointer: a young map stored into this old
         // cache is the only edge a minor walk must visit.
-        if majit_gc::gc_is_nursery_object(cache.attrs[attr_hash] as usize)
-            || majit_gc::gc_is_nursery_object(cache.cached_attrs[attr_hash] as usize)
+        if majit_ir::value::gc_is_young_object(cache.attrs[attr_hash] as usize)
+            || majit_ir::value::gc_is_young_object(cache.cached_attrs[attr_hash] as usize)
         {
             cache.young.push(attr_hash);
         }
@@ -1395,15 +1395,14 @@ pub unsafe fn walk_map_attr_cache(f: &mut dyn FnMut(*mut PyObjectRef)) {
             young,
             ..
         } = &mut *cache;
-        // incminimark.py collect_oldrefs_to_nursery: old values do not move
-        // in a minor collection.
+        // incminimark.py collect_oldrefs_to_nursery: trace every remembered
+        // slot; `_trace_drag_out` copies a nursery object, flags a young
+        // rawmalloced one and leaves an old one where it is.
         for i in young.drain(..) {
-            if !attrs[i].is_null() && majit_gc::gc_is_nursery_object(attrs[i] as usize) {
+            if !attrs[i].is_null() {
                 f(&mut attrs[i] as *mut MapRef as *mut PyObjectRef);
             }
-            if !cached_attrs[i].is_null()
-                && majit_gc::gc_is_nursery_object(cached_attrs[i] as usize)
-            {
+            if !cached_attrs[i].is_null() {
                 f(&mut cached_attrs[i] as *mut MapRef as *mut PyObjectRef);
             }
         }
