@@ -1635,6 +1635,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         specialization: crate::parse::GraphSpecialization::Regular,
                         segments: vec!["__getslice_range".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![s.clone(), start, stop]),
@@ -1670,6 +1671,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         specialization: crate::parse::GraphSpecialization::Regular,
                         segments: vec!["w_bytearray_data".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![owner]),
@@ -1707,6 +1709,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         specialization: crate::parse::GraphSpecialization::Regular,
                         segments: vec!["__getslice_range".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![buf.clone(), start, stop]),

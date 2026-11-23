@@ -12837,6 +12837,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         specialization: crate::parse::GraphSpecialization::Regular,
                         segments: path.segments.clone(),
+                        resolved_path: None,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
@@ -12885,6 +12886,7 @@ impl<'a> Transformer<'a> {
                             target: CallTarget::FunctionPath {
                                 specialization: crate::parse::GraphSpecialization::Regular,
                                 segments: path.segments.clone(),
+                                resolved_path: None,
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(args.iter().cloned()),
