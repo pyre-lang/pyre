@@ -234,12 +234,32 @@ fn dispatch_case_pc(code: &CodeObject, mut py_pc: usize) -> usize {
     py_pc
 }
 
-/// `f_lasti` stored on a dispatch-loop continue: the opcode pc after an
-/// `EXTENDED_ARG` prefix (`pyopcode.py dispatch_bytecode` EXTENDED_ARG
-/// loop / `eval.rs` `set_last_instr_from_next_instr(opcode_pc + 1)`). The
-/// `next_instr` green stays the instruction start so prefixed cases
-/// still accumulate EXTENDED_ARG. Resume / Nop stay their own greens
-/// (`dispatch_bytecode` executes them).
+/// Post-prefix opcode pc a prefixed dispatch case stores at entry,
+/// mirroring the interpreter (`eval.rs` dispatch:
+/// `set_last_instr_from_next_instr(opcode_pc + 1)` after
+/// `decode_instruction_forward`).
+///
+/// [3.15-spec] This departs from `pyopcode.py dispatch_bytecode`, which
+/// leaves `last_instr` at the instruction start while its EXTENDED_ARG
+/// loop consumes the prefixes. The pinned CPython reports the real
+/// opcode instead: for a `LOAD_ATTR` behind an `EXTENDED_ARG` that
+/// raises, `tb_lasti` is the `LOAD_ATTR` offset on CPython 3.15 and
+/// the `EXTENDED_ARG` offset on pypy3. The parity runner measures this
+/// against the pinned CPython in
+/// `extra_tests/parity_tests/tb_lasti_names_the_opcode_behind_extended_arg.py`
+/// (declared `pypy-diverges`). No PyPy hint governs which offset is stored:
+/// `interp_jit.py PyFrame._virtualizable_` fixes only the storage owner
+/// (`last_instr` stays a virtualizable field here), `pyframe.py
+/// resume_execute_frame` promotes whatever value is there, and
+/// `@jit.unroll_safe` on `dispatch_bytecode` governs unrolling only.
+/// The jitcode must agree with the interpreter, so it stores the same value.
+///
+/// Continues do not store this value: the loop head writes the
+/// instruction start (`dispatch_bytecode`
+/// `self.last_instr = intmask(next_instr)`), and `jump_absolute` writes
+/// `dispatch_case_pc` of the target. The `next_instr` green stays the
+/// instruction start so prefixed cases still accumulate EXTENDED_ARG.
+/// Resume / Nop stay their own greens (`dispatch_bytecode` executes them).
 fn dispatch_last_instr_pc(code: &CodeObject, py_pc: usize) -> usize {
     let mut opcode_pc = dispatch_case_pc(code, py_pc);
     while opcode_pc < code.instructions.len()
@@ -1660,6 +1680,13 @@ fn dispatch_link_args(source: &FrameState, target: &FrameState) -> Vec<super::fl
     result
 }
 
+/// Continue the dispatch `while True` (`interp_jit.py PyFrame.dispatch`)
+/// with `next_instr` equal to the target's instruction start
+/// (`dispatch_case_pc`). A continue does not store `last_instr`; the
+/// loop head writes the `next_instr` green after `jit_merge_point`
+/// (`pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`),
+/// and `jump_absolute` writes the target's instruction start before
+/// `bytecode_trace`.
 fn dispatch_continue_to_loop_head(
     code: &CodeObject,
     current_block: &SpamBlockRef,
@@ -1672,15 +1699,27 @@ fn dispatch_continue_to_loop_head(
     } else {
         dispatch_case_pc(code, target_py_pc)
     };
-    // `next_instr` is the instruction start so the switch hits the
-    // prefix case (`interp_jit.py PyFrame.dispatch`). `last_instr` is
-    // stored at the loop head after `jit_merge_point`
-    // (`pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`
-    // then the EXTENDED_ARG walk), not on this continue: a predecessor
-    // store is the merge-point vable box and `bytecode_only_trace` after
-    // the merge would not see the opcode pc.
+    dispatch_continue_to_loop_head_with_next_instr(
+        current_block,
+        current_state,
+        dispatch,
+        super::flow::Constant::signed(case_pc as i64).into(),
+    );
+}
+
+/// Continue the dispatch `while True` with an explicit `next_instr`
+/// green. `interp_jit.py jump_absolute` does
+/// `jumpto = r_uint(self.last_instr)` after `bytecode_trace`; the tick
+/// path passes that vable read. Other continues pass
+/// `Constant(dispatch_case_pc)`.
+fn dispatch_continue_to_loop_head_with_next_instr(
+    current_block: &SpamBlockRef,
+    current_state: &FrameState,
+    dispatch: &DispatchLoop,
+    next_instr: super::flow::FlowValue,
+) {
     let mut source = current_state.clone();
-    source.dispatch_next_instr = Some(super::flow::Constant::signed(case_pc as i64).into());
+    source.dispatch_next_instr = Some(next_instr);
     // `interp_jit.py PyFrame.dispatch` re-reads
     // `is_being_profiled = self.get_is_being_profiled()` after every
     // `handle_bytecode`; the continue re-enters the head's diamond.
@@ -1807,6 +1846,14 @@ fn setup_dispatch_loop(
         .with_portal_extras((frame_var.into(), Some(ec_var.into())));
         let case = SpamBlockRef::new(graph.new_block(Vec::new()), Some(state.clone()));
         case.block().borrow_mut().inputargs = state.getvariables();
+        let opcode_pc = dispatch_last_instr_pc(code, py_pc);
+        if opcode_pc != py_pc {
+            // The case consumes the EXTENDED_ARG prefixes
+            // (`dispatch_bytecode`'s inner EXTENDED_ARG loop; pyre
+            // interpreter `decode_instruction_forward`), so `last_instr`
+            // names the opcode from here on.
+            emit_setfield_last_instr(&case.block(), frame_var, opcode_pc, py_pc as i64);
+        }
         all_walker_blocks.push(case.clone());
         joinpoints.insert(py_pc, vec![case.clone()]);
         pendingblocks.push_back(case.clone());
@@ -2713,10 +2760,10 @@ const VABLE_CODE_FIELD_IDX: u16 = 1;
 const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 
-/// `pyopcode.py dispatch_bytecode` `self.last_instr = intmask(next_instr)`
-/// as a vable immediate store. Used on `jump_absolute` (`interp_jit.py`).
-/// A dispatch-loop body stores at the loop head from the live
-/// `next_instr` green instead.
+/// Immediate `last_instr` vable store (`pyopcode.py dispatch_bytecode`
+/// `self.last_instr = intmask(next_instr)`). `jump_absolute`
+/// (`interp_jit.py`) writes the instruction start before `bytecode_trace`;
+/// a prefixed dispatch case writes the post-prefix opcode pc after the hook.
 fn emit_setfield_last_instr(
     block: &super::flow::BlockRef,
     frame_var: super::flow::Variable,
@@ -2733,91 +2780,27 @@ fn emit_setfield_last_instr(
     );
 }
 
-/// Store `last_instr` after `jit_merge_point` from the promoted `next_instr`
-/// green (`pyopcode.py dispatch_bytecode` `self.last_instr =
-/// intmask(next_instr)`). `next_instr` is the instruction start, while the
-/// interpreter's `last_instr` is the opcode pc after an `EXTENDED_ARG`
-/// prefix (`eval.rs` `decode_instruction_forward_dispatch` then
-/// `set_last_instr_from_next_instr(opcode_pc + 1)`). When the code has
-/// prefixed starts, `block` ends in a `switch` on `next_instr` whose cases
-/// rename the prefixed starts to their opcode pc and whose default passes
-/// `next_instr` through; the store sits in the join. The switch reads only
-/// the green, so tracing folds it like the `co_code` read it stands for.
-/// Returns the block (and its state) that continues the head.
+/// Store the instruction start in `last_instr` after `jit_merge_point`
+/// from the promoted `next_instr` green (`pyopcode.py dispatch_bytecode`
+/// `self.last_instr = intmask(next_instr)` before `bytecode_only_trace`).
+/// The post-prefix opcode pc is stored at the opcode case entry.
 fn emit_setfield_last_instr_from_next(
-    graph: &mut super::flow::FunctionGraph,
-    block: &SpamBlockRef,
-    state: &FrameState,
+    block: &super::flow::BlockRef,
     frame_var: super::flow::Variable,
     next_instr_var: super::flow::Variable,
-    code: &CodeObject,
     offset: i64,
-    all_walker_blocks: &mut Vec<SpamBlockRef>,
-) -> (SpamBlockRef, FrameState) {
-    let prefixed: Vec<(usize, usize)> = (0..code.instructions.len())
-        .filter(|&py_pc| is_python_instruction_start(code, py_pc))
-        .map(|py_pc| (py_pc, dispatch_last_instr_pc(code, py_pc)))
-        .filter(|&(py_pc, opcode_pc)| opcode_pc != py_pc)
-        .collect();
-    if prefixed.is_empty() {
-        record_graph_op(
-            &block.block(),
-            "setfield_vable_i",
-            vable_setfield_int_graph_args(
-                frame_var.into(),
-                next_instr_var.into(),
-                VABLE_LAST_INSTR_FIELD_IDX,
-            ),
-            None,
-            offset,
-        );
-        return (block.clone(), state.clone());
-    }
-    let store_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        state.copy(&mut fresh)
-    };
-    let last_instr = graph.fresh_variable(Kind::Int);
-    let store = SpamBlockRef::new(graph.new_block(Vec::new()), Some(store_state.clone()));
-    let mut inputargs = store_state.getvariables();
-    inputargs.push(last_instr.into());
-    store.block().borrow_mut().inputargs = inputargs;
-    all_walker_blocks.push(store.clone());
-    let state_args = state.getoutputargs(&store_state);
-    block.block().borrow_mut().exitswitch =
-        Some(super::flow::ExitSwitch::Value(next_instr_var.into()));
-    for (py_pc, opcode_pc) in prefixed {
-        let case: super::flow::FlowValue = super::flow::Constant::signed(py_pc as i64).into();
-        let mut args = state_args.clone();
-        args.push(super::flow::Constant::signed(opcode_pc as i64).into());
-        append_exit(
-            &block.block(),
-            super::flow::Link::new(args, Some(store.block()), Some(case.clone()))
-                .with_llexitcase(case)
-                .into_ref(),
-        );
-    }
-    let default_case: super::flow::FlowValue = super::flow::Constant::string("default").into();
-    let mut args = state_args;
-    args.push(next_instr_var.into());
-    append_exit(
-        &block.block(),
-        super::flow::Link::new(args, Some(store.block()), Some(default_case.clone()))
-            .with_llexitcase(default_case)
-            .into_ref(),
-    );
+) {
     record_graph_op(
-        &store.block(),
+        block,
         "setfield_vable_i",
         vable_setfield_int_graph_args(
             frame_var.into(),
-            last_instr.into(),
+            next_instr_var.into(),
             VABLE_LAST_INSTR_FIELD_IDX,
         ),
         None,
         offset,
     );
-    (store, store_state)
 }
 
 /// `jtransform.py rewrite_op_getfield` virtualizable branch: `-live-`
@@ -2869,6 +2852,74 @@ fn emit_vable_getfield_int(
     offset: i64,
 ) -> super::flow::Variable {
     emit_vable_getfield(graph, block, frame_var, field_idx, Kind::Int, offset)
+}
+
+/// Reload register-held locals and operand-stack slots from the
+/// virtualizable array after a call that can run a trace hook.
+///
+/// Dispatch jitcode keeps those values in flow-graph Variables that
+/// mirror `locals_cells_stack_w` (every push/pop/store also writes the
+/// vable slot; pops write NULL). A hook may pop the stack
+/// (`pyframe.py PyFrame.fset_f_lineno`) or write locals through
+/// `f_locals` (`executioncontext.py _trace` `locals2fast`). Upstream
+/// keeps the value stack in the frame, so nothing is reloaded there;
+/// `pyopcode.py PyFrame.dispatch_bytecode` continues at
+/// `next_instr = r_uint(self.last_instr)` and
+/// `pypyjit/interp_jit.py jump_absolute` at
+/// `jumpto = r_uint(self.last_instr)`. After the hook the registers
+/// must be refreshed from the vable before continuing. Each read
+/// follows its own `-live-` (`jtransform.py do_fixed_list_getitem`),
+/// the resume point of the guard
+/// `pyjitpl.py MIFrame._nonstandard_virtualizable` records at the read.
+fn emit_vable_reload_frame_slots(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    state: &FrameState,
+    frame_var: super::flow::Variable,
+    code: &CodeObject,
+    offset: i64,
+) -> FrameState {
+    let stack_base_absolute = RegisterLayout::compute(code).stack_base_absolute;
+    let mut reloaded = state.clone();
+    for (i, slot) in reloaded.locals_w.iter_mut().enumerate() {
+        match slot {
+            Some(super::flow::FlowValue::Variable(v)) if v.kind == Some(Kind::Ref) => {}
+            _ => continue,
+        }
+        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
+        let loaded = emit_graph_op_with_result(
+            graph,
+            block,
+            "getarrayitem_vable_r",
+            vable_getarrayitem_ref_graph_args(
+                frame_var.into(),
+                super::flow::Constant::signed(local_to_vable_slot(i) as i64).into(),
+            ),
+            Kind::Ref,
+            offset,
+        );
+        *slot = Some(loaded.into());
+    }
+    for (d, slot) in reloaded.stack.iter_mut().enumerate() {
+        match slot {
+            super::flow::FlowValue::Variable(v) if v.kind == Some(Kind::Ref) => {}
+            _ => continue,
+        }
+        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
+        let loaded = emit_graph_op_with_result(
+            graph,
+            block,
+            "getarrayitem_vable_r",
+            vable_getarrayitem_ref_graph_args(
+                frame_var.into(),
+                super::flow::Constant::signed((stack_base_absolute + d) as i64).into(),
+            ),
+            Kind::Ref,
+            offset,
+        );
+        *slot = loaded.into();
+    }
+    reloaded
 }
 
 /// `jtransform.py rewrite_op_hint` promote: `-live-` then
@@ -2936,8 +2987,14 @@ fn emit_portal_is_being_profiled_read(
 
     let debugdata_in = graph.fresh_variable(Kind::Ref);
     let nonnull_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
+        let mut state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            current_state.copy(&mut fresh)
+        };
+        if let Some(super::flow::FlowValue::Variable(_)) = &state.dispatch_next_instr {
+            state.dispatch_next_instr = Some(graph.fresh_variable(Kind::Int).into());
+        }
+        state
     };
     let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
     let mut nonnull_inputs = nonnull_state.getvariables();
@@ -2947,8 +3004,14 @@ fn emit_portal_is_being_profiled_read(
 
     let profiled_phi = graph.fresh_variable(Kind::Int);
     let join_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
+        let mut state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            current_state.copy(&mut fresh)
+        };
+        if let Some(super::flow::FlowValue::Variable(_)) = &state.dispatch_next_instr {
+            state.dispatch_next_instr = Some(graph.fresh_variable(Kind::Int).into());
+        }
+        state
     };
     let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
     let mut join_inputs = join_state.getvariables();
@@ -3118,19 +3181,6 @@ fn emit_ptr_iszero_split(
     set_last_bool_exitcase(&current_block.block(), false);
 
     (nonnull_arm, ptr_in)
-}
-
-fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
-    let source_state = source
-        .framestate()
-        .expect("dispatch_bytecode arm carries a FrameState");
-    let join_state = join
-        .framestate()
-        .expect("dispatch_bytecode join carries a FrameState");
-    append_exit(
-        &source.block(),
-        output_link(&source_state, &join_state, join.block()),
-    );
 }
 
 /// True when any instruction-start pc is covered by the exception table.
@@ -3448,8 +3498,8 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         .expect("ptr_iszero armed arm carries a FrameState");
     // Identity split after the raising call: same `next_offset` / blocklist
     // as `make_next_block`, without enqueueing the successor on
-    // `pendingblocks` — the `last_instr` reload is emitted here, then
-    // `link_to_join`.
+    // `pendingblocks` — the `last_instr` and frame-slot reloads are
+    // emitted here, then the join.
     let mut next_state = {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         armed_state.copy(&mut fresh)
@@ -3494,14 +3544,22 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         offset,
     );
     // `dispatch_bytecode`: `next_instr = r_uint(self.last_instr)` after
-    // `ec.bytecode_only_trace(self)`. last_instr is the opcode pc after
-    // EXTENDED_ARG; the switch green is the instruction start. Reloading
-    // the vable into the green would miss the prefix case. The getfield
-    // still records a tracer that writes last_instr (`run_trace_func`).
-    // Do not inject the Int into `dispatch_next_instr` (`flatten.py
-    // insert_renamings` would emit `ref_copy` of an Int).
-    let _ = next_instr;
-    link_to_join(&next_block, &join);
+    // `ec.bytecode_only_trace(self)`. The head stores the instruction
+    // start, and `fset_f_lineno` stores an instruction start, so the
+    // reloaded value is always a key of the `next_instr` switch.
+    let mut reloaded_state = emit_vable_reload_frame_slots(
+        graph,
+        &next_block.block(),
+        &next_state,
+        frame_var,
+        code,
+        offset,
+    );
+    reloaded_state.dispatch_next_instr = Some(next_instr.into());
+    append_exit(
+        &next_block.block(),
+        output_link(&reloaded_state, &join_state, join.block()),
+    );
 
     join
 }
@@ -3605,21 +3663,12 @@ fn emit_dispatch_loop_head(
     // `pyopcode.py dispatch_bytecode`: `self.last_instr = intmask(next_instr)`
     // after `jit_merge_point` and before `bytecode_only_trace`. The green is
     // already boxed (`int_guard_value`); this is not a merge-point Int phi.
-    let (stored, stored_state) = emit_setfield_last_instr_from_next(
-        graph,
-        &join,
-        &join_state,
-        frame_var,
-        next_instr_var,
-        code,
-        LOOP_HEAD_OFFSET,
-        all_walker_blocks,
-    );
+    emit_setfield_last_instr_from_next(&join.block(), frame_var, next_instr_var, LOOP_HEAD_OFFSET);
     let switch_block = emit_dispatch_bytecode_jitted_trace_arm(
         code,
         graph,
-        &stored,
-        &stored_state,
+        &join,
+        &join_state,
         frame_var,
         ec_var,
         0,
@@ -3806,16 +3855,28 @@ fn emit_jump_absolute_slow_residual(
             depth_at_pc,
         );
     }
+    // The residual call is canraise (`flatten.py insert_exits`); reload
+    // the hook-updated stack/locals on the normal successor.
+    let (after, after_state) =
+        copy_spam_block_at_pc(code, graph, &slow_state, py_pc, all_walker_blocks);
     append_exit(
         &slow.block(),
-        super::flow::Link::new(
-            slow_state.getoutputargs(dest_state),
-            Some(dest.block()),
-            None,
-        )
-        .into_ref(),
+        output_link(&slow_state, &after_state, after.block()),
     );
     restore_canraise_exit_order(&slow.block());
+    let reloaded = emit_vable_reload_frame_slots(
+        graph,
+        &after.block(),
+        &after_state,
+        frame_var,
+        code,
+        py_pc as i64,
+    );
+    append_exit(
+        &after.block(),
+        super::flow::Link::new(reloaded.getoutputargs(dest_state), Some(dest.block()), None)
+            .into_ref(),
+    );
     (slow, slow_state)
 }
 
@@ -4019,13 +4080,6 @@ fn emit_jump_absolute_tick(
     let header_block = if !emit_ticker && !emit_breaker {
         current_block.clone()
     } else {
-        // interp_jit.py jump_absolute: `self.last_instr = intmask(jumpto)`
-        // before `bytecode_trace`. The store below uses the opcode pc of
-        // jumpto (`dispatch_last_instr_pc`). The dead `jump_absolute` shim
-        // uses `set_last_instr_from_next_instr(jumpto)` (`last_instr =
-        // jumpto - 1`), which is the f_lasti store and not the live
-        // convention.
-        //
         // Split a new graph block for the poll.  JUMP_BACKWARD falls
         // through from STORE_FAST in the same CFG block; appending the
         // poll there made `derive_pc_live_indices_from_sparse` key the
@@ -4044,14 +4098,13 @@ fn emit_jump_absolute_tick(
             output_link(current_state, &tick_state, tick_block.block()),
         );
 
-        // `interp_jit.py jump_absolute`: `self.last_instr = intmask(jumpto)`
-        // before `bytecode_trace`. jumpto is the instruction start; store the
-        // opcode pc so `f_lasti` names FOR_ITER, not its EXTENDED_ARG prefix
-        // (`eval.rs` `set_last_instr_from_next_instr(opcode_pc + 1)`).
+        // `interp_jit.py jump_absolute`: `self.last_instr = intmask(jumpto)`.
+        // `jumpto` is the target's instruction start (`dispatch_case_pc`);
+        // `target_py_pc` may point at trivia the switch skips.
         emit_setfield_last_instr(
             &tick_block.block(),
             frame_var,
-            dispatch_last_instr_pc(code, target_py_pc),
+            dispatch_case_pc(code, target_py_pc),
             py_pc as i64,
         );
 
@@ -4144,33 +4197,54 @@ fn emit_jump_absolute_tick(
     // The diamond closes `header_block`, so `loop_header` lives on the
     // join. That is the same predecessor/join split the portal header
     // uses, so `flatten_graph` emits the diamond before the marker.
-    let goto_block = if emit_header {
-        let header_state = header_block
-            .framestate()
-            .unwrap_or_else(|| current_state.clone());
+    // `interp_jit.py jump_absolute`: `jumpto = r_uint(self.last_instr)`
+    // after `bytecode_trace`, before the `can_enter_jit` arguments. During
+    // tracing the read returns the box the tick stored, so traces do not change.
+    let mut diamond_state = header_block
+        .framestate()
+        .unwrap_or_else(|| current_state.clone());
+    if emit_ticker || emit_breaker {
+        let next_instr = emit_vable_getfield_int(
+            graph,
+            &header_block.block(),
+            frame_var,
+            VABLE_LAST_INSTR_FIELD_IDX,
+            py_pc as i64,
+        );
+        diamond_state.dispatch_next_instr = Some(next_instr.into());
+    }
+    let (goto_block, goto_state) = if emit_header {
         let _ = emit_getcode(graph, &header_block.block(), frame_var, py_pc as i64);
         let (join, _) = emit_portal_is_being_profiled_read(
             graph,
             &header_block,
-            &header_state,
+            &diamond_state,
             frame_var,
             py_pc as i64,
             all_walker_blocks,
         );
         emit_loop_header(graph, &join, ssarepr, jdindex, py_pc);
-        join
+        let join_state = join.framestate().unwrap_or_else(|| diamond_state.clone());
+        (join, join_state)
     } else {
-        header_block
+        let continue_state = if emit_ticker || emit_breaker {
+            diamond_state
+        } else {
+            current_state.clone()
+        };
+        (header_block, continue_state)
     };
-    let goto_is_new_block = emit_header || emit_ticker || emit_breaker;
-    let goto_state = if goto_is_new_block {
-        goto_block
-            .framestate()
-            .unwrap_or_else(|| current_state.clone())
-    } else {
-        current_state.clone()
-    };
-    dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc);
+    match goto_state.dispatch_next_instr.clone() {
+        Some(next_instr) => dispatch_continue_to_loop_head_with_next_instr(
+            &goto_block,
+            &goto_state,
+            dispatch,
+            next_instr,
+        ),
+        None => {
+            dispatch_continue_to_loop_head(code, &goto_block, &goto_state, dispatch, target_py_pc)
+        }
+    }
 }
 
 fn emit_frontend_neg(
@@ -10253,9 +10327,11 @@ impl CodeWriter {
         //
         // `getfield_vable_i` production sites call `emit_vable_getfield_int`:
         // the promoted `valuestackdepth` after `jit_merge_point`
-        // (`interp_jit.py PyFrame.dispatch`) and the `last_instr` reload after
+        // (`interp_jit.py PyFrame.dispatch`), the `last_instr` reload after
         // `bytecode_only_trace` (`dispatch_bytecode`
-        // `next_instr = r_uint(self.last_instr)`).
+        // `next_instr = r_uint(self.last_instr)`), and the `last_instr`
+        // reload after `bytecode_trace` (`interp_jit.py jump_absolute`
+        // `jumpto = r_uint(self.last_instr)`).
         // The remaining vable scalar variants (`getfield_vable_f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
         // production emit site today; those arms already require the same
@@ -21714,6 +21790,68 @@ mod tests {
             opnames.contains(&"getfield_vable_i"),
             "armed arm reloads last_instr after bytecode_only_trace, got {opnames:?}"
         );
+        let decoded: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let is_reload_block_terminator = |name: &str| {
+            name == "goto"
+                || name.starts_with("goto_if_")
+                || name.starts_with("switch")
+                || name.ends_with("_return")
+                || name == "raise"
+                || name == "reraise"
+        };
+        let last_instr_getfield_tails: Vec<Vec<&str>> = decoded
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                op.opname == "getfield_vable_i"
+                    && vable_field_index(
+                        &*pyjit.jitcode,
+                        decoded_descr_u16(&pyjit.jitcode.code, op.pc, 2),
+                    ) == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            })
+            .map(|(i, _)| {
+                decoded[i + 1..]
+                    .iter()
+                    .map(|next| next.opname)
+                    .take_while(|name| !is_reload_block_terminator(name))
+                    .collect()
+            })
+            .collect();
+        let reload_then_array = last_instr_getfield_tails.iter().any(|after| {
+            after.iter().all(|name| {
+                matches!(
+                    *name,
+                    "live" | "getarrayitem_vable_r" | "int_copy" | "ref_copy"
+                )
+            }) && after.contains(&"getarrayitem_vable_r")
+                && after.iter().enumerate().all(|(k, name)| {
+                    *name != "getarrayitem_vable_r" || (k > 0 && after[k - 1] == "live")
+                })
+        });
+        if !reload_then_array {
+            eprintln!(
+                "last_instr getfield tails (ops until goto/goto_if_*/switch*/*_return/raise/reraise): {last_instr_getfield_tails:?}"
+            );
+        }
+        assert!(
+            reload_then_array,
+            "trace-arm last_instr reload must be a reload block of live/getarrayitem_vable_r/int_copy/ref_copy with every getarrayitem_vable_r immediately preceded by live; last_instr getfield tails={last_instr_getfield_tails:?}, opnames={opnames:?}"
+        );
+        let last_instr_reloads = decoded
+            .iter()
+            .filter(|op| {
+                op.opname == "getfield_vable_i"
+                    && vable_field_index(
+                        &*pyjit.jitcode,
+                        decoded_descr_u16(&pyjit.jitcode.code, op.pc, 2),
+                    ) == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            })
+            .count();
+        assert!(
+            last_instr_reloads >= 2,
+            "armed arm and jump tick must each reload last_instr, got {last_instr_reloads} in {opnames:?}"
+        );
         let residual_void = opnames
             .iter()
             .filter(|&&name| name == "residual_call_r_v")
@@ -21826,6 +21964,52 @@ mod tests {
         u16::from_le_bytes([code[pc + offset], code[pc + offset + 1]]) as usize
     }
 
+    fn vable_field_index(
+        jitcode: &majit_metainterp::jitcode::JitCode,
+        descr_idx: usize,
+    ) -> Option<usize> {
+        jitcode
+            .descr_at(descr_idx)
+            .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_bh_descr)
+            .and_then(|descr| match descr {
+                majit_jitcode::jitcode::BhDescr::VableField { index } => Some(*index),
+                _ => None,
+            })
+    }
+
+    fn last_instr_setfield_value(
+        jitcode: &majit_metainterp::jitcode::JitCode,
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+        num_regs_i: usize,
+        regs: &[Option<i64>],
+    ) -> Option<i64> {
+        let code = jitcode.code.as_slice();
+        match (op.opname, op.argcodes) {
+            ("setfield_vable_i_imm", "rdd") => {
+                if vable_field_index(jitcode, decoded_descr_u16(code, op.pc, 4))
+                    != Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+                {
+                    return None;
+                }
+                Some(u16::from_le_bytes([code[op.pc + 2], code[op.pc + 3]]) as i64)
+            }
+            ("setfield_vable_i", "rid") => {
+                if vable_field_index(jitcode, decoded_descr_u16(code, op.pc, 3))
+                    != Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+                {
+                    return None;
+                }
+                resolve_int_operand(
+                    code[op.pc + 2] as usize,
+                    num_regs_i,
+                    &jitcode.constants_i,
+                    regs,
+                )
+            }
+            _ => None,
+        }
+    }
+
     fn apply_int_copy_to_regs(
         code: &[u8],
         op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
@@ -21929,6 +22113,9 @@ mod tests {
         let mut adapted_pos = None;
         let mut ticker_load_pos = None;
         let mut breaker_load_pos = None;
+        let mut tick_last_instr = None;
+        let mut last_instr_read_pos = None;
+        let mut pycode_promote_pos = None;
         for (idx, op) in before.iter().enumerate() {
             if op.opname == "int_copy" {
                 apply_int_copy_to_regs(
@@ -21938,6 +22125,18 @@ mod tests {
                     &jitcode.constants_i,
                     &mut regs,
                 );
+            }
+            if let Some(value) = last_instr_setfield_value(jitcode, op, num_regs_i, &regs) {
+                tick_last_instr = Some(value);
+            }
+            if op.opname == "getfield_vable_i"
+                && vable_field_index(jitcode, decoded_descr_u16(&jitcode.code, op.pc, 2))
+                    == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            {
+                last_instr_read_pos = Some(idx);
+            }
+            if op.opname == "ref_guard_value" {
+                pycode_promote_pos = Some(idx);
             }
             if let Some(name) = inline_call_callee_name(jitcode, op) {
                 if name.ends_with("gil_ready_word") {
@@ -22023,6 +22222,31 @@ mod tests {
                 && breaker_load_pos < uint_ge_pos
                 && uint_ge_pos < breaker_slow_pos,
             "back-edge order, got {opnames:?}"
+        );
+        let last_instr_read_pos = last_instr_read_pos.unwrap_or_else(|| {
+            panic!("jump tick reads last_instr before loop_header, got {opnames:?}")
+        });
+        let pycode_promote_pos = pycode_promote_pos.unwrap_or_else(|| {
+            panic!("getcode promotes pycode before loop_header, got {opnames:?}")
+        });
+        assert!(
+            breaker_slow_pos < last_instr_read_pos && last_instr_read_pos < pycode_promote_pos,
+            "jumpto = r_uint(self.last_instr) follows bytecode_trace and precedes can_enter_jit's getcode, got {opnames:?}"
+        );
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let headers = pyre_interpreter::find_loop_header_pcs(&code);
+        assert_eq!(
+            headers.len(),
+            1,
+            "while-loop fixture must have one header, got {headers:?}"
+        );
+        let header = *headers.iter().next().expect("unique while-header");
+        assert_eq!(
+            tick_last_instr,
+            Some(header as i64),
+            "jump_absolute tick stores the instruction start jumpto"
         );
     }
 
@@ -23060,6 +23284,139 @@ def f(x):
                 "dispatch must case on opcode pc {opcode_pc}, keys={keys:?}"
             );
         }
+    }
+
+    #[test]
+    fn prefixed_dispatch_case_restamps_opcode_pc() {
+        use pyre_jit_trace::jitcode_runtime::{decode_op_at, decoded_ops};
+
+        let mut source = String::from("def f(x):\n    try:\n        if x:\n");
+        for _ in 0..160 {
+            source.push_str("            x = 1\n");
+        }
+        source.push_str("        return x\n    except Exception:\n        return 0\n");
+        let code = first_nested_function_code(&source);
+        let mut prefix_and_opcode: Vec<(usize, usize)> = Vec::new();
+        for py_pc in 0..code.instructions.len() {
+            if !is_python_instruction_start(&code, py_pc) {
+                continue;
+            }
+            let opcode_pc = dispatch_last_instr_pc(&code, py_pc);
+            if opcode_pc != py_pc {
+                prefix_and_opcode.push((py_pc, opcode_pc));
+            }
+        }
+        assert!(
+            !prefix_and_opcode.is_empty(),
+            "fixture must contain an EXTENDED_ARG-prefixed instruction"
+        );
+
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("prefixed try/if must produce a jitcode");
+        let jitcode = &*pyjit.jitcode;
+        let bytes = jitcode.code.as_slice();
+        let ops: Vec<_> = decoded_ops(bytes).collect();
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opname == "setfield_vable_i"
+                    && op.argcodes == "rid"
+                    && vable_field_index(jitcode, decoded_descr_u16(bytes, op.pc, 3))
+                        == Some(VABLE_LAST_INSTR_FIELD_IDX as usize)
+            }),
+            "head stores the next_instr green as setfield_vable_i/rid of last_instr"
+        );
+
+        let num_regs_i = jitcode.num_regs_i();
+        let mut regs = vec![None; 256.max(num_regs_i)];
+        let mut last_instr_values = Vec::new();
+        for op in &ops {
+            if op.opname == "int_copy" {
+                apply_int_copy_to_regs(bytes, op, num_regs_i, &jitcode.constants_i, &mut regs);
+            }
+            if let Some(value) = last_instr_setfield_value(jitcode, op, num_regs_i, &regs) {
+                last_instr_values.push(value);
+            }
+        }
+        assert!(
+            prefix_and_opcode
+                .iter()
+                .any(|&(_, opcode_pc)| last_instr_values.contains(&(opcode_pc as i64))),
+            "prefixed case must store opcode pc P as last_instr, P={prefix_and_opcode:?} stores={last_instr_values:?}"
+        );
+
+        let mut case_begins_with_opcode_pc = false;
+        for op in &ops {
+            if !op.opname.starts_with("switch") {
+                continue;
+            }
+            let descr_idx = decoded_descr_u16(bytes, op.pc, 2);
+            let Some(dict) = jitcode
+                .descr_at(descr_idx)
+                .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_bh_descr)
+                .and_then(|descr| match descr {
+                    majit_jitcode::jitcode::BhDescr::Switch { dict, .. } => Some(dict),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            for &(prefix_pc, opcode_pc) in &prefix_and_opcode {
+                let Some(&case_pc) = dict.get(&(prefix_pc as i64)) else {
+                    continue;
+                };
+                let mut pc = case_pc;
+                let mut local_regs = vec![None; 256.max(num_regs_i)];
+                for _ in 0..32 {
+                    let Some(case_op) = decode_op_at(bytes, pc) else {
+                        break;
+                    };
+                    if case_op.opname == "int_copy" {
+                        apply_int_copy_to_regs(
+                            bytes,
+                            &case_op,
+                            num_regs_i,
+                            &jitcode.constants_i,
+                            &mut local_regs,
+                        );
+                    }
+                    match case_op.opname {
+                        "live" | "int_copy" | "ref_copy" | "float_copy" | "int_push"
+                        | "ref_push" | "float_push" | "int_pop" | "ref_pop" | "float_pop" => {
+                            pc = case_op.next_pc;
+                            continue;
+                        }
+                        "goto" if case_op.argcodes == "L" => {
+                            pc = u16::from_le_bytes([bytes[case_op.pc + 1], bytes[case_op.pc + 2]])
+                                as usize;
+                            continue;
+                        }
+                        _ => {
+                            if last_instr_setfield_value(jitcode, &case_op, num_regs_i, &local_regs)
+                                == Some(opcode_pc as i64)
+                            {
+                                case_begins_with_opcode_pc = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            case_begins_with_opcode_pc,
+            "prefixed dispatch case must begin with setfield_vable_i of P, P={prefix_and_opcode:?}"
+        );
     }
 
     #[test]
