@@ -2520,7 +2520,7 @@ impl<'a> Lowering<'a> {
         let mut work = vec![(
             recv,
             mir_bb,
-            self.body.body[mir_bb].statements.len(),
+            self.body.body()[mir_bb].statements.len(),
             true,
             false,
         )];
@@ -2533,7 +2533,7 @@ impl<'a> Lowering<'a> {
             for (def_bb, def_stmt) in defs {
                 let point = if let Some(idx) = def_stmt {
                     let Ok(StmtKind::Assign(_, rvalue)) =
-                        self.body.body[def_bb].statements[idx].stmt_kind_ref()
+                        self.body.body()[def_bb].statements[idx].stmt_kind_ref()
                     else {
                         sources.address = true;
                         continue;
@@ -2557,7 +2557,7 @@ impl<'a> Lowering<'a> {
                     }
                 } else {
                     let Ok(TermKind::Call { call, .. }) =
-                        self.body.body[def_bb].term_ref(self.llbc)
+                        self.body.body()[def_bb].term_ref(self.llbc)
                     else {
                         sources.address = true;
                         continue;
@@ -2581,7 +2581,7 @@ impl<'a> Lowering<'a> {
                     (
                         src,
                         def_bb,
-                        self.body.body[def_bb].statements.len(),
+                        self.body.body()[def_bb].statements.len(),
                         false,
                         crossed_ref,
                     )
@@ -2656,7 +2656,7 @@ impl<'a> Lowering<'a> {
     /// entry. Built once per body.
     fn block_predecessors(&self) -> &[Vec<usize>] {
         self.block_predecessors.get_or_init(|| {
-            let n = self.body.body.len();
+            let n = self.body.body().len();
             let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
             for p in 0..n {
                 if !self.forward_reached[p] {
@@ -2683,7 +2683,7 @@ impl<'a> Lowering<'a> {
         bb: usize,
         stmt: usize,
     ) -> Vec<(usize, Option<usize>)> {
-        let statements = &self.body.body[bb].statements;
+        let statements = &self.body.body()[bb].statements;
         let end = stmt.min(statements.len());
         for idx in (0..end).rev() {
             let Ok(StmtKind::Assign(dest, _)) = statements[idx].stmt_kind_ref() else {
@@ -2697,7 +2697,7 @@ impl<'a> Lowering<'a> {
             }
         }
 
-        let n = self.body.body.len();
+        let n = self.body.body().len();
         let preds = self.block_predecessors();
 
         let mut defs = Vec::new();
@@ -2707,7 +2707,7 @@ impl<'a> Lowering<'a> {
             work.push((p, bb));
         }
         while let Some((p, s)) = work.pop() {
-            let block = &self.body.body[p];
+            let block = &self.body.body()[p];
             let returns_into = matches!(
                 block.term_ref(self.llbc),
                 Ok(TermKind::Call { call, target, .. })
@@ -6598,7 +6598,7 @@ impl<'a> Lowering<'a> {
         &self,
         target: usize,
     ) -> bool {
-        let Some(bb) = self.body.body.get(target) else {
+        let Some(bb) = self.body.body().get(target) else {
             return false;
         };
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
@@ -7678,7 +7678,7 @@ impl<'a> Lowering<'a> {
             let mut producers = 0usize;
             let mut followed: Option<usize> = None;
             let mut is_fixed = false;
-            for (bb_idx, bb) in self.body.body.iter().enumerate() {
+            for (bb_idx, bb) in self.body.body().iter().enumerate() {
                 if !self.forward_reached[bb_idx] {
                     continue;
                 }

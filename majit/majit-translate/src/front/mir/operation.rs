@@ -10881,11 +10881,10 @@ impl<'a> Lowering<'a> {
     }
 
     fn type_decl_is_declared_gc(&self, td: &TypeDecl) -> bool {
-        let name = strip_crate_prefix(td.item_meta.name_path_str());
         struct_id_is_declared_gc(
             self.gc_struct_ids,
             super::struct_id_for_type_decl(td),
-            &name,
+            td.item_meta.name_path_stripped(),
         )
     }
 
@@ -11439,7 +11438,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         match &td.kind {
-            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
+            TypeDeclKind::Struct(_) => Some(td.item_meta.name_path_stripped().to_string()),
             _ => None,
         }
     }
@@ -12755,7 +12754,7 @@ pub(in crate::front::mir) fn overlay_field_lltype(
         if struct_id_is_declared_gc(
             gc_struct_ids,
             struct_id_for_type_decl(td),
-            &strip_crate_prefix(td.item_meta.name_path_str()),
+            td.item_meta.name_path_stripped(),
         ) {
             return (*GCREF).clone();
         }

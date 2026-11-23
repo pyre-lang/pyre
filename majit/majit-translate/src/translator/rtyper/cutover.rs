@@ -3059,13 +3059,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // dedupe trap (using `FunctionGraph::name`) is still avoided because
     // we key on GraphKey / the post-strip segment sequence, not on the
     // bare leaf.
-    let mut pending: Vec<(
-        FunctionPathKey,
-        Rc<LegacyGraph>,
-        Rc<FunctionEntry>,
-        Signature,
-        crate::codewriter::call::StoredBody,
-    )> = Vec::with_capacity(function_graphs.len());
+    // One tuple per FunctionEntry: the spelling whose `key.segments()` is
+    // smallest (the earlier-encountered spelling on a tie).
+    let mut pending: IndexMap<
+        *const FunctionEntry,
+        (
+            FunctionPathKey,
+            Rc<LegacyGraph>,
+            Rc<FunctionEntry>,
+            Signature,
+            crate::codewriter::call::StoredBody,
+        ),
+    > = IndexMap::new();
     // `by_canonical_path` tracks the canonical `FunctionPathKey` of
     // the first-encountered alias for each canonical-stripped key.
     // Subsequent aliases of the same callable register an alias row
@@ -3102,7 +3107,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             continue;
         }
         let key = FunctionPathKey::from(&path);
-        let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
@@ -3127,9 +3131,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             existing
         } else {
             let entry = registry.lookup(&key).unwrap_or_else(|| {
+                let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
                 registry.get_or_register_with_func(
                     key.clone(),
-                    signature.clone(),
+                    signature,
                     source_graph_func(&graph),
                 )
             });
@@ -3137,15 +3142,24 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             entry
         };
         publish_source_signature(&graph, &entry);
-        let body = function_graphs
-            .body(&path)
-            .expect("a declared path names a funcobj");
-        pending.push((key, graph, entry, signature, body));
+        let entry_ptr = Rc::as_ptr(&entry);
+        let should_store = match pending.get(&entry_ptr) {
+            None => true,
+            Some(existing) => key.segments() < existing.0.segments(),
+        };
+        if should_store {
+            let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
+            let body = function_graphs
+                .body(&path)
+                .expect("a declared path names a funcobj");
+            pending.insert(entry_ptr, (key, graph, entry, signature, body));
+        }
     }
     // `function_graphs.iter_declared()` yields `CallPath.display_name` order,
     // so `alloc_desc_key` and first-alias-wins already follow that key.
-    // Sort pending as a defense for the lift/prefill passes below.
-    pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
+    // Sort pending (one tuple per FunctionEntry, smallest-segments spelling)
+    // as a defense for the lift/prefill passes below.
+    pending.sort_by(|_, a, _, b| a.0.segments().cmp(b.0.segments()));
     // Point each AccessDirect path at the origin FunctionDesc
     // (`cachedgraph` stores both graphs on one desc). Skip when the
     // origin was never registered (a declined callable has no desc to
@@ -3250,7 +3264,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // the entry's `FunctionDesc` and lifted when the graph is first
     // observed; a failure is recorded on the entry and surfaces at that
     // `cachedgraph`.
-    let mut lifted: HashSet<*const FunctionEntry> = HashSet::with_capacity(by_canonical_path.len());
     // Pre-pass — project each callee's declared LLBC fn-ptr signature onto
     // its entry BEFORE any body is lifted.  The fn-const materialisation
     // fallback (`flowspace_adapter::translate_op`) reads this to type an
@@ -3262,21 +3275,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // sees a later callee's declared type.  A non-projectable signature
     // leaves the slot `None` — the fallback declines and the site fails
     // closed exactly as before.
-    {
-        let mut seeded: HashSet<*const FunctionEntry> =
-            HashSet::with_capacity(by_canonical_path.len());
-        for (_key, graph, entry, _signature, _body) in &pending {
-            if !seeded.insert(Rc::as_ptr(entry)) {
-                continue;
-            }
-            seed_declared_funcptr_type(graph, entry, Some(registry.bookkeeper()));
-        }
+    for (_key, graph, entry, _signature, _body) in pending.values() {
+        seed_declared_funcptr_type(graph, entry, Some(registry.bookkeeper()));
     }
-    for (key, graph, entry, signature, body) in &pending {
-        let entry_ptr = Rc::as_ptr(entry);
-        if !lifted.insert(entry_ptr) {
-            continue;
-        }
+    for (key, graph, entry, signature, body) in pending.values() {
         install_source_graph(registry, key, graph, entry, signature, body);
     }
     // Methods live on the declaring class's dict
@@ -19878,9 +19880,9 @@ mod tests {
         let mut graph = out.graph;
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.contains_key("getfield_raw_i/id>i"),
             "getfield_raw_i missing, got {:?}",
@@ -20200,9 +20202,9 @@ mod tests {
             "f must assemble through a call op, graph={graph:?}"
         );
 
-        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         assert!(
             asm.insns.keys().any(|key| key.contains("call")),
             "assembled call missing, keys={:?}",

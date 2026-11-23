@@ -346,7 +346,7 @@ fn walk_body(
     vable: &HashSet<&str>,
     census: &mut Census,
 ) {
-    for bb in &body.body {
+    for bb in body.body() {
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(dest, rvalue)) => {

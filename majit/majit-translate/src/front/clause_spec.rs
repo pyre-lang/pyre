@@ -571,19 +571,19 @@ pub(crate) fn substituted_unstructured(
     types: &[Value],
     const_generics: &[Value],
 ) -> Option<Unstructured> {
-    let raw = fd.body.as_ref()?.get();
-    let mut value: Value = serde_json::from_str(raw).ok()?;
-    let body = value.get_mut("Unstructured")?;
-    // Type variables first. `subst_vars` replaces a wrapper with a plain
-    // copy of its body; doing that after the clause pass would restore
-    // the shared dedup body and put the `Clause` back.
-    substitute_type_vars(body, llbc, types, const_generics);
-    substitute_clauses(body, llbc, trait_refs);
     #[derive(Deserialize)]
     struct Proj {
         #[serde(rename = "Unstructured")]
         unstructured: Unstructured,
     }
+    // One Unstructured deserialize. Type and clause substitution walks
+    // local TyRefs and each statement/terminator kind; a span id is not
+    // a type id (`Space::Span`). Promoted-constant splices stay off this
+    // copy: only `rewrite_str_literal_reads` rewrites a `&str` Global.
+    let mut u = serde_json::from_str::<Proj>(fd.body.as_ref()?.get())
+        .ok()?
+        .unstructured;
+    subst_unstructured(&mut u, llbc, trait_refs, types, const_generics);
     // FunDecl::unstructured keeps cleanup blocks at their original
     // indices; every scan uses `forward_reachable_mask`. A spec copy
     // that stripped them would lower a different CFG than the template.
@@ -591,11 +591,60 @@ pub(crate) fn substituted_unstructured(
     // i64 instantiation of RDict::lookup_for_store still becomes a graph.
     // getkind banks the substituted &i64 key as int (lltype.Ptr with
     // _gckind == 'raw').
-    let mut u = serde_json::from_value::<Proj>(value).ok()?.unstructured;
     fd.rewrite_str_literal_reads(&mut u);
     fd.rewrite_checked_binop_calls(&mut u);
     duplicate_return(&mut u);
     Some(u)
+}
+
+/// Type variables first. `subst_vars` replaces a wrapper with a plain copy
+/// of its body; doing that after the clause pass would restore the shared
+/// dedup body and put the `Clause` back.
+fn subst_unstructured(
+    u: &mut Unstructured,
+    llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) {
+    for local in &mut u.locals.locals {
+        local.ty = subst_tyref_with_clauses(&local.ty, llbc, trait_refs, types, const_generics);
+    }
+    for block in u.body_mut() {
+        for stmt in &mut block.statements {
+            if let Some(kind) =
+                subst_kind_value(stmt.kind.get(), llbc, trait_refs, types, const_generics)
+            {
+                stmt.set_kind(kind);
+            }
+        }
+        if let Some(kind) = subst_kind_value(
+            block.terminator.kind.get(),
+            llbc,
+            trait_refs,
+            types,
+            const_generics,
+        ) {
+            block.set_terminator_kind(kind);
+        }
+    }
+}
+
+fn subst_kind_value(
+    raw: &str,
+    llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Option<Value> {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+    let mut kind: Value = serde_json::from_str(raw).ok()?;
+    substitute_type_vars(&mut kind, llbc, types, const_generics);
+    substitute_clauses(&mut kind, llbc, trait_refs);
+    Some(kind)
 }
 
 /// `fn from(t: T) -> T { t }` as an Unstructured body. core's reflexive
@@ -932,14 +981,35 @@ pub(crate) fn subst_tyref(
     types: &[Value],
     const_generics: &[Value],
 ) -> TyRef {
-    let mut value = match ty {
+    let mut value = tyref_to_value(ty);
+    substitute_type_vars(&mut value, llbc, types, const_generics);
+    value_to_tyref(value)
+}
+
+fn subst_tyref_with_clauses(
+    ty: &TyRef,
+    llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> TyRef {
+    let mut value = tyref_to_value(ty);
+    substitute_type_vars(&mut value, llbc, types, const_generics);
+    substitute_clauses(&mut value, llbc, trait_refs);
+    value_to_tyref(value)
+}
+
+fn tyref_to_value(ty: &TyRef) -> Value {
+    match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
             serde_json::json!({ "Value": [id, &**body] })
         }
         TyRef::Other(body) => (*body.0).clone(),
-    };
-    substitute_type_vars(&mut value, llbc, types, const_generics);
+    }
+}
+
+fn value_to_tyref(value: Value) -> TyRef {
     serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value.into()))
 }
 
@@ -2774,7 +2844,7 @@ mod tests {
         let copied =
             substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
         let arm =
-            copied.body[0].terminator.kind_value()["Switch"]["data"]["branches"][0][0].clone();
+            copied.body()[0].terminator.kind_value()["Switch"]["data"]["branches"][0][0].clone();
         assert_ne!(arm, type_body, "switch arm resolved as the type body");
         assert!(
             arm == json!({"Deduplicated": 11}) || arm == const_body,
@@ -2784,7 +2854,7 @@ mod tests {
             !value_has_depth0_type_var(&arm),
             "type var leaked into switch arm: {arm}"
         );
-        copied.body[0]
+        copied.body()[0]
             .term(&llbc)
             .expect("switch arm const unresolved");
         assert_eq!(llbc.dedup_body(11), Some(&type_body));
@@ -2824,15 +2894,15 @@ mod tests {
         let u = identity_unstructured(&ty).expect("identity body");
         assert_eq!(u.locals.arg_count, 1);
         assert_eq!(u.locals.locals.len(), 2);
-        assert_eq!(u.body.len(), 1);
-        assert_eq!(u.body[0].statements.len(), 1);
-        let kind = u.body[0].statements[0].kind_value();
+        assert_eq!(u.body().len(), 1);
+        assert_eq!(u.body()[0].statements.len(), 1);
+        let kind = u.body()[0].statements[0].kind_value();
         assert!(
             kind.get("Assign").is_some(),
             "identity assigns the argument to the return local; kind={kind}"
         );
         assert_eq!(
-            u.body[0].terminator.kind.get(),
+            u.body()[0].terminator.kind.get(),
             "\"Return\"",
             "identity terminator is Return"
         );
@@ -2883,11 +2953,79 @@ mod tests {
         let template = fd.unstructured().expect("template");
         let copied =
             substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
-        assert_eq!(copied.body.len(), template.body.len());
-        assert_eq!(copied.body.len(), 2);
-        assert!(!copied.body[0].is_cleanup);
-        assert!(copied.body[1].is_cleanup);
-        assert!(template.body[1].is_cleanup);
+        assert_eq!(copied.body().len(), template.body().len());
+        assert_eq!(copied.body().len(), 2);
+        assert!(!copied.body()[0].is_cleanup);
+        assert!(copied.body()[1].is_cleanup);
+        assert!(template.body()[1].is_cleanup);
+    }
+
+    /// Type variables live on statement kinds as well as locals. A spec
+    /// copy that only rewrote `Local.ty` would leave the Assign place typed
+    /// as Bound[0].
+    #[test]
+    fn substituted_unstructured_rewrites_types_inside_statement_kinds() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let typevar = json!({"TypeVar": {"Bound": [0, 0]}});
+        let local =
+            |index, ty: &Value| json!({"index": index, "name": null, "span": span, "ty": ty});
+        let place = |index, ty: &Value| json!({"kind": {"Local": index}, "ty": ty});
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [local(0, &typevar), local(1, &typevar)]
+                },
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &typevar),
+                            {"Use": [{"Read": place(1, &typevar)}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [typevar], "output": typevar},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied = substituted_unstructured(fd, &llbc, &[], &[i64_ty.clone()], &[])
+            .expect("substituted body");
+        let kind = copied.body()[0].statements[0].kind_value();
+        assert_eq!(
+            kind.pointer("/Assign/0/ty"),
+            Some(&i64_ty),
+            "Assign dest place ty: {kind}"
+        );
+        assert_eq!(
+            kind.pointer("/Assign/1/Use/0/Read/ty"),
+            Some(&i64_ty),
+            "Assign src place ty: {kind}"
+        );
     }
 
     /// Nested `type T = U` aliases expand on the residual path only.

@@ -3316,7 +3316,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let mut found = None;
-        for bb in &self.body.body {
+        for bb in self.body.body() {
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;

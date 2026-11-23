@@ -106,7 +106,7 @@ pub(super) fn locals_only_dropped(body: &Unstructured, llbc: &Llbc) -> Vec<bool>
             }
         }
     };
-    for bb in &body.body {
+    for bb in body.body() {
         for st in &bb.statements {
             match st.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
@@ -189,7 +189,7 @@ fn mem_drop_move_chain_locals(body: &Unstructured, llbc: &Llbc) -> HashSet<usize
 
 fn mem_drop_chains(body: &Unstructured, llbc: &Llbc) -> Vec<HashSet<usize>> {
     let mut chains = Vec::new();
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -231,7 +231,7 @@ pub(super) fn erased_registration_locals(
     let only = locals_only_dropped(body, llbc);
     let chains = mem_drop_chains(body, llbc);
     let mut out = HashSet::new();
-    for (mir_bb, bb) in body.body.iter().enumerate() {
+    for (mir_bb, bb) in body.body().iter().enumerate() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -377,7 +377,7 @@ fn body_effect(
     // same non-wrapper bodies from every caller.
     let forward = super::forward_reachable_mask(llbc, body);
     let mut callees: Vec<u64> = Vec::new();
-    for (i, bb) in body.body.iter().enumerate() {
+    for (i, bb) in body.body().iter().enumerate() {
         if !forward.get(i).copied().unwrap_or(false) {
             continue;
         }
@@ -633,7 +633,7 @@ fn unique_assign_rvalue<'a>(
 ) -> Option<&'a Rvalue> {
     let forward = super::forward_reachable_mask(llbc, body);
     let mut found = None;
-    for (i, bb) in body.body.iter().enumerate() {
+    for (i, bb) in body.body().iter().enumerate() {
         if !forward.get(i).copied().unwrap_or(false) {
             continue;
         }

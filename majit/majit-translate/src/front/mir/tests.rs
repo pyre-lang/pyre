@@ -144,6 +144,29 @@ mod reachable_mask_tests {
         let succs = successor_blocks(&llbc, &body, 0, false);
         assert_eq!(succs, vec![1]);
     }
+
+    /// A second scan of the same Unstructured reuses the CFG cache. A
+    /// clone starts empty and still walks the copied terminators.
+    #[test]
+    fn forward_reachable_mask_is_cached_on_the_body() {
+        let (llbc, body) = body_of(vec![
+            bb(json!({"Goto": {"target": 1}}), false),
+            bb(json!("Return"), false),
+        ]);
+        let first = forward_reachable_mask(&llbc, &body);
+        let second = forward_reachable_mask(&llbc, &body);
+        assert_eq!(first, vec![true, true]);
+        assert_eq!(second, first);
+        let cloned = body.clone();
+        assert_eq!(forward_reachable_mask(&llbc, &cloned), first);
+        let mut rewritten = body;
+        rewritten.body_mut()[0].set_terminator_kind(json!("Return"));
+        assert_eq!(
+            forward_reachable_mask(&llbc, &rewritten),
+            vec![true, false],
+            "after Goto becomes Return, bb1 is no longer reached"
+        );
+    }
 }
 
 /// The unsubstituted generic `entries_item_ptr` has TypeVars and no
@@ -11012,7 +11035,7 @@ fn array_from_fn_first_call(llbc: &Llbc) -> majit_charon_reader::ullbc::CallPayl
         })
         .expect("from_fn caller");
     let body = fd.unstructured().expect("from_fn caller body");
-    match body.body[0].term(llbc).expect("from_fn terminator") {
+    match body.body()[0].term(llbc).expect("from_fn terminator") {
         TermKind::Call { call, .. } => call,
         other => panic!("expected Call, got {other:?}"),
     }
@@ -48534,7 +48557,7 @@ fn live_arcinner_misd_offsetof_and_subst() {
     let body = crate::front::clause_spec::substituted_unstructured(fd, llbc, &[], &types, &[])
         .expect("substituted deref body");
     let mut field_offs = Vec::new();
-    for bb in &body.body {
+    for bb in body.body() {
         for st in &bb.statements {
             let Ok(majit_charon_reader::ullbc::StmtKind::Assign(_, rv)) = st.stmt_kind() else {
                 continue;

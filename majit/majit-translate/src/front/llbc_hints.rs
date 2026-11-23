@@ -82,7 +82,7 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
         let llbc = llbc.borrow();
         let function_paths: HashSet<String> = llbc
             .iter_local_fns()
-            .map(|fd| strip_crate_prefix(fd.item_meta.name_path_str()))
+            .map(|fd| fd.item_meta.name_path_stripped().to_string())
             .collect();
         let marker_keys = |gd: &GlobalDecl, prefix: &str| {
             harvest_marker_fn_keys(llbc, gd, prefix, &function_paths)
@@ -311,7 +311,7 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
         // set equals the published set and a stamped accessor always resolves
         // to a real address.
         for fd in llbc.iter_local_fns() {
-            let path = strip_crate_prefix(fd.item_meta.name_path_str());
+            let path = fd.item_meta.name_path_stripped().to_string();
             let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
             if leaf == "type_object"
                 && fd.signature.inputs.is_empty()
@@ -1507,7 +1507,7 @@ pub(crate) fn fun_decl_hint_keys(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
     if let Some((owner, leaf)) = crate::front::mir::impl_method_owner_for_fundecl(llbc, fd) {
         vec![format!("{owner}::{leaf}")]
     } else {
-        vec![strip_crate_prefix(&fd.item_meta.name_path())]
+        vec![fd.item_meta.name_path_stripped().to_string()]
     }
 }
 
@@ -1528,7 +1528,7 @@ pub(crate) fn fun_decl_has_harvested_hint(
             return true;
         }
     }
-    set.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+    set.contains(fd.item_meta.name_path_stripped())
 }
 
 fn harvest_marker_fn_keys(
@@ -1621,7 +1621,7 @@ pub(crate) fn marker_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
 fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1662,7 +1662,7 @@ fn global_marker_str_uncached(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     let init_id = marker_init_fun_id(gd)?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1703,7 +1703,7 @@ fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut
         return false;
     };
     let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1771,7 +1771,7 @@ fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i6
     }
     let save_err = save_err?;
     let fd = llbc.fn_by_id(fn_id?)?;
-    let path = strip_crate_prefix(fd.item_meta.name_path_str());
+    let path = fd.item_meta.name_path_stripped().to_string();
     let link = fd
         .item_meta
         .attr_info

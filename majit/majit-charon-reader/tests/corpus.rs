@@ -133,7 +133,7 @@ fn every_corpus_function_decodes() {
         let name = fd.item_meta.name_path_str();
         let Some(u) = fd.unstructured() else { continue };
 
-        for (bb_idx, bb) in u.body.iter().enumerate() {
+        for (bb_idx, bb) in u.body().iter().enumerate() {
             for (s_idx, st) in bb.statements.iter().enumerate() {
                 let stmt = st.stmt_kind().unwrap_or_else(|e| {
                     panic!("stmt decode failed in {name} bb{bb_idx} stmt{s_idx}: {e}")
@@ -162,21 +162,21 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
-    assert_eq!(u.body.len(), 8);
+    assert_eq!(u.body().len(), 8);
     assert!(
-        u.body.iter().any(|bb| bb.is_cleanup),
+        u.body().iter().any(|bb| bb.is_cleanup),
         "cleanup blocks stay in the body the reader returns"
     );
 
     // bb0 should end in an overflow Assert (AddChecked + Assert).
-    let bb0 = &u.body[0];
+    let bb0 = &u.body()[0];
     assert!(
         matches!(bb0.term(&llbc).unwrap(), TermKind::Assert { .. }),
         "bb0 terminator was not Assert",
     );
 
     // bb3 should be the return block.
-    let bb3 = &u.body[3];
+    let bb3 = &u.body()[3];
     assert!(matches!(bb3.term(&llbc).unwrap(), TermKind::Return));
 }
 
@@ -188,7 +188,7 @@ fn branch_loop_sum_has_switch_int_and_switch_if() {
 
     let mut saw_switch_int = false;
     let mut saw_switch_if = false;
-    for bb in &u.body {
+    for bb in u.body() {
         if let Ok(TermKind::Switch { targets, .. }) = bb.term(&llbc) {
             match targets {
                 majit_charon_reader::ullbc::SwitchTargets::If(..) => saw_switch_if = true,
@@ -208,7 +208,7 @@ fn call_classify_covers_corpus() {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for fd in llbc.iter_local_fns() {
         let Some(u) = fd.unstructured() else { continue };
-        for bb in &u.body {
+        for bb in u.body() {
             if let Ok(TermKind::Call { call, .. }) = bb.term(&llbc) {
                 let label = match call.func.classify() {
                     CallClass::Direct => "direct",
@@ -305,7 +305,7 @@ fn json_global_ids(v: &Value, out: &mut Vec<u64>) {
 
 fn unstructured_global_ids(u: &majit_charon_reader::ullbc::Unstructured) -> Vec<u64> {
     let mut ids = Vec::new();
-    for bb in &u.body {
+    for bb in u.body() {
         for st in &bb.statements {
             json_global_ids(st.kind_value(), &mut ids);
         }
@@ -355,7 +355,7 @@ fn consecutive_assigns(
     u: &majit_charon_reader::ullbc::Unstructured,
 ) -> Vec<(Place, Rvalue, Place, Rvalue)> {
     let mut out = Vec::new();
-    for bb in &u.body {
+    for bb in u.body() {
         for pair in bb.statements.windows(2) {
             let Ok(StmtKind::Assign(p0, rv0)) = pair[0].stmt_kind() else {
                 continue;
@@ -426,14 +426,14 @@ fn straight_line_add_unchanged_without_promoted_read() {
         .local_fn("straight_line_add")
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
-    assert_eq!(u.body.len(), 8);
-    let stmt_counts: Vec<usize> = u.body.iter().map(|bb| bb.statements.len()).collect();
+    assert_eq!(u.body().len(), 8);
+    let stmt_counts: Vec<usize> = u.body().iter().map(|bb| bb.statements.len()).collect();
     assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0, 0, 0, 0]);
     assert!(
-        u.body[4].is_cleanup
-            && u.body[5].is_cleanup
-            && u.body[6].is_cleanup
-            && u.body[7].is_cleanup,
+        u.body()[4].is_cleanup
+            && u.body()[5].is_cleanup
+            && u.body()[6].is_cleanup
+            && u.body()[7].is_cleanup,
         "cleanup blocks stay in the body the reader returns"
     );
 }

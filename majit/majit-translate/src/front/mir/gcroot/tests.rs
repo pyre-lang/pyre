@@ -280,7 +280,7 @@ fn drop_term_is_goto(
     bb: usize,
 ) -> bool {
     matches!(
-        body.body[bb].term(llbc),
+        body.body()[bb].term(llbc),
         Ok(majit_charon_reader::ullbc::TermKind::Goto { .. })
     )
 }
@@ -291,7 +291,7 @@ fn drop_term_is_drop(
     bb: usize,
 ) -> bool {
     matches!(
-        body.body[bb].term(llbc),
+        body.body()[bb].term(llbc),
         Ok(majit_charon_reader::ullbc::TermKind::Drop { .. })
     )
 }
@@ -991,7 +991,7 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     // guard inside the bracket.  It reads nothing at run time, so the
     // bracket is still erased.
     let mut fake_read = body_of(4, 4);
-    fake_read.body[2].statements.insert(
+    fake_read.body_mut()[2].statements.insert(
         0,
         serde_json::from_value(stmt(
             serde_json::json!({"Borrowck": {"FakeRead": place(2)}}),
@@ -1113,9 +1113,9 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     // callee may append or overwrite a slot without borrowing this guard.
     for callee in [5, 6] {
         let mut foreign = body_of(4, 4);
-        foreign.body[2].terminator.kind =
+        foreign.body_mut()[2].terminator.kind =
             serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
-        foreign.body.push(
+        foreign.body_mut().push(
             serde_json::from_value(block(vec![], call(callee, vec![copy(1)], 9, 3))).unwrap(),
         );
         let plan = super::analyze_root_brackets_with(
@@ -1134,10 +1134,10 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     // A callee proved to leave the root stack as it found it does not
     // keep the bracket: `ll_append` spans `_ll_resize_ge` this way.
     let mut balanced = body_of(4, 4);
-    balanced.body[2].terminator.kind =
+    balanced.body_mut()[2].terminator.kind =
         serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
     balanced
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], call(7, vec![copy(1)], 9, 3))).unwrap());
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
@@ -1190,10 +1190,10 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     // A pin saves the value, not the mutable MIR carrier that supplied
     // it. An assignment after the pin must not change get(base).
     let mut reassigned = body_of(4, 4);
-    reassigned.body[2].terminator.kind =
+    reassigned.body_mut()[2].terminator.kind =
         serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
     reassigned
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 3))).unwrap());
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
@@ -1214,12 +1214,12 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     // The loop's producer returns a new value into _1 each iteration.
     // It is one static definition, so definition counting alone cannot
     // distinguish the first saved value from later ones.
-    repeated.body[1].terminator.kind =
+    repeated.body_mut()[1].terminator.kind =
         serde_json::value::to_raw_value(&call(2, vec![copy(3)], 4, 6)).unwrap();
-    repeated.body[3].terminator.kind =
+    repeated.body_mut()[3].terminator.kind =
         serde_json::value::to_raw_value(&call(4, vec![copy(7), copy(4)], 8, 6)).unwrap();
     repeated
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 2))).unwrap());
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
@@ -1246,28 +1246,29 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
         .locals
         .push(serde_json::from_value(local(11)).unwrap());
     let pin_outer = std::mem::replace(
-        &mut nested.body[2],
+        &mut nested.body_mut()[2],
         serde_json::from_value(block(vec![], call(1, vec![], 9, 6))).unwrap(),
     );
-    nested.body.push(
+    nested.body_mut().push(
         serde_json::from_value(block(
             vec![borrow(10, 9)],
             call(3, vec![copy(10), copy(0)], 11, 7),
         ))
         .unwrap(),
     );
-    nested.body.push(pin_outer);
-    nested.body[4].terminator.kind = serde_json::value::to_raw_value(&drop_guard(9, 8)).unwrap();
+    nested.body_mut().push(pin_outer);
+    nested.body_mut()[4].terminator.kind =
+        serde_json::value::to_raw_value(&drop_guard(9, 8)).unwrap();
     nested
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], drop_guard(2, 5))).unwrap());
     // Produce the inner value before either scope opens, so _0 is a
     // defined pointer distinct from the outer pin's input _1.
     let open_outer = std::mem::replace(
-        &mut nested.body[0],
+        &mut nested.body_mut()[0],
         serde_json::from_value(block(vec![], call(5, vec![], 0, 9))).unwrap(),
     );
-    nested.body.push(open_outer);
+    nested.body_mut().push(open_outer);
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &nested,
@@ -1471,8 +1472,8 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     // The restores are the only definitions inside the bracket, so every
     // read there still sees the pinned value.
     let mut restored = body_of(vec![copy(1), copy(2)]);
-    restored.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
-    restored.body[5].set_terminator_kind(call(4, vec![copy(14), mv(16)], 2, 6));
+    restored.body_mut()[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
+    restored.body_mut()[5].set_terminator_kind(call(4, vec![copy(14), mv(16)], 2, 6));
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &restored,
@@ -1490,8 +1491,8 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     // Any other write to a pinned local inside the bracket changes what a
     // later `get` would be answered with.
     let mut clobbered = body_of(vec![copy(1), copy(2)]);
-    clobbered.body[2].set_terminator_kind(call(5, vec![copy(1)], 1, 3));
-    clobbered.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
+    clobbered.body_mut()[2].set_terminator_kind(call(5, vec![copy(1)], 1, 3));
+    clobbered.body_mut()[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &clobbered,
@@ -1508,12 +1509,12 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     // shadow_stack_get(b + k)` pins onto and reads from the one bracket
     // open around it.
     let mut free = body_of(vec![mv(19), mv(20)]);
-    free.body[1].statements.pop();
-    free.body[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
-    free.body[3].statements.remove(0);
-    free.body[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
-    free.body[4].statements.remove(0);
-    free.body[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
+    free.body_mut()[1].statements.pop();
+    free.body_mut()[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
+    free.body_mut()[3].statements.remove(0);
+    free.body_mut()[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
+    free.body_mut()[4].statements.remove(0);
+    free.body_mut()[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &free,
@@ -1533,7 +1534,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
 
     // A read of a slot some other guard's pin filled is not this one's.
     let mut stray = body_of(vec![mv(19), mv(20)]);
-    stray.body[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
+    stray.body_mut()[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &stray,
@@ -2161,13 +2162,13 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     // The artefact's opener unwinds to the body's `UnwindResume`.  That
     // edge runs only when opening fails, so it is not inside the bracket.
     let mut unwinding = body_of(blocks(second_pin(), vec![]));
-    let resume = unwinding.body.len();
+    let resume = unwinding.body().len();
     unwinding
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap());
-    let mut kind = unwinding.body[0].terminator.kind_value().clone();
+    let mut kind = unwinding.body()[0].terminator.kind_value().clone();
     kind["Call"]["on_unwind"] = serde_json::json!(resume);
-    unwinding.body[0].set_terminator_kind(kind);
+    unwinding.body_mut()[0].set_terminator_kind(kind);
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &unwinding,
@@ -2184,13 +2185,13 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     // once cleanup blocks are stripped. Visiting it must not refuse
     // a bracket whose normal path is still balanced.
     let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
-    let resume = inner_unwinding.body.len();
+    let resume = inner_unwinding.body().len();
     inner_unwinding
-        .body
+        .body_mut()
         .push(serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap());
-    let mut kind = inner_unwinding.body[4].terminator.kind_value().clone();
+    let mut kind = inner_unwinding.body()[4].terminator.kind_value().clone();
     kind["Call"]["on_unwind"] = serde_json::json!(resume);
-    inner_unwinding.body[4].set_terminator_kind(kind);
+    inner_unwinding.body_mut()[4].set_terminator_kind(kind);
     let plan = super::analyze_root_brackets_with(
         &fixture_llbc(),
         &inner_unwinding,
@@ -3596,7 +3597,7 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
     ];
     let llbc = llbc_with_types("pyre_object", vec![], funs);
     let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
-    let drop_place = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
+    let drop_place = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body()[bb]
         .term_ref(&llbc)
     {
         Ok(TermKind::Drop { place, target, .. }) => match place.kind {
@@ -3610,14 +3611,14 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
     // The temporary's only move is the `mem::drop` operand, and that
     // move is not a move-out, so the call is Drop of the guard.
     assert_eq!(
-        u.body[2].statements.len(),
+        u.body()[2].statements.len(),
         0,
         "the move into the call is stripped"
     );
     assert_eq!(drop_place(&u, 2), Some((2, 3)));
     assert!(
         matches!(
-            u.body[3].term_ref(&llbc),
+            u.body()[3].term_ref(&llbc),
             Ok(TermKind::Goto { target }) if *target == 7
         ),
         "scope-end Drop of the closed guard becomes Goto"
@@ -3629,12 +3630,12 @@ fn an_explicit_drop_of_a_root_guard_is_its_bracket_close() {
     let mut u = llbc.fn_by_id(5).unwrap().unstructured().unwrap();
     super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
     assert_eq!(
-        u.body[2].statements.len(),
+        u.body()[2].statements.len(),
         1,
         "a guard closed on one arm is left"
     );
     assert!(matches!(
-        u.body[2].term_ref(&llbc),
+        u.body()[2].term_ref(&llbc),
         Ok(TermKind::Call { .. })
     ));
     assert_eq!(drop_place(&u, 3), Some((2, 4)));

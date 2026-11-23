@@ -42,7 +42,7 @@ fn discover_eval_hook_families_uncached(llbc: &Llbc) -> (Vec<String>, Vec<String
         let assigns = collect_local_assigns(llbc, &body);
         let bounds = collect_local_fn_bounds(llbc, &assigns);
         let forward_blocks = forward_reachable_mask(llbc, &body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -131,7 +131,7 @@ pub(crate) fn discover_profilefunc_graphs(llbc: &Llbc) -> Vec<String> {
         };
         let mut bound = vec![None; body.locals.locals.len()];
         let forward_blocks = forward_reachable_mask(llbc, &body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -564,7 +564,7 @@ pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String
 /// with the field name. Shared by harvest, `fnptr_struct_field_target`,
 /// and `register_fnptr_field_family_path`.
 pub(in crate::front::mir) fn fnptr_field_family_struct_key(td: &TypeDecl) -> String {
-    strip_crate_prefix(&td.item_meta.name_path())
+    td.item_meta.name_path_stripped().to_string()
 }
 
 fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, String)> {
@@ -623,7 +623,7 @@ fn enroll_fnptr_field_stores(
 ) {
     let assigns = collect_local_assigns(llbc, body);
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1111,7 +1111,7 @@ fn collect_local_assigns<'a>(llbc: &Llbc, body: &'a Unstructured) -> LocalAssign
     let mut rvalues = vec![Vec::new(); n];
     let mut opaque = vec![false; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1342,7 +1342,7 @@ pub(in crate::front::mir) fn operand_produced_by_get_eval_fn(
         return false;
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1487,7 +1487,7 @@ pub(in crate::front::mir) fn compute_binop_result_locals(
 ) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1516,7 +1516,7 @@ pub(in crate::front::mir) fn compute_binop_result_locals(
 
 fn for_each_assigned_place(llbc: &Llbc, body: &Unstructured, mut visit: impl FnMut(&Place)) {
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1562,7 +1562,7 @@ pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
 ) -> Vec<usize> {
     let forward_blocks = forward_reachable_mask(llbc, body);
     let mut out = Vec::new();
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2044,7 +2044,7 @@ impl AccumulatorFacts {
             if c >= n || !builder_mode[c] {
                 continue;
             }
-            for (bb_idx, block) in body.body.iter().enumerate() {
+            for (bb_idx, block) in body.body().iter().enumerate() {
                 if !forward_blocks[bb_idx] {
                     continue;
                 }
@@ -2119,7 +2119,7 @@ pub(in crate::front::mir) fn format_str_locals(body: &Unstructured, llbc: &Llbc)
         }
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2254,7 +2254,7 @@ pub(in crate::front::mir) fn ref_temp_is_sole_append_arg(
     let mut selected = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2362,7 +2362,7 @@ pub(in crate::front::mir) fn clean_accumulator_ref_temps_scan(
 ) -> Option<Vec<usize>> {
     let mut ref_temps: Vec<usize> = Vec::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2497,7 +2497,7 @@ pub(in crate::front::mir) fn ref_temp_is_sole_take_arg(
     let mut selected = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2570,7 +2570,7 @@ pub(in crate::front::mir) fn take_receiver_of_borrow(
     let mut recv: Option<usize> = None;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2687,7 +2687,7 @@ pub(in crate::front::mir) fn ref_temp_is_sole_identity_arg(
     let mut selected = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2869,7 +2869,7 @@ pub(in crate::front::mir) fn sole_string_alias_successor_scan(
     let mut successor: Option<usize> = None;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2981,7 +2981,7 @@ pub(in crate::front::mir) fn append_arg_of_borrow_scan(
     let mut recv: Option<usize> = None;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3126,7 +3126,7 @@ pub(in crate::front::mir) fn append_piece_accumulator_of_arg_temp(
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -3168,7 +3168,7 @@ pub(in crate::front::mir) fn identity_accumulator_of_arg_temp(
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -3216,7 +3216,7 @@ pub(in crate::front::mir) fn accumulator_materialization_site_count(
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3283,7 +3283,7 @@ pub(in crate::front::mir) fn single_def_is_str_builder_ctor(
     let mut defs = 0usize;
     let mut ctor = false;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3660,7 +3660,7 @@ pub(in crate::front::mir) fn str_chars_view_extra_live(
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3834,7 +3834,7 @@ pub(in crate::front::mir) fn defining_call(
     let mut found = None;
     let mut producers = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -3906,7 +3906,7 @@ pub(in crate::front::mir) fn defining_assign<'a>(
     let mut found = None;
     let mut producers = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -4155,7 +4155,7 @@ pub(in crate::front::mir) fn inner_global_id(place: &Place) -> u64 {
 pub(in crate::front::mir) fn promoted_const_linear_blocks(
     body: &Unstructured,
 ) -> Option<Vec<&BasicBlock>> {
-    let n = body.body.len();
+    let n = body.body().len();
     if n == 0 {
         return None;
     }
@@ -4167,7 +4167,7 @@ pub(in crate::front::mir) fn promoted_const_linear_blocks(
             return None;
         }
         seen[bb] = true;
-        let block = &body.body[bb];
+        let block = &body.body()[bb];
         if block.is_cleanup {
             return None;
         }
@@ -4425,7 +4425,7 @@ pub(in crate::front::mir) fn divmod_result_observed_as_result(
     let forward_blocks = forward_reachable_mask(llbc, body);
     while grew {
         grew = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -4450,7 +4450,7 @@ pub(in crate::front::mir) fn divmod_result_observed_as_result(
     if alias.contains(&0) {
         return true;
     }
-    body.body.iter().enumerate().any(|(bb_idx, bb)| {
+    body.body().iter().enumerate().any(|(bb_idx, bb)| {
         forward_blocks[bb_idx]
             && (bb
                 .statements
@@ -4647,7 +4647,7 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
             }
             return crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, leaf).segments;
         }
-        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let stripped = fd.item_meta.name_path_stripped().to_string();
         let module = stripped
             .rsplit_once("::")
             .map(|(module, _)| module)
@@ -4676,7 +4676,7 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
         }
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
     }
-    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     let module = stripped
         .rsplit_once("::")
         .map(|(module, _)| module)
@@ -4736,7 +4736,7 @@ pub(in crate::front::mir) fn inherent_impl_callee_identity(
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     let (module, path_leaf) = stripped.rsplit_once("::")?;
     if module.is_empty() || path_leaf != leaf {
         return None;
@@ -5249,7 +5249,7 @@ pub(in crate::front::mir) fn base_traces_to_items_block_accessor_matching(
         let mut producers = 0usize;
         let mut copy_src: Option<usize> = None;
         let mut is_accessor = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -5475,7 +5475,7 @@ pub(in crate::front::mir) fn dest_deref_census(
         other: 0,
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5781,7 +5781,7 @@ pub(in crate::front::mir) fn struct_field_census(
         other: 0,
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -5926,7 +5926,7 @@ fn fused_get_local_ok(
     fields: &mut usize,
 ) -> bool {
     let forward = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward[bb_idx] {
             continue;
         }
@@ -6211,7 +6211,7 @@ pub(in crate::front::mir) fn ptr_add_def_site(
 ) -> Option<(usize, usize)> {
     let mut found = None;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -6322,7 +6322,7 @@ pub(in crate::front::mir) fn captured_local_reaches_field_uses(
     let Some((add_bb, add_target)) = ptr_add_def_site(llbc, body, dest) else {
         return false;
     };
-    let n = body.body.len();
+    let n = body.body().len();
     if add_target >= n {
         return false;
     }
@@ -6331,7 +6331,7 @@ pub(in crate::front::mir) fn captured_local_reaches_field_uses(
     state[add_target] = Some(false);
     while let Some(bb) = queue.pop() {
         let mut stale = state[bb].unwrap_or(false);
-        let block = &body.body[bb];
+        let block = &body.body()[bb];
         for stmt in &block.statements {
             if stale && stmt_has_struct_field_value_use(llbc, stmt, dest) {
                 return false;
@@ -6431,14 +6431,14 @@ pub(in crate::front::mir) fn locals_assigned_reachable(
     start: usize,
     locals: &[usize],
 ) -> bool {
-    let mut seen = vec![false; body.body.len()];
+    let mut seen = vec![false; body.body().len()];
     let mut stack = vec![start];
     while let Some(bb_id) = stack.pop() {
-        if bb_id >= body.body.len() || seen[bb_id] {
+        if bb_id >= body.body().len() || seen[bb_id] {
             continue;
         }
         seen[bb_id] = true;
-        let bb = &body.body[bb_id];
+        let bb = &body.body()[bb_id];
         if locals
             .iter()
             .any(|local| block_assigns_local(llbc, bb, *local))
@@ -6466,7 +6466,7 @@ pub(in crate::front::mir) fn header_producer(
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

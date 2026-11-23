@@ -11266,7 +11266,7 @@ impl Lowering<'_> {
     /// runtime statements: the MIR of `let _ = vec.drain(a..b)` /
     /// `vec.drain(a..b);`.
     fn mir_successor_is_immediate_drop_of_local(&self, target: usize, dest_local: usize) -> bool {
-        let Some(bb) = self.body.body.get(target) else {
+        let Some(bb) = self.body.body().get(target) else {
             return false;
         };
         let Ok(TermKind::Drop { place, .. }) = bb.term_ref(self.llbc) else {

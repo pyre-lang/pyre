@@ -226,7 +226,7 @@ fn a_panic_terminator_raises_implicitly_like_abort() {
         .and_then(|fd| fd.unstructured())
         .expect("panic body");
     assert!(
-        matches!(panic_body.body[0].term(&llbc), Ok(TermKind::Panic { .. })),
+        matches!(panic_body.body()[0].term(&llbc), Ok(TermKind::Panic { .. })),
         "the Panic JSON shape must decode as TermKind::Panic"
     );
 
@@ -680,7 +680,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             // control flow.  A leak, by contrast, sits in a REACHABLE success
             // block and would push the live count above the raise count.
             let raises_in_mir = body
-                .body
+                .body()
                 .iter()
                 .filter(|blk| {
                     matches!(

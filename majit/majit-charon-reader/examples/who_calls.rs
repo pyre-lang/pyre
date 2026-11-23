@@ -43,7 +43,7 @@ fn main() {
         for fd in llbc.iter_local_fns() {
             let Some(u) = fd.unstructured() else { continue };
             let entry = graph.entry(fd.item_meta.name_path()).or_default();
-            for bb in &u.body {
+            for bb in u.body() {
                 if let Ok(TermKind::Call { call, .. }) = bb.term(&llbc)
                     && let Some(callee) = name_of(&call.func)
                 {

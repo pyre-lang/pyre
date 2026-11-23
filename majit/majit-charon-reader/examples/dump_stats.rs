@@ -52,7 +52,7 @@ fn main() {
             continue;
         };
         bodies += 1;
-        for bb in &u.body {
+        for bb in u.body() {
             for st in &bb.statements {
                 let label = match st.stmt_kind() {
                     Ok(StmtKind::StorageLive(_)) => "StorageLive",

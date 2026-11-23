@@ -362,7 +362,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
 /// `local -> block` for each guard a `push_roots` call binds in this body.
 fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<u64, usize> {
     let mut out = std::collections::HashMap::new();
-    for (i, bb) in body.body.iter().enumerate() {
+    for (i, bb) in body.body().iter().enumerate() {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
@@ -449,7 +449,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
 fn moved_out_locals(body: &Unstructured) -> std::collections::HashSet<u64> {
     let mut moved = std::collections::HashSet::new();
     let mut stack: Vec<&serde_json::Value> = Vec::new();
-    for bb in &body.body {
+    for bb in body.body() {
         stack.extend(bb.statements.iter().map(|st| st.kind_value()));
         stack.push(bb.terminator.kind_value());
     }
@@ -607,7 +607,7 @@ fn guard_drop_sites<'a>(
     llbc: &'a Llbc,
     body: &'a Unstructured,
 ) -> impl Iterator<Item = (usize, u64)> + 'a {
-    body.body.iter().enumerate().filter_map(move |(i, bb)| {
+    body.body().iter().enumerate().filter_map(move |(i, bb)| {
         let Ok(TermKind::Drop { place, .. }) = bb.term(llbc) else {
             return None;
         };
@@ -627,7 +627,7 @@ fn name_path_ends_with(path: &str, suffix: &str) -> bool {
 /// (`jit::we_are_jitted` → true, `majit_gc::gc_alloc_failed_pending` → false).
 fn folded_switch_bools(llbc: &Llbc, body: &Unstructured) -> Vec<Option<bool>> {
     let mut folded = Vec::new();
-    for bb in &body.body {
+    for bb in body.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
@@ -716,14 +716,14 @@ fn switch_int_zero_target(arms: &[(JsonVal, u64)], default: u64) -> Option<u64> 
 /// no close, because the lowered graph does not contain them.
 fn reachable_without_unwind(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
     let folded = folded_switch_bools(llbc, body);
-    let mut seen = vec![false; body.body.len()];
+    let mut seen = vec![false; body.body().len()];
     let mut stack = vec![0usize];
     while let Some(b) = stack.pop() {
         if b >= seen.len() || seen[b] {
             continue;
         }
         seen[b] = true;
-        let Ok(term) = body.body[b].term(llbc) else {
+        let Ok(term) = body.body()[b].term(llbc) else {
             continue;
         };
         match term {
@@ -2302,7 +2302,7 @@ fn frame_locals_root_new_ids(llbc: &Llbc) -> Vec<u64> {
         .filter(|fd| {
             fd.item_meta.name_path().ends_with("::new")
                 && fd.unstructured().is_some_and(|body| {
-                    body.body.iter().any(|bb| {
+                    body.body().iter().any(|bb| {
                         matches!(
                             bb.term_ref(llbc),
                             Ok(TermKind::Call { call, .. })

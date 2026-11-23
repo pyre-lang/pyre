@@ -1141,7 +1141,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
         let mut defs: HashMap<u64, Rvalue> = HashMap::new();
         let mut from_call: HashMap<u64, String> = HashMap::new();
         let mut projected: HashMap<u64, String> = HashMap::new();
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
@@ -1169,7 +1169,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 from_call.insert(l, name.rsplit("::").take(2).collect::<Vec<_>>().join("::"));
             }
         }
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
@@ -1741,7 +1741,7 @@ mod tests {
     ) -> HashSet<u64> {
         use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
         let mut entry = HashSet::new();
-        for bb in &body.body {
+        for bb in body.body() {
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
@@ -2103,7 +2103,7 @@ mod tests {
         let body = concrete.unstructured().expect("body");
         let (callee, generics) = {
             use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
-            let TermKind::Call { call, .. } = body.body[0].term(&llbc).expect("call") else {
+            let TermKind::Call { call, .. } = body.body()[0].term(&llbc).expect("call") else {
                 panic!("expected Call");
             };
             let CallFunc::Regular(reg) = &call.func else {
@@ -2147,7 +2147,7 @@ mod tests {
         let body = open.unstructured().expect("body");
         let (callee, generics) = {
             use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
-            let TermKind::Call { call, .. } = body.body[0].term(&llbc).expect("call") else {
+            let TermKind::Call { call, .. } = body.body()[0].term(&llbc).expect("call") else {
                 panic!("expected Call");
             };
             let CallFunc::Regular(reg) = &call.func else {
@@ -2347,7 +2347,7 @@ mod tests {
         use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
         let fd = llbc.fn_by_id(fd_id).expect("fun decl");
         let body = fd.unstructured().expect("body");
-        let TermKind::Call { call, .. } = body.body[0].term(llbc).expect("call") else {
+        let TermKind::Call { call, .. } = body.body()[0].term(llbc).expect("call") else {
             panic!("expected Call");
         };
         let CallFunc::Regular(reg) = &call.func else {

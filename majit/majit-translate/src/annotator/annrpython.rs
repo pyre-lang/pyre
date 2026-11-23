@@ -552,54 +552,63 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                 self.ann.all_blocks.try_borrow_mut(),
                 self.ann.blocked_blocks.try_borrow_mut(),
             ) {
-                let new_keys: Vec<BlockKey> = annotated
+                // Drop only keys this subject added to `annotated`.
+                // `all_blocks` / `blocked_blocks` also hold blocks other
+                // subjects already committed; a blanket retain against
+                // `annotated_at_entry` would evict those too.
+                // `IndexMap::shift_remove` is O(n) per key, so one retain
+                // pass is the same rollback as the per-key loop.
+                let had_new = annotated
                     .keys()
-                    .filter(|k| !self.annotated_at_entry.contains(*k))
-                    .cloned()
-                    .collect();
-                let fixed_graphs = self.ann.fixed_graphs.try_borrow();
-                for k in &new_keys {
-                    // A block of a fixed (already-rtyped) graph is
-                    // evicted from the maps like any other — leaving it
-                    // in `annotated` would re-feed the session-global
-                    // specialize walk with a block whose rtyping
-                    // already failed, echoing one failure into every
-                    // later subject.  Only its Variable BINDINGS are
-                    // kept: the `addpendingblock` fixed-graph arm
-                    // validates later callers against them and returns
-                    // before the `bindinputargs` re-seed, so the
-                    // bindings-without-`annotated`-entry state is
-                    // harmless for fixed graphs.
-                    let is_fixed = match fixed_graphs.as_deref() {
-                        Ok(fixed) => annotated
-                            .get(k)
-                            .cloned()
-                            .flatten()
-                            .or_else(|| {
-                                blocked_blocks.get(k).map(|(_, g, _)| std::rc::Rc::clone(g))
-                            })
-                            .is_some_and(|g| fixed.contains_key(&GraphKey::of(&g))),
-                        Err(_) => false,
-                    };
-                    annotated.shift_remove(k);
-                    blocked_blocks.shift_remove(k);
-                    // See `clear_block_bindings` — every eviction from
-                    // `annotated` must also reset the block's defined
-                    // Variables (unless the graph is fixed).  Mirrors
-                    // the dual-gate Skip arm's graph-wide
-                    // `var.annotation = None` reset
-                    // (codewriter.rs::dual_gate_type_state).
-                    if let Some(block) = all_blocks.shift_remove(k)
-                        && !is_fixed
-                    {
-                        clear_block_bindings(&block);
-                    }
-                }
-                if !new_keys.is_empty()
-                    && let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut()
-                {
-                    for g in pending.iter_mut() {
-                        g.retain(|k, _| self.annotated_at_entry.contains(k));
+                    .any(|k| !self.annotated_at_entry.contains(k));
+                if had_new {
+                    let fixed_graphs = self.ann.fixed_graphs.try_borrow();
+                    all_blocks.retain(|k, block| {
+                        if self.annotated_at_entry.contains(k) || !annotated.contains_key(k) {
+                            return true;
+                        }
+                        // A block of a fixed (already-rtyped) graph is
+                        // evicted from the maps like any other — leaving
+                        // it in `annotated` would re-feed the
+                        // session-global specialize walk with a block
+                        // whose rtyping already failed, echoing one
+                        // failure into every later subject.  Only its
+                        // Variable BINDINGS are kept: the
+                        // `addpendingblock` fixed-graph arm validates
+                        // later callers against them and returns before
+                        // the `bindinputargs` re-seed, so the
+                        // bindings-without-`annotated`-entry state is
+                        // harmless for fixed graphs.
+                        let is_fixed = match fixed_graphs.as_deref() {
+                            Ok(fixed) => annotated
+                                .get(k)
+                                .cloned()
+                                .flatten()
+                                .or_else(|| {
+                                    blocked_blocks.get(k).map(|(_, g, _)| std::rc::Rc::clone(g))
+                                })
+                                .is_some_and(|g| fixed.contains_key(&GraphKey::of(&g))),
+                            Err(_) => false,
+                        };
+                        // See `clear_block_bindings` — every eviction
+                        // from `annotated` must also reset the block's
+                        // defined Variables (unless the graph is
+                        // fixed).  Mirrors the dual-gate Skip arm's
+                        // graph-wide `var.annotation = None` reset
+                        // (`dual_gate_type_state`).
+                        if !is_fixed {
+                            clear_block_bindings(block);
+                        }
+                        false
+                    });
+                    blocked_blocks.retain(|k, _| {
+                        self.annotated_at_entry.contains(k) || !annotated.contains_key(k)
+                    });
+                    annotated.retain(|k, _| self.annotated_at_entry.contains(k));
+                    if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
+                        for g in pending.iter_mut() {
+                            g.retain(|k, _| self.annotated_at_entry.contains(k));
+                        }
                     }
                 }
             }
@@ -4532,6 +4541,76 @@ mod tests {
                 .borrow()
                 .contains_key(&LinkKey::of(&link)),
             "uncommitted reflow must not leave links_followed set"
+        );
+    }
+
+    #[test]
+    fn uncommitted_scope_evicts_only_this_subjects_new_annotated_keys() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let kept_graph = mk_graph("kept", 0);
+        let kept = kept_graph.borrow().startblock.clone();
+        let kept_key = BlockKey::of(&kept);
+        ann.annotated
+            .borrow_mut()
+            .insert(kept_key.clone(), Some(Rc::clone(&kept_graph)));
+        ann.all_blocks
+            .borrow_mut()
+            .insert(kept_key.clone(), kept.clone());
+
+        let sibling_graph = mk_graph("sibling", 0);
+        let sibling = sibling_graph.borrow().startblock.clone();
+        let sibling_key = BlockKey::of(&sibling);
+        // Another subject's block lives in `all_blocks` without an
+        // `annotated` entry this subject owns.
+        ann.all_blocks
+            .borrow_mut()
+            .insert(sibling_key.clone(), sibling.clone());
+
+        let added_graph = mk_graph("added", 0);
+        let added = added_graph.borrow().startblock.clone();
+        let added_key = BlockKey::of(&added);
+        {
+            let _scope = ann.enter_added_blocks_scope();
+            ann.annotated
+                .borrow_mut()
+                .insert(added_key.clone(), Some(Rc::clone(&added_graph)));
+            ann.all_blocks
+                .borrow_mut()
+                .insert(added_key.clone(), added.clone());
+            ann.blocked_blocks.borrow_mut().insert(
+                added_key.clone(),
+                (added.clone(), Rc::clone(&added_graph), None),
+            );
+            ann.genpendingblocks.borrow_mut()[0]
+                .insert(added_key.clone(), (added.clone(), Rc::clone(&added_graph)));
+        }
+        assert!(
+            ann.annotated.borrow().contains_key(&kept_key),
+            "committed annotated key must survive uncommit"
+        );
+        assert!(
+            ann.all_blocks.borrow().contains_key(&kept_key),
+            "committed all_blocks key must survive uncommit"
+        );
+        assert!(
+            ann.all_blocks.borrow().contains_key(&sibling_key),
+            "all_blocks key never in this subject's annotated must survive"
+        );
+        assert!(
+            !ann.annotated.borrow().contains_key(&added_key),
+            "this subject's new annotated key must be evicted"
+        );
+        assert!(
+            !ann.all_blocks.borrow().contains_key(&added_key),
+            "this subject's new all_blocks key must be evicted"
+        );
+        assert!(
+            !ann.blocked_blocks.borrow().contains_key(&added_key),
+            "this subject's new blocked_blocks key must be evicted"
+        );
+        assert!(
+            !ann.genpendingblocks.borrow()[0].contains_key(&added_key),
+            "this subject's pending key must be evicted"
         );
     }
 

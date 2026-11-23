@@ -248,7 +248,7 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -315,11 +315,11 @@ pub(in crate::front::mir) fn compute_index_write_extra_live(
             ),
         );
     }
-    let mut extra = vec![Vec::new(); body.body.len()];
+    let mut extra = vec![Vec::new(); body.body().len()];
     if index_call.is_empty() {
         return extra;
     }
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -354,7 +354,7 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     let n_locals = body.locals.locals.len();
     let forward_blocks = forward_reachable_mask(llbc, body);
     let empty_raw = std::collections::HashSet::<String>::new();
@@ -363,7 +363,7 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
     // over the body, not a (add × block) product (`graphanalyze.py` walks
     // each op once).
     let mut dest_of: Vec<Option<(usize, usize)>> = vec![None; n_locals];
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -421,7 +421,7 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
     }
     let mut extra = vec![Vec::new(); n_blocks];
     let mut seen = bit_set::BitSet::new();
-    for (use_idx, use_bb) in body.body.iter().enumerate() {
+    for (use_idx, use_bb) in body.body().iter().enumerate() {
         if !forward_blocks[use_idx] {
             continue;
         }
@@ -444,8 +444,8 @@ pub(in crate::front::mir) fn window_owner_storage_dead_extra_live(
     body: &Unstructured,
     owner_shadow: &[Option<usize>],
 ) -> Vec<Vec<usize>> {
-    let mut extra = vec![Vec::new(); body.body.len()];
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    let mut extra = vec![Vec::new(); body.body().len()];
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         for stmt in &bb.statements {
             let Ok(StmtKind::StorageDead(local)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -466,7 +466,7 @@ pub(in crate::front::mir) fn compute_mir_liveness(
     glue_call_drops: &bit_set::BitSet,
     cell_locals: &bit_set::BitSet,
 ) -> Vec<LocalSet> {
-    let n_blocks = body.body.len();
+    let n_blocks = body.body().len();
     let n_locals = body.locals.locals.len();
     // Same closure as whole-body scans: a panic-abort default still
     // contributes uses, and an `on_unwind` cleanup block does not.
@@ -476,7 +476,7 @@ pub(in crate::front::mir) fn compute_mir_liveness(
     let mut succs = vec![Vec::<usize>::new(); n_blocks];
     let mut preds = vec![Vec::<usize>::new(); n_blocks];
 
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward[bb_idx] {
             continue;
         }

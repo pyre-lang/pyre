@@ -5857,9 +5857,9 @@ mod tests {
                     majit_translate::regalloc::perform_register_allocation(&rewritten, kind),
                 );
             }
-            let mut flat = majit_translate::flatten_graph(&rewritten, &mut regallocs);
+            let flat = majit_translate::flatten_graph(&rewritten, &mut regallocs);
             let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
-            let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
             let x_color = regallocs
                 .get(&RegKind::Int)
                 .and_then(|alloc| alloc.color_for_variable(&x))

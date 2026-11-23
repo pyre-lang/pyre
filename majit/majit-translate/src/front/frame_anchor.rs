@@ -474,8 +474,7 @@ fn callee_stays_residual(
     if !fd.has_unstructured_body() {
         return true;
     }
-    let path = super::strip_crate_prefix(&fd.item_meta.name_path());
-    dont_look_inside.contains(&path)
+    dont_look_inside.contains(fd.item_meta.name_path_stripped())
 }
 
 /// `is_some` / `is_none` on `Option<FrameAnchor>` call the core
@@ -543,7 +542,7 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
         };
         let graph = fd.item_meta.name_path();
         let forward_blocks = super::forward_reachable_mask(llbc, &body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }

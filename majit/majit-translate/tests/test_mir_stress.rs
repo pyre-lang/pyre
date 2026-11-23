@@ -421,7 +421,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
         let Some(body): Option<Unstructured> = fd.unstructured() else {
             continue;
         };
-        let blocks = &body.body;
+        let blocks = &body.body();
         if blocks.len() < 2 {
             continue;
         }
@@ -593,7 +593,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
             continue;
         };
 
-        let (class, detail) = classify_uninit_read(&llbc, &body.body, read_bb, local_n);
+        let (class, detail) = classify_uninit_read(&llbc, &body.body(), read_bb, local_n);
         match class {
             UninitClass::ForwardRef => forward_ref += 1,
             UninitClass::LoopCarried => loop_carried += 1,
@@ -813,7 +813,7 @@ fn mir_on_unwind_target_taxonomy() {
         let Some(body): Option<Unstructured> = fd.unstructured() else {
             continue;
         };
-        let blocks = &body.body;
+        let blocks = &body.body();
         for (bb_idx, block) in blocks.iter().enumerate() {
             let (term_kind_label, on_unwind): (&'static str, u64) = match block.term(&llbc) {
                 Ok(TermKind::Call { on_unwind, .. }) => ("Call", on_unwind),

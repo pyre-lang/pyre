@@ -29,7 +29,7 @@ fn callee_name_paths<'a>(
     llbc: &'a Llbc,
     body: &'a majit_charon_reader::ullbc::Unstructured,
 ) -> impl Iterator<Item = String> + 'a {
-    body.body.iter().filter_map(move |bb| {
+    body.body().iter().filter_map(move |bb| {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             return None;
         };

@@ -374,7 +374,7 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
         };
         let graph = fd.item_meta.name_path();
         let forward_blocks = super::forward_reachable_mask(llbc, &body);
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }

@@ -5712,8 +5712,8 @@ fn production_rdict_alias_instances_keep_distinct_num_live_items() {
         .layout_for_target(&llbc, &target)
         .and_then(|layout| layout.struct_field_offset(live_idx))
         .expect("IntDictStorage Charon offset for num_live_items");
-    let canonical = super::strip_crate_prefix(&rdict.item_meta.name_path());
-    let template = majit_ir::descr::StructId::from_canonical(&canonical);
+    let canonical = rdict.item_meta.name_path_stripped();
+    let template = majit_ir::descr::StructId::from_canonical(canonical);
     let ident_sid = super::concrete_adt_struct_id(template, Some(ident_adt), &llbc, tombstoned);
     let int_sid = super::concrete_adt_struct_id(template, Some(int_adt), &llbc, tombstoned);
     let (_, _, fields, _, _, _, exact_layouts, struct_ids) = super::derive_program_metadata(

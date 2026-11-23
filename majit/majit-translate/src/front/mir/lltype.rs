@@ -63,7 +63,7 @@ pub(crate) fn impl_owner_from_item_meta(
     let impl_seg = meta.name.iter().rev().find(|seg| seg.is_impl())?;
     let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_seg)?;
     let td = llbc.type_by_id(adt_def_id)?;
-    let owner = strip_crate_prefix(&td.item_meta.name_path());
+    let owner = td.item_meta.name_path_stripped().to_string();
     match impl_atomic_alias_leaf(llbc, impl_seg) {
         Some(alias) => match owner.rsplit_once("::") {
             Some((module, _)) => Some(format!("{module}::{alias}")),
@@ -99,7 +99,7 @@ pub(crate) fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option
             // Without this qualification the canonical registration loop at
             // `lib.rs` cannot find the graph keyed by
             // `[qualified_owner, method]`.
-            let owner = strip_crate_prefix(td.item_meta.name_path_str());
+            let owner = td.item_meta.name_path_stripped().to_string();
             match impl_atomic_alias_leaf(llbc, impl_seg) {
                 Some(alias) => match owner.rsplit_once("::") {
                     Some((module, _)) => format!("{module}::{alias}"),
@@ -140,7 +140,7 @@ pub(in crate::front::mir) fn trait_default_call_segments(
     }
     let self_ty = generics.get("types")?.as_array()?.first()?;
     let td = llbc.type_by_id(resolve_tyexpr_to_adt_def_id_free(llbc, self_ty)?)?;
-    let owner = strip_crate_prefix(td.item_meta.name_path_str());
+    let owner = td.item_meta.name_path_stripped().to_string();
     if owner.is_empty() {
         return None;
     }
@@ -1021,11 +1021,7 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
     let Some(sid) = declared_adt_struct_id(pointee, llbc) else {
         return false;
     };
-    struct_id_is_declared_gc(
-        gc_struct_ids,
-        sid,
-        &strip_crate_prefix(td.item_meta.name_path_str()),
-    )
+    struct_id_is_declared_gc(gc_struct_ids, sid, td.item_meta.name_path_stripped())
 }
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
@@ -2416,10 +2412,8 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
         return None;
     }
     let td = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id));
-    let name = td
-        .map(|td| strip_crate_prefix(td.item_meta.name_path_str()))
-        .unwrap_or_default();
-    if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+    let name = td.map(|td| td.item_meta.name_path_stripped()).unwrap_or("");
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
         return None;
     }
     // A closure environment is the callable's instance, not a C struct
@@ -2505,8 +2499,12 @@ fn adt_def_is_raw_storage_at(
     // bag. `&E` must stay `Ref` so the parameter carries the class root.
     if matches!(&td.kind, TypeDeclKind::Enum(_)) {
         let path = td.item_meta.name_path_str();
-        let canon = strip_crate_prefix(&path);
-        if exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon).is_some()
+        if exception_class_hint_for_paths(
+            llbc_exception_class_hints(llbc),
+            path,
+            td.item_meta.name_path_stripped(),
+        )
+        .is_some()
         {
             return false;
         }
@@ -2514,7 +2512,7 @@ fn adt_def_is_raw_storage_at(
     if struct_id_is_declared_gc(
         gc_struct_ids,
         struct_id_for_type_decl(td),
-        &strip_crate_prefix(td.item_meta.name_path_str()),
+        td.item_meta.name_path_stripped(),
     ) {
         return false;
     }
@@ -2526,7 +2524,7 @@ fn adt_def_is_raw_storage_at(
     // (`rclass.py` `getinstancerepr` / `getgcflavor`).
     if crate::front::llbc_hints::alloc_flavor_raw_contains(
         raw_alloc_flavor_structs,
-        &td.item_meta.name_path(),
+        td.item_meta.name_path_str(),
     ) {
         return false;
     }
@@ -2888,7 +2886,7 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
         if struct_id_is_declared_gc(
             gc_struct_ids,
             struct_id_for_type_decl(td),
-            &strip_crate_prefix(td.item_meta.name_path_str()),
+            td.item_meta.name_path_stripped(),
         ) {
             return false;
         }
@@ -3967,7 +3965,7 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
 /// env type's name path without its crate, the same key
 /// `impl_method_owner_for_fundecl` stamps on the impl's `self_ty_root`.
 pub(in crate::front::mir) fn closure_env_call_once_owner(td: &TypeDecl) -> String {
-    strip_crate_prefix(td.item_meta.name_path_str())
+    td.item_meta.name_path_stripped().to_string()
 }
 
 /// Byte compared in a predicate body of the form `item == c`.
@@ -3976,7 +3974,7 @@ pub(in crate::front::mir) fn const_eq_u8_in_unstructured(
     body: &Unstructured,
 ) -> Option<u8> {
     let mut found = None;
-    for bb in &body.body {
+    for bb in body.body() {
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(_, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind_ref()
             else {
@@ -5093,14 +5091,14 @@ pub(in crate::front::mir) fn discr_int_ty_raw_store(
 /// The crate-stripped `module::Enum` spelling of a fieldless enum `ty`,
 /// or `None` when `ty` is not a fieldless enum.  Matches the spelling
 /// [`debug_enum_variants_by_discr`] compares against
-/// (`strip_crate_prefix(name_path())`) so the `Debug`-fmt collapse can
+/// (`ItemMeta::name_path_stripped`) so the `Debug`-fmt collapse can
 /// recover the enum's variant table from the value's origin `Input` op.
 pub(in crate::front::mir) fn tyref_fieldless_enum_class_root(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<String> {
     let td = tyref_fieldless_enum_def(ty, llbc)?;
-    Some(strip_crate_prefix(td.item_meta.name_path_str()))
+    Some(td.item_meta.name_path_stripped().to_string())
 }
 
 /// Interned class-root spelling of a payload-carrying enum `ty`.
@@ -5583,8 +5581,7 @@ fn gcarray_item_ptr_return_class_root(
 }
 
 fn type_decl_unsuffixed_identity(td: &TypeDecl) -> String {
-    let path = strip_crate_prefix(&td.item_meta.name_path());
-    majit_ir::descr::strip_generic_args(&path).into_owned()
+    majit_ir::descr::strip_generic_args(td.item_meta.name_path_stripped()).into_owned()
 }
 
 /// True when `td` is the inlined ITEM of a declared-GC `{integer, [T; 0]}`
@@ -5603,11 +5600,10 @@ fn type_decl_is_gcarray_item(
         if fields.len() != 2 {
             continue;
         }
-        let wrapper_name = strip_crate_prefix(&wrapper.item_meta.name_path());
         if !struct_id_is_declared_gc(
             gc_struct_ids,
             struct_id_for_type_decl(wrapper),
-            &wrapper_name,
+            wrapper.item_meta.name_path_stripped(),
         ) {
             continue;
         }
@@ -9580,7 +9576,13 @@ pub(crate) fn is_oparg_newtype_spelling(ty: &str) -> bool {
 /// The ADT def_id of an (already wrapper-stripped) type node, or
 /// `None` for non-ADT nodes.
 pub(in crate::front::mir) fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
-    type_decl_ref_adt_id(node.as_object()?.get("Adt")?.as_object()?)
+    let obj = node.as_object()?;
+    let payload = match type_node_entry(obj) {
+        Some(("Adt", payload)) => payload,
+        None => obj.get("Adt")?,
+        _ => return None,
+    };
+    type_decl_ref_adt_id(payload.as_object()?)
 }
 
 /// The def id of a nominal ADT `TypeDeclRef` (`{"id": N, "generics": ..,
@@ -9592,8 +9594,17 @@ pub(in crate::front::mir) fn adt_node_def_id(node: &serde_json::Value) -> Option
 pub(crate) fn type_decl_ref_adt_id(
     tref: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<u64> {
-    match tref.get("builtin").and_then(serde_json::Value::as_str) {
-        None | Some("Box") => tref.get("id")?.as_u64(),
+    let mut id = None;
+    let mut builtin = None;
+    for (key, value) in tref {
+        match key.as_str() {
+            "id" => id = value.as_u64(),
+            "builtin" => builtin = value.as_str(),
+            _ => {}
+        }
+    }
+    match builtin {
+        None | Some("Box") => id,
         Some(_) => None,
     }
 }
@@ -10274,9 +10285,9 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     let sid = declared_adt_struct_id(pointee, llbc)?;
     let name = adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
-        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
-        .unwrap_or_default();
-    if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+        .map(|td| td.item_meta.name_path_stripped())
+        .unwrap_or("");
+    if !struct_id_is_declared_gc(gc_struct_ids, sid, name) {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -12361,15 +12372,29 @@ pub(in crate::front::mir) fn json_ty_adt_def_id(
     ty: &serde_json::Value,
 ) -> Option<u64> {
     let obj = ty.as_object()?;
-    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return llbc.dedup_to_adt_def_id(id);
+    match type_node_entry(obj) {
+        Some(("Deduplicated", id)) => llbc.dedup_to_adt_def_id(id.as_u64()?),
+        Some(("Value", arr)) => {
+            if let Some(arr) = arr.as_array().filter(|a| a.len() == 2) {
+                json_ty_adt_def_id(llbc, &arr[1]).or_else(|| adt_node_def_id(&arr[1]))
+            } else {
+                adt_node_def_id(ty)
+            }
+        }
+        _ => adt_node_def_id(ty),
     }
-    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
-        && arr.len() == 2
-    {
-        return json_ty_adt_def_id(llbc, &arr[1]).or_else(|| adt_node_def_id(&arr[1]));
+}
+
+/// The single Charon type-node constructor and its payload. Wrapper and
+/// leaf nodes are one-key objects (`Adt`, `Ref`, `Deduplicated`, …).
+fn type_node_entry(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(&str, &serde_json::Value)> {
+    if obj.len() != 1 {
+        return None;
     }
-    adt_node_def_id(ty)
+    let (key, value) = obj.iter().next()?;
+    Some((key.as_str(), value))
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -12382,24 +12407,27 @@ pub(in crate::front::mir) fn strip_ty_wrappers<'l>(
 ) -> Option<&'l serde_json::Value> {
     for _ in 0..24 {
         let obj = node.as_object()?;
-        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            node = llbc.dedup_body(id)?;
-            continue;
+        match type_node_entry(obj) {
+            Some(("Deduplicated", id)) => {
+                let Some(id) = id.as_u64() else {
+                    return Some(node);
+                };
+                node = llbc.dedup_body(id)?;
+            }
+            Some(("Value" | "HashConsedValue", arr)) => {
+                let Some(inner) = arr.as_array().filter(|a| a.len() == 2).map(|a| &a[1]) else {
+                    return Some(node);
+                };
+                node = inner;
+            }
+            Some(("Ref", arr)) => {
+                let Some(arr) = arr.as_array() else {
+                    return Some(node);
+                };
+                node = arr.get(1)?;
+            }
+            _ => return Some(node),
         }
-        if let Some(arr) = obj
-            .get("Value")
-            .or_else(|| obj.get("HashConsedValue"))
-            .and_then(serde_json::Value::as_array)
-            && arr.len() == 2
-        {
-            node = &arr[1];
-            continue;
-        }
-        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
-            node = arr.get(1)?;
-            continue;
-        }
-        return Some(node);
     }
     None
 }
@@ -12417,20 +12445,21 @@ pub(in crate::front::mir) fn strip_ty_indirections<'l>(
 ) -> Option<&'l serde_json::Value> {
     for _ in 0..24 {
         let obj = node.as_object()?;
-        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            node = llbc.dedup_body(id)?;
-            continue;
+        match type_node_entry(obj) {
+            Some(("Deduplicated", id)) => {
+                let Some(id) = id.as_u64() else {
+                    return Some(node);
+                };
+                node = llbc.dedup_body(id)?;
+            }
+            Some(("Value" | "HashConsedValue", arr)) => {
+                let Some(inner) = arr.as_array().filter(|a| a.len() == 2).map(|a| &a[1]) else {
+                    return Some(node);
+                };
+                node = inner;
+            }
+            _ => return Some(node),
         }
-        if let Some(arr) = obj
-            .get("Value")
-            .or_else(|| obj.get("HashConsedValue"))
-            .and_then(serde_json::Value::as_array)
-            && arr.len() == 2
-        {
-            node = &arr[1];
-            continue;
-        }
-        return Some(node);
     }
     None
 }
@@ -14712,124 +14741,144 @@ fn charon_type_value_to_ast_string_with(
         // payload; `??scalar` is that atom (`is_uninhabited_ok`).
         return charon_unit_tykind_to_ast_string(v);
     };
-    // Indirections — follow the dedup table / inline hash-cons one hop.
-    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return match llbc.dedup_body(id) {
-            Some(body) => charon_type_value_to_ast_string_with(body, llbc, depth + 1, tombstoned),
-            None => format!("??unresolved_dedup#{id}"),
+    if let Some((tag, payload)) = type_node_entry(obj) {
+        return match tag {
+            "Deduplicated" => match payload.as_u64().and_then(|id| llbc.dedup_body(id)) {
+                Some(body) => {
+                    charon_type_value_to_ast_string_with(body, llbc, depth + 1, tombstoned)
+                }
+                None => match payload.as_u64() {
+                    Some(id) => format!("??unresolved_dedup#{id}"),
+                    None => "??Deduplicated".to_string(),
+                },
+            },
+            "Value" | "HashConsedValue" => {
+                if let Some(arr) = payload.as_array()
+                    && arr.len() == 2
+                {
+                    charon_type_value_to_ast_string_with(&arr[1], llbc, depth + 1, tombstoned)
+                } else {
+                    format!("??{tag}")
+                }
+            }
+            "Scalar" => charon_literal_to_ast_string(payload),
+            // Class-root lookup strips `&T` / `&mut T` to the referent. CAST
+            // intern suffixes keep the constructor in [`charon_type_value_to_enum_arg`]
+            // so `Option<&T>` is not the tagged `Option<T>` class
+            // (`intern_niche_option_payload_spelling`; `model.py`
+            // `SomeObject.noneify`).
+            "Ref" => {
+                if let Some(inner) = payload.as_array().and_then(|arr| arr.get(1)) {
+                    charon_type_value_to_ast_string_with(inner, llbc, depth + 1, tombstoned)
+                } else {
+                    "??ref_shape".to_string()
+                }
+            }
+            "RawPtr" => {
+                if let Some(arr) = payload.as_array()
+                    && arr.len() == 2
+                {
+                    let inner =
+                        charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
+                    let mutbl = arr[1].as_str().unwrap_or("");
+                    let prefix = if mutbl.eq_ignore_ascii_case("Mut") {
+                        "*mut "
+                    } else {
+                        "*const "
+                    };
+                    format!("{prefix}{inner}")
+                } else {
+                    "??rawptr_shape".to_string()
+                }
+            }
+            "FnPtr" => charon_fn_ptr_to_ast_string(v, llbc, depth),
+            // ADTs: tuples, builtins (Box/Slice/Str/Array), and named types.
+            // `type T = fn(...)` aliases are Adt nodes that peel to FnPtr
+            // (`lltype.FuncType` / `getfunctionptr`).
+            "Adt" => {
+                if type_node_is_fn_ptr(v, llbc) {
+                    let peeled = type_node_peel_aliases(v, llbc).unwrap_or(v);
+                    charon_fn_ptr_to_ast_string(peeled, llbc, depth)
+                } else if let Some(adt) = payload.as_object() {
+                    charon_adt_to_ast_string(adt, llbc, depth, tombstoned)
+                } else {
+                    "??Adt".to_string()
+                }
+            }
+            "Array" => {
+                if let Some(arr) = payload.as_array()
+                    && arr.len() == 3
+                {
+                    let elem =
+                        charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
+                    let len = charon_array_len_to_string(&arr[1], llbc);
+                    format!("[{elem};{len}]")
+                } else {
+                    "??Array".to_string()
+                }
+            }
+            "Slice" => {
+                if let Some(elem) = payload.as_array().and_then(|arr| arr.first()) {
+                    format!(
+                        "[{}]",
+                        charon_type_value_to_ast_string_with(elem, llbc, depth + 1, tombstoned)
+                    )
+                } else {
+                    "??Slice".to_string()
+                }
+            }
+            // FnPtr `output` / a field of type `()` serializes as `{"Tuple": []}`,
+            // not the Adt-shaped `builtin: "Tuple"` unit. The fallback `??{key}`
+            // would spell `??Tuple` and `type_arg_is_concrete` would drop a tagged
+            // Option that leaked a hasher `fn() -> ()` Instantiated arg.
+            "Tuple" => {
+                if let Some(items) = payload.as_array() {
+                    if items.is_empty() {
+                        "()".to_string()
+                    } else {
+                        let inner = items
+                            .iter()
+                            .map(|ty| {
+                                charon_type_value_to_ast_string_with(
+                                    ty,
+                                    llbc,
+                                    depth + 1,
+                                    tombstoned,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("({inner})")
+                    }
+                } else {
+                    "??Tuple".to_string()
+                }
+            }
+            // Trait associated-type projections (`C::Name`). Ambiguous
+            // (multi-impl) or unresolvable projections keep `??TraitType`.
+            "TraitType" => {
+                if let Some(arr) = payload.as_array()
+                    && arr.len() == 3
+                    && let Some(rendered) = resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
+                {
+                    rendered
+                } else {
+                    "??TraitType".to_string()
+                }
+            }
+            "DynTrait" => charon_dyn_trait_to_ast_string(payload, llbc),
+            "TypeVar" => match typevar_bound_index(v) {
+                Some(index) => format!("??TypeVar#{index}"),
+                None => "??TypeVar".to_string(),
+            },
+            other => format!("??{other}"),
         };
     }
-    if let Some(arr) = obj
-        .get("Value")
-        .or_else(|| obj.get("HashConsedValue"))
-        .and_then(serde_json::Value::as_array)
-        && arr.len() == 2
-    {
-        return charon_type_value_to_ast_string_with(&arr[1], llbc, depth + 1, tombstoned);
-    }
-    // Primitive literals.
-    if let Some(lit) = obj.get("Scalar") {
-        return charon_literal_to_ast_string(lit);
-    }
-    // Class-root lookup strips `&T` / `&mut T` to the referent. CAST
-    // intern suffixes keep the constructor in [`charon_type_value_to_enum_arg`]
-    // so `Option<&T>` is not the tagged `Option<T>` class
-    // (`intern_niche_option_payload_spelling`; `model.py`
-    // `SomeObject.noneify`).
-    if let Some(r) = obj.get("Ref") {
-        if let Some(arr) = r.as_array() {
-            // `{"Ref": [region, ty, kind]}`.
-            if let Some(inner) = arr.get(1) {
-                return charon_type_value_to_ast_string_with(inner, llbc, depth + 1, tombstoned);
-            }
-        }
-        return "??ref_shape".to_string();
-    }
-    // Raw pointers keep the mutability prefix.
-    if let Some(rp) = obj.get("RawPtr") {
-        if let Some(arr) = rp.as_array()
-            && arr.len() == 2
-        {
-            let inner = charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
-            let mutbl = arr[1].as_str().unwrap_or("");
-            let prefix = if mutbl.eq_ignore_ascii_case("Mut") {
-                "*mut "
-            } else {
-                "*const "
-            };
-            return format!("{prefix}{inner}");
-        }
-        return "??rawptr_shape".to_string();
-    }
     // A function-pointer type, including `type T = fn(...)` aliases.
-    // `lltype.FuncType` / `getfunctionptr` derive one signature; the
-    // rendered spelling is that signature so every producer of one Rust
-    // `fn` type annotates one `Ptr(FuncType)`.
     if type_node_is_fn_ptr(v, llbc) {
         let peeled = type_node_peel_aliases(v, llbc).unwrap_or(v);
         return charon_fn_ptr_to_ast_string(peeled, llbc, depth);
     }
-    // ADTs: tuples, builtins (Box/Slice/Str/Array), and named types.
-    if let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) {
-        return charon_adt_to_ast_string(adt, llbc, depth, tombstoned);
-    }
-    // Top-level array `{"Array": [elem, len, trait_ref]}` -> `[elem;len]`.
-    if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array)
-        && arr.len() == 3
-    {
-        let elem = charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
-        let len = charon_array_len_to_string(&arr[1], llbc);
-        return format!("[{elem};{len}]");
-    }
-    // Top-level slice `{"Slice": [elem, trait_ref]}` -> `[elem]`.
-    if let Some(elem) = obj
-        .get("Slice")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.first())
-    {
-        return format!(
-            "[{}]",
-            charon_type_value_to_ast_string_with(elem, llbc, depth + 1, tombstoned)
-        );
-    }
-    // FnPtr `output` / a field of type `()` serializes as `{"Tuple": []}`,
-    // not the Adt-shaped `builtin: "Tuple"` unit. The fallback `??{key}`
-    // would spell `??Tuple` and `type_arg_is_concrete` would drop a tagged
-    // Option that leaked a hasher `fn() -> ()` Instantiated arg.
-    if let Some(items) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
-        if items.is_empty() {
-            return "()".to_string();
-        }
-        let inner = items
-            .iter()
-            .map(|ty| charon_type_value_to_ast_string_with(ty, llbc, depth + 1, tombstoned))
-            .collect::<Vec<_>>()
-            .join(",");
-        return format!("({inner})");
-    }
-    // Trait associated-type projections (`C::Name`).  The decl-level
-    // type cannot spell a concrete type, but the program-level
-    // resolution is recoverable when the LLBC carries exactly ONE impl
-    // of the trait: the impl's `types[]` binds each associated type to
-    // its concrete value (e.g. `impl Constant for ConstantData { type
-    // Name = String }` → `CodeObject<C>`'s `varnames: Box<[C::Name]>`
-    // row renders `Box<[String]>`).  Ambiguous (multi-impl) or
-    // unresolvable projections keep the `??TraitType` fallback below,
-    // so a lookup miss stays conservative.
-    if let Some(arr) = obj.get("TraitType").and_then(serde_json::Value::as_array)
-        && arr.len() == 3
-        && let Some(rendered) = resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
-    {
-        return rendered;
-    }
-    // `dyn Trait` -> `dyn <trait-root>`; recover the trait's leaf name
-    // from the first trait-ref's resolved decl when present.
-    if obj.contains_key("DynTrait") {
-        return charon_dyn_trait_to_ast_string(&obj["DynTrait"], llbc);
-    }
-    // A declaration field of type `T` has no concrete spelling. The index
-    // is the declaration parameter, so `RawPair<f64, usize>` can substitute
-    // `??TypeVar#0` and `??TypeVar#1` separately.
     if let Some(index) = typevar_bound_index(v) {
         return format!("??TypeVar#{index}");
     }

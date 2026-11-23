@@ -118,7 +118,7 @@ fn main() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        for bb in &body.body {
+        for bb in body.body() {
             for st in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind() else {
                     continue;

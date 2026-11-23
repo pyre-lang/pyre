@@ -1055,14 +1055,14 @@ impl CodeWriter {
         // startblock inputarg colors land in the dense `0..N` prefix
         // of each kind, and the rotation persists into the assembler
         // assembly, matching the upstream invocation order.
-        let mut ssarepr = crate::flatten::flatten_graph(rewritten_graph, &mut regallocs);
+        let ssarepr = crate::flatten::flatten_graph(rewritten_graph, &mut regallocs);
 
         // `assemble_with_callcontrol` computes liveness internally and returns
         // the body so call descriptors can be filled before `set_body` commits
         // the JitCode shell.
-        let body =
-            self.assembler
-                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol));
+        let body = self
+            .assembler
+            .assemble_with_callcontrol(ssarepr, &regallocs, Some(callcontrol));
 
         // call.py `get_jitcode_calldescr`:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -1147,7 +1147,6 @@ impl CodeWriter {
             // signature; the high-verbosity branch lands when
             // `format_assembler` is ported.
             let _ = verbose;
-            let _ = &ssarepr;
             // RPython `codewriter.py log.dot()` is unconditional —
             // the only gate is the `CodeWriter.debug` instance flag
             // (`codewriter.py CodeWriter debug = True`).  Keep that semantics:

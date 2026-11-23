@@ -1902,7 +1902,7 @@ fn helper_body_fact(
 ) -> Option<HelperBodyFact> {
     let forward = crate::front::mir::forward_reachable_mask(llbc, body);
     let terms: Vec<Option<&TermKind>> = body
-        .body
+        .body()
         .iter()
         .map(|blk| blk.term_ref(llbc).ok())
         .collect();
@@ -1917,7 +1917,7 @@ fn helper_body_fact(
     {
         return None;
     }
-    let index = index_pin_assigns(&body.body, &terms, &forward);
+    let index = index_pin_assigns(&body.body(), &terms, &forward);
     let mut has_push_roots = false;
     let mut calls = Vec::new();
     let mut pin_result_locals = HashSet::new();
@@ -1977,7 +1977,7 @@ fn helper_body_fact(
         });
     }
     let mut assigns = vec![HashSet::new(); n];
-    for (b, blk) in body.body.iter().enumerate() {
+    for (b, blk) in body.body().iter().enumerate() {
         if !is_forward(&forward, b) {
             continue;
         }
@@ -2231,12 +2231,12 @@ pub fn scan(
         }
 
         stats.bodies_scanned += 1;
-        let n = body.body.len();
+        let n = body.body().len();
         // Cleanup reached only through `on_unwind` is outside the flow
         // graph. One mask per body; walks below reuse it.
         let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
         let terms: Vec<Option<&TermKind>> =
-            body.body.iter().map(|b| b.term_ref(llbc).ok()).collect();
+            body.body().iter().map(|b| b.term_ref(llbc).ok()).collect();
         let unparsed_terms = terms.iter().enumerate().any(|(b, t)| {
             is_forward(&forward, b) && (t.is_none() || matches!(t, Some(TermKind::Unknown)))
         });
@@ -2246,7 +2246,7 @@ pub fn scan(
             // clean.
             stats.unparsed_terminator_bodies += 1;
         }
-        let unparsed_stmts = body.body.iter().enumerate().any(|(b, blk)| {
+        let unparsed_stmts = body.body().iter().enumerate().any(|(b, blk)| {
             is_forward(&forward, b)
                 && blk
                     .statements
@@ -2435,7 +2435,7 @@ pub fn scan(
             defs,
             mut_borrow_of,
             ..
-        } = index_pin_assigns(&body.body, &terms, &forward);
+        } = index_pin_assigns(&body.body(), &terms, &forward);
 
         // A body whose pinned set cannot be read is not a body with an empty
         // one: grading it would turn "not understood" into "root missing".
@@ -2603,7 +2603,7 @@ pub fn scan(
         // `framework.py push_roots` / `pop_roots` reloads every live variable;
         // the original local is not that reloaded word.
         let pin_arg_union: HashSet<u64> = term_pin_args.iter().flatten().copied().collect();
-        let address_of_local = address_bearing_locals(&body.body, &forward);
+        let address_of_local = address_bearing_locals(&body.body(), &forward);
         let pyerror_locals: HashSet<u64> = body
             .locals
             .locals
@@ -2656,7 +2656,7 @@ pub fn scan(
             Copy { src: u64, dest: u64 },
         }
         let mut stmt_xfers: Vec<Vec<RawPinXfer>> = (0..n).map(|_| Vec::new()).collect();
-        for (b, blk) in body.body.iter().enumerate() {
+        for (b, blk) in body.body().iter().enumerate() {
             if !is_forward(&forward, b) {
                 continue;
             }
@@ -2962,7 +2962,7 @@ pub fn scan(
                     &drop_owners,
                     &mut drop_memo,
                 );
-                for st in body.body[b].statements.iter().rev() {
+                for st in body.body()[b].statements.iter().rev() {
                     if let Ok(k) = st.stmt_kind_ref() {
                         transfer_stmt(&k, &mut live, &gc_locals);
                     }
@@ -2980,7 +2980,7 @@ pub fn scan(
         // being judged, so a local that reaches such a callee anywhere in the
         // body is in the set for every call the body makes.
         let mut movable_args: HashSet<u64> = HashSet::new();
-        for (b, other) in body.body.iter().enumerate() {
+        for (b, other) in body.body().iter().enumerate() {
             if !is_forward(&forward, b) {
                 continue;
             }
@@ -3065,7 +3065,7 @@ pub fn scan(
             let mut locals: Vec<String> = still.iter().map(|l| gc_locals[l].clone()).collect();
             locals.sort();
             movable.sort();
-            let at = term_span(llbc, &body.body[b].terminator.span, &fd.item_meta.span);
+            let at = term_span(llbc, &body.body()[b].terminator.span, &fd.item_meta.span);
             stats.stale_pin_reads.push(StalePinRead {
                 func_name: fd.item_meta.name_path(),
                 file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
@@ -3077,7 +3077,7 @@ pub fn scan(
         }
 
         // Now re-walk, and at every collecting Call read the live-after set.
-        for (b, bb) in body.body.iter().enumerate() {
+        for (b, bb) in body.body().iter().enumerate() {
             if !is_forward(&forward, b) {
                 continue;
             }
@@ -3189,7 +3189,7 @@ pub fn scan(
                     .collect();
                 if !watched.is_empty() {
                     let flagged = pyerror_stale_after_collect(
-                        &body.body,
+                        &body.body(),
                         &terms,
                         &cg.names,
                         &mut_borrow_of,

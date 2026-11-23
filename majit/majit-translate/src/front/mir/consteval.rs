@@ -180,7 +180,7 @@ impl<'a> Lowering<'a> {
         let mut borrow: Option<(u64, u64)> = None;
         let mut return_alias: Option<u64> = None;
         let forward_blocks = forward_reachable_mask(self.llbc, &body);
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -301,7 +301,7 @@ impl<'a> Lowering<'a> {
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
         let mut array: Option<(u64, Vec<String>)> = None;
-        for block in &body.body {
+        for block in body.body() {
             for stmt in &block.statements {
                 match stmt.stmt_kind_ref() {
                     Ok(StmtKind::StorageLive(_))
@@ -613,7 +613,7 @@ impl<'a> Lowering<'a> {
         let mut found: Option<(bool, serde_json::Value)> = None;
         let mut saw_return = false;
         let forward_blocks = forward_reachable_mask(self.llbc, &body);
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -1748,7 +1748,7 @@ pub(in crate::front::mir) fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
     let u = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut named = None;
-    for bb in &u.body {
+    for bb in u.body() {
         for st in &bb.statements {
             let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind_ref() else {
                 continue;
@@ -1795,7 +1795,7 @@ pub(in crate::front::mir) fn promoted_int_range_inclusive_bounds(
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
     let u = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut bounds = None;
-    for bb in &u.body {
+    for bb in u.body() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -1888,7 +1888,7 @@ pub(in crate::front::mir) fn decoded_named_const_on_llbc(
     // accessor path.
     let mut found: Option<serde_json::Value> = None;
     let forward_blocks = forward_reachable_mask(llbc, &body);
-    for (bb_idx, blk) in body.body.iter().enumerate() {
+    for (bb_idx, blk) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2178,7 +2178,7 @@ pub(in crate::front::mir) fn eval_const_int_array(
     let mut locals: std::collections::HashMap<u64, ArrVal> = std::collections::HashMap::new();
     let mut bb = 0usize;
     for _ in 0..8192 {
-        let block = u.body.get(bb)?;
+        let block = u.body().get(bb)?;
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
@@ -2559,7 +2559,7 @@ pub(in crate::front::mir) fn local_assignment_counts(
 ) -> Vec<usize> {
     let mut counts = vec![0usize; body.locals.locals.len()];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2595,7 +2595,7 @@ pub(in crate::front::mir) fn const_struct_copy_aliases(
     let mut grew = true;
     while grew {
         grew = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -2642,7 +2642,7 @@ pub(in crate::front::mir) fn const_struct_uses_are_field_reads(
     let mut fields = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2756,7 +2756,7 @@ pub(in crate::front::mir) fn eval_const_struct_init(
     let mut structs: Vec<Option<Vec<u64>>> = vec![None; n];
     let mut bb = 0usize;
     for _ in 0..64 {
-        let block = u.body.get(bb)?;
+        let block = u.body().get(bb)?;
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
@@ -2930,7 +2930,7 @@ pub(in crate::front::mir) fn const_eval_init_body_with_locals(
     // A genuine init body is a short assert-diamond chain; the step cap
     // only guards against cycles.
     for _ in 0..64 {
-        let block = u.body.get(bb)?;
+        let block = u.body().get(bb)?;
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))

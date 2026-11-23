@@ -1293,7 +1293,7 @@ fn intern_enums_from_unstructured(
     // are not part of the lowered body. The local-type scan below still
     // sees an instantiation a normal block only reads.
     let forward_blocks = forward_reachable_mask(llbc, u);
-    for (bb_idx, bb) in u.body.iter().enumerate() {
+    for (bb_idx, bb) in u.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -1361,7 +1361,7 @@ fn intern_enqueue_generic_calls(
     seen: &mut std::collections::HashSet<(u64, String)>,
 ) {
     let forward_blocks = forward_reachable_mask(llbc, u);
-    for (bb_idx, bb) in u.body.iter().enumerate() {
+    for (bb_idx, bb) in u.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -2804,7 +2804,7 @@ impl EntryInstantiationScan<'_> {
                     if args.iter().all(|arg| !arg.contains("??"))
                         && let Some(td) = self.llbc.type_by_id(id)
                     {
-                        let path = strip_crate_prefix(&td.item_meta.name_path());
+                        let path = td.item_meta.name_path_stripped().to_string();
                         let inst = if args.is_empty() {
                             path
                         } else {
@@ -4207,10 +4207,10 @@ impl<'l> CrateLowering<'l> {
             &req.types,
             &req.const_generics,
         );
-        let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
+        let stripped = fd.item_meta.name_path_stripped();
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
-            None => (String::new(), stripped),
+            None => (String::new(), stripped.to_string()),
         };
         let policy_fn_path = if module_path.is_empty() {
             bare_leaf
@@ -4649,10 +4649,10 @@ fn fun_decl_name_path_is_host_env(fd: &FunDecl) -> bool {
 }
 
 fn decl_module_path_and_name(fd: &FunDecl) -> (String, String) {
-    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
+    let stripped = fd.item_meta.name_path_stripped();
     match stripped.rsplit_once("::") {
         Some((module, leaf)) => (module.to_string(), leaf.to_string()),
-        None => (String::new(), stripped),
+        None => (String::new(), stripped.to_string()),
     }
 }
 
@@ -4709,7 +4709,7 @@ fn note_body_crate_root_into(
         return;
     };
     fields.note_foreign_body_crate_root(root);
-    let stripped = strip_crate_prefix(fd.item_meta.name_path_str());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     fields.note_foreign_body_callable(root, &stripped);
 }
 
@@ -4738,7 +4738,7 @@ fn fun_decl_has_body_in_loaded_crate(
     {
         return true;
     }
-    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    let stripped = fd.item_meta.name_path_stripped().to_string();
     fields.is_some_and(|fields| {
         fields
             .foreign_callables
@@ -8379,7 +8379,7 @@ pub(crate) fn harvest_repr_transparent_struct_ids(
 }
 
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
-    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(td.item_meta.name_path_str()))
+    majit_ir::descr::StructId::from_canonical(td.item_meta.name_path_stripped())
 }
 
 /// `true` when `path` is majit-gc's `GcType` declaration.
@@ -8506,7 +8506,7 @@ pub(crate) fn declared_gckind_by_name(
             if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
                 continue;
             }
-            let canon = strip_crate_prefix(td.item_meta.name_path_str());
+            let canon = td.item_meta.name_path_stripped().to_string();
             let kind = if struct_id_is_declared_gc(&gc, struct_id_for_type_decl(td), &canon) {
                 GcKind::Gc
             } else {
@@ -9574,7 +9574,7 @@ fn lower_fat_dyn_callee(
     if fun_decl_is_dont_look_inside(llbc, decl, dont_look_inside) || !decl.has_unstructured_body() {
         return None;
     }
-    let nblocks = decl.unstructured()?.body.len();
+    let nblocks = decl.unstructured()?.body().len();
     if nblocks == 0 {
         return None;
     }
@@ -9801,7 +9801,7 @@ pub fn residual_rbigint_gc_root_escapes(llbc: &Llbc) -> Vec<(String, String)> {
 fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
     let mut def_count = vec![0usize; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
@@ -11217,7 +11217,7 @@ impl std::ops::Index<usize> for MirBlockMap {
 
 fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool {
     matches!(
-        body.body
+        body.body()
             .get(bb as usize)
             .and_then(|block| block.term_ref(llbc).ok()),
         Some(
@@ -11248,8 +11248,8 @@ pub(in crate::front::mir) fn successor_blocks(
     mir_bb: usize,
     include_panic_default: bool,
 ) -> Vec<usize> {
-    let n = body.body.len();
-    let Ok(term) = body.body[mir_bb].term_ref(llbc) else {
+    let n = body.body().len();
+    let Ok(term) = body.body()[mir_bb].term_ref(llbc) else {
         return Vec::new();
     };
     let raw: Vec<u64> = match term {
@@ -11318,7 +11318,7 @@ fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(JsonVal, u64)]) -> b
 }
 
 fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool) -> Vec<bool> {
-    let n = body.body.len();
+    let n = body.body().len();
     let mut reached = vec![false; n];
     if n == 0 {
         return reached;
@@ -11341,7 +11341,8 @@ fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool)
 /// this set: a panic-abort block can still assign a local, and an
 /// `on_unwind` cleanup block cannot.
 pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
-    reachable_mask(llbc, body, true)
+    body.cached_forward_reachable(|| reachable_mask(llbc, body, true))
+        .to_vec()
 }
 
 /// Empty every block outside [`forward_reachable_mask`]: its statements are
@@ -11351,7 +11352,7 @@ pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bo
 /// run before it from projecting their terminators.
 pub(crate) fn clear_unreachable_blocks(llbc: &Llbc, body: &mut Unstructured) {
     let forward = forward_reachable_mask(llbc, body);
-    for (block, reached) in body.body.iter_mut().zip(forward) {
+    for (block, reached) in body.body_mut().iter_mut().zip(forward) {
         if !reached {
             block.statements = Vec::new();
             block.set_terminator_kind(serde_json::Value::String("UnwindResume".into()));
@@ -11361,7 +11362,8 @@ pub(crate) fn clear_unreachable_blocks(llbc: &Llbc, body: &mut Unstructured) {
 
 /// Blocks reachable from bb0 along the edges the lowering emits.
 fn lowered_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
-    reachable_mask(llbc, body, false)
+    body.cached_lowered_reachable(|| reachable_mask(llbc, body, false))
+        .to_vec()
 }
 
 /// Resolve a `Variable` used as a call argument back to the operation

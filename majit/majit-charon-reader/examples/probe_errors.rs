@@ -13,7 +13,7 @@ fn main() {
     let mut samples: BTreeMap<String, String> = BTreeMap::new();
     for fd in llbc.iter_local_fns() {
         let Some(u) = fd.unstructured() else { continue };
-        for bb in &u.body {
+        for bb in u.body() {
             for st in &bb.statements {
                 if let Err(e) = st.stmt_kind() {
                     let outer = outer_key(st.kind_value());

@@ -446,7 +446,7 @@ impl<'a> Builder<'a> {
         let forward = crate::front::mir::forward_reachable_mask(self.llbc, body);
         let mut incomplete = false;
         let mut unresolved = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
+        for (bb_idx, bb) in body.body().iter().enumerate() {
             if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
@@ -653,7 +653,7 @@ impl<'a> Builder<'a> {
 
 fn body_has_clause_trait_call(llbc: &Llbc, body: &Unstructured) -> bool {
     let forward = crate::front::mir::forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !call_graph_walks_block(bb, forward[bb_idx]) {
             continue;
         }

@@ -88,7 +88,7 @@ fn dyn_impl_desc_strings(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, String
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let n = body.locals.locals.len();
     let mut local_strs = vec![None; n];
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                 continue;
@@ -107,7 +107,7 @@ fn dyn_impl_desc_strings(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, String
             }
         }
     }
-    for block in &body.body {
+    for block in body.body() {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind() else {
                 continue;

@@ -1141,7 +1141,7 @@ fn classify_atomic_locals(
     let mutably_borrowed = compute_mutably_borrowed_locals(llbc, body);
     let mut considered = vec![false; n];
     let mut work = Vec::new();
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -1163,7 +1163,7 @@ fn classify_atomic_locals(
         }
     }
     while let Some(dest) = work.pop() {
-        for (bb_idx, block) in body.body.iter().enumerate() {
+        for (bb_idx, block) in body.body().iter().enumerate() {
             if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
                 continue;
             }
@@ -1300,7 +1300,7 @@ fn atomic_class_contributions(
     if dest >= 1 && dest <= arg_count {
         (joined, tmpl) = join_atomic_class(joined, tmpl, AtomicClass::Plain, None);
     }
-    for (bb_idx, block) in body.body.iter().enumerate() {
+    for (bb_idx, block) in body.body().iter().enumerate() {
         if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -2036,8 +2036,8 @@ impl<'a> Lowering<'a> {
         // the `drop_in_place` spelling #1689 already keeps live.
         let root_scope_moved_locals = MovedOutLocals::new(body, llbc);
         let root_bracket = analyze_root_brackets(body, llbc, &root_scope_moved_locals, root_stack);
-        if extra_live.len() < body.body.len() {
-            extra_live.resize(body.body.len(), Vec::new());
+        if extra_live.len() < body.body().len() {
+            extra_live.resize(body.body().len(), Vec::new());
         }
         for (bb_idx, local) in root_scope_drop_sites(body, llbc, &root_scope_moved_locals) {
             // An erased bracket emits no close, so its guard is not read at
@@ -2602,7 +2602,7 @@ impl<'a> Lowering<'a> {
             if !is_fresh_str_builder(&cache, self.body, self.llbc, candidate) {
                 continue;
             }
-            for (bb_idx, block) in self.body.body.iter().enumerate() {
+            for (bb_idx, block) in self.body.body().iter().enumerate() {
                 if !forward_blocks[bb_idx] {
                     continue;
                 }
@@ -2865,7 +2865,7 @@ impl<'a> Lowering<'a> {
     /// and produce an undefined-operand graph, which the pass-2 / final
     /// self-validation guards reject into the monotonic fallback.
     pub(in crate::front::mir) fn mir_model_loop_headers(&self) -> Vec<bool> {
-        let n = self.body.body.len();
+        let n = self.body.body().len();
         let mut headers = vec![false; n];
         if n == 0 {
             return headers;
@@ -2901,7 +2901,7 @@ impl<'a> Lowering<'a> {
     /// the block itself, which is exactly the order the two-pass framestate
     /// threading relies on.
     pub(in crate::front::mir) fn model_rpo(&self) -> Vec<usize> {
-        let n = self.body.body.len();
+        let n = self.body.body().len();
         if n == 0 {
             return vec![];
         }
@@ -3071,7 +3071,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         loop_headers: &[bool],
     ) -> Result<(), LowerError> {
-        let n = self.body.body.len();
+        let n = self.body.body().len();
         if n == 0 {
             return Ok(());
         }
@@ -3459,7 +3459,7 @@ impl<'a> Lowering<'a> {
     }
 
     pub(in crate::front::mir) fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
-        let bb: &BasicBlock = &self.body.body[mir_bb];
+        let bb: &BasicBlock = &self.body.body()[mir_bb];
         let row = self.block_id.row(mir_bb);
         self.local_var = self.hydrate_words(self.block_entry_local_var[row].unpack());
         // `FrameState.copy` mints a fresh Variable per slot

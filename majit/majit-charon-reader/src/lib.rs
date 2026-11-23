@@ -1958,7 +1958,7 @@ mod tests {
         let bytes = serde_json::to_vec(&doc).unwrap();
         let llbc = Llbc::from_slice(&bytes).expect("fixture");
         let bool_fn = llbc.fn_by_id(0).unwrap().unstructured().unwrap();
-        match bool_fn.body[0].term(&llbc).unwrap() {
+        match bool_fn.body()[0].term(&llbc).unwrap() {
             ullbc::TermKind::Switch { targets, .. } => match targets {
                 ullbc::SwitchTargets::If(1, 2) => {}
                 other => panic!("bool arm was not If: {other:?}"),
@@ -1966,7 +1966,7 @@ mod tests {
             other => panic!("bool switch: {other:?}"),
         }
         let int_fn = llbc.fn_by_id(1).unwrap().unstructured().unwrap();
-        match int_fn.body[0].term(&llbc).unwrap() {
+        match int_fn.body()[0].term(&llbc).unwrap() {
             ullbc::TermKind::Switch { targets, .. } => match targets {
                 ullbc::SwitchTargets::SwitchInt(_, arms, 3) => {
                     assert_eq!(arms.len(), 2);
