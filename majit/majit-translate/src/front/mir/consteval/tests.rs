@@ -2225,6 +2225,18 @@ fn const_ref_addrs(graph: &crate::model::FunctionGraph) -> Vec<i64> {
         .collect()
 }
 
+fn const_ref_addr_dest(graph: &crate::model::FunctionGraph) -> crate::flowspace::model::Variable {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match op.kind {
+            OpKind::ConstRefAddr(_) => op.result.clone(),
+            _ => None,
+        })
+        .expect("ConstRefAddr dest")
+}
+
 fn call_paths_in(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
     graph
         .blocks
@@ -2694,6 +2706,31 @@ fn oncelock_fn_opaque_global_emits_bare_const_ref_addr() {
     );
 }
 
+/// A refs-row `OnceLock<fn>` static stays `llmemory.Address`
+/// (`oncelock_fn_static!`, `raw_load` of `Ptr(FuncType)`).
+#[test]
+fn oncelock_fn_static_stays_an_address() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_fn_global_llbc(serde_json::json!("Opaque"), None);
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<fn> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let cell = const_ref_addr_dest(&graph);
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&cell),
+        crate::model::ConcreteType::Signed,
+        "llmemory.Address getkind is int"
+    );
+    assert!(
+        matches!(
+            cell.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ),
+        "OnceLock<fn> address is Address, got {:?}",
+        cell.concretetype()
+    );
+}
+
 /// A Struct-kind `OnceLock<fn>` still emits a bare ConstRefAddr: the type
 /// lane runs before `refs_static_struct_root` would wrap the address as
 /// `SomeInstance(OnceLock)`.
@@ -2793,6 +2830,36 @@ fn oncelock_usize_struct_global_does_not_cast_instance() {
             segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
         }),
         "OnceLock<usize> must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+/// A refs-row `OnceLock<usize>` singleton is the prebuilt GC object
+/// (`baseobjspace.py fromcache` / `cache.py Cache.getorbuild`,
+/// `rclass.py InstanceRepr.convert_const`). The ConstRefAddr is the
+/// ordinary refs-row GCREF shape, not `llmemory.Address`.
+#[test]
+fn oncelock_usize_singleton_static_is_a_gc_reference_constant() {
+    super::register_foldable_const_lits(Vec::new());
+    let graph = super::lower_function_with_static_addrs(
+        &oncelock_usize_global_llbc(),
+        "read_cell",
+        fnptrcell_refs(),
+    )
+    .expect("Struct OnceLock<usize> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let cell = const_ref_addr_dest(&graph);
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&cell),
+        crate::model::ConcreteType::Unknown,
+        "non-fn refs-row ConstRefAddr is Unknown; adapter last arm is GCREF"
+    );
+    assert!(
+        !matches!(
+            cell.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ),
+        "refs-row OnceLock<usize> must not be stamped Address, got {:?}",
+        cell.concretetype()
     );
 }
 

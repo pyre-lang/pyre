@@ -33,7 +33,8 @@ use crate::flowspace::model::{
     ConcretetypePlaceholder, ConstValue, FunctionGraph, GraphKey, GraphRef, Hlvalue,
 };
 use crate::rlib::rarithmetic::{
-    RIntValue, mask_bigint, normalizedinttype, rint_new, rint_value, signed_int_overflow_message,
+    RIntValue, mask_bigint, normalizedinttype, r_longlong, rint_new, rint_value,
+    signed_int_overflow_message,
 };
 use crate::translator::rtyper::error::TyperError;
 use malachite_bigint::BigInt;
@@ -130,23 +131,72 @@ impl Number {
 }
 
 /// RPython `_numbertypes` (`lltype.py`): keyed by the Python integer
-/// class (`int`, `r_uint`, a `build_int` class, …). Seeded with the six
+/// class (`int`, `r_uint`, a `build_int` class, …). Seeded with the
 /// predefined Number singletons; `build_number` inserts further
 /// `LowLevelType::Number` entries.
-#[allow(non_upper_case_globals)]
-pub static _numbertypes: LazyLock<Mutex<HashMap<KnownType, LowLevelType>>> = LazyLock::new(|| {
-    Mutex::new(HashMap::from([
+fn seed_numbertypes() -> HashMap<KnownType, LowLevelType> {
+    let mut map = HashMap::from([
         (KnownType::Int, LowLevelType::Signed),
         // `_numbertypes[r_int] = _numbertypes[int]` (`lltype.py`):
         // `r_int` shares the Signed low-level type with builtin `int`.
         (KnownType::Rint, LowLevelType::Signed),
         (KnownType::Ruint, LowLevelType::Unsigned),
-        (KnownType::LongLong, LowLevelType::SignedLongLong),
         (KnownType::LongLongLong, LowLevelType::SignedLongLongLong),
-        (KnownType::ULongLong, LowLevelType::UnsignedLongLong),
         (KnownType::ULongLongLong, LowLevelType::UnsignedLongLongLong),
-    ]))
-});
+    ]);
+    // `if r_longlong is not r_int` (`lltype.py`): seed a distinct
+    // `Number("SignedLongLong", r_longlong, …)`. On a 64-bit word
+    // `r_longlong is r_int`, so `SignedLongLong = build_number(
+    // "SignedLongLong", r_longlong)` is `Signed`. The Rust
+    // `KnownType::LongLong` variant of that same class maps to
+    // `Signed` too; likewise `ULongLong` → `Unsigned`.
+    if r_longlong() != KnownType::Rint {
+        map.insert(KnownType::LongLong, LowLevelType::SignedLongLong);
+        map.insert(KnownType::ULongLong, LowLevelType::UnsignedLongLong);
+    } else {
+        map.insert(KnownType::LongLong, LowLevelType::Signed);
+        map.insert(KnownType::ULongLong, LowLevelType::Unsigned);
+    }
+    map
+}
+
+#[allow(non_upper_case_globals)]
+pub static _numbertypes: LazyLock<Mutex<HashMap<KnownType, LowLevelType>>> =
+    LazyLock::new(|| Mutex::new(seed_numbertypes()));
+
+/// RPython `SignedLongLong = build_number("SignedLongLong", r_longlong)`
+/// (`lltype.py`). `if r_longlong is not r_int` is the only seed of a
+/// distinct Number; on a 64-bit word this is `Signed`.
+pub fn signed_long_long() -> LowLevelType {
+    signed_long_long_for(crate::layout::target_signed_size())
+}
+
+/// `scalar_lltype_for(_, signed_size)` pattern: a 4-byte Signed word
+/// keeps a distinct `SignedLongLong`.
+pub fn signed_long_long_for(signed_size: usize) -> LowLevelType {
+    if signed_size == 8 {
+        LowLevelType::Signed
+    } else {
+        LowLevelType::SignedLongLong
+    }
+}
+
+/// RPython `UnsignedLongLong = build_number("UnsignedLongLong", r_ulonglong)`
+/// (`lltype.py`). On a 64-bit word `r_ulonglong is r_uint`, so this is
+/// `Unsigned`.
+pub fn unsigned_long_long() -> LowLevelType {
+    unsigned_long_long_for(crate::layout::target_signed_size())
+}
+
+/// `scalar_lltype_for(_, signed_size)` pattern: a 4-byte Signed word
+/// keeps a distinct `UnsignedLongLong`.
+pub fn unsigned_long_long_for(signed_size: usize) -> LowLevelType {
+    if signed_size == 8 {
+        LowLevelType::Unsigned
+    } else {
+        LowLevelType::UnsignedLongLong
+    }
+}
 
 /// RPython `_to_primitive` (`lltype.py`): low-level primitive token
 /// name to the conversion routine name used by `cast_primitive`.
@@ -6964,6 +7014,29 @@ fn build_normalized_number(t: KnownType) -> LowLevelType {
 
 /// RPython `lltype.build_number(name, type)` (`lltype.py`).
 pub fn build_number(name: Option<&str>, knowntype: KnownType) -> Result<LowLevelType, String> {
+    build_number_for(name, knowntype, crate::layout::target_signed_size())
+}
+
+/// `build_number` for a chosen Signed width (`scalar_lltype_for(_, signed_size)`).
+/// `KnownType::LongLong` / `ULongLong` follow `signed_long_long_for` /
+/// `unsigned_long_long_for`, so a 4-byte Signed word keeps a distinct
+/// `SignedLongLong` (`if r_longlong is not r_int` in `lltype.py`).
+pub fn build_number_for(
+    name: Option<&str>,
+    knowntype: KnownType,
+    signed_size: usize,
+) -> Result<LowLevelType, String> {
+    match knowntype {
+        KnownType::LongLong => Ok(signed_long_long_for(signed_size)),
+        KnownType::ULongLong => Ok(unsigned_long_long_for(signed_size)),
+        _ => lookup_or_insert_numbertype(name, knowntype),
+    }
+}
+
+fn lookup_or_insert_numbertype(
+    name: Option<&str>,
+    knowntype: KnownType,
+) -> Result<LowLevelType, String> {
     let mut map = _numbertypes.lock();
     if let Some(ty) = map.get(&knowntype) {
         return Ok(ty.clone());
@@ -10020,6 +10093,41 @@ mod tests {
         let method = staticAdtMethod::new("adt");
         assert_eq!(method.get(), &"adt");
         assert_eq!(typeMethod(7), 7);
+    }
+
+    #[test]
+    fn longlong_is_signed_when_the_word_is_64_bit() {
+        assert_eq!(crate::rlib::rarithmetic::long_bit(), 64);
+        assert_eq!(signed_long_long(), LowLevelType::Signed);
+        assert_eq!(unsigned_long_long(), LowLevelType::Unsigned);
+        assert_eq!(signed_long_long_for(8), LowLevelType::Signed);
+        assert_eq!(unsigned_long_long_for(8), LowLevelType::Unsigned);
+        assert_eq!(
+            _numbertypes.lock().get(&KnownType::LongLong),
+            Some(&LowLevelType::Signed)
+        );
+        assert_eq!(
+            _numbertypes.lock().get(&KnownType::ULongLong),
+            Some(&LowLevelType::Unsigned)
+        );
+        assert_eq!(
+            build_number(None, KnownType::LongLong).unwrap(),
+            LowLevelType::Signed
+        );
+        assert_eq!(
+            build_number(None, crate::rlib::rarithmetic::r_longlong()).unwrap(),
+            LowLevelType::Signed
+        );
+        assert_eq!(
+            build_number(None, crate::rlib::rarithmetic::r_ulonglong()).unwrap(),
+            LowLevelType::Unsigned
+        );
+    }
+
+    #[test]
+    fn longlong_is_a_distinct_number_when_the_word_is_32_bit() {
+        assert_eq!(signed_long_long_for(4), LowLevelType::SignedLongLong);
+        assert_eq!(unsigned_long_long_for(4), LowLevelType::UnsignedLongLong);
     }
 
     #[test]

@@ -52,7 +52,9 @@ use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::extregistry::{self, ExtRegistryEntry};
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{
+    LowLevelType, signed_long_long, unsigned_long_long,
+};
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{ConvertedTo, HighLevelOp, RPythonTyper};
@@ -1542,9 +1544,8 @@ pub fn rtype_intmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 /// ```
 pub fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
-    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
-        &LowLevelType::SignedLongLong,
-    )])?;
+    let ty = signed_long_long();
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&ty)])?;
     Ok(vlist.into_iter().next())
 }
 
@@ -1567,9 +1568,8 @@ pub fn rtype_ulonglonglongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 
 pub fn rtype_ulonglongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
-    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
-        &LowLevelType::UnsignedLongLong,
-    )])?;
+    let ty = unsigned_long_long();
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&ty)])?;
     Ok(vlist.into_iter().next())
 }
 
@@ -2089,6 +2089,8 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// `rlib/longlong2float.py` — `Float2LongLongEntry.specialize_call`:
 /// `hop.inputargs(lltype.Float)`, `hop.exception_cannot_occur()`,
 /// `return hop.genop("convert_float_bytes_to_longlong", [v_float], SignedLongLong)`.
+/// `SignedLongLong = build_number("SignedLongLong", r_longlong)` is
+/// `Signed` when `r_longlong is r_int`.
 pub fn rtype_float2longlong(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2097,7 +2099,7 @@ pub fn rtype_float2longlong(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
     Ok(hop.genop(
         "convert_float_bytes_to_longlong",
         vlist,
-        GenopResult::LLType(LowLevelType::SignedLongLong),
+        GenopResult::LLType(signed_long_long()),
     ))
 }
 
@@ -2106,9 +2108,8 @@ pub fn rtype_float2longlong(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
 pub fn rtype_longlong2float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
-    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
-        &LowLevelType::SignedLongLong,
-    )])?;
+    let ty = signed_long_long();
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&ty)])?;
     hop.exception_cannot_occur()?;
     Ok(hop.genop(
         "convert_longlong_bytes_to_float",
@@ -6114,6 +6115,54 @@ mod tests {
         );
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops)
+    }
+
+    /// `f64::to_bits` rtypes through `convert_float_bytes_to_longlong`.
+    /// `SignedLongLong is Signed` when `r_longlong is r_int`, so the
+    /// result is `Signed` and the graph has no `llong_*` family.
+    #[test]
+    fn float2longlong_emits_no_longlong_ops_on_64_bit() {
+        use crate::annotator::model::{SomeFloat, SomeValue};
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rfloat::float_repr;
+
+        assert_eq!(crate::rlib::rarithmetic::long_bit(), 64);
+        let hop = dummy_hop();
+        let v_float = Variable::named("f");
+        v_float.set_concretetype(Some(LowLevelType::Float));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_float));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Float(SomeFloat::new()));
+        hop.args_r.borrow_mut().push(Some(float_repr()));
+        let result = rtype_float2longlong(&hop, &HashMap::new())
+            .expect("rtype_float2longlong")
+            .expect("result");
+        let Hlvalue::Variable(v) = &result else {
+            panic!("float2longlong result is a Variable, got {result:?}");
+        };
+        assert_eq!(v.concretetype(), Some(LowLevelType::Signed));
+        let ops = hop.llops.borrow();
+        assert!(
+            !ops.ops.iter().any(|op| op.opname.starts_with("llong_")
+                || op.opname == "cast_int_to_longlong"
+                || op.opname == "truncate_longlong_to_int"),
+            "64-bit float2longlong emitted longlong ops: {:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "convert_float_bytes_to_longlong");
+        let Hlvalue::Variable(produced) = &ops.ops[0].result else {
+            panic!(
+                "convert_float_bytes_to_longlong result is a Variable, got {:?}",
+                ops.ops[0].result
+            );
+        };
+        assert_eq!(produced.concretetype(), Some(LowLevelType::Signed));
+        assert_ne!(produced.concretetype(), Some(LowLevelType::SignedLongLong));
     }
 
     /// `ann_nullptr` `immutablevalue` folds through `rtype_const_result`

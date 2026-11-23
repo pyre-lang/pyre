@@ -1735,10 +1735,11 @@ pub fn rarith_longlongmask(
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // upstream: `SomeInteger(knowntype=rpython.rlib.rarithmetic.r_longlong)`.
+    // `SomeInteger(knowntype=rpython.rlib.rarithmetic.r_longlong)`.
+    // `r_longlong is r_int` when `LONG_BIT == 64` (`build_int`).
     Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
         false,
-        crate::annotator::model::KnownType::LongLong,
+        crate::rlib::rarithmetic::r_longlong(),
     )))
 }
 
@@ -1772,13 +1773,14 @@ pub fn rarith_ulonglongmask(
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
         true,
-        crate::annotator::model::KnownType::ULongLong,
+        crate::rlib::rarithmetic::r_ulonglong(),
     )))
 }
 
 /// `longlong2float.float2longlong(floatval)` — upstream
 /// `Float2LongLongEntry.compute_result_annotation` returns
-/// `SomeInteger(knowntype=r_int64)` (== `r_longlong`).
+/// `SomeInteger(knowntype=r_int64)` (`r_int64` is `r_longlong`, and
+/// `r_longlong is r_int` when `LONG_BIT == 64`).
 pub fn float2longlong_analyzer(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -1786,7 +1788,7 @@ pub fn float2longlong_analyzer(
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
         false,
-        crate::annotator::model::KnownType::LongLong,
+        crate::rlib::rarithmetic::r_longlong(),
     )))
 }
 
@@ -9822,5 +9824,32 @@ mod tests {
             one_msg.contains("missing callable argument"),
             "got {one_msg}"
         );
+    }
+
+    #[test]
+    fn longlongmask_annotates_as_the_word_integer_on_64_bit() {
+        use crate::rlib::rarithmetic::{long_bit, r_longlong, r_ulonglong};
+        assert_eq!(long_bit(), 64);
+        let empty = HashMap::new();
+        let s = rarith_longlongmask(&bk(), &[], &empty).expect("longlongmask");
+        let SomeValue::Integer(i) = s else {
+            panic!("longlongmask annotates as SomeInteger, got {s:?}");
+        };
+        assert_eq!(i.base.knowntype, r_longlong());
+        assert_eq!(i.base.knowntype, crate::annotator::model::KnownType::Rint);
+
+        let s = rarith_ulonglongmask(&bk(), &[], &empty).expect("ulonglongmask");
+        let SomeValue::Integer(i) = s else {
+            panic!("ulonglongmask annotates as SomeInteger, got {s:?}");
+        };
+        assert_eq!(i.base.knowntype, r_ulonglong());
+        assert_eq!(i.base.knowntype, crate::annotator::model::KnownType::Ruint);
+
+        let s = float2longlong_analyzer(&bk(), &[], &empty).expect("float2longlong");
+        let SomeValue::Integer(i) = s else {
+            panic!("float2longlong annotates as SomeInteger, got {s:?}");
+        };
+        assert_eq!(i.base.knowntype, r_longlong());
+        assert_eq!(i.base.knowntype, crate::annotator::model::KnownType::Rint);
     }
 }

@@ -1120,10 +1120,11 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn signed_long_long_concretetype_is_signed_on_64_bit() {
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut g = FunctionGraph::new("ll");
         let var = crate::flowspace::model::Variable::named("v");
-        var.set_concretetype(Some(LowLevelType::SignedLongLong));
+        var.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::signed_long_long(),
+        ));
         g.block_mut(g.startblock).inputargs.push(var);
         assert!(!contains_unsupported_variable_type(&g, true, false, true));
     }
@@ -1133,10 +1134,11 @@ mod tests {
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn signed_long_long_concretetype_needs_longlong_support_on_32_bit() {
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut g = FunctionGraph::new("ll");
         let var = crate::flowspace::model::Variable::named("v");
-        var.set_concretetype(Some(LowLevelType::SignedLongLong));
+        var.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::signed_long_long(),
+        ));
         g.block_mut(g.startblock).inputargs.push(var);
         assert!(contains_unsupported_variable_type(&g, true, false, true));
         assert!(!contains_unsupported_variable_type(&g, true, true, true));

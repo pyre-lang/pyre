@@ -6486,11 +6486,24 @@ fn exception_class_integer_storage(
     let SomeValue::Integer(int) = annotation else {
         return None;
     };
-    let built =
-        crate::translator::rtyper::lltypesystem::lltype::build_number(None, int.base.knowntype)
-            .ok()?;
+    let built = crate::translator::rtyper::lltypesystem::lltype::build_number_for(
+        None,
+        int.base.knowntype,
+        signed_size,
+    )
+    .ok()?;
     let lltype = crate::codewriter::call::array_of_lltype_identity_for(&built, signed_size);
-    let uncollapsed = crate::codewriter::call::lltype_item_spelling(&built)?;
+    // `r_longlong` stays `i64` (`lltype_item_spelling` of the uncollapsed
+    // Number) when `scalar_lltype_for` still projects that spelling onto
+    // the collapsed type. `signed_long_long_for(4)` is that Number.
+    let uncollapsed = crate::codewriter::call::lltype_item_spelling(
+        &crate::translator::rtyper::lltypesystem::lltype::build_number_for(
+            None,
+            int.base.knowntype,
+            4,
+        )
+        .ok()?,
+    )?;
     let spelling = if crate::annotator::bookkeeper::scalar_lltype_for(&uncollapsed, signed_size)
         .as_ref()
         == Some(&lltype)

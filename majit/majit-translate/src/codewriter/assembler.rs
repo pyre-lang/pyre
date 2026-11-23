@@ -282,6 +282,24 @@ fn exception_instance_spec(
     Some((name, message))
 }
 
+/// Class name stored on an `OBJECT_VTABLE` (`ClassRepr.fill_vtable_root`
+/// `vtable.name = alloc_array_name(class_shortname)`).
+fn vtable_class_name(
+    vtable: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelValue;
+    use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
+
+    if !vtable.nonzero() {
+        return None;
+    }
+    let LowLevelValue::Ptr(name_ptr) = vtable.getattr("name").ok()? else {
+        return None;
+    };
+    let (bytes, _) = prebuilt_str_bytes_and_hash(&name_ptr)?;
+    String::from_utf8(bytes).ok()
+}
+
 /// Assembler.emit_const keys a GC constant by `value._obj.container`.
 /// InstanceRepr.get_reusable_prebuilt_instance mallocs one dummy instance
 /// and writes only the root `typeptr` (ClassesPBCRepr.redispatch_call's
@@ -291,7 +309,6 @@ fn prebuilt_ll_exception_instance(
     ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
 ) -> Option<String> {
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue, normalizeptr};
-    use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
 
     if !ptr.nonzero() {
         return None;
@@ -337,14 +354,7 @@ fn prebuilt_ll_exception_instance(
     let LowLevelValue::Ptr(vtable) = typeptr? else {
         return None;
     };
-    if !vtable.nonzero() {
-        return None;
-    }
-    let LowLevelValue::Ptr(name_ptr) = vtable.getattr("name").ok()? else {
-        return None;
-    };
-    let (bytes, _) = prebuilt_str_bytes_and_hash(&name_ptr)?;
-    String::from_utf8(bytes).ok()
+    vtable_class_name(&vtable)
 }
 
 fn ll_instance_field_is_default(
@@ -4594,6 +4604,19 @@ impl AssemblerEncode for Assembler {
             // with `majit_gc::subclass_range` (`exceptiondata.ll_issubclass`,
             // `jtransform.py` `goto_if_exception_mismatch`).
             ConstValue::LLPtr(ptr) => {
+                let typeptr = object_vtable_typeptr(ptr);
+                if let Some(name) = vtable_class_name(&typeptr) {
+                    let pytypes = callcontrol.map_or(&[][..], CallControl::exc_pytype_rows);
+                    if let Some((row_name, bits)) =
+                        lookup_exc_static_row_named(pytypes, &name, "_TYPE")
+                    {
+                        return self.emit_const_i_reloc(
+                            bits,
+                            ConstIRelocKind::StaticAddr { name: row_name },
+                            state,
+                        );
+                    }
+                }
                 let bits = rpython_exception_vtable_word(ptr);
                 self.emit_const_i(bits, state)
             }
@@ -11749,6 +11772,41 @@ mod tests {
         for class in [&stop, &base, &exc] {
             assert!(!body.constants_i.contains(&(class.identity_id() as i64)));
         }
+    }
+
+    /// `OverflowError` as a vtable `LLPtr` (`get_type_repr().convert_const`)
+    /// and as a `HostObject` pool the same pytype row and the same reloc.
+    #[test]
+    fn builtin_exception_vtable_llexitcase_pools_the_pytype_row() {
+        use crate::flowspace::model::HOST_ENV;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        use crate::translator::rtyper::rclass;
+
+        let overflow = HOST_ENV
+            .lookup_exception_class("OverflowError")
+            .expect("OverflowError");
+        let cc = cc_with_exc_rows(&[("interp_exceptions::EXC_OVERFLOW_ERROR_TYPE", 0x40)]);
+        let vtable_ty = resolved_object_vtable();
+        let mut vtable =
+            malloc(vtable_ty, None, MallocFlavor::Gc, true).expect("malloc OBJECT_VTABLE");
+        let name_ptr = rclass::alloc_array_name("OverflowError").expect("alloc_array_name");
+        vtable
+            .setattr("name", LowLevelValue::Ptr(Box::new(name_ptr)))
+            .expect("setattr name");
+        let host_body = assemble_mismatch(vec![ConstValue::HostObject(overflow)], Some(&cc));
+        let vtable_body = assemble_mismatch(vec![ConstValue::LLPtr(Box::new(vtable))], Some(&cc));
+        assert_eq!(host_body.code, vtable_body.code);
+        assert_eq!(host_body.constants_i, vtable_body.constants_i);
+        assert_eq!(host_body.reloc_consts_i, vtable_body.reloc_consts_i);
+        assert_eq!(host_body.constants_i, vec![0x40]);
+        assert_eq!(host_body.reloc_consts_i.len(), 1);
+        assert!(matches!(
+            &host_body.reloc_consts_i[0].kind,
+            crate::jitcode::ConstIRelocKind::StaticAddr { name }
+                if name.contains("EXC_OVERFLOW_ERROR_TYPE")
+        ));
     }
 
     #[test]

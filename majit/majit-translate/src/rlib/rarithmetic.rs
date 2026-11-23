@@ -218,6 +218,19 @@ fn seed_inttypes() -> HashMap<(bool, u16), KnownType> {
 pub static _inttypes: LazyLock<Mutex<HashMap<(bool, u16), KnownType>>> =
     LazyLock::new(|| Mutex::new(seed_inttypes()));
 
+/// RPython `r_longlong = build_int('r_longlong', True, 64)` (`rarithmetic.py`).
+/// `build_int` caches on `(sign, bits)`, so this is `r_int` when
+/// `LONG_BIT == 64`.
+pub fn r_longlong() -> KnownType {
+    *_inttypes.lock().get(&(true, 64)).expect("r_longlong")
+}
+
+/// RPython `r_ulonglong = build_int('r_ulonglong', False, 64)` (`rarithmetic.py`).
+/// Cached on `(sign, bits)`, so this is `r_uint` when `LONG_BIT == 64`.
+pub fn r_ulonglong() -> KnownType {
+    *_inttypes.lock().get(&(false, 64)).expect("r_ulonglong")
+}
+
 fn no_predefined_int(sign: bool, bits: u16) -> String {
     format!(
         "TypeError: No predefined {}int{}",

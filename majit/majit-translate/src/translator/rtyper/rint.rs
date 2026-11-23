@@ -770,16 +770,21 @@ pub fn unsigned_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `signedlonglong_repr = getintegerrepr(SignedLongLong, 'llong_')`
-/// (`rint.py`).
+/// (`rint.py`). On a 64-bit word `SignedLongLong is Signed`, so this is
+/// the `signed_repr` cache hit.
 pub fn signedlonglong_repr() -> Arc<IntegerRepr> {
-    static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
-    REPR.get_or_init(|| {
-        Arc::new(IntegerRepr::new(
-            LowLevelType::SignedLongLong,
-            Some("llong_"),
-        ))
-    })
-    .clone()
+    if crate::rlib::rarithmetic::long_bit() == 64 {
+        signed_repr()
+    } else {
+        static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
+        REPR.get_or_init(|| {
+            Arc::new(IntegerRepr::new(
+                LowLevelType::SignedLongLong,
+                Some("llong_"),
+            ))
+        })
+        .clone()
+    }
 }
 
 /// RPython `signedlonglonglong_repr =
@@ -796,16 +801,21 @@ pub fn signedlonglonglong_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `unsignedlonglong_repr = getintegerrepr(UnsignedLongLong, 'ullong_')`
-/// (`rint.py`).
+/// (`rint.py`). On a 64-bit word `UnsignedLongLong is Unsigned`, so this
+/// is the `unsigned_repr` cache hit.
 pub fn unsignedlonglong_repr() -> Arc<IntegerRepr> {
-    static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
-    REPR.get_or_init(|| {
-        Arc::new(IntegerRepr::new(
-            LowLevelType::UnsignedLongLong,
-            Some("ullong_"),
-        ))
-    })
-    .clone()
+    if crate::rlib::rarithmetic::long_bit() == 64 {
+        unsigned_repr()
+    } else {
+        static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
+        REPR.get_or_init(|| {
+            Arc::new(IntegerRepr::new(
+                LowLevelType::UnsignedLongLong,
+                Some("ullong_"),
+            ))
+        })
+        .clone()
+    }
 }
 
 /// RPython `unsignedlonglonglong_repr =
@@ -1488,7 +1498,8 @@ mod tests {
     use crate::flowspace::model::Variable;
     use crate::translator::rtyper::llinterp::eval_funcptr;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        _getconcretetype, build_number, getfunctionptr,
+        _getconcretetype, build_number, getfunctionptr, signed_long_long_for,
+        unsigned_long_long_for,
     };
     use crate::translator::rtyper::lltypesystem::rffi;
     use crate::translator::rtyper::rmodel::setupstate;
@@ -1541,10 +1552,25 @@ mod tests {
 
     #[test]
     fn unsigned_and_longlong_singletons_match_upstream_opprefixes() {
-        // rint.py:193-198.
+        // rint.py `getintegerrepr` prefixes. The 64-bit longlong
+        // singleton is `signed_repr`; the 32-bit prefix lives on a
+        // `_for(4)` IntegerRepr.
         assert_eq!(unsigned_repr().opprefix().unwrap(), "uint_");
-        assert_eq!(signedlonglong_repr().opprefix().unwrap(), "llong_");
-        assert_eq!(unsignedlonglong_repr().opprefix().unwrap(), "ullong_");
+        assert_eq!(signedlonglonglong_repr().opprefix().unwrap(), "lllong_");
+        assert_eq!(unsignedlonglonglong_repr().opprefix().unwrap(), "ulllong_");
+        let llong = IntegerRepr::new(signed_long_long_for(4), Some("llong_"));
+        assert_eq!(llong.opprefix().unwrap(), "llong_");
+        let ullong = IntegerRepr::new(unsigned_long_long_for(4), Some("ullong_"));
+        assert_eq!(ullong.opprefix().unwrap(), "ullong_");
+    }
+
+    #[test]
+    fn longlong_repr_is_the_signed_repr_on_64_bit() {
+        assert_eq!(crate::rlib::rarithmetic::long_bit(), 64);
+        assert!(Arc::ptr_eq(&signedlonglong_repr(), &signed_repr()));
+        assert_eq!(signedlonglong_repr().opprefix().unwrap(), "int_");
+        assert!(Arc::ptr_eq(&unsignedlonglong_repr(), &unsigned_repr()));
+        assert_eq!(unsignedlonglong_repr().opprefix().unwrap(), "uint_");
     }
 
     #[test]
@@ -1911,8 +1937,6 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         for (r, expected) in [
-            (signedlonglong_repr(), "truncate_longlong_to_int"),
-            (unsignedlonglong_repr(), "cast_primitive"),
             (signedlonglonglong_repr(), "cast_primitive"),
             (unsignedlonglonglong_repr(), "cast_primitive"),
         ] {
@@ -1926,6 +1950,21 @@ mod tests {
             assert_eq!(startblock.operations.len(), 1, "{}", llfn.name);
             assert_eq!(startblock.operations[0].opname, expected, "{}", llfn.name);
         }
+
+        let r = IntegerRepr::new(signed_long_long_for(4), Some("llong_"));
+        let llfn = r
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function")
+            .expect("returns Some helper");
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.operations.len(), 1, "{}", llfn.name);
+        assert_eq!(
+            startblock.operations[0].opname, "truncate_longlong_to_int",
+            "{}",
+            llfn.name
+        );
     }
 
     fn eval_helper(llfn: &LowLevelFunction, args: &[LowLevelValue]) -> LowLevelValue {

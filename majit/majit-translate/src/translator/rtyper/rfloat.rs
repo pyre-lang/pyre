@@ -34,7 +34,7 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, signed_long_long};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, constant_with_lltype, helper_pygraph_from_graph,
@@ -467,7 +467,19 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     // arithmetic.
     //
     // `bits = f.to_bits()` (rebinding f64 ↔ i64).
-    let bits = variable_with_lltype("bits", LowLevelType::SignedLongLong);
+    // `SignedLongLong = build_number("SignedLongLong", r_longlong)` is
+    // `Signed` when `r_longlong is r_int`, so the helper uses the `int_`
+    // prefix (`getintegerrepr` cache hit).
+    let bits_ty = signed_long_long();
+    let bits_prefix = match &bits_ty {
+        LowLevelType::Signed => "int_",
+        _ => "llong_",
+    };
+    let bits_cast_to_float = match &bits_ty {
+        LowLevelType::Signed => "cast_int_to_float",
+        _ => "cast_longlong_to_float",
+    };
+    let bits = variable_with_lltype("bits", bits_ty.clone());
     block_finite_nonzero
         .borrow_mut()
         .operations
@@ -476,35 +488,34 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
             vec![Hlvalue::Variable(f_nz)],
             Hlvalue::Variable(bits.clone()),
         ));
-    let llong_const =
-        |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::SignedLongLong);
+    let llong_const = |n: i64| constant_with_lltype(ConstValue::Int(n), bits_ty.clone());
     // `bits_high = bits >> 52`.
-    let bits_high = variable_with_lltype("bits_high", LowLevelType::SignedLongLong);
+    let bits_high = variable_with_lltype("bits_high", bits_ty.clone());
     block_finite_nonzero
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_rshift",
+            format!("{bits_prefix}rshift"),
             vec![Hlvalue::Variable(bits.clone()), llong_const(52)],
             Hlvalue::Variable(bits_high.clone()),
         ));
     // `exp_raw = bits_high & 0x7ff`.
-    let exp_raw = variable_with_lltype("exp_raw", LowLevelType::SignedLongLong);
+    let exp_raw = variable_with_lltype("exp_raw", bits_ty.clone());
     block_finite_nonzero
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_and",
+            format!("{bits_prefix}and"),
             vec![Hlvalue::Variable(bits_high), llong_const(0x7ff)],
             Hlvalue::Variable(exp_raw.clone()),
         ));
     // `mantissa_lo = bits & 0x000f_ffff_ffff_ffff`.
-    let mantissa_lo = variable_with_lltype("mantissa_lo", LowLevelType::SignedLongLong);
+    let mantissa_lo = variable_with_lltype("mantissa_lo", bits_ty.clone());
     block_finite_nonzero
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_and",
+            format!("{bits_prefix}and"),
             vec![
                 Hlvalue::Variable(bits.clone()),
                 llong_const(0x000f_ffff_ffff_ffff),
@@ -513,12 +524,12 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         ));
     // `sign_bit = bits & 0x8000_0000_0000_0000` — preserve IEEE 754
     // sign bit so `math.frexp(-x)` returns a negative mantissa.
-    let sign_bit = variable_with_lltype("sign_bit", LowLevelType::SignedLongLong);
+    let sign_bit = variable_with_lltype("sign_bit", bits_ty.clone());
     block_finite_nonzero
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_and",
+            format!("{bits_prefix}and"),
             vec![Hlvalue::Variable(bits), llong_const(i64::MIN)],
             Hlvalue::Variable(sign_bit.clone()),
         ));
@@ -530,32 +541,32 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_eq",
+            format!("{bits_prefix}eq"),
             vec![Hlvalue::Variable(exp_raw.clone()), llong_const(0)],
             Hlvalue::Variable(is_subnormal.clone()),
         ));
     block_finite_nonzero.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_subnormal));
 
     // Block layout for the post-extraction phase.
-    let mantissa_lo_for_sub = variable_with_lltype("mantissa_lo", LowLevelType::SignedLongLong);
-    let sign_bit_for_sub = variable_with_lltype("sign_bit", LowLevelType::SignedLongLong);
+    let mantissa_lo_for_sub = variable_with_lltype("mantissa_lo", bits_ty.clone());
+    let sign_bit_for_sub = variable_with_lltype("sign_bit", bits_ty.clone());
     let block_subnormal = Block::shared(vec![
         Hlvalue::Variable(mantissa_lo_for_sub.clone()),
         Hlvalue::Variable(sign_bit_for_sub.clone()),
     ]);
 
-    let exp_raw_for_normal = variable_with_lltype("exp_raw", LowLevelType::SignedLongLong);
-    let mantissa_lo_for_normal = variable_with_lltype("mantissa_lo", LowLevelType::SignedLongLong);
-    let sign_bit_for_normal = variable_with_lltype("sign_bit", LowLevelType::SignedLongLong);
+    let exp_raw_for_normal = variable_with_lltype("exp_raw", bits_ty.clone());
+    let mantissa_lo_for_normal = variable_with_lltype("mantissa_lo", bits_ty.clone());
+    let sign_bit_for_normal = variable_with_lltype("sign_bit", bits_ty.clone());
     let block_normal = Block::shared(vec![
         Hlvalue::Variable(exp_raw_for_normal.clone()),
         Hlvalue::Variable(mantissa_lo_for_normal.clone()),
         Hlvalue::Variable(sign_bit_for_normal.clone()),
     ]);
 
-    let expo_ll_for_join = variable_with_lltype("expo_ll", LowLevelType::SignedLongLong);
-    let mantissa_lo_for_join = variable_with_lltype("mantissa_lo", LowLevelType::SignedLongLong);
-    let sign_bit_for_join = variable_with_lltype("sign_bit", LowLevelType::SignedLongLong);
+    let expo_ll_for_join = variable_with_lltype("expo_ll", bits_ty.clone());
+    let mantissa_lo_for_join = variable_with_lltype("mantissa_lo", bits_ty.clone());
+    let sign_bit_for_join = variable_with_lltype("sign_bit", bits_ty.clone());
     let block_join = Block::shared(vec![
         Hlvalue::Variable(expo_ll_for_join.clone()),
         Hlvalue::Variable(mantissa_lo_for_join.clone()),
@@ -598,11 +609,11 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "cast_longlong_to_float",
+            bits_cast_to_float,
             vec![Hlvalue::Variable(mantissa_lo_for_sub.clone())],
             Hlvalue::Variable(mantissa_lo_as_float.clone()),
         ));
-    let mantissa_lo_bits = variable_with_lltype("mantissa_lo_bits", LowLevelType::SignedLongLong);
+    let mantissa_lo_bits = variable_with_lltype("mantissa_lo_bits", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
@@ -611,77 +622,74 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
             vec![Hlvalue::Variable(mantissa_lo_as_float)],
             Hlvalue::Variable(mantissa_lo_bits.clone()),
         ));
-    let mantissa_lo_exp_high =
-        variable_with_lltype("mantissa_lo_exp_high", LowLevelType::SignedLongLong);
+    let mantissa_lo_exp_high = variable_with_lltype("mantissa_lo_exp_high", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_rshift",
+            format!("{bits_prefix}rshift"),
             vec![Hlvalue::Variable(mantissa_lo_bits), llong_const(52)],
             Hlvalue::Variable(mantissa_lo_exp_high.clone()),
         ));
-    let mantissa_lo_exp = variable_with_lltype("mantissa_lo_exp", LowLevelType::SignedLongLong);
+    let mantissa_lo_exp = variable_with_lltype("mantissa_lo_exp", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_and",
+            format!("{bits_prefix}and"),
             vec![Hlvalue::Variable(mantissa_lo_exp_high), llong_const(0x7ff)],
             Hlvalue::Variable(mantissa_lo_exp.clone()),
         ));
     // `B = mantissa_lo_exp - 1023` (B in [0, 51]).
-    let b_pos = variable_with_lltype("b_pos", LowLevelType::SignedLongLong);
+    let b_pos = variable_with_lltype("b_pos", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_sub",
+            format!("{bits_prefix}sub"),
             vec![Hlvalue::Variable(mantissa_lo_exp), llong_const(1023)],
             Hlvalue::Variable(b_pos.clone()),
         ));
     // `expo_ll = B - 1073` — yields -1073..-1022 across full subnormal range.
-    let expo_ll_sub = variable_with_lltype("expo_ll", LowLevelType::SignedLongLong);
+    let expo_ll_sub = variable_with_lltype("expo_ll", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_sub",
+            format!("{bits_prefix}sub"),
             vec![Hlvalue::Variable(b_pos.clone()), llong_const(1073)],
             Hlvalue::Variable(expo_ll_sub.clone()),
         ));
     // `shift_amount = 52 - B` (in [1, 52]). Shift mantissa_lo so the
     // leading-1 lands at bit 52, then mask to the IEEE 754 fraction
     // field (bits 0..51) — the leading-1 then becomes the implicit bit.
-    let shift_amount = variable_with_lltype("shift_amount", LowLevelType::SignedLongLong);
+    let shift_amount = variable_with_lltype("shift_amount", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_sub",
+            format!("{bits_prefix}sub"),
             vec![llong_const(52), Hlvalue::Variable(b_pos)],
             Hlvalue::Variable(shift_amount.clone()),
         ));
-    let mantissa_lo_shifted =
-        variable_with_lltype("mantissa_lo_shifted", LowLevelType::SignedLongLong);
+    let mantissa_lo_shifted = variable_with_lltype("mantissa_lo_shifted", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_lshift",
+            format!("{bits_prefix}lshift"),
             vec![
                 Hlvalue::Variable(mantissa_lo_for_sub),
                 Hlvalue::Variable(shift_amount),
             ],
             Hlvalue::Variable(mantissa_lo_shifted.clone()),
         ));
-    let mantissa_lo_normalized_sub =
-        variable_with_lltype("mantissa_lo_norm", LowLevelType::SignedLongLong);
+    let mantissa_lo_normalized_sub = variable_with_lltype("mantissa_lo_norm", bits_ty.clone());
     block_subnormal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_and",
+            format!("{bits_prefix}and"),
             vec![
                 Hlvalue::Variable(mantissa_lo_shifted),
                 llong_const(0x000f_ffff_ffff_ffff),
@@ -704,12 +712,12 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     // block_normal: `expo_ll = exp_raw - 1022`. Normal floats
     // already encode (1 + frac/2^52) at bias 1023, so mantissa_lo
     // passes through unchanged.
-    let expo_ll_normal = variable_with_lltype("expo_ll", LowLevelType::SignedLongLong);
+    let expo_ll_normal = variable_with_lltype("expo_ll", bits_ty.clone());
     block_normal
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "llong_sub",
+            format!("{bits_prefix}sub"),
             vec![Hlvalue::Variable(exp_raw_for_normal), llong_const(1022)],
             Hlvalue::Variable(expo_ll_normal.clone()),
         ));
@@ -730,18 +738,18 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
     // PyPy's `_hash_float` arithmetic on it.
     //
     // `mantissa_bits = mantissa_lo_normalized | (1022 << 52) | sign_bit`.
-    let mantissa_unsigned = variable_with_lltype("mantissa_unsigned", LowLevelType::SignedLongLong);
+    let mantissa_unsigned = variable_with_lltype("mantissa_unsigned", bits_ty.clone());
     block_join.borrow_mut().operations.push(SpaceOperation::new(
-        "llong_or",
+        format!("{bits_prefix}or"),
         vec![
             Hlvalue::Variable(mantissa_lo_for_join),
             llong_const(0x3fe0_0000_0000_0000),
         ],
         Hlvalue::Variable(mantissa_unsigned.clone()),
     ));
-    let mantissa_bits = variable_with_lltype("mantissa_bits", LowLevelType::SignedLongLong);
+    let mantissa_bits = variable_with_lltype("mantissa_bits", bits_ty.clone());
     block_join.borrow_mut().operations.push(SpaceOperation::new(
-        "llong_or",
+        format!("{bits_prefix}or"),
         vec![
             Hlvalue::Variable(mantissa_unsigned),
             Hlvalue::Variable(sign_bit_for_join),
@@ -755,15 +763,19 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
         vec![Hlvalue::Variable(mantissa_bits)],
         Hlvalue::Variable(mantissa.clone()),
     ));
-    // Truncate `expo_ll` (SignedLongLong) → `expo` (Signed) for use
-    // with `int_lshift`. On 64-bit hosts both lltypes are 64-bit so
-    // this is a value-preserving cast for the small exponent range.
-    let expo = variable_with_lltype("expo", LowLevelType::Signed);
-    block_join.borrow_mut().operations.push(SpaceOperation::new(
-        "truncate_longlong_to_int",
-        vec![Hlvalue::Variable(expo_ll_for_join)],
-        Hlvalue::Variable(expo.clone()),
-    ));
+    // Truncate `expo_ll` → `expo` (Signed) for `int_lshift`. On a
+    // 64-bit word `signed_long_long()` is already `Signed`.
+    let expo = if matches!(bits_ty, LowLevelType::Signed) {
+        expo_ll_for_join
+    } else {
+        let expo = variable_with_lltype("expo", LowLevelType::Signed);
+        block_join.borrow_mut().operations.push(SpaceOperation::new(
+            "truncate_longlong_to_int",
+            vec![Hlvalue::Variable(expo_ll_for_join)],
+            Hlvalue::Variable(expo.clone()),
+        ));
+        expo
+    };
 
     // `TAKE_NEXT = 2**31 = 2147483648.0`.
     let take_next = || constant_with_lltype(ConstValue::float(2147483648.0), LowLevelType::Float);
@@ -1082,6 +1094,22 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let r = float_repr();
+        let bits_ty = signed_long_long();
+        let bits_prefix = match &bits_ty {
+            LowLevelType::Signed => "int_",
+            _ => "llong_",
+        };
+        let bits_cast_to_float = match &bits_ty {
+            LowLevelType::Signed => "cast_int_to_float",
+            _ => "cast_longlong_to_float",
+        };
+        let bits_op = |name: &str| format!("{bits_prefix}{name}");
+        let rshift = bits_op("rshift");
+        let and = bits_op("and");
+        let eq = bits_op("eq");
+        let sub_op = bits_op("sub");
+        let lshift = bits_op("lshift");
+        let or = bits_op("or");
 
         let llfn = r.get_ll_hash_function(&rtyper).unwrap().unwrap();
         let graph = llfn.graph.as_ref().unwrap();
@@ -1117,11 +1145,11 @@ mod tests {
             nz_ops,
             vec![
                 "convert_float_bytes_to_longlong",
-                "llong_rshift",
-                "llong_and", // exp_raw
-                "llong_and", // mantissa_lo
-                "llong_and", // sign_bit
-                "llong_eq",  // is_subnormal
+                rshift.as_str(),
+                and.as_str(), // exp_raw
+                and.as_str(), // mantissa_lo
+                and.as_str(), // sign_bit
+                eq.as_str(),  // is_subnormal
             ]
         );
         assert_eq!(nz.exits.len(), 2);
@@ -1137,15 +1165,15 @@ mod tests {
         assert_eq!(
             sub_ops,
             vec![
-                "cast_longlong_to_float",          // mantissa_lo as f64
+                bits_cast_to_float,                // mantissa_lo as f64
                 "convert_float_bytes_to_longlong", // back to bit pattern
-                "llong_rshift",                    // (>> 52)
-                "llong_and",                       // & 0x7ff -> 1023 + B
-                "llong_sub",                       // B = .. - 1023
-                "llong_sub",                       // expo_ll = B - 1073
-                "llong_sub",                       // shift_amount = 52 - B
-                "llong_lshift",                    // mantissa_lo << shift_amount
-                "llong_and",                       // & 0x000fffffffffffff
+                rshift.as_str(),                   // (>> 52)
+                and.as_str(),                      // & 0x7ff -> 1023 + B
+                sub_op.as_str(),                   // B = .. - 1023
+                sub_op.as_str(),                   // expo_ll = B - 1073
+                sub_op.as_str(),                   // shift_amount = 52 - B
+                lshift.as_str(),                   // mantissa_lo << shift_amount
+                and.as_str(),                      // & 0x000fffffffffffff
             ]
         );
 
@@ -1160,7 +1188,7 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(norm_ops, vec!["llong_sub"]);
+        assert_eq!(norm_ops, vec![sub_op.as_str()]);
 
         // block_join — both branches converge here. Single exit; ops
         // assemble mantissa_bits then run PyPy's _hash_float arithmetic.
@@ -1174,25 +1202,22 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(
-            join_ops,
-            vec![
-                "llong_or", // mantissa_unsigned
-                "llong_or", // mantissa_bits = mantissa_unsigned | sign_bit
-                "convert_longlong_bytes_to_float",
-                "truncate_longlong_to_int", // expo
-                // _hash_float arithmetic (rlib/objectmodel.py).
-                "float_mul",
-                "cast_float_to_int",
-                "cast_int_to_float",
-                "float_sub",
-                "float_mul",
-                "cast_float_to_int",
-                "int_lshift",
-                "int_add",
-                "int_add",
-            ]
-        );
+        let mut join_expected = vec![or.as_str(), or.as_str(), "convert_longlong_bytes_to_float"];
+        if !matches!(bits_ty, LowLevelType::Signed) {
+            join_expected.push("truncate_longlong_to_int");
+        }
+        join_expected.extend([
+            "float_mul",
+            "cast_float_to_int",
+            "cast_int_to_float",
+            "float_sub",
+            "float_mul",
+            "cast_float_to_int",
+            "int_lshift",
+            "int_add",
+            "int_add",
+        ]);
+        assert_eq!(join_ops, join_expected);
     }
 
     #[test]

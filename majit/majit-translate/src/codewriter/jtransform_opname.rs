@@ -71,6 +71,7 @@ use std::rc::Rc;
 use crate::flowspace::model::Variable as FVar;
 use crate::flowspace::model::{
     Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, GraphRef, Hlvalue,
+    HostObject,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
@@ -130,7 +131,7 @@ impl StrFamily {
 /// `crate::flowspace::model::Variable` type and carry their `concretetype`
 /// cell through unchanged, so no value-bridge round-trip is needed.
 pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
-    lower_graph_with_callees(graph, &|_| None)
+    lower_graph_with_callees(graph, &|_| None, None)
 }
 
 /// Lower `graph`, resolving each `direct_call` / `jit_conditional_call`
@@ -147,6 +148,7 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
 pub fn lower_graph_with_callees(
     graph: &FlowGraph,
     callee_path: &dyn Fn(&GraphRef) -> Option<CallPath>,
+    carrier_class: Option<&HostObject>,
 ) -> crate::model::FunctionGraph {
     let mut out = crate::model::FunctionGraph::new(graph.name.clone());
     let family = detect_family(graph);
@@ -260,7 +262,7 @@ pub fn lower_graph_with_callees(
                     })
                     .collect();
                 let exitcase = match &link.exitcase {
-                    Some(Hlvalue::Constant(c)) => exitcase_from_const(&c.value),
+                    Some(Hlvalue::Constant(c)) => exitcase_from_const(&c.value, carrier_class),
                     _ => None,
                 };
                 let mut model_link = Link::new_mixed(args, target_id, exitcase);
@@ -278,6 +280,16 @@ pub fn lower_graph_with_callees(
                     .last_exc_value
                     .as_ref()
                     .map(|hlv| linkarg_from_hlvalue(rename_void_hlvalue(hlv, &void_renamings)));
+                // `flatten.py insert_exits` reads `link.llexitcase`.
+                // `RPythonTyper._convert_link` already stored the low-level
+                // constant on the flowspace link; copy it. Do not recompute.
+                model_link.llexitcase = match &link.llexitcase {
+                    Some(Hlvalue::Constant(c)) => Some(c.value.clone()),
+                    None => model_link.llexitcase,
+                    Some(other) => panic!(
+                        "jtransform_opname::lower_graph: llexitcase is not a Constant: {other:?}"
+                    ),
+                };
                 model_link
             })
             .collect();
@@ -2866,9 +2878,14 @@ fn assert_rtyped_link_constant_kind(graph_name: &str, c: &Constant, target: &FVa
 }
 
 /// Map a flowspace exitcase constant to the model `ExitCase`.
-fn exitcase_from_const(value: &ConstValue) -> Option<ExitCase> {
+/// Inverse of `flowspace_adapter::exitcase_to_hlvalue`: the carrier class
+/// HostObject is `ExitCase::ErrorCarrier`, compared by identity.
+fn exitcase_from_const(value: &ConstValue, carrier_class: Option<&HostObject>) -> Option<ExitCase> {
     match value {
         ConstValue::Bool(b) => Some(ExitCase::Bool(*b)),
+        ConstValue::HostObject(obj) if carrier_class.is_some_and(|carrier| carrier == obj) => {
+            Some(ExitCase::ErrorCarrier)
+        }
         other => Some(ExitCase::Const(other.clone())),
     }
 }
@@ -4091,6 +4108,162 @@ mod tests {
         assert_eq!(canraise_blocks, 1, "exactly one c_last_exception block");
     }
 
+    /// `RPythonTyper._convert_link` stores the low-level class constant on
+    /// the flowspace link. `lower_graph` copies that `llexitcase` onto the
+    /// model link (`flatten.py insert_exits`).
+    #[test]
+    fn lowered_typed_exception_link_carries_the_rtyper_llexitcase() {
+        use crate::translator::rtyper::rtyper::exception_args;
+
+        let overflow = exception_args("OverflowError").expect("OverflowError args");
+        let a = variable_with_lltype("a", LowLevelType::Signed);
+        let b = variable_with_lltype("b", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        let ret = variable_with_lltype("result", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_typed_exc_llexitcase",
+            start.clone(),
+            Hlvalue::Variable(ret),
+        );
+        let sum = variable_with_lltype("sum", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add_ovf",
+            vec![Hlvalue::Variable(a), Hlvalue::Variable(b)],
+            Hlvalue::Variable(sum.clone()),
+        ));
+        start.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let rtyper_llexitcase = ConstValue::Int(0x51);
+        let handler = Block::shared(vec![]);
+        handler.closeblock(vec![
+            Link::new(overflow.clone(), Some(graph.exceptblock.clone()), None).into_ref(),
+        ]);
+        let normal = Link::new(
+            vec![Hlvalue::Variable(sum)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut exc = Link::new(vec![], Some(handler), Some(overflow[0].clone()));
+        exc.extravars(Some(overflow[0].clone()), Some(overflow[1].clone()));
+        exc.llexitcase = Some(Hlvalue::Constant(Constant::new(rtyper_llexitcase.clone())));
+        start.closeblock(vec![normal, exc.into_ref()]);
+
+        let model = lower_graph(&graph);
+        let start = model.block(model.startblock);
+        let exc_exit = start
+            .exits
+            .iter()
+            .find(|l| l.exitcase.is_some())
+            .expect("typed OverflowError exit");
+        assert_eq!(
+            exc_exit.llexitcase.as_ref(),
+            Some(&rtyper_llexitcase),
+            "model link must carry the rtyper llexitcase, not recompute it"
+        );
+    }
+
+    /// Inverse of `flowspace_adapter::exitcase_to_hlvalue`: the bookkeeper's
+    /// carrier class HostObject lowers to `ExitCase::ErrorCarrier` by identity.
+    #[test]
+    fn carrier_class_exitcase_lowers_to_the_error_carrier_case() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::flowspace::model::HostObject;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_exception_carrier("error::PyErrorObject");
+        let carrier = bk
+            .exception_carrier_class()
+            .expect("bookkeeper mints the carrier class");
+        let a = variable_with_lltype("a", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(a.clone())]);
+        let ret = variable_with_lltype("result", LowLevelType::Signed);
+        let graph =
+            FlowGraph::with_return_var("ll_carrier_catch", start.clone(), Hlvalue::Variable(ret));
+        start.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let handler = Block::shared(vec![]);
+        handler.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(a.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let normal = Link::new(
+            vec![Hlvalue::Variable(a.clone())],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut exc = Link::new(
+            vec![],
+            Some(handler),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                carrier.clone(),
+            )))),
+        );
+        exc.extravars(None, None);
+        start.closeblock(vec![normal, exc.into_ref()]);
+
+        let model = lower_graph_with_callees(&graph, &|_| None, Some(&carrier));
+        let start = model.block(model.startblock);
+        let exc_exit = start
+            .exits
+            .iter()
+            .find(|l| l.exitcase.is_some())
+            .expect("carrier exception exit");
+        assert_eq!(exc_exit.exitcase, Some(ExitCase::ErrorCarrier));
+
+        let other = HostObject::new_class("error::PyErrorObject", Vec::new());
+        let start_other = Block::shared(vec![Hlvalue::Variable(a.clone())]);
+        let graph_other = FlowGraph::with_return_var(
+            "ll_carrier_catch_other",
+            start_other.clone(),
+            Hlvalue::Variable(variable_with_lltype("result", LowLevelType::Signed)),
+        );
+        start_other.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let handler_other = Block::shared(vec![]);
+        handler_other.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(a.clone())],
+                Some(graph_other.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let normal_other = Link::new(
+            vec![Hlvalue::Variable(a)],
+            Some(graph_other.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut exc_other = Link::new(
+            vec![],
+            Some(handler_other),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                other,
+            )))),
+        );
+        exc_other.extravars(None, None);
+        start_other.closeblock(vec![normal_other, exc_other.into_ref()]);
+        let model_other = lower_graph_with_callees(&graph_other, &|_| None, Some(&carrier));
+        let other_exit = model_other
+            .block(model_other.startblock)
+            .exits
+            .iter()
+            .find(|l| l.exitcase.is_some())
+            .expect("same-name host exit");
+        assert_ne!(other_exit.exitcase, Some(ExitCase::ErrorCarrier));
+        assert!(matches!(
+            other_exit.exitcase,
+            Some(ExitCase::Const(ConstValue::HostObject(_)))
+        ));
+    }
+
     /// `ll_bool(builder)` drains end-to-end with NO struct layout registered:
     /// its only opname is `ptr_ne(builder, NULL)`, which lowers to the unary
     /// `ptr_nonzero` and assembles to an `int_is_true`-family bytecode with no
@@ -4735,9 +4908,11 @@ mod tests {
         let flow = flow_graph_direct_calling(funcptr);
         let key = crate::flowspace::model::GraphKey::of(&callee_graph);
         let resolved = crate::parse::CallPath::from_segments(["T", "m"]);
-        let model = lower_graph_with_callees(&flow, &|g| {
-            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
-        });
+        let model = lower_graph_with_callees(
+            &flow,
+            &|g| (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone()),
+            None,
+        );
         assert_eq!(
             lowered_direct_call_target(&model),
             crate::model::CallTarget::from_call_path(&resolved)
@@ -4755,9 +4930,11 @@ mod tests {
             segments: vec!["T".into(), "m".into()],
             specialization: crate::parse::GraphSpecialization::AccessDirect,
         };
-        let model = lower_graph_with_callees(&flow, &|g| {
-            (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone())
-        });
+        let model = lower_graph_with_callees(
+            &flow,
+            &|g| (crate::flowspace::model::GraphKey::of(g) == key).then(|| resolved.clone()),
+            None,
+        );
         assert_eq!(
             lowered_direct_call_target(&model),
             crate::model::CallTarget::from_call_path(&resolved)
@@ -4770,7 +4947,7 @@ mod tests {
     fn lower_graph_direct_call_without_subject_graph_uses_func_name() {
         let (funcptr, _callee_graph) = funcptr_named_with_graph("a::<Impl>::m");
         let flow = flow_graph_direct_calling(funcptr);
-        let model = lower_graph_with_callees(&flow, &|_| None);
+        let model = lower_graph_with_callees(&flow, &|_| None, None);
         assert_eq!(
             lowered_direct_call_target(&model),
             crate::model::CallTarget::function_path(["a", "<Impl>", "m"])

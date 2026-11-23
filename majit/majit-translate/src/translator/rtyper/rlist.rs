@@ -29,6 +29,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory::{itemoffsetof, sizeof};
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, GCREF, GcKind, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
+    signed_long_long,
 };
 use crate::translator::rtyper::lltypesystem::rbuilder::close_ovfcheck_block;
 use crate::translator::rtyper::lltypesystem::rstr::{
@@ -6097,13 +6098,18 @@ fn emit_zero_or_null(block: &BlockRef, item_lltype: &LowLevelType, item: Hlvalue
             // `_ll_zero_or_null` (`rlist.py`): Float is a Primitive, so
             // `not item`. IEEE `not -0.0` is true and would take the
             // cleared arm (`+0.0`); compare bits so only `+0.0` clears.
-            let bits = variable_with_lltype("check", LowLevelType::SignedLongLong);
+            let bits_ty = signed_long_long();
+            let is_true = match &bits_ty {
+                LowLevelType::Signed => "int_is_true",
+                _ => "llong_is_true",
+            };
+            let bits = variable_with_lltype("check", bits_ty);
             block.borrow_mut().operations.push(SpaceOperation::new(
                 "convert_float_bytes_to_longlong",
                 vec![item],
                 Hlvalue::Variable(bits.clone()),
             ));
-            ("llong_is_true", Hlvalue::Variable(bits))
+            (is_true, Hlvalue::Variable(bits))
         }
         LowLevelType::SingleFloat => {
             // Same bit test as Float. `cast_singlefloat_to_float`
@@ -6115,13 +6121,18 @@ fn emit_zero_or_null(block: &BlockRef, item_lltype: &LowLevelType, item: Hlvalue
                 vec![item],
                 Hlvalue::Variable(as_float.clone()),
             ));
-            let bits = variable_with_lltype("check", LowLevelType::SignedLongLong);
+            let bits_ty = signed_long_long();
+            let is_true = match &bits_ty {
+                LowLevelType::Signed => "int_is_true",
+                _ => "llong_is_true",
+            };
+            let bits = variable_with_lltype("check", bits_ty);
             block.borrow_mut().operations.push(SpaceOperation::new(
                 "convert_float_bytes_to_longlong",
                 vec![Hlvalue::Variable(as_float)],
                 Hlvalue::Variable(bits.clone()),
             ));
-            ("llong_is_true", Hlvalue::Variable(bits))
+            (is_true, Hlvalue::Variable(bits))
         }
         LowLevelType::LongFloat => ("float_is_true", item),
         LowLevelType::Ptr(_) | LowLevelType::Address => ("ptr_nonzero", item),
@@ -15327,20 +15338,20 @@ mod tests {
             probe(LowLevelType::UniChar),
             vec!["cast_unichar_to_int", "int_is_true", "bool_not"]
         );
+        let bits_is_true = match signed_long_long() {
+            LowLevelType::Signed => "int_is_true",
+            _ => "llong_is_true",
+        };
         assert_eq!(
             probe(LowLevelType::Float),
-            vec![
-                "convert_float_bytes_to_longlong",
-                "llong_is_true",
-                "bool_not"
-            ]
+            vec!["convert_float_bytes_to_longlong", bits_is_true, "bool_not"]
         );
         assert_eq!(
             probe(LowLevelType::SingleFloat),
             vec![
                 "cast_singlefloat_to_float",
                 "convert_float_bytes_to_longlong",
-                "llong_is_true",
+                bits_is_true,
                 "bool_not"
             ]
         );

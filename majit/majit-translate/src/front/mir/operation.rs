@@ -9694,35 +9694,55 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 // A `FnPtrCell<F>` static (`global_hook!`) or a
-                // `OnceLock<T>` static (`oncelock_fn_static!`,
-                // `define_prebuilt_dict_strategy_ref`) is a prebuilt
-                // constant (`bookkeeper.py Bookkeeper.immutablevalue` /
-                // `llmemory.Address`).
+                // `OnceLock<fn>` static (`oncelock_fn_static!`) is a
+                // raw host function address (`bookkeeper.py
+                // Bookkeeper.immutablevalue` / `llmemory.Address`).
+                // `raw_load` of that word is int-kinded, so the
+                // ConstRefAddr result is Address.
+                //
+                // A refs-row `OnceLock<T>` whose payload is not a
+                // function pointer (`OnceLock<usize>` singletons:
+                // `define_prebuilt_dict_strategy_ref`, `w_none`) is
+                // the prebuilt GC object itself (`cache.py
+                // Cache.getorbuild`, `baseobjspace.py fromcache`).
+                // `rclass.py InstanceRepr.convert_const` turns that
+                // into a GC `Ptr` constant; there is never an integer
+                // stage. Leave the result typed as the ordinary
+                // refs-row ConstRefAddr (Unknown): the adapter last
+                // arm (`const_ref_addr_define_hlvalue`) then produces
+                // the GCREF constant.
+                //
                 // The cell is not a class instance: wrapping it in
                 // `__cast_instance_intrinsic` would mint
                 // `SomeInstance(OnceLock)` and drop the subsequent
                 // `get` / `get_or_init`. `OnceLock<fn>::get` is a load
                 // of `Option<Ptr(FuncType)>`; `get_or_init` of a
-                // refs-keyed singleton is the registered object
-                // (`cache.py Cache.getorbuild` specialize:memo,
-                // `baseobjspace.py fromcache`).
+                // refs-keyed singleton is the registered object.
                 // `refs_static_struct_root` already returns None for
                 // OnceLock; this lane must run before
                 // `tyref_class_root_with` re-wraps a harvested
                 // `std`/`core` Struct (`foreign_body_generic_struct`).
                 // Emit the bare `ConstRefAddr`, keyed on the
-                // GlobalDecl's type.
+                // GlobalDecl's type. Refs-row is `static_addr_op`;
+                // fn payload is `tyref_is_fnptrcell` /
+                // `tyref_is_oncelock_fn`.
                 if (tyref_is_fnptrcell(&place_ty, self.llbc)
                     || tyref_is_oncelock(&place_ty, self.llbc))
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                    res.set_concretetype(Some(
-                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
-                    ));
+                    let stamp_fn_address = tyref_is_fnptrcell(&place_ty, self.llbc)
+                        || tyref_is_oncelock_fn(&place_ty, self.llbc);
+                    let res = self.graph.alloc_value_var_with_type(if stamp_fn_address {
+                        crate::model::ConcreteType::Signed
+                    } else {
+                        crate::model::ConcreteType::Unknown
+                    });
+                    if stamp_fn_address {
+                        res.set_concretetype(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+                        ));
+                    }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: op,
