@@ -7660,11 +7660,30 @@ fn arraydescrof(
         None => 0,
         Some(off) => off + crate::layout::target_word_size(),
     };
+    let identity = match pool_id.as_deref() {
+        Some(id) => id.to_owned(),
+        None => format!(
+            "__anon_array[item_type={item_type:?};len_offset={len_offset:?};\
+             base_size={base_size};itemsize={itemsize}]"
+        ),
+    };
+    let cache_key = majit_ir::descr::array_identity_hash(&identity);
+    let _ = majit_ir::descr::gc_cache().lock().get_array_descr(
+        majit_ir::descr::LLType::Array(cache_key),
+        base_size,
+        itemsize,
+        flag,
+        item_type,
+        len_offset.is_none(),
+        len_offset.unwrap_or(0),
+        false,
+        '\x00',
+    );
     crate::jitcode::BhDescr::Array {
         base_size,
         itemsize,
         len_offset,
-        type_id: 0,
+        type_id: cache_key,
         gc_type_id: 0,
         item_type,
         is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
@@ -7675,8 +7694,9 @@ fn arraydescrof(
         // path that needs EffectInfo heap invalidation must pass CallControl
         // so `arraydescrof_for_type` can publish the real `ei_index`.
         ei_index: u32::MAX,
-        // Same interned-ARRAY spelling as the CallControl path.
-        array_type_id: pool_id,
+        // Same interned-ARRAY spelling as the CallControl path; a missing
+        // spelling keeps the anonymous shape identity `type_id` hashed.
+        array_type_id: Some(identity),
         interior_fields: Vec::new(),
         // Shape-only fallback is for GC arrays; the raw `pool_arrays`
         // base is minted only via `add_ptr_array_descr`.
@@ -16124,9 +16144,9 @@ mod tests {
             .graph;
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
 
         assert!(
             asm.insns.contains_key("arraylen_vable/rdd>i"),
@@ -16180,6 +16200,13 @@ mod tests {
         // 2B adescr + 1B dest`, each index little-endian.  A swapped emission
         // would still leave the pool in this order and still key
         // `arraylen_vable/rdd>i`.
+        let flat = body
+            ._ssarepr
+            .as_ref()
+            .expect("assemble records _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
         let op_index = flat
             .insns
             .iter()
@@ -16361,7 +16388,7 @@ mod tests {
             let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
             let mut flat = flatten_graph(&rewritten, &mut regallocs);
             let mut asm = Assembler::new();
-            let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
             assert!(
                 asm.insns.contains_key("arraylen_vable/rdd>i"),
                 "vable arraylen must assemble without unique vinfo, got {:?}",
@@ -16523,7 +16550,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         for key in [
             "getarrayitem_vable_i/ridd>i",
             "setarrayitem_vable_i/riidd",
@@ -16642,7 +16669,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         let key = "setarrayitem_vable_i/riidd";
         let Some(&opnum) = asm.insns.get(key) else {
             panic!(

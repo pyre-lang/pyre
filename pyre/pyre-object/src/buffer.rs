@@ -314,7 +314,16 @@ impl Buffer {
                     }
                 }
                 Buffer::Byte { w_obj } => {
-                    Ok(crate::bytearrayobject::w_bytearray_data(*w_obj).as_ptr() as *mut u8)
+                    // `BytearrayBuffer.get_raw_address`:
+                    // `nonmoving_raw_ptr_for_resizable_list` then `ptradd`
+                    // of `ba._offset`. pyre keeps the live payload at
+                    // `chars[0]`; a `Sub` window adds its own offset.
+                    let addr = crate::bytearrayobject::w_bytearray_raw_address(*w_obj);
+                    if addr == 0 {
+                        Err(RawAddressError::Memory)
+                    } else {
+                        Ok(addr as *mut u8)
+                    }
                 }
                 Buffer::Array { w_obj } => {
                     Ok(crate::interp_array::w_array_bytes(*w_obj).as_ptr() as *mut u8)

@@ -3262,11 +3262,11 @@ pub(crate) struct CrateLoweringState {
     /// GC-schema path uses (leaf and crate-stripped path).
     immutable_fields: ImmutableFieldsTable,
     dont_look_inside: std::collections::HashSet<String>,
-    /// Harvested `oopspec:jit.*` paths from `func_hints` (the
-    /// whole-program union when the provider filled that map). Residual
-    /// `&Scalar` spills skip those callees: jtransform rewrites them to
-    /// a box query (`jit.isconstant`) instead of the rustc pointer ABI.
-    /// `ordereddict.lookup` still residual-executes the rustc trampoline.
+    /// Harvested `oopspec:` paths from `func_hints` (the whole-program
+    /// union when the provider filled that map). Residual `&Scalar`
+    /// spills skip those callees: `jtransform.py` `handle_builtin_call`
+    /// rewrites them (`_handle_jit_call`, `_handle_dict_lookup_call` /
+    /// `OS_DICT_LOOKUP`, …) instead of the rustc `&T` pointer ABI.
     oopspec_fns: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
@@ -3554,7 +3554,7 @@ impl CrateLoweringState {
             .filter(|(_, hints)| {
                 hints.iter().any(|hint| {
                     hint.strip_prefix("oopspec:")
-                        .is_some_and(|spec| spec.starts_with("jit."))
+                        .is_some_and(|spec| !spec.is_empty())
                 })
             })
             .map(|(path, _)| path.clone())
@@ -8088,32 +8088,81 @@ fn derive_program_metadata(
         );
     }
 
-    // `core::alloc::layout::Layout` is Opaque. It is the two-word
-    // `{size, align}` aggregate (`from_size_align.rs`); Charon has no
-    // field rows. `__pos_0` is size at 0, `__pos_1` is align at one word.
-    let layout_path = "core::alloc::layout::Layout";
-    if llbc
-        .iter_type_decls()
-        .any(|td| td.item_meta.name_path_str() == layout_path)
-    {
+    // `core::alloc::layout::Layout` is an Opaque core TypeDecl: Charon does
+    // not publish `{size, align}`, but `from_size_align::build_layout_aggregate`
+    // writes `__pos_0` / `__pos_1`. The niladic struct ctor lowers to
+    // `OpKind::New` (`jtransform` `struct_ctor_alloc_owner`), which needs a
+    // fieldful SizeDescr so the collector issues a type id. Same metadata
+    // shape as `Constants` / `Complex` above: rows on the real value, gated
+    // on `is_layout_adt_owner` so an unrelated local `Layout` is not given
+    // this shape. `__pos_0` is size at 0, `__pos_1` is align at one word.
+    //
+    // Identity is the crate-stripped path (`struct_id_for_type_decl`), not
+    // a hardcoded `alloc::layout::Layout` spelling: a TypeDecl already
+    // named `alloc::layout::Layout` hashes as `layout::Layout`. A second
+    // id on the same qualified keys would collapse them to `None`
+    // (`record_layout_struct_id`) and `harden_duplicate_leaf_metadata`
+    // would then keep the bare leaf (`unique_declarations` skips `None`).
+    // The bare leaf is first-writer (`Constants` `or_insert`): two
+    // declarations sharing `Layout` keep the earlier row, and a second
+    // identity on that spelling becomes `None` (`bookkeeper.py`
+    // `getuniqueclassdef`, `MirGraphLookup::insert_or_mark_ambiguous`).
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path_str().to_string();
+        if !crate::front::from_size_align::is_layout_adt_owner(&name) {
+            continue;
+        }
+        if struct_fields
+            .fields
+            .get(&name)
+            .is_some_and(|rows| rows.iter().any(|row| row.name == "__pos_0"))
+        {
+            continue;
+        }
         let rows = vec![
             crate::front::semantic::FieldRow::positional("__pos_0", "usize"),
             crate::front::semantic::FieldRow::positional("__pos_1", "usize"),
         ];
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
-            struct_fields.fields.insert(key.to_string(), rows.clone());
-            known_struct_names.insert(key.to_string());
-        }
-        let sid = majit_ir::descr::StructId::from_canonical("alloc::layout::Layout");
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
+        let canonical_name = strip_crate_prefix(&name);
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
+        for key in [name.clone(), canonical_name.clone()] {
+            struct_fields.fields.insert(key.clone(), rows.clone());
+            known_struct_names.insert(key.clone());
             record_struct_id(
                 &mut struct_ids,
                 &mut struct_fields.class_identity,
-                key.to_string(),
+                key,
                 sid,
-                "alloc::layout::Layout",
+                &canonical_name,
             );
         }
+        struct_fields
+            .fields
+            .entry(leaf.clone())
+            .or_insert_with(|| rows.clone());
+        known_struct_names.insert(leaf.clone());
+        record_struct_id(
+            &mut struct_ids,
+            &mut struct_fields.class_identity,
+            leaf.clone(),
+            sid,
+            &canonical_name,
+        );
+        let segs: Vec<&str> = name.split("::").collect();
+        let module = if segs.len() >= 2 {
+            segs[1..segs.len() - 1].join("::")
+        } else {
+            String::new()
+        };
+        struct_origins.entry(leaf).or_insert(module);
+        struct_field_attrs.insert(
+            canonical_name,
+            vec![
+                ("__pos_0".to_string(), ValueType::Unsigned),
+                ("__pos_1".to_string(), ValueType::Unsigned),
+            ],
+        );
         let word = crate::layout::target_word_size() as u64;
         let mut field_offsets = std::collections::HashMap::new();
         field_offsets.insert("__pos_0".to_string(), 0);

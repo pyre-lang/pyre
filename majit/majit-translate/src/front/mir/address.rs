@@ -202,10 +202,13 @@ pub(in crate::front::mir) struct FunctionScopeCell {
     pub(in crate::front::mir) place: Place,
 }
 
-/// FunDecl paths that carry an `oopspec:jit.*` marker const.
-/// jtransform rewrites those calls to a box query (`jit.isconstant`)
-/// instead of the rustc `&T` pointer ABI. `ordereddict.lookup` still
-/// residual-executes the trampoline and is not in this set.
+/// FunDecl paths that carry an `oopspec:` marker const.
+///
+/// Residual `&Scalar` spills skip those callees: `jtransform.py`
+/// `handle_builtin_call` rewrites the call (`_handle_jit_call`,
+/// `_handle_dict_lookup_call` / `OS_DICT_LOOKUP`, …) instead of the
+/// rustc `&T` pointer ABI. Copy-sized keys stay one residual word
+/// (`lookup_key_jit_abi` `with_residual_key`).
 pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> &std::collections::HashSet<String> {
     llbc_derived(llbc)
         .oopspec_fn_paths
@@ -216,27 +219,36 @@ fn collect_oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for gd in llbc.iter_global_decls() {
         let path = gd.item_meta.name_path_stripped().to_string();
-        let Some((module, leaf)) = path.rsplit_once("::") else {
-            continue;
-        };
-        let Some(fn_leaf) = leaf.strip_prefix("oopspec_") else {
-            continue;
-        };
         let Some(spec) = crate::front::llbc_hints::global_marker_str(llbc, gd) else {
             continue;
         };
-        if !spec.starts_with("jit.") {
+        if spec.is_empty() {
             continue;
         }
-        out.insert(format!("{module}::{fn_leaf}"));
-        // Body-local marker: `<fn_path>::oopspec_<leaf>` — `module` is
-        // already the function path.
-        out.insert(module.to_string());
+        match path.rsplit_once("::") {
+            Some((module, leaf)) => {
+                let Some(fn_leaf) = leaf.strip_prefix("oopspec_") else {
+                    continue;
+                };
+                out.insert(format!("{module}::{fn_leaf}"));
+                // Body-local marker: `<fn_path>::oopspec_<leaf>` — `module` is
+                // already the function path.
+                out.insert(module.to_string());
+            }
+            None => {
+                // `llbc_hints::marker_path_to_fn_path` None arm: the
+                // crate-stripped `oopspec_<leaf>` names the function leaf.
+                let Some(fn_leaf) = path.strip_prefix("oopspec_") else {
+                    continue;
+                };
+                out.insert(fn_leaf.to_string());
+            }
+        }
     }
     out
 }
 
-/// Membership of artefact-local `oopspec:jit.*` paths plus the program set.
+/// Membership of artefact-local `oopspec:` paths plus the program set.
 #[derive(Clone, Copy)]
 pub(in crate::front::mir) struct OopspecFns<'a> {
     local: &'a std::collections::HashSet<String>,
@@ -1893,11 +1905,12 @@ impl<'a> Lowering<'a> {
     /// spill address when that pointer names a place spilled by
     /// another argument. An `&mut i64` parameter of a look-inside
     /// callee is the word on both sides and is left alone. A residual
-    /// callee's `&T` of a copy word is a pointer in the residual
-    /// ABI (`ResidualSlot` for `&T`), so the aliased word is stored
-    /// in the same cell and the address is passed. A callee with an
-    /// `oopspec:jit.*` hint is skipped: jtransform rewrites that call
-    /// to a box query. A byte pointer stays `Ref`.
+    /// callee's `&T` of a copy word is a pointer in the rustc residual
+    /// ABI, so the aliased word is stored in the same cell and the
+    /// address is passed. A callee with an `oopspec:` hint is skipped:
+    /// `jtransform.py` `handle_builtin_call` rewrites that call
+    /// (`_handle_jit_call`, `_handle_dict_lookup_call`, …). A byte
+    /// pointer stays `Ref`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,

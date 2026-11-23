@@ -2,7 +2,9 @@
 # pyre-check: selfcheck-compiles=entry-bridge:_rlistdir
 # The inner `_rlistdir` next is a residual StopIteration from
 # `ll_generatorentry_portal_runner_shim` (several_yields portal). `join`'s
-# ForIter then fails a non-exception guard inside the compiled `_rlistdir` entry bridge.
+# ForIter then fails a non-exception guard inside the compiled `_rlistdir` entry bridge. The PyPy
+# jit-log-opt oracle records its FOR_ITER traces as entry bridges; removing
+# pyre's visited-header entry synthesizer preserves that trace kind.
 # pyopcode.py FOR_ITER `e.match(StopIteration)` already consumed that publish;
 # blackhole.py `_prepare_resume_from_failure` must not re-raise it, or
 # generator.py `_leak_stopiteration` reports

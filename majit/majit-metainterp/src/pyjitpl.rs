@@ -4137,6 +4137,11 @@ impl<M: Clone> MetaInterp<M> {
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
         }
+        // Production FBW encodes then clears `snapshots`; ConstPtr boxes
+        // named by that last snapshot still live here.
+        for op in &trace_ctx.encoded_snapshot_live_refs {
+            op.trace_const_ptr(&mut visitor);
+        }
         // pyjitpl.py `MetaInterp.virtualref_boxes`: each pair is
         // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
         // `box.getref_base()` for the concrete `JitVirtualRef*`.
@@ -4243,6 +4248,13 @@ impl<M: Clone> MetaInterp<M> {
                     Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
                 }
             }
+        }
+        // Byte-mode `capture_resumedata` drops `snapshots` after encode.
+        // The last snapshot's TAGBOX Ref ops stay here so `_resref` is
+        // forwarded the same way (`Getfield` dest still SSA-live across
+        // a later `NewArrayClear`).
+        for op in &trace_ctx.encoded_snapshot_live_refs {
+            Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
         }
         // `initialize_state_from_start` `self.virtualizable_boxes` stores
         // ordinary BoxPtr objects whose concrete refs the GC traces through
@@ -11092,6 +11104,41 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|token| token.has_target_tokens())
     }
 
+    /// True when the compiled procedure for `green_key` is a FINISH-only
+    /// `ResumeFromInterpDescr` (last op is `Finish`).
+    ///
+    /// A JUMP entry-bridge (`compile_entry_bridge`) also has empty
+    /// `target_tokens`, but ends with `Jump` and must still be entered from
+    /// `can_enter_jit` (nested-for outer header jumping to the inner
+    /// preamble). A FINISH-only occupier at a loop header is the last-
+    /// iteration FOR_ITER exhaustion stub: running it from JUMP_BACKWARD
+    /// makes that exhaustion guard fail ~200 times without a bridge
+    /// (`recursive_call_frame_relocation` t1). The back-edge door then
+    /// starts an interp-origin `compile_loop`, which replaces the stub
+    /// (`has_compiled_targets` is false).
+    pub fn compiled_entry_is_finish_only(&self, green_key: u64) -> bool {
+        self.compiled_entry_is_finish_only_on_driver(
+            self.active_jitdriver_sd.unwrap_or(0),
+            green_key,
+        )
+    }
+
+    pub fn compiled_entry_is_finish_only_on_driver(&self, jd_no: usize, green_key: u64) -> bool {
+        // `CompiledEntry.traces` last-op Finish was the pre-#2529 index.
+        // After procedure tokens replaced that side table, a JUMP
+        // entry-bridge still records the target loop through
+        // `compile.py record_loop_or_bridge` `record_jump_to` (keepalive),
+        // while a FINISH stub never does (`compile.py:1079-1083` never
+        // builds a TargetToken). Empty `target_tokens` alone is not
+        // enough: `compile_entry_bridge` also leaves that list empty.
+        self.get_procedure_token_on_driver(jd_no, green_key)
+            .is_some_and(|token| {
+                token.has_compiled_code()
+                    && !token.has_target_tokens()
+                    && token.keepalive_tokens.lock().is_empty()
+            })
+    }
+
     /// pyjitpl.py: compile_trace — try to compile the current
     /// trace as a bridge to an existing compiled loop.
     ///
@@ -15920,6 +15967,7 @@ impl<M: Clone> MetaInterp<M> {
                 .tracing
                 .as_ref()
                 .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+
         let mut prepared = if use_byte_iter {
             prepare_bridge_from_byte_recorder(
                 &self.tracing.as_ref().expect("checked").recorder,
@@ -31705,6 +31753,7 @@ mod tests {
                 nargs: 0,
                 len_tail: false,
                 ctor_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             }],
@@ -31820,37 +31869,91 @@ mod tests {
     }
 
     #[test]
-    fn walk_active_trace_refs_forwards_virtualref_boxes() {
-        // pyjitpl.py `MetaInterp.virtualref_boxes` holds `[virtualbox, vrefbox]`
-        // Box pairs; the `.1` word is `getref_base()` of the concrete vref.
+    fn walk_active_trace_refs_forwards_encoded_snapshot_live_ref() {
+        // Production FBW `capture_resumedata` encodes then
+        // `snapshots.clear()`. A Getfield dest still SSA-live across a
+        // later NewArrayClear is not in `registers_r`; pyjitpl.py traces
+        // that TAGBOX FrontendOp so `_resref` is forwarded.
+        const BASE: usize = 0x7E34_C100;
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
-        let input = trace_ctx.recorder.inputargs()[0].opref();
-        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        let (const_ref, index, _restore) = intern_const_ptr(GcRef(0x93_0000_A000));
-        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (const_ref, 0)];
+        trace_ctx
+            .recorder
+            .attach_byte_buffer(Arc::new(MetaInterpStaticData::new()));
+        let dest = trace_ctx
+            .recorder
+            .record_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)]);
+        assert!(
+            trace_ctx
+                .recorder
+                .set_concrete_at(dest.raw(), Value::Ref(GcRef(BASE)))
+        );
+        let _ = trace_ctx.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes: vec![crate::recorder::SnapshotTagged::Box(dest, Type::Ref)],
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        });
+        assert!(trace_ctx.snapshots.is_empty());
+        assert_eq!(trace_ctx.encoded_snapshot_live_refs, vec![dest]);
         meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
-            if slot.0 == 0x7000 {
-                slot.0 = 0x8000;
-            }
-            if slot.0 == 0x9000 {
-                slot.0 = 0x9100;
-            }
-            if slot.0 == 0x93_0000_A000 {
-                slot.0 = 0x93_0000_B000;
+            if slot.0 == BASE {
+                slot.0 = BASE + 0x1000;
             }
         });
 
-        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
+        let forwarded = meta
+            .tracing
+            .as_ref()
+            .unwrap()
+            .recorder
+            .concrete_at(dest.raw());
+        assert_eq!(forwarded, Some(Value::Ref(GcRef(BASE + 0x1000))));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_virtualref_boxes() {
+        // pyjitpl.py `MetaInterp.virtualref_boxes` holds `[virtualbox, vrefbox]`
+        // Box pairs; the `.1` word is `getref_base()` of the concrete vref.
+        // Process-global intern table: other tests intern 0xA000/0xB000.
+        const BASE: usize = 0x7E12_B000;
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(BASE)));
+        let (const_ref, index, _restore) = intern_const_ptr(GcRef(BASE + 0x3000));
+        trace_ctx.virtualref_boxes = vec![(input, BASE + 0x2000), (const_ref, 0)];
+        meta.tracing = Some(Box::new(trace_ctx));
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == BASE {
+                slot.0 = BASE + 0x1000;
+            }
+            if slot.0 == BASE + 0x2000 {
+                slot.0 = BASE + 0x2100;
+            }
+            if slot.0 == BASE + 0x3000 {
+                slot.0 = BASE + 0x4000;
+            }
+        });
+
+        assert_eq!(
+            meta.tracing.as_ref().unwrap().box_bits(input),
+            Some((BASE + 0x1000) as i64)
+        );
         let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
-        assert_eq!(boxes[0].1, 0x9100);
+        assert_eq!(boxes[0].1, BASE + 0x2100);
         // The index does not move. The table slot does.
         assert_eq!(boxes[1].0, OpRef::ConstPtr(index));
         assert_eq!(
             majit_ir::const_ptr_table::resolve(index),
-            GcRef(0x93_0000_B000)
+            GcRef(BASE + 0x4000)
         );
     }
 
@@ -32618,6 +32721,7 @@ mod tests {
                 nargs: 0,
                 len_tail: false,
                 ctor_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             }],

@@ -1068,6 +1068,13 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                self.fill_header_view_pairs(
+                    mir_bb,
+                    &reg,
+                    &mut args,
+                    &mut pair_lens,
+                    &arg_operands,
+                )?;
                 // A pair slice's `.len()` / `.is_empty()` is its length
                 // word (`Rvalue::Len`). A string-byte-view window planted
                 // that word as `ll_strlen`; an object-list view keeps
@@ -2403,6 +2410,26 @@ impl<'a> Lowering<'a> {
                         first_arg_ty.as_ref(),
                         &call.dest.ty,
                     ) {
+                        // A later window / pair `from_raw_parts` must keep
+                        // chars as a displaced ptr (`length_relaxed` is not
+                        // `ll_strlen`). Aliasing the add dest to the header
+                        // would make that dest `(header, live_len)` and
+                        // would drop the peel `ptr_add_chars_offset_header`
+                        // needs. Bind CCHARP (`direct_arrayitems` of
+                        // `STR.chars`), not `r_uint`.
+                        if self.add_dest_feeds_window_from_raw_parts(dest_local) {
+                            let chars = self.chars_ptr_of_header(
+                                mir_bb,
+                                args[0].clone(),
+                                lowlevel_string_chars_byte_offset(),
+                            );
+                            let ptr = emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars);
+                            self.local_var[dest_local] = Some(LocalValue::One(ptr));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -4547,7 +4574,7 @@ impl<'a> Lowering<'a> {
                 // list's logical length may be below capacity).
                 if args.len() == 2
                     && let Some(block) =
-                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0], &args[1])
                 {
                     self.alias_dest_to_arg0(dest_local, block, true);
                     let target_bb = self.block_id[target];
@@ -7354,6 +7381,13 @@ impl<'a> Lowering<'a> {
                     {
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
                     }
+                    self.fill_header_view_pairs(
+                        mir_bb,
+                        &reg,
+                        &mut args,
+                        &mut pair_lens,
+                        &arg_operands,
+                    )?;
                     if !pair_lens.is_empty() {
                         let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                         self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;

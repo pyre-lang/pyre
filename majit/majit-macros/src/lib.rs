@@ -1292,7 +1292,7 @@ fn is_pair_slice_item(ty: &Type) -> bool {
     primitive_type_ident(ty).is_some_and(|ident| {
         matches!(
             ident.to_string().as_str(),
-            "i64" | "u64" | "isize" | "usize"
+            "u8" | "i64" | "u64" | "isize" | "usize"
         )
     })
 }
@@ -5765,10 +5765,24 @@ mod tests {
             skip("fn f(name: &str, path: &Path) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
-        assert_eq!(
-            skip("fn f(xs: &[u8]) -> i64 { 0 }"),
-            Some(HelperFnAddrSkip::FatPointerArg)
+        assert_eq!(skip("fn f(xs: &[u8]) -> i64 { 0 }"), None);
+        let u8_func = parse_fn("fn f(xs: &[u8]) -> i64 { 0 }");
+        let (_, _, u8_tokens) =
+            emit_helper_call_target_fn(&u8_func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("u8 pair trampoline");
+        let u8_text = u8_tokens.to_string();
+        assert!(
+            u8_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_arg_0_len : i64) -> i64"
+            ),
+            "{u8_text}"
         );
+        assert!(
+            u8_text.contains("std :: slice :: from_raw_parts"),
+            "{u8_text}"
+        );
+        assert!(u8_text.contains("as * const () , 2"), "{u8_text}");
         assert_eq!(skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"), None);
         assert_eq!(skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"), None);
         assert_eq!(skip("fn f(a: Option<PyObjectRef>) -> i64 { 0 }"), None);
@@ -5815,9 +5829,50 @@ mod tests {
             skip("fn f() -> *const [u8] { loop {} }"),
             Some(HelperFnAddrSkip::Other)
         );
+        assert_eq!(skip("fn f(x: i64) -> &[u8] { &[] }"), None);
+        assert_eq!(
+            skip("fn f(&mut self) -> &[u8] { &[] }"),
+            Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        let pair_ret = parse_fn("fn f(x: i64) -> &[u8] { &[] }");
+        let (_, _, pair_ret_tokens) =
+            emit_helper_call_target_fn(&pair_ret, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("pair-return trampoline");
+        let pair_ret_text = pair_ret_tokens.to_string();
+        assert!(
+            pair_ret_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_ret_len_slot : i64) -> i64"
+            ),
+            "{pair_ret_text}"
+        );
+        assert!(
+            pair_ret_text.contains("ll_slice_len_slot_store"),
+            "{pair_ret_text}"
+        );
         assert_eq!(
             skip("fn f(x: i64) -> Result<&[u8], PyError> { Ok(&[]) }"),
-            Some(HelperFnAddrSkip::Other)
+            None
+        );
+        let result_pair = parse_fn("fn f(x: i64) -> Result<&[u8], PyError> { Ok(&[]) }");
+        let (_, _, result_pair_tokens) =
+            emit_helper_call_target_fn(&result_pair, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("Result pair-return trampoline");
+        let result_pair_text = result_pair_tokens.to_string();
+        assert!(
+            result_pair_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_ret_len_slot : i64) -> i64"
+            ),
+            "{result_pair_text}"
+        );
+        assert!(
+            result_pair_text.contains("ll_slice_len_slot_store"),
+            "{result_pair_text}"
+        );
+        assert!(
+            result_pair_text.contains("publish_residual"),
+            "{result_pair_text}"
         );
         assert_eq!(
             skip("fn f(x: i64) -> Result<i64, ()> { Ok(x) }"),

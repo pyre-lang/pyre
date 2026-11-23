@@ -3667,7 +3667,7 @@ impl<'a> Lowering<'a> {
         let n = self.body.locals.locals.len();
         let mut found: Vec<Option<Place>> = vec![None; n];
         let mut invalid = vec![false; n];
-        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+        for (bb_idx, bb) in self.body.body().iter().enumerate() {
             if !self.forward_reached.get(bb_idx).copied().unwrap_or(false) {
                 continue;
             }
@@ -3700,7 +3700,7 @@ impl<'a> Lowering<'a> {
                     found[i] = None;
                     continue;
                 }
-                found[i] = Some(clone_place(referent));
+                found[i] = Some(clone_place(&referent));
             }
             if let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc)
                 && let PlaceKind::Local(i) = call.dest.kind
@@ -3780,7 +3780,7 @@ impl<'a> Lowering<'a> {
     /// metadata.
     fn install_deref_only_representations(&mut self) {
         let forward_blocks = forward_reachable_mask(self.llbc, self.body);
-        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+        for (bb_idx, bb) in self.body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
@@ -3792,7 +3792,7 @@ impl<'a> Lowering<'a> {
                     continue;
                 };
                 let dest = *dest as usize;
-                match self.deref_only_representation(dest, rvalue) {
+                match self.deref_only_representation(dest, &rvalue) {
                     Some(DerefOnlyRepresentation::FieldInterior(referent)) => {
                         self.atomic_ref_place.insert(dest, referent);
                     }

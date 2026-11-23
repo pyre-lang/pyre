@@ -4,13 +4,14 @@ use super::*;
 
 impl<'a> Lowering<'a> {
     /// Resolve an [`Operand`] to the Variable the IR should reference.
-    /// The item kind of `ty` when it is a pair slice of an enabled kind.
+    /// The item kind of `ty` when it is a pair slice of an enabled kind,
+    /// including a host `&mut [u8]`. Shared `&[u8]` is rstr `STR`.
+    /// [`tyref_pair_slice_item_kind`] stays one-word items.
     pub(in crate::front::mir) fn pair_slice_kind(
         &self,
         ty: &TyRef,
     ) -> Option<majit_ir::rvec::VecItemKind> {
-        tyref_pair_slice_item_kind(ty, self.llbc)
-            .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+        tyref_pair_or_host_u8_item_kind(ty, self.llbc)
     }
 
     /// The item kind of `ty` when it is a slice iterator of an enabled kind.
@@ -19,6 +20,7 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> Option<majit_ir::rvec::VecItemKind> {
         tyref_pair_slice_iter_item_kind(ty, self.llbc)
+            .or_else(|| tyref_host_u8_pair_iter_item_kind(ty, self.llbc))
             .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
     }
 
@@ -458,6 +460,27 @@ impl<'a> Lowering<'a> {
             .is_some_and(|root| is_str_family_class_root(&root))
     }
 
+    /// `var` is an rstr `STR` / `BytesBlock` header word (`rstr.py` `STR`).
+    /// `STRPTR` and a string-byte-view local are [`Self::var_is_str_repr`];
+    /// a bound `*const Utf8Str` / `*const BytesBlock` is the same layout
+    /// even when the stamp has not been applied yet.
+    pub(in crate::front::mir) fn var_is_string_header_word(&self, var: &Variable) -> bool {
+        if self.var_is_str_repr(var) || self.var_has_str_value_type(var) {
+            return true;
+        }
+        self.body.locals.locals.iter().enumerate().any(|(i, loc)| {
+            let bound = self
+                .local_var
+                .get(i)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())
+                .is_some_and(|current| current == *var);
+            bound
+                && (tyref_is_lowlevel_string_header_ptr(&loc.ty, self.llbc)
+                    || tyref_is_bytes_block_ptr(&loc.ty, self.llbc))
+        })
+    }
+
     pub(in crate::front::mir) fn rvalue_is_str_view_source(&self, rvalue: &Rvalue) -> bool {
         match rvalue {
             Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
@@ -613,6 +636,7 @@ impl<'a> Lowering<'a> {
                     _ => {
                         let (ptr, len) = self.pair_local_parts(mir_bb, *local as usize)?;
                         let data = if tyref_is_u8_window(&place.ty, self.llbc) {
+                            let ptr = self.chars_ptr_if_str_header(mir_bb, ptr);
                             self.ensure_window_ccharp(mir_bb, ptr)
                         } else {
                             ptr
@@ -1355,6 +1379,104 @@ impl<'a> Lowering<'a> {
         self.emit_uint_binop(mir_bb, "add", then_part, else_part)
     }
 
+    /// Host `&[u8]` item load: one unsigned byte at `ptr + index`.
+    /// Word-sized `ll_slice_getitem_fast` would stride 8.
+    /// Stamped Signed: `get_value_kind_var` defaults Unknown to `'r'`,
+    /// and `rewrite_op_raw_load` would wrap the byte in `cast_int_to_ptr`.
+    pub(in crate::front::mir) fn emit_u8_raw_load(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        index: Variable,
+    ) -> Variable {
+        let offset = self.retype_word(mir_bb, index, &ValueType::Unsigned, &ValueType::Int);
+        let bb_id = self.emit_bb(mir_bb);
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base: ptr,
+                offset,
+                item_ty: ValueType::Unsigned,
+                itemsize: 1,
+                is_item_signed: false,
+            },
+        });
+        loaded
+    }
+
+    /// Host `&mut [u8]` item store: one unsigned byte at `ptr + index`.
+    fn emit_u8_raw_store(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        index: Variable,
+        value: Variable,
+    ) {
+        let offset = self.retype_word(mir_bb, index, &ValueType::Unsigned, &ValueType::Int);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base: ptr,
+                offset,
+                value,
+                item_ty: ValueType::Unsigned,
+                itemsize: 1,
+                is_item_signed: false,
+            },
+        });
+    }
+
+    /// Local whose ItemAddr word addresses a `u8`: `Option<&u8>` from
+    /// pair `get`, or `&u8` / `&mut u8` of a host `&[u8]` item.
+    pub(in crate::front::mir) fn item_addr_elem_is_u8(&self, local: usize) -> bool {
+        self.body.locals.locals.get(local).is_some_and(|loc| {
+            if let Some(payload) =
+                crate::front::result_exc::tyref_option_payload(&loc.ty, self.llbc)
+            {
+                let inner = ref_pointee_ty(&payload, self.llbc).unwrap_or(payload);
+                tyref_is_u8_scalar(&inner, self.llbc)
+            } else {
+                ref_pointee_ty(&loc.ty, self.llbc)
+                    .is_some_and(|pointee| tyref_is_u8_scalar(&pointee, self.llbc))
+            }
+        })
+    }
+
+    fn item_seq_elem_is_u8(&self, seq: ItemSeq) -> bool {
+        match seq {
+            ItemSeq::Pair(local) => self
+                .body
+                .locals
+                .locals
+                .get(local)
+                .is_some_and(|loc| tyref_slice_elem_is_u8(&loc.ty, self.llbc)),
+            ItemSeq::RawArray(storage) => self.body.locals.locals.get(storage).is_some_and(|loc| {
+                tyref_raw_array_parts(&loc.ty, self.llbc).is_some_and(|(item, _)| {
+                    json_ty_scalar_element_spelling(item, self.llbc).as_deref() == Some("u8")
+                })
+            }),
+        }
+    }
+
+    fn refuse_host_u8_word_helper(
+        &self,
+        mir_bb: usize,
+        name: &str,
+        recv_ty: Option<&TyRef>,
+    ) -> Result<(), LowerError> {
+        if recv_ty.is_some_and(|ty| tyref_slice_elem_is_u8(ty, self.llbc)) {
+            Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: {name} of a host &[u8] pair"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// The index an `Index` projection over `seq` selects: `offset`, or
     /// `len - offset` when it counts from the end.
     pub(in crate::front::mir) fn item_seq_index(
@@ -1643,6 +1765,15 @@ impl<'a> Lowering<'a> {
         let index = self.item_seq_index(mir_bb, seq, index_payload)?;
         let len = self.item_seq_len(mir_bb, seq)?;
         let (ptr, index) = self.guard_item_index(mir_bb, len, ptr, index)?;
+        if self.item_seq_elem_is_u8(seq) {
+            let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+            return Ok(self.retype_word(
+                mir_bb,
+                item,
+                &ValueType::Unsigned,
+                &u8_pair_item_ty(item_ty),
+            ));
+        }
         let helper_ty = Self::pair_helper_item_ty(kind);
         let item = self.emit_path_call(
             mir_bb,
@@ -1712,10 +1843,21 @@ impl<'a> Lowering<'a> {
         // `IterMut` yields `&mut T`: the item's address in the slice buffer,
         // so a later `*slot = v` writes through `ptr`. Shared `Iter` yields
         // the loaded item, the list-iteration value.
+        let iter_is_u8 = self
+            .body
+            .locals
+            .locals
+            .get(iter)
+            .is_some_and(|loc| tyref_iter_elem_is_u8(&loc.ty, self.llbc));
         if ref_kind_is_mut(payload_ty, self.llbc) {
-            let (size, _) = kind.size_align(crate::layout::target_word_size());
+            let size = if iter_is_u8 {
+                1
+            } else {
+                kind.size_align(crate::layout::target_word_size()).0
+            };
             let size = self.emit_const_uint(mir_bb, size as u64);
             let offset = self.emit_uint_binop(mir_bb, "mul", index, size);
+            let ptr = self.pair_ptr_as_unsigned(mir_bb, ptr);
             return Ok(self.emit_uint_binop(mir_bb, "add", ptr, offset));
         }
         let item_ty = tyref_ref_pointee_value_type(
@@ -1731,6 +1873,15 @@ impl<'a> Lowering<'a> {
             ))
         })?;
         let item_ty = self.with_item_class_root(item_ty, payload_ty);
+        if iter_is_u8 {
+            let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+            return Ok(self.retype_word(
+                mir_bb,
+                item,
+                &ValueType::Unsigned,
+                &u8_pair_item_ty(&item_ty),
+            ));
+        }
         let helper_ty = Self::pair_helper_item_ty(kind);
         let item = self.emit_path_call(
             mir_bb,
@@ -1752,6 +1903,11 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), LowerError> {
         let (ptr, kind) = self.item_seq_ptr(mir_bb, seq)?;
         let index = self.item_seq_index(mir_bb, seq, index_payload)?;
+        if self.item_seq_elem_is_u8(seq) {
+            let value = self.retype_word(mir_bb, value, value_ty, &ValueType::Unsigned);
+            self.emit_u8_raw_store(mir_bb, ptr, index, value);
+            return Ok(());
+        }
         self.emit_slice_setitem(mir_bb, ptr, index, kind, value, value_ty);
         Ok(())
     }
@@ -2700,6 +2856,7 @@ impl<'a> Lowering<'a> {
             args[0] = ptr;
             pair_lens.insert(0, (0, len));
         }
+        self.fill_header_view_pairs(mir_bb, reg, &mut args, &mut pair_lens, &call.args)?;
         let vec_kind = arg_tys
             .first()
             .and_then(Option::as_ref)
@@ -2828,7 +2985,17 @@ impl<'a> Lowering<'a> {
             let src_owner = args.first().and_then(|v| self.owner_for_window_source(v));
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
+                    let item_bytes = self.pair_slice_item_bytes(None, kind);
+                    self.pair_subslice(
+                        mir_bb,
+                        kind,
+                        ptr,
+                        len,
+                        &args[1],
+                        arg_is_range_full,
+                        true,
+                        item_bytes,
+                    )?
                 }
                 // Inherent `alloc::vec::<Impl>::deref` and the trait-impl
                 // residual `vec::Vec::<impl Deref<Vec<…>>>::deref` (and
@@ -2838,11 +3005,36 @@ impl<'a> Lowering<'a> {
                 (_, Some(kind)) if args.len() == 1 && rust_vec_slice_view(&name).is_some() => {
                     self.pair_of_vec(mir_bb, kind, args[0].clone())
                 }
+                (_, None)
+                    if args.len() == 1
+                        && rust_vec_slice_view(&name).is_some()
+                        && arg_tys[0]
+                            .as_ref()
+                            .is_some_and(|ty| tyref_ptr_pointee_is_vec(ty, self.llbc))
+                        && tyref_host_u8_pair_item_kind(&dest_ty, self.llbc).is_some() =>
+                {
+                    self.pair_of_host_u8_vec(
+                        mir_bb,
+                        args[0].clone(),
+                        arg_tys[0].as_ref().expect("vec receiver"),
+                    )
+                }
                 ("alloc::vec::<Impl>::index" | "alloc::vec::<Impl>::index_mut", Some(kind))
                     if args.len() == 2 =>
                 {
                     let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
+                    let item_bytes =
+                        self.pair_slice_item_bytes(arg_tys.first().and_then(Option::as_ref), kind);
+                    self.pair_subslice(
+                        mir_bb,
+                        kind,
+                        ptr,
+                        len,
+                        &args[1],
+                        arg_is_range_full,
+                        true,
+                        item_bytes,
+                    )?
                 }
                 ("core::slice::<Impl>::get", _)
                     if args.len() == 2 && matches!(pair_lens.as_slice(), [(0, _)]) =>
@@ -2876,6 +3068,7 @@ impl<'a> Lowering<'a> {
                         &args[1],
                         index_ty.as_ref(),
                         arg_is_range_full,
+                        arg_tys[0].as_ref(),
                     )?
                 }
                 (
@@ -2886,6 +3079,7 @@ impl<'a> Lowering<'a> {
                         .pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"))
                         .expect("pair receiver");
                     let len = pair_lens[0].1.clone();
+                    let item_bytes = self.pair_slice_item_bytes(arg_tys[0].as_ref(), kind);
                     self.pair_subslice(
                         mir_bb,
                         kind,
@@ -2894,6 +3088,7 @@ impl<'a> Lowering<'a> {
                         &args[1],
                         arg_is_range_full,
                         true,
+                        item_bytes,
                     )?
                 }
                 _ if is_slice_from_ref_name(&name) && args.len() == 1 => {
@@ -2921,77 +3116,124 @@ impl<'a> Lowering<'a> {
                     "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut",
                     _,
                 ) if args.len() == 2 => {
-                    let ptr_ty = arg_tys[0].as_ref().map(|ty| self.value_type_of(ty));
-                    let ptr = match ptr_ty {
-                        Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
-                            self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
-                        }
-                        // `typed_items_block_items_base(block)` lowers to the
-                        // block header (the array descr re-adds `base_size`),
-                        // so the item address is
-                        // `cast_ptr_to_adr(block) + itemoffsetof(ITEMS, 0)`.
-                        Some(ValueType::Ref(_))
-                            if operand_local(call.args.first()).is_some_and(|base| {
-                                base_traces_to_typed_items_block_accessor(
-                                    self.body, base, self.llbc,
-                                )
-                            }) =>
-                        {
-                            self.items_block_item_address(
-                                mir_bb,
-                                args[0].clone(),
-                                &[
-                                    "majit_rlib",
-                                    "lltypesystem",
-                                    "rlist",
-                                    "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
-                                ],
-                            )
-                        }
-                        // `items_block_items_base(block)` likewise lowers to
-                        // the `ItemsBlock` header.
-                        Some(ValueType::Ref(_))
-                            if operand_local(call.args.first()).is_some_and(|base| {
-                                base_traces_to_items_block_accessor(self.body, base, self.llbc)
-                            }) =>
-                        {
-                            self.items_block_item_address(
-                                mir_bb,
-                                args[0].clone(),
-                                &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
-                            )
-                        }
-                        Some(ValueType::Ref(_)) => {
+                    // `addr_of!((*header).chars) as *const T` is
+                    // `lltype.py direct_arrayitems`. The address-taken
+                    // FieldRead is a value load of item zero; the host
+                    // pair pointer is the items address. The `.cast()`
+                    // method path already recovers this
+                    // (`taken_array_field_address`); the `as *const T`
+                    // Rvalue plus a later `from_raw_parts` must too,
+                    // including when `length_relaxed` splits the
+                    // FieldRead and `from_raw_parts` across blocks.
+                    if let Some((base, offset)) =
+                        self.array_tail_of_pair_from_raw_parts_ptr(mir_bb, &args[0], Some(&dest_ty))
+                    {
+                        let chars = self.chars_ptr_of_header(mir_bb, base, offset as usize);
+                        let u8_chars_view = tyref_is_u8_window(&dest_ty, self.llbc)
+                            || tyref_host_u8_pair_item_kind(&dest_ty, self.llbc).is_some();
+                        let ptr = if u8_chars_view {
                             let bb_id = self.emit_bb(mir_bb);
-                            let (retype, ptr) =
-                                push_ptr_to_unsigned_cast(&mut self.graph, bb_id, args[0].clone());
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(ptr.clone()),
-                                kind: retype,
-                            });
-                            ptr
-                        }
-                        None => args[0].clone(),
-                        other => {
-                            return Err(LowerError::Unsupported(format!(
-                                "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
-                            )));
-                        }
-                    };
-                    // W3 is only a `u8` window (`tyref_is_u8_window`).
-                    // `from_raw_parts` of `*mut i64` / `*mut PyObjectRef`
-                    // keeps the window-commit pair `(ptr, n)`. A STR
-                    // chars view is CCHARP (`direct_arrayitems`).
-                    let data = if tyref_is_u8_window(&dest_ty, self.llbc) {
-                        self.emit_window_from_raw_parts_ptr(
+                            emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars)
+                        } else {
+                            chars
+                        };
+                        (ptr, args[1].clone())
+                    } else if let Some(ptr) =
+                        self.chars_array_view_of_from_raw_parts_ptr(mir_bb, &args[0])
+                    {
+                        (ptr, args[1].clone())
+                    } else if self.var_is_string_header_word(&args[0]) {
+                        let chars = self.chars_ptr_of_header(
                             mir_bb,
-                            ptr,
-                            arg_tys.first().and_then(Option::as_ref),
+                            args[0].clone(),
+                            lowlevel_string_chars_byte_offset(),
+                        );
+                        let bb_id = self.emit_bb(mir_bb);
+                        (
+                            emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars),
+                            args[1].clone(),
                         )
                     } else {
-                        ptr
-                    };
-                    (data, args[1].clone())
+                        let ptr_ty = arg_tys[0].as_ref().map(|ty| self.value_type_of(ty));
+                        let ptr = match ptr_ty {
+                            Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                                self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                            }
+                            // `typed_items_block_items_base(block)` lowers to the
+                            // block header (the array descr re-adds `base_size`),
+                            // so the item address is
+                            // `cast_ptr_to_adr(block) + itemoffsetof(ITEMS, 0)`.
+                            Some(ValueType::Ref(_))
+                                if operand_local(call.args.first()).is_some_and(|base| {
+                                    base_traces_to_typed_items_block_accessor(
+                                        self.body, base, self.llbc,
+                                    )
+                                }) =>
+                            {
+                                self.items_block_item_address(
+                                    mir_bb,
+                                    args[0].clone(),
+                                    &[
+                                        "majit_rlib",
+                                        "lltypesystem",
+                                        "rlist",
+                                        "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                                    ],
+                                )
+                            }
+                            // `items_block_items_base(block)` likewise lowers to
+                            // the `ItemsBlock` header.
+                            Some(ValueType::Ref(_))
+                                if operand_local(call.args.first()).is_some_and(|base| {
+                                    base_traces_to_items_block_accessor(self.body, base, self.llbc)
+                                }) =>
+                            {
+                                self.items_block_item_address(
+                                    mir_bb,
+                                    args[0].clone(),
+                                    &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+                                )
+                            }
+                            Some(ValueType::Ref(_))
+                                if self.from_raw_parts_ptr_already_chars_view(&args[0]) =>
+                            {
+                                args[0].clone()
+                            }
+                            Some(ValueType::Ref(_)) => {
+                                let bb_id = self.emit_bb(mir_bb);
+                                let (retype, ptr) = push_ptr_to_unsigned_cast(
+                                    &mut self.graph,
+                                    bb_id,
+                                    args[0].clone(),
+                                );
+                                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                    result: Some(ptr.clone()),
+                                    kind: retype,
+                                });
+                                ptr
+                            }
+                            None => args[0].clone(),
+                            other => {
+                                return Err(LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
+                                )));
+                            }
+                        };
+                        // W3 is only a `u8` window (`tyref_is_u8_window`).
+                        // `from_raw_parts` of `*mut i64` / `*mut PyObjectRef`
+                        // keeps the window-commit pair `(ptr, n)`. A STR
+                        // chars view is CCHARP (`direct_arrayitems`).
+                        let data = if tyref_is_u8_window(&dest_ty, self.llbc) {
+                            self.emit_window_from_raw_parts_ptr(
+                                mir_bb,
+                                ptr,
+                                arg_tys.first().and_then(Option::as_ref),
+                            )
+                        } else {
+                            ptr
+                        };
+                        (data, args[1].clone())
+                    }
                 }
                 _ => {
                     let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
@@ -3048,11 +3290,18 @@ impl<'a> Lowering<'a> {
                     self.tombstoned_leaves,
                 );
                 self.result_exc_call_results
-                    .push(crate::front::result_exc::ResultExcCall::new(
-                        ptr.clone(),
+                    .push(crate::front::result_exc::ResultExcCall {
+                        result: ptr.clone(),
                         suffix,
-                        ValueType::Unsigned,
-                    ));
+                        payload_ty: ValueType::Unsigned,
+                        sum: crate::front::result_exc::exception_sum_of_result(
+                            &dest_ty,
+                            self.llbc,
+                            self.static_addrs.error_carrier,
+                        ),
+                        ok_vsid: self.stamp_variant_vsid(&dest_ty, "Ok"),
+                        err_vsid: self.stamp_variant_vsid(&dest_ty, "Err"),
+                    });
             }
             let owner = self.owner_for_window_source(&ptr).or(src_owner);
             self.bind_pair_local(mir_bb, dest_local, ptr, len, owner);
@@ -3089,16 +3338,31 @@ impl<'a> Lowering<'a> {
                     res
                 }
                 "core::slice::<Impl>::reverse" => {
-                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
-                    let kind = kind.expect("pair receiver");
-                    self.emit_path_call(
-                        mir_bb,
-                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Reverse, kind),
-                        vec![args[0].clone(), len],
-                        ValueType::Void,
-                    )
+                    let recv = arg_tys[0].as_ref().expect("pair receiver");
+                    // Host `&mut [u8]`: byte stride. `ll_slice_reverse_i`
+                    // strides a machine word (`refuse_host_u8_word_helper`).
+                    if tyref_host_u8_pair_item_kind(recv, self.llbc).is_some() {
+                        self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::SLICE_REVERSE_U8,
+                            vec![args[0].clone(), len],
+                            ValueType::Void,
+                        )
+                    } else {
+                        let kind = self.pair_slice_kind(recv).expect("pair receiver");
+                        self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::Reverse,
+                                kind,
+                            ),
+                            vec![args[0].clone(), len],
+                            ValueType::Void,
+                        )
+                    }
                 }
                 "core::slice::<Impl>::rotate_left" | "core::slice::<Impl>::rotate_right" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let Some(count) = args.get(1).cloned() else {
@@ -3119,6 +3383,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::copy_from_slice" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let Some(src_ptr) = args.get(1).cloned() else {
@@ -3165,6 +3430,7 @@ impl<'a> Lowering<'a> {
                     self.window_ptr_add(mir_bb, args[0].clone(), args[1].clone())
                 }
                 "core::slice::<Impl>::contains" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let item_ty = arg_tys[1]
@@ -3193,6 +3459,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "alloc::slice::<Impl>::to_vec" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     self.emit_path_call(
@@ -3230,12 +3497,27 @@ impl<'a> Lowering<'a> {
                         }
                         _ => args[1].clone(),
                     };
-                    let addr = self.emit_path_call(
-                        mir_bb,
-                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetAddr, kind),
-                        vec![args[0].clone(), len, index],
-                        ValueType::Unsigned,
-                    );
+                    let addr = if arg_tys[0]
+                        .as_ref()
+                        .is_some_and(|ty| tyref_slice_elem_is_u8(ty, self.llbc))
+                    {
+                        let in_bounds =
+                            self.emit_uint_binop(mir_bb, "lt", index.clone(), len.clone());
+                        let ptr = self.pair_ptr_as_unsigned(mir_bb, args[0].clone());
+                        let addr = self.emit_uint_binop(mir_bb, "add", ptr, index);
+                        let zero = self.emit_const_uint(mir_bb, 0);
+                        self.emit_uint_select(mir_bb, in_bounds, addr, zero)
+                    } else {
+                        self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::GetAddr,
+                                kind,
+                            ),
+                            vec![args[0].clone(), len, index],
+                            ValueType::Unsigned,
+                        )
+                    };
                     self.local_var[dest_local] = Some(LocalValue::ItemAddr(addr.clone()));
                     addr
                 }
@@ -3268,6 +3550,21 @@ impl<'a> Lowering<'a> {
     /// the pointer. `RangeFrom` panics when `start > len`. `Range` panics
     /// when `start > end` or `end > len`. `start == end == len` is in bounds.
     /// `slice.get` passes `checked = false` and selects a null pointer.
+    fn pair_slice_item_bytes(
+        &self,
+        ty: Option<&TyRef>,
+        kind: majit_ir::rvec::VecItemKind,
+    ) -> usize {
+        if ty.is_some_and(|t| tyref_slice_elem_is_u8(t, self.llbc)) {
+            1
+        } else {
+            match kind {
+                majit_ir::rvec::VecItemKind::Int | majit_ir::rvec::VecItemKind::Float => 8,
+                majit_ir::rvec::VecItemKind::Ref => crate::layout::target_word_size(),
+            }
+        }
+    }
+
     pub(in crate::front::mir) fn pair_subslice(
         &mut self,
         mir_bb: usize,
@@ -3277,7 +3574,16 @@ impl<'a> Lowering<'a> {
         range: &Variable,
         range_is_full: bool,
         checked: bool,
+        item_bytes: usize,
     ) -> Result<(Variable, Variable), LowerError> {
+        // A STR / BytesBlock GCREF is the header (`rstr.py` `STR`). Adding
+        // `start` to it is `header+p` (`chars+(p-16)`). Byte-stride
+        // slices copy from chars (`LLHelpers.ll_stringslice_startstop`).
+        let ptr = if item_bytes == 1 {
+            self.chars_ptr_if_str_header(mir_bb, ptr)
+        } else {
+            ptr
+        };
         if range_is_full {
             return Ok((ptr, len));
         }
@@ -3321,12 +3627,17 @@ impl<'a> Lowering<'a> {
         } else {
             (ptr, start, end)
         };
-        let ptr = self.emit_path_call(
-            mir_bb,
-            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Offset, kind),
-            vec![ptr, start.clone()],
-            ValueType::Unsigned,
-        );
+        let ptr = if item_bytes == 1 {
+            let ptr = self.pair_ptr_as_unsigned(mir_bb, ptr);
+            self.emit_uint_binop(mir_bb, "add", ptr, start.clone())
+        } else {
+            self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Offset, kind),
+                vec![ptr, start.clone()],
+                ValueType::Unsigned,
+            )
+        };
         let len = self.emit_uint_binop(mir_bb, "sub", end, start);
         Ok((ptr, len))
     }
@@ -3345,6 +3656,20 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> Option<majit_ir::rvec::VecItemKind> {
         tyref_result_pair_slice_item_kind(ty, self.llbc, self.static_addrs.error_carrier)
+    }
+
+    /// Pair item pointer as Unsigned. A residual Result unwrap can leave
+    /// the pointer in the Ref bank; `int_add` of that word is unwired.
+    pub(in crate::front::mir) fn pair_ptr_as_unsigned(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+    ) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&ptr) == crate::model::ConcreteType::GcRef {
+            self.retype_word(mir_bb, ptr, &ValueType::Ref(None), &ValueType::Unsigned)
+        } else {
+            ptr
+        }
     }
 
     /// `(ptr, len)` of an `Option<&[T]>` operand carried as a pair, `None`
@@ -3381,6 +3706,7 @@ impl<'a> Lowering<'a> {
         range: &Variable,
         index_ty: Option<&TyRef>,
         range_is_full: bool,
+        recv_ty: Option<&TyRef>,
     ) -> Result<(Variable, Variable), LowerError> {
         let spelling = index_ty
             .map(|ty| tyref_to_ast_string(ty, self.llbc))
@@ -3432,7 +3758,9 @@ impl<'a> Lowering<'a> {
         let end_le_len = self.emit_uint_binop(mir_bb, "le", end, len.clone());
         let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
         let full = range_is_full || spelling == "RangeFull";
-        let (sub_ptr, sub_len) = self.pair_subslice(mir_bb, kind, ptr, len, range, full, false)?;
+        let item_bytes = self.pair_slice_item_bytes(recv_ty, kind);
+        let (sub_ptr, sub_len) =
+            self.pair_subslice(mir_bb, kind, ptr, len, range, full, false, item_bytes)?;
         let ptr = self.emit_uint_select(mir_bb, in_bounds.clone(), sub_ptr, zero.clone());
         let len = self.emit_uint_select(mir_bb, in_bounds, sub_len, zero);
         Ok((ptr, len))
@@ -3603,6 +3931,228 @@ impl<'a> Lowering<'a> {
             inputs.iter().map(is_pair_or_window).collect(),
             is_pair_or_window(output),
         )
+    }
+
+    /// `(ll_vec_as_ptr(v), ll_vec_as_len(v))` of a `Vec<u8>`. Not a
+    /// [`VecItemKind`] column: `u8` is not a word-sized list item, so
+    /// [`Self::pair_of_vec`] would call `ll_vec_length_i` (`[Int]`) with
+    /// the Adt `Ref`. `rlist.py` `ll_items` / the header `length` field.
+    fn pair_of_host_u8_vec(
+        &mut self,
+        mir_bb: usize,
+        vec: Variable,
+        vec_ty: &TyRef,
+    ) -> (Variable, Variable) {
+        let from = tyref_to_value_type_with(
+            vec_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        let header = self.retype_word(mir_bb, vec, &from, &ValueType::Unsigned);
+        let ptr = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::VEC_AS_PTR,
+            vec![header.clone()],
+            ValueType::Unsigned,
+        );
+        let len = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::VEC_AS_LEN,
+            vec![header],
+            ValueType::Unsigned,
+        );
+        (ptr, len)
+    }
+
+    /// One-word STR / BytesBlock `&[u8]` view: no pair-length shadow, typed
+    /// as a host pair slice of `u8`. `as_bytes` of a string family and
+    /// `from_raw_parts` of `BytesBlock.chars` plus that header's length
+    /// both alias the dest to the GC header (`rstr.py` `STR`). A host pair
+    /// local has a length shadow and is not this view.
+    fn operand_is_header_view(&self, op: &Operand) -> bool {
+        if self.operand_is_string_byte_view(op) {
+            return true;
+        }
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                matches!(
+                    place.kind,
+                    PlaceKind::Local(i)
+                        if self
+                            .len_shadow
+                            .get(i as usize)
+                            .copied()
+                            .flatten()
+                            .is_none()
+                ) && self.pair_slice_kind(&place.ty) == Some(majit_ir::rvec::VecItemKind::Int)
+            }
+            Operand::Const(_) => false,
+        }
+    }
+
+    /// `(s.chars, ll_strlen(s))` of an rstr `STR` header (`rstr.py` `STR`).
+    /// `chars` is the header address plus `LOWLEVEL_STRING_CHARS_OFFSET`
+    /// (`lowlevel_string.rs`: hash word then len word).
+    fn pair_of_str_view(&mut self, mir_bb: usize, header: Variable) -> (Variable, Variable) {
+        let len = self.emit_path_call(mir_bb, "__strlen", vec![header.clone()], ValueType::Int);
+        let len = self.retype_word(mir_bb, len, &ValueType::Int, &ValueType::Unsigned);
+        let ptr = self.chars_ptr_of_header(mir_bb, header, lowlevel_string_chars_byte_offset());
+        (ptr, len)
+    }
+
+    /// `(block.chars, arraylen_gc(block))` of a `BytesBlock` header.
+    /// `BytesBlock` is `Utf8Str` (`bytesobject.rs`): chars sit at
+    /// `LOWLEVEL_STRING_CHARS_OFFSET` (`2 * target_word_size()`), the same
+    /// offset [`Self::pair_of_str_view`] uses (`rstr.py` `STR`).
+    fn pair_of_bytes_block_view(
+        &mut self,
+        mir_bb: usize,
+        header: Variable,
+    ) -> (Variable, Variable) {
+        let bb_id = self.emit_bb(mir_bb);
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::ArrayLen {
+                base: header.clone(),
+                array_type_id: None,
+                array: None,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+        });
+        let len = self.retype_word(mir_bb, len, &ValueType::Int, &ValueType::Unsigned);
+        let ptr = self.chars_ptr_of_header(mir_bb, header, lowlevel_string_chars_byte_offset());
+        (ptr, len)
+    }
+
+    /// Interior `chars` pointer as a host-pair word.
+    ///
+    /// Same integer sequence as [`Self::emit_array_tail_item_ptr`] /
+    /// `rewrite_op_getsubstruct`: `cast_ptr_to_int(header)` then `add`
+    /// of the byte offset. Both operands are Signed, so the assembler
+    /// emits `int_add/ii>i`. `direct_ptradd` of a GC header keeps the
+    /// operand as `SomePtr` and `rewrite_op_direct_ptradd` then
+    /// assembles `int_add/ri>i`, which the production blackhole leaves
+    /// unwired (`wire_bhimpl_handlers_leaves_mixed_ref_int_int_ops_unwired`).
+    /// The pair word stays the integer (`r_uint`); it is not
+    /// `cast_int_to_ptr` back to a GC pointer.
+    pub(in crate::front::mir) fn chars_ptr_of_header(
+        &mut self,
+        mir_bb: usize,
+        header: Variable,
+        offset: usize,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, header);
+        let off = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(off.clone()),
+            kind: OpKind::ConstInt(offset as i64),
+        });
+        let sum = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: off,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.retype_word(mir_bb, sum, &ValueType::Int, &ValueType::Unsigned)
+    }
+
+    /// Host-pair data word of a STR / BytesBlock header is the chars
+    /// address (`rstr.py` `STR`, `llmemory.offsetof(STR, 'chars')`).
+    /// `is_string_header_chars_byte_ptr_add` aliases
+    /// `header.add(LOWLEVEL_STRING_CHARS_OFFSET)` back to the header
+    /// when the dest stays a W1 view; a window / pair of that GCREF
+    /// must still copy from chars.
+    pub(in crate::front::mir) fn chars_ptr_if_str_header(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+    ) -> Variable {
+        if self.var_is_string_header_word(&ptr) {
+            self.chars_ptr_of_header(mir_bb, ptr, lowlevel_string_chars_byte_offset())
+        } else {
+            ptr
+        }
+    }
+
+    /// Convert STR / BytesBlock header views to host pairs at pair-slice
+    /// FunDecl inputs that do not already have a length slot.
+    ///
+    /// A pair-slice parameter (`pair_slice_kind`, including host `&[u8]`)
+    /// is the `(ptr, len)` pair. The view is one GC Ref. rtyper
+    /// converts StringRepr / Array(Char) to a C buffer the same way:
+    /// interior chars pointer plus `ll_strlen` / `arraylen_gc`. A window
+    /// already in `pair_lens` whose ptr is a STR / BytesBlock GCREF is
+    /// rewritten to chars; the live length stays. A W1 view passed to a
+    /// window FunDecl stays one word (`emit_str_to_window`). The split is
+    /// the operand's header (string-byte-view vs BytesBlock) and the
+    /// callee's input type, not the callee's name. Slice intercepts
+    /// (`<[T]>::len` → `__strlen` on the header) return before this runs.
+    pub(in crate::front::mir) fn fill_header_view_pairs(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &mut Vec<Variable>,
+        pair_lens: &mut Vec<(usize, Variable)>,
+        arg_operands: &[Operand],
+    ) -> Result<(), LowerError> {
+        let inputs: Vec<TyRef> = regular_call_fun_decl_id(&reg.kind)
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .map(|fd| fd.signature.inputs.iter().map(clone_tyref).collect())
+            .unwrap_or_default();
+        for (index, ty) in inputs.iter().enumerate() {
+            let is_window = tyref_is_u8_window(ty, self.llbc);
+            if self.pair_slice_kind(ty).is_none() && !is_window {
+                continue;
+            }
+            let Some(header) = args.get(index).cloned() else {
+                continue;
+            };
+            if pair_lens.iter().any(|(at, _)| *at == index) {
+                // Window already split. Rewrite a STR / BytesBlock GCREF
+                // ptr to chars; keep the live length (`rstr.py` `STR`).
+                if is_window {
+                    args[index] = self.chars_ptr_if_str_header(mir_bb, header);
+                }
+                continue;
+            }
+            // A W1 STR / BytesBlock view passed to a window FunDecl stays
+            // one `Ptr(STR)` word (`emit_str_to_window`). Splicing it here
+            // would feed `(chars, __strlen)` to `RDict::get` / identity
+            // `from_utf8_unchecked`.
+            if is_window || self.pair_slice_kind(ty).is_none() {
+                continue;
+            }
+            let Some(op) = arg_operands.get(index) else {
+                continue;
+            };
+            if !self.operand_is_header_view(op) {
+                continue;
+            }
+            let (ptr, len) = if self.operand_is_string_byte_view(op) {
+                self.pair_of_str_view(mir_bb, header)
+            } else {
+                self.pair_of_bytes_block_view(mir_bb, header)
+            };
+            args[index] = ptr;
+            pair_lens.push((index, len));
+        }
+        pair_lens.sort_by_key(|(at, _)| *at);
+        Ok(())
     }
 
     /// The declaration of a callee that takes or returns pair slices: its
@@ -4556,13 +5106,12 @@ pub(in crate::front::mir) fn tyref_pair_field_kind(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<majit_ir::rvec::VecItemKind> {
-    tyref_pair_slice_item_kind(ty, llbc)
+    tyref_pair_or_host_u8_item_kind(ty, llbc)
         .or_else(|| {
             let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
             let referent = node.get("Ref")?.as_array()?.get(1)?;
-            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone().into()), llbc)
+            tyref_pair_or_host_u8_item_kind(&TyRef::Other(referent.clone().into()), llbc)
         })
-        .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
         // A struct field of `&mut [PyObjectRef]` stays the one-word object
         // array. Body locals of that type are the `{ptr, len}` view.
         .filter(|_| !tyref_is_object_pointer_mut_slice_or_iter(ty, llbc))
@@ -4646,7 +5195,7 @@ pub(in crate::front::mir) fn tyref_option_pair_slice_item_kind(
     llbc: &Llbc,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
-    tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+    tyref_pair_or_host_u8_item_kind(&payload, llbc)
 }
 
 /// The item kind of `Result<&[T], PyError>` when the Ok payload is a pair.
@@ -4661,7 +5210,7 @@ fn tyref_result_pair_slice_item_kind(
         return None;
     }
     let payload = crate::front::result_exc::tyref_result_ok(ty, llbc)?;
-    tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+    tyref_pair_or_host_u8_item_kind(&payload, llbc)
 }
 
 /// `&[PyObjectRef]` / `&[*mut PyObject]` (and the mut / raw-pointer
@@ -4791,6 +5340,34 @@ pub(in crate::front::mir) fn tyref_pair_slice_item_kind(
     None
 }
 
+/// Host `&mut [u8]` / `*mut [u8]` pair item. Shared `&[u8]` / `*const [u8]`
+/// is rstr `STR` (`tyref_is_shared_u8_slice`). [`tyref_pair_slice_item_kind`]
+/// is one-word items only. Does not peel `Option` or `Iter`.
+pub(in crate::front::mir) fn tyref_host_u8_pair_item_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    if tyref_is_shared_u8_slice(ty, llbc) {
+        return None;
+    }
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array()?.get(1)?,
+        (None, Some(raw)) => raw.as_array()?.first()?,
+        (None, None) => return None,
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let item = pointee.get("Slice")?.as_array()?.first()?;
+    (json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8"))
+        .then_some(majit_ir::rvec::VecItemKind::Int)
+}
+
+fn tyref_pair_or_host_u8_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    tyref_pair_slice_item_kind(ty, llbc)
+        .or_else(|| tyref_host_u8_pair_item_kind(ty, llbc))
+        .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
 fn slice_item_node_is_object_pointer(item: &serde_json::Value, llbc: &Llbc) -> bool {
     json_ty_is_objectptr(item, llbc)
         || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0))
@@ -4859,6 +5436,31 @@ pub(in crate::front::mir) fn tyref_pair_slice_iter_item_kind(
         return Some(majit_ir::rvec::VecItemKind::Ref);
     }
     None
+}
+
+fn tyref_iter_elem_is_u8(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(path) = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| td.item_meta.name_path())
+    else {
+        return false;
+    };
+    if path != "core::slice::iter::IterMut" {
+        return false;
+    }
+    node.get("Adt")
+        .and_then(|adt| adt.get("generics")?.get("types")?.as_array()?.first())
+        .is_some_and(|item| json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8"))
+}
+
+fn tyref_host_u8_pair_iter_item_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    tyref_iter_elem_is_u8(ty, llbc).then_some(majit_ir::rvec::VecItemKind::Int)
 }
 
 /// An object-pointer `&mut [T]` / `IterMut<T>` whose parameter form keeps
@@ -5141,8 +5743,7 @@ pub(in crate::front::mir) fn item_addr_locals(
                 _ => None,
             });
             let pair_recv = recv_place.is_some_and(|place| {
-                tyref_pair_slice_item_kind(&place.ty, llbc)
-                    .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+                tyref_pair_or_host_u8_item_kind(&place.ty, llbc).is_some()
                     || tyref_pair_field_kind(&place.ty, llbc).is_some()
             });
             let mark = match name.as_str() {
@@ -5184,7 +5785,7 @@ pub(in crate::front::mir) fn pair_len_shadows(
     mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
     let dyn_fat_pairs = dyn_fat_pair_locals(body, llbc);
     let block_u8 = bytes_block_chars_view_locals(body, llbc);
-    let len_shadow = pair_len_shadows_of(
+    let mut len_shadow = pair_len_shadows_of(
         &body.locals,
         llbc,
         &views,
@@ -5194,6 +5795,33 @@ pub(in crate::front::mir) fn pair_len_shadows(
         &block_u8,
         spec,
     );
+    // W2 `&mut [u8]` is normally a list view (no length shadow). A
+    // `from_raw_parts{,_mut}` whose pointer SSA-proves as
+    // `header.add(CHARS_OFFSET)` is `direct_arrayitems` of `STR.chars`
+    // (`lltype.py`); the dest is the `{chars_ptr, supplied_len}` pair,
+    // including when `supplied_len` is a live prefix below capacity.
+    let chars_offset_dest = chars_offset_from_raw_parts_dest_locals(body, llbc);
+    let n_locals = body.locals.locals.len();
+    let mut next = len_shadow
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(n_locals);
+    for (index, local) in body.locals.locals.iter().enumerate() {
+        if len_shadow.get(index).copied().flatten().is_some() {
+            continue;
+        }
+        if !chars_offset_dest.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if tyref_host_u8_pair_item_kind(&local.ty, llbc).is_none() {
+            continue;
+        }
+        len_shadow[index] = Some(next);
+        next += 1;
+    }
     (len_shadow, str_views, list_views, list_view_fixed, block_u8)
 }
 
@@ -5795,8 +6423,7 @@ pub(in crate::front::mir) fn unstructured_if_naked_pair_slice(
     fd: &FunDecl,
     llbc: &Llbc,
 ) -> Option<Unstructured> {
-    tyref_pair_slice_item_kind(&fd.signature.output, llbc)
-        .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+    tyref_pair_or_host_u8_item_kind(&fd.signature.output, llbc)
         .is_some()
         .then(|| fd.unstructured())
         .flatten()
@@ -6149,6 +6776,42 @@ fn from_raw_parts_is_bytes_block_chars_view(
     let ptr_h = operand_bytes_block_chars_header(llbc, body, &call.args[0])
         .or_else(|| operand_ptr_add_chars_offset_header(llbc, body, &call.args[0]));
     ptr_h == Some(len_h)
+}
+
+/// Dest of `from_raw_parts{,_mut}` whose pointer SSA-proves as
+/// `header.add(LOWLEVEL_STRING_CHARS_OFFSET)`. Length is not consulted:
+/// a live prefix `[0, len)` with `len <= capacity` is still a view of
+/// `STR.chars` (`lltype.py` `direct_arrayitems`). Header identity comes
+/// from the pointer.
+fn chars_offset_from_raw_parts_dest_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let mut mark = vec![false; n];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body().iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !regular_call_is_slice_from_raw_parts(reg, llbc) || call.args.len() != 2 {
+            continue;
+        }
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        let dest = dest as usize;
+        if dest >= n {
+            continue;
+        }
+        if operand_ptr_add_chars_offset_header(llbc, body, &call.args[0]).is_some() {
+            mark[dest] = true;
+        }
+    }
+    mark
 }
 
 /// `(header as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — the same
@@ -6762,6 +7425,12 @@ pub(in crate::front::mir) fn pair_len_shadows_of(
                 || tyref_strips_to_str(&local.ty, llbc)
                 || tyref_is_w1_str(&local.ty, llbc)
             {
+                return None;
+            }
+            // Host `&mut [u8]` is a W2 list / Vec view. `tyref_pair_field_kind`
+            // now answers a pair item for it; a length shadow then makes a
+            // One-bound owner look like a STR view joining a window.
+            if tyref_host_u8_pair_item_kind(&local.ty, llbc).is_some() {
                 return None;
             }
             let kind = if index <= arg_count {

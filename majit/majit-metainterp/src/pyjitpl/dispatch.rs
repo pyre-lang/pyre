@@ -5617,6 +5617,11 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    // Portal only (`compile.py` / #2446). Helper-innermost resume puts the
+    // helper last; a whole-body scan of that helper would refuse every
+    // exception bridge whose jitcode names `push_roots` / `make_pyerror` in
+    // an untaken arm. Record-time abort refuses a helper residual that
+    // this walk actually records.
     if frames
         .first()
         .is_some_and(|frame| refuse_reachable_symbolic_residuals(&frame.jitcode))

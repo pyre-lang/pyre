@@ -3715,7 +3715,7 @@ fn block_rewind_open_depth(
         classified.get(&bb),
         Some((Leaf::Close | Leaf::ItemsClose, _))
     ) {
-        let call = match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
+        let call = match body.body().get(bb).and_then(|b| b.term_ref(llbc).ok()) {
             Some(TermKind::Call { call, .. }) => call,
             _ => return None,
         };
@@ -3726,11 +3726,11 @@ fn block_rewind_open_depth(
             .and_then(|l| special_open_guard(specials, l))
             .map(|(d, _)| d);
     }
-    match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
+    match body.body().get(bb).and_then(|b| b.term_ref(llbc).ok()) {
         Some(TermKind::Drop { place, .. }) => {
-            place_local(place).and_then(|l| special_open_guard(specials, l).map(|(d, _)| d))
+            place_local(&place).and_then(|l| special_open_guard(specials, l).map(|(d, _)| d))
         }
-        Some(TermKind::Call { call, .. }) => mem_drop_guard_depth(call, llbc, specials),
+        Some(TermKind::Call { call, .. }) => mem_drop_guard_depth(&call, llbc, specials),
         _ => None,
     }
 }
