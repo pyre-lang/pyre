@@ -6787,7 +6787,7 @@ fn chars_offset_from_raw_parts_dest_locals(body: &Unstructured, llbc: &Llbc) -> 
     let n = body.locals.locals.len();
     let mut mark = vec![false; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

@@ -16144,9 +16144,9 @@ mod tests {
             .graph;
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
 
         assert!(
             asm.insns.contains_key("arraylen_vable/rdd>i"),
@@ -16200,6 +16200,13 @@ mod tests {
         // 2B adescr + 1B dest`, each index little-endian.  A swapped emission
         // would still leave the pool in this order and still key
         // `arraylen_vable/rdd>i`.
+        let flat = body
+            ._ssarepr
+            .as_ref()
+            .expect("assemble records _ssarepr")
+            .as_any()
+            .downcast_ref::<SSARepr>()
+            .expect("SSARepr");
         let op_index = flat
             .insns
             .iter()
@@ -16381,7 +16388,7 @@ mod tests {
             let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
             let mut flat = flatten_graph(&rewritten, &mut regallocs);
             let mut asm = Assembler::new();
-            let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
             assert!(
                 asm.insns.contains_key("arraylen_vable/rdd>i"),
                 "vable arraylen must assemble without unique vinfo, got {:?}",
@@ -16543,7 +16550,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         for key in [
             "getarrayitem_vable_i/ridd>i",
             "setarrayitem_vable_i/riidd",
@@ -16662,7 +16669,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         let key = "setarrayitem_vable_i/riidd";
         let Some(&opnum) = asm.insns.get(key) else {
             panic!(

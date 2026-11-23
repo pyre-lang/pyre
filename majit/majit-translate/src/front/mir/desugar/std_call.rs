@@ -7165,7 +7165,7 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
     ) -> bool {
         let forward_blocks = forward_reachable_mask(self.llbc, self.body);
-        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+        for (bb_idx, bb) in self.body.body().iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
             }
