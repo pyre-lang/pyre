@@ -34,20 +34,33 @@
 //! `NewArray` of the same id plus the traced `setarrayitem` loop
 //! (`fixed_list_clears` is false for `i64`).
 
-use crate::codewriter::call::CallControl;
+use crate::codewriter::call::{
+    CallControl, array_from_concretetype, array_item_size_of_lltype,
+    effect_graph_from_rtyped_helper,
+};
 use crate::flowspace::model::Variable;
+use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
     BlockId, CallTarget, ConcreteType, ExitSwitch, FunctionGraph, LinkArg, OpKind, ValueType,
 };
 use crate::parse::CallPath;
+use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+use crate::translator::rtyper::lltypesystem::rbuilder::{
+    build_ll_arrayclear_helper_graph_for_array, build_ll_arrayfill_helper_graph_for_array,
+    ll_arrayclear_helper_name, ll_arrayfill_helper_name,
+};
 
 /// `rlist.py _ll_alloc_and_set_nonnull`: `jit.isconstant(count) and count < 137`.
 pub(crate) const LOOK_INSIDE_COUNT_LIMIT: i64 = 137;
 
-/// Item kind and ARRAY identity of one fixed `[item] * count`.
+/// Item kind, dump ARRAY identity, and the list's real ARRAY lltype of
+/// one fixed `[item] * count`. `rgc.py ll_arrayclear` / `ll_arrayfill`
+/// are `@specialize.ll()` on `lltype.typeOf(p)`.
 pub(crate) struct FixedArrayRepeat {
     pub(crate) item_ty: ValueType,
     pub(crate) array_type_id: String,
+    pub(crate) array: Array,
     pub(crate) clears: bool,
 }
 
@@ -90,7 +103,12 @@ pub(crate) fn ll_fixed_alloc_and_set_path(
     let trampoline = build_trampoline(&names, identity);
     let wrapper = build_wrapper(&names, identity);
     let jit = build_jit_arm(&names, identity);
-    let nojit = build_nojit(&names, identity);
+    // `rlist.py _ll_alloc_and_set_nojit` `direct_call`s the T1
+    // `rgc.ll_arrayclear` / `rgc.ll_arrayfill` graphs. Mint those
+    // before the nojit body so the callee path binds.
+    let intern_id = cc.intern_array(&identity.array);
+    ensure_rgc_helpers(cc, identity, intern_id);
+    let nojit = build_nojit(&names, identity, intern_id);
     let outer = build_outer(&names, identity);
     // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
     // `func._annspecialcase_ = "specialize:call_location"` on the
@@ -131,6 +149,56 @@ fn register(cc: &mut CallControl, name: &str, mut graph: FunctionGraph, hints: &
     cc.add_candidate_graph_if_look_inside(path);
 }
 
+/// Mint the T1 `rgc.ll_arrayclear` / `rgc.ll_arrayfill` graphs the nojit
+/// arm `direct_call`s (`rlist.py _ll_alloc_and_set_nojit`). Same
+/// `register` as the rest of the family: the helper body is residual
+/// (`rgc.py` `@jit.dont_look_inside`). The body is `Ptr(identity.array)`.
+fn ensure_rgc_helpers(cc: &mut CallControl, identity: &FixedArrayRepeat, intern_id: u64) {
+    if !identity.clears {
+        let name = ll_arrayclear_helper_name(intern_id);
+        ensure_rgc_helper(cc, &name, &identity.array, true, || {
+            build_ll_arrayclear_helper_graph_for_array(intern_id, &identity.array)
+        });
+    }
+    let name = ll_arrayfill_helper_name(intern_id);
+    ensure_rgc_helper(cc, &name, &identity.array, false, || {
+        build_ll_arrayfill_helper_graph_for_array(intern_id, &identity.array)
+    });
+}
+
+fn ensure_rgc_helper(
+    cc: &mut CallControl,
+    name: &str,
+    array: &Array,
+    clear: bool,
+    build: impl FnOnce() -> Result<PyGraph, TyperError>,
+) {
+    let path = CallPath::from_segments([name]);
+    let existing_array = cc.function_graphs().get(&path).and_then(|graph| {
+        graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .and_then(|v| array_from_concretetype(v.concretetype().as_ref()))
+    });
+    if cc.has_function_graph(&path) {
+        let existing_id = existing_array.as_ref().map(|arr| cc.intern_array(arr));
+        let want_id = cc.intern_array(array);
+        assert_eq!(
+            existing_id,
+            Some(want_id),
+            "LowLevelAnnotatorPolicy.lowlevelspecialize: helper {name} \
+             startblock ARRAY {existing_array:?} != requested {array:?}"
+        );
+        bind_rgc_helper_fnaddr(cc, name, &array.OF, clear);
+        return;
+    }
+    let py = build().unwrap_or_else(|err| panic!("{name}: {err}"));
+    let graph = effect_graph_from_rtyped_helper(&py.graph.borrow());
+    register(cc, name, graph, &["dont_look_inside"]);
+    bind_rgc_helper_fnaddr(cc, name, &array.OF, clear);
+}
+
 /// Kind leaf published by `HELPER_FNADDRS` for the residual trampoline.
 /// Identity-specific graphs alias this address (`look_inside_iff`
 /// trampoline is an ordinary translated function).
@@ -169,6 +237,66 @@ fn bind_kind_trampoline_fnaddr(cc: &mut CallControl, trampoline: &str, item_ty: 
         return;
     }
     let src = kind_trampoline_fnaddr_key(item_ty);
+    if cc.lookup_function_fnaddr(&src).is_some() {
+        cc.alias_function_fnaddr(dest, &src);
+    }
+}
+
+/// Kind leaf published by `HELPER_FNADDRS` for `rgc.py ll_arrayclear` /
+/// `ll_arrayfill`. `@specialize.ll()` fixes `llmemory.sizeof(ARRAY.OF)`
+/// per ARRAY; identity-specific graphs alias this width-split address
+/// (`call.py getcalldescr` / `getfunctionptr`).
+fn rgc_kind_leaf(clear: bool, of: &LowLevelType) -> &'static str {
+    const CLEAR: [&str; 7] = [
+        "ll_arrayclear_f",
+        "ll_arrayclear_s",
+        "ll_arrayclear_r",
+        "ll_arrayclear_i1",
+        "ll_arrayclear_i2",
+        "ll_arrayclear_i4",
+        "ll_arrayclear_i8",
+    ];
+    const FILL: [&str; 7] = [
+        "ll_arrayfill_f",
+        "ll_arrayfill_s",
+        "ll_arrayfill_r",
+        "ll_arrayfill_i1",
+        "ll_arrayfill_i2",
+        "ll_arrayfill_i4",
+        "ll_arrayfill_i8",
+    ];
+    let kind = match of {
+        LowLevelType::Float => 0,
+        LowLevelType::SingleFloat => 1,
+        LowLevelType::Ptr(_) => 2,
+        of => match array_item_size_of_lltype(of) {
+            Some(1) => 3,
+            Some(2) => 4,
+            Some(4) => 5,
+            Some(8) => 6,
+            other => panic!(
+                "rgc.py ll_arrayclear/ll_arrayfill: sizeof(ARRAY.OF) must be 1, 2, 4, or 8, got {other:?}"
+            ),
+        },
+    };
+    if clear { CLEAR[kind] } else { FILL[kind] }
+}
+
+fn rgc_kind_fnaddr_key(clear: bool, of: &LowLevelType) -> CallPath {
+    CallPath::from_segments(["listobject", rgc_kind_leaf(clear, of)])
+}
+
+#[cfg(test)]
+fn rgc_kind_helper_fnaddr_path(clear: bool, of: &LowLevelType) -> String {
+    format!("pyre_object::{}", rgc_kind_fnaddr_key(clear, of))
+}
+
+fn bind_rgc_helper_fnaddr(cc: &mut CallControl, name: &str, of: &LowLevelType, clear: bool) {
+    let dest = CallPath::from_segments([name]);
+    if cc.lookup_function_fnaddr(&dest).is_some() {
+        return;
+    }
+    let src = rgc_kind_fnaddr_key(clear, of);
     if cc.lookup_function_fnaddr(&src).is_some() {
         cc.alias_function_fnaddr(dest, &src);
     }
@@ -568,7 +696,11 @@ fn build_trampoline(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Fu
 /// (`identity.clears`), so the zero arm skips `ll_arrayclear`. The
 /// Float fill test is the bit compare in [`push_item_is_zero`]: `-0.0`
 /// takes `ll_arrayfill`.
-fn build_nojit(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> FunctionGraph {
+fn build_nojit(
+    names: &AllocAndSetNames,
+    identity: &FixedArrayRepeat,
+    intern_id: u64,
+) -> FunctionGraph {
     let mut graph = FunctionGraph::new(&names.nojit);
     let start = graph.startblock;
     let (count, item) = entry_params(&mut graph, start, identity);
@@ -580,11 +712,14 @@ fn build_nojit(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Functio
     FunctionGraph::set_concretetype_of_inline(&zero_args[1], item_concrete(&identity.item_ty));
     // `not isinstance(typeOf(item), Ptr)`: only a non-Ptr item still
     // needs `rgc.ll_arrayclear`. The fixed receiver is the array ptr.
+    // The callee is the synthesised helper graph (`rgc.py ll_arrayclear`),
+    // keyed by ARRAY identity — not a path-only void call.
+    let clear_name = ll_arrayclear_helper_name(intern_id);
     if !identity.clears {
         push_void_call(
             &mut graph,
             zero_block,
-            &["ll_arrayclear"],
+            &[clear_name.as_str()],
             vec![zero_args[0].clone()],
         );
     }
@@ -593,10 +728,11 @@ fn build_nojit(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Functio
     let (fill_block, fill_args) = graph.create_block_with_arg_vars(2);
     FunctionGraph::set_concretetype_of_inline(&fill_args[0], ConcreteType::GcRef);
     FunctionGraph::set_concretetype_of_inline(&fill_args[1], item_concrete(&identity.item_ty));
+    let fill_name = ll_arrayfill_helper_name(intern_id);
     push_void_call(
         &mut graph,
         fill_block,
-        &["ll_arrayfill"],
+        &[fill_name.as_str()],
         vec![fill_args[0].clone(), fill_args[1].clone()],
     );
     graph.set_return(fill_block, Some(fill_args[0].clone()));
@@ -705,11 +841,13 @@ mod tests {
     use super::*;
     use crate::codewriter::call::CallKind;
     use crate::model::SpaceOperation;
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
 
     fn i64_identity() -> FixedArrayRepeat {
         FixedArrayRepeat {
             item_ty: ValueType::Int,
             array_type_id: "[i64]".into(),
+            array: Array::gc(LowLevelType::Signed),
             clears: false,
         }
     }
@@ -718,6 +856,7 @@ mod tests {
         FixedArrayRepeat {
             item_ty: ValueType::Float,
             array_type_id: "[f64]".into(),
+            array: Array::gc(LowLevelType::Float),
             clears: false,
         }
     }
@@ -726,8 +865,61 @@ mod tests {
         FixedArrayRepeat {
             item_ty: ValueType::Ref(None),
             array_type_id: crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into(),
+            array: Array::gc((*GCREF).clone()),
             clears: true,
         }
+    }
+
+    fn i8_identity() -> FixedArrayRepeat {
+        use crate::translator::rtyper::lltypesystem::rffi::SIGNEDCHAR;
+        FixedArrayRepeat {
+            item_ty: ValueType::Int,
+            array_type_id: "[i8]".into(),
+            array: Array::gc((*SIGNEDCHAR).clone()),
+            clears: false,
+        }
+    }
+
+    fn u8_identity() -> FixedArrayRepeat {
+        use crate::translator::rtyper::lltypesystem::rffi::UCHAR;
+        FixedArrayRepeat {
+            item_ty: ValueType::Unsigned,
+            array_type_id: "[u8]".into(),
+            array: Array::gc((*UCHAR).clone()),
+            clears: false,
+        }
+    }
+
+    fn singlefloat_identity() -> FixedArrayRepeat {
+        FixedArrayRepeat {
+            item_ty: ValueType::SingleFloat,
+            array_type_id: "[f32]".into(),
+            array: Array::gc(LowLevelType::SingleFloat),
+            clears: false,
+        }
+    }
+
+    fn rgc_helper_names(cc: &CallControl, identity: &FixedArrayRepeat) -> (String, String) {
+        let intern_id = cc.intern_array(&identity.array);
+        (
+            ll_arrayclear_helper_name(intern_id),
+            ll_arrayfill_helper_name(intern_id),
+        )
+    }
+
+    fn helper_array(cc: &CallControl, name: &str) -> Array {
+        graph_ops(cc, name)
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ArrayLen {
+                    array: Some(arr), ..
+                }
+                | OpKind::ArrayWrite {
+                    array: Some(arr), ..
+                } => Some(arr.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} carries ARRAY"))
     }
 
     fn mint(identity: &FixedArrayRepeat) -> (CallControl, AllocAndSetNames) {
@@ -742,6 +934,14 @@ mod tests {
         if let Some(addr) = addr {
             cc.register_macro_helper_trace_fnaddr(
                 &kind_trampoline_helper_fnaddr_path(&identity.item_ty),
+                addr,
+            );
+            cc.register_macro_helper_trace_fnaddr(
+                &rgc_kind_helper_fnaddr_path(true, &identity.array.OF),
+                addr,
+            );
+            cc.register_macro_helper_trace_fnaddr(
+                &rgc_kind_helper_fnaddr_path(false, &identity.array.OF),
                 addr,
             );
         }
@@ -974,7 +1174,8 @@ mod tests {
     /// fills (only `+0.0` has bits 0 and clears).
     #[test]
     fn nojit_zero_nonptr_clears_and_nonzero_fills() {
-        let (cc, names) = mint(&float_identity());
+        let identity = float_identity();
+        let (cc, names) = mint(&identity);
         let nops = graph_ops(&cc, &names.nojit);
         assert!(
             nops.iter()
@@ -993,8 +1194,9 @@ mod tests {
             }),
             "IEEE float_is_true would treat -0.0 as zero"
         );
-        assert!(calls_named(&nops, "ll_arrayclear"));
-        assert!(calls_named(&nops, "ll_arrayfill"));
+        let (clear, fill) = rgc_helper_names(&cc, &identity);
+        assert!(calls_named(&nops, &clear));
+        assert!(calls_named(&nops, &fill));
         assert!(
             !nops
                 .iter()
@@ -1007,14 +1209,98 @@ mod tests {
     /// zeroed the slots (`zero_gc_pointers_inside`).
     #[test]
     fn nojit_ptr_item_skips_arrayclear() {
-        let (cc, names) = mint(&ptr_identity());
+        let identity = ptr_identity();
+        let (cc, names) = mint(&identity);
         let nops = graph_ops(&cc, &names.nojit);
         assert!(
             nops.iter()
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
         );
+        let (clear, fill) = rgc_helper_names(&cc, &identity);
+        assert!(!calls_named(&nops, &clear));
         assert!(!calls_named(&nops, "ll_arrayclear"));
-        assert!(calls_named(&nops, "ll_arrayfill"));
+        assert!(calls_named(&nops, &fill));
+    }
+
+    /// `_ll_alloc_and_set_nojit` `direct_call`s the synthesised
+    /// `rgc.ll_arrayclear` / `rgc.ll_arrayfill` graphs (`rlist.py`),
+    /// keyed by ARRAY identity. The callee is registered on CallControl
+    /// (`lowlevel_helper_function_with_builder` analog), not a
+    /// path-named void call.
+    #[test]
+    fn nojit_int_repeat_calls_registered_rgc_helper_graphs() {
+        let identity = i64_identity();
+        let (cc, names) = mint(&identity);
+        let nops = graph_ops(&cc, &names.nojit);
+        let (clear, fill) = rgc_helper_names(&cc, &identity);
+        assert!(
+            !calls_named(&nops, "ll_arrayclear"),
+            "nojit must not emit a path-only ll_arrayclear call"
+        );
+        assert!(
+            !calls_named(&nops, "ll_arrayfill"),
+            "nojit must not emit a path-only ll_arrayfill call"
+        );
+        assert!(calls_named(&nops, &clear), "zero arm: [0] * n");
+        assert!(calls_named(&nops, &fill), "nonzero arm: [x] * n");
+
+        for name in [&clear, &fill] {
+            let path = CallPath::from_segments([name.as_str()]);
+            assert!(
+                cc.has_function_graph(&path),
+                "{name} must be reachable from CallControl"
+            );
+            let hops = graph_ops(&cc, name);
+            assert!(
+                hops.iter()
+                    .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+                "{name} body is rgc.py ll_arrayclear/ll_arrayfill (getarraysize)"
+            );
+            assert!(
+                !cc.is_candidate(&path),
+                "rgc.py @jit.dont_look_inside refuses {name}"
+            );
+            let call = SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([name.as_str()]),
+                    args: crate::model::call_args(vec![Variable::new()]),
+                    result_ty: ValueType::Void,
+                },
+            };
+            assert!(
+                cc.graphs_from(&call).is_none(),
+                "{name} is residual, not a path-only miss"
+            );
+        }
+        let clear_ops = graph_ops(&cc, &clear);
+        assert!(
+            !clear_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+            "ll_arrayclear has no ArrayWrite of the list's ARRAY"
+        );
+        assert!(
+            clear_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "raw_memclear"
+            )),
+            "ll_arrayclear stores with raw_memclear"
+        );
+        let fill_ops = graph_ops(&cc, &fill);
+        assert!(
+            fill_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "bare_setarrayitem"
+            )),
+            "ll_arrayfill stores with bare_setarrayitem"
+        );
+        assert!(
+            !fill_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+            "writeanalyze.py analyze_simple_operation: bare_setarrayitem is empty"
+        );
     }
 
     /// `look_inside_iff` stamps `specialize:call_location` on the
@@ -1037,6 +1323,212 @@ mod tests {
                 .iter()
                 .any(|h| h == "specialize:call_location"),
             "look_inside_iff wrapper f does not get call_location"
+        );
+    }
+
+    /// `rgc.py ll_arrayclear` / `ll_arrayfill` are `@specialize.ll()` on
+    /// `lltype.typeOf(p)`. An i8 / u8 / SingleFloat list keeps that ARRAY,
+    /// not a word `Signed` or `Float`.
+    #[test]
+    fn rgc_helpers_keep_i8_u8_singlefloat_array() {
+        use crate::translator::rtyper::lltypesystem::rffi::size_and_sign;
+        let cases: [(FixedArrayRepeat, usize, bool); 3] = [
+            (i8_identity(), 1, false),
+            (u8_identity(), 1, true),
+            (singlefloat_identity(), 4, false),
+        ];
+        for (identity, size, unsigned) in cases {
+            let (cc, _) = mint(&identity);
+            let (clear, fill) = rgc_helper_names(&cc, &identity);
+            for name in [&clear, &fill] {
+                let arr = helper_array(&cc, name);
+                assert_eq!(
+                    size_and_sign(&arr.OF).expect("ARRAY.OF size"),
+                    (size, unsigned),
+                    "{name} ARRAY.OF {:?}",
+                    arr.OF
+                );
+                assert_ne!(arr.OF, LowLevelType::Signed, "{name} is not a word array");
+                assert_ne!(arr.OF, LowLevelType::Float, "{name} is not a double array");
+                assert_eq!(arr, identity.array, "{name} is the list's ARRAY");
+            }
+        }
+    }
+
+    /// `writeanalyze.py analyze_simple_operation` records an array write
+    /// for `setarrayitem` only. `ll_arrayfill` uses `bare_setarrayitem`
+    /// and `ll_arrayclear` uses `raw_memclear`, so neither effect info
+    /// has an array-write of the list's ARRAY.
+    #[test]
+    fn ll_arrayfill_effect_has_no_array_write() {
+        let identity = i64_identity();
+        let (cc, _) = mint(&identity);
+        let (clear, fill) = rgc_helper_names(&cc, &identity);
+        let fill_ops = graph_ops(&cc, &fill);
+        assert!(fill_ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::LoweredBlackholeOp { opname, .. } if opname == "bare_setarrayitem"
+        )));
+        assert!(
+            !fill_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+            "fill helper has no ArrayWrite of the list's ARRAY"
+        );
+        let clear_ops = graph_ops(&cc, &clear);
+        assert!(
+            !clear_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+            "clear helper has no ArrayWrite of the list's ARRAY"
+        );
+        assert!(
+            clear_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "raw_memclear"
+            )),
+            "clear helper stores with raw_memclear"
+        );
+    }
+
+    /// Dump ids `[A::B]` / `[A__B]` collapse under `valid_identifier`.
+    /// `intern_array` keeps the ARRAYs distinct, so each gets its own
+    /// `rgc.ll_arrayclear` graph (`LowLevelAnnotatorPolicy.lowlevelspecialize`).
+    #[test]
+    fn rgc_helpers_split_arrays_whose_dump_ids_sanitize_alike() {
+        fn sanitize(id: &str) -> String {
+            id.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        }
+        let dump_a = "[A::B]";
+        let dump_b = "[A__B]";
+        assert_eq!(sanitize(dump_a), sanitize(dump_b));
+        let a = Array::gc(LowLevelType::Signed);
+        let b = Array::gc(LowLevelType::Float);
+        let ident_a = FixedArrayRepeat {
+            item_ty: ValueType::Int,
+            array_type_id: dump_a.into(),
+            array: a.clone(),
+            clears: false,
+        };
+        let ident_b = FixedArrayRepeat {
+            item_ty: ValueType::Float,
+            array_type_id: dump_b.into(),
+            array: b.clone(),
+            clears: false,
+        };
+        let mut cc = CallControl::new();
+        let intern_a = cc.intern_array(&a);
+        let intern_b = cc.intern_array(&b);
+        assert_ne!(intern_a, intern_b);
+        ensure_rgc_helpers(&mut cc, &ident_a, intern_a);
+        ensure_rgc_helpers(&mut cc, &ident_b, intern_b);
+        let name_a = ll_arrayclear_helper_name(intern_a);
+        let name_b = ll_arrayclear_helper_name(intern_b);
+        assert_ne!(name_a, name_b);
+        assert_eq!(helper_array(&cc, &name_a), a);
+        assert_eq!(helper_array(&cc, &name_b), b);
+        assert_eq!(helper_array(&cc, &ll_arrayfill_helper_name(intern_a)), a);
+        assert_eq!(helper_array(&cc, &ll_arrayfill_helper_name(intern_b)), b);
+    }
+
+    /// A graph already registered under the interned leaf must be the
+    /// same ARRAY (`LowLevelAnnotatorPolicy.lowlevelspecialize`).
+    #[test]
+    #[should_panic(expected = "lowlevelspecialize")]
+    fn rgc_helper_reuse_rejects_a_different_array() {
+        let mut cc = CallControl::new();
+        let signed = Array::gc(LowLevelType::Signed);
+        let intern_id = cc.intern_array(&signed);
+        let name = ll_arrayclear_helper_name(intern_id);
+        let float = Array::gc(LowLevelType::Float);
+        ensure_rgc_helper(&mut cc, &name, &float, true, || {
+            build_ll_arrayclear_helper_graph_for_array(intern_id, &float)
+        });
+        ensure_rgc_helper(&mut cc, &name, &signed, true, || panic!("must not rebuild"));
+    }
+
+    /// `call.py getcalldescr` needs a real `getfunctionptr`. After
+    /// codewriting a fixed list repeat, each `ll_arrayclear__<id>` /
+    /// `ll_arrayfill__<id>` aliases the kind-level `HELPER_FNADDRS` row.
+    #[test]
+    fn rgc_helpers_bind_kind_fnaddr_after_fixed_repeat() {
+        fn assert_bound(cc: &CallControl, name: &str) {
+            let path = CallPath::from_segments([name]);
+            let addr = cc
+                .lookup_function_fnaddr(&path)
+                .unwrap_or_else(|| panic!("{name} fnaddr"));
+            assert_ne!(addr, 0, "{name}");
+            assert!(
+                !crate::codewriter::call::is_symbolic_fnaddr(addr),
+                "{name} is executable"
+            );
+        }
+        for identity in [
+            i8_identity(),
+            i64_identity(),
+            float_identity(),
+            singlefloat_identity(),
+            ptr_identity(),
+        ] {
+            let (cc, _) = mint(&identity);
+            let (clear, fill) = rgc_helper_names(&cc, &identity);
+            if !identity.clears {
+                assert_bound(&cc, &clear);
+            }
+            assert_bound(&cc, &fill);
+        }
+    }
+
+    /// `descr.py map_type_to_argclass`: `ll_arrayfill` of `Array(SingleFloat)`
+    /// keeps call class `S` (`get_call_descr` ARGS), not `i`.
+    #[test]
+    fn ll_arrayfill_singlefloat_calldescr_arg_classes_are_r_s() {
+        let identity = singlefloat_identity();
+        let (cc, _) = mint(&identity);
+        let (_, fill) = rgc_helper_names(&cc, &identity);
+        let path = CallPath::from_segments([fill.as_str()]);
+        let classes = cc
+            .declared_non_void_arg_classes(&path)
+            .expect("ll_arrayfill helper has a graph");
+        assert_eq!(classes, "rS", "{fill} arg classes");
+        let tys: Vec<_> = graph_ops(&cc, &fill)
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } => Some(ty.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(tys.get(1), Some(ValueType::SingleFloat)),
+            "{fill} item Input.ty is SingleFloat, got {tys:?}"
+        );
+    }
+
+    /// `rgc.py ll_arrayfill` is `@specialize.ll()` per ARRAY; the kind
+    /// leaf carries `sizeof(ARRAY.OF)`. SingleFloat is its own leaf,
+    /// not the Float pair; integer widths split `_i1`..`_i8`.
+    #[test]
+    fn rgc_kind_leaf_maps_singlefloat_to_s() {
+        use crate::translator::rtyper::lltypesystem::rffi::{SHORT, SIGNEDCHAR, UINT};
+        assert_eq!(
+            rgc_kind_leaf(true, &LowLevelType::SingleFloat),
+            "ll_arrayclear_s"
+        );
+        assert_eq!(
+            rgc_kind_leaf(false, &LowLevelType::SingleFloat),
+            "ll_arrayfill_s"
+        );
+        assert_eq!(rgc_kind_leaf(false, &LowLevelType::Float), "ll_arrayfill_f");
+        assert_eq!(rgc_kind_leaf(false, &*GCREF), "ll_arrayfill_r");
+        assert_eq!(rgc_kind_leaf(false, &LowLevelType::Char), "ll_arrayfill_i1");
+        assert_eq!(rgc_kind_leaf(false, &*SIGNEDCHAR), "ll_arrayfill_i1");
+        assert_eq!(rgc_kind_leaf(false, &*SHORT), "ll_arrayfill_i2");
+        assert_eq!(rgc_kind_leaf(false, &*UINT), "ll_arrayfill_i4");
+        assert_eq!(
+            rgc_kind_leaf(false, &LowLevelType::SignedLongLong),
+            "ll_arrayfill_i8"
         );
     }
 }

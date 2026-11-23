@@ -3812,11 +3812,14 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::PBC(merged))
         }
 
-        // SomeWeakRef ∪ SomeWeakRef — upstream widens the classdef to
-        // the common base when both sides carry one.
+        // binaryop.py `pairtype(SomeWeakRef, SomeWeakRef).union`:
+        // dead ∪ x → x's classdef (so dead ∪ dead → None);
+        // x ∪ dead → x's classdef;
+        // live ∪ live → commonbase or UnionError.
         (SomeValue::WeakRef(a), SomeValue::WeakRef(b)) => {
             let merged_classdef: Option<Rc<RefCell<ClassDef>>> = match (&a.classdef, &b.classdef) {
-                (None, _) | (_, None) => None,
+                (None, other) => other.clone(), // s_wrf1 is known to be dead
+                (other, None) => other.clone(), // s_wrf2 is known to be dead
                 (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
                     Some(base) => Some(base),
                     None => {
@@ -6227,6 +6230,18 @@ mod tests {
 
         let dead = SomeValue::WeakRef(SomeWeakRef::new(None));
         let u = union(&a, &dead).unwrap();
+        let SomeValue::WeakRef(w) = u else {
+            panic!("expected SomeWeakRef");
+        };
+        assert!(matches!(&w.classdef, Some(cd) if Rc::ptr_eq(cd, &x)));
+
+        let u = union(&dead, &a).unwrap();
+        let SomeValue::WeakRef(w) = u else {
+            panic!("expected SomeWeakRef");
+        };
+        assert!(matches!(&w.classdef, Some(cd) if Rc::ptr_eq(cd, &x)));
+
+        let u = union(&dead, &dead).unwrap();
         let SomeValue::WeakRef(w) = u else {
             panic!("expected SomeWeakRef");
         };

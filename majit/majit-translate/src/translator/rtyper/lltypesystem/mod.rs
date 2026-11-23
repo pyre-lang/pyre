@@ -6,11 +6,11 @@
 // through ctypes; pyre compiles to native code via Charon/LLBC and never
 // simulates lltype, so the whole module is permanently unused by design.
 pub mod ll_str;
-// `llarena` is intentionally absent and must NEVER be added. RPython's
-// `llarena.py` simulates GC arenas for the moving collectors in
-// `rpython/memory/gc/` (which pyre does not port); pyre's GC allocates each old
-// object through the system allocator and bump-allocates the nursery, with no
-// arena layer, so it is permanently unused by design.
+// `llarena` is not a module here. `llarena.py` serves the collectors in
+// `rpython/memory/gc/`; pyre ports `incminimark.py` as `majit-gc`, whose
+// arena calls (`_alloc_nursery`'s `arena_malloc(size, 0)`, `arena_reset`,
+// `llimpl_arena_protect`) live in `majit-gc/src/nursery.rs` over the system
+// allocator. No lltype program the rtyper handles allocates an arena.
 pub mod llgroup;
 pub mod llheap;
 pub mod llmemory;

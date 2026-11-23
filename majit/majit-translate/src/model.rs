@@ -1149,6 +1149,70 @@ impl IndirectFamilyKey {
     }
 }
 
+/// `jtransform.py rewrite_op_getarrayitem` arg `arraydescr`
+/// (`vinfo.array_descrs[arrayindex]`).
+#[derive(Debug, Clone)]
+pub struct VableArrayDescr(pub majit_jitcode::codewriter::jitcode::BhDescr);
+
+impl PartialEq for VableArrayDescr {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (
+                majit_jitcode::codewriter::jitcode::BhDescr::Array {
+                    base_size: a_base,
+                    itemsize: a_item,
+                    len_offset: a_len,
+                    type_id: a_tid,
+                    gc_type_id: a_gc,
+                    item_type: a_item_ty,
+                    is_array_of_pointers: a_ptrs,
+                    is_array_of_structs: a_structs,
+                    is_item_signed: a_signed,
+                    ei_index: a_ei,
+                    array_type_id: a_array_id,
+                    interior_fields: a_interior,
+                    is_gc_managed: a_gc_managed,
+                    load_is_acquire: a_acquire,
+                },
+                majit_jitcode::codewriter::jitcode::BhDescr::Array {
+                    base_size: b_base,
+                    itemsize: b_item,
+                    len_offset: b_len,
+                    type_id: b_tid,
+                    gc_type_id: b_gc,
+                    item_type: b_item_ty,
+                    is_array_of_pointers: b_ptrs,
+                    is_array_of_structs: b_structs,
+                    is_item_signed: b_signed,
+                    ei_index: b_ei,
+                    array_type_id: b_array_id,
+                    interior_fields: b_interior,
+                    is_gc_managed: b_gc_managed,
+                    load_is_acquire: b_acquire,
+                },
+            ) => {
+                a_base == b_base
+                    && a_item == b_item
+                    && a_len == b_len
+                    && a_tid == b_tid
+                    && a_gc == b_gc
+                    && a_item_ty == b_item_ty
+                    && a_ptrs == b_ptrs
+                    && a_structs == b_structs
+                    && a_signed == b_signed
+                    && a_ei == b_ei
+                    && a_array_id == b_array_id
+                    && a_interior == b_interior
+                    && a_gc_managed == b_gc_managed
+                    && a_acquire == b_acquire
+            }
+            _ => format!("{:?}", self.0) == format!("{:?}", other.0),
+        }
+    }
+}
+
+impl Eq for VableArrayDescr {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpKind {
     Input {
@@ -1746,6 +1810,9 @@ pub enum OpKind {
         array_itemsize: usize,
         /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
         array_is_signed: bool,
+        /// `jtransform.py rewrite_op_getarrayitem` arg `arraydescr`
+        /// (`vinfo.array_descrs[arrayindex]`).
+        array_descr: Option<VableArrayDescr>,
     },
     /// Virtualizable array write → writes to boxes.
     /// RPython: `setarrayitem_vable_i/r/f`. `rewrite_op_setarrayitem` passes
@@ -1761,6 +1828,9 @@ pub enum OpKind {
         array_itemsize: usize,
         /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
         array_is_signed: bool,
+        /// `jtransform.py rewrite_op_setarrayitem` arg `arraydescr`
+        /// (`vinfo.array_descrs[arrayindex]`).
+        array_descr: Option<VableArrayDescr>,
     },
     /// Virtualizable array length → reads the length off the boxes.
     /// RPython: `arraylen_vable`.
@@ -1785,6 +1855,9 @@ pub enum OpKind {
         array_itemsize: usize,
         /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
         array_is_signed: bool,
+        /// `jtransform.py rewrite_op_getarraysize` arg `arraydescr`
+        /// (`vinfo.array_descrs[arrayindex]`).
+        array_descr: Option<VableArrayDescr>,
     },
     /// Binary arithmetic/comparison operation.
     /// RPython: `int_add`, `int_lt`, etc.
@@ -12446,6 +12519,44 @@ mod tests {
     fn longlong_wider_than_signed_compares_against_signed_size() {
         assert!(!longlong_wider_than_signed(8));
         assert!(longlong_wider_than_signed(4));
+    }
+
+    #[test]
+    fn vable_array_descr_eq_compares_every_array_field() {
+        use majit_ir::Type;
+        use majit_jitcode::codewriter::jitcode::BhDescr;
+        fn descr(len_offset: Option<usize>) -> super::VableArrayDescr {
+            super::VableArrayDescr(BhDescr::Array {
+                base_size: 8,
+                itemsize: 8,
+                len_offset,
+                type_id: 1,
+                gc_type_id: 0,
+                item_type: Type::Ref,
+                is_array_of_pointers: true,
+                is_array_of_structs: false,
+                is_item_signed: false,
+                ei_index: 0,
+                array_type_id: None,
+                interior_fields: Vec::new(),
+                is_gc_managed: true,
+                load_is_acquire: false,
+            })
+        }
+        assert_eq!(descr(Some(0)), descr(Some(0)));
+        assert_ne!(
+            descr(Some(0)),
+            descr(Some(8)),
+            "len_offset is part of VableArrayDescr equality"
+        );
+        let mut acquire = descr(Some(0));
+        match &mut acquire.0 {
+            BhDescr::Array {
+                load_is_acquire, ..
+            } => *load_is_acquire = true,
+            other => panic!("expected BhDescr::Array, got {other:?}"),
+        }
+        assert_ne!(descr(Some(0)), acquire);
     }
 
     #[test]

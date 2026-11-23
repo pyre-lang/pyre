@@ -309,6 +309,28 @@ impl majit_jitcode::codewriter::call::VirtualizableInfoHandle for VirtualizableI
             .iter()
             .position(|field| field.name == name)
     }
+
+    /// `virtualizable.py VirtualizableInfo.__init__` `self.array_descrs[i]`.
+    fn array_descr(&self, index: usize) -> Option<BhDescr> {
+        let descr = self.array_descrs.get(index)?;
+        let a = descr.as_array_descr()?;
+        Some(BhDescr::Array {
+            base_size: a.base_size(),
+            itemsize: a.item_size(),
+            len_offset: a.len_descr().map(|fd| fd.offset()),
+            type_id: a.cache_key(),
+            gc_type_id: a.type_id(),
+            item_type: a.item_type(),
+            is_array_of_pointers: a.is_array_of_pointers(),
+            is_array_of_structs: a.is_array_of_structs(),
+            is_item_signed: a.is_item_signed(),
+            ei_index: descr.get_ei_index(),
+            array_type_id: None,
+            interior_fields: majit_jitcode::jitcode::bh_interior_field_specs_from_array_descr(a),
+            is_gc_managed: a.is_gc_managed(),
+            load_is_acquire: a.load_is_acquire(),
+        })
+    }
 }
 
 /// majit-ir's `FieldDescr::get_vinfo()` returns `Option<Arc<dyn VinfoMarker>>`;
@@ -1956,6 +1978,27 @@ mod tests {
     /// type id would hand `walk_vable_resume_ref_roots` the same value it reads
     /// as "no type is known", which switches OFF the nursery type-id compare
     /// guarding the resume ref root push.
+    #[test]
+    fn handle_array_descr_exposes_vinfo_array_descrs() {
+        use majit_jitcode::codewriter::call::VirtualizableInfoHandle;
+        let mut info = VirtualizableInfo::new(0);
+        test_add_array_field(&mut info, "locals_w", Type::Ref, 16, 0, 8);
+        let descr = VirtualizableInfoHandle::array_descr(&info, 0)
+            .expect("virtualizable.py VirtualizableInfo.array_descrs[0]");
+        match descr {
+            BhDescr::Array {
+                item_type,
+                is_array_of_pointers,
+                ..
+            } => {
+                assert_eq!(item_type, Type::Ref);
+                assert!(is_array_of_pointers);
+            }
+            other => panic!("expected BhDescr::Array, got {other:?}"),
+        }
+        assert!(VirtualizableInfoHandle::array_descr(&info, 1).is_none());
+    }
+
     #[test]
     #[should_panic(expected = "is not an array")]
     fn a_non_array_descr_is_refused_at_declaration() {

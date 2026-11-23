@@ -11276,10 +11276,9 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let lineno = traceback_c_int_arg(pyre_object::gc_roots::shadow_stack_get(lineno_slot))?;
     let frame = frame_anchor.live();
     let next = pyre_object::gc_roots::shadow_stack_get(next_slot);
-    let w_code = unsafe { (*frame).fget_f_code() };
 
     crate::runtime_ops::obj_or_memory_error(crate::pytraceback::w_pytraceback_new(
-        frame, lasti, next, lineno, w_code,
+        frame, lasti, next, lineno,
     ))
 }
 
@@ -18874,20 +18873,18 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
     if is_bound_builtin_method(obj) {
         let mut descr = unsafe { pyre_object::w_method_get_func(obj) };
         let instance = unsafe { pyre_object::w_method_get_self(obj) };
-        // A class receiver names the class that *defines* the method, not the
-        // metatype: a `classmethod_descriptor` binds the class itself, so
-        // `type(__self__)` would report `dict.fromkeys` as `type.fromkeys`.
-        // The defining class is already stamped on the descriptor's qualname
-        // (`stamp_method_owners`), which is also what `bool.from_bytes`
-        // reporting `int.from_bytes` requires.
-        if unsafe { pyre_object::is_type(instance) } {
-            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-                crate::function::function_get_qualname(descr)
-            }));
-        }
-        let actual_type =
-            crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
-        let type_qualname = pyre_object::with_roots!(descr => crate::baseobjspace::getattr_str(actual_type, "__qualname__"))?;
+        // [3.15-spec] methodobject.c meth_get__qualname__ (source at v3.15.0
+        // through v3.15.2; measured on 3.15.1t): owner is `m_self` when that
+        // is a type, else type(m_self); result is
+        // `owner.__qualname__ + "." + __name__`.
+        // pypy/interpreter/function.py _Method.descr_method_getattribute
+        // delegates to the function's stamped qualname.
+        let mut owner = if unsafe { pyre_object::is_type(instance) } {
+            instance
+        } else {
+            crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr())
+        };
+        let type_qualname = pyre_object::with_roots!(descr, owner => crate::baseobjspace::getattr_str(owner, "__qualname__"))?;
         if !unsafe { pyre_object::is_str(type_qualname) } {
             return Err(crate::PyError::type_error(
                 "<method>.__class__.__qualname__ is not a unicode object",
@@ -26507,14 +26504,6 @@ fn init_object_type(ns: PyObjectRef) {
         );
         let init_subclass_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(init_subclass);
-        // Read the wrapped callable back out of the classmethod: allocating it
-        // can move the function, and the qualname lookup compares addresses.
-        crate::function::register_object_class_method(
-            "__init_subclass__",
-            pyre_object::function::w_classmethod_get_func(pyre_object::gc_roots::shadow_stack_get(
-                init_subclass_slot,
-            )),
-        );
         crate::__pyre_put_new!(
             ns_slot,
             "__init_subclass__",
@@ -26537,12 +26526,6 @@ fn init_object_type(ns: PyObjectRef) {
         );
         let subclasshook_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(subclasshook);
-        crate::function::register_object_class_method(
-            "__subclasshook__",
-            pyre_object::function::w_classmethod_get_func(pyre_object::gc_roots::shadow_stack_get(
-                subclasshook_slot,
-            )),
-        );
         crate::__pyre_put_new!(
             ns_slot,
             "__subclasshook__",

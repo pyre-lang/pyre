@@ -2483,6 +2483,12 @@ impl Drop for FrameBox {
             "FrameBox.ptr is the new_boxed birth address"
         );
         unsafe {
+            // `pyframe.py mark_as_escaped`: a traceback or other
+            // Python-visible object still names this frame. No collector
+            // reclaims a `new_boxed` allocation, so leave it alive.
+            if (*self.ptr).escaped() {
+                return;
+            }
             let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
             drop(Box::from_raw(prefix));
         }
@@ -5060,11 +5066,9 @@ impl PyFrame {
         // because nothing reached it.
         //
         // Being GC-owned is what lets the trace's synchronization target be a
-        // forwardable object: a `new_boxed` snapshot is an address the
-        // collector does not own, so `pytraceback_object_custom_trace` has to
-        // skip its frame edge and `TraceCtx::virtualizable_heap_ptr` has no
-        // slot to read back.  Same allocation shape as
-        // `snapshot_for_generator` below, for the same reason.
+        // forwardable object: `TraceCtx::virtualizable_heap_ptr` has a slot to
+        // read back.  Same allocation shape as `snapshot_for_generator` below,
+        // for the same reason.
         // The snapshot is pyre's own stand-in for the `MIFrame` stack and its
         // address is the walk's `cf_addr` identity, so it is young-nonmoving
         // rather than a moving nursery frame.

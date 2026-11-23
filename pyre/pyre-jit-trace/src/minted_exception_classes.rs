@@ -80,9 +80,10 @@ fn alloc_with_del_for_index(index: usize, vtable: usize) -> i64 {
 /// into the header.
 ///
 /// `parent` `None` uses `host_exc_tid`. A `Some` index must name an
-/// earlier row. A row with a destructor attaches it before registration
-/// (`young_objects_with_destructors` reads it at alloc) and again with
-/// `set_destructor`. Returns the tid of each row, in order.
+/// earlier row. A row with a destructor is registered through
+/// `TypeInfo::with_destructor_fn` (`encode_type_shape` /
+/// `make_destructor_funcptr_for_type`); `young_objects_with_destructors`
+/// reads it at alloc. Returns the tid of each row, in order.
 pub fn register_minted_exception_classes(
     gc: &mut MiniMarkGC,
     rows: &[MintedExceptionClass],
@@ -116,9 +117,6 @@ pub fn register_minted_exception_classes(
         let tid = gc.register_type(info);
         let pytype = row.pytype as *const pyre_object::PyType as usize;
         majit_gc::GcAllocator::register_vtable_for_type(gc, pytype, tid);
-        if let Some(destructor) = row.destructor {
-            gc.types.set_destructor(tid, destructor);
-        }
         tids.push(tid);
     }
     tids
@@ -602,15 +600,10 @@ mod tests {
 
         majit_gc::gc_sync::gc_op(|gc| {
             let object_size = std::mem::size_of::<pyre_object::PyObject>();
-            if gc.types.len() > tid as usize {
-                let info = gc.types.get(tid);
-                assert!(
-                    info.old_style_finalizer.is_none(),
-                    "minted tid {tid} already has an old-style finalizer; set_destructor cannot attach the counting destructor"
-                );
-                gc.types.set_destructor(tid, minted_raw_counting_destructor);
-                return;
-            }
+            assert!(
+                gc.types.len() <= tid as usize,
+                "minted tid {tid} already registered; destructor belongs on TypeInfo at registration"
+            );
             while gc.types.len() < tid as usize {
                 let id = gc.register_type(majit_gc::trace::TypeInfo::object(object_size));
                 assert!(id < tid);
@@ -649,10 +642,11 @@ mod tests {
         );
     }
 
-    /// `register_unresolved_struct_tids` / `replay_synthetic_struct_tids`
-    /// must not mint a second `TypeInfo` for a minted SizeDescr, and the
-    /// vtable-mismatch clone `size_descr_ref_from_bh` records keeps the
-    /// same tid (`init_size_descr` / `get_type_id`).
+    /// `register_unresolved_struct_tids` must not mint a second `TypeInfo`
+    /// for a minted SizeDescr, and the vtable-mismatch clone
+    /// `size_descr_ref_from_bh` records keeps the same tid
+    /// (`init_size_descr` / `get_type_id`). A fresh cache under a new
+    /// collector stamps at mint instead of replaying.
     #[test]
     fn register_unresolved_leaves_minted_size_descr_tid_unchanged() {
         use majit_ir::descr::SizeDescr;
@@ -670,6 +664,7 @@ mod tests {
             minted.cache_key,
             minted.pytype as usize,
             true,
+            false,
             false,
             std::slice::from_ref(&spec),
             &[],
@@ -723,9 +718,38 @@ mod tests {
         );
         let registered = private.register_unresolved_struct_tids(|_, _| 1);
         assert_eq!(registered, 0);
-        private.replay_synthetic_struct_tids(|_, _| 1);
         assert_eq!(SizeDescr::type_id(minted.descr.as_ref()), minted.tid);
         assert!(minted.descr.collector_tid_is_fixed());
+
+        fn stamp_fresh(_size: usize, _offsets: Vec<usize>) -> u32 {
+            7
+        }
+        let mut fresh = majit_ir::descr::GcCache::new();
+        fresh.set_collector_tid_register(Some(stamp_fresh), None);
+        let fresh_key = 0xfeed_face_dead_beef;
+        let mut sd = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, minted.size, 0);
+        sd.set_cache_key(fresh_key);
+        let fresh_descr: majit_ir::DescrRef = std::sync::Arc::new(sd.with_all_fielddescrs(vec![
+            std::sync::Arc::new(
+                majit_ir::descr::SimpleFieldDescr::new_with_name(
+                    0,
+                    field_off,
+                    8,
+                    majit_ir::value::Type::Ref,
+                    false,
+                    majit_ir::descr::ArrayFlag::Pointer,
+                    "ref0".to_string(),
+                    "ref0".to_string(),
+                )
+                .with_index_in_parent(0),
+            ) as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+        ]));
+        fresh.register_keyed_size(
+            majit_ir::descr::LLType::Struct(fresh_key),
+            fresh_descr.clone(),
+        );
+        assert_eq!(fresh_descr.as_size_descr().unwrap().type_id(), 7);
+        assert_eq!(SizeDescr::type_id(minted.descr.as_ref()), minted.tid);
     }
 
     /// The parent here is `TypeInfo::object`, which has no offsets.

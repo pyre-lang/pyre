@@ -361,9 +361,8 @@ mod frame_replacement_tests {
             );
             let site = TracebackNodeSite {
                 frame: old,
-                w_code: 0,
                 last_instruction: 7,
-                w_code_pin: None,
+                _w_code_pin: None,
             };
             let tail = ctx.trace_ctx.const_ref(0);
             let guards_before = ctx.trace_ctx.num_guards();

@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 // STW pair on OS-backed primitives: a parking_lot condvar also inherits its
 // process-global userspace waiter queue, and waking that queue in the child
 // deadlocks before the rest of the after-fork hooks can rebuild thread state.
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexTrait;
@@ -122,6 +122,18 @@ static GC_SYNC: GcSync = GcSync {
     gc_lock: RawMutex::INIT,
 };
 
+/// Take the RUNNING-count lock. `thread_pthread.c` guards this state with
+/// a raw pthread mutex, which has no poison state: a mutator that panicked
+/// while holding it does not make every later safepoint panic. The count is
+/// updated in single statements, so the state a panicking holder left behind
+/// is the state it last wrote.
+fn lock_quiesce() -> MutexGuard<'static, QuiesceState> {
+    GC_SYNC
+        .quiesce
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 // ──────────────────────────────────────────────────────────────
 // Singleton management
 // ──────────────────────────────────────────────────────────────
@@ -132,7 +144,10 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
-    let _guard = GC_SYNC.install_mutex.lock().unwrap();
+    let _guard = GC_SYNC
+        .install_mutex
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Double-check after acquiring mutex.
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
@@ -320,7 +335,7 @@ pub fn register_thread() {
     );
     // Counted under `quiesce`, which `rgil::disable_gil` holds across its
     // census check and the mode switch.
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
@@ -328,7 +343,7 @@ pub fn register_thread() {
     state = GC_SYNC
         .resumed
         .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-        .unwrap();
+        .unwrap_or_else(PoisonError::into_inner);
     state.running += 1;
     GC_THREAD.with(|t| t.running.set(true));
     GC_THREAD.with(|t| t.registered.set(true));
@@ -356,7 +371,7 @@ pub fn register_thread_parked() {
         "GC mutator thread registered twice"
     );
     // Counted under `quiesce`; see [`register_thread`].
-    let _state = GC_SYNC.quiesce.lock().unwrap();
+    let _state = lock_quiesce();
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
@@ -464,7 +479,7 @@ pub fn unregister_thread() {
     if crate::rgil::am_i_holding_the_gil() {
         crate::rgil::release();
     }
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     // A thread that came in through `register_thread_parked` sits outside the
     // census between callbacks, so there is nothing to subtract for it.
     if GC_THREAD.with(|t| t.running.replace(false)) {
@@ -524,11 +539,11 @@ impl Drop for BlockingGuard {
         if !self.left_census {
             return;
         }
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        let mut state = lock_quiesce();
         state = GC_SYNC
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-            .unwrap();
+            .unwrap_or_else(PoisonError::into_inner);
         state.running += 1;
         assert!(
             !GC_THREAD.with(|t| t.running.replace(true)),
@@ -554,7 +569,7 @@ pub fn before_external_block() -> BlockingGuard {
     // leave, and nothing to rejoin when it ends.
     let left_census = GC_THREAD.with(|t| t.registered.get() && t.running.get());
     if left_census {
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        let mut state = lock_quiesce();
         GC_THREAD.with(|t| t.running.set(false));
         state.running = state
             .running
@@ -572,7 +587,7 @@ pub fn before_external_block() -> BlockingGuard {
 impl Drop for CallbackGuard {
     fn drop(&mut self) {
         if self.rejoined {
-            let mut state = GC_SYNC.quiesce.lock().unwrap();
+            let mut state = lock_quiesce();
             assert!(
                 GC_THREAD.with(|t| t.running.replace(false)),
                 "GC mutator left an external callback twice"
@@ -599,11 +614,11 @@ pub fn enter_external_callback() -> CallbackGuard {
     let running = GC_THREAD.with(|t| t.running.get());
     let mut rejoined = false;
     if registered && !running {
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        let mut state = lock_quiesce();
         state = GC_SYNC
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-            .unwrap();
+            .unwrap_or_else(PoisonError::into_inner);
         state.running += 1;
         GC_THREAD.with(|t| t.running.set(true));
         rejoined = true;
@@ -625,7 +640,7 @@ pub(crate) fn leave_running_for_gil() -> GilCensus {
     if !GC_THREAD.with(|t| t.registered.get() && t.running.get()) {
         return GilCensus { rejoin: false };
     }
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     GC_THREAD.with(|t| t.running.set(false));
     state.running = state
         .running
@@ -642,7 +657,7 @@ pub(crate) fn rejoin_running_after_gil(census: GilCensus) {
     if !census.rejoin {
         return;
     }
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     debug_assert!(
         !GC_SYNC.stw_requested.load(Ordering::Acquire),
         "the GIL was acquired while a collector was draining mutators"
@@ -701,7 +716,7 @@ pub fn after_fork_child() {
     // that did not survive the fork has no dispatch loop left to raise it in
     // the child.
     majit_ir::eval_breaker_word::memory_error_after_fork_child();
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     state.running = usize::from(registered && running);
     GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);
     GC_SYNC.resumed.notify_all();
@@ -1130,7 +1145,7 @@ pub fn quiesce_mutators() -> StwGuard {
         );
     }
 
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     if GC_SYNC.stw_requested.load(Ordering::Acquire) {
         drop(state);
         park_as_mutator_for_foreign_stw();
@@ -1149,7 +1164,7 @@ pub fn quiesce_mutators() -> StwGuard {
     state = GC_SYNC
         .quiesced
         .wait_while(state, |state| state.running != drain_target)
-        .unwrap();
+        .unwrap_or_else(PoisonError::into_inner);
     drop(state);
     STW_OWNER.store(ident, Ordering::Release);
     STW_DEPTH.store(1, Ordering::Relaxed);
@@ -1179,7 +1194,7 @@ fn park_as_mutator_for_foreign_stw() {
         park_until_stw_done();
         return;
     }
-    let state = GC_SYNC.quiesce.lock().unwrap();
+    let state = lock_quiesce();
     drop(
         GC_SYNC
             .resumed
@@ -1191,7 +1206,7 @@ fn park_as_mutator_for_foreign_stw() {
 /// [`register_thread_parked`] count a new mutator under the same lock, so
 /// the registered census `f` reads cannot change before `f` returns.
 pub(crate) fn with_registration_blocked<R>(f: impl FnOnce() -> R) -> R {
-    let _state = GC_SYNC.quiesce.lock().unwrap();
+    let _state = lock_quiesce();
     f()
 }
 
@@ -1215,7 +1230,7 @@ impl Drop for StwGuard {
         assert_eq!(remaining, 0, "outer STW guard dropped before nested guard");
         STW_OWNER.store(0, Ordering::Release);
 
-        let _state = GC_SYNC.quiesce.lock().unwrap();
+        let _state = lock_quiesce();
         GC_SYNC.stw_requested.store(false, Ordering::Release);
         majit_ir::eval_breaker_word::clear_stw();
         GC_SYNC.stw_generation.fetch_add(1, Ordering::Release);
@@ -1263,7 +1278,7 @@ pub fn stop_the_world<R>(f: impl FnOnce() -> R) -> R {
 pub fn fork_under_stw<R>(fork_fn: impl FnOnce() -> R) -> R {
     gc_op_stw(&mut [], |_, _| {
         let _stw = quiesce_mutators_owned();
-        let held = GC_SYNC.quiesce.lock().unwrap();
+        let held = lock_quiesce();
         let result = fork_fn();
         drop(held);
         result
@@ -1330,7 +1345,7 @@ fn park_until_stw_done() {
         return;
     }
 
-    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    let mut state = lock_quiesce();
     if !GC_SYNC.stw_requested.load(Ordering::Acquire) {
         return;
     }
@@ -1347,7 +1362,7 @@ fn park_until_stw_done() {
     state = GC_SYNC
         .resumed
         .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-        .unwrap();
+        .unwrap_or_else(PoisonError::into_inner);
     state.running += 1;
     assert!(
         !GC_THREAD.with(|t| t.running.replace(true)),
@@ -1383,6 +1398,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn a_panic_holding_the_running_count_lock_does_not_poison_later_safepoints() {
+        let before = lock_quiesce().running;
+        let panicked = std::thread::spawn(|| {
+            let _held = lock_quiesce();
+            panic!("mutator panics while holding the RUNNING-count lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(GC_SYNC.quiesce.is_poisoned());
+        assert_eq!(lock_quiesce().running, before);
+        GC_SYNC.quiesce.clear_poison();
+    }
 
     struct GcOpCounter(UnsafeCell<usize>);
 

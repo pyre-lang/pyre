@@ -347,6 +347,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: false,
                 headerless: true,
+                is_immutable: false,
                 all_fielddescrs: vec![BhFieldSpec {
                     index: 0,
                     field_key: "depth".into(),

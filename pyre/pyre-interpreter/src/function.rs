@@ -4026,22 +4026,8 @@ pub unsafe fn descr_method_getattribute(
         return Err(crate::PyError::type_error("attribute name must be string"));
     };
     let mut function = unsafe { pyre_object::w_method_get_func(obj) };
-    // PyPy's Method.descr_method_getattribute delegates every miss to the
-    // wrapped function, so an inherited object.__subclasshook__ keeps the
-    // defining qualname.  CPython 3.14 exposes object.__subclasshook__ and
-    // object.__init_subclass__ as METH_CLASS builtins: their bound-method
-    // qualname uses the class they are currently bound to (`type` / `int` /
-    // ...), while the definitions still remain absent from those type dicts.
-    // Preserve that selected 3.14 delta without changing ordinary Python
-    // classmethods, whose qualname continues to name the defining class.
-    if name == "__qualname__"
-        && let Some(qualname) =
-            unsafe { pyre_object::with_roots!(function, obj => method_class_bound_qualname(obj))? }
-    {
-        return Ok(qualname);
-    }
-    // function.py:604-614 — method attributes win, except `__doc__`;
-    // an AttributeError falls back to the wrapped function.
+    // function.py _Method.descr_method_getattribute — method attributes win,
+    // except `__doc__`; an AttributeError falls back to the wrapped function.
     if name != "__doc__" {
         match pyre_object::with_roots!(function =>
             crate::baseobjspace::object_getattribute(obj, name)
@@ -4052,79 +4038,6 @@ pub unsafe fn descr_method_getattribute(
         }
     }
     crate::baseobjspace::getattr_str(function, name)
-}
-
-/// The callables `object` publishes as class methods, paired with the name
-/// each is published under.
-///
-/// Only these two take a bound qualname naming the class they were read off,
-/// and `__qualname__` is writable on an ordinary function, so they have to be
-/// recognised by identity.  `Box` so a slot keeps one address for the
-/// collector's whole lifetime; the `Vec` only owns them.
-static OBJECT_CLASS_METHODS: parking_lot::Mutex<Vec<(&'static str, Box<usize>)>> =
-    parking_lot::Mutex::new(Vec::new());
-
-/// Publish `function` as `object.<name>` for [`method_class_bound_qualname`].
-///
-/// The address is registered as a process-lifetime GC root so the collector
-/// forwards it, the `intern_str` idiom: nothing else keeps this raw copy in
-/// step with a moving collection.
-pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
-    let mut slot = Box::new(function as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut pyre_object::gc_hook::GCREF;
-    unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
-    OBJECT_CLASS_METHODS.lock().push((name, slot));
-}
-
-/// The name `object` publishes `function` under, if it publishes it at all.
-///
-/// This process-global registry is the runtime metadata carrier for the
-/// documented CPython-3.14 METH_CLASS observable above.  It is not a
-/// trace-time constant: keep its mutex and moving-GC root table behind one
-/// residual lookup, just as PyPy keeps host/runtime metadata operations out of
-/// the object-space trace.  The returned static name remains ordinary data to
-/// the caller.
-#[majit_macros::dont_look_inside]
-fn object_class_method_name(function: PyObjectRef) -> Option<&'static str> {
-    OBJECT_CLASS_METHODS
-        .lock()
-        .iter()
-        .find(|(_, slot)| **slot == function as usize)
-        .map(|(name, _)| *name)
-}
-
-/// Python 3.14's dynamic qualname for the two METH_CLASS methods inherited
-/// from `object`; `None` for every ordinary bound method.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn method_class_bound_qualname(
-    obj: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    let function = unsafe { pyre_object::w_method_get_func(obj) };
-    let instance = unsafe { pyre_object::w_method_get_self(obj) };
-    if !unsafe { pyre_object::is_type(instance) } {
-        return Ok(None);
-    }
-    // Identify the two by the callables `object` publishes, not by their
-    // qualname: `__qualname__` is writable on an ordinary function, so a
-    // classmethod over one that spells itself `object.__subclasshook__` would
-    // otherwise be rewritten to name its own owner instead of keeping the
-    // string it was given.
-    let Some(inherited_name) = object_class_method_name(function) else {
-        return Ok(None);
-    };
-    let owner_qualname = crate::baseobjspace::getattr_str(instance, "__qualname__")?;
-    let Some(owner_qualname) = (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) }) else {
-        return Err(crate::PyError::type_error(
-            "type.__qualname__ is not a unicode object",
-        ));
-    };
-    let w_name = pyre_object::w_str_new_managed(&format!("{owner_qualname}.{inherited_name}"));
-    if w_name.is_null() {
-        return Err(crate::runtime_ops::fetch_memory_error());
-    }
-    Ok(Some(w_name))
 }
 
 #[inline]

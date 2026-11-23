@@ -1884,13 +1884,16 @@ pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// The raw `self.w_traceback` slot read.  `descr_gettraceback`
-/// (`interp_exceptions.py`) and `OperationError.get_traceback`
-/// (`error.py`) are this read plus `tb.frame.mark_as_escaped()`;
-/// that mark lives in `pytraceback::mark_traceback_escaped`, since the
-/// frame type is not visible from this crate.  Callers mirroring either
-/// getter pair the two; callers mirroring a direct `_application_traceback`
-/// read (printing, chain trimming) use this alone.
+/// Direct `w_traceback` / `_application_traceback` field read. Not
+/// `descr_gettraceback`.
+///
+/// `interp_exceptions.py descr_gettraceback` and `error.py
+/// OperationError.get_traceback` are this read plus
+/// `tb.frame.mark_as_escaped()`; that mark lives in
+/// `pytraceback::mark_traceback_escaped`, since the frame type is not
+/// visible from this crate. Callers mirroring either getter pair the two;
+/// callers mirroring a direct `_application_traceback` read (printing,
+/// chain trimming) use this alone.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.

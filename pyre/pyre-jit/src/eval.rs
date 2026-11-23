@@ -826,30 +826,21 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 /// PyPy's `PyTraceback.frame` is a normal `PyFrame` W_Root, so its
 /// tracer reaches the frame (and thence its locals / `f_backref`
 /// chain) through the ordinary reference.  Pyre stores `frame` as a
-/// raw `*mut PyFrame` and the two `PyObjectRef` slots (`w_next`,
-/// `w_code`) inline; none are reachable through `gc_ptr_offsets`
-/// (the type was registered with empty offsets), so forward all of
-/// them here:
+/// raw `*mut PyFrame` and `w_next` inline; none are reachable through
+/// `gc_ptr_offsets` (the type was registered with empty offsets), so
+/// forward all of them here:
 ///
 ///   * `ob_header.w_class` — the type object every `PyObject`-layout
 ///     struct carries.
 ///   * `w_next` — the chained caller-side traceback link.
-///   * `w_code` — the raising frame's PyCode snapshot (kept alive so
-///     source-path / function-name metadata survives).
-///   * `frame` — forwarded as a managed edge **only** when
-///     `try_gc_owns_object(frame)` holds (an executing/oldgen frame,
-///     `PYFRAME_GC_TYPE_ID`).  Mark greys the frame block and its own
-///     `pyframe_object_custom_trace` recurses into locals/cells/
-///     valuestack and the `f_backref` chain, so a frame reachable only
-///     through a live traceback (the whole point of `tb_frame`) is not
-///     reclaimed.  The condition covers the pre-hook bootstrap frame
-///     (`FrameBox::new`'s `new_boxed` fallback), whose address the
-///     collector does not own and must never be handed; such a pointer
-///     is left alone and is never dereferenced.  A walk records
-///     tracebacks against the live virtualizable
-///     (`pyjitpl.rs record_application_traceback` unwraps the
-///     standard vable), which is GC-owned (`FrameBox::pin_existing`
-///     / `FrameBox::new`), so that traceback keeps its frame alive.
+///   * `frame` — forwarded as a managed edge unconditionally, matching
+///     `pytraceback.py PyTraceback.__init__`.  Mark greys the frame
+///     block and its own `pyframe_object_custom_trace` recurses into
+///     locals/cells/valuestack and the `f_backref` chain, so a frame
+///     reachable only through a live traceback (the whole point of
+///     `tb_frame`) is not reclaimed.  `w_pytraceback_new` asserts the
+///     frame is GC-owned (`try_gc_owns_object`), so this slot is never
+///     a `FrameBox::new_boxed` address.
 unsafe fn pytraceback_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
@@ -857,12 +848,7 @@ unsafe fn pytraceback_object_custom_trace(
     let tb = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pytraceback::PyTraceback) };
     f(&mut tb.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !tb.frame.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(tb.frame as pyre_object::gc_hook::GCREF)
-    {
-        f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
-    }
+    f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
 }
 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -2373,7 +2359,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         |gc: &mut MiniMarkGC,
          pytype_to_tid: &mut HashMap<usize, u32>,
          descr: &'static pyre_object::lltype::PyreClassDescriptor,
-         memory_pressure_offset: Option<usize>|
+         memory_pressure_offset: Option<usize>,
+         destructor: Option<majit_gc::trace::DestructorFn>|
          -> u32 {
             let tid = gc.get_type_id(GcTypeKey::of(descr.gc_type_id), || {
                 let parent_tid = if descr.mapdict_user_layout {
@@ -2401,6 +2388,11 @@ fn build_gc() -> Box<MiniMarkGC> {
                 };
                 if let Some(offset) = memory_pressure_offset {
                     type_info = type_info.with_memory_pressure_offset(offset);
+                }
+                // `encode_type_shape` / `make_destructor_funcptr_for_type`
+                // record the destructor on the TYPE_INFO row at construction.
+                if let Some(destructor) = destructor {
+                    type_info = type_info.with_destructor_fn(destructor);
                 }
                 type_info
             });
@@ -2431,7 +2423,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         |gc: &mut MiniMarkGC,
          pytype_to_tid: &mut HashMap<usize, u32>,
          descr: &'static pyre_object::lltype::PyreClassDescriptor|
-         -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
+         -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None, None) };
     // The GC types `pyre-module` owns, each declaring its own layout and sweep
     // destructor. They register after every interpreter class, so an
     // interpreter without the module hooks keeps the same ids for its own.
@@ -2448,15 +2440,13 @@ fn build_gc() -> Box<MiniMarkGC> {
                     ModuleGcLayout::PyreClass {
                         memory_pressure_offset,
                     } => {
-                        let tid = register_pyre_class_with_pressure(
+                        register_pyre_class_with_pressure(
                             gc,
                             pytype_to_tid,
                             descr,
                             memory_pressure_offset,
+                            ty.destructor,
                         );
-                        if let Some(destructor) = ty.destructor {
-                            gc.types.set_destructor(tid, destructor);
-                        }
                         continue;
                     }
                     ModuleGcLayout::Object => {
@@ -2734,27 +2724,28 @@ fn build_gc() -> Box<MiniMarkGC> {
     // field each: w_function) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop so the GC
     // walker reaches the inline descriptor refs.
-    let property_tid = register_pyre_class(
+    // All three own `QuasiImmutField`s, which the type census does not reach.
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::descriptor::W_Property as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(property_destructor),
     );
-    let staticmethod_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::StaticMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(staticmethod_destructor),
     );
-    let classmethod_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::ClassMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        None,
+        Some(classmethod_destructor),
     );
-    // All three own `QuasiImmutField`s, which the type census does not reach.
-    gc.types.set_destructor(property_tid, property_destructor);
-    gc.types
-        .set_destructor(staticmethod_tid, staticmethod_destructor);
-    gc.types
-        .set_destructor(classmethod_tid, classmethod_destructor);
     // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop because that
     // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,
@@ -3363,9 +3354,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_code_tid,
     );
     // `pytraceback.py PyTraceback` — pre-registered here, right
-    // after PyCode, with a custom trace that forwards `w_next` /
-    // `w_code` and (when GC-owned) the raw `frame` edge so a frame
-    // reachable only through `tb.tb_frame` survives.  Like PyCode it
+    // after PyCode, with a custom trace that forwards `w_next` and
+    // the raw `frame` edge so a frame reachable only through
+    // `tb.tb_frame` survives.  Like PyCode it
     // stays in `all_foreign_pytypes()` and is skipped by the loop's
     // `contains_key` guard, so the net register-call count through
     // `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged (one explicit
@@ -4856,13 +4847,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_object::descriptor::W_SUPER_USER_PYRE_CLASS_DESCRIPTOR,
     );
-    let property_user_tid = register_pyre_class(
+    register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::descriptor::W_PROPERTY_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(property_destructor),
     );
-    gc.types
-        .set_destructor(property_user_tid, property_destructor);
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -5035,22 +5026,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Parents are the builtin tids already registered above (20, 21).
     // `QuasiImmutField` reclamation is the base destructor: the user struct
     // is that payload as a prefix.
-    let staticmethod_user_tid = register_pyre_class(
+    let staticmethod_user_tid = register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::function::W_STATICMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(staticmethod_destructor),
     );
     assert_eq!(staticmethod_user_tid, 202);
-    gc.types
-        .set_destructor(staticmethod_user_tid, staticmethod_destructor);
-    let classmethod_user_tid = register_pyre_class(
+    let classmethod_user_tid = register_pyre_class_with_pressure(
         &mut gc,
         &mut pytype_to_tid,
         &pyre_object::function::W_CLASSMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+        None,
+        Some(classmethod_destructor),
     );
     assert_eq!(classmethod_user_tid, 203);
-    gc.types
-        .set_destructor(classmethod_user_tid, classmethod_destructor);
     // `ModuleUser` (`typedef.py` `_getusercls`). Subclass instances are
     // traced as a module plus its mapdict storage. The trace walks
     // `W_MODULE_GC_PTR_OFFSETS`. The typed `w_dict` stays the namespace.
@@ -5753,9 +5744,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
-    // for synthetic struct tids during translation. pyre stamps them from
-    // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
-    // once this collector is installed. They are not registered in this
+    // for synthetic struct tids during translation. pyre installs the mint
+    // callbacks when this collector is stored; kind-0 leftovers drain in
+    // `materialize_gccache_owned_descrs`. They are not registered in this
     // function: it runs before `gc_sync` publishes the collector.
 
     // `interp_deque.py Lock` is a fieldless internal GC identity token, not a
@@ -6595,6 +6586,10 @@ fn build_gc_global() {
         // eval-breaker poll.
         majit_ir::eval_breaker_word::publish_addr();
         majit_gc::gc_sync::store_singleton(gc);
+        // `gc.py` `GcLLDescr_framework.init_size_descr` / `init_array_descr`
+        // stamp at mint because `gc_ll_descr` already exists. Install the
+        // collector half before any later `get_size_descr` / `get_array_descr`.
+        pyre_jit_trace::jitcode_runtime::install_collector_tid_register();
     });
 }
 
@@ -6615,6 +6610,7 @@ fn build_gc_global() {
 /// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
+    pyre_jit_trace::jitcode_runtime::install_collector_tid_register();
     pyre_interpreter::call::register_thread_entry_hook(|| {
         init_jit_hooks();
         init_gc_root_walkers();
@@ -11415,8 +11411,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// The first call with a live collector stamps unresolved tids; later
-/// calls on the same collector skip the census (`LAST_GC`).
+/// Kind-0 decode stamps unresolved tids on the GIL thread after the
+/// helper returns; later calls share that `Once`.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -11475,11 +11471,10 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     // Kind-0 Size tids are published on the first trace by
     // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
-    // `bound_reached`. The first live collector stamps unresolved tids;
-    // later calls on that collector skip the census (`LAST_GC`). The
-    // type-registry close hook drains leftovers before `freeze_types`,
-    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` /
-    // `PYRE_NO_JIT` never reach those callers.
+    // `bound_reached`. The decode `Once` stamps unresolved tids on the
+    // GIL thread. The type-registry close hook drains EffectInfo leftovers
+    // before `freeze_types`, off the recursive `CALL_ASSEMBLER` stack.
+    // `PYRE_JIT=0` / `PYRE_NO_JIT` never reach those callers.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
@@ -18587,10 +18582,11 @@ fn decode_pending_value(
 /// deferred SETFIELD_GC / SETARRAYITEM_GC stored in `rd_pendingfields`.
 ///
 /// Iterate the tagged `GuardPendingFieldEntry` list, not
-/// `exit_pending_field_layouts`. Decode the value first so a virtual
-/// `allocate` can collect, decode the target (`decode_ref` on
-/// `target_tagged`), then `setfield` / `setarrayitem` which decode the
-/// value again from the tag. TAGCONST Refs are
+/// `exit_pending_field_layouts`. Decode the target first
+/// (`struct = decode_ref(num)`), then `setfield` / `setarrayitem` which
+/// decode the value and re-read the target from its rooted slot after
+/// that decode (`virtuals_cache.concrete_roots` / TAGBOX `failarg_refs` /
+/// TAGCONST `rd_consts`). TAGCONST Refs are
 /// `rd_consts[ci].getref_base()` at use (`ResumeDataDirectReader.decode_ref`).
 fn replay_pending_fields(
     dead_frame_typed: &[Value],
@@ -18643,22 +18639,39 @@ fn replay_pending_fields(
             pf.target_tagged,
             pf.value_tagged,
         );
-        // Decode the value first so materializing a virtual value can
-        // collect before we capture the target pointer. resume.py
-        // ResumeDataDirectReader._prepare_pendingfields does
-        // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
-        // every ref is GC-tracked so ordering does not matter. `setfield`
-        // / `setarrayitem` then decode the value again from the tag
-        // (`ResumeDataDirectReader.decode_ref`). The decoded struct is
-        // the SETFIELD_GC / SETARRAYITEM_GC target
+        // resume.py `_prepare_pendingfields`:
+        //   struct = self.decode_ref(num)
+        //   if itemindex < 0: self.setfield(struct, fieldnum, descr)
+        //   else: self.setarrayitem(struct, itemindex, fieldnum, descr)
+        // The decoded struct is the SETFIELD_GC / SETARRAYITEM_GC target
         // (`heap.py force_lazy_sets_for_guard`, `_add_pending_fields`)
-        // and is never NULL.
+        // and is never NULL. `setfield`/`setarrayitem` decode the value;
+        // re-read the target from its rooted slot after that decode
+        // (`abstract_virtual_struct_info_setfields` after
+        // `decode_field_source`).
+        let struct_ptr = decode_ref(
+            pf.target_tagged,
+            dead_frame_typed,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+            Some(&failarg_refs),
+        );
+        assert!(
+            !struct_ptr.is_null(),
+            "resume.py `_prepare_pendingfields`: pending-field target \
+             decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
+            pf.target_tagged,
+            pf.item_index,
+            field_descr,
+        );
         let (addr, value_type, value_size, target_ptr, value_raw) = if pf.item_index < 0 {
             let fd = field_descr.as_field_descr().expect(
                 "resume.py `_prepare_pendingfields`: setfield pending field \
                  must carry a FieldDescr",
             );
-            let _ = decode_pending_value(
+            let value_raw = decode_pending_value(
                 pf.value_tagged,
                 fd.field_type(),
                 dead_frame_typed,
@@ -18670,24 +18683,6 @@ fn replay_pending_fields(
             );
             let struct_ptr = decode_ref(
                 pf.target_tagged,
-                dead_frame_typed,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-                Some(&failarg_refs),
-            );
-            assert!(
-                !struct_ptr.is_null(),
-                "resume.py `_prepare_pendingfields`: pending-field target \
-                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
-                pf.target_tagged,
-                pf.item_index,
-                field_descr,
-            );
-            let value_raw = decode_pending_value(
-                pf.value_tagged,
-                fd.field_type(),
                 dead_frame_typed,
                 num_failargs,
                 rd_consts,
@@ -18708,7 +18703,7 @@ fn replay_pending_fields(
                 "resume.py `_prepare_pendingfields`: setarrayitem pending \
                  field must carry an ArrayDescr",
             );
-            let _ = decode_pending_value(
+            let value_raw = decode_pending_value(
                 pf.value_tagged,
                 ad.item_type(),
                 dead_frame_typed,
@@ -18720,24 +18715,6 @@ fn replay_pending_fields(
             );
             let struct_ptr = decode_ref(
                 pf.target_tagged,
-                dead_frame_typed,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-                Some(&failarg_refs),
-            );
-            assert!(
-                !struct_ptr.is_null(),
-                "resume.py `_prepare_pendingfields`: pending-field target \
-                 decoded to NULL (target_tagged={}, item_index={}, descr={:?})",
-                pf.target_tagged,
-                pf.item_index,
-                field_descr,
-            );
-            let value_raw = decode_pending_value(
-                pf.value_tagged,
-                ad.item_type(),
                 dead_frame_typed,
                 num_failargs,
                 rd_consts,

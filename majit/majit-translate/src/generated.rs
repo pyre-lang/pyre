@@ -248,7 +248,7 @@ fn build() -> AllJitCodes {
             },
         },
         None,
-        &|_, _| None,
+        &|_, _, _| None,
         &[],
         crate::HostStaticAddrs {
             pytypes: &[

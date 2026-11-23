@@ -1364,8 +1364,10 @@ type CodeMapdictCaches = Vec<Option<crate::objspace::std::mapdict::MapdictCacheE
 /// so a raise leaks nothing. The caches are `Box::into_raw` tables, and an
 /// owning constructor has already `Box::into_raw`'d the `CodeObject` graph;
 /// `attach_code_unit_wrapper` runs only after the wrapper malloc. This Drop
-/// frees what no destructor will: the caches while the wrapper does not
-/// exist, and the owned graph until the unit is attached.
+/// frees the caches while the wrapper does not exist, and frees an
+/// unattached owned graph through [`free_unattached_code_graph`]:
+/// address-keyed entries are removed first so a later body at the reused
+/// address registers its own, then the unattached graph is dropped.
 struct CodeNewCleanup {
     code_ptr: *const (),
     owner: usize,
@@ -1405,13 +1407,35 @@ impl Drop for CodeNewCleanup {
             self.mapdict_caches = std::ptr::null_mut();
         }
         if !self.attached {
-            reclaim_owned_code_box(self.owner, self.code_ptr);
+            free_unattached_code_graph(self.owner, self.code_ptr);
         }
     }
 }
 
-fn reclaim_owned_code_box(owner: usize, code_ptr: *const ()) {
+/// Free a graph `w_code_new_owned` owned but did not attach.
+///
+/// `pycode.py` `PyCode.__init__` failing leaves an unreachable object the
+/// GC reclaims; nothing should be retained. Construction has already
+/// recorded [`CODE_LOCATIONS`] for `code_ptr` (`release_code_locations`).
+/// Nested code constants are wrapped only in the fill loop after
+/// [`attach_code_unit_wrapper`], so they have no cache entries of their
+/// own, and the unit — whose `members` list [`retire_code_unit`] would
+/// walk — does not exist yet. The owning constructor (`owner` is
+/// `code_ptr`) therefore removes that one cache entry under
+/// `code_locations_cache().lock()` first, so a later body allocated at
+/// the reused address registers its own, then drops the `Box<CodeObject>`.
+/// A nested in-place wrap, and [`w_code_new`]'s caller-owned body, leave
+/// the body where its owner put it: those constructors share the address
+/// with a live graph.
+fn free_unattached_code_graph(owner: usize, code_ptr: *const ()) {
     if owner != 0 && owner == code_ptr as usize && !code_ptr.is_null() {
+        {
+            let mut cache = code_locations_cache().lock();
+            cache.remove(&(code_ptr as usize));
+        }
+        // SAFETY: `code_ptr` is the `Box::into_raw` address the owning
+        // constructor stored, and `attach_code_unit_wrapper` has not run, so
+        // no wrapper and no unit claim this graph.
         drop(unsafe { Box::from_raw(code_ptr as *mut crate::CodeObject) });
     }
 }
@@ -6168,6 +6192,9 @@ mod tests {
     fn w_code_new_owned_releases_caches_when_wrapper_malloc_fails() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // `fetch_memory_error` builds `OperationError(w_MemoryError, w_None)`;
+        // the class table is filled by `init_typeobjects`.
+        let _ctx = crate::PyExecutionContext::default();
         static PENDING: AtomicBool = AtomicBool::new(false);
         fn raise() {
             PENDING.store(true, Ordering::SeqCst);
@@ -6220,6 +6247,127 @@ mod tests {
         let w_code =
             box_code_object(compile_exec("answer = 42\n").expect("compile failed")).unwrap();
         assert!(!w_code.is_null());
+    }
+
+    /// Wrapper malloc fails after `release_code_locations` has claimed
+    /// `code_ptr`. The Drop guard frees the unattached graph: the cache
+    /// entry is gone and a later body at a reused address registers its
+    /// own, matching `pycode.py` `PyCode.__init__` leaving an unreachable
+    /// object for the GC.
+    #[test]
+    fn w_code_new_owned_frees_unattached_graph_when_wrapper_malloc_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // `fetch_memory_error` builds `OperationError(w_MemoryError, w_None)`;
+        // the class table is filled by `init_typeobjects`.
+        let _ctx = crate::PyExecutionContext::default();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        fn refuse_pycode(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+            if type_id == W_CODE_GC_TYPE_ID {
+                return std::ptr::null_mut();
+            }
+            // Filename intern and other managed births can run before the
+            // wrapper malloc. Fail only the PyCode request; every other
+            // type gets a headered host block so
+            // `try_gc_write_barrier_managed` can read `obj - GcHeader::SIZE`.
+            let header = majit_gc::header::GcHeader::SIZE;
+            let total = header.saturating_add(payload_size.max(1));
+            let layout =
+                std::alloc::Layout::from_size_align(total, majit_gc::header::GcHeader::ALIGN)
+                    .expect("PyCode refuse-hook host layout");
+            unsafe {
+                let raw = std::alloc::alloc_zeroed(layout);
+                if raw.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                *(raw as *mut majit_gc::header::GcHeader) =
+                    majit_gc::header::GcHeader::new(type_id);
+                raw.add(header) as pyre_object::gc_hook::GCREF
+            }
+        }
+        struct ClearRaise;
+        impl Drop for ClearRaise {
+            fn drop(&mut self) {
+                majit_gc::set_active_raise_memory_error(None);
+                majit_gc::set_active_exception_occurred(None);
+            }
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        let _clear_raise = ClearRaise;
+        let code =
+            compile_exec("def outer():\n    def inner():\n        return 1\n    return inner\n")
+                .expect("compile failed");
+        assert!(!code.instructions.is_empty());
+        let code_ptr = Box::into_raw(Box::new(code));
+        let nested: Vec<*const crate::CodeObject> = {
+            let body = unsafe { &*code_ptr };
+            body.constants
+                .iter()
+                .filter_map(|constant| match constant {
+                    crate::bytecode::ConstantData::Code { code } => {
+                        Some(&**code as *const crate::CodeObject)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            !nested.is_empty(),
+            "the fixture must own nested code constants"
+        );
+        pyre_object::gc_hook::register_gc_alloc_hook(refuse_pycode);
+        let err = w_code_new_owned(code_ptr as *const (), false, code_ptr as usize, &[], true)
+            .expect_err("PyCode malloc must fail");
+        assert_eq!(err.kind, crate::PyErrorKind::MemoryError);
+        pyre_object::gc_hook::clear_gc_alloc_hook();
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
+        {
+            let cache = code_locations_cache().lock();
+            assert!(
+                !cache.contains_key(&(code_ptr as usize)),
+                "construction's CODE_LOCATIONS entry must be removed"
+            );
+            for member in &nested {
+                assert!(
+                    !cache.contains_key(&(*member as usize)),
+                    "nested constants are wrapped after attach, so they must have no cache entry"
+                );
+            }
+        }
+        let registry = code_units()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!registry.units.contains_key(&(code_ptr as usize)));
+        assert!(!registry.owner_of.contains_key(&(code_ptr as usize)));
+        drop(registry);
+        // A later body at a reused address must register its own
+        // `CODE_LOCATIONS` entry. Construction empties `locations` and
+        // `code_locations` rebuilds from `linetable`.
+        let fresh = compile_exec("answer = 42\n").expect("compile failed");
+        let firstlineno = fresh.first_line_number.map_or(1, |line| line.get() as i32);
+        let expected_locations = fresh.locations.to_vec();
+        assert!(!expected_locations.is_empty());
+        let w_code = box_code_object(fresh).unwrap();
+        assert_eq!(unsafe { w_code_firstlineno_raw(w_code) }, firstlineno);
+        let stored = unsafe { &*w_code_get_ptr(w_code) };
+        assert!(stored.locations.is_empty());
+        assert_eq!(code_locations(stored), expected_locations.as_slice());
+        assert!(
+            code_locations_cache()
+                .lock()
+                .contains_key(&(stored as *const crate::CodeObject as usize)),
+            "a fresh body must register its own CODE_LOCATIONS entry"
+        );
     }
 
     #[test]

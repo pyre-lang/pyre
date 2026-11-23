@@ -8,10 +8,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::object_array::{
-    FloatItemsBlock, ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc,
-    alloc_typed_items_block, alloc_typed_items_block_nursery, dealloc_list_items_block,
-    gc_float_array_gc_type_id, gc_int_array_gc_type_id, items_block_capacity,
-    items_block_items_base, items_block_set_ref, ll_new_int_items, typed_items_block_items_base,
+    FloatItemsBlock, ItemsBlock, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
+    alloc_list_items_block_gc, alloc_typed_items_block, alloc_typed_items_block_nursery,
+    dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
+    items_block_capacity, items_block_items_base, items_block_set_ref, ll_new_int_items,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -129,6 +130,196 @@ pub unsafe fn w_list_lock_release(lock: usize) {
 
 pub fn list_locks_after_fork_child() {
     LIST_LOCKS.after_fork_child();
+}
+
+/// Items and `len(p)` of one ARRAY. `rgc.py ll_arrayclear` /
+/// `ll_arrayfill` are `@specialize.ll()`: `len(p)` is the word at
+/// offset 0 (`TypeInfo.length_offset`), and items start at
+/// `llmemory.itemoffsetof(ARRAY, 0)`, a constant of the specialization:
+/// [`TYPED_ITEMS_BLOCK_ITEMS_OFFSET`] for the int/float item blocks and
+/// `object_array::ITEMS_BLOCK_ITEMS_OFFSET` for the object one (they differ
+/// on a 32-bit target, where the object block's header is one 4-byte word).
+/// Follow a forwarding word with `try_gc_current_object_address`.
+
+struct ArrayItems {
+    address: usize,
+    items: *mut u8,
+    length: usize,
+}
+
+fn array_items(p: i64, items_offset: usize) -> Option<ArrayItems> {
+    if p == 0 {
+        return None;
+    }
+    let address =
+        crate::gc_hook::try_gc_current_object_address(p as crate::gc_hook::GCREF) as usize;
+    if address == 0 {
+        return None;
+    }
+    let length = unsafe { *(address as *const usize) };
+    let items = unsafe { (address as *mut u8).add(items_offset) };
+    Some(ArrayItems {
+        address,
+        items,
+        length,
+    })
+}
+
+/// `rgc.py ll_arrayclear`: `raw_memclear` of `sizeof(ARRAY.OF) * length`.
+/// No write barrier: writing NULL never creates an old->young reference.
+fn ll_arrayclear_body(p: i64, items_offset: usize, item_size: usize) {
+    let Some(arr) = array_items(p, items_offset) else {
+        return;
+    };
+    let nbytes = arr
+        .length
+        .checked_mul(item_size)
+        .expect("ll_arrayclear byte length overflow");
+    unsafe { std::ptr::write_bytes(arr.items, 0, nbytes) };
+}
+
+/// `rgc.py ll_arrayfill`: one `gc_writebarrier`, then
+/// `bare_setarrayitem` at `sizeof(T)` for every slot.
+fn ll_arrayfill_copy<T: Copy>(p: i64, items_offset: usize, item: T) {
+    let Some(arr) = array_items(p, items_offset) else {
+        return;
+    };
+    unsafe {
+        crate::gc_hook::try_gc_write_barrier(arr.address as crate::gc_hook::GCREF);
+        let mut i = 0usize;
+        while i < arr.length {
+            let dest = arr.items.add(
+                i.checked_mul(std::mem::size_of::<T>())
+                    .expect("ll_arrayfill item offset overflow"),
+            ) as *mut T;
+            *dest = item;
+            i += 1;
+        }
+    }
+}
+
+/// `rgc.py ll_arrayclear` for a 1-byte integer ARRAY (`sizeof(ARRAY.OF)`).
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_i1(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 1);
+}
+
+/// `rgc.py ll_arrayfill` for a 1-byte integer ARRAY: one `gc_writebarrier`
+/// then `bare_setarrayitem` at a 1-byte stride.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_i1(p: i64, item: i64) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u8);
+}
+
+/// `rgc.py ll_arrayclear` for a 2-byte integer ARRAY (`sizeof(ARRAY.OF)`).
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_i2(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 2);
+}
+
+/// `rgc.py ll_arrayfill` for a 2-byte integer ARRAY: one `gc_writebarrier`
+/// then `bare_setarrayitem` at a 2-byte stride.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_i2(p: i64, item: i64) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u16);
+}
+
+/// `rgc.py ll_arrayclear` for a 4-byte integer ARRAY (`sizeof(ARRAY.OF)`).
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_i4(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+}
+
+/// `rgc.py ll_arrayfill` for a 4-byte integer ARRAY: one `gc_writebarrier`
+/// then `bare_setarrayitem` at a 4-byte stride.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_i4(p: i64, item: i64) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item as u32);
+}
+
+/// `rgc.py ll_arrayclear` for an 8-byte integer ARRAY (`sizeof(ARRAY.OF)`).
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_i8(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+}
+
+/// `rgc.py ll_arrayfill` for an 8-byte integer ARRAY: one `gc_writebarrier`
+/// then `bare_setarrayitem` at an 8-byte stride.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_i8(p: i64, item: i64) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+}
+
+/// `rgc.py ll_arrayclear` for `GcArray(Float)`.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_f(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 8);
+}
+
+/// `rgc.py ll_arrayfill` for `GcArray(Float)`: one `gc_writebarrier`
+/// then `bare_setarrayitem` for every slot.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_f(p: i64, item: f64) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+}
+
+/// `rgc.py ll_arrayclear` for `GcArray(SingleFloat)`.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_s(p: i64) {
+    ll_arrayclear_body(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, 4);
+}
+
+/// `rgc.py ll_arrayfill` for `GcArray(SingleFloat)`: one `gc_writebarrier`
+/// then `bare_setarrayitem` at a 4-byte stride. The residual ABI is the
+/// call stub's C `float` (`descr.py CallDescr.create_call_stub` `'S'`).
+pub extern "C" fn ll_arrayfill_s(p: i64, item: f32) {
+    ll_arrayfill_copy(p, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, item);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static LL_ARRAYFILL_S: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::listobject::ll_arrayfill_s",
+        ll_arrayfill_s as *const (),
+        2,
+        "ww>v",
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_ll_arrayfill_s() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::listobject::ll_arrayfill_s",
+        ll_arrayfill_s as *const (),
+        2,
+        "ww>v",
+    );
+}
+
+/// `rgc.py ll_arrayclear` for `GcArray(OBJECTPTR)`: writing NULL never
+/// creates an old->young reference, so no write barrier is needed when
+/// zeroing.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayclear_r(p: i64) {
+    ll_arrayclear_body(
+        p,
+        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+        std::mem::size_of::<PyObjectRef>(),
+    );
+}
+
+/// `rgc.py ll_arrayfill` for `GcArray(OBJECTPTR)`: one `gc_writebarrier`
+/// then `bare_setarrayitem` for every slot.
+#[majit_macros::dont_look_inside]
+pub fn ll_arrayfill_r(p: i64, item: i64) {
+    ll_arrayfill_copy(
+        p,
+        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+        item as usize as PyObjectRef,
+    );
 }
 
 #[repr(u8)]
@@ -8514,6 +8705,172 @@ mod tests {
                 .join()
                 .unwrap()
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn residual_rgc_array_helpers_are_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in [
+            "ll_arrayclear_i1",
+            "ll_arrayclear_i2",
+            "ll_arrayclear_i4",
+            "ll_arrayclear_i8",
+            "ll_arrayclear_f",
+            "ll_arrayclear_s",
+            "ll_arrayclear_r",
+            "ll_arrayfill_i1",
+            "ll_arrayfill_i2",
+            "ll_arrayfill_i4",
+            "ll_arrayfill_i8",
+            "ll_arrayfill_f",
+            "ll_arrayfill_s",
+            "ll_arrayfill_r",
+        ] {
+            let path = format!("{module}::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
+    }
+
+    #[test]
+    fn ll_arrayfill_i8_then_ll_arrayclear_i8() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        unsafe {
+            let block = alloc_typed_items_block_nursery(3, 0);
+            ll_arrayfill_i8(block as usize as i64, 7);
+            let base = typed_items_block_items_base(block) as *mut i64;
+            assert_eq!(*base, 7);
+            assert_eq!(*base.add(1), 7);
+            assert_eq!(*base.add(2), 7);
+            ll_arrayclear_i8(block as usize as i64);
+            assert_eq!(*base, 0);
+            assert_eq!(*base.add(1), 0);
+            assert_eq!(*base.add(2), 0);
+        }
+    }
+
+    #[test]
+    fn ll_arrayfill_f_then_ll_arrayclear_f() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        unsafe {
+            let block = alloc_typed_items_block_nursery(2, 0);
+            ll_arrayfill_f(block as usize as i64, 1.5);
+            let base = typed_items_block_items_base(block) as *mut f64;
+            assert_eq!(*base, 1.5);
+            assert_eq!(*base.add(1), 1.5);
+            ll_arrayclear_f(block as usize as i64);
+            assert_eq!(*base, 0.0);
+            assert_eq!(*base.add(1), 0.0);
+        }
+    }
+
+    #[test]
+    fn ll_arrayfill_r_then_ll_arrayclear_r() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        unsafe {
+            let block =
+                alloc_list_items_block_gc(&[crate::PY_NULL, crate::PY_NULL, crate::PY_NULL]);
+            let item = 0x1000usize as PyObjectRef;
+            ll_arrayfill_r(block as usize as i64, item as usize as i64);
+            let base = items_block_items_base(block);
+            assert_eq!(*base, item);
+            assert_eq!(*base.add(1), item);
+            assert_eq!(*base.add(2), item);
+            ll_arrayclear_r(block as usize as i64);
+            assert_eq!(*base, crate::PY_NULL);
+            assert_eq!(*base.add(1), crate::PY_NULL);
+            assert_eq!(*base.add(2), crate::PY_NULL);
+        }
+    }
+
+    /// `rgc.py ll_arrayclear` / `ll_arrayfill` use `sizeof(ARRAY.OF) * length`.
+    /// A length-3 byte ARRAY touches three bytes; the guard after it stays.
+    /// The specialization's 1-byte width is the leaf, not a collector layout.
+    #[test]
+    fn ll_arrayfill_and_clear_a_byte_array_touch_three_bytes() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        #[repr(C)]
+        struct ByteArrayBuf {
+            length: usize,
+            items: [u8; 3],
+            guard: [u8; 8],
+        }
+        let mut buf = ByteArrayBuf {
+            length: 3,
+            items: [0xAA, 0xAA, 0xAA],
+            guard: [0xBB; 8],
+        };
+        ll_arrayfill_i1(&mut buf as *mut ByteArrayBuf as usize as i64, 0x5A);
+        assert_eq!(buf.items, [0x5A, 0x5A, 0x5A]);
+        assert_eq!(buf.guard, [0xBB; 8]);
+        ll_arrayclear_i1(&mut buf as *mut ByteArrayBuf as usize as i64);
+        assert_eq!(buf.items, [0, 0, 0]);
+        assert_eq!(buf.guard, [0xBB; 8]);
+    }
+
+    /// A length-3 2-byte ARRAY writes three `u16` slots; the guard after
+    /// it stays. No collector layout hook: the `_i2` leaf is the width.
+    #[test]
+    fn ll_arrayfill_and_clear_a_short_array_touch_three_items() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        #[repr(C)]
+        struct ShortArrayBuf {
+            length: usize,
+            items: [u16; 3],
+            guard: [u8; 8],
+        }
+        let mut buf = ShortArrayBuf {
+            length: 3,
+            items: [0xAAAA, 0xAAAA, 0xAAAA],
+            guard: [0xBB; 8],
+        };
+        ll_arrayfill_i2(&mut buf as *mut ShortArrayBuf as usize as i64, 0x5A5A);
+        assert_eq!(buf.items, [0x5A5A, 0x5A5A, 0x5A5A]);
+        assert_eq!(buf.guard, [0xBB; 8]);
+        ll_arrayclear_i2(&mut buf as *mut ShortArrayBuf as usize as i64);
+        assert_eq!(buf.items, [0, 0, 0]);
+        assert_eq!(buf.guard, [0xBB; 8]);
+    }
+
+    /// `rgc.py ll_arrayfill` for `GcArray(SingleFloat)` stores `f32` at a
+    /// 4-byte stride.
+    #[test]
+    fn ll_arrayfill_s_stores_f32_at_a_four_byte_stride() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        #[repr(C)]
+        struct SingleFloatBuf {
+            length: usize,
+            items: [f32; 2],
+            guard: f32,
+        }
+        let mut buf = SingleFloatBuf {
+            length: 2,
+            items: [0.0, 0.0],
+            guard: 9.0,
+        };
+        ll_arrayfill_s(&mut buf as *mut SingleFloatBuf as usize as i64, 1.5);
+        assert_eq!(buf.items, [1.5, 1.5]);
+        assert_eq!(buf.guard, 9.0);
+        ll_arrayclear_s(&mut buf as *mut SingleFloatBuf as usize as i64);
+        assert_eq!(buf.items, [0.0, 0.0]);
+        assert_eq!(buf.guard, 9.0);
     }
 
     #[test]

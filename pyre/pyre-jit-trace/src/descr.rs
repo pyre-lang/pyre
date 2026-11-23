@@ -1292,6 +1292,7 @@ fn build_object_descr_group_inlining_parent(
         vtable,
         true,
         headerless,
+        false,
         &specs,
         &gc_edges,
         inlined_parent,
@@ -1392,6 +1393,7 @@ fn build_bare_gcstruct_descr_group(
         0,     // vtable: a bare GcStruct is not an object
         true,  // is_gc_managed: headered + forwardable
         false, // headerless: carries a GcHeader tid word
+        false,
         &specs,
         // No edge beyond the positional fields: `with_all_fielddescrs` already
         // puts every `Type::Ref` spec (e.g. `extra_pieces`) into gc_fielddescrs.
@@ -5141,6 +5143,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
             &pyre_object::TYPE_TYPE as *const _ as usize,
             true,
             headerless,
+            false,
             &payload,
             &extra_gc,
         );
@@ -5406,6 +5409,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             0,
             true,
             headerless,
+            false,
             &specs,
             &[],
         )
@@ -5565,6 +5569,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
             0,
             true,
             headerless,
+            false,
             &specs,
             &[],
         )
@@ -5664,6 +5669,7 @@ fn make_mapdict_quasi_descr_group(
         0,
         false,
         true,
+        false,
         &specs,
         &[],
     )
@@ -5898,6 +5904,7 @@ static HOLDER_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         0,
         false,
         true,
+        false,
         &specs,
         &[],
     )
@@ -6132,6 +6139,7 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
         &pyre_object::descriptor::PROPERTY_TYPE as *const _ as usize,
         true,
         headerless,
+        false,
         &specs,
         &[],
     )
@@ -9515,7 +9523,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     use pyre_interpreter::pytraceback::{
         PYTRACEBACK_FRAME_OFFSET, PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_LASTI_OFFSET,
         PYTRACEBACK_LINENO_OFFSET, PYTRACEBACK_OBJECT_SIZE, PYTRACEBACK_TYPE,
-        PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
+        PYTRACEBACK_W_NEXT_OFFSET,
     };
 
     build_object_descr_group_with_extra_gc_edges(
@@ -9561,15 +9569,6 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 8,
                 Type::Int,
                 true,
-                false,
-                false,
-            ),
-            (
-                "w_code",
-                PYTRACEBACK_W_CODE_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
                 false,
                 false,
             ),
@@ -9983,6 +9982,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         true,
         // headerless: `malloc_typed_stable` prepends a `GcHeader`.
         false,
+        false,
         &specs,
         &[],
     );
@@ -10116,6 +10116,7 @@ static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Lazy
         0,
         false,
         true,
+        false,
         &specs,
         &[],
     )
@@ -12769,6 +12770,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: wire,
         });
         assert_eq!(
@@ -12796,6 +12798,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![
                 BhFieldSpec {
                     index: 0,
@@ -12991,6 +12994,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![BhFieldSpec {
                 index: 0,
                 field_key: "localspluskinds".into(),
@@ -13100,6 +13104,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![BhFieldSpec {
                 index: 0,
                 field_key: "buffer".into(),
@@ -13139,6 +13144,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![BhFieldSpec {
                 index: 1,
                 field_key: "imp".into(),
@@ -13259,6 +13265,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![BhFieldSpec {
                 index: 1,
                 field_key: "imp".into(),
@@ -13545,6 +13552,7 @@ mod tests {
             vtable: 0,
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: Vec::new(),
         };
         let spec =
@@ -13683,6 +13691,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: vec![capacity.clone()],
         };
         let descr = make_descr_from_bh(&BhDescr::Field {
@@ -14180,6 +14189,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: vec![BhFieldSpec {
                     index: 0,
                     field_key: "probe".into(),
@@ -14273,6 +14283,7 @@ mod tests {
             0,
             false,
             true,
+            false,
             &[listed],
             &[],
         );
@@ -14284,6 +14295,7 @@ mod tests {
             owner: "d1_leftover_probe::SubsetStruct".into(),
             is_gc_managed: false,
             headerless: true,
+            is_immutable: false,
             all_fielddescrs: vec![
                 BhFieldSpec {
                     index: 0,
@@ -15969,6 +15981,7 @@ mod tests {
             owner: String::new(),
             is_gc_managed: true,
             headerless: false,
+            is_immutable: false,
             all_fielddescrs: fields.clone(),
         };
         let interior_fields = vec![
@@ -16825,7 +16838,7 @@ pub(crate) fn publish_pyre_class_vtables() {
 
 /// Second pass after the collector has stamped `TypeIdCell`s.
 ///
-/// One walk per collector (`LAST_GC` epoch), matching
+/// Runs after kind-0 decode stamps tids, matching
 /// `heaptracker.py` `setup_cache_gcstruct2vtable`.
 pub(crate) fn refresh_pyre_class_vtable_tids() {
     publish_pyre_class_vtables_inner();
@@ -16958,14 +16971,14 @@ fn minted_size_collector_tid(owner: &str, vtable: u64, fallback: u32) -> u32 {
 
 /// Stamp that id onto the cached SizeDescr and fix it there.
 ///
-/// Parent layouts publish before `register_synthetic_struct_tids`
-/// (`materialize_gccache_owned_descrs_with`: `publish_pyre_class_vtables`,
+/// Parent layouts publish before kind-0 decode stamps tids
+/// (`materialize_gccache_owned_descrs`: `publish_pyre_class_vtables`,
 /// then `decode_kind0_descrs` which publishes packed parents before
-/// parentless slots, then the census). The tid has to be on the descr
-/// before that census. A different nonzero collector tid already on the
-/// slot is a host group that won the STRUCT key (`descr.py` one
-/// SizeDescr per STRUCT); leave it. A zero or unresolved tid is the
-/// structural placeholder and takes the minted id.
+/// parentless slots, then `drain_unresolved_gccache_tids`). The tid has
+/// to be on the descr before that drain. A different nonzero collector
+/// tid already on the slot is a host group that won the STRUCT key
+/// (`descr.py` one SizeDescr per STRUCT); leave it. A zero or unresolved
+/// tid is the structural placeholder and takes the minted id.
 fn bind_minted_size_descr(cache_key: u64, owner: &str, vtable: u64) {
     let Some(tid) = crate::minted_exception_classes::minted_exception_collector_tid(owner, vtable)
     else {
@@ -17027,6 +17040,7 @@ fn simple_descr_group_from_bh_size(
             spec.vtable as usize,
             spec.is_gc_managed,
             spec.headerless,
+            spec.is_immutable,
             &field_specs,
             &[],
         );
@@ -17050,6 +17064,7 @@ fn simple_descr_group_from_bh_size(
         spec.vtable as usize,
         spec.is_gc_managed,
         spec.headerless,
+        spec.is_immutable,
         &field_specs,
         &[],
     );
@@ -17320,6 +17335,7 @@ pub(crate) fn publish_kind0_parent_layout(spec: majit_jitcode::jitcode::BhSizeSp
         vtable as usize,
         spec.is_gc_managed,
         spec.headerless,
+        spec.is_immutable,
         &field_specs,
         &[],
     );
@@ -18838,6 +18854,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless,
+                    is_immutable: false,
                     all_fielddescrs: all_fielddescrs.clone(),
                 };
                 simple_descr_group_from_bh_size(&spec).size_descr.clone()

@@ -12112,7 +12112,7 @@ fn descr_get_tb_lineno_is_the_pypy_leaf() {
         "{path} must carry assembled bytecode; ops={ops:?}"
     );
     // Slot reads lower as `inline_call` of the `#[inline]` accessors
-    // (`w_pytraceback_get_lineno_raw` / `get_w_code` / `get_lasti`).
+    // (`w_pytraceback_get_lineno_raw` / `w_pytraceback_frame_pycode` / `get_lasti`).
     assert!(
         ops.iter().any(|op| *op == "inline_call_r_i"),
         "{path} must read the integer slots; ops={ops:?}"
@@ -31184,15 +31184,14 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
         ExcKind, w_exception_get_traceback, w_exception_new, w_exception_set_traceback,
     };
 
-    // `frame` is only ever compared by identity here, and `w_code` only has to
-    // be a chain-terminating slot, so both stay NULL — the splice walks
-    // `w_next` and nothing dereferences either. `w_pytraceback_new` can
-    // collect, so the exception is read from its root slot on each side of it.
+    // `frame` is only ever compared by identity here, so it stays NULL — the
+    // splice walks `w_next` and nothing dereferences the frame.
+    // `w_pytraceback_new` can collect, so the exception is read from its root
+    // slot on each side of it.
     fn prepend(slot: usize, lasti: i64) {
         unsafe {
             let head = w_exception_get_traceback(pyre_object::gc_roots::shadow_stack_get(slot));
-            let node =
-                w_pytraceback_new(std::ptr::null_mut(), lasti, head, 1, pyre_object::PY_NULL);
+            let node = w_pytraceback_new(std::ptr::null_mut(), lasti, head, 1);
             w_exception_set_traceback(pyre_object::gc_roots::shadow_stack_get(slot), node);
         }
     }

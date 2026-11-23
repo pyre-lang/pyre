@@ -32,6 +32,10 @@ pub struct VirtualizableFieldDescriptor {
     pub array_itemsize: Option<usize>,
     /// RPython: arraydescr.is_item_signed() — FLAG_SIGNED for vable arrays.
     pub array_is_signed: Option<bool>,
+    /// `getattr(VTYPE, name).TO` (`virtualizable.py VirtualizableInfo.__init__`
+    /// `cpu.arraydescrof`). Absent until a test or mint path records it.
+    #[serde(skip, default)]
+    pub array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
 }
 
 impl VirtualizableFieldDescriptor {
@@ -42,6 +46,7 @@ impl VirtualizableFieldDescriptor {
             index,
             array_itemsize: None,
             array_is_signed: None,
+            array: None,
         }
     }
 
@@ -60,7 +65,17 @@ impl VirtualizableFieldDescriptor {
             index,
             array_itemsize: Some(itemsize),
             array_is_signed: Some(is_signed),
+            array: None,
         }
+    }
+
+    /// Record `getattr(VTYPE, name).TO` for `cpu.arraydescrof`.
+    pub fn with_array(
+        mut self,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> Self {
+        self.array = Some(array);
+        self
     }
 
     fn matches(&self, field: &FieldDescriptor) -> bool {
@@ -107,6 +122,18 @@ impl VirtualizableFieldDescriptor {
 }
 
 /// Configuration for the graph rewrite pass.
+/// `jtransform.py` `vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)`.
+#[derive(Clone)]
+struct VableArrayVar {
+    vable_base: crate::flowspace::model::Variable,
+    array_index: usize,
+    itemsize: usize,
+    is_signed: bool,
+    /// Field `owner_root` for `Transformer.get_vinfo`, the same lookup
+    /// `get_virtualizable_field_descr` uses.
+    owner: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphTransformConfig {
     /// Whether to rewrite virtualizable field/array accesses.
@@ -690,11 +717,9 @@ pub struct Transformer<'a> {
     /// Used by `make_three_lists()` to split args by kind.
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
     /// RPython: `Transformer.vable_array_vars`.
-    /// Stores (vable_base, array_index, itemsize, is_signed) per vable array variable.
-    vable_array_vars: std::collections::HashMap<
-        crate::flowspace::model::Variable,
-        (crate::flowspace::model::Variable, usize, usize, bool),
-    >,
+    /// Stores `(v_base, arrayfielddescr, arraydescr)` per vable array variable
+    /// (`jtransform.py rewrite_op_getfield` `except VirtualizableArrayField`).
+    vable_array_vars: std::collections::HashMap<crate::flowspace::model::Variable, VableArrayVar>,
     /// RPython: `Transformer.vable_flags`. Keyed by Variable identity
     /// matching upstream `self.vable_flags[op.args[0]] = ...`
     /// (`jtransform.py` populates with `Variable` objects).
@@ -3728,6 +3753,32 @@ impl<'a> Transformer<'a> {
             .map(|item| item.index)
     }
 
+    /// `jtransform.py rewrite_op_getarrayitem`: `vinfo = self.get_vinfo(v_base)`
+    /// then `vinfo.array_descrs[arrayindex]`. A config-only declaration
+    /// still rewrites to `VableArray*` (`GraphTransformConfig.vable_arrays`);
+    /// mint `array_descrs[arrayindex]` from the recorded ARRAY when the
+    /// handle has not published it yet.
+    fn vable_array_descr_for(
+        &self,
+        vable_base: &crate::flowspace::model::Variable,
+        owner: Option<&str>,
+        arr_idx: usize,
+    ) -> Option<crate::model::VableArrayDescr> {
+        if let Some(descr) = self
+            .get_vinfo_for_var(vable_base, owner)
+            .and_then(|vinfo| vinfo.array_descr(arr_idx))
+        {
+            return Some(crate::model::VableArrayDescr(descr));
+        }
+        crate::call::vable_array_descr_from_config(
+            self.config,
+            owner,
+            arr_idx,
+            self.callcontrol.as_deref(),
+        )
+        .map(crate::model::VableArrayDescr)
+    }
+
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
     /// (`jtransform.py`). Pyre keeps `cpu` / `callcontrol` behind
     /// builder setters because the borrow checker demands a late binding
@@ -4755,9 +4806,7 @@ impl<'a> Transformer<'a> {
             return;
         }
         for v in list {
-            if let Some((_v_base, array_index, _itemsize, _is_signed)) =
-                self.vable_array_vars.get(v)
-            {
+            if let Some(VableArrayVar { array_index, .. }) = self.vable_array_vars.get(v) {
                 panic!(
                     "A virtualizable array is passed around; it should\n\
                      only be used immediately after being read.  Note\n\
@@ -10883,8 +10932,16 @@ impl<'a> Transformer<'a> {
                 .array_itemsize
                 .unwrap_or_else(crate::layout::target_word_size);
             let is_signed = array_field.array_is_signed.unwrap_or(false);
-            self.vable_array_vars
-                .insert(result, (base_var, array_field.index, itemsize, is_signed));
+            self.vable_array_vars.insert(
+                result,
+                VableArrayVar {
+                    vable_base: base_var,
+                    array_index: array_field.index,
+                    itemsize,
+                    is_signed,
+                    owner: field.owner_root.clone(),
+                },
+            );
             // `rewrite_op_getfield`'s `except VirtualizableArrayField:` handler
             // ends in `return []` — registering the base is the whole rewrite
             // and the read itself is dropped.  `rewrite_op_getarrayitem` emits
@@ -11458,7 +11515,13 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+        if let Some(VableArrayVar {
+            vable_base,
+            array_index: arr_idx,
+            itemsize,
+            is_signed,
+            owner,
+        }) = self
             .vable_array_vars
             .get(&resolve_alias(base, &self.aliases))
             .cloned()
@@ -11469,7 +11532,8 @@ impl<'a> Transformer<'a> {
             });
             self.vable_rewrites += 1;
             // `jtransform.py:764-767` — `-live-` leads the virtualizable
-            // array read.
+            // array read. The ARRAY descr lives on `vinfo.array_descrs`.
+            let array_descr = self.vable_array_descr_for(&vable_base, owner.as_deref(), arr_idx);
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
@@ -11484,6 +11548,7 @@ impl<'a> Transformer<'a> {
                         item_ty: typed_item_ty,
                         array_itemsize: itemsize,
                         array_is_signed: is_signed,
+                        array_descr,
                     },
                 },
             ]);
@@ -11614,7 +11679,13 @@ impl<'a> Transformer<'a> {
         base: &crate::flowspace::model::Variable,
         graph_name: &str,
     ) -> RewriteResult {
-        let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+        let Some(VableArrayVar {
+            vable_base,
+            array_index: arr_idx,
+            itemsize,
+            is_signed,
+            owner,
+        }) = self
             .vable_array_vars
             .get(&resolve_alias(base, &self.aliases))
             .cloned()
@@ -11660,6 +11731,8 @@ impl<'a> Transformer<'a> {
         self.vable_rewrites += 1;
         // `jtransform.py:814` — `-live-` leads the virtualizable array
         // length read, as it leads its read and write siblings.
+        // `jtransform.py:816` takes `vinfo.array_descrs[arrayindex]`.
+        let array_descr = self.vable_array_descr_for(&vable_base, owner.as_deref(), arr_idx);
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: None,
@@ -11670,17 +11743,10 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::VableArrayLen {
                     base: vable_base,
                     array_index: arr_idx,
-                    // Upstream passes the `arraydescr` off `vinfo`
-                    // (`jtransform.py:816`), not one derived at the access —
-                    // an `arraylen_gc` carries no element type to derive one
-                    // from.  `vable_arraydescrof` asserts the block behind a
-                    // virtualizable array is a `FixedObjectArray` of
-                    // word-wide `PyObjectRef`s, which is the one shape this
-                    // mint accepts, so the element type is that and the pair
-                    // `vable_array_index_pair_at` checks holds.
                     item_ty: ValueType::Ref(None),
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
+                    array_descr,
                 },
             },
         ])
@@ -11700,7 +11766,13 @@ impl<'a> Transformer<'a> {
             .as_variable()
             .and_then(|v| self.get_value_type(v))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+        if let Some(VableArrayVar {
+            vable_base,
+            array_index: arr_idx,
+            itemsize,
+            is_signed,
+            owner,
+        }) = self
             .vable_array_vars
             .get(&resolve_alias(base, &self.aliases))
             .cloned()
@@ -11712,6 +11784,8 @@ impl<'a> Transformer<'a> {
             self.vable_rewrites += 1;
             // `jtransform.py:798-801` — `-live-` then `setarrayitem_vable_*`
             // with the value argument unchanged, constant or variable.
+            // `jtransform.py:800` takes `vinfo.array_descrs[arrayindex]`.
+            let array_descr = self.vable_array_descr_for(&vable_base, owner.as_deref(), arr_idx);
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
@@ -11727,6 +11801,7 @@ impl<'a> Transformer<'a> {
                         item_ty: typed_item_ty,
                         array_itemsize: itemsize,
                         array_is_signed: is_signed,
+                        array_descr,
                     },
                 },
             ]);
@@ -18396,15 +18471,30 @@ fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
     Some((id, nolength))
 }
 
-/// ARRAY identity of a rich `__array_repeat`.
-///
-/// A lifted graph reaches `rtype_alloc_and_set`, which folds `LIST`
-/// into `ll_alloc_and_set`. This spine never met the rtyper, so the
-/// item comes from a shaped `Array<T;N>` result or from an
-/// `ArrayRead` / `ArrayWrite` of the result (`LinkClasses`: the front
-/// threads the value through every block as a fresh inputarg). A
-/// headerless reader, a nested item, or two consumers that name
-/// different items stay the residual call.
+/// ARRAY of a skip-spine fixed list, keyed by the identity
+/// [`fixed_list_reader`] already published (`slice_array_type_id`, then
+/// `canonical_array_type_id`). `rstr.py CHAR_ARRAY` is `[u8]`;
+/// `rlist.py` list items are `GcArray(Signed)` / `GcArray(Float)`;
+/// `rmodel.py externalvsinternal(..., gcref=True)` stores object items
+/// as `GcArray(GCREF)`.
+fn gc_array_for_fixed_list_id(
+    array_type_id: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+    let mut inner = array_type_id.trim();
+    while let Some(rest) = crate::front::typestr::peel_pointer_prefix(inner) {
+        inner = rest;
+    }
+    let id = crate::front::typestr::canonical_array_type_id(inner);
+    match id.as_ref() {
+        LIST_INT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Signed)),
+        LIST_FLOAT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Float)),
+        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID => Some(Array::gc((*GCREF).clone())),
+        "[u8]" | "GcArray<u8>" => Some(crate::codewriter::call::gcarray_char()),
+        _ => None,
+    }
+}
+
 fn fixed_repeat_identity(
     graph: &FunctionGraph,
     result: &crate::flowspace::model::Variable,
@@ -18412,19 +18502,22 @@ fn fixed_repeat_identity(
 ) -> Option<crate::codewriter::alloc_and_set::FixedArrayRepeat> {
     let classes = crate::codewriter::getslice::LinkClasses::of(graph);
     let mut consumer_item: Option<String> = None;
+    let mut consumer_array: Option<crate::translator::rtyper::lltypesystem::lltype::Array> = None;
     for block in &graph.blocks {
         for op in &block.operations {
-            let (base, array_type_id) = match &op.kind {
+            let (base, array_type_id, array) = match &op.kind {
                 OpKind::ArrayRead {
                     base,
                     array_type_id,
+                    array,
                     ..
                 }
                 | OpKind::ArrayWrite {
                     base,
                     array_type_id,
+                    array,
                     ..
-                } => (base, array_type_id),
+                } => (base, array_type_id, array),
                 _ => continue,
             };
             if !classes.same(base, result) {
@@ -18438,6 +18531,13 @@ fn fixed_repeat_identity(
                 Some(seen) if seen != &item => return None,
                 Some(_) => {}
                 None => consumer_item = Some(item),
+            }
+            if let Some(arr) = array {
+                match &consumer_array {
+                    Some(seen) if seen != arr => return None,
+                    Some(_) => {}
+                    None => consumer_array = Some(arr.clone()),
+                }
             }
         }
     }
@@ -18460,9 +18560,14 @@ fn fixed_repeat_identity(
     if nolength {
         return None;
     }
+    let array = match consumer_array {
+        Some(arr) => arr,
+        None => gc_array_for_fixed_list_id(&array_type_id)?,
+    };
     Some(crate::codewriter::alloc_and_set::FixedArrayRepeat {
         item_ty: crate::front::mir::tuple_field_value_type(&item),
         array_type_id,
+        array,
         clears: fixed_list_clears(&item),
     })
 }
@@ -19609,6 +19714,7 @@ fn remap_op_renamings(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayRead {
             base: remap_value(base, aliases),
             array_index: *array_index,
@@ -19616,6 +19722,7 @@ fn remap_op_renamings(
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::VableArrayLen {
             base,
@@ -19623,12 +19730,14 @@ fn remap_op_renamings(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayLen {
             base: remap_value(base, aliases),
             array_index: *array_index,
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::VableArrayWrite {
             base,
@@ -19638,6 +19747,7 @@ fn remap_op_renamings(
             item_ty,
             array_itemsize,
             array_is_signed,
+            array_descr,
         } => OpKind::VableArrayWrite {
             base: remap_value(base, aliases),
             array_index: *array_index,
@@ -19646,6 +19756,7 @@ fn remap_op_renamings(
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
+            array_descr: array_descr.clone(),
         },
         OpKind::BinOp {
             op,
@@ -29383,6 +29494,85 @@ mod tests {
         };
         assert_eq!(*array_index, 0);
         assert_eq!(rewritten_base, &base_var_held);
+    }
+
+    #[test]
+    fn transform_graph_attaches_array_descrs_from_the_recorded_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF};
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: array_var,
+                    index: index_var,
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: None,
+                    array: None,
+                    nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var));
+
+        let array = Array::gc(GCREF.clone());
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("locals_stack_w", Some("Frame".into()), 0)
+                    .with_array(array.clone()),
+            ],
+            ..Default::default()
+        };
+        let mut cc = crate::call::CallControl::new();
+        crate::call::install_vtype_array_layout(&mut cc, "Frame", &[("locals_stack_w", array)]);
+        cc.setup_jitdriver(
+            crate::parse::CallPath::from_segments(["portal"]),
+            vec![],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+            false,
+            vec!["frame".into()],
+            vec!["Frame".into()],
+            crate::parse::CallPath::from_segments(["portal"]),
+        );
+        cc.make_virtualizable_infos(|_, vtype, cpu| {
+            crate::call::codewriter_vinfo_from_config_with_cpu(vtype, &config, cpu)
+        });
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &result.graph.block(graph.startblock).operations;
+        let array_descr = ops.iter().find_map(|op| match &op.kind {
+            OpKind::VableArrayRead { array_descr, .. } => Some(array_descr),
+            _ => None,
+        });
+        let array_descr =
+            array_descr.unwrap_or_else(|| panic!("expected VableArrayRead, got {ops:?}"));
+        assert!(
+            array_descr.is_some(),
+            "config-only recorded ARRAY must attach vinfo.array_descrs[0]"
+        );
     }
 
     /// With `lower_virtualizable` off, the array field read stays: the four
@@ -42247,6 +42437,45 @@ mod tests {
             assert_residual(&ops);
         }
 
+        // Names-only `[u8]`: `slice_array_type_id` publishes `[u8]`, the
+        // same identity as `rstr.py CHAR_ARRAY` (`gcarray_char`). The
+        // fallback does not invert `lltype_item_spelling` onto `UCHAR`.
+        {
+            let graph = repeat_graph(
+                "repeat_u8",
+                Some("Array<u8;4>"),
+                OpKind::ConstInt(1),
+                Some(OpKind::ConstInt(4)),
+            );
+            let (ops, cc) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[u8]");
+            assert_redirect(&ops, &names.outer);
+            let fill = crate::translator::rtyper::lltypesystem::rbuilder::ll_arrayfill_helper_name(
+                cc.intern_array(&crate::codewriter::call::gcarray_char()),
+            );
+            let arr = registered_ops(&cc, &fill)
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::ArrayLen {
+                        array: Some(arr), ..
+                    }
+                    | OpKind::ArrayWrite {
+                        array: Some(arr), ..
+                    } => Some(arr.clone()),
+                    _ => None,
+                })
+                .expect("ll_arrayfill carries ARRAY");
+            assert_eq!(arr, crate::codewriter::call::gcarray_char());
+            assert_eq!(
+                arr.OF,
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char
+            );
+            assert_ne!(
+                arr.OF,
+                (*crate::translator::rtyper::lltypesystem::rffi::UCHAR).clone()
+            );
+        }
+
         // Headerless `[u32]`, a nested item, and a 1-arg call stay residual.
         {
             let graph = repeat_graph(
@@ -42278,6 +42507,44 @@ mod tests {
             let (ops, _) = transform_with_cc(&graph);
             assert_residual(&ops);
         }
+    }
+
+    /// Skip-spine ARRAY follows the published identity
+    /// (`slice_array_type_id` / `canonical_array_type_id`), not an
+    /// inverse of `lltype_item_spelling`.
+    #[test]
+    fn skip_spine_repeat_array_follows_published_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType};
+        assert_eq!(
+            gc_array_for_fixed_list_id("[u8]"),
+            Some(crate::codewriter::call::gcarray_char())
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[i64]"),
+            Some(Array::gc(LowLevelType::Signed))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id(LIST_INT_ITEMS_ARRAY),
+            Some(Array::gc(LowLevelType::Signed))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[f64]"),
+            Some(Array::gc(LowLevelType::Float))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("[str]"),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id("&[str]"),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert_eq!(
+            gc_array_for_fixed_list_id(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+            Some(Array::gc((*GCREF).clone()))
+        );
+        assert!(gc_array_for_fixed_list_id("[u32]").is_none());
+        assert!(gc_array_for_fixed_list_id("[i8]").is_none());
     }
 
     /// Allocation and every read of a fixed array share the `&[T]` reader's

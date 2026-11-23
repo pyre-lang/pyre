@@ -1354,44 +1354,28 @@ fn rebucket_args(
     }
 }
 
-/// `goto_if_not_int_*` reads the int bank (`blackhole.py`
-/// `bhhandler_goto_if_not_ii`). A fused operand whose cell is `GcRef`
-/// is `cast_ptr_to_int` (`rbuiltin.py rtype_cast_ptr_to_int`) and the
-/// guard reads that int.
-pub(crate) fn reint_fused_int_ref_operands(graph: &mut FunctionGraph) {
-    for block_index in 0..graph.blocks.len() {
-        let Some(crate::model::ExitSwitch::Fused { opname, args }) =
-            graph.blocks[block_index].exitswitch.clone()
-        else {
+/// `optimize_goto_if_not` (`jtransform.py`) fuses `ptr_eq`/`ptr_ne`/
+/// `ptr_iszero`/`ptr_nonzero` as their own exits; `_rewrite_cmp_ptrs`
+/// only rewrites a non-GC ptr compare to `int_*`. The rtyper never
+/// gives an `int_*` op a `GcRef` operand.
+pub(crate) fn assert_fused_int_operands_are_int(graph: &FunctionGraph) {
+    for block in &graph.blocks {
+        let Some(crate::model::ExitSwitch::Fused { opname, args }) = &block.exitswitch else {
             continue;
         };
         if !opname.starts_with("int_") {
             continue;
         }
-        let mut new_args = args;
-        let mut changed = false;
-        for arg in &mut new_args {
-            if FunctionGraph::concretetype_of(arg) != ConcreteType::GcRef {
-                continue;
+        for (argpos, arg) in args.iter().enumerate() {
+            if FunctionGraph::concretetype_of(arg) == ConcreteType::GcRef {
+                panic!(
+                    "fused {opname} has GcRef operand at argpos={argpos} \
+                     (graph {}) — jtransform.optimize_goto_if_not / \
+                     _rewrite_cmp_ptrs keep GC ptr_* as their own exits; \
+                     rtyper never gives int_* a ref operand",
+                    graph.name
+                );
             }
-            let casted = graph.alloc_value_var();
-            FunctionGraph::set_concretetype_of_inline(&casted, ConcreteType::Signed);
-            graph.blocks[block_index].operations.push(SpaceOperation {
-                result: Some(casted.clone()),
-                kind: OpKind::UnaryOp {
-                    op: "cast_ptr_to_int".into(),
-                    operand: arg.clone(),
-                    result_ty: ValueType::Int,
-                },
-            });
-            *arg = casted;
-            changed = true;
-        }
-        if changed {
-            graph.blocks[block_index].exitswitch = Some(crate::model::ExitSwitch::Fused {
-                opname,
-                args: new_args,
-            });
         }
     }
 }
@@ -1506,7 +1490,8 @@ mod tests {
     }
 
     #[test]
-    fn reint_fused_int_lt_casts_a_ref_operand() {
+    #[should_panic(expected = "fused int_lt has GcRef operand at argpos=0 (graph fused_ir_lt)")]
+    fn fused_int_lt_with_a_ref_operand_is_a_type_state_bug() {
         use crate::model::{ExitCase, ExitSwitch, Link};
         let mut graph = FunctionGraph::new("fused_ir_lt");
         let lhs = push_input(&mut graph, "p", ValueType::Ref(None));
@@ -1526,27 +1511,7 @@ mod tests {
             Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
         ];
 
-        reint_fused_int_ref_operands(&mut graph);
-
-        let ExitSwitch::Fused { opname, args } =
-            graph.block(graph.startblock).exitswitch.clone().unwrap()
-        else {
-            panic!("fused guard");
-        };
-        assert_eq!(opname, "int_lt");
-        assert_eq!(args[1], rhs);
-        assert_ne!(args[0], lhs);
-        assert_eq!(
-            FunctionGraph::concretetype_of(&args[0]),
-            ConcreteType::Signed
-        );
-        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, operand, .. }
-                    if op == "cast_ptr_to_int" && *operand == lhs
-            )
-        }));
+        assert_fused_int_operands_are_int(&graph);
     }
 
     #[test]
@@ -2700,6 +2665,7 @@ mod tests {
             item_ty: ValueType::Ref(None),
             array_itemsize: 8,
             array_is_signed: false,
+            array_descr: None,
         };
         let empty = HashSet::new();
         assert_eq!(

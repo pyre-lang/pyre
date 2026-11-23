@@ -9841,6 +9841,38 @@ mod tests {
         );
     }
 
+    /// `rgc.py ll_arrayclear` / `ll_arrayfill` kind trampolines
+    /// (`listobject::{ll_arrayclear,ll_arrayfill}_{i1,i2,i4,i8,f,s,r}`)
+    /// must occupy a real `HELPER_FNADDRS` slot so identity graphs
+    /// `ll_arrayclear__<id>` / `ll_arrayfill__<id>` can alias them
+    /// (`call.py getcalldescr` / `getfunctionptr`).
+    #[test]
+    fn jit_trace_fnaddrs_covers_rgc_array_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for leaf in [
+            "ll_arrayclear_i1",
+            "ll_arrayclear_i2",
+            "ll_arrayclear_i4",
+            "ll_arrayclear_i8",
+            "ll_arrayclear_f",
+            "ll_arrayclear_s",
+            "ll_arrayclear_r",
+            "ll_arrayfill_i1",
+            "ll_arrayfill_i2",
+            "ll_arrayfill_i4",
+            "ll_arrayfill_i8",
+            "ll_arrayfill_f",
+            "ll_arrayfill_s",
+            "ll_arrayfill_r",
+        ] {
+            let path = format!("pyre_object::listobject::{leaf}");
+            let addr = *bindings
+                .get(path.as_str())
+                .unwrap_or_else(|| panic!("{path}"));
+            assert_ne!(addr, 0, "{path}");
+        }
+    }
+
     /// These path spellings are what keep the `pop_value` / paired-local
     /// / exception-TLS residual calls off the `symbolic_fnaddr_for_path`
     /// fallback (which SEGVs at trace time); a typo in either the

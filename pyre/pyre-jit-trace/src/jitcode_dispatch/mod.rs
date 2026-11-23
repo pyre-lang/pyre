@@ -1900,8 +1900,8 @@ fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
     crate::state::jitcode_pc_raise_keeps_existing_traceback(jitcode_index, opcode_position as i32)
 }
 
-/// The frame identity, code object and instruction coordinate one
-/// `PyTraceback` node needs, resolved from the walk's current frame.
+/// The frame identity and instruction coordinate one `PyTraceback` node
+/// needs, resolved from the walk's current frame.
 struct TracebackNodeSite {
     /// `PyTraceback.frame`.  `OpRef::NONE` when the walk has no materialized
     /// frame for this level — a branchless leaf inlined without one leaves
@@ -1909,13 +1909,11 @@ struct TracebackNodeSite {
     /// put a bogus box in the trace, so every caller has to DECLINE on it and
     /// leave the node to the frame-fabricating hook.
     frame: OpRef,
-    w_code: usize,
     last_instruction: i32,
-    /// `W_Code` is a GCREF. `traceback_node_site` copies it out of the
-    /// live frame; `emit_traceback_node` then `execute_new_with_vtable`
-    /// / `record_op` appends to `opencoder.py Trace._ops`. Pin the
-    /// referent so `const_ref` intern's the forwarded address.
-    w_code_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// Live `frame.pycode` (`pytraceback.py PyTraceback.__init__` reads it
+    /// off the frame, not a node snapshot).  Pin it across `is_code` /
+    /// `hidden_applevel` and `emit_traceback_node`'s `execute_new_with_vtable`.
+    _w_code_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
 /// Resolve the `PyTraceback` fields of the frame the walk is currently in.
@@ -1987,12 +1985,10 @@ fn traceback_node_site<Sym: WalkSym>(
     {
         return None;
     }
-    let w_code = w_code_pin.as_ref().map(|p| p.get().0).unwrap_or(w_code);
     Some(TracebackNodeSite {
         frame,
-        w_code,
         last_instruction,
-        w_code_pin,
+        _w_code_pin: w_code_pin,
     })
 }
 
@@ -2010,11 +2006,6 @@ fn emit_traceback_node<Sym: WalkSym>(
     let traceback = ctx
         .trace_ctx
         .execute_new_with_vtable(crate::descr::pytraceback_size_descr(), None);
-    let w_code = site
-        .w_code_pin
-        .as_ref()
-        .map(|pin| pin.get().0)
-        .unwrap_or(site.w_code);
     let fields = [
         (site.frame, 0),
         // Field 1 is `lasti`, which the slot holds in bytes.
@@ -2025,13 +2016,13 @@ fn emit_traceback_node<Sym: WalkSym>(
         ),
         (w_next, 2),
         // `record_application_traceback` leaves `lineno` at
-        // `LINENO_NOT_COMPUTED`; the `tb_lineno` getter resolves it.
+        // `LINENO_NOT_COMPUTED`; the `tb_lineno` getter resolves it from
+        // `self.frame.pycode` (`pytraceback.py PyTraceback.get_lineno`).
         (
             ctx.trace_ctx
                 .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED),
             3,
         ),
-        (ctx.trace_ctx.const_ref(w_code as i64), 4),
     ];
     for (value, index) in fields {
         let descr = crate::descr::pytraceback_field_descr(index);

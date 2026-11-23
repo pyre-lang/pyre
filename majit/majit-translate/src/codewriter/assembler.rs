@@ -3422,9 +3422,8 @@ impl AssemblerEncode for Assembler {
                 base,
                 array_index,
                 elem_index,
-                item_ty,
-                array_itemsize,
-                array_is_signed,
+                array_descr,
+                ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(
@@ -3444,11 +3443,8 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
-                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
-                    item_ty,
-                    *array_itemsize,
-                    *array_is_signed,
-                ));
+                let descr_idx2 =
+                    self.emit_ready_descr(vable_array_descr_from_op(array_descr, *array_index));
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -3468,9 +3464,8 @@ impl AssemblerEncode for Assembler {
                 array_index,
                 elem_index,
                 value,
-                item_ty,
-                array_itemsize,
-                array_is_signed,
+                array_descr,
+                ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(
@@ -3508,11 +3503,8 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
-                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
-                    item_ty,
-                    *array_itemsize,
-                    *array_is_signed,
-                ));
+                let descr_idx2 =
+                    self.emit_ready_descr(vable_array_descr_from_op(array_descr, *array_index));
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -3524,9 +3516,8 @@ impl AssemblerEncode for Assembler {
             OpKind::VableArrayLen {
                 base,
                 array_index,
-                item_ty,
-                array_itemsize,
-                array_is_signed,
+                array_descr,
+                ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(
@@ -3546,11 +3537,8 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
-                    item_ty,
-                    *array_itemsize,
-                    *array_is_signed,
-                ));
+                let descr_idx2 =
+                    self.emit_ready_descr(vable_array_descr_from_op(array_descr, *array_index));
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -6265,6 +6253,7 @@ fn minted_exception_instance_size_spec(
         size,
         is_gc_managed,
         headerless,
+        is_immutable: cc.size_descr_immutable_flag(owner, None),
         type_id: bh_size_type_id(owner, owner, is_gc_managed),
         vtable: 0,
         owner: key,
@@ -6532,6 +6521,7 @@ fn bh_size_spec_for(
         size,
         is_gc_managed,
         headerless,
+        is_immutable: cc.size_descr_immutable_flag(owner, owner_id),
         // `descr.py get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash_for_gc_kind(owner, is_gc_managed)` per
@@ -7652,59 +7642,21 @@ fn arraydescrof(
     }
 }
 
-fn vable_arraydescrof(
-    ty: &crate::model::ValueType,
-    itemsize: usize,
-    is_item_signed: bool,
+/// `jtransform.py rewrite_op_getarrayitem` / `rewrite_op_setarrayitem` /
+/// `rewrite_op_getarraysize` put `vinfo.array_descrs[arrayindex]` on the op.
+fn vable_array_descr_from_op(
+    array_descr: &Option<crate::model::VableArrayDescr>,
+    array_index: usize,
 ) -> crate::jitcode::BhDescr {
-    let item_type = value_type_to_ir_type_for_descr(ty);
-    // The runtime block behind a vable array is `FixedObjectArray`: a length
-    // word with items flat at the target word (`FIXED_ARRAY_ITEMS_OFFSET`),
-    // holding word-wide `PyObjectRef` items. An element wider than the word
-    // would need an items-base decision this mint has never had to make
-    // (flat word vs element-aligned — the `TypedItemsBlock` /
-    // `GcTypedArray` split in `call.rs`); fail the build instead of
-    // silently picking a base.
-    assert!(
-        itemsize <= crate::layout::target_word_size(),
-        "vable array itemsize {itemsize} exceeds the target word \
-         {} — the flat-word items base below would under-align it; \
-         decide the items base against the runtime block before widening",
-        crate::layout::target_word_size(),
-    );
-    let array_type_id = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
-    crate::jitcode::BhDescr::Array {
-        // A virtualizable frame array is length-prefixed by a single word
-        // (`len_offset = Some(0)`), so its items start at the target word — the
-        // build host's word would mis-stride the block on a narrower target.
-        base_size: crate::layout::target_word_size(),
-        itemsize,
-        len_offset: Some(0),
-        // `cpu.arraydescrof(GcArray(OBJECTPTR))`: the runtime block is
-        // `FixedObjectArray` under the object-array tid, the same ARRAY
-        // `pyobject_gcarray_descr` publishes. The codewriter cannot see
-        // the dense collector tid; serialize the structural cache key
-        // (`path_hash` of this identity) so `BhDescr::resolve_gc_tid` /
-        // `GcCache::resolve_array_tid` recover it at runtime
-        // (`descr.py get_array_descr`, `ArrayPtrInfo.make_guards`).
-        type_id: majit_ir::descr::path_hash(array_type_id),
-        gc_type_id: 0,
-        item_type,
-        is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
-        is_array_of_structs: false,
-        is_item_signed,
-        // vable array slots are codewriter-known per-vinfo descrs, not
-        // EffectInfo-keyed; ei_index stays unset.
-        ei_index: u32::MAX,
-        array_type_id: Some(array_type_id.to_string()),
-        interior_fields: Vec::new(),
-        // Virtualizable frame array slots are GC-managed frame fields;
-        // `ArrayPtrInfo.make_guards` emits GUARD_GC_TYPE from this identity.
-        is_gc_managed: true,
-        // `cpu.arraydescrof(GcArray(OBJECTPTR))` for a vable frame array,
-        // not an Acquire Atomic* view.
-        load_is_acquire: false,
-    }
+    array_descr
+        .as_ref()
+        .map(|descr| descr.0.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "jtransform.py rewrite_op_getarrayitem: vinfo.array_descrs[{array_index}] \
+             missing on VableArray op"
+            )
+        })
 }
 
 /// Convert OpKind to an opname string for the assembler's instruction table.
@@ -8753,10 +8705,30 @@ mod tests {
 
     #[test]
     fn vable_arraydescrof_pins_the_flat_word_base_for_pointer_items() {
-        // `FixedObjectArray`: length word at 0, word-wide pointer items flat
-        // at the word. On the host both words are `size_of::<usize>()`.
+        // `FixedObjectArray`: `cpu.arraydescrof(GcArray(OBJECTPTR))` —
+        // length word at 0, word-wide pointer items flat at the word.
+        // Minted once on the vinfo (`virtualizable.py VirtualizableInfo.__init__`).
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, install_vtype_array_layout};
+        use crate::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF};
         let word = crate::layout::target_word_size();
-        let descr = vable_arraydescrof(&crate::model::ValueType::Ref(None), word, false);
+        let array = Array::gc(GCREF.clone());
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new(
+                    "locals_cells_stack_w",
+                    Some("PyFrame".into()),
+                    0,
+                )
+                .with_array(array.clone()),
+            ],
+            ..Default::default()
+        };
+        let mut cc = CallControl::new();
+        install_vtype_array_layout(&mut cc, "PyFrame", &[("locals_cells_stack_w", array)]);
+        let vinfo = CodewriterVirtualizableInfo::from_config_with_cpu("PyFrame", &config, &cc)
+            .expect("PyFrame vinfo");
+        let descr = vinfo.array_descr(0).expect("array_descrs[0]");
         let crate::jitcode::BhDescr::Array {
             base_size,
             itemsize,
@@ -8764,29 +8736,159 @@ mod tests {
             type_id,
             gc_type_id,
             is_array_of_pointers,
+            is_array_of_structs,
+            is_item_signed,
+            ei_index,
             array_type_id,
+            interior_fields,
+            is_gc_managed,
+            load_is_acquire,
             ..
         } = descr
         else {
-            panic!("vable_arraydescrof must mint a BhDescr::Array");
+            panic!("vinfo.array_descrs[0] must be a BhDescr::Array");
         };
         assert_eq!(base_size, word);
         assert_eq!(itemsize, word);
         assert_eq!(len_offset, Some(0));
         assert!(is_array_of_pointers);
+        assert!(!is_array_of_structs);
+        assert!(!is_item_signed);
+        assert!(interior_fields.is_empty());
+        assert!(is_gc_managed);
+        assert!(!load_is_acquire);
         let object_array = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
         assert_eq!(array_type_id.as_deref(), Some(object_array));
         assert_eq!(type_id, majit_ir::descr::path_hash(object_array));
-        assert_eq!(gc_type_id, 0);
+        // `descr.py get_array_descr` / `cpu.arraydescrof`: collector tid and
+        // EffectInfo index come from the ARRAY's registration, not a later patch.
+        assert_ne!(gc_type_id, 0);
+        assert_ne!(ei_index, u32::MAX);
     }
 
     #[test]
-    #[should_panic(expected = "exceeds the target word")]
-    fn vable_arraydescrof_rejects_items_wider_than_the_word() {
-        // A wider-than-word element would be under-aligned by the flat-word
-        // base; the mint must fail the build rather than pick a base.
-        let word = crate::layout::target_word_size();
-        let _ = vable_arraydescrof(&crate::model::ValueType::Int, word * 2, true);
+    #[should_panic(expected = "getkind")]
+    fn vable_arraydescrof_rejects_an_inline_struct_item() {
+        // `virtualizable.py VirtualizableInfo.__init__` runs
+        // `history.getkind(ARRAY.OF)` per array; `history.py getkind`
+        // refuses an inline struct (`NotImplementedError`).
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, install_vtype_array_layout};
+        use crate::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let mut cc = CallControl::new();
+        let item_name = "majit_test_vable_wide_item";
+        cc.set_known_struct_names([item_name.to_string()].into_iter().collect());
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            item_name.to_string(),
+            vec![
+                ("lo".to_string(), "u64".to_string()),
+                ("hi".to_string(), "u64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+        let array = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            item_name,
+            vec![
+                ("lo".into(), LowLevelType::UnsignedLongLong),
+                ("hi".into(), LowLevelType::UnsignedLongLong),
+            ],
+        ))));
+        install_vtype_array_layout(&mut cc, "Holder", &[("wide", array.clone())]);
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("wide", Some("Holder".into()), 0)
+                    .with_array(array),
+            ],
+            ..Default::default()
+        };
+        let _ = CodewriterVirtualizableInfo::from_config_with_cpu("Holder", &config, &cc);
+    }
+
+    #[test]
+    fn vable_arraydescrof_accepts_a_void_item() {
+        // `history.py getkind` returns "void" for `lltype.Void`;
+        // `virtualizable.py VirtualizableInfo.__init__` stores it on
+        // `arrayitem_extra_types`.
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, install_vtype_array_layout};
+        use crate::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let mut cc = CallControl::new();
+        let array = Array::gc(LowLevelType::Void);
+        install_vtype_array_layout(&mut cc, "Holder", &[("holes", array.clone())]);
+        let config = GraphTransformConfig {
+            vable_arrays: vec![
+                VirtualizableFieldDescriptor::new("holes", Some("Holder".into()), 0)
+                    .with_array(array),
+            ],
+            ..Default::default()
+        };
+        let vinfo = CodewriterVirtualizableInfo::from_config_with_cpu("Holder", &config, &cc)
+            .expect("Holder vinfo");
+        assert!(vinfo.array_descr(0).is_some());
+    }
+
+    #[test]
+    fn vable_arraydescrof_mints_primitive_item_from_the_array() {
+        // `cpu.arraydescrof(ARRAY)` takes itemsize / kind / signedness
+        // from `ARRAY.OF` (`getkind` int/ref/float, `get_type_flag`).
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, install_vtype_array_layout};
+        use crate::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cases: [(&str, Array, usize, majit_ir::Type, bool); 3] = [
+            (
+                "floats",
+                Array::gc(LowLevelType::Float),
+                8,
+                majit_ir::Type::Float,
+                false,
+            ),
+            (
+                "chars",
+                Array::gc(LowLevelType::Char),
+                1,
+                majit_ir::Type::Int,
+                false,
+            ),
+            (
+                "shorts",
+                Array::gc((*rffi::SHORT).clone()),
+                2,
+                majit_ir::Type::Int,
+                true,
+            ),
+        ];
+        for (name, array, want_itemsize, want_kind, want_signed) in cases {
+            let mut cc = CallControl::new();
+            install_vtype_array_layout(&mut cc, "Holder", &[(name, array.clone())]);
+            let config = GraphTransformConfig {
+                vable_arrays: vec![
+                    VirtualizableFieldDescriptor::new(name, Some("Holder".into()), 0)
+                        .with_array(array),
+                ],
+                ..Default::default()
+            };
+            let vinfo = CodewriterVirtualizableInfo::from_config_with_cpu("Holder", &config, &cc)
+                .expect("Holder vinfo");
+            let descr = vinfo.array_descr(0).expect("array_descrs[0]");
+            let crate::jitcode::BhDescr::Array {
+                itemsize,
+                item_type,
+                is_item_signed,
+                is_array_of_pointers,
+                is_array_of_structs,
+                ..
+            } = descr
+            else {
+                panic!("vinfo.array_descrs[0] must be a BhDescr::Array");
+            };
+            assert_eq!(itemsize, want_itemsize, "{name} itemsize");
+            assert_eq!(item_type, want_kind, "{name} item_type");
+            assert_eq!(is_item_signed, want_signed, "{name} signedness");
+            assert!(!is_array_of_pointers, "{name} is not a pointer array");
+            assert!(!is_array_of_structs, "{name} is not a struct array");
+        }
     }
 
     /// `cpu.arraydescrof(GcArray(OBJECTPTR))`: once the ARRAY is in
@@ -10124,6 +10226,36 @@ mod tests {
             resulttypes: indexmap::IndexMap::new(),
             var_producers: HashMap::new(),
         }
+    }
+
+    fn callcontrol_with_vable_array(
+        vtype: &str,
+        field: &str,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> crate::call::CallControl {
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, bh_array_descr_of};
+        use crate::parse::CallPath;
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec![],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+            false,
+            vec!["frame".into()],
+            vec![vtype.to_string()],
+            CallPath::from_segments(["portal"]),
+        );
+        let descr = bh_array_descr_of(&cc, &array);
+        let vinfo = CodewriterVirtualizableInfo::with_array_descrs(
+            vtype,
+            Vec::new(),
+            vec![field.to_string()],
+            vec![descr],
+        );
+        cc.set_jitdriver_virtualizable_info(0, std::sync::Arc::new(vinfo));
+        cc
     }
 
     fn push_input_var(
@@ -15898,12 +16030,22 @@ mod tests {
             )],
             ..Default::default()
         };
-        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let mut cc = callcontrol_with_vable_array(
+            "Frame",
+            "locals_stack_w",
+            crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+            ),
+        );
+        let mut rewritten = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
 
         assert!(
             asm.insns.contains_key("arraylen_vable/rdd>i"),
@@ -15981,6 +16123,170 @@ mod tests {
             array_at,
             "the second descr operand must be the array descr"
         );
+    }
+
+    /// `jtransform.py rewrite_op_getarraysize` takes
+    /// `vinfo = self.get_vinfo(v_base)` (`call.py CallControl.get_vinfo`
+    /// filters by the operand VTYPEPTR) and puts `vinfo.array_descrs[arrayindex]`
+    /// on the op. Two drivers with different vtypes must not share one descr
+    /// and must not panic through `unique_virtualizable_info`.
+    #[test]
+    fn vable_array_access_uses_the_operand_vtype_descr() {
+        use crate::call::{CallControl, CodewriterVirtualizableInfo, bh_array_descr_of};
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        fn setup_driver(cc: &mut CallControl, portal: &str, vtype: &str) {
+            cc.setup_jitdriver(
+                CallPath::from_segments([portal]),
+                vec![],
+                vec!["frame".into()],
+                vec![],
+                vec![],
+                false,
+                vec!["frame".into()],
+                vec![vtype.to_string()],
+                CallPath::from_segments([portal]),
+            );
+        }
+
+        let mut cc = CallControl::new();
+        setup_driver(&mut cc, "portal_a", "FrameA");
+        setup_driver(&mut cc, "portal_b", "FrameB");
+        let char_array = crate::call::gcarray_char();
+        let word_array = Array::gc(LowLevelType::Signed);
+        let char_descr = bh_array_descr_of(&cc, &char_array);
+        let word_descr = bh_array_descr_of(&cc, &word_array);
+        cc.set_jitdriver_virtualizable_info(
+            0,
+            std::sync::Arc::new(CodewriterVirtualizableInfo::with_array_descrs(
+                "FrameA",
+                Vec::new(),
+                vec!["chars".to_string()],
+                vec![char_descr],
+            )),
+        );
+        cc.set_jitdriver_virtualizable_info(
+            1,
+            std::sync::Arc::new(CodewriterVirtualizableInfo::with_array_descrs(
+                "FrameB",
+                Vec::new(),
+                vec!["words".to_string()],
+                vec![word_descr],
+            )),
+        );
+        assert!(
+            cc.unique_virtualizable_info().is_none(),
+            "two vtypes must not collapse to one vinfo"
+        );
+
+        fn transform_len(
+            cc: &mut CallControl,
+            vtype: &str,
+            field: &str,
+            itemsize: usize,
+            is_signed: bool,
+        ) -> (FunctionGraph, Option<crate::model::VableArrayDescr>) {
+            let mut graph = FunctionGraph::new(format!("vable_len_{vtype}"));
+            let base_var = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+            let array_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: base_var.clone(),
+                        field: FieldDescriptor::new(field, Some(vtype.into())),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            let len_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::ArrayLen {
+                        base: array_var,
+                        array_type_id: None,
+                        array: None,
+                        nolength: false,
+                        gckind: crate::model::ArrayGcKind::Gc,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(len_var.clone()));
+            // `call.py CallControl.get_vinfo` filters by the operand
+            // VTYPEPTR. Stamp the frame as `Ptr(GcStruct vtype)` so two
+            // drivers do not collapse through `unique_virtualizable_info`.
+            base_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::gc(vtype, Vec::new())),
+            }))));
+            FunctionGraph::set_concretetype_of_inline(
+                &len_var,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            let config = GraphTransformConfig {
+                vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                    field,
+                    Some(vtype.into()),
+                    0,
+                    itemsize,
+                    is_signed,
+                )],
+                ..Default::default()
+            };
+            let rewritten = Transformer::new(&config)
+                .with_callcontrol(cc)
+                .transform(&graph)
+                .graph;
+            let descr = rewritten
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find_map(|op| match &op.kind {
+                    OpKind::VableArrayLen { array_descr, .. } => array_descr.clone(),
+                    _ => None,
+                });
+            (rewritten, descr)
+        }
+
+        let (graph_a, descr_a) = transform_len(&mut cc, "FrameA", "chars", 1, false);
+        let (graph_b, descr_b) = transform_len(&mut cc, "FrameB", "words", 8, true);
+        let descr_a = descr_a.expect("FrameA access carries FrameA array descr");
+        let descr_b = descr_b.expect("FrameB access carries FrameB array descr");
+        let crate::jitcode::BhDescr::Array {
+            itemsize: size_a, ..
+        } = descr_a.0
+        else {
+            panic!("FrameA descr is Array, got {:?}", descr_a.0);
+        };
+        let crate::jitcode::BhDescr::Array {
+            itemsize: size_b, ..
+        } = descr_b.0
+        else {
+            panic!("FrameB descr is Array, got {:?}", descr_b.0);
+        };
+        assert_eq!(size_a, 1, "char array item size");
+        assert_eq!(size_b, 8, "signed word array item size");
+        assert_ne!(size_a, size_b);
+
+        for mut rewritten in [graph_a, graph_b] {
+            regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+            let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+            let mut flat = flatten_graph(&rewritten, &mut regallocs);
+            let mut asm = Assembler::new();
+            let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            assert!(
+                asm.insns.contains_key("arraylen_vable/rdd>i"),
+                "vable arraylen must assemble without unique vinfo, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Safe `Index` / `IndexMut` / `.len()` of a virtualizable `Vec<i64>`
@@ -16102,7 +16408,17 @@ mod tests {
             )],
             ..Default::default()
         };
-        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let mut cc = callcontrol_with_vable_array(
+            "Frame",
+            "words",
+            crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+            ),
+        );
+        let mut rewritten = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
         let names: Vec<String> = rewritten
             .blocks
             .iter()
@@ -16126,7 +16442,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
         for key in [
             "getarrayitem_vable_i/ridd>i",
             "setarrayitem_vable_i/riidd",
@@ -16213,7 +16529,17 @@ mod tests {
             )],
             ..Default::default()
         };
-        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let mut cc = callcontrol_with_vable_array(
+            "Frame",
+            "words",
+            crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+            ),
+        );
+        let mut rewritten = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
         let write = rewritten
             .blocks
             .iter()
@@ -16235,7 +16561,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
         let key = "setarrayitem_vable_i/riidd";
         let Some(&opnum) = asm.insns.get(key) else {
             panic!(

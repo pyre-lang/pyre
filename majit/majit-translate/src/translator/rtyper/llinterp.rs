@@ -1474,6 +1474,13 @@ impl LLFrame {
             ) => match val {
                 LLValue::Int(_) => Ok(val),
                 LLValue::Bool(b) => Ok(LLValue::Int(i64::from(b))),
+                // `Signed._contains_value` accepts a Symbolic whose
+                // `lltype()` is Signed (`AddressOffset.lltype`).
+                LLValue::Const(ConstValue::AddressOffset(_))
+                    if matches!(t, LowLevelType::Signed) =>
+                {
+                    Ok(val)
+                }
                 other => Err(TaskError {
                     message: format!(
                         "llinterp.py:246 type error: expected {}, got {other:?}",
@@ -2035,11 +2042,7 @@ impl LLFrame {
                     .as_i64(opname)?
                     .wrapping_sub(vals[1].as_i64(opname)?),
             )),
-            "int_mul" => Ok(LLValue::Int(
-                vals[0]
-                    .as_i64(opname)?
-                    .wrapping_mul(vals[1].as_i64(opname)?),
-            )),
+            "int_mul" => self.op_int_mul(vals),
             "int_neg" => Ok(LLValue::Int(vals[0].as_i64(opname)?.wrapping_neg())),
             "int_is_true" => Ok(LLValue::Bool(vals[0].truth())),
             "int_eq" => Ok(LLValue::Bool(
@@ -2432,6 +2435,9 @@ impl LLFrame {
                     })?;
                 Ok(LLValue::Int(n))
             }
+            "cast_ptr_to_adr" => self.op_cast_ptr_to_adr(vals),
+            "adr_add" => self.op_adr_add(vals),
+            "raw_memclear" => self.op_raw_memclear(vals),
             "debug_assert" => {
                 if !vals[0].truth() {
                     let msg = vals
@@ -2547,6 +2553,71 @@ impl LLFrame {
             message: format!("getarrayitem: {e}"),
         })?;
         lowlevel_to_llvalue(value, "getarrayitem")
+    }
+
+    /// `opimpl.py op_int_mul`: `intmask(x * y)` for ints;
+    /// `ItemOffset.__mul__` (`llmemory.py`) for a symbolic size.
+    fn op_int_mul(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        match (&vals[0], &vals[1]) {
+            (LLValue::Const(ConstValue::AddressOffset(off)), LLValue::Int(n))
+            | (LLValue::Int(n), LLValue::Const(ConstValue::AddressOffset(off))) => {
+                let scaled = off.clone().mul(*n).ok_or_else(|| TaskError {
+                    message: format!(
+                        "opimpl.py op_int_mul: ItemOffset.__mul__ declined for {off:?} * {n}"
+                    ),
+                })?;
+                Ok(LLValue::Const(ConstValue::AddressOffset(scaled)))
+            }
+            (a, b) => Ok(LLValue::Int(
+                a.as_i64("int_mul")?.wrapping_mul(b.as_i64("int_mul")?),
+            )),
+        }
+    }
+
+    /// `LLFrame.op_cast_ptr_to_adr` (`llinterp.py`): `checkptr` then
+    /// `llmemory.cast_ptr_to_adr`.
+    fn op_cast_ptr_to_adr(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        const OP: &str = "cast_ptr_to_adr";
+        checkptr_ll(&vals[0], OP)?;
+        Ok(LLValue::Address(llmemory::cast_ptr_to_adr(
+            vals[0].as_ptr(OP)?,
+        )))
+    }
+
+    /// `opimpl.py op_adr_add`: `checkadr(addr)` then `fakeaddress.__add__`.
+    fn op_adr_add(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        const OP: &str = "adr_add";
+        checkadr_ll(&vals[0], OP)?;
+        let addr = vals[0].as_address(OP)?;
+        match &vals[1] {
+            LLValue::Const(ConstValue::AddressOffset(off)) => {
+                let added =
+                    llmemory::fakeaddress_add(addr, off).map_err(|e| TaskError { message: e })?;
+                Ok(LLValue::Address(added))
+            }
+            LLValue::Int(0) => Ok(LLValue::Address(addr.clone())),
+            other => Err(TaskError {
+                message: format!("opimpl.py op_adr_add: unsupported offset {other:?}"),
+            }),
+        }
+    }
+
+    /// `LLFrame.op_raw_memclear` (`llinterp.py`): `checkadr` then
+    /// `llmemory.raw_memclear(addr, size)`.
+    fn op_raw_memclear(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        const OP: &str = "raw_memclear";
+        checkadr_ll(&vals[0], OP)?;
+        let addr = vals[0].as_address(OP)?;
+        let size = match &vals[1] {
+            LLValue::Const(ConstValue::AddressOffset(off)) => off,
+            other => {
+                return Err(TaskError {
+                    message: format!("llmemory.raw_memclear: NotImplementedError({other:?})"),
+                });
+            }
+        };
+        llmemory::raw_memclear(addr, size).map_err(|e| TaskError { message: e })?;
+        Ok(LLValue::Void)
     }
 
     /// `op_getarraysize` (`opimpl.py`): `len(array)`.
@@ -2735,6 +2806,15 @@ fn checkptr_ll(val: &LLValue, opname: &str) -> Result<(), TaskError> {
         LLValue::Ptr(_) => Ok(()),
         other => Err(TaskError {
             message: format!("llinterp.checkptr: {opname} expected Ptr, got {other:?}"),
+        }),
+    }
+}
+
+fn checkadr_ll(val: &LLValue, opname: &str) -> Result<(), TaskError> {
+    match val {
+        LLValue::Address(_) => Ok(()),
+        other => Err(TaskError {
+            message: format!("llinterp.checkadr: {opname} expected Address, got {other:?}"),
         }),
     }
 }
@@ -7141,11 +7221,10 @@ mod tests {
         );
     }
 
-    /// `rgc.ll_arrayclear` on a `rffi.UCHAR` array binds `rffi.cast(ARRAY.OF, 0)`
-    /// (`ConstValue::RInt`) to each slot. `LLFrame.getval` must keep that
-    /// constant as the Number carrier so `lltype.enforce` does not reject it.
+    /// `rgc.ll_arrayclear` else-branch (`raw_memclear`) on a `rffi.UCHAR`
+    /// array of length 3: items set to 7 are 0 after the helper runs.
     #[test]
-    fn eval_graph_arrayclear_uchar_rint_zero_constant() {
+    fn eval_graph_arrayclear_uchar_clears_items() {
         use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc};
         use crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayclear_helper_graph;
 
@@ -7171,11 +7250,41 @@ mod tests {
                 vec![Rc::new(LowLevelValue::Ptr(Box::new(arrayptr.clone()))) as Rc<dyn Any>],
                 false,
             )
-            .expect("arrayclear UCHAR graph binds the RInt zero constant");
+            .expect("arrayclear UCHAR graph clears items");
         for i in 0..3 {
             match arrayptr.getitem(i).expect("in-bounds read") {
                 LowLevelValue::Number(_, 0) => {}
                 other => panic!("expected Number(_, 0) at {i}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn eval_graph_arrayclear_signed_clears_items() {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc};
+        use crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayclear_helper_graph;
+
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let mut arrayptr =
+            malloc(array_ty, Some(4), MallocFlavor::Gc, true).expect("malloc Signed array");
+        for i in 0..4 {
+            arrayptr.setitem(i, LowLevelValue::Signed(7)).expect("fill");
+        }
+
+        let helper = build_ll_arrayclear_helper_graph("ll_arrayclear", LowLevelType::Signed)
+            .expect("build_ll_arrayclear_helper_graph");
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        interp
+            .eval_graph(
+                helper.graph.clone() as Rc<dyn Any>,
+                vec![Rc::new(LowLevelValue::Ptr(Box::new(arrayptr.clone()))) as Rc<dyn Any>],
+                false,
+            )
+            .expect("arrayclear Signed graph clears items");
+        for i in 0..4 {
+            match arrayptr.getitem(i).expect("in-bounds read") {
+                LowLevelValue::Signed(0) => {}
+                other => panic!("expected Signed(0) at {i}, got {other:?}"),
             }
         }
     }

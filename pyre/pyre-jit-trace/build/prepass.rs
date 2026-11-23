@@ -1004,6 +1004,7 @@ fn opcode_published_descr_members(
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
+                    is_immutable: false,
                     all_fielddescrs: all_fielddescrs.clone(),
                 },
             ),
@@ -1481,14 +1482,16 @@ fn real_main() {
     // import that crate (no metainterp build-dep, and the offsets are
     // a runtime fact), so the codewriter-side factory returns the
     // offset-free `CodewriterVirtualizableInfo` that
-    // `codewriter_vinfo_from_config` builds from the `vable_fields` /
-    // `vable_arrays` table above (field membership and indices only)
-    // until the runtime metainterp setter overrides it.  TODO: documented at
+    // `codewriter_vinfo_from_config_with_cpu` builds from the
+    // `vable_fields` / `vable_arrays` table above and mints
+    // `array_descrs` through `cpu.arraydescrof` at construction
+    // (`VirtualizableInfo(self, VTYPEPTR)`).  TODO: documented at
     // `CallControl::make_virtualizable_infos`.
-    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, vtype| {
-        majit_translate::call::codewriter_vinfo_from_config(
+    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, vtype, cpu| {
+        majit_translate::call::codewriter_vinfo_from_config_with_cpu(
             vtype,
             &analyze_config.pipeline.transform,
+            cpu,
         )
     };
     // Link the optional-module crate into this process so its
@@ -2103,6 +2106,7 @@ fn real_main() {
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
+                    is_immutable: false,
                     all_fielddescrs: all_fielddescrs.clone(),
                 }
                 .pack_into(&mut descrs_bin);

@@ -113,10 +113,13 @@ fn arena_layout(size: usize) -> Layout {
     Layout::from_size_align(size, NURSERY_ARENA_ALIGN).expect("invalid nursery layout")
 }
 
-/// `llimpl_arena_malloc(..., zero=True)` for one nursery-sized arena.
+/// incminimark.py `_alloc_nursery`: `llarena.arena_malloc(size, 0)`, an
+/// uninitialized arena. Nothing reads nursery bytes before an allocation
+/// site initializes them, the same contract `reset` keeps for recycled
+/// bytes.
 fn alloc_arena(size: usize) -> *mut u8 {
     let layout = arena_layout(size);
-    let start = unsafe { alloc::alloc_zeroed(layout) };
+    let start = unsafe { alloc::alloc(layout) };
     if start.is_null() {
         alloc::handle_alloc_error(layout);
     }
@@ -197,6 +200,11 @@ impl Nursery {
         let mut fallback = Box::new(NurseryPtrs::pair(start, top));
         let cursor = fallback.as_mut() as *mut NurseryPtrs;
         let poison_on_reset = crate::gc_nursery_poison_enabled();
+        // Poison mode marks the fresh arena as it marks a reset range, so a
+        // read of never-initialized bytes shows the same 0xAA pattern.
+        if poison_on_reset {
+            unsafe { ptr::write_bytes(start, 0xAA, size) };
+        }
         Nursery {
             start,
             size,
@@ -518,6 +526,17 @@ impl Nursery {
     pub(crate) fn poison_enabled(&self) -> bool {
         self.poison_on_reset
     }
+
+    /// Arm poison for one nursery without the process-wide
+    /// `MAJIT_GC_NURSERY_POISON` flag. Fills the arena so a fresh allocation
+    /// reads 0xAA, as [`Nursery::new`] does when that flag is set.
+    #[cfg(test)]
+    pub(crate) fn set_poison_on_reset(&mut self, on: bool) {
+        self.poison_on_reset = on;
+        if on {
+            unsafe { ptr::write_bytes(self.start, 0xAA, self.size) };
+        }
+    }
 }
 
 impl Drop for Nursery {
@@ -717,13 +736,13 @@ mod tests {
     }
 
     #[test]
-    fn test_nursery_zero_filled() {
+    fn test_nursery_poison_filled() {
         let mut nursery = Nursery::new(4096);
+        nursery.set_poison_on_reset(true);
         let p = nursery.alloc(64);
         assert!(!p.is_null());
-        // Check memory is zero-filled
         for i in 0..64 {
-            assert_eq!(unsafe { *p.add(i) }, 0);
+            assert_eq!(unsafe { *p.add(i) }, 0xAA);
         }
     }
 

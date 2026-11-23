@@ -826,6 +826,7 @@ impl JitCodeBuilder {
                     owner: String::new(),
                     is_gc_managed,
                     headerless,
+                    is_immutable: false,
                     all_fielddescrs: new_fields,
                 },
             );
@@ -1260,6 +1261,7 @@ impl JitCodeBuilder {
             owner: parent_spec.owner.clone(),
             is_gc_managed: parent_spec.is_gc_managed,
             headerless: parent_spec.headerless,
+            is_immutable: parent_spec.is_immutable,
             all_fielddescrs: Vec::new(),
         });
         self.add_bh_descr(CanonicalBhDescr::Field {
@@ -7858,6 +7860,7 @@ mod tests {
             type_id,
             0,
             true,
+            false,
             false,
             &specs,
             &[],

@@ -15,13 +15,17 @@
 # Shapes: explicit `raise` two frames down, a builtin ZeroDivisionError two
 # frames down, and an explicit `raise` three frames down.
 #
-# N is 0.95x the earlier 145455.  At that count cranelift's survey loop spent
-# the `GuardValue(Function.code)` guard's 200 `trace_eagerness` failures
-# across one of the decay generations `invoke_after_minor_collection` starts
-# every 32 minor collections, so `guard_failures` read 803 or 806 depending on
-# startup allocation alone (hash seed, length of argv[0]).  Measured from 0.80x
-# to 0.95x and from 1.05x to 1.20x, both native backends read 803 under every
-# hash seed, environment size and argv[0] tried; keep N clear of 1.00x.
+# `survey` is called three times with a different `fn`. The compiled loop
+# GUARD_VALUEs `Function.code`; `must_compile` keys that failing ref by
+# `cast_ptr_to_int(refval)`. Isolated sections stay at 604/604/1006 across a
+# 4MiB..16MiB nursery, but the combined run moved (1006/1012/1013 on cranelift
+# at 4/8/16MiB) when a minor collection inside the second and third surveys'
+# 200 `trace_eagerness` failures relocated a still-young code object. The
+# `fill` allocation below is larger than check.py's pinned 4MiB nursery, so
+# at that pin a minor collection promotes those functions and their code
+# objects before the first survey, whatever startup allocated. Measured with
+# it: both native backends read guard_failures 1006 at every 256KiB step from
+# 4MiB to 16MiB, at 20/24/32/48MiB, and under hash seeds 0/1/42/12345.
 N = 138182
 
 
@@ -89,6 +93,8 @@ def survey(label, fn):
     print(label, sorted(shapes))
 
 
+fill = list(map(str, range(50000)))
+del fill
 survey("two_frames   =", catch_two_frames)
 survey("builtin_two  =", catch_builtin_two_frames)
 survey("three_frames =", catch_three_frames)

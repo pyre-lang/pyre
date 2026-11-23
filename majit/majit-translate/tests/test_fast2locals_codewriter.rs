@@ -12,11 +12,12 @@ mod common;
 
 use common::{interpreter_llbc, with_shared_lowering};
 use majit_charon_reader::Llbc;
-use majit_translate::codewriter::call::CallControl;
+use majit_translate::codewriter::call::{CallControl, install_vtype_array_layout};
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
 use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+use majit_translate::translator::rtyper::lltypesystem::lltype::{Array, GCREF};
 use majit_translate::{
     CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs, VirtualizableFieldDescriptor,
 };
@@ -248,7 +249,7 @@ fn config() -> GraphTransformConfig {
 /// `CallControl` rather than the full portal set. `rewrite_op_jit_force_virtualizable`
 /// still asserts a jitdriver vinfo once a handle is attached
 /// (`jtransform.py`), so the eval-loop virtualizable is registered from
-/// `config()` the same way `codewriter_vinfo_from_config` does in the
+/// `config()` the same way `codewriter_vinfo_from_config_with_cpu` does in the
 /// prepass.
 #[test]
 fn fast2locals_assembles() {
@@ -292,6 +293,11 @@ fn fast2locals_assembles() {
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();
+    install_vtype_array_layout(
+        &mut callcontrol,
+        "PyFrame",
+        &[("locals_cells_stack_w", Array::gc(GCREF.clone()))],
+    );
     let llbc = interpreter_llbc();
     callcontrol.set_struct_fields(with_shared_lowering(llbc, |ctx| {
         ctx.struct_field_registry()
@@ -312,8 +318,8 @@ fn fast2locals_assembles() {
         vec!["PyFrame".into()],
         CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_bytecode"]),
     );
-    callcontrol.make_virtualizable_infos(|_, vtype| {
-        majit_translate::codewriter::call::codewriter_vinfo_from_config(vtype, &cfg)
+    callcontrol.make_virtualizable_infos(|_, vtype, cpu| {
+        majit_translate::codewriter::call::codewriter_vinfo_from_config_with_cpu(vtype, &cfg, cpu)
     });
     let mut codewriter = CodeWriter::new();
     let jitcode = std::sync::Arc::new(JitCode::new("fast2locals"));

@@ -2440,6 +2440,10 @@ pub struct BhSizeSpec {
     /// analyzer paths that describe ordinary GC-headered structs.
     #[serde(default)]
     pub headerless: bool,
+    /// `descr.py get_size_descr` `immutable_flag = heaptracker.is_immutable_struct(STRUCT)`.
+    /// Default false for older serialized specs and records with no hint.
+    #[serde(default)]
+    pub is_immutable: bool,
     pub all_fielddescrs: Vec<BhFieldSpec>,
 }
 
@@ -2452,6 +2456,7 @@ impl BhSizeSpec {
             && self.vtable == other.vtable
             && self.is_gc_managed == other.is_gc_managed
             && self.headerless == other.headerless
+            && self.is_immutable == other.is_immutable
             && self.all_fielddescrs.len() == other.all_fielddescrs.len()
             && self
                 .all_fielddescrs
@@ -2483,6 +2488,9 @@ impl BhSizeSpec {
         }
         if self.headerless {
             flags |= 2;
+        }
+        if self.is_immutable {
+            flags |= 4;
         }
         out.push(flags);
         push_u32(
@@ -2581,6 +2589,7 @@ impl BhSizeSpec {
                 owner,
                 is_gc_managed: flags & 1 != 0,
                 headerless: flags & 2 != 0,
+                is_immutable: flags & 4 != 0,
                 all_fielddescrs,
             },
             {
@@ -2674,6 +2683,7 @@ impl BhSizeSpec {
                 vtable,
                 is_gc_managed: flags & 1 != 0,
                 headerless: flags & 2 != 0,
+                is_immutable: flags & 4 != 0,
                 owner,
                 fields,
             },
@@ -2693,6 +2703,8 @@ pub struct StaticParentLayout {
     pub vtable: u64,
     pub is_gc_managed: bool,
     pub headerless: bool,
+    /// `descr.py get_size_descr` `immutable_flag = heaptracker.is_immutable_struct(STRUCT)`.
+    pub is_immutable: bool,
     /// `BhSizeSpec.owner`. `get_field_descr` keeps the STRUCT name the
     /// translator stored so `init_size_descr` can stamp
     /// `TypeLayoutBuilder.get_type_id` for that TYPE.
@@ -2839,6 +2851,7 @@ mod layout_pack_tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: true,
                 all_fielddescrs: vec![BhFieldSpec {
                     index: 1,
                     field_key: "intval".to_string(),
@@ -2869,7 +2882,9 @@ mod layout_pack_tests {
             let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
             assert_eq!(static_consumed, leaked.len());
             assert_eq!(decoded.owner, spec.owner);
+            assert!(decoded.is_immutable);
             assert_eq!(layout.owner, "");
+            assert!(layout.is_immutable);
             assert_eq!(layout.fields[0].name, "W_IntObject.intval");
             assert!(
                 leaked
@@ -2886,6 +2901,7 @@ mod layout_pack_tests {
                 owner: "INT_TYPE".into(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: Vec::new(),
             };
             let mut bytes = Vec::new();
@@ -4097,6 +4113,7 @@ pub fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> BhSizeSpe
         // a spurious `GUARD_GC_TYPE`).
         is_gc_managed: sd.is_gc_managed(),
         headerless: sd.headerless(),
+        is_immutable: sd.is_immutable(),
         all_fielddescrs: sd
             .all_fielddescrs()
             .iter()
@@ -4126,6 +4143,7 @@ pub fn bh_interior_field_specs_from_array_descr(
                     owner: String::new(),
                     is_gc_managed: true,
                     headerless: false,
+                    is_immutable: false,
                     all_fielddescrs: vec![field.clone()],
                 });
             Some(BhInteriorFieldSpec {

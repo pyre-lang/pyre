@@ -1926,57 +1926,49 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// before `freeze_types`, so the registry is still open when leftover tids
 /// are drained. CallDescr restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
+    static DECODE: Once = Once::new();
+    static STAMP: Once = Once::new();
     // The close hook and a trace that starts without `init_jit_hooks` can
     // already be inside recursive `CALL_ASSEMBLER`. That stack must not
     // run the bincode.
-    let _ = materialize_gccache_owned_descrs_with(false);
-}
-
-/// Trace-start publication plus a drain of unresolved tids.
-///
-/// `ensure_type_registry_closed` (`gctypelayout.py` `encode_type_shapes_now`)
-/// runs this before `freeze_types`. Trace start uses
-/// [`materialize_gccache_owned_descrs`], which skips the census on the same
-/// collector (`LAST_GC`); this drain still walks unresolved entries so a
-/// descr minted while the registry was open is stamped before freeze.
-pub fn materialize_gccache_owned_descrs_before_freeze() {
-    materialize_gccache_owned_descrs();
-    drain_unresolved_gccache_tids();
-}
-
-/// Same publication as [`materialize_gccache_owned_descrs`], decoded on
-/// this thread.
-///
-/// The `Once` is shared with the helper-thread path: whichever caller
-/// runs first chooses the stack, and the other call only registers tids.
-pub fn materialize_gccache_owned_descrs_on_caller_stack() {
-    let _ = materialize_gccache_owned_descrs_with(true);
-}
-
-fn materialize_gccache_owned_descrs_with(on_caller_stack: bool) -> TidPublish {
-    static ONCE: Once = Once::new();
     // `heaptracker.setup_cache_gcstruct2vtable` before `get_size_descr`.
     // Kind-0 decode mints analyzer field descrs with `vtable=0`; the
     // table has to be populated first so those SizeDescrs are born
     // `is_object()`.
     crate::descr::publish_pyre_class_vtables();
-    ONCE.call_once(|| {
-        if on_caller_stack {
-            decode_kind0_descrs();
-        } else {
-            decode_kind0_descrs_off_caller_stack();
-        }
+    DECODE.call_once(|| {
+        decode_kind0_descrs_off_caller_stack();
     });
-    // Kind-0 decode may have run before a collector existed. The first
-    // call with a live collector stamps unresolved tids (`gc.py`
-    // `init_size_descr`); the same collector then skips (`LAST_GC`).
-    // `refresh_pyre_class_vtable_tids` runs once per collector
-    // (`heaptracker.py` `setup_cache_gcstruct2vtable`).
-    let published = register_synthetic_struct_tids();
-    if !matches!(published, TidPublish::Skipped) {
-        crate::descr::refresh_pyre_class_vtable_tids();
+    // Kind-0 decode is data only: the helper has no GIL, so
+    // `register_struct_tid_now` / `register_array_tid_now` leave those
+    // descrs unstamped. Upstream stamps at mint (`gc.py`
+    // `GcLLDescr_framework.init_size_descr` / `init_array_descr` from
+    // `descr.py` `get_size_descr` / `get_array_descr`) because
+    // `gc_ll_descr` already exists; pyre defers that stamp until a
+    // calling thread that holds the GIL drains unresolved entries.
+    // Decode must stay in its own Once: a first call before the
+    // collector exists must not skip stamping forever.
+    if majit_gc::gc_sync::is_initialized() {
+        STAMP.call_once(|| {
+            crate::descr::force_declared_object_groups();
+            drain_unresolved_gccache_tids();
+            crate::descr::refresh_pyre_class_vtable_tids();
+        });
     }
-    published
+}
+
+/// Trace-start publication plus a drain of unresolved tids.
+///
+/// `ensure_type_registry_closed` (`gctypelayout.py` `encode_type_shapes_now`)
+/// runs this before `freeze_types`. Kind-0 decode is its own `Once`;
+/// collector tid stamping is a second `Once` entered only after a
+/// collector exists. This drain still walks unresolved entries so an
+/// EffectInfo / rehydrate mint that skipped mint-time `init_size_descr`
+/// (no GIL, inside `gc_op`, or no collector) is stamped before freeze.
+pub fn materialize_gccache_owned_descrs_before_freeze() {
+    materialize_gccache_owned_descrs();
+    drain_unresolved_gccache_tids();
+    crate::descr::refresh_pyre_class_vtable_tids();
 }
 
 /// Kind-0 bincode runs on a fresh 8 MiB stack.
@@ -2035,58 +2027,13 @@ fn decode_kind0_descrs() {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TidPublish {
-    /// No collector, or the same `LAST_GC` address as the last census.
-    Skipped,
-    /// First collector: walked unresolved entries.
-    Registered { structs: usize, arrays: usize },
-    /// Replacement collector: replayed every synthetic layout.
-    Replayed,
-}
-
-/// Collector identity for the last tid census.
+/// `gc.py GcLLDescr_framework.init_size_descr` / `init_array_descr` at mint.
 ///
-/// `warmspot.py` `WarmRunnerDesc.finish` / `pyjitpl.py` `finish_setup_descrs`
-/// run once. A new `MiniMarkGC` address replays; the same address skips.
-static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Stamp collector tids onto synthetic struct `SizeDescr`s.
-///
-/// No-op until `gc_sync` has a collector: unit tests rehydrate the descr
-/// table with no `MiniMarkGC`. Once a collector exists the registry must
-/// still be open — `set_type_registry_close_hook` guarantees that in
-/// production by running [`materialize_gccache_owned_descrs_before_freeze`]
-/// before `freeze_types`. The same collector skips the census (`LAST_GC`);
-/// leftover unresolved tids are drained only from that close hook.
-fn register_synthetic_struct_tids() -> TidPublish {
-    if !majit_gc::gc_sync::is_initialized() {
-        return TidPublish::Skipped;
-    }
-    install_collector_tid_register();
-    let skip = majit_gc::gc_sync::gc_op(|gc| {
-        use std::sync::atomic::Ordering;
-        let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
-        LAST_GC.load(Ordering::Acquire) == addr
-    });
-    if skip {
-        return TidPublish::Skipped;
-    }
-    // Runtime groups carry collector tids (`W_INT_GC_TYPE_ID` and the
-    // rest). They must own `_cache_size` before this walk, including when
-    // no kind-0 slot named the struct. A descr minted afterwards reuses
-    // that entry instead of keeping the truncated cache key. Outside
-    // `gc_op`: a group constructor may allocate.
-    crate::descr::force_declared_object_groups();
-    majit_gc::gc_sync::gc_op(|gc| {
-        let mut cache = majit_ir::descr::gc_cache().lock();
-        publish_tids_on_cache(gc, &LAST_GC, &mut cache)
-    })
-}
-
-/// `gc.py GcLLDescr_framework.init_size_descr` at mint: the same callback
-/// `register_unresolved_struct_tids` already passes to `gc.register_type`.
-fn install_collector_tid_register() {
+/// Upstream's `gc_ll_descr` exists before any descr is minted. The product
+/// installs these callbacks when the collector is stored
+/// (`init_gc_subsystem` / `store_singleton`); later `get_size_descr` /
+/// `get_array_descr` stamp without a census. Idempotent.
+pub fn install_collector_tid_register() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         majit_ir::descr::gc_cache()
@@ -2135,47 +2082,12 @@ fn register_array_tid_now(
     })
 }
 
-fn publish_tids_on_cache(
-    gc: &mut majit_gc::collector::MiniMarkGC,
-    last_gc: &std::sync::atomic::AtomicUsize,
-    cache: &mut majit_ir::descr::GcCache,
-) -> TidPublish {
-    use majit_gc::GcAllocator;
-    use std::sync::atomic::Ordering;
-    let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
-    let previous = last_gc.swap(addr, Ordering::AcqRel);
-    if previous == addr {
-        return TidPublish::Skipped;
-    }
-    assert!(
-        !gc.types_frozen(),
-        "materialize_gccache_owned_descrs: synthetic struct tids must be \
-         registered while the type registry is still open; \
-         set_type_registry_close_hook runs this before freeze_types"
-    );
-    if previous == 0 {
-        let structs = cache.register_unresolved_struct_tids(|size, offsets| {
-            gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
-        });
-        let arrays = cache.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
-            register_array_layout(gc, base, item, len, offs, is_ptr)
-        });
-        TidPublish::Registered { structs, arrays }
-    } else {
-        cache.replay_synthetic_struct_tids(|size, offsets| {
-            gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
-        });
-        cache.replay_synthetic_array_tids(|base, item, len, offs, is_ptr| {
-            register_array_layout(gc, base, item, len, offs, is_ptr)
-        });
-        TidPublish::Replayed
-    }
-}
-
-/// Close-hook drain: stamp any Size/Array descr still carrying the
-/// unstamped placeholder. Trace start skips this walk on the same
-/// collector; `ensure_type_registry_closed` still runs it before
-/// `freeze_types`.
+/// Stamp any Size/Array descr still carrying the unstamped placeholder.
+///
+/// Kind-0 decode runs this on the GIL thread immediately after the helper
+/// returns. `ensure_type_registry_closed` runs it again before
+/// `freeze_types` so an EffectInfo / rehydrate mint that skipped mint-time
+/// `init_size_descr` is stamped while the registry is still open.
 fn drain_unresolved_gccache_tids() {
     if !majit_gc::gc_sync::is_initialized() {
         return;
@@ -2409,10 +2321,10 @@ pub fn rehydrate_build_descr_raw_sets() {
         // `rehydrated_call_descr_ref` after this pass publishes its frozen
         // EffectInfo identity, preserving the canonical call-cache key.
         report_descr_spelling_gate();
-        // EffectInfo mints can create size descriptors after the first
-        // registration. Mint-time `init_size_descr` stamps them when the
-        // collector is installed; drain catches any that were still
-        // unstamped (`LAST_GC` would skip a second census).
+        // EffectInfo mints can create size descriptors after the kind-0
+        // decode `Once`. Mint-time `init_size_descr` stamps them when the
+        // collector callbacks are installed; drain catches any that were
+        // still unstamped (no GIL, inside `gc_op`, or no collector).
         drain_unresolved_gccache_tids();
     });
 }
@@ -4294,66 +4206,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tid_census_skips_the_same_collector_and_replays_a_new_one() {
+    fn fresh_gc_cache_stamps_at_mint_and_unresolved_drain_skips_stamped() {
         use majit_gc::collector::MiniMarkGC;
         use majit_gc::trace::TypeInfo;
-        use std::sync::atomic::AtomicUsize;
 
         fn occupy_typeid_zero(gc: &mut MiniMarkGC) {
             let _ = gc.register_type(TypeInfo::with_gc_ptrs(8, Vec::new()));
         }
 
-        let last_gc = AtomicUsize::new(0);
-        let mut cache = majit_ir::descr::GcCache::new();
+        fn stamp_struct_a(_size: usize, _offsets: Vec<usize>) -> u32 {
+            1000
+        }
+        fn stamp_struct_b(_size: usize, _offsets: Vec<usize>) -> u32 {
+            2000
+        }
+        fn stamp_array(
+            _base: usize,
+            _item: usize,
+            _len: usize,
+            _offs: Vec<usize>,
+            _is_ptr: bool,
+        ) -> u32 {
+            1001
+        }
+
+        fn ref_fields() -> Vec<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> {
+            [0usize]
+                .into_iter()
+                .enumerate()
+                .map(|(index, offset)| {
+                    std::sync::Arc::new(
+                        majit_ir::descr::SimpleFieldDescr::new_with_name(
+                            index as u32,
+                            offset,
+                            8,
+                            majit_ir::value::Type::Ref,
+                            false,
+                            majit_ir::descr::ArrayFlag::Pointer,
+                            format!("ref{index}"),
+                            format!("ref{index}"),
+                        )
+                        .with_index_in_parent(index),
+                    ) as std::sync::Arc<dyn majit_ir::descr::FieldDescr>
+                })
+                .collect()
+        }
+
         let cache_key = 0x1234_5678_9abc_def2;
-        let fields: Vec<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = [0usize]
-            .into_iter()
-            .enumerate()
-            .map(|(index, offset)| {
-                std::sync::Arc::new(
-                    majit_ir::descr::SimpleFieldDescr::new_with_name(
-                        index as u32,
-                        offset,
-                        8,
-                        majit_ir::value::Type::Ref,
-                        false,
-                        majit_ir::descr::ArrayFlag::Pointer,
-                        format!("ref{index}"),
-                        format!("ref{index}"),
-                    )
-                    .with_index_in_parent(index),
-                ) as std::sync::Arc<dyn majit_ir::descr::FieldDescr>
-            })
-            .collect();
-        let mut sd = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, 8, 0);
-        sd.set_cache_key(cache_key);
-        let descr: majit_ir::DescrRef = std::sync::Arc::new(sd.with_all_fielddescrs(fields));
-        cache.register_keyed_size(majit_ir::descr::LLType::Struct(cache_key), descr.clone());
+        let mut cache = majit_ir::descr::GcCache::new();
+        cache.set_collector_tid_register(Some(stamp_struct_a), Some(stamp_array));
+        let key = majit_ir::descr::LLType::Struct(cache_key);
+        let descr = cache.get_size_descr(key.clone(), 8, 0, false);
+        assert_eq!(
+            descr.as_size_descr().unwrap().type_id(),
+            0,
+            "fieldless get_size_descr shell waits for all_fielddescrs"
+        );
+        let populated: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(u32::MAX, 8, 0)
+                .with_all_fielddescrs(ref_fields()),
+        );
+        cache.register_keyed_size(key, populated);
+        let tid1 = descr.as_size_descr().unwrap().type_id();
+        assert_eq!(
+            tid1, 1000,
+            "descrs minted after decode carry collector tids"
+        );
+
+        let again = cache.register_unresolved_struct_tids(|_, _| 1);
+        assert_eq!(again, 0, "already-stamped descr is not registered again");
+        assert_eq!(descr.as_size_descr().unwrap().type_id(), tid1);
 
         let mut gc1 = MiniMarkGC::new();
         occupy_typeid_zero(&mut gc1);
-        let first = publish_tids_on_cache(&mut gc1, &last_gc, &mut cache);
-        assert!(
-            matches!(first, TidPublish::Registered { structs: 1, .. }),
-            "first collector registers unresolved layouts, got {first:?}"
+        let drain_key = 0x1234_5678_9abc_def4;
+        let mut drain_cache = majit_ir::descr::GcCache::new();
+        let mut drain_sd = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, 8, 0);
+        drain_sd.set_cache_key(drain_key);
+        let drain_descr: majit_ir::DescrRef =
+            std::sync::Arc::new(drain_sd.with_all_fielddescrs(ref_fields()));
+        drain_cache.register_keyed_size(
+            majit_ir::descr::LLType::Struct(drain_key),
+            drain_descr.clone(),
         );
-        let tid1 = descr.as_size_descr().unwrap().type_id();
-        assert_ne!(tid1, 0);
-
-        let second = publish_tids_on_cache(&mut gc1, &last_gc, &mut cache);
-        assert_eq!(
-            second,
-            TidPublish::Skipped,
-            "same LAST_GC does no per-entry census work"
-        );
-        assert_eq!(descr.as_size_descr().unwrap().type_id(), tid1);
+        let drained = drain_cache.register_unresolved_struct_tids(|size, offsets| {
+            gc1.register_type(TypeInfo::with_gc_ptrs(size, offsets))
+        });
+        assert_eq!(drained, 1);
+        let drained_tid = drain_descr.as_size_descr().unwrap().type_id();
+        assert_ne!(drained_tid, 0);
 
         let mut gc2 = MiniMarkGC::new();
         occupy_typeid_zero(&mut gc2);
-        let third = publish_tids_on_cache(&mut gc2, &last_gc, &mut cache);
-        assert_eq!(third, TidPublish::Replayed);
-        let tid2 = descr.as_size_descr().unwrap().type_id();
-        assert_ne!(tid2, 0);
+        let mut cache2 = majit_ir::descr::GcCache::new();
+        cache2.set_collector_tid_register(Some(stamp_struct_b), Some(stamp_array));
+        let key2 = majit_ir::descr::LLType::Struct(0x1234_5678_9abc_def6);
+        let descr2 = cache2.get_size_descr(key2.clone(), 8, 0, false);
+        let populated2: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(u32::MAX, 8, 0)
+                .with_all_fielddescrs(ref_fields()),
+        );
+        cache2.register_keyed_size(key2, populated2);
+        assert_eq!(
+            descr2.as_size_descr().unwrap().type_id(),
+            2000,
+            "a fresh cache under a new collector stamps at mint"
+        );
+        assert_eq!(descr.as_size_descr().unwrap().type_id(), tid1);
+
+        let fresh_unresolved = cache2.register_unresolved_struct_tids(|size, offsets| {
+            gc2.register_type(TypeInfo::with_gc_ptrs(size, offsets))
+        });
+        assert_eq!(fresh_unresolved, 0);
+        assert_eq!(drain_descr.as_size_descr().unwrap().type_id(), drained_tid);
     }
 
     /// `descr.py` `get_size_descr` returns a STRUCT that already lists fields.
@@ -4439,6 +4404,101 @@ mod tests {
         }
     }
 
+    /// Re-run a collector-installing test in its own process.
+    ///
+    /// `store_singleton` is process-global and races lib tests that assert
+    /// the singleton is still unset (`assert_raw_prebuilt_payload`). The
+    /// child is `--exact --test-threads=1`. wasm32 has no process spawn.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_stamp_test_in_child(test_name: &str, body: fn()) {
+        if std::env::var("PYRE_STAMP_GC_CHILD").is_ok_and(|name| name == test_name) {
+            body();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let module = module_path!();
+        let module = module
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module);
+        let filter = format!("{module}::{test_name}");
+        let output = std::process::Command::new(&exe)
+            .args([&filter, "--exact", "--test-threads=1"])
+            .env("PYRE_STAMP_GC_CHILD", test_name)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {exe:?}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(&filter) && stdout.contains("1 passed"),
+            "{test_name} child failed: status={} filter={filter}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    /// Kind-0 decode is its own `Once`. Collector tid stamping must run
+    /// after a collector exists, so a first `materialize` with no collector
+    /// does not skip stamping forever.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn materialize_stamps_descrs_minted_before_the_collector() {
+        run_stamp_test_in_child(
+            "materialize_stamps_descrs_minted_before_the_collector",
+            materialize_stamps_descrs_minted_before_the_collector_body,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn materialize_stamps_descrs_minted_before_the_collector_body() {
+        use majit_gc::collector::MiniMarkGC;
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescr, SizeDescr};
+
+        assert!(
+            !majit_gc::gc_sync::is_initialized(),
+            "child process must start without a collector"
+        );
+        let cache_key = 0xE287_0000_0000_0001_u64;
+        let mut sd = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, 16, 0);
+        sd.set_cache_key(cache_key);
+        sd.set_gc_managed(true);
+        sd.set_headerless(false);
+        let field: std::sync::Arc<dyn majit_ir::descr::FieldDescr> = std::sync::Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                majit_ir::value::Type::Int,
+                false,
+                ArrayFlag::Signed,
+                "slot",
+                "slot",
+            )
+            .with_index_in_parent(0),
+        );
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(sd.with_all_fielddescrs(vec![field]));
+        majit_ir::descr::gc_cache()
+            .lock()
+            .register_keyed_size(majit_ir::descr::LLType::Struct(cache_key), descr.clone());
+
+        materialize_gccache_owned_descrs();
+        assert_eq!(
+            SizeDescr::type_id(descr.as_size_descr().unwrap()),
+            0,
+            "decode Once must not stamp without a collector"
+        );
+        majit_gc::rgil::acquire_maybe_in_new_thread();
+        majit_gc::gc_sync::store_singleton(Box::new(MiniMarkGC::new()));
+        majit_gc::gc_sync::gc_op(|gc| {
+            let _ = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(8, Vec::new()));
+        });
+        materialize_gccache_owned_descrs();
+        let tid = SizeDescr::type_id(descr.as_size_descr().unwrap());
+        assert_ne!(
+            tid, 0,
+            "descrs minted by the first call must be stamped once a collector exists"
+        );
+    }
+
     /// `descr.py` `get_size_descr` reads the STRUCT row. A nonzero `type_id`
     /// slot is that packed row, not a bincode `BhDescr` enum.
     #[test]
@@ -4453,6 +4513,7 @@ mod tests {
                 owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
+                is_immutable: false,
                 all_fielddescrs: vec![BhFieldSpec {
                     index: 0,
                     field_key: "slot".to_string(),

@@ -463,10 +463,9 @@ pub struct TypeInfo {
     /// byte (gc.py:631-642).
     pub is_object: bool,
     /// Whether this type corresponds to an RPython classdef and therefore
-    /// contributes peers to `assign_inheritance_ids`. Some frontend-private
-    /// storage layouts still carry an `rclass.OBJECT` header (and must set
-    /// `is_object`) while sharing a classdef/vtable with another registered
-    /// type; those layouts must not perturb the classdef census.
+    /// contributes peers to `assign_inheritance_ids`. Every `rclass.OBJECT`
+    /// layout GC type is some classdef's instance struct, so `is_object`
+    /// implies this flag (`normalizecalls.py assign_inheritance_ids`).
     pub has_subclass_range: bool,
     /// CPython-internal object that remains an OBJECT-layout GC boundary but
     /// is omitted from app-level `gc.get_objects()` enumeration.  This models
@@ -1076,16 +1075,6 @@ impl TypeInfo {
         }
     }
 
-    /// Mark an `rclass.OBJECT`-shaped private storage layout that shares the
-    /// classdef/vtable of another registered type. It remains visible to
-    /// `check_is_object` and app-level GC inspection, but contributes no
-    /// duplicate peer to the subclass-range numbering.
-    pub fn object_layout_without_subclass_range(mut self) -> Self {
-        self.is_object = true;
-        self.has_subclass_range = false;
-        self
-    }
-
     /// Create a varsize type info with a custom trace hook.
     ///
     /// RPython parity: `rgc.register_custom_trace_hook` on a
@@ -1237,6 +1226,14 @@ impl TypeRegistry {
             "TypeRegistry::register called after freeze_types \
              (gctypelayout.can_add_new_types == False)"
         );
+        // Every OBJECT-layout GC type is some classdef's instance struct;
+        // `assign_inheritance_ids` numbers every classdef, so the subclass
+        // range is part of the type (`normalizecalls.py assign_inheritance_ids`).
+        assert!(
+            !info.is_object || info.has_subclass_range,
+            "is_object type must have has_subclass_range \
+             (normalizecalls.py assign_inheritance_ids)"
+        );
         if self.inheritance_ids_assigned {
             assert!(
                 !info.has_subclass_range,
@@ -1299,86 +1296,6 @@ impl TypeRegistry {
         // the pointer-bearing auxiliary tables have stable storage.
         self.layout_table.push(TypeEntry::default());
         id as u32
-    }
-
-    /// Attach a sweep-time destructor to an already-registered type.
-    /// For `#[pyre_class]` types registered through the generic
-    /// `object_subclass_with_gc_ptrs` path (which sets no destructor) that
-    /// nonetheless own Rust heap needing drop glue when the collector
-    /// reclaims a dead instance.
-    ///
-    /// Sweep reads `get(type_id).destructor`, so the `entries` slot is the
-    /// dispatch source. After `freeze_types` the published `TypeEntry` also
-    /// carries `T_HAS_DESTRUCTOR` and `customdata`; rematerialize that row so
-    /// a late attach cannot leave the group describing a type without a
-    /// destructor.
-    pub fn set_destructor(&mut self, type_id: u32, destructor: DestructorFn) {
-        assert!(
-            self.entries[type_id as usize].old_style_finalizer.is_none(),
-            "a type cannot have both a light destructor and an old-style finalizer"
-        );
-        self.entries[type_id as usize].destructor = Some(destructor);
-        if self.frozen_layout_table.is_some() {
-            self.rematerialize_type_entry(type_id as usize);
-        }
-    }
-
-    /// Rebuild one frozen `type_info_group` row from the live `TypeInfo`.
-    /// Offsets stay where `freeze_types` published them; only `infobits` and
-    /// `customdata` can change when a destructor is attached later.
-    fn rematerialize_type_entry(&mut self, index: usize) {
-        let info = &self.entries[index];
-        let existing = self
-            .frozen_layout_table
-            .as_ref()
-            .expect("rematerialize_type_entry after freeze_types")[index];
-        let need_custom = info.custom_trace.is_some()
-            || info.destructor.is_some()
-            || info.old_style_finalizer.is_some()
-            || info.memory_pressure_offset.is_some();
-        let customfunc = info
-            .custom_trace
-            .map(|f| f as usize)
-            .or_else(|| info.old_style_finalizer.map(|f| f as usize))
-            .or_else(|| info.destructor.map(|f| f as usize))
-            .unwrap_or(0);
-        let pressure = info.memory_pressure_offset.unwrap_or(0) as isize;
-        let item_size = info.item_size;
-        let customdata = if need_custom {
-            if existing.type_info.customdata != 0 {
-                // The Box in `custom_data` owns this row for the registry
-                // lifetime; rewrite the fields in place rather than allocating
-                // a second CUSTOM_DATA_STRUCT the old address would abandon.
-                let data =
-                    unsafe { &mut *(existing.type_info.customdata as *mut CustomDataLayout) };
-                data.customfunc = customfunc;
-                data.memory_pressure_offset = pressure;
-                existing.type_info.customdata
-            } else {
-                let data = Box::new(CustomDataLayout {
-                    customfunc,
-                    memory_pressure_offset: pressure,
-                });
-                let address = (&*data) as *const CustomDataLayout as usize;
-                self.custom_data.push(data);
-                address
-            }
-        } else {
-            0
-        };
-        let fixed_offsets = existing.type_info.ofstoptrs;
-        let var_offsets = if item_size > 0 {
-            unsafe { existing.tail.varsize.varofstoptrs }
-        } else {
-            0
-        };
-        let info = &self.entries[index];
-        let table = self
-            .frozen_layout_table
-            .as_mut()
-            .expect("rematerialize_type_entry after freeze_types");
-        table[index] =
-            TypeEntry::from_type_info(info, index as u32, customdata, fixed_offsets, var_offsets);
     }
 
     /// `gctypelayout.encode_type_shapes_now` parity
@@ -1843,16 +1760,13 @@ mod tests {
     }
 
     #[test]
-    fn set_destructor_after_freeze_rematerializes_type_entry() {
+    fn register_with_destructor_encodes_frozen_type_entry() {
+        // `encode_type_shape` / `make_destructor_funcptr_for_type` fix the
+        // destructor on the TYPE_INFO row at construction; freeze publishes it.
         let mut reg = TypeRegistry::new();
-        let type_id = reg.register(TypeInfo::simple(16));
+        let type_id =
+            reg.register(TypeInfo::simple(16).with_destructor_fn(materialized_destructor));
         reg.freeze_types();
-
-        let row = &reg.type_info_table()[type_id as usize];
-        assert_eq!(row.type_info.infobits & TypeInfoLayout::T_HAS_DESTRUCTOR, 0);
-        assert_eq!(row.type_info.customdata, 0);
-
-        reg.set_destructor(type_id, materialized_destructor);
 
         assert!(reg.get(type_id).destructor.is_some());
         let row = &reg.type_info_table()[type_id as usize];
@@ -2025,38 +1939,6 @@ mod tests {
         assert!(
             p.subclassrange_min < c.subclassrange_min || p.subclassrange_max > c.subclassrange_max
         );
-    }
-
-    #[test]
-    fn test_private_object_layout_does_not_perturb_subclass_ranges() {
-        unsafe fn trace_nothing(_: usize, _: &mut dyn FnMut(*mut majit_ir::GcRef)) {}
-
-        let build = |with_private_layout| {
-            let mut reg = TypeRegistry::new();
-            let parent = reg.register(TypeInfo::object(16));
-            let child = reg.register(TypeInfo::object_subclass(16, parent));
-            if with_private_layout {
-                let private = reg.register(
-                    TypeInfo::with_custom_trace(24, trace_nothing)
-                        .object_layout_without_subclass_range(),
-                );
-                assert!(reg.get(private).is_object);
-                assert!(!reg.get(private).has_subclass_range);
-            }
-            reg.freeze_types();
-            (
-                (
-                    reg.get(parent).subclassrange_min,
-                    reg.get(parent).subclassrange_max,
-                ),
-                (
-                    reg.get(child).subclassrange_min,
-                    reg.get(child).subclassrange_max,
-                ),
-            )
-        };
-
-        assert_eq!(build(false), build(true));
     }
 
     #[test]
