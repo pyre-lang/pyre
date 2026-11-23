@@ -1031,6 +1031,7 @@ impl<'a> Lowering<'a> {
                             majit_ir::rvec::VecOp::ExtendFromSlice,
                             kind,
                         ),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1050,6 +1051,7 @@ impl<'a> Lowering<'a> {
                         .split("::")
                         .map(str::to_string)
                         .collect(),
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -2590,6 +2592,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -2647,6 +2650,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 specialization: crate::parse::GraphSpecialization::Regular,
                                 segments: vec![leaf.to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(getslice_args),
@@ -3066,6 +3070,7 @@ impl<'a> Lowering<'a> {
                                         majit_ir::rvec::VecOp::GetItem,
                                         kind,
                                     ),
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -3196,6 +3201,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![
                                     crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -3463,6 +3469,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -3783,6 +3790,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![marker.to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -3832,6 +3840,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -3868,6 +3877,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__majit_stringbuilder_append".to_string()],
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -3957,6 +3967,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_APPEND
                                             .to_string(),
                                     ],
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -4694,6 +4705,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["ll_math".to_string(), leaf.to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5027,6 +5039,7 @@ impl<'a> Lowering<'a> {
                                     "longlong2float".to_string(),
                                     "float2longlong".to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5075,6 +5088,7 @@ impl<'a> Lowering<'a> {
                                     "longlong2float".to_string(),
                                     "float2longlong".to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5156,6 +5170,7 @@ impl<'a> Lowering<'a> {
                                     "slice".to_string(),
                                     "iter".to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5183,6 +5198,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5217,6 +5233,7 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
                                         .to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5246,6 +5263,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5419,6 +5437,7 @@ impl<'a> Lowering<'a> {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -5429,6 +5448,7 @@ impl<'a> Lowering<'a> {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__len".to_string()],
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
@@ -5714,6 +5734,7 @@ impl<'a> Lowering<'a> {
                                     majit_ir::rvec::VecOp::Length,
                                     kind,
                                 ),
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -5770,6 +5791,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -6554,6 +6576,7 @@ impl<'a> Lowering<'a> {
                                     "longobject".to_string(),
                                     "jit_bigint_from_i64".to_string(),
                                 ],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -6661,6 +6684,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -6942,6 +6966,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
+                                resolved_path: None,
                                 fun_decl_id: None,
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
@@ -7139,6 +7164,7 @@ impl<'a> Lowering<'a> {
                     ) {
                         CallTarget::FunctionPath {
                             segments: path,
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
@@ -7147,6 +7173,7 @@ impl<'a> Lowering<'a> {
                     {
                         CallTarget::FunctionPath {
                             segments: vec![marker.to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
@@ -7227,9 +7254,7 @@ impl<'a> Lowering<'a> {
                                 if let Some(id) = fun_decl_id {
                                     target = target.with_fun_decl_id(id);
                                     if let Some(fd) = self.llbc.fn_by_id(id) {
-                                        target = target.with_resolved_path(
-                                            registered_path_for_fun_decl(self.llbc, fd),
-                                        );
+                                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
                                     }
                                 }
                                 target
@@ -7278,11 +7303,16 @@ impl<'a> Lowering<'a> {
                                 }
                                 let mut target = CallTarget::FunctionPath {
                                     segments,
+                                    resolved_path: None,
                                     fun_decl_id: None,
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 };
-                                if same_callee && let Some(id) = fun_decl_id {
+                                if same_callee && let Some(id) = self.call_target_fun_decl_id(&reg)
+                                {
                                     target = target.with_fun_decl_id(id);
+                                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                                        target = stamp_call_target_fun_decl(target, self.llbc, fd);
+                                    }
                                 }
                                 target
                             }
@@ -7536,6 +7566,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__dyn_call".to_string()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -7610,6 +7641,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7670,6 +7702,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7710,6 +7743,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7754,6 +7788,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7904,6 +7939,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7947,6 +7983,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -7984,6 +8021,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8016,6 +8054,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8048,6 +8087,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8163,6 +8203,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8240,6 +8281,7 @@ impl<'a> Lowering<'a> {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: residual,
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -8275,6 +8317,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8301,6 +8344,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8336,6 +8380,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -8389,6 +8434,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: residual,
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -10369,7 +10415,7 @@ impl<'a> Lowering<'a> {
             method_hint
         };
         // Declined-Method impl-owned callees still name the FunDecl
-        // Charon recorded. `spec_segments` is that registry key
+        // Charon recorded. `spec_segments` is that harvest/registry key
         // (inherent `for_impl_method`, trait-impl identity path, inherent
         // Self identity) so std matchers keep `[.., "<Impl>", leaf]` only
         // on the `name_path` branch below.
@@ -10458,7 +10504,8 @@ impl<'a> Lowering<'a> {
                     // before `enqueue_spec` copies it.  (The reflexive
                     // `Identity` outcome is intercepted at `lower_call`
                     // before reaching here.)
-                    if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                    if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg)
+                    {
                         return (segments, None);
                     }
                     if let Some(segments) = self.specialized_fun_segments(fd, reg) {
@@ -10515,7 +10562,7 @@ impl<'a> Lowering<'a> {
             CallKind::Trait(v) => {
                 // Same Target-before-spec as the Fun arm: a Trait
                 // `into` is still `U::from(self)` (`ClassDesc.lookup`).
-                if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg) {
                     return Ok((segments, None));
                 }
                 if let Some(target) = self.specialized_trait_target(v) {

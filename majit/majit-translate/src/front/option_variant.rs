@@ -404,6 +404,7 @@ pub(crate) fn slice_len_op(
     OpKind::Call {
         target: CallTarget::FunctionPath {
             segments: vec![marker.to_string()],
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         },

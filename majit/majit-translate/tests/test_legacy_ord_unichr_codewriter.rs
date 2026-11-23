@@ -199,6 +199,7 @@ fn skip_arm_unichr_call_codewrites_without_int_unichr() {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__majit_unichr".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: GraphSpecialization::Regular,
                 },

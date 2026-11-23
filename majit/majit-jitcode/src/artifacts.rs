@@ -22,12 +22,20 @@ pub struct JitCodeIndex {
     pub names: Vec<String>,
     /// Graph identity: `call.py CallControl.get_jitcode` keys by graph,
     /// `description.py FunctionDesc.cachedgraph` by specialization.
-    /// `None` is a jitcode minted without a graph key.
+    /// `None` is a jitcode minted without a graph key. This column is the
+    /// one canonical harvest DISPLAY spelling `CallControl.jitcodes` stores.
     pub paths: Vec<Option<CallPath>>,
     pub offsets: Vec<u32>,
     pub reachable_symbolic_residuals: Vec<i64>,
     pub reachable_symbolic_offsets: Vec<u32>,
     pub reachable_symbolic_visited: Vec<u32>,
+    /// Extra GraphStore spellings of `paths[i]` (`GraphStore::alias_paths`
+    /// minus the canonical `get_jitcode` key). `pathed_jitcode` resolves any
+    /// spelling of the one graph; `call.py CallControl.get_jitcode` keys by
+    /// graph object. Empty on a jitcode with no aliases, or on a decoded
+    /// index that predates this column (`serde` default).
+    #[serde(default)]
+    pub alias_groups: Vec<Vec<CallPath>>,
 }
 
 /// Per-jitcode symbolic residual closure, flat so the index stays one bincode
@@ -44,9 +52,16 @@ impl JitCodeIndex {
     pub fn encode(
         jitcodes: &[Arc<JitCode>],
         paths: Vec<Option<CallPath>>,
+        alias_groups: Vec<Vec<CallPath>>,
         reachable: ReachableSymbolicResidualTable,
     ) -> bincode::Result<(Self, Vec<u8>)> {
         assert_eq!(paths.len(), jitcodes.len());
+        let alias_groups = if alias_groups.is_empty() {
+            vec![Vec::new(); jitcodes.len()]
+        } else {
+            assert_eq!(alias_groups.len(), jitcodes.len());
+            alias_groups
+        };
         let mut bodies = Vec::new();
         let mut index = Self {
             names: Vec::new(),
@@ -55,6 +70,7 @@ impl JitCodeIndex {
             reachable_symbolic_residuals: reachable.values,
             reachable_symbolic_offsets: reachable.offsets,
             reachable_symbolic_visited: reachable.visited,
+            alias_groups,
         };
         for jitcode in jitcodes {
             index.names.push(jitcode.name.clone());
@@ -88,6 +104,7 @@ impl JitCodeIndex {
                 .reachable_symbolic_offsets
                 .windows(2)
                 .all(|p| p[0] <= p[1])
+            || (!self.alias_groups.is_empty() && self.alias_groups.len() != self.names.len())
         {
             return Err(Box::new(bincode::ErrorKind::Custom(
                 "invalid JitCode archive index".into(),
@@ -184,8 +201,18 @@ mod tests {
         residuals: Vec<i64>,
         residual_offsets: Vec<u32>,
         visited: Vec<u32>,
+        alias_groups: Vec<Vec<CallPath>>,
     ) -> Vec<u8> {
-        bincode::serialize(&(names, paths, offsets, residuals, residual_offsets, visited)).unwrap()
+        bincode::serialize(&(
+            names,
+            paths,
+            offsets,
+            residuals,
+            residual_offsets,
+            visited,
+            alias_groups,
+        ))
+        .unwrap()
     }
 
     fn empty_reachable(len: usize) -> ReachableSymbolicResidualTable {
@@ -209,6 +236,7 @@ mod tests {
             vec![4, 9],
             vec![0, 2, 2],
             vec![3, 1],
+            vec![Vec::new(); 2],
         );
         let index = JitCodeIndex::decode(&old, &[0, 0]).unwrap();
         assert_eq!(index.paths, paths);
@@ -246,12 +274,33 @@ mod tests {
         let (index, bodies) = JitCodeIndex::encode(
             &[a, b],
             vec![Some(regular.clone()), Some(access_direct.clone())],
+            Vec::new(),
             empty_reachable(2),
         )
         .unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
         assert_eq!(decoded.paths, [Some(regular), Some(access_direct)]);
         assert_ne!(decoded.paths[0], decoded.paths[1]);
+        assert_eq!(decoded.alias_groups.len(), 2);
+        assert!(decoded.alias_groups.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn encode_roundtrips_graphstore_aliases() {
+        let harvest = CallPath::from_segments(["mod", "f"]);
+        let identity = CallPath::from_segments(["crate", "mod", "f"]);
+        let a = Arc::new(JitCode::new("f"));
+        a.set_index(0);
+        let (index, bodies) = JitCodeIndex::encode(
+            &[a],
+            vec![Some(harvest.clone())],
+            vec![vec![identity.clone()]],
+            empty_reachable(1),
+        )
+        .unwrap();
+        let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
+        assert_eq!(decoded.paths, [Some(harvest)]);
+        assert_eq!(decoded.alias_groups, [vec![identity]]);
     }
 
     #[test]
@@ -278,6 +327,7 @@ mod tests {
                 Vec::new(),
                 vec![0, 0],
                 vec![0],
+                Vec::new(),
             );
             assert!(JitCodeIndex::decode(&bytes, &[0, 0]).is_err());
         }
@@ -290,6 +340,7 @@ mod tests {
             vec![7, 9],
             vec![0, 1],
             vec![1],
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&mismatched_len, &[]).is_err());
         // `last == values.len()`, but the span is not monotonic.
@@ -300,6 +351,7 @@ mod tests {
             vec![9],
             vec![0, 2, 1],
             vec![1, 1],
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&non_monotonic, &[]).is_err());
         let bad_origin = index_bytes(
@@ -309,6 +361,7 @@ mod tests {
             vec![5],
             vec![1, 1],
             vec![1],
+            Vec::new(),
         );
         assert!(JitCodeIndex::decode(&bad_origin, &[]).is_err());
         let bad_visited = index_bytes(
@@ -317,6 +370,7 @@ mod tests {
             vec![0, 0],
             Vec::new(),
             vec![0, 0],
+            Vec::new(),
             Vec::new(),
         );
         assert!(JitCodeIndex::decode(&bad_visited, &[]).is_err());

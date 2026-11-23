@@ -918,6 +918,7 @@ pub(in crate::front::mir) fn emit_str_const(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), text.to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -1246,6 +1247,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text.to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1318,6 +1320,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__strlen".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1351,6 +1354,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "cmp".into(), "max".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1366,6 +1370,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_rangeto".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -1466,6 +1471,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -1563,6 +1569,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[0].clone()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1582,6 +1589,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[1].clone()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -2376,6 +2384,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
                     target:
                         CallTarget::FunctionPath {
                             segments: pseg,
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -2396,6 +2405,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
             op.kind = OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },

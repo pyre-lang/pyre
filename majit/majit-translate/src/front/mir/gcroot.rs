@@ -4658,7 +4658,7 @@ fn scope_owner_other_seg(llbc: &Llbc, seg: &NameSeg) -> String {
 
 /// One `Impl` name segment, from that segment's payload. Nested ancestor
 /// impls keep their own Self / trait; the method's impl is not reused.
-fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
+pub(in crate::front::mir) fn scope_owner_impl_seg(llbc: &Llbc, seg: &NameSeg) -> String {
     if let Some(id) = seg.impl_trait_id() {
         let name = crate::front::clause_spec::render_trait_impl(llbc, id)
             .unwrap_or_else(|| "?".to_string());
@@ -4726,11 +4726,7 @@ pub(in crate::front::mir) fn identity_ty(llbc: &Llbc, ty: &TyRef) -> String {
     }
 }
 
-pub(in crate::front::mir) fn identity_type_value(
-    llbc: &Llbc,
-    value: &serde_json::Value,
-    depth: usize,
-) -> String {
+pub(crate) fn identity_type_value(llbc: &Llbc, value: &serde_json::Value, depth: usize) -> String {
     if depth > 32 {
         return "?".to_string();
     }
@@ -4800,6 +4796,9 @@ pub(in crate::front::mir) fn identity_type_value(
     // distinct types.
     if let Some(fnptr) = obj.get("FnPtr") {
         return identity_fn_ptr(llbc, fnptr, depth);
+    }
+    if let Some(fndef) = obj.get("FnDef") {
+        return crate::front::clause_spec::spec_fn_def(fndef, llbc, depth, false);
     }
     if let Some(array) = obj.get("Array").and_then(serde_json::Value::as_array)
         && !array.is_empty()

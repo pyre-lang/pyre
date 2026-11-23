@@ -188,6 +188,14 @@ pub struct ProgramPipelineResult {
     #[serde(skip)]
     pub jitcodes_by_path:
         indexmap::IndexMap<crate::parse::CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
+    /// GraphStore alias spellings of each `jitcodes[i]` besides the
+    /// canonical `jitcodes_by_path` key. Frozen into
+    /// `JitCodeIndex.alias_groups` so `pathed_jitcode` can resolve any
+    /// spelling of the one graph (`call.py CallControl.get_jitcode` keys
+    /// by graph object). `CallControl.jitcodes` itself stays one harvest
+    /// key.
+    #[serde(skip)]
+    pub jitcode_alias_paths: Vec<Vec<crate::parse::CallPath>>,
     /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
     /// table grown on-demand by `write_insn`. Persisted alongside the
     /// jitcodes so the runtime can map bytecode bytes back to opnames —
@@ -291,6 +299,7 @@ mod tests {
             symbolic_fnaddr_paths: Vec::new(),
             indirectcalltarget_indices: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
+            jitcode_alias_paths: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),

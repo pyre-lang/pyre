@@ -648,6 +648,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), leaf.into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -1185,11 +1186,13 @@ mod tests {
         };
         let impl_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "<Impl>", "ok"]),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let owner_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "Result", "ok"]),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };
@@ -1202,6 +1205,7 @@ mod tests {
         };
         let unrelated = CallTarget::FunctionPath {
             segments: segs(&["core", "option", "<Impl>", "ok"]),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         };

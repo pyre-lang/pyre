@@ -292,16 +292,28 @@ fn slice_addend_is_computed(op: &Operand, stmt_assigned: &HashMap<usize, usize>)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Special {
     /// A `RootScope` guard opened at this depth, with the join skew
-    /// (`hi - lo`) recorded at Open so a Close/Drop restores both.
+    /// (`hi - lo`) recorded at Open. Compatible rebinds take the max skew.
     Guard { depth: usize, skew: usize },
     /// A borrow of a guard.
     Alias(usize),
     /// A slot index. `relative` is a `Leaf::Len` (or arithmetic on one):
     /// the offset tracks the analysed depth. Absolute indices are a
-    /// guard base, a constant, or arithmetic on those.
-    Index { k: usize, relative: bool },
+    /// guard base, a pin_roots dest, or arithmetic on those.
+    /// `floor` is the walk `rel` at the Len that produced this index
+    /// (0 when that Len ran aligned, and always 0 for absolute indices).
+    /// A Get of a pre-join Len after a later disagreeing join is sound:
+    /// the static `k` equals the runtime value on every arm.
+    Index {
+        k: usize,
+        relative: bool,
+        floor: usize,
+    },
     /// A checked-add pair whose `.0` is this offset.
-    IndexPair { k: usize, relative: bool },
+    IndexPair {
+        k: usize,
+        relative: bool,
+        floor: usize,
+    },
     /// `pin_roots` / `publish_roots` of an incoming `&[PyObjectRef]`
     /// parameter (or a copy / reborrow / unsize of one)
     /// (`pin_roots_incoming_slice`). The dest usize aliases that parameter:
@@ -364,54 +376,60 @@ fn mem_drop_guard_depth(
 }
 
 impl Special {
-    fn as_index(self) -> Option<(usize, bool)> {
+    fn as_index(self) -> Option<(usize, bool, usize)> {
         match self {
-            Special::Index { k, relative } | Special::IndexPair { k, relative } => {
-                Some((k, relative))
+            Special::Index { k, relative, floor } | Special::IndexPair { k, relative, floor } => {
+                Some((k, relative, floor))
             }
             _ => None,
         }
     }
 
-    fn index(k: usize, relative: bool, checked: bool) -> Self {
+    fn index(k: usize, relative: bool, floor: usize, checked: bool) -> Self {
         if checked {
-            Special::IndexPair { k, relative }
+            Special::IndexPair { k, relative, floor }
         } else {
-            Special::Index { k, relative }
+            Special::Index { k, relative, floor }
         }
     }
 }
 
-/// Compatible rebind of one local: same `Index`/`IndexPair` `k` (AND of
-/// `relative`) or same `Guard` depth (max of `skew`). Anything else is
-/// `special-rebound`.
+/// Compatible rebind of one local: same `Index`/`IndexPair` `k` and
+/// `floor` (AND of `relative`) or same `Guard` depth (max of `skew`).
+/// Different floors are `special-rebound`.
 fn merge_special(previous: Special, new: Special) -> Result<Special, Refusal> {
     match (previous, new) {
         (
             Special::Index {
                 k: k1,
                 relative: r1,
+                floor: f1,
             },
             Special::Index {
                 k: k2,
                 relative: r2,
+                floor: f2,
             },
-        ) if k1 == k2 => Ok(Special::Index {
+        ) if k1 == k2 && f1 == f2 => Ok(Special::Index {
             k: k1,
             relative: r1 && r2,
+            floor: f1,
         }),
         (
             Special::IndexPair {
                 k: k1,
                 relative: r1,
+                floor: f1,
             },
             Special::IndexPair {
                 k: k2,
                 relative: r2,
+                floor: f2,
             },
-        ) if k1 == k2 => Ok(Special::IndexPair {
+        ) if k1 == k2 && f1 == f2 => Ok(Special::IndexPair {
             k: k1,
             relative: r1 && r2,
+            floor: f1,
         }),
         (
             Special::Guard {
@@ -660,16 +678,18 @@ fn switch_arm_value(v: &Value) -> Option<u64> {
     s.parse().ok()
 }
 
-fn switch_int_arm_target(
+/// Edge index of the SwitchInt arm whose scalar equals `value`.
+/// Same order as [`erase_forward_successors`]: arm `i` is `succs[from][i]`.
+fn switch_int_arm_edge(
     arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
     value: u64,
-) -> Option<u64> {
+) -> Option<usize> {
     arms.iter()
-        .find_map(|(scalar, t)| (switch_arm_value(scalar) == Some(value)).then_some(*t))
+        .position(|(scalar, _)| switch_arm_value(scalar) == Some(value))
 }
 
 fn switch_int_covers(
-    arm_exit: &HashMap<(usize, u64), (usize, usize, usize)>,
+    arm_exit: &HashMap<(usize, u64), (usize, usize, usize, usize)>,
     root: usize,
     arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
 ) -> bool {
@@ -1193,10 +1213,14 @@ fn const_slot_trace_local(
 
 /// What a rewritten getter call answers.
 enum GetterAnswer {
-    /// `|| shadow_stack_get(captured)` of a scalar slot. `relative` is
-    /// inherited from the captured [`Special::Index`] (a Len vs a base
-    /// or constant).
-    Scalar { k: usize, relative: bool },
+    /// `|| shadow_stack_get(captured)` of a scalar slot. `relative` and
+    /// `floor` are inherited from the captured [`Special::Index`] (a Len
+    /// vs a base or constant).
+    Scalar {
+        k: usize,
+        relative: bool,
+        floor: usize,
+    },
     /// `|| shadow_stack_get(captured + k)` of an incoming slice
     /// (`pin_roots_incoming_slice`).
     Slice { slice_local: usize, k: usize },
@@ -1271,10 +1295,11 @@ fn try_slot_getter_call(
         .ok()?
         .checked_add(usize::try_from(addend.addend).ok()?)?;
     let answer = match specials.get(&index_local) {
-        Some(Special::Index { k, relative } | Special::IndexPair { k, relative }) => {
+        Some(Special::Index { k, relative, floor } | Special::IndexPair { k, relative, floor }) => {
             GetterAnswer::Scalar {
                 k: k.checked_add(extra)?,
                 relative: *relative,
+                floor: *floor,
             }
         }
         Some(Special::SliceBase { slice_local }) => GetterAnswer::Slice {
@@ -1307,10 +1332,54 @@ enum WalkMode {
     Emit,
 }
 
+/// Per-edge OUT of the Probe walk. Indexed like [`EraseWalk::succs`]:
+/// `edge_out[from][i]` is the lattice leaving `from` along `succs[from][i]`.
+/// A block's IN is the join of those current predecessor OUTs
+/// (`ssa.py` `DataFlowFamilyBuilder` / `mkentrymap`: each incoming *link*
+/// contributes; a block input is the union over those links.
+/// `graphanalyze.py` `Dependency.merge_with_result` is the same join over
+/// the current set, not over history).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EdgeOut {
+    depth: usize,
+    lo: usize,
+    rel: usize,
+    open: usize,
+}
+
+impl EdgeOut {
+    fn from_outgoing(depth: usize, lo: usize, rel: usize, open: usize) -> Self {
+        Self {
+            depth,
+            lo,
+            rel: if lo == depth { 0 } else { rel },
+            open,
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        let joined_hi = self.depth.max(other.depth);
+        let joined_lo = self.lo.min(other.lo);
+        let joined_rel = if joined_lo == joined_hi {
+            0
+        } else if self.depth != other.depth {
+            self.rel.max(other.rel).max(joined_hi)
+        } else {
+            self.rel.max(other.rel)
+        };
+        Self {
+            depth: joined_hi,
+            lo: joined_lo,
+            rel: joined_rel,
+            open: self.open.min(other.open),
+        }
+    }
+}
+
 /// One walk of the erase CFG. `Probe` pushes the per-block entry lattice
-/// (`depth_in` / `lo_in` / `open_in`) to a fixpoint and does not write
-/// the rewrite `Plan`. `Emit` walks each reachable block once at those
-/// entry values and fills the plan.
+/// (`depth_in` / `lo_in` / `rel_in` / `open_in`) to a fixpoint and does
+/// not write the rewrite `Plan`. `Emit` walks each reachable block once
+/// at those entry values and fills the plan.
 ///
 /// `gctransform/framework.py` computes livevars per block from the
 /// finished graph before `push_roots` inserts the stores; the analysis
@@ -1322,6 +1391,10 @@ struct EraseWalk<'a> {
     classified: &'a HashMap<usize, (Leaf, bool)>,
     forward_blocks: &'a [bool],
     succs: &'a [Vec<u64>],
+    /// Parallel to `succs`. Probe only; Emit leaves it empty.
+    edge_out: Vec<Vec<Option<EdgeOut>>>,
+    /// Transpose of `succs`: `(pred, edge_index)` for each incoming edge.
+    incoming: Vec<Vec<(usize, usize)>>,
     n_blocks: usize,
     n_locals: usize,
     arg_count: usize,
@@ -1332,9 +1405,12 @@ struct EraseWalk<'a> {
     call_dests: &'a bit_set::BitSet,
     depth_in: &'a mut Vec<Option<usize>>,
     lo_in: &'a mut Vec<Option<usize>>,
+    rel_in: &'a mut Vec<Option<usize>>,
     open_in: &'a mut Vec<Option<usize>>,
     frozen_depth: &'a [Option<usize>],
     frozen_lo: &'a [Option<usize>],
+    frozen_rel: &'a [Option<usize>],
+    frozen_open: &'a [Option<usize>],
     queue: &'a mut VecDeque<usize>,
     visited: &'a mut [bool],
     specials: &'a mut HashMap<usize, Special>,
@@ -1361,10 +1437,10 @@ struct EraseWalk<'a> {
     /// that reached this block (`funccall_flat_from_args` `match nargs`).
     split_key: Option<(usize, u64)>,
     split_key_in: &'a mut Vec<Option<Option<(usize, u64)>>>,
-    /// Per-arm (`depth`, `lo`, `open`) at the first disagreeing join of
+    /// Per-arm (`depth`, `lo`, `rel`, `open`) at the first disagreeing join of
     /// those arms. A later switch on the same local restores, plus the
     /// shared-suffix delta (`current_depth - max snapshot`).
-    arm_exit: &'a mut HashMap<(usize, u64), (usize, usize, usize)>,
+    arm_exit: &'a mut HashMap<(usize, u64), (usize, usize, usize, usize)>,
     slice_set_sites: &'a mut Vec<SliceSetSite>,
     /// Published slices whose `CopyRange` restore was dropped.
     copy_range_slices: &'a mut Vec<usize>,
@@ -1424,6 +1500,8 @@ impl<'a> EraseWalk<'a> {
                     Ok(())
                 }
                 Err(_) if !self.emit() => {
+                    // Probe overwrites a lattice re-walk of one assignment:
+                    // Open then binds a new Guard depth, Len at a joined hi.
                     self.specials.insert(local, special);
                     Ok(())
                 }
@@ -1432,10 +1510,13 @@ impl<'a> EraseWalk<'a> {
         }
     }
 
+    /// `floor` is the Index's own floor, taken at the Len that produced
+    /// it, not the walk `rel` at this read.
     fn check_slot_read(
         &self,
         k: usize,
         relative: bool,
+        floor: usize,
         depth: usize,
         lo: usize,
         set: bool,
@@ -1443,15 +1524,18 @@ impl<'a> EraseWalk<'a> {
         if !self.emit() {
             return Ok(());
         }
-        if relative || lo == depth {
-            if k >= depth {
-                return Err(if set {
-                    "set-above-depth"
-                } else {
-                    "get-above-depth"
-                });
+        if k >= depth {
+            return Err(if set {
+                "set-above-depth"
+            } else {
+                "get-above-depth"
+            });
+        }
+        if relative {
+            if k < floor {
+                return Err("relative-get-below-join");
             }
-        } else if k >= lo && k < self.join_band_hi(lo) {
+        } else if lo != depth && k >= lo && k < self.join_band_hi(lo) {
             return Err("absolute-get-above-join-floor");
         } else if k >= depth {
             return Err(if set {
@@ -1467,7 +1551,7 @@ impl<'a> EraseWalk<'a> {
         let snap_hi = self
             .arm_exit
             .values()
-            .map(|(d, _, _)| *d)
+            .map(|(d, _, _, _)| *d)
             .max()
             .unwrap_or(0);
         if snap_hi > lo {
@@ -1477,14 +1561,27 @@ impl<'a> EraseWalk<'a> {
         }
     }
 
+    /// Record the lattice leaving `from` along `succs[from][edge]`.
+    /// That slot is one incoming `Link` (`mkentrymap`; `ssa.py`
+    /// `DataFlowFamilyBuilder`): two parallel edges from `from` to the
+    /// same block each keep their own OUT, and the IN join over
+    /// `incoming[target]` visits both.
     fn reach(
         &mut self,
         from: usize,
-        target: u64,
+        edge: usize,
         depth: usize,
         lo: usize,
+        rel: usize,
         open: usize,
     ) -> Result<(), Refusal> {
+        debug_assert!(
+            edge < self.succs.get(from).map_or(0, |s| s.len()),
+            "reach edge must name a succs[from] Link (from={from} edge={edge})"
+        );
+        let Some(&target) = self.succs.get(from).and_then(|s| s.get(edge)) else {
+            return Ok(());
+        };
         let target = target as usize;
         if target >= self.n_blocks {
             return Ok(());
@@ -1497,7 +1594,13 @@ impl<'a> EraseWalk<'a> {
                 // `depth-disagrees-at-merge` in release.
                 let frozen_hi = self.frozen_depth[target];
                 let frozen_lo = self.frozen_lo[target];
-                if !frozen_hi.is_some_and(|h| depth <= h) || !frozen_lo.is_some_and(|l| lo >= l) {
+                let frozen_rel = self.frozen_rel[target];
+                let frozen_open = self.frozen_open[target];
+                if !frozen_hi.is_some_and(|h| depth <= h)
+                    || !frozen_lo.is_some_and(|l| lo >= l)
+                    || !frozen_rel.is_some_and(|r| rel <= r)
+                    || !frozen_open.is_some_and(|o| open >= o)
+                {
                     debug_assert!(
                         frozen_hi.is_some_and(|h| depth <= h),
                         "emit incoming depth exceeds phase-1 lattice"
@@ -1505,6 +1608,14 @@ impl<'a> EraseWalk<'a> {
                     debug_assert!(
                         frozen_lo.is_some_and(|l| lo >= l),
                         "emit incoming lo is below phase-1 lattice"
+                    );
+                    debug_assert!(
+                        frozen_rel.is_some_and(|r| rel <= r),
+                        "emit incoming rel exceeds phase-1 lattice"
+                    );
+                    debug_assert!(
+                        frozen_open.is_some_and(|o| open >= o),
+                        "emit incoming open is below phase-1 lattice"
                     );
                     return Err("depth-disagrees-at-merge");
                 }
@@ -1526,7 +1637,7 @@ impl<'a> EraseWalk<'a> {
                         if self.arm_exit.len() < MAX_SCRUTINEE_ARMS
                             || self.arm_exit.contains_key(&key)
                         {
-                            self.arm_exit.entry(key).or_insert((depth, lo, open));
+                            self.arm_exit.entry(key).or_insert((depth, lo, rel, open));
                         }
                         if let Some(Some(prev_key)) = self.split_key_in[target] {
                             if prev_key != key
@@ -1536,72 +1647,118 @@ impl<'a> EraseWalk<'a> {
                                 self.arm_exit.entry(prev_key).or_insert((
                                     prev_d,
                                     self.lo_in[target].unwrap_or(prev_d),
+                                    self.rel_in[target].unwrap_or(0),
                                     self.open_in[target].unwrap_or(0),
                                 ));
                             }
                         }
                     }
                 }
-                match (self.depth_in[target], self.lo_in[target]) {
-                    (Some(d), Some(l)) if d == depth && l == lo => self.join_pins_at(target),
-                    (None, _) => {
-                        self.depth_in[target] = Some(depth);
-                        self.lo_in[target] = Some(lo);
-                        self.open_in[target] = Some(open);
-                        self.pin_count_in[target] = Some(self.pin_count.clone());
-                        self.split_key_in[target] = Some(self.split_key);
-                        self.queue.push_back(target);
-                        Ok(())
-                    }
-                    (Some(d), Some(l)) => {
-                        // Incoming depths disagree at a CFG join, including a
-                        // Drop/Close: that block postdominates itself, so the
-                        // join is accepted and `slot_count` takes max.
-                        // `stack_walk` `Depth::join` takes a min lower bound for
-                        // neutrality; this walk takes max for `slot_count`.
-                        // `gctransform/shadowstack.py`
-                        // `ShadowStackFrameworkGCTransformer.push_roots` /
-                        // `gctransform/framework.py` `get_livevars_for_roots` is
-                        // one livevar set around the collecting op, not a
-                        // per-arm stack pointer. Extra-pin Gets stay on the
-                        // writing arm (SSA slot locals). A back edge that grows
-                        // depth is pins accumulating around a loop: refuse
-                        // rather than let the lattice climb.
-                        // `gctransform/framework.py` computes livevars per block
-                        // from the finished graph before `push_roots` inserts the
-                        // stores; the analysis never rewrites while it is still
-                        // iterating.
-                        if d != depth && dominates(self.succs, self.n_blocks, target, from) {
-                            return Err("depth-disagrees-at-merge");
-                        }
-                        if d != depth
-                            && !join_postdominated_by_this_guard_rewind(
-                                self.body,
-                                self.llbc,
-                                self.classified,
-                                self.specials,
-                                self.succs,
-                                self.n_blocks,
-                                target,
-                            )
-                        {
-                            return Err("depth-disagrees-at-merge");
-                        }
-                        let joined_hi = d.max(depth);
-                        let joined_lo = l.min(lo);
-                        if joined_hi != d || joined_lo != l {
-                            self.depth_in[target] = Some(joined_hi);
-                            self.lo_in[target] = Some(joined_lo);
-                            if depth == joined_hi {
-                                self.open_in[target] = Some(open);
-                            }
-                            self.visited[target] = false;
-                            self.queue.push_back(target);
-                        }
-                        self.join_pins_at(target)
-                    }
-                    _ => Ok(()),
+                // Incoming depths disagree at a CFG join, including a
+                // Drop/Close: that block postdominates itself, so the
+                // join is accepted and `slot_count` takes max.
+                // `stack_walk` `Depth::join` takes a min lower bound for
+                // neutrality; this walk takes max for `slot_count`.
+                // `gctransform/shadowstack.py`
+                // `ShadowStackFrameworkGCTransformer.push_roots` /
+                // `gctransform/framework.py` `get_livevars_for_roots` is
+                // one livevar set around the collecting op, not a
+                // per-arm stack pointer. Extra-pin Gets stay on the
+                // writing arm (SSA slot locals). A back edge that grows
+                // depth is pins accumulating around a loop: refuse
+                // rather than let the lattice climb.
+                // `gctransform/framework.py` computes livevars per block
+                // from the finished graph before `push_roots` inserts the
+                // stores; the analysis never rewrites while it is still
+                // iterating.
+                let incoming = EdgeOut::from_outgoing(depth, lo, rel, open);
+                let old_same_edge = self.edge_out[from][edge];
+                self.edge_out[from][edge] = Some(incoming);
+                let mut others: Option<EdgeOut> = None;
+                let mut joined: Option<EdgeOut> = None;
+                let mut min_d = usize::MAX;
+                let mut max_d = 0usize;
+                // Block 0 has no CFG predecessor for the function entry.
+                // Keep that (0,0,0,0) contribution so a back-edge cannot
+                // replace the start IN with only the loop OUT.
+                if target == 0 {
+                    let entry = EdgeOut {
+                        depth: 0,
+                        lo: 0,
+                        rel: 0,
+                        open: 0,
+                    };
+                    joined = Some(entry);
+                    others = Some(entry);
+                    min_d = 0;
+                    max_d = 0;
                 }
+                for &(pred, ei) in &self.incoming[target] {
+                    let Some(e) = self.edge_out[pred][ei] else {
+                        continue;
+                    };
+                    min_d = min_d.min(e.depth);
+                    max_d = max_d.max(e.depth);
+                    joined = Some(match joined {
+                        None => e,
+                        Some(cur) => cur.join(e),
+                    });
+                    if pred != from {
+                        others = Some(match others {
+                            None => e,
+                            Some(cur) => cur.join(e),
+                        });
+                    }
+                }
+                let Some(joined) = joined else {
+                    return Ok(());
+                };
+                // Back-edge vs the join of the *other* current incoming
+                // edges (or this edge's previous OUT / current IN when
+                // this is the only predecessor): a unique re-walk that
+                // climbs would otherwise install the new OUT as IN.
+                if dominates(self.succs, self.n_blocks, target, from) {
+                    let back_hi = others
+                        .map(|o| o.depth)
+                        .or_else(|| old_same_edge.map(|o| o.depth))
+                        .or(self.depth_in[target]);
+                    if back_hi.is_some_and(|d| d != incoming.depth) {
+                        return Err("depth-disagrees-at-merge");
+                    }
+                }
+                if min_d != max_d
+                    && !join_postdominated_by_this_guard_rewind(
+                        self.body,
+                        self.llbc,
+                        self.classified,
+                        self.specials,
+                        self.succs,
+                        self.n_blocks,
+                        target,
+                        joined.lo,
+                    )
+                {
+                    return Err("depth-disagrees-at-merge");
+                }
+                if Some(joined.depth) != self.depth_in[target]
+                    || Some(joined.lo) != self.lo_in[target]
+                    || Some(joined.rel) != self.rel_in[target]
+                    || Some(joined.open) != self.open_in[target]
+                {
+                    self.depth_in[target] = Some(joined.depth);
+                    self.lo_in[target] = Some(joined.lo);
+                    self.rel_in[target] = Some(joined.rel);
+                    self.open_in[target] = Some(joined.open);
+                    self.visited[target] = false;
+                    self.queue.push_back(target);
+                }
+                if self.split_key_in[target].is_none() {
+                    self.split_key_in[target] = Some(self.split_key);
+                }
+                if self.pin_count_in[target].is_none() {
+                    self.pin_count_in[target] = Some(self.pin_count.clone());
+                }
+                self.join_pins_at(target)
             }
         }
     }
@@ -1613,15 +1770,16 @@ impl<'a> EraseWalk<'a> {
         targets: &SwitchTargets,
         depth: usize,
         lo: usize,
+        rel: usize,
         open: usize,
     ) -> Result<(), Refusal> {
         match targets {
-            SwitchTargets::If(a, b) => {
-                self.reach(from, *a, depth, lo, open)?;
-                self.reach(from, *b, depth, lo, open)
+            SwitchTargets::If(_, _) => {
+                self.reach(from, SWITCH_IF_THEN_EDGE, depth, lo, rel, open)?;
+                self.reach(from, SWITCH_IF_ELSE_EDGE, depth, lo, rel, open)
             }
-            SwitchTargets::SwitchInt(_, arms, default) => {
-                self.reach_switch_int(from, discr, arms, *default, depth, lo, open)
+            SwitchTargets::SwitchInt(_, arms, _) => {
+                self.reach_switch_int(from, discr, arms, depth, lo, rel, open)
             }
         }
     }
@@ -1636,9 +1794,9 @@ impl<'a> EraseWalk<'a> {
         from: usize,
         discr: &Operand,
         arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
-        default: u64,
         depth: usize,
         lo: usize,
+        rel: usize,
         open: usize,
     ) -> Result<(), Refusal> {
         let root = operand_local(discr).map(|l| self.copy_root(l));
@@ -1647,31 +1805,39 @@ impl<'a> EraseWalk<'a> {
         if covers && lo != depth {
             let root = root.expect("covers implies a discr local");
             let mut restored = Vec::new();
-            for (scalar, t) in arms {
+            for (scalar, _) in arms {
                 let val = switch_arm_value(scalar).expect("covers parsed every arm");
                 let snap = self
                     .arm_exit
                     .get(&(root, val))
                     .copied()
                     .expect("covers has every snapshot");
-                restored.push((*t, snap));
+                restored.push(snap);
             }
             let join_hi = restored
                 .iter()
-                .map(|(_, (arm_d, _, _))| *arm_d)
+                .map(|(arm_d, _, _, _)| *arm_d)
                 .max()
                 .unwrap_or(depth);
             let delta = depth.saturating_sub(join_hi);
-            for (t, (arm_d, arm_lo, _)) in restored {
+            for (edge, (arm_d, arm_lo, arm_rel, _)) in restored.into_iter().enumerate() {
                 let rd = arm_d.saturating_add(delta);
                 let rlo = if arm_lo == arm_d {
                     rd
                 } else {
                     arm_lo.saturating_add(delta).min(rd)
                 };
-                self.reach(from, t, rd, rlo, open)?;
+                let rrel = if rlo == rd { 0 } else { arm_rel };
+                self.reach(from, edge, rd, rlo, rrel, open)?;
             }
-            self.reach(from, default, depth, lo, open)?;
+            self.reach(
+                from,
+                switch_int_default_edge(arms.len()),
+                depth,
+                lo,
+                rel,
+                open,
+            )?;
             return Ok(());
         }
         if !killed && let Some(root) = root {
@@ -1682,30 +1848,58 @@ impl<'a> EraseWalk<'a> {
                     // Unique-arm walk of a later switch: wait for the
                     // join-band re-walk so Get arms first-visit at the
                     // restored depth, not this arm's transient depth.
-                    self.reach(from, default, depth, lo, open)?;
+                    self.reach(
+                        from,
+                        switch_int_default_edge(arms.len()),
+                        depth,
+                        lo,
+                        rel,
+                        open,
+                    )?;
                     return Ok(());
                 }
-                if let Some(t) = switch_int_arm_target(arms, val) {
-                    self.reach(from, t, depth, lo, open)?;
-                    self.reach(from, default, depth, lo, open)?;
+                if let Some(edge) = switch_int_arm_edge(arms, val) {
+                    self.reach(from, edge, depth, lo, rel, open)?;
+                    self.reach(
+                        from,
+                        switch_int_default_edge(arms.len()),
+                        depth,
+                        lo,
+                        rel,
+                        open,
+                    )?;
                     return Ok(());
                 }
             }
             let saved = self.split_key;
-            for (scalar, t) in arms {
+            for (edge, (scalar, _)) in arms.iter().enumerate() {
                 if saved.is_none() {
                     self.split_key = switch_arm_value(scalar).map(|val| (root, val));
                 }
-                self.reach(from, *t, depth, lo, open)?;
+                self.reach(from, edge, depth, lo, rel, open)?;
             }
             self.split_key = saved;
-            self.reach(from, default, depth, lo, open)?;
+            self.reach(
+                from,
+                switch_int_default_edge(arms.len()),
+                depth,
+                lo,
+                rel,
+                open,
+            )?;
             return Ok(());
         }
-        for (_, t) in arms {
-            self.reach(from, *t, depth, lo, open)?;
+        for edge in 0..arms.len() {
+            self.reach(from, edge, depth, lo, rel, open)?;
         }
-        self.reach(from, default, depth, lo, open)
+        self.reach(
+            from,
+            switch_int_default_edge(arms.len()),
+            depth,
+            lo,
+            rel,
+            open,
+        )
     }
 
     fn guard_open(&self, g: usize) -> Result<(usize, usize), Refusal> {
@@ -1719,20 +1913,18 @@ impl<'a> EraseWalk<'a> {
         &self,
         call: &majit_charon_reader::ullbc::CallPayload,
         i: usize,
-        llbc: &Llbc,
-    ) -> Result<(usize, bool), Refusal> {
-        if let Some((k, relative)) = call
+    ) -> Result<(usize, bool, usize), Refusal> {
+        if let Some((k, relative, floor)) = call
             .args
             .get(i)
             .and_then(operand_local)
             .and_then(|l| self.specials.get(&l))
             .and_then(|s| s.as_index())
         {
-            return Ok((k, relative));
+            return Ok((k, relative, floor));
         }
-        if let Some(k) = call.args.get(i).and_then(|op| const_usize(op, llbc)) {
-            return Ok((k, false));
-        }
+        // A literal const index names a caller slot (`RootScope::get`,
+        // `shadow_stack_get`: `stack.slot(index)`), not this body's.
         Err("index-not-static")
     }
 
@@ -1857,6 +2049,26 @@ fn pin_depth(depth: &mut usize, lo: &mut usize, n: usize) {
     *depth = depth.saturating_add(n);
 }
 
+/// Close/Drop of a guard, or `mem_drop_guard_depth`, rewinds to `d_open`.
+/// Popping through the join floor realigns; an inner rewind above `lo`
+/// keeps the floor and the relative-read restriction.
+fn apply_rewind(
+    depth: &mut usize,
+    lo: &mut usize,
+    rel: &mut usize,
+    d_open: usize,
+    open: &mut usize,
+) {
+    if d_open <= *lo {
+        *depth = d_open;
+        *lo = d_open;
+        *rel = 0;
+    } else {
+        *depth = d_open;
+    }
+    *open = open.saturating_sub(1);
+}
+
 fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
     let body = cx.body;
     let llbc = cx.llbc;
@@ -1878,15 +2090,17 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
             continue;
         }
         cx.visited[bb] = true;
-        let (mut depth, mut lo, mut open) = match cx.mode {
+        let (mut depth, mut lo, mut rel, mut open) = match cx.mode {
             WalkMode::Emit => (
                 cx.frozen_depth[bb].expect("emit block is phase-1 reachable"),
                 cx.frozen_lo[bb].expect("emit block is phase-1 reachable"),
-                cx.open_in[bb].expect("queued blocks have an open count"),
+                cx.frozen_rel[bb].expect("emit block is phase-1 reachable"),
+                cx.frozen_open[bb].expect("emit block is phase-1 reachable"),
             ),
             WalkMode::Probe => (
                 cx.depth_in[bb].expect("queued blocks have a depth"),
                 cx.lo_in[bb].expect("queued blocks have a lo"),
+                cx.rel_in[bb].expect("queued blocks have a rel"),
                 cx.open_in[bb].expect("queued blocks have an open count"),
             ),
         };
@@ -1975,8 +2189,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 }
                             }
                             match cx.specials.get(&l).copied() {
-                                Some(Special::Index { k, relative }) => {
-                                    Some(Special::Index { k, relative })
+                                Some(Special::Index { k, relative, floor }) => {
+                                    Some(Special::Index { k, relative, floor })
                                 }
                                 Some(Special::Alias(g)) => Some(Special::Alias(g)),
                                 Some(Special::Guard { depth, skew }) => {
@@ -2001,8 +2215,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             }
                         } else if let Some((base, field)) = tuple_field_of_local(src) {
                             match (field, cx.specials.get(&base).copied()) {
-                                (0, Some(Special::IndexPair { k, relative })) => {
-                                    Some(Special::Index { k, relative })
+                                (0, Some(Special::IndexPair { k, relative, floor })) => {
+                                    Some(Special::Index { k, relative, floor })
                                 }
                                 (0, Some(Special::SliceIndexPair { slice_local, k })) => {
                                     Some(Special::SliceIndex { slice_local, k })
@@ -2014,9 +2228,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 (0, Some(Special::Guard { depth, .. })) => Some(Special::Index {
                                     k: depth,
                                     relative: false,
+                                    floor: 0,
                                 }),
-                                (0, Some(Special::Index { k, relative })) => {
-                                    Some(Special::Index { k, relative })
+                                (0, Some(Special::Index { k, relative, floor })) => {
+                                    Some(Special::Index { k, relative, floor })
                                 }
                                 _ => None,
                             }
@@ -2146,30 +2361,31 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         } else {
                             let index_of = |o: &Operand| match spec_of(o) {
                                 Some(
-                                    Special::Index { k, relative }
-                                    | Special::IndexPair { k, relative },
-                                ) => Some((k, relative)),
+                                    Special::Index { k, relative, floor }
+                                    | Special::IndexPair { k, relative, floor },
+                                ) => Some((k, relative, floor)),
                                 _ => None,
                             };
                             // `len + k` and `len - k` are compile-time offsets
                             // from the depth at the Len/Base. `zip_two_tuple_next`
                             // names a just-pinned slot as `shadow_stack_len() - 1`.
                             let offset = match (arith, index_of(lhs), index_of(rhs)) {
-                                (IndexArith::Add { checked }, Some((k, relative)), None) => {
-                                    const_addend(rhs).map(|c| (k + c, checked, relative))
+                                (IndexArith::Add { checked }, Some((k, relative, floor)), None) => {
+                                    const_addend(rhs).map(|c| (k + c, checked, relative, floor))
                                 }
-                                (IndexArith::Add { checked }, None, Some((k, relative))) => {
-                                    const_addend(lhs).map(|c| (k + c, checked, relative))
+                                (IndexArith::Add { checked }, None, Some((k, relative, floor))) => {
+                                    const_addend(lhs).map(|c| (k + c, checked, relative, floor))
                                 }
-                                (IndexArith::Sub { checked }, Some((k, relative)), None) => {
+                                (IndexArith::Sub { checked }, Some((k, relative, floor)), None) => {
                                     const_addend(rhs).and_then(|c| {
-                                        k.checked_sub(c).map(|n| (n, checked, relative))
+                                        k.checked_sub(c).map(|n| (n, checked, relative, floor))
                                     })
                                 }
                                 _ => None,
                             };
-                            offset
-                                .map(|(k, checked, relative)| Special::index(k, relative, checked))
+                            offset.map(|(k, checked, relative, floor)| {
+                                Special::index(k, relative, floor, checked)
+                            })
                         }
                     }
                     None => None,
@@ -2203,7 +2419,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     cx.note_local_assign(dest);
                 }
                 let Some(&(leaf, method)) = classified.get(&bb) else {
-                    if let Some((d, skew)) = mem_drop_guard(call, llbc, &cx.specials) {
+                    if let Some((d, _)) = mem_drop_guard(call, llbc, &cx.specials) {
                         if d > depth {
                             // Drop flag: this path did not open the guard
                             // (`funccall_flat_from_args` nargs arm copies a
@@ -2213,15 +2429,13 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             // nested pin-count the short arm never held.
                             cx.forget_closed_guards(d);
                             cx.record_term(bb, *target, Vec::new());
-                            cx.reach(bb, *target, depth, lo, open)?;
+                            cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                             continue;
                         }
                         cx.forget_closed_guards(d);
-                        depth = d;
-                        lo = d - skew;
-                        open = open.saturating_sub(1);
+                        apply_rewind(&mut depth, &mut lo, &mut rel, d, &mut open);
                         cx.record_term(bb, *target, Vec::new());
-                        cx.reach(bb, *target, depth, lo, open)?;
+                        cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
                     // A closure whose body is `shadow_stack_get` of a captured
@@ -2241,10 +2455,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     ) {
                         let dest_json = &term_json["Call"]["dest"];
                         let stmts = match answer {
-                            GetterAnswer::Scalar { k, relative } => {
-                                cx.check_slot_read(k, relative, depth, lo, false)?;
+                            GetterAnswer::Scalar { k, relative, floor } => {
+                                cx.check_slot_read(k, relative, floor, depth, lo, false)?;
                                 if !cx.emit() {
-                                    cx.reach(bb, *target, depth, lo, open)?;
+                                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                                     continue;
                                 }
                                 let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
@@ -2258,7 +2472,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     return Err("get-above-depth");
                                 }
                                 if !cx.emit() {
-                                    cx.reach(bb, *target, depth, lo, open)?;
+                                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                                     continue;
                                 }
                                 vec![assign_json(
@@ -2272,14 +2486,14 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         for local in carriers {
                             cx.capture_temps.insert(local);
                         }
-                        cx.reach(bb, *target, depth, lo, open)?;
+                        cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
                     if call_is_anchor_identity(call, llbc) {
-                        cx.reach(bb, *target, depth, lo, open)?;
+                        cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
                     let effect =
@@ -2294,7 +2508,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         }
                         return Err("calls-stack-sensitive-fn");
                     }
-                    cx.reach(bb, *target, depth, lo, open)?;
+                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                     continue;
                 };
                 let args_json = &term_json["Call"]["call"]["args"];
@@ -2371,7 +2585,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         cx.note_guard_pins(dest, GuardPins::Exact(1 + extra));
                     }
                     Leaf::Close | Leaf::ItemsClose => {
-                        let (d, skew) = if let Some(g) = guard {
+                        let (d, _) = if let Some(g) = guard {
                             cx.guard_open(g)?
                         } else {
                             call.args
@@ -2384,9 +2598,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             return Err("close-above-depth");
                         }
                         cx.forget_closed_guards(d);
-                        depth = d;
-                        lo = d - skew;
-                        open = open.saturating_sub(1);
+                        apply_rewind(&mut depth, &mut lo, &mut rel, d, &mut open);
                     }
                     Leaf::Base => {
                         let (d, _) = cx.guard_open(guard.ok_or("base-without-guard")?)?;
@@ -2395,6 +2607,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             Special::Index {
                                 k: d,
                                 relative: false,
+                                floor: 0,
                             },
                         )?;
                     }
@@ -2404,6 +2617,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             Special::Index {
                                 k: depth,
                                 relative: true,
+                                floor: rel,
                             },
                         )?;
                     }
@@ -2479,6 +2693,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     Special::Index {
                                         k: depth,
                                         relative: false,
+                                        floor: 0,
                                     },
                                 )?;
                             }
@@ -2570,12 +2785,12 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     }
                     Leaf::Get => {
                         let index_local = call.args.get(arg0).and_then(operand_local);
-                        let const_k = call.args.get(arg0).and_then(|op| const_usize(op, llbc));
                         match index_local.and_then(|l| cx.specials.get(&l).copied()) {
                             Some(
-                                Special::Index { k, relative } | Special::IndexPair { k, relative },
+                                Special::Index { k, relative, floor }
+                                | Special::IndexPair { k, relative, floor },
                             ) => {
-                                cx.check_slot_read(k, relative, depth, lo, false)?;
+                                cx.check_slot_read(k, relative, floor, depth, lo, false)?;
                                 if cx.emit() {
                                     let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
                                     stmts.push(assign_json(
@@ -2654,17 +2869,6 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     ));
                                 }
                             }
-                            _ if const_k.is_some() => {
-                                let k = const_k.unwrap();
-                                cx.check_slot_read(k, false, depth, lo, false)?;
-                                if cx.emit() {
-                                    let ty = cx.slot_ty_at(k).ok_or("get-before-any-pin")?;
-                                    stmts.push(assign_json(
-                                        dest_json.clone(),
-                                        json!({ "Use": [{ "Read": local_place_json(cx.slot_local(k), &ty) }, "Yes"] }),
-                                    ));
-                                }
-                            }
                             _ => return Err("index-not-static"),
                         }
                     }
@@ -2680,7 +2884,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             })
                             .ok_or("index-not-static")?;
                         let slot = d.checked_add(k).ok_or("get-above-depth")?;
-                        cx.check_slot_read(slot, false, depth, lo, false)?;
+                        cx.check_slot_read(slot, false, 0, depth, lo, false)?;
                         if cx.emit() {
                             let ty = cx.slot_ty_at(slot).ok_or("get-before-any-pin")?;
                             stmts.push(assign_json(
@@ -2709,7 +2913,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             return Err("get-out-of-set");
                         }
                         let slot = d.checked_add(rel).ok_or("get-above-depth")?;
-                        cx.check_slot_read(slot, false, depth, lo, false)?;
+                        cx.check_slot_read(slot, false, 0, depth, lo, false)?;
                         if cx.emit() {
                             let ty = cx.slot_ty_at(slot).ok_or("get-before-any-pin")?;
                             stmts.push(assign_json(
@@ -2762,8 +2966,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 ));
                             }
                         } else {
-                            let (k, relative) = cx.slot_index_of(call, arg0, llbc)?;
-                            cx.check_slot_read(k, relative, depth, lo, true)?;
+                            let (k, relative, floor) = cx.slot_index_of(call, arg0)?;
+                            cx.check_slot_read(k, relative, floor, depth, lo, true)?;
                             if cx.emit() {
                                 let ty = cx.slot_ty_at(k).ok_or("set-before-any-pin")?;
                                 stmts.push(assign_json(
@@ -2804,6 +3008,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         if depth == 0 {
                             return Err("reload-empty-stack");
                         }
+                        cx.check_slot_read(depth - 1, true, rel, depth, lo, false)?;
                         if cx.emit() {
                             let ty = cx.slot_ty_at(depth - 1).ok_or("reload-before-any-pin")?;
                             stmts.push(assign_json(
@@ -2815,11 +3020,11 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     Leaf::Unmodeled => unreachable!("refused above"),
                 }
                 cx.record_term(bb, *target, stmts);
-                cx.reach(bb, *target, depth, lo, open)?;
+                cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
             }
             Ok(TermKind::Drop { place, target, .. }) => {
                 let dropped = place_local(place);
-                if let Some(Special::Guard { depth: d, skew }) =
+                if let Some(Special::Guard { depth: d, .. }) =
                     dropped.and_then(|l| cx.specials.get(&l)).copied()
                 {
                     // A drop flag the artefact does not carry can leave the
@@ -2833,30 +3038,28 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         // nested pin-count the short arm never held.
                         cx.forget_closed_guards(d);
                         cx.record_term(bb, *target, Vec::new());
-                        cx.reach(bb, *target, depth, lo, open)?;
+                        cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                     } else {
                         cx.forget_closed_guards(d);
-                        depth = d;
-                        lo = d - skew;
-                        open = open.saturating_sub(1);
+                        apply_rewind(&mut depth, &mut lo, &mut rel, d, &mut open);
                         cx.record_term(bb, *target, Vec::new());
-                        cx.reach(bb, *target, depth, lo, open)?;
+                        cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                     }
                 } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
                     return Err("drop-of-unopened-guard");
                 } else {
-                    cx.reach(bb, *target, depth, lo, open)?;
+                    cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                 }
             }
             Ok(TermKind::Assert { assert, target, .. }) => {
                 if assert_is_slot_index_bounds_check(assert, &cx.specials, &cx.const_locals, llbc) {
                     cx.record_term(bb, *target, Vec::new());
                 }
-                cx.reach(bb, *target, depth, lo, open)?;
+                cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
             }
-            Ok(TermKind::Goto { target }) => cx.reach(bb, *target, depth, lo, open)?,
+            Ok(TermKind::Goto { .. }) => cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?,
             Ok(TermKind::Switch { discr, targets }) => {
-                cx.reach_switch(bb, discr, targets, depth, lo, open)?;
+                cx.reach_switch(bb, discr, targets, depth, lo, rel, open)?;
             }
             Ok(TermKind::Return) => {
                 if depth != 0 {
@@ -2983,12 +3186,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         .collect();
     let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
     let mut lo_in: Vec<Option<usize>> = vec![None; n_blocks];
+    let mut rel_in: Vec<Option<usize>> = vec![None; n_blocks];
     // Guards currently open. Incoming-slice Gets are allowed only while
     // this is non-zero: Open does not change scalar depth, so Close of a
     // slice-only bracket is still depth 0.
     let mut open_in: Vec<Option<usize>> = vec![None; n_blocks];
     depth_in[0] = Some(0);
     lo_in[0] = Some(0);
+    rel_in[0] = Some(0);
     open_in[0] = Some(0);
     let mut pin_count_in: Vec<Option<HashMap<usize, GuardPins>>> = vec![None; n_blocks];
     pin_count_in[0] = Some(HashMap::new());
@@ -2999,7 +3204,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let mut dummy_getter_bbs = bit_set::BitSet::new();
     let mut dummy_capture = bit_set::BitSet::new();
     let mut split_key_in: Vec<Option<Option<(usize, u64)>>> = vec![None; n_blocks];
-    let mut arm_exit: HashMap<(usize, u64), (usize, usize, usize)> = HashMap::new();
+    let mut arm_exit: HashMap<(usize, u64), (usize, usize, usize, usize)> = HashMap::new();
     let mut scrutinee_killed: HashSet<usize> = HashSet::new();
     {
         let mut cx = EraseWalk {
@@ -3009,6 +3214,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             classified: &classified,
             forward_blocks: &forward_blocks,
             succs: &succs,
+            edge_out: succs.iter().map(|s| vec![None; s.len()]).collect(),
+            incoming: incoming_edges(&succs, n_blocks),
             n_blocks,
             n_locals,
             arg_count,
@@ -3019,9 +3226,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             call_dests: &call_dests,
             depth_in: &mut depth_in,
             lo_in: &mut lo_in,
+            rel_in: &mut rel_in,
             open_in: &mut open_in,
             frozen_depth: &[],
             frozen_lo: &[],
+            frozen_rel: &[],
+            frozen_open: &[],
             queue: &mut queue,
             visited: &mut visited,
             specials: &mut probe_specials,
@@ -3049,6 +3259,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let frozen_depth = depth_in.clone();
     let frozen_lo = lo_in.clone();
     let frozen_pin_count = pin_count_in.clone();
+    let frozen_rel = rel_in.clone();
+    let frozen_open = open_in.clone();
     visited.fill(false);
     queue.clear();
     queue.push_back(0);
@@ -3074,6 +3286,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             classified: &classified,
             forward_blocks: &forward_blocks,
             succs: &succs,
+            edge_out: Vec::new(),
+            incoming: Vec::new(),
             n_blocks,
             n_locals,
             arg_count,
@@ -3084,9 +3298,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             call_dests: &call_dests,
             depth_in: &mut depth_in,
             lo_in: &mut lo_in,
+            rel_in: &mut rel_in,
             open_in: &mut open_in,
             frozen_depth: &frozen_depth,
             frozen_lo: &frozen_lo,
+            frozen_rel: &frozen_rel,
+            frozen_open: &frozen_open,
             queue: &mut queue,
             visited: &mut visited,
             specials: &mut emit_specials,
@@ -3366,8 +3583,41 @@ fn block_rewinds_scope(
     }
 }
 
-/// Forward successors the erase walk follows: `on_unwind` is not a
-/// successor (`analyze` does not walk cleanup).
+/// Call / Drop / Assert / Goto: the one forward successor at `succs[bb][0]`.
+/// Unwind is not a successor (`erase_forward_successors`).
+const ERASE_SINGLE_EDGE: usize = 0;
+/// `SwitchTargets::If(a, b)`: `a` then `b`, matching [`erase_forward_successors`].
+const SWITCH_IF_THEN_EDGE: usize = 0;
+const SWITCH_IF_ELSE_EDGE: usize = 1;
+
+/// Default SwitchInt edge: after every arm, same as [`erase_forward_successors`].
+fn switch_int_default_edge(n_arms: usize) -> usize {
+    n_arms
+}
+
+/// Transpose of `succs`: `(pred, edge_index)` for each incoming edge.
+/// Parallel Links to one block are distinct `(pred, ei)` pairs
+/// (`mkentrymap`; `ssa.py` `DataFlowFamilyBuilder`).
+fn incoming_edges(succs: &[Vec<u64>], n: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut incoming = vec![Vec::new(); n];
+    for (from, edges) in succs.iter().enumerate() {
+        for (ei, &target) in edges.iter().enumerate() {
+            let target = target as usize;
+            if target < n {
+                incoming[target].push((from, ei));
+            }
+        }
+    }
+    incoming
+}
+
+/// Forward successors the erase walk follows. Edge order is the Link
+/// order (`mkentrymap`):
+/// - Call / Drop / Assert / Goto: `[target]` (index [`ERASE_SINGLE_EDGE`]).
+///   `on_unwind` is omitted.
+/// - Switch If: `[then, else]` ([`SWITCH_IF_THEN_EDGE`], [`SWITCH_IF_ELSE_EDGE`]).
+/// - SwitchInt: each arm target in source order, then the default
+///   (arm `i` is index `i`; default is [`switch_int_default_edge`]).
 fn erase_forward_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<u64> {
     let Some(block) = body.body.get(bb) else {
         return Vec::new();
@@ -3452,11 +3702,48 @@ fn dominates(succs: &[Vec<u64>], n: usize, dominator: usize, node: usize) -> boo
     dominator == node || !reachable_avoiding(succs, n, 0, node, dominator)
 }
 
+/// Open depth a rewind block restores to, when that depth is a compile-time
+/// constant. `None` if the block is not a rewind, or the target cannot be
+/// named statically: those do not cover a disagreeing join.
+fn block_rewind_open_depth(
+    body: &Unstructured,
+    llbc: &Llbc,
+    classified: &HashMap<usize, (Leaf, bool)>,
+    specials: &HashMap<usize, Special>,
+    bb: usize,
+) -> Option<usize> {
+    if matches!(
+        classified.get(&bb),
+        Some((Leaf::Close | Leaf::ItemsClose, _))
+    ) {
+        let call = match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
+            Some(TermKind::Call { call, .. }) => call,
+            _ => return None,
+        };
+        return call
+            .args
+            .first()
+            .and_then(operand_local)
+            .and_then(|l| special_open_guard(specials, l))
+            .map(|(d, _)| d);
+    }
+    match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
+        Some(TermKind::Drop { place, .. }) => {
+            place_local(place).and_then(|l| special_open_guard(specials, l).map(|(d, _)| d))
+        }
+        Some(TermKind::Call { call, .. }) => mem_drop_guard_depth(call, llbc, specials),
+        _ => None,
+    }
+}
+
 /// The set of Close/Drop of this body's open guard postdominates `join`
 /// on the erase CFG: every *returning* path from `join` goes through some
 /// rewind. rustc copies the Drop onto each return, so no single rewind
 /// block postdominates; the set does. UB / abort / panic sinks (shared
-/// unreachable defaults) do not need a rewind.
+/// unreachable defaults) do not need a rewind. A rewind counts only if it
+/// restores the stack to a depth `<= joined_lo` (the extra-pin band is
+/// actually popped). An inner bracket that rewinds above the floor does
+/// not cover the join.
 fn join_postdominated_by_this_guard_rewind(
     body: &Unstructured,
     llbc: &Llbc,
@@ -3465,14 +3752,17 @@ fn join_postdominated_by_this_guard_rewind(
     succs: &[Vec<u64>],
     n: usize,
     join: usize,
+    joined_lo: usize,
 ) -> bool {
     let mut seen = vec![false; n];
     let mut queue = VecDeque::new();
     queue.push_back(join);
     seen[join] = true;
     while let Some(bb) = queue.pop_front() {
-        if block_rewinds_scope(body, llbc, classified, specials, bb) {
-            continue;
+        if let Some(d) = block_rewind_open_depth(body, llbc, classified, specials, bb) {
+            if d <= joined_lo {
+                continue;
+            }
         }
         if is_erase_returning_exit(body, llbc, bb) {
             return false;
@@ -6371,6 +6661,48 @@ mod tests {
         })
     }
 
+    fn root_scope_type_decl() -> Value {
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    ident("pyre_object"),
+                    ident("gc_roots"),
+                    ident("RootScope")
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": []}
+        })
+    }
+
+    fn root_scope_adt() -> Value {
+        json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn copy_scope(i: u64) -> Value {
+        json!({"Read": {"kind": {"Local": i}, "ty": root_scope_adt()}})
+    }
+
     /// A `pin_roots` of a same-block array, with a cleanup block in front of
     /// that array block. The body keeps every extracted block at its original
     /// index; erase still accepts the publish.
@@ -6697,7 +7029,7 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "c",
-                "type_decls": [frame_anchor_type_decl()],
+                "type_decls": [frame_anchor_type_decl(), root_scope_type_decl()],
                 "fun_decls": [
                     null,
                     opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
@@ -6707,7 +7039,10 @@ mod tests {
                     opaque_fun(5, &["pyre_interpreter", "eval", "frame_anchor_push"], json!("Opaque")),
                     opaque_fun(6, &["pyre_interpreter", "eval", "frame_anchor_live"], json!("Opaque")),
                     opaque_fun(7, &["pyre_interpreter", "eval", "frame_anchor_release"], json!("Opaque")),
-                    opaque_fun(8, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque"))
+                    opaque_fun(8, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(9, &["pyre_object", "gc_roots", "RootScope", "base"], json!("Opaque")),
+                    opaque_fun(10, &["pyre_object", "gc_roots", "reload_top_root"], json!("Opaque")),
+                    opaque_fun(11, &["pyre_object", "gc_roots", "shadow_stack_set"], json!("Opaque"))
                 ]
             }
         });
@@ -8263,6 +8598,7 @@ mod tests {
             Special::Index {
                 k: 0,
                 relative: false,
+                floor: 0,
             },
         )]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
@@ -8293,6 +8629,7 @@ mod tests {
                 Special::Index {
                     k: 0,
                     relative: false,
+                    floor: 0,
                 },
             ),
             (
@@ -8300,6 +8637,7 @@ mod tests {
                 Special::Index {
                     k: 3,
                     relative: true,
+                    floor: 0,
                 },
             ),
         ]);
@@ -8925,9 +9263,8 @@ mod tests {
     }
 
     /// Two-phase walk: the short arm reaches the join first. After the join
-    /// a Len, a pin, and a Get of that Len in a block also reached from the
-    /// extra-pin arm already at `hi`. Emit walks at the Probe fixpoint: the
-    /// Get copies the pin after the join (`slot == hi`).
+    /// a Len, a pin, and a Get of that Len. Emit walks at the Probe
+    /// fixpoint: the Get copies the pin after the join (`slot == hi`).
     #[test]
     fn analyze_rewrites_len_after_disagreeing_join_at_final_depth() {
         let llbc = stack_ops_llbc();
@@ -8943,10 +9280,7 @@ mod tests {
                 }})),
                 bb(json!({"Goto": {"target": 6}})),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
-                bb(json!({"Switch": {
-                    "discr": {"Read": place(3)},
-                    "targets": {"If": [6, 8]}
-                }})),
+                bb(json!({"Goto": {"target": 6}})),
                 bb(call_fun(3, vec![], 4, 7)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 8)),
                 bb(call_fun(2, vec![copy_local(4)], 6, 9)),
@@ -8973,13 +9307,13 @@ mod tests {
         );
     }
 
-    /// After a disagreeing join, `guard.get(1)` is an absolute index in
+    /// After a disagreeing join, `guard.base() + 1` is an absolute index in
     /// the `[lo, hi)` band and refuses `absolute-get-above-join-floor`.
     #[test]
     fn analyze_refuses_absolute_get_in_join_band() {
         let llbc = stack_ops_llbc();
         let body = body_of(
-            6,
+            8,
             vec![
                 bb(call_fun(1, vec![], 1, 1)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
@@ -8991,8 +9325,15 @@ mod tests {
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
                 bb(json!({"Goto": {"target": 6}})),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 7)),
-                bb(call_fun(2, vec![usize_lit(1)], 5, 8)),
-                bb(drop_local(1, 9)),
+                bb(call_fun(9, vec![copy_scope(1)], 5, 8)),
+                bb_stmts(
+                    vec![assign_local(
+                        6,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(5)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(6)})], 7, 9),
+                ),
+                bb(drop_local(1, 10)),
                 bb(json!("Return")),
             ],
         );
@@ -9005,11 +9346,11 @@ mod tests {
     }
 
     /// Same CFG as [`analyze_refuses_absolute_get_in_join_band`], slot 0
-    /// sits below `lo`.
+    /// sits below `lo`. The index is `guard.base() + 0`, not a literal.
     #[test]
     fn analyze_accepts_absolute_get_below_join_floor() {
         let llbc = stack_ops_llbc();
-        let n_locals: u64 = 6;
+        let n_locals: u64 = 8;
         let body = body_of(
             n_locals,
             vec![
@@ -9023,8 +9364,15 @@ mod tests {
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
                 bb(json!({"Goto": {"target": 6}})),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 7)),
-                bb(call_fun(2, vec![usize_lit(0)], 5, 8)),
-                bb(drop_local(1, 9)),
+                bb(call_fun(9, vec![copy_scope(1)], 5, 8)),
+                bb_stmts(
+                    vec![assign_local(
+                        6,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(5)}), usize_lit(0)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(6)})], 7, 9),
+                ),
+                bb(drop_local(1, 10)),
                 bb(json!("Return")),
             ],
         );
@@ -9034,11 +9382,11 @@ mod tests {
             Err(reason) => panic!("expected accepted erase, got {reason}"),
         };
         let slot0 = local_place_json(n_locals as usize, &ty());
-        let rewrite_get = plan.terms.get(&7).expect("Get of slot 0 rewritten");
+        let rewrite_get = plan.terms.get(&8).expect("Get of slot 0 rewritten");
         assert_eq!(
             rewrite_get.stmts,
             vec![json!({"Assign": [
-                place(5),
+                place(7),
                 {"Use": [{"Read": slot0}, "Yes"]}
             ]})],
             "absolute get below the join floor copies slot 0"
@@ -9061,11 +9409,31 @@ mod tests {
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 5)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 4)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 6, 5)),
-                bb(json!({"Goto": {"target": 6}})),
+                // `guard.base() + k`, not a literal: `shadow_stack_get(0)`
+                // names a caller slot (`index-not-static`).
+                bb(call_fun(9, vec![copy_scope(2)], 3, 6)),
                 bb(switch_int(1, &[(0, 7), (1, 8)], 11)),
-                bb(call_fun(2, vec![usize_lit(0)], 8, 10)),
-                bb(call_fun(2, vec![usize_lit(0)], 9, 9)),
-                bb(call_fun(2, vec![usize_lit(1)], 10, 10)),
+                bb_stmts(
+                    vec![assign_local(
+                        7,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(0)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(7)})], 8, 10),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        7,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(0)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(7)})], 9, 9),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        11,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(11)})], 10, 10),
+                ),
                 bb(drop_local(2, 12)),
                 bb(abort),
                 bb(json!("Return")),
@@ -9113,6 +9481,48 @@ mod tests {
         );
     }
 
+    /// Two SwitchInt arms restore different depths into the same successor:
+    /// the first switch's extra-pin join records snapshots 1 and 2, the
+    /// second switch's restored-arm path (`covers && lo != depth`) walks
+    /// both Links. `mkentrymap` keeps each incoming Link; joining (1,1)
+    /// with (2,2) is hi=2, lo=1. Drop of the guard postdominates that join
+    /// and rewinds to 0, so the body erases (`slot_count` is the extra-pin
+    /// max). A Probe that wrote both parallel edges with the last arm
+    /// would freeze lo=2, and Emit's depth-1 arm would fail the
+    /// frozen-lattice check.
+    #[test]
+    fn analyze_erases_parallel_switch_int_edges_at_different_restored_depths() {
+        let llbc = stack_ops_llbc();
+        let abort = json!({"Abort": "UndefinedBehavior"});
+        let body = body_of_args(
+            1,
+            6,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(switch_int(0, &[(0, 2), (1, 3)], 8)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 4)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 5)),
+                bb(switch_int(0, &[(0, 6), (1, 6)], 8)),
+                bb(drop_local(2, 7)),
+                bb(json!("Return")),
+                bb(abort),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(plan)) => {
+                assert_eq!(
+                    plan.slot_count, 2,
+                    "joined extra-pin max over restored depths 1 and 2"
+                );
+            }
+            Ok(None) => panic!("expected accepted erase of parallel restored-arm Links"),
+            Err(reason) => {
+                panic!("expected accepted erase of parallel restored-arm Links, got {reason}")
+            }
+        }
+    }
+
     /// Same shape, but the scrutinee is assigned between the switches,
     /// so the suffix Get of the extra pin is again in the join band.
     #[test]
@@ -9128,15 +9538,33 @@ mod tests {
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 5)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 4)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 6, 5)),
-                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(9, vec![copy_scope(2)], 3, 6)),
                 bb_stmts(
                     vec![assign_local(1, json!({"Use": [usize_lit(99), "Yes"]}))],
                     json!({"Goto": {"target": 7}}),
                 ),
                 bb(switch_int(1, &[(0, 8), (1, 9)], 12)),
-                bb(call_fun(2, vec![usize_lit(0)], 8, 11)),
-                bb(call_fun(2, vec![usize_lit(0)], 9, 10)),
-                bb(call_fun(2, vec![usize_lit(1)], 10, 11)),
+                bb_stmts(
+                    vec![assign_local(
+                        7,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(0)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(7)})], 8, 11),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        7,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(0)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(7)})], 9, 10),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        11,
+                        json!({"BinaryOp": ["Add", json!({"Read": place(3)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(11)})], 10, 11),
+                ),
                 bb(drop_local(2, 13)),
                 bb(abort),
                 bb(json!("Return")),
@@ -9189,6 +9617,8 @@ mod tests {
 
     /// Two arms bind the same index local to different `k`. That is
     /// `special-rebound`: a join Get would read one slot on both arms.
+    /// The Get sits after an empty join so both Lens bind in Emit
+    /// before the read (`special-rebound`, not a Get refusal).
     #[test]
     fn analyze_refuses_dual_def_with_different_slot_index() {
         let llbc = stack_ops_llbc();
@@ -9202,10 +9632,11 @@ mod tests {
                 }})),
                 bb(call_fun(3, vec![], 2, 4)),
                 bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 7)),
-                bb(call_fun(2, vec![copy_local(2)], 4, 5)),
+                bb(json!({"Goto": {"target": 8}})),
                 bb(drop_local(1, 6)),
                 bb(json!("Return")),
                 bb(call_fun(3, vec![], 2, 4)),
+                bb(call_fun(2, vec![copy_local(2)], 4, 5)),
             ],
         );
         match analyze(&body, &llbc) {
@@ -9246,6 +9677,294 @@ mod tests {
             }
             Ok(None) => panic!("expected accepted erase, got no bracket"),
             Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// Open, pin, `shadow_stack_get(0)` / `shadow_stack_set(0, _)`: a
+    /// literal names a caller slot, not this body's slot 0.
+    #[test]
+    fn analyze_refuses_literal_shadow_stack_index() {
+        let llbc = stack_ops_llbc();
+        let get_body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(2, vec![usize_lit(0)], 3, 3)),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&get_body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("expected index-not-static on literal Get, got accepted"),
+            Ok(None) => panic!("expected index-not-static on literal Get, got no bracket"),
+            Err(reason) => panic!("expected index-not-static on literal Get, got {reason}"),
+        }
+        let set_body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(
+                    11,
+                    vec![usize_lit(0), json!({"Read": place(0)})],
+                    3,
+                    3,
+                )),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&set_body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("expected index-not-static on literal Set, got accepted"),
+            Ok(None) => panic!("expected index-not-static on literal Set, got no bracket"),
+            Err(reason) => panic!("expected index-not-static on literal Set, got {reason}"),
+        }
+    }
+
+    /// Extra pin on one arm, then `len - 1` at the join: that relative
+    /// index names `hi-1` on the long arm and `lo-1` on the short arm.
+    #[test]
+    fn analyze_refuses_relative_get_of_len_minus_one_at_disagreeing_join() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            7,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(3, vec![], 4, 7)),
+                bb_stmts(
+                    vec![assign_local(
+                        5,
+                        json!({"BinaryOp": ["Sub", json!({"Read": place(4)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(5)})], 6, 8),
+                ),
+                bb(drop_local(1, 9)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("relative-get-below-join") => {}
+            Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
+            Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
+            Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
+        }
+    }
+
+    /// Same join as [`analyze_refuses_relative_get_of_len_minus_one_at_disagreeing_join`],
+    /// `reload_top_root` reads `depth-1` as a relative index.
+    #[test]
+    fn analyze_refuses_reload_top_after_disagreeing_join() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            5,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(10, vec![], 4, 7)),
+                bb(drop_local(1, 8)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("relative-get-below-join") => {}
+            Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
+            Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
+            Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
+        }
+    }
+
+    /// Len while aligned, then a conditional extra pin, then Get of that
+    /// Len: the index was computed before the arms diverged, so its
+    /// static `k` equals the runtime value on every path.
+    #[test]
+    fn analyze_accepts_pre_join_len_get_after_conditional_pin() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [4, 5]}
+                }})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 6)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(2, vec![json!({"Read": place(3)})], 5, 7)),
+                bb(drop_local(1, 8)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// Same CFG as [`analyze_accepts_pre_join_len_get_after_conditional_pin`],
+    /// but Len is evaluated after the join and the Get is of `s - 1`:
+    /// Emit freezes that Len to the joined hi.
+    #[test]
+    fn analyze_refuses_post_join_len_minus_one_after_conditional_pin() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            7,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(3, vec![], 4, 7)),
+                bb_stmts(
+                    vec![assign_local(
+                        5,
+                        json!({"BinaryOp": ["Sub", json!({"Read": place(4)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(5)})], 6, 8),
+                ),
+                bb(drop_local(1, 9)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("relative-get-below-join") => {}
+            Ok(Some(_)) => panic!("expected relative-get-below-join, got accepted"),
+            Ok(None) => panic!("expected relative-get-below-join, got no bracket"),
+            Err(reason) => panic!("expected relative-get-below-join, got {reason}"),
+        }
+    }
+
+    /// Pin after the disagreeing join, then `len - 1`: that slot was
+    /// pushed on both arms after the join.
+    #[test]
+    fn analyze_accepts_len_minus_one_of_pin_after_disagreeing_join() {
+        let llbc = stack_ops_llbc();
+        let n_locals: u64 = 8;
+        let body = body_of(
+            n_locals,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 3, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 7)),
+                bb(call_fun(3, vec![], 5, 8)),
+                bb_stmts(
+                    vec![assign_local(
+                        6,
+                        json!({"BinaryOp": ["Sub", json!({"Read": place(5)}), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![json!({"Read": place(6)})], 7, 9),
+                ),
+                bb(drop_local(1, 10)),
+                bb(json!("Return")),
+            ],
+        );
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert_eq!(plan.slot_count, 3, "obj + extra pin + pin after join");
+        let slot_hi = local_place_json(n_locals as usize + 2, &ty());
+        let rewrite_get = plan.terms.get(&8).expect("Get of len-1 rewritten");
+        assert_eq!(
+            rewrite_get.stmts,
+            vec![json!({"Assign": [
+                place(7),
+                {"Use": [{"Read": slot_hi}, "Yes"]}
+            ]})],
+            "len-1 after a post-join pin copies the pin (slot hi)"
+        );
+    }
+
+    /// Extra-pin join postdominated only by an inner Open/Close that
+    /// rewinds to `hi`, not `<= lo`.
+    #[test]
+    fn analyze_refuses_inner_rewind_only_after_extra_pin_join() {
+        let llbc = stack_ops_llbc();
+        let body = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(2)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(call_fun(1, vec![], 3, 6)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 2, 5)),
+                bb(call_fun(1, vec![], 3, 6)),
+                bb(drop_local(3, 7)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("depth-disagrees-at-merge") => {}
+            Ok(Some(_)) => panic!("expected depth-disagrees-at-merge, got accepted"),
+            Ok(None) => panic!("expected depth-disagrees-at-merge, got no bracket"),
+            Err(reason) => panic!("expected depth-disagrees-at-merge, got {reason}"),
+        }
+    }
+
+    /// Agreeing scalar depth, one arm closed: pin-count keys disagree at
+    /// the Get join (`forget_closed_guards` on the drop arm). `open_in`
+    /// min would also refuse the leftover-slice Get (`get-above-depth`).
+    #[test]
+    fn analyze_refuses_incoming_slice_get_after_open_count_join() {
+        let llbc = incoming_slice_llbc();
+        let body = body_of_args(
+            1,
+            6,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(5, vec![copy_local(1)], 3, 2)),
+                bb(json!({"Switch": {
+                    "discr": {"Read": place(0)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb(json!({"Goto": {"target": 5}})),
+                bb(drop_local(2, 5)),
+                bb(call_fun(2, vec![copy_local(3)], 4, 6)),
+                bb(drop_local(2, 7)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("pin-count-disagrees-at-merge") => {}
+            Ok(Some(_)) => panic!("expected pin-count-disagrees-at-merge, got accepted"),
+            Ok(None) => panic!("expected pin-count-disagrees-at-merge, got no bracket"),
+            Err(reason) => panic!("expected pin-count-disagrees-at-merge, got {reason}"),
         }
     }
 

@@ -841,16 +841,17 @@ fn mapdict_getclass_fnptr_family_includes_object_carrier() {
         2,
         "getclass family is shared + object copy: {getclass:?}"
     );
+    // Members are registered_path_for_fun_decl: the FunDecl identity keeps the crate Ident.
     assert!(
         getclass
             .iter()
-            .any(|path| *path == "mapdict::base_user_class_mapdict_getclass"),
+            .any(|path| *path == "pyre_object::mapdict::base_user_class_mapdict_getclass"),
         "shared getclass member path: {getclass:?}"
     );
     assert!(
-        getclass
-            .iter()
-            .any(|path| *path == "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass"),
+        getclass.iter().any(|path| {
+            *path == "pyre_object::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass"
+        }),
         "object getclass member path: {getclass:?}"
     );
     let get_map: Vec<&str> = rows

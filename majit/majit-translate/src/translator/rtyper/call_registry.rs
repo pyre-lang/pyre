@@ -486,7 +486,8 @@ pub struct SubjectTdcPlan {
     pub cutoff_callees: Vec<crate::flowspace::model::GraphRef>,
 }
 
-/// Whole-program two-phase type cache, keyed by subject [`CallPath`].
+/// Whole-program two-phase type cache, keyed by the GraphStore
+/// representative of a subject graph (`GraphStore::canonical_path`).
 /// AccessDirect and Regular of the same segments stay distinct via
 /// [`GraphSpecialization`] (`specialize.py default_specialize`).
 #[derive(Default)]
@@ -524,6 +525,7 @@ pub struct TwoPhaseTypeCache {
 impl TwoPhaseTypeCache {
     /// Record a subject and the inverse `graph → path` map
     /// (`call.py CallControl.jitcodes` / `graphs_from` `funcobj.graph`).
+    /// `path` is the GraphStore representative (`GraphStore::canonical_path`).
     pub fn insert_subject(&mut self, path: CallPath, subject: TwoPhaseSubject) {
         self.subject_paths
             .insert(subject.graph_key.clone(), path.clone());

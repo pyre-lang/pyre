@@ -1538,12 +1538,14 @@ fn emit_conditional_call_oopspec_named(
     let fn_target = match callee {
         CallTarget::FunctionPath {
             mut segments,
+            resolved_path: _,
             fun_decl_id,
             specialization,
         } => {
             segments.insert(0, FN_CONST_HEAD.to_string());
             CallTarget::FunctionPath {
                 segments,
+                resolved_path: None,
                 fun_decl_id,
                 specialization,
             }

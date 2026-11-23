@@ -274,6 +274,13 @@ pub enum CallTarget {
     },
     FunctionPath {
         segments: Vec<String>,
+        /// Same role as [`Self::Method`]'s `resolved_path`: the registered
+        /// graph key stamped when the FunDecl is known
+        /// (`call.py:29` `getfunctionptr(graph)` / `Bookkeeper.getdesc`).
+        /// `segments` stay the harvest spelling front-end matchers read.
+        /// Transient (`#[serde(skip)]`) — never reaches codegen / serde.
+        #[serde(skip, default)]
+        resolved_path: Option<crate::parse::CallPath>,
         /// Caller's LLBC-local `FunDecl.def_id`. See [`Self::Method`].
         #[serde(skip, default)]
         fun_decl_id: Option<u64>,
@@ -426,7 +433,8 @@ impl CallTarget {
 
     pub fn resolved_path(&self) -> Option<&crate::parse::CallPath> {
         match self {
-            CallTarget::Method { resolved_path, .. } => resolved_path.as_ref(),
+            CallTarget::Method { resolved_path, .. }
+            | CallTarget::FunctionPath { resolved_path, .. } => resolved_path.as_ref(),
             _ => None,
         }
     }
@@ -452,10 +460,14 @@ impl CallTarget {
         self
     }
 
-    /// Stamp the registered graph path for a method callee.
+    /// Stamp the registered graph path for a Method or FunctionPath callee.
     pub fn with_resolved_path(mut self, path: crate::parse::CallPath) -> Self {
-        if let CallTarget::Method { resolved_path, .. } = &mut self {
-            *resolved_path = Some(path);
+        match &mut self {
+            CallTarget::Method { resolved_path, .. }
+            | CallTarget::FunctionPath { resolved_path, .. } => {
+                *resolved_path = Some(path);
+            }
+            _ => {}
         }
         self
     }
@@ -467,6 +479,7 @@ impl CallTarget {
     {
         Self::FunctionPath {
             segments: segments.into_iter().map(Into::into).collect(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: crate::parse::GraphSpecialization::Regular,
         }
@@ -476,6 +489,7 @@ impl CallTarget {
     pub fn from_call_path(path: &crate::parse::CallPath) -> Self {
         Self::FunctionPath {
             segments: path.segments.clone(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: path.specialization,
         }
@@ -9641,14 +9655,48 @@ impl FuncEffects {
     }
 }
 
-/// Identity of a source funcobj: `(source_identity or owner_root, name, specialization)`.
+/// Identity of a source funcobj: `(funcobj_identity or source_identity or
+/// owner_root, name, specialization)`.
 ///
-/// `name` is the graph's display name (`description.py FunctionDesc.cachedgraph`
-/// alt_name). `specialization` is the `specialize.py default_specialize`
-/// cache key: `AccessDirect` is `(AccessDirect, None)`, `Regular` is every
-/// other graph. Alias spellings of one source funcobj resolve to the same
-/// `GraphKey`.
+/// `funcobj_identity` is `scope_owner_identity` (`Bookkeeper.getdesc`).
+/// When that identity (or `source_identity`) is present, `name` is the
+/// last segment of the graph's display name: occupancy harvest
+/// (`num::<Impl>::<impl usize>::saturating_sub`) and the unique-primitive
+/// harvest (`num::<Impl>::saturating_sub`) of one item share that leaf, so
+/// one function object is one GraphKey. A `__spec_*` suffix stays on the
+/// leaf (`FunctionDesc.cachedgraph`). When neither identity is present,
+/// `name` is the full display name so graphs that share a leaf
+/// (`Owner::setitem` vs `Store::setitem`) stay distinct. `specialization`
+/// is the `specialize.py default_specialize` cache key: `AccessDirect` is
+/// `(AccessDirect, None)`, `Regular` is every other graph. Alias spellings
+/// of one source funcobj resolve to the same `GraphKey`.
 pub type GraphKey = (Option<String>, String, crate::parse::GraphSpecialization);
+
+/// [`GraphKey`] of a funcobj from the same components `FunctionGraph::graph_key`
+/// and `semantic_function_dedup_key` read: identity (`Bookkeeper.getdesc`),
+/// display name, and `FunctionDesc.cachedgraph` specialization.
+///
+/// When `identity` is present, the name component is the last `::` segment of
+/// `display_name`, so occupancy and unique-primitive harvest prefixes of one
+/// item share a key and a `__spec_*` suffix stays on the leaf. When it is
+/// absent, the full display name is kept so graphs that share a leaf stay
+/// distinct.
+pub(crate) fn graph_key_of(
+    identity: Option<&str>,
+    display_name: &str,
+    specialization: crate::parse::GraphSpecialization,
+) -> GraphKey {
+    let name = if identity.is_some() {
+        display_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(display_name)
+            .to_string()
+    } else {
+        display_name.to_string()
+    };
+    (identity.map(str::to_string), name, specialization)
+}
 
 /// A funcobj's flow graph, built on first demand
 /// (`description.py FunctionDesc.cachedgraph`). Clones share the one graph.
@@ -9914,6 +9962,14 @@ pub struct FunctionGraph {
     /// Synthetic/test graphs leave this as `None` and retain the historical
     /// `(owner_root, name)` identity fallback.
     pub source_identity: Option<String>,
+    /// Occupancy key of the source function object (`Bookkeeper.getdesc`).
+    ///
+    /// `scope_owner_identity` is injective over local bodies and matches
+    /// across crates for the same rustc item. GraphStore occupies by this
+    /// string, not by the human [`Self::source_identity`] label. `None` on
+    /// synthetic and test graphs, which fall back to `source_identity` /
+    /// `owner_root`.
+    pub funcobj_identity: Option<String>,
     /// Caller's LLBC-local `FunDecl.def_id` of the declaration this graph
     /// was lowered from. Unique within that artefact only; graph lookup
     /// uses the registered path, never this number. `None` for synthetic
@@ -10143,6 +10199,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
     FunctionGraph {
         name: graph.name.clone(),
         source_identity: graph.source_identity.clone(),
+        funcobj_identity: graph.funcobj_identity.clone(),
         fun_decl_id: graph.fun_decl_id,
         owner_root: graph.owner_root.clone(),
         startblock: graph.startblock,
@@ -10313,6 +10370,7 @@ impl FunctionGraph {
             residual_return_type: None,
             owner_root: None,
             source_identity: None,
+            funcobj_identity: None,
             fun_decl_id: None,
             hints: Vec::new(),
             access_directly: false,
@@ -10338,13 +10396,12 @@ impl FunctionGraph {
 
     /// The source funcobj's [`GraphKey`].
     pub fn graph_key(&self) -> GraphKey {
-        (
-            self.source_identity
-                .clone()
-                .or_else(|| self.owner_root.clone()),
-            self.name.clone(),
-            self.specialization,
-        )
+        let identity = self
+            .funcobj_identity
+            .as_deref()
+            .or(self.source_identity.as_deref());
+        let (id, name, spec) = graph_key_of(identity, &self.name, self.specialization);
+        (id.or_else(|| self.owner_root.clone()), name, spec)
     }
 
     /// Append one hint token and project a policy token onto `func`.
@@ -10397,6 +10454,11 @@ impl FunctionGraph {
 
     pub fn with_source_identity(mut self, identity: impl Into<String>) -> Self {
         self.source_identity = Some(identity.into());
+        self
+    }
+
+    pub fn with_funcobj_identity(mut self, identity: impl Into<String>) -> Self {
+        self.funcobj_identity = Some(identity.into());
         self
     }
 
@@ -12350,6 +12412,35 @@ impl FunctionGraph {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn occupancy_and_unique_primitive_harvest_share_graph_key() {
+        let identity = "core::num::<impl usize>::saturating_sub|usize,usize|usize|/rustc/library/core/src/num/mod.rs:1454:4||";
+        let mut unique_primitive = FunctionGraph::new("num::<Impl>::saturating_sub");
+        unique_primitive.funcobj_identity = Some(identity.into());
+        let mut occupancy = FunctionGraph::new("num::<Impl>::<impl usize>::saturating_sub");
+        occupancy.funcobj_identity = Some(identity.into());
+        assert_eq!(
+            unique_primitive.graph_key(),
+            occupancy.graph_key(),
+            "one function object is one GraphKey"
+        );
+        let mut spec = FunctionGraph::new("num::<Impl>::saturating_sub__spec_deadbeefdeadbeef");
+        spec.funcobj_identity = Some(identity.into());
+        assert_ne!(
+            unique_primitive.graph_key(),
+            spec.graph_key(),
+            "a cachedgraph spec copy keeps its leaf"
+        );
+        let inherent = FunctionGraph::new("Owner::setitem");
+        let trait_impl = FunctionGraph::new("Store::setitem");
+        assert_ne!(
+            inherent.graph_key(),
+            trait_impl.graph_key(),
+            "graphs without a funcobj identity keep the full display name"
+        );
+    }
 
     #[test]
     fn longlong_wider_than_signed_compares_against_signed_size() {
@@ -12441,7 +12532,6 @@ mod tests {
         assert_eq!(first.jit_look_inside, Some(false));
         assert!(first.unroll_safe);
     }
-    use super::*;
 
     #[test]
     fn getkind_number_floors_sizeof_like_rffi() {
@@ -13783,6 +13873,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13884,6 +13975,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -13978,6 +14070,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14021,6 +14114,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -14140,6 +14234,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14215,6 +14310,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -14267,6 +14363,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["core".into(), "ptr".into(), "write".into()],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -14550,6 +14647,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -14628,6 +14726,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15163,6 +15262,7 @@ mod tests {
                             "object_model".into(),
                             "get_instantiate".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15284,6 +15384,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15439,6 +15540,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15628,6 +15730,7 @@ mod tests {
                             "Box".into(),
                             "new_uninit".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15642,6 +15745,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -15656,6 +15760,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "assume_init".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -15929,6 +16034,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "new".into()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -16039,6 +16145,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -16108,6 +16215,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -16155,6 +16263,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -16378,6 +16487,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -16537,6 +16647,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -16672,6 +16783,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -16815,6 +16927,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -17132,6 +17245,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17245,6 +17359,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17368,6 +17483,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17433,6 +17549,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -17683,6 +17800,7 @@ mod tests {
                                 "object_model".into(),
                                 "get_instantiate".into(),
                             ],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -17725,6 +17843,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -17818,6 +17937,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -17957,6 +18077,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -18165,6 +18286,7 @@ mod tests {
                             "object_model".into(),
                             "get_instantiate".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18228,6 +18350,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18372,6 +18495,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18527,6 +18651,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18682,6 +18807,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18812,6 +18938,7 @@ mod tests {
                             "lltype".into(),
                             "malloc".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -18995,6 +19122,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19110,6 +19238,7 @@ mod tests {
                             "IntArray".into(),
                             "empty".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19195,6 +19324,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19334,6 +19464,7 @@ mod tests {
                             "IntArray".into(),
                             "empty".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19433,6 +19564,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -19587,6 +19719,7 @@ mod tests {
                                 "Payload".into(),
                                 "empty".into(),
                             ],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -19673,6 +19806,7 @@ mod tests {
                                 "lltype".into(),
                                 "malloc_typed_managed".into(),
                             ],
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -19930,6 +20064,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20181,6 +20316,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20409,6 +20545,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20530,6 +20667,7 @@ mod tests {
                             "IntArray".into(),
                             "empty".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20610,6 +20748,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -20628,6 +20767,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20768,6 +20908,7 @@ mod tests {
                             "IntArray".into(),
                             "empty".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -20782,6 +20923,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -20866,6 +21008,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21008,6 +21151,7 @@ mod tests {
                             "IntArray".into(),
                             "empty".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21127,6 +21271,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21367,6 +21512,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21563,6 +21709,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21662,6 +21809,7 @@ mod tests {
                             "young_nonmoving".into(),
                             "alloc_raw".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21756,6 +21904,7 @@ mod tests {
                             "young_nonmoving".into(),
                             "alloc_raw".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -21866,6 +22015,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -22169,6 +22319,7 @@ mod tests {
                                         .iter()
                                         .map(|s| (*s).to_string())
                                         .collect(),
+                                        resolved_path: None,
                                         fun_decl_id: None,
                                         specialization: crate::parse::GraphSpecialization::Regular,
                                     },
@@ -22214,6 +22365,7 @@ mod tests {
                                 .iter()
                                 .map(|s| (*s).to_string())
                                 .collect(),
+                            resolved_path: None,
                             fun_decl_id: None,
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
@@ -22451,6 +22603,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -22588,6 +22741,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -22727,6 +22881,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -22822,6 +22977,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed_managed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -22942,6 +23098,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -23026,6 +23183,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -23116,6 +23274,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_header".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -23170,6 +23329,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -23268,6 +23428,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -23358,6 +23519,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -23442,6 +23604,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -23652,6 +23815,7 @@ mod tests {
                     "object_model".into(),
                     "get_instantiate".into(),
                 ],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -23821,6 +23985,7 @@ mod tests {
         let box_new_uninit = || OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
+                resolved_path: None,
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
@@ -25417,6 +25582,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        resolved_path: None,
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -25433,6 +25599,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__iter_next".to_string()],
+                    resolved_path: None,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
@@ -25696,6 +25863,25 @@ mod tests {
             resolved_path: Some(path),
             fun_decl_id: None,
             branch_payloads: None,
+        };
+        let json = serde_json::to_string(&t).expect("encode");
+        assert!(
+            !json.contains("resolved_path"),
+            "serialized form leaks resolved_path: {json}"
+        );
+        let round_trip: CallTarget = serde_json::from_str(&json).expect("decode");
+        assert_eq!(round_trip.resolved_path(), None);
+    }
+
+    #[test]
+    fn call_target_function_path_resolved_path_is_skipped_by_serde() {
+        use crate::parse::CallPath;
+        let path = CallPath::from_segments(["fixture", "celldict", "Owner", "setitem"]);
+        let t = CallTarget::FunctionPath {
+            segments: vec!["celldict".into(), "Owner".into(), "setitem".into()],
+            resolved_path: Some(path),
+            fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let json = serde_json::to_string(&t).expect("encode");
         assert!(

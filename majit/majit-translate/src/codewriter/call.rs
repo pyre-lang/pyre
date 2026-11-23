@@ -137,6 +137,7 @@ fn call_is_access_directly_identity(kind: &OpKind) -> bool {
     let origin_kind = OpKind::Call {
         target: CallTarget::FunctionPath {
             segments: segments.clone(),
+            resolved_path: None,
             fun_decl_id: None,
             specialization: GraphSpecialization::Regular,
         },
@@ -2285,6 +2286,20 @@ impl GraphStore {
         Self::default()
     }
 
+    /// Representative spelling of the funcobj `path` names.
+    /// `call.py CallControl.get_jitcode` keys `self.jitcodes` on the graph
+    /// object; `lltype.py getfunctionptr` derives the pointer from that
+    /// graph. Unregistered `path` is its own canonical spelling.
+    pub(crate) fn canonical_path(&self, path: &CallPath) -> CallPath {
+        StoreCore::canonical_path(self, path)
+    }
+
+    /// Stamp `path` as this GraphKey's DISPLAY/harvest representative when
+    /// it is a stored spelling (`harvest_registration_path`).
+    pub(crate) fn mark_canonical_path(&self, path: &CallPath) {
+        StoreCore::mark_canonical_path(self, path)
+    }
+
     /// The graph of the funcobj `path` names, for a reader that outlives
     /// this borrow of the store.
     pub(crate) fn body(&self, path: &CallPath) -> Option<StoredBody> {
@@ -2431,6 +2446,14 @@ struct GraphSlot {
     /// over its self type); the desc `cachedgraph` copies are named from
     /// (`bookkeeper.py Bookkeeper.getdesc`).
     identity: Option<CallPath>,
+    /// DISPLAY/harvest spelling of this GraphKey (`spec_segments` /
+    /// `harvest_registration_path`). `call.py CallControl.get_jitcode` keys
+    /// `self.jitcodes` on the graph object; pyre uses this path as that key.
+    /// Stamped by `StoreCore::mark_canonical_path` when harvest is stored;
+    /// otherwise the first-bound path (`add_path`). `paths` is sorted by
+    /// segments and is not the representative (crate-prefixed identity
+    /// would sort first).
+    canonical: Option<CallPath>,
 }
 
 #[derive(Clone)]
@@ -2750,6 +2773,7 @@ impl GraphSlot {
             declared: false,
             paths: Vec::new(),
             identity: None,
+            canonical: None,
         }
     }
 
@@ -2763,10 +2787,14 @@ impl GraphSlot {
             declared: false,
             paths: Vec::new(),
             identity: None,
+            canonical: None,
         }
     }
 
     fn add_path(&mut self, path: CallPath) {
+        if self.canonical.is_none() {
+            self.canonical = Some(path.clone());
+        }
         match self
             .paths
             .binary_search_by(|p| p.segments.cmp(&path.segments))
@@ -3061,11 +3089,12 @@ impl StoreCore {
             .collect();
         self.passes.push(pass.clone());
         for key in keys {
-            let Some((mut graph, paths, declared, identity)) = self.take_graph(&key) else {
+            let Some((mut graph, paths, declared, identity, canonical)) = self.take_graph(&key)
+            else {
                 continue;
             };
             self.apply_pass(&pass, &mut graph);
-            self.restore_graph(key, graph, paths, declared, identity);
+            self.restore_graph(key, graph, paths, declared, identity, canonical);
         }
     }
 
@@ -3351,8 +3380,7 @@ impl StoreCore {
     /// The graph of the funcobj `path` names, built on first demand.
     pub(crate) fn get(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
         let slot = self.slot_for(path)?;
-        let graph = self.slot_graph(&slot)?.graph.clone();
-        Some(graph)
+        Some(self.slot_graph(&slot)?.graph.clone())
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
@@ -3442,6 +3470,67 @@ impl StoreCore {
         self.iter().into_iter().map(|(path, _)| path).collect()
     }
 
+    /// FunctionPath calls whose stamped `resolved_path` is not a graph
+    /// in this store. Spec copies must alias that identity onto the
+    /// harvest graph (`Bookkeeper.getdesc`). Walks already-built slots
+    /// only: `iter` / `get` would build residual funcobjs.
+    ///
+    /// The bool is whether the call's harvest `segments` path *is*
+    /// registered: then identity is missing on a graph that exists
+    /// (a registration gap). Residual externals have harvest unregistered
+    /// too; lookup falls back to `segments` as HEAD did.
+    pub(crate) fn unregistered_function_path_resolved(&self) -> Vec<(Vec<String>, CallPath, bool)> {
+        self.register_declared();
+        let mut seen = std::collections::HashSet::new();
+        let mut built = Vec::new();
+        {
+            let graphs = self.graphs.borrow();
+            for slot in graphs.values() {
+                let Some(Some(built_slot)) = slot.graph.get() else {
+                    continue;
+                };
+                let ptr = std::rc::Rc::as_ptr(&built_slot.graph) as usize;
+                if seen.insert(ptr) {
+                    built.push(built_slot.graph.clone());
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for graph in built {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let crate::model::OpKind::Call {
+                        target:
+                            crate::model::CallTarget::FunctionPath {
+                                segments,
+                                specialization,
+                                resolved_path: Some(resolved),
+                                ..
+                            },
+                        ..
+                    } = &op.kind
+                    else {
+                        continue;
+                    };
+                    if self.names_funcobj(resolved) {
+                        continue;
+                    }
+                    let mut harvest = CallPath::from_segments(segments.iter().cloned());
+                    harvest.specialization = *specialization;
+                    let harvest_registered = self.names_funcobj(&harvest);
+                    rows.push((segments.clone(), resolved.clone(), harvest_registered));
+                }
+            }
+        }
+        rows.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.display_name().cmp(&right.1.display_name()))
+        });
+        rows.dedup();
+        rows
+    }
+
     /// `(alias path, shared graph)` for every registered spelling, each
     /// graph built.  The same graph appears once per alias, mirroring the
     /// old per-path map. Ordered by `CallPath.display_name` so
@@ -3495,7 +3584,13 @@ impl StoreCore {
     fn take_graph(
         &mut self,
         key: &GraphKey,
-    ) -> Option<(FunctionGraph, Vec<CallPath>, bool, Option<CallPath>)> {
+    ) -> Option<(
+        FunctionGraph,
+        Vec<CallPath>,
+        bool,
+        Option<CallPath>,
+        Option<CallPath>,
+    )> {
         self.register_declared();
         let graphs = self.graphs.get_mut();
         let slot = graphs.remove(key)?;
@@ -3504,12 +3599,14 @@ impl StoreCore {
             let paths = slot.paths;
             let declared = slot.declared;
             let identity = slot.identity;
+            let canonical = slot.canonical;
             let built = slot.graph.into_inner().flatten()?;
             return Some((
                 std::rc::Rc::unwrap_or_clone(built.graph),
                 paths,
                 declared,
                 identity,
+                canonical,
             ));
         }
         // Not built: put it back untouched.
@@ -3525,11 +3622,13 @@ impl StoreCore {
         paths: Vec<CallPath>,
         declared: bool,
         identity: Option<CallPath>,
+        canonical: Option<CallPath>,
     ) {
         let mut slot = GraphSlot::built(std::rc::Rc::new(graph));
         slot.paths = paths;
         slot.declared = declared;
         slot.identity = identity;
+        slot.canonical = canonical;
         self.graphs.get_mut().insert(key, std::rc::Rc::new(slot));
     }
 
@@ -3538,6 +3637,58 @@ impl StoreCore {
     pub(crate) fn len(&self) -> usize {
         self.register_declared();
         self.path_to_key.borrow().len()
+    }
+
+    /// Representative spelling of the funcobj `path` names.
+    /// `call.py CallControl.get_jitcode` keys `self.jitcodes` on the graph
+    /// object; `lltype.py getfunctionptr` derives the pointer from that
+    /// graph. Unregistered `path` is its own canonical spelling.
+    ///
+    /// The representative is a current stored spelling of this GraphKey
+    /// (`slot.paths`): the stamped DISPLAY/harvest path when that path is
+    /// still bound, else the declared identity path, else the remaining
+    /// alias. A first-bound Charon `<Impl>` token that
+    /// `bind_unique_alias_proposals` later unbound is not a drain key
+    /// (`function_graphs.get`).
+    pub(crate) fn canonical_path(&self, path: &CallPath) -> CallPath {
+        let Some(key) = self.key_for(path) else {
+            return path.clone();
+        };
+        let graphs = self.graphs.borrow();
+        let Some(slot) = graphs.get(&key) else {
+            return path.clone();
+        };
+        let stored = |candidate: &CallPath| slot.paths.iter().any(|p| p == candidate);
+        if let Some(canonical) = &slot.canonical
+            && stored(canonical)
+        {
+            return canonical.clone();
+        }
+        if let Some(identity) = &slot.identity
+            && stored(identity)
+        {
+            return identity.clone();
+        }
+        slot.paths.first().cloned().unwrap_or_else(|| path.clone())
+    }
+
+    /// Stamp `path` as the DISPLAY/harvest representative of its GraphKey
+    /// when `path` is currently stored. Free-function harvest aliases are
+    /// registered through a `HashMap` whose iteration order is not the
+    /// harvest-first bind `alias_unique_call_path` documents; without this
+    /// stamp `get_jitcode` would key shells on a random alias.
+    pub(crate) fn mark_canonical_path(&self, path: &CallPath) {
+        let Some(key) = self.key_for(path) else {
+            return;
+        };
+        let mut graphs = self.graphs.borrow_mut();
+        let Some(slot) = graphs.get_mut(&key) else {
+            return;
+        };
+        let slot = std::rc::Rc::make_mut(slot);
+        if slot.paths.iter().any(|p| p == path) {
+            slot.canonical = Some(path.clone());
+        }
     }
 
     /// Every `CallPath` spelling of the funcobj `path` names, including
@@ -3794,11 +3945,16 @@ impl StoreCore {
         let Some(key) = self.key_for(&existing) else {
             return Vec::new();
         };
-        let mut paths = aliases;
-        paths.push(identity_path);
-        paths
+        // `identity_path` is the harvest DISPLAY spelling already bound
+        // as this funcobj (`spec_segments`). Propose only extra aliases.
+        // Ambiguous extra aliases stay unbound (`Bookkeeper.getdesc`).
+        aliases
             .into_iter()
-            .filter(|path| !is_access_directly_path(path) && !colliding_inherent(path))
+            .filter(|path| {
+                *path != identity_path
+                    && !is_access_directly_path(path)
+                    && !colliding_inherent(path)
+            })
             .map(|path| (path, key.clone()))
             .collect()
     }
@@ -4482,7 +4638,9 @@ pub struct CallControl {
     method_to_impl_types: HashMap<String, Vec<String>>,
 
     /// Candidate targets — graphs we will inline.
-    /// RPython: `CallControl.candidate_graphs`.
+    /// RPython: `CallControl.candidate_graphs` (a set of graph objects).
+    /// Each graph is stored under its GraphStore representative
+    /// (`GraphStore::canonical_path`).
     candidate_graphs: HashSet<CallPath>,
     /// Support flags of the policy `find_all_graphs` / `find_helper_graphs`
     /// received. Helpers minted after that walk (`alloc_and_set`) call
@@ -7653,8 +7811,13 @@ impl CallControl {
     /// Admit `path` as a candidate after `find_all_graphs` has run — for a
     /// helper graph minted during transformation (`codewriter::getslice`),
     /// which the BFS could not have reached.
+    ///
+    /// `call.py CallControl.candidate_graphs` is a set of graph objects.
+    /// Insert the GraphStore representative so a caller's spelling cannot
+    /// miss (`GraphStore::canonical_path`).
     pub fn add_candidate_graph(&mut self, path: CallPath) {
-        self.candidate_graphs.insert(path);
+        self.candidate_graphs
+            .insert(self.function_graphs.canonical_path(&path));
     }
 
     /// Admit `path` when `policy.look_inside_graph` would, using the flags
@@ -7663,6 +7826,7 @@ impl CallControl {
     /// goes through this so a `_jit_look_inside_ = False` trampoline stays
     /// residual the way BFS would have left it.
     pub fn add_candidate_graph_if_look_inside(&mut self, path: CallPath) {
+        let path = self.function_graphs.canonical_path(&path);
         let Some(graph) = self.function_graphs.get(&path) else {
             return;
         };
@@ -8792,7 +8956,8 @@ impl CallControl {
         if self.jitdrivers_sd.is_empty() {
             let all_paths: Vec<CallPath> = self.function_graphs.keys();
             for path in all_paths {
-                self.candidate_graphs.insert(path);
+                self.candidate_graphs
+                    .insert(self.function_graphs.canonical_path(&path));
             }
             return;
         }
@@ -9053,7 +9218,7 @@ impl CallControl {
             Trait(String, String),
             BuiltinWrappers,
         }
-        let (spelled_function_path, expand) = {
+        let (spelled_function_path, stamped_resolved, expand) = {
             let Some(graph) = self.function_graphs.get(caller) else {
                 return;
             };
@@ -9068,7 +9233,11 @@ impl CallControl {
                 OpKind::Call {
                     target: target @ CallTarget::FunctionPath { .. },
                     ..
-                } => (target.function_call_path(), None),
+                } => (
+                    target.function_call_path(),
+                    target.resolved_path().cloned(),
+                    None,
+                ),
                 OpKind::Call {
                     target:
                         CallTarget::Indirect {
@@ -9079,18 +9248,22 @@ impl CallControl {
                     ..
                 } => (
                     None,
+                    None,
                     Some(ExpandFamily::Trait(trait_root.clone(), method_name.clone())),
                 ),
                 OpKind::IndirectCall {
                     graphs: Some(graphs),
                     ..
-                } if graphs.is_empty() => (None, Some(ExpandFamily::BuiltinWrappers)),
-                _ => (None, None),
+                } if graphs.is_empty() => (None, None, Some(ExpandFamily::BuiltinWrappers)),
+                _ => (None, None, None),
             }
         };
         let function_path_matches = spelled_function_path
             .as_ref()
             .is_some_and(|spelled| from_aliases.contains(&self.resolved_callable_path(spelled)));
+        let resolved_matches = stamped_resolved.as_ref().is_some_and(|path| {
+            path == from || from_aliases.contains(&self.resolved_callable_path(path))
+        });
         let mut expanded = match expand {
             Some(ExpandFamily::Trait(trait_root, method_name)) => {
                 Some(self.all_impls_for_indirect(&trait_root, &method_name))
@@ -9115,11 +9288,15 @@ impl CallControl {
                 CallTarget::FunctionPath {
                     segments,
                     specialization,
+                    resolved_path,
                     ..
                 } => {
                     if function_path_matches {
                         *segments = to.segments.clone();
                         *specialization = to.specialization;
+                    }
+                    if function_path_matches || resolved_matches {
+                        *resolved_path = Some(to.clone());
                     }
                 }
                 CallTarget::Method { resolved_path, .. } => {
@@ -9437,7 +9614,7 @@ impl CallControl {
         self.return_notify
             .entry(key)
             .or_default()
-            .insert(caller.clone());
+            .insert(self.function_graphs.canonical_path(caller));
     }
 
     /// Callers wired onto `callee`'s returnblock notify set.
@@ -9498,7 +9675,10 @@ impl CallControl {
     /// for the entry point.
     pub(crate) fn annotate_access_directly(&mut self, roots: &[CallPath]) {
         let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
-        let mut todo: Vec<CallPath> = roots.to_vec();
+        let mut todo: Vec<CallPath> = roots
+            .iter()
+            .map(|path| self.function_graphs.canonical_path(path))
+            .collect();
         let mut entered: HashSet<CallPath> = todo.iter().cloned().collect();
         while let Some(path) = todo.pop() {
             let Some(graph) = self.function_graphs.get(&path) else {
@@ -9677,6 +9857,7 @@ impl CallControl {
                                     op_returns.push(FlagReturn::UNFLAGGED);
                                     continue;
                                 };
+                                let ad_path = self.function_graphs.canonical_path(&ad_path);
                                 self.retarget_call_op(&path, block_idx, op_idx, &origin, &ad_path);
                                 let callee_return = self
                                     .function_graphs
@@ -9711,6 +9892,7 @@ impl CallControl {
                                 } else {
                                     callee_path
                                 };
+                                let target = self.function_graphs.canonical_path(&target);
                                 let callee_return = self
                                     .function_graphs
                                     .get(&target)
@@ -10015,9 +10197,13 @@ impl CallControl {
         let mut todo: Vec<CallPath> = self
             .jitdrivers_sd
             .iter()
-            .map(|jd| jd.portal_graph.clone())
+            .map(|jd| self.function_graphs.canonical_path(&jd.portal_graph))
             .collect();
-        todo.extend_from_slice(helper_roots);
+        todo.extend(
+            helper_roots
+                .iter()
+                .map(|path| self.function_graphs.canonical_path(path)),
+        );
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
         }
@@ -10030,8 +10216,9 @@ impl CallControl {
             // same generated-wrapper PBC family explicitly.  This is the builtin
             // gateway analogue of call.py:59-64's oopspec helper seeds below.
             for path in &builtin_wrappers {
+                let path = self.function_graphs.canonical_path(path);
                 if self.candidate_graphs.insert(path.clone()) {
-                    todo.push(path.clone());
+                    todo.push(path);
                 }
             }
             // PyPy's portal reaches `_trace` → `profilefunc`
@@ -10045,10 +10232,14 @@ impl CallControl {
             // `warmspot.py check_access_directly_sanity` requires the
             // specialized graph itself to be in `jit_graphs`.
             for path in self.profilefunc_indirect_graphs() {
+                let path = self.function_graphs.canonical_path(&path);
                 if self.candidate_graphs.insert(path.clone()) {
                     todo.push(path.clone());
                 }
-                self.candidate_graphs.insert(access_directly_path(&path));
+                self.candidate_graphs.insert(
+                    self.function_graphs
+                        .canonical_path(&access_directly_path(&path)),
+                );
             }
             // call.py:59-64 — seed the BFS with builtin oopspec helpers so
             // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
@@ -10123,7 +10314,9 @@ impl CallControl {
                     None,
                     None,
                 );
-                let impl_path = CallPath::from_segments([spec.impl_name.as_str()]);
+                let impl_path = self
+                    .function_graphs
+                    .canonical_path(&CallPath::from_segments([spec.impl_name.as_str()]));
                 if self.function_graphs.contains_key(&impl_path)
                     && !self.candidate_graphs.contains(&impl_path)
                 {
@@ -10137,6 +10330,7 @@ impl CallControl {
         // no graph is reported by the drain loop below.
         let helper_seeds = self.helper_seed_graphs.clone();
         for path in helper_seeds {
+            let path = self.function_graphs.canonical_path(&path);
             if self.candidate_graphs.insert(path.clone()) {
                 todo.push(path);
             }
@@ -10170,6 +10364,7 @@ impl CallControl {
                     let callees =
                         self.call_op_callees(op, &path, block_idx, op_idx, true, &builtin_wrappers);
                     for callee_path in callees {
+                        let callee_path = self.function_graphs.canonical_path(&callee_path);
                         // A target with no registered graph is upstream's
                         // `funcobj.graph is None` → residual (call.py:127).
                         //
@@ -10223,7 +10418,8 @@ impl CallControl {
     /// RPython: `CallControl.is_candidate(graph)`.
     /// Used only after `find_all_graphs()`.
     pub fn is_candidate(&self, path: &CallPath) -> bool {
-        self.candidate_graphs.contains(path)
+        self.candidate_graphs
+            .contains(&self.function_graphs.canonical_path(path))
     }
 
     /// Size of the post-`find_all_graphs` candidate set — the graphs the
@@ -10254,14 +10450,18 @@ impl CallControl {
     /// RPython call.py: creates JitCode(graph.name, fnaddr, calldescr)
     /// and adds graph to unfinished_graphs for later assembly.
     pub fn get_jitcode(&mut self, path: &CallPath) -> std::sync::Arc<crate::jitcode::JitCode> {
+        // `call.py CallControl.get_jitcode` keys `self.jitcodes` on the
+        // graph object. Lookup and insert use that object's one GraphStore
+        // representative (`GraphStore::canonical_path`).
+        let path = self.function_graphs.canonical_path(path);
         // RPython call.py:157-158: try: return self.jitcodes[graph]
-        if let Some(arc) = self.jitcodes.get(path) {
+        if let Some(arc) = self.jitcodes.get(&path) {
             return arc.clone();
         }
         // RPython call.py:159-165: except KeyError:
         //   must never produce JitCode for close_stack.
         assert!(
-            !self.func_effects(path).is_some_and(|f| f.close_stack),
+            !self.func_effects(&path).is_some_and(|f| f.close_stack),
             "{:?} has _gctransformer_hint_close_stack_",
             path
         );
@@ -10280,17 +10480,20 @@ impl CallControl {
         // AccessDirect copies share the original function's address: one
         // Rust function backs both graphs, as one C function backs a
         // residual call in upstream only if the graph is not looked inside.
-        let origin = access_directly_origin_path(path);
-        let fnaddr_path = origin.as_ref().unwrap_or(path);
+        let origin = access_directly_origin_path(&path);
+        let fnaddr_path = origin.as_ref().unwrap_or(&path);
+        // `lltype.py getfunctionptr(graph)` derives the pointer from the
+        // graph object: hash the same canonical spelling the cache uses.
+        let fnaddr_path = self.function_graphs.canonical_path(fnaddr_path);
         // `call.py get_jitcode` stores `getfunctionptr(graph)` — a
         // symbolic the C backend's linker resolves by name. Record the
         // same `{ path, symbolic }` pair `fnaddr_binding_for_target`
         // writes onto a `constants_i` FnAddr descriptor.
-        let (resolved_path, fnaddr, symbolic) = match self.concrete_fnaddr_binding(fnaddr_path) {
+        let (resolved_path, fnaddr, symbolic) = match self.concrete_fnaddr_binding(&fnaddr_path) {
             Some((resolved, addr)) => (resolved, addr, false),
             None => (
                 fnaddr_path.clone(),
-                symbolic_fnaddr_for_path(fnaddr_path),
+                symbolic_fnaddr_for_path(&fnaddr_path),
                 true,
             ),
         };
@@ -10328,6 +10531,7 @@ impl CallControl {
         path: CallPath,
         graph: crate::flowspace::model::FunctionGraph,
     ) -> std::sync::Arc<crate::jitcode::JitCode> {
+        let path = self.function_graphs.canonical_path(&path);
         self.opname_graphs.insert(path.clone(), graph);
         // Make the helper resolvable as a regular callee: record its path
         // persistently (for `target_to_path`) and mark it a candidate (for
@@ -10352,13 +10556,15 @@ impl CallControl {
         &mut self,
         path: &CallPath,
     ) -> Option<crate::flowspace::model::FunctionGraph> {
-        self.opname_graphs.remove(path)
+        let path = self.function_graphs.canonical_path(path);
+        self.opname_graphs.remove(&path)
     }
 
     /// Whether `path` is registered as an opname-dispatch helper graph.
     /// Read-only peek used where a borrow of the graph is not yet needed.
     pub fn has_opname_graph(&self, path: &CallPath) -> bool {
-        self.opname_graphs.contains_key(path)
+        self.opname_graphs
+            .contains_key(&self.function_graphs.canonical_path(path))
     }
 
     /// Read-only handle lookup. Returns `None` for paths that have not
@@ -10367,7 +10573,8 @@ impl CallControl {
         &self,
         path: &CallPath,
     ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
-        self.jitcodes.get(path).cloned()
+        let path = self.function_graphs.canonical_path(path);
+        self.jitcodes.get(&path).cloned()
     }
 
     /// RPython `codewriter.py CodeWriter.make_jitcodes all_jitcodes.append(jitcode)` — the
@@ -11015,7 +11222,7 @@ impl CallControl {
         // gateway body to its JitCode.
         let wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
         for wrapper in wrappers {
-            if self.candidate_graphs.contains(&wrapper) {
+            if self.is_candidate(&wrapper) {
                 self.get_jitcode(&wrapper);
             }
         }
@@ -11171,10 +11378,11 @@ impl CallControl {
         match &op.kind {
             OpKind::Call { target, .. } => {
                 // `graphs_from` direct_call branch: `funcobj.graph` if
-                // `is_candidate(graph)`.  The registered spelling is the
-                // graph identity BFS also follows; an unregistered
+                // `is_candidate(graph)`.  The GraphStore representative is
+                // the graph identity BFS also follows; an unregistered
                 // `target_to_path` result is residual, not a different key.
                 let path = self.direct_callee_graph_path(target, None)?;
+                let path = self.function_graphs.canonical_path(&path);
                 if self.candidate_graphs.contains(&path) {
                     Some(vec![path])
                 } else {
@@ -11188,11 +11396,13 @@ impl CallControl {
                 // shape as `inputconst(Void, None)` when the callee is
                 // not a Constant.
                 let graphs = graphs.as_ref()?;
-                let result: Vec<CallPath> = graphs
-                    .iter()
-                    .filter(|p| self.candidate_graphs.contains(p))
-                    .cloned()
-                    .collect();
+                let mut result: Vec<CallPath> = Vec::new();
+                for p in graphs {
+                    let p = self.function_graphs.canonical_path(p);
+                    if self.candidate_graphs.contains(&p) && !result.contains(&p) {
+                        result.push(p);
+                    }
+                }
                 if result.is_empty() {
                     None
                 } else {
@@ -11213,11 +11423,14 @@ impl CallControl {
     /// `target_to_path_and_graph` / `direct_callee_graph_path`.
     pub fn direct_graph_for(&self, target: &CallTarget) -> Option<std::rc::Rc<FunctionGraph>> {
         let (path, graph) = self.target_to_path_and_graph(target)?;
-        self.candidate_graphs.contains(&path).then_some(graph)
+        self.is_candidate(&path).then_some(graph)
     }
 
     fn has_callable_graph(&self, path: &CallPath) -> bool {
-        self.function_graphs.contains_key(path) || self.opname_helper_paths.contains(path)
+        self.function_graphs.contains_key(path)
+            || self
+                .opname_helper_paths
+                .contains(&self.function_graphs.canonical_path(path))
     }
 
     /// `funcobj.graph` under `path`, or under the crate-stripped harvest
@@ -11327,9 +11540,18 @@ impl CallControl {
     /// `def_id` is an index inside one LLBC and never selects a graph.
     pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
-            CallTarget::FunctionPath { .. } => {
+            CallTarget::FunctionPath { resolved_path, .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
+                }
+                // Unique FunDecl key first, harvest `segments` fallback.
+                // Prefer `resolved_path` only when that key names a graph
+                // (`lib.rs` unique_call_path). Spec `cachedgraph` copies
+                // stamp the spec leaf on that key so it aliases the copy.
+                if let Some(path) = resolved_path
+                    && self.has_callable_graph(path)
+                {
+                    return Some(path.clone());
                 }
                 // The spelled path, even when no graph is registered:
                 // `fnaddr_for_target` and oopspec marks key on it.
@@ -11381,9 +11603,15 @@ impl CallControl {
             addr,
             symbolic,
         };
+        // Concrete keeps today's priority: exact hit, then sorted alias
+        // walk of the requested spelling (`concrete_fnaddr_binding`).
+        // Symbolic miss hashes the funcobj's one GraphStore
+        // representative (`call.py CallControl.get_jitcode` /
+        // `lltype.py getfunctionptr`).
         let from_table = |path: CallPath| match self.concrete_fnaddr_binding(&path) {
             Some((resolved, addr)) => binding(resolved, addr, false),
             None => {
+                let path = self.function_graphs.canonical_path(&path);
                 let addr = symbolic_fnaddr_for_path(&path);
                 binding(path, addr, true)
             }
@@ -11404,7 +11632,8 @@ impl CallControl {
         // change attributable to a real refusal.
         let wrapper_path = crate::model::fn_const_segments(target)
             .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
-            .or_else(|| self.target_to_path(target));
+            .or_else(|| self.target_to_path(target))
+            .map(|path| self.function_graphs.canonical_path(&path));
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
@@ -11855,7 +12084,10 @@ impl CallControl {
     /// `jit_trace_fnaddrs`; pair those addresses with their registered source
     /// graphs here. Aliases sharing an address name the same wrapper; select
     /// the most-qualified source identity for the one graph object entered
-    /// into the PBC family.  The family is memoised in
+    /// into the PBC family, then store that graph's
+    /// `GraphStore::canonical_path` (`call.py graphs_from` names the graph
+    /// object; `CallControl.jitcodes` is keyed on the same representative).
+    /// The family is memoised in
     /// `builtin_wrapper_family`; its inputs are frozen before the first
     /// reader runs.  Members are ordered by path (`display_name`, then
     /// segments); the address map is used only to merge aliases.
@@ -11922,7 +12154,9 @@ impl CallControl {
                         .then_with(|| a.segments.cmp(&b.segments))
                 })
                 .expect("address bucket holds at least one alias");
-            result.push(pick);
+            // The pick chooses the graph object among address aliases.
+            // The family names that object the way `get_jitcode` keys it.
+            result.push(self.function_graphs.canonical_path(&pick));
         }
         // The address buckets only merge alias spellings of one function.
         // Their key is the link-time layout of the host binary, so the
@@ -13133,11 +13367,12 @@ impl CallControl {
         seen: &mut HashSet<CallPath>,
         chain: &mut Vec<String>,
     ) -> bool {
+        let path = self.function_graphs.canonical_path(path);
         if !seen.insert(path.clone()) {
             return false; // cycle → bottom_result
         }
         let name = path.segments.join("::");
-        let graph = match self.function_graphs.get(path) {
+        let graph = match self.function_graphs.get(&path) {
             Some(graph) => graph,
             None => {
                 // Mirrors the leaf arms of `analyze_random_effects` /
@@ -13145,7 +13380,7 @@ impl CallControl {
                 // `random_effects_on_gcobjs` external is a witness.
                 let reached = witness == EffectWitness::RandomEffects
                     && self
-                        .external_funcobj(path)
+                        .external_funcobj(&path)
                         .is_some_and(|funcobj| funcobj.random_effects_on_gcobjs);
                 if reached {
                     chain.push(format!("{name} is external with random_effects_on_gcobjs"));
@@ -18682,6 +18917,63 @@ mod tests {
             store.key_for(&charon),
             store.key_for(&identity),
             "Charon <Impl> token must still share the identity GraphKey"
+        );
+    }
+
+    /// Primitive occupancy harvest (`spec_segments` 4-seg) is this
+    /// funcobj's DISPLAY spelling. Extra aliases of several GraphKeys
+    /// unbind; the harvest path itself is not a proposal.
+    #[test]
+    fn bind_unique_alias_proposals_keeps_occupancy_harvest_path() {
+        let harvest = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+        ));
+        let identity = "core::num::<impl usize>::saturating_sub|usize,usize|usize|/rustc/library/core/src/num/mod.rs:1454:4||";
+        let mut object_graph = FunctionGraph::new("num::<Impl>::<impl usize>::saturating_sub");
+        object_graph.funcobj_identity = Some(identity.into());
+        let mut interpreter_graph = FunctionGraph::new("num::<Impl>::saturating_sub");
+        interpreter_graph.funcobj_identity = Some(identity.into());
+        assert_eq!(
+            object_graph.graph_key(),
+            interpreter_graph.graph_key(),
+            "occupancy and unique-primitive harvest of one item share a GraphKey"
+        );
+        let mut store = GraphStore::new();
+        store.insert(harvest.clone(), object_graph);
+        let object_proposals = store.collect_trait_impl_alias_proposals(
+            None,
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+            false,
+            None,
+        );
+        store.insert(harvest.clone(), interpreter_graph);
+        let bound = store.key_for(&harvest).expect("harvest stays bound");
+        let interpreter_proposals = store.collect_trait_impl_alias_proposals(
+            None,
+            "num::<Impl>",
+            "usize",
+            "saturating_sub",
+            false,
+            None,
+        );
+        assert!(
+            object_proposals
+                .iter()
+                .chain(interpreter_proposals.iter())
+                .all(|(path, _)| *path != harvest),
+            "canonical harvest is not an alias proposal: {object_proposals:?} {interpreter_proposals:?}"
+        );
+        let mut proposals = object_proposals;
+        proposals.extend(interpreter_proposals);
+        store.bind_unique_alias_proposals(proposals);
+        assert_eq!(
+            store.key_for(&harvest),
+            Some(bound),
+            "occupancy harvest DISPLAY must stay bound"
         );
     }
 
@@ -26327,6 +26619,105 @@ mod tests {
         );
     }
 
+    /// `call.py CallControl.get_jitcode` keys `self.jitcodes` on the graph
+    /// object. Harvest DISPLAY and FunDecl identity are aliases of one
+    /// GraphKey (`GraphStore::share_path`); they must return one JitCode.
+    #[test]
+    fn get_jitcode_alias_spellings_share_one_shell() {
+        let mut cc = CallControl::new();
+        let harvest = CallPath::from_segments(["mod", "f"]);
+        let identity = CallPath::from_segments(["crate", "mod", "f"]);
+        cc.register_function_graph(harvest.clone(), FunctionGraph::new("f"));
+        cc.function_graphs_mut()
+            .share_path(identity.clone(), &harvest);
+
+        let from_identity = cc.get_jitcode(&identity);
+        let from_harvest = cc.get_jitcode(&harvest);
+
+        assert!(
+            std::sync::Arc::ptr_eq(&from_identity, &from_harvest),
+            "alias spellings of one funcobj must share one JitCode"
+        );
+        assert_eq!(
+            cc.jitcodes().len(),
+            1,
+            "jitcodes must hold one key, the harvest DISPLAY spelling"
+        );
+        assert!(cc.jitcodes().contains_key(&harvest));
+        assert!(!cc.jitcodes().contains_key(&identity));
+    }
+
+    /// Harvest DISPLAY is the jitcodes key even when the FunDecl identity
+    /// spelling was bound first (`GraphStore::mark_canonical_path`).
+    #[test]
+    fn get_jitcode_stamped_harvest_wins_over_identity_first_bind() {
+        let mut cc = CallControl::new();
+        let harvest = CallPath::from_segments(["mod", "f"]);
+        let identity = CallPath::from_segments(["crate", "mod", "f"]);
+        cc.register_function_graph(identity.clone(), FunctionGraph::new("f"));
+        cc.function_graphs_mut()
+            .share_path(harvest.clone(), &identity);
+        cc.function_graphs_mut().mark_canonical_path(&harvest);
+
+        let from_identity = cc.get_jitcode(&identity);
+        let from_harvest = cc.get_jitcode(&harvest);
+        assert!(
+            std::sync::Arc::ptr_eq(&from_identity, &from_harvest),
+            "alias spellings of one funcobj must share one JitCode"
+        );
+        assert_eq!(cc.jitcodes().len(), 1);
+        assert!(cc.jitcodes().contains_key(&harvest));
+        assert!(!cc.jitcodes().contains_key(&identity));
+    }
+
+    /// The wrapper PBC family names the graph object (`canonical_path`).
+    /// Host `jit_trace_fnaddrs` publishes the identity spelling; the family
+    /// member is the harvest key `CallControl.jitcodes` stores.
+    #[test]
+    fn builtin_wrapper_family_names_the_canonical_graph() {
+        let mut cc = CallControl::new();
+        let harvest = CallPath::from_segments(["mod", "__majit_wrap_f"]);
+        let identity = CallPath::from_segments(["crate", "mod", "__majit_wrap_f"]);
+        cc.register_function_graph(identity.clone(), FunctionGraph::new("__majit_wrap_f"));
+        cc.function_graphs_mut()
+            .share_path(harvest.clone(), &identity);
+        cc.function_graphs_mut().mark_canonical_path(&harvest);
+        cc.register_function_fnaddr(identity.clone(), 0x1000);
+
+        let family_path = cc.builtin_wrapper_indirect_graphs()[0].clone();
+        assert_eq!(family_path, harvest);
+        assert!(!cc.builtin_wrapper_indirect_graphs().contains(&identity));
+
+        let shell = cc.get_jitcode(&identity);
+        assert!(
+            cc.jitcodes()
+                .get(&family_path)
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &shell)),
+            "family member must be the jitcodes harvest key"
+        );
+    }
+
+    /// `lltype.py getfunctionptr(graph)` derives the pointer from the graph
+    /// object. A `__fn_const` naming the identity spelling must hash the
+    /// same canonical path `get_jitcode` records on that graph's JitCode.
+    #[test]
+    fn fn_const_and_jitcode_share_symbolic_fnaddr() {
+        let mut cc = CallControl::new();
+        let harvest = CallPath::from_segments(["mod", "f"]);
+        let identity = CallPath::from_segments(["crate", "mod", "f"]);
+        cc.register_function_graph(harvest.clone(), FunctionGraph::new("f"));
+        cc.function_graphs_mut()
+            .share_path(identity.clone(), &harvest);
+
+        let jitcode = cc.get_jitcode(&harvest);
+        let target = CallTarget::function_path([crate::model::FN_CONST_HEAD, "crate", "mod", "f"]);
+        let binding = cc.fnaddr_binding_for_target(&target);
+        assert_eq!(
+            jitcode.fnaddr, binding.addr,
+            "function constant and target JitCode must share getfunctionptr identity"
+        );
+    }
+
     #[test]
     fn matching_fnaddr_abi_binds() {
         let mut cc = CallControl::new();
@@ -31579,8 +31970,8 @@ mod tests {
         let op = &portal_graph.block(portal_graph.startblock).operations[0];
         assert_eq!(
             cc.graphs_from(op),
-            Some(vec![call_spelling.clone()]),
-            "emit must use the same registered path BFS followed"
+            Some(vec![registered.clone()]),
+            "emit uses the GraphStore representative BFS stored, not the call spelling"
         );
     }
 
@@ -31900,11 +32291,15 @@ mod tests {
         );
         cc.register_function_graph(
             nested.clone(),
-            FunctionGraph::new("call").with_fun_decl_id(11),
+            FunctionGraph::new("call")
+                .with_fun_decl_id(11)
+                .with_funcobj_identity("eval::f::closure#1"),
         );
         cc.register_function_graph(
             other.clone(),
-            FunctionGraph::new("call").with_fun_decl_id(12),
+            FunctionGraph::new("call")
+                .with_fun_decl_id(12)
+                .with_funcobj_identity("other::g::closure#1"),
         );
         cc.mark_portal(portal.clone());
 
@@ -32075,9 +32470,9 @@ mod tests {
                 && !std::sync::Arc::ptr_eq(&jc_inner, &jc_trait),
             "each of the three graphs gets its own jitcode"
         );
-        // `get_jitcode` keys shells on CallPath (`call.py` keys on the
-        // graph object). Alias spellings of one funcobj share GraphKey
-        // (`key_for` above); they do not share a shell Arc.
+        // `call.py CallControl.get_jitcode` keys shells on the graph
+        // object (`GraphStore::canonical_path`). These three GraphKeys
+        // remain distinct, so each keeps its own shell Arc.
     }
 
     #[test]

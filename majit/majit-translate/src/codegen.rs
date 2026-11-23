@@ -121,6 +121,7 @@ mod tests {
             jitcodes: vec![main_jitcode],
             symbolic_fnaddr_paths: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
+            jitcode_alias_paths: Vec::new(),
             indirectcalltarget_indices: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
