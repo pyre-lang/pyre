@@ -11332,22 +11332,26 @@ impl<M: Clone> MetaInterp<M> {
         // ConstantPool to snapshot — this typed-constant map starts fresh.
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
-        // resume.py `ResumeDataVirtualAdder.finish` numbers via
-        // `trace.get_snapshot_iter(rd_resume_position)`. Loop compile
-        // materializes those snapshots as maps
-        // (`snapshot_map_from_byte_recorder`) and remaps them through
-        // `TraceIterator._cache`. Bridges use the same maps:
-        // `snapshot_maps_from_ctx` already walks the byte recorder when
-        // it has a buffer. Empty maps would leave
-        // `store_final_boxes_in_guard` numbering from unique_cache only,
-        // which is not `get_snapshot_iter`.
+        // resume.py ResumeDataLoopMemo.number walks
+        // `trace.get_snapshot_iter(position)` of each emitted guard.
+        // A byte-recorder bridge leaves the five maps empty; numbering
+        // happens at emit through ByteBridgeResume::number_guard →
+        // Trace::number_byte_snapshot. The list recorder fills the maps
+        // here. collect_snapshot_const_ptr_slots roots ConstPtr copies
+        // in those maps; empty maps yield no slots, and snapshot
+        // ConstPtrs stay on the recorder `_refs` / const_ptr_area until
+        // numbering ends.
         let (
             mut snapshot_boxes,
             snapshot_frame_sizes,
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = snapshot_maps_from_ctx(ctx);
+        ) = if use_byte_iter {
+            Default::default()
+        } else {
+            snapshot_maps_from_ctx(ctx)
+        };
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,

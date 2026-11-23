@@ -540,3 +540,118 @@ fn owned_deadframe_root_slot_roots_the_returned_frames_refs() {
          which would keep a dead frame alive"
     );
 }
+
+struct CollectorBackend {
+    backend: DynasmBackend,
+}
+
+impl CollectorBackend {
+    fn new() -> Self {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_gc_allocator(Box::new(gc));
+        Self { backend }
+    }
+}
+
+impl Drop for CollectorBackend {
+    fn drop(&mut self) {
+        majit_backend_dynasm::runner::clear_gc_allocator();
+    }
+}
+
+/// Successful raw done leaves the word-stack depth and walked roots
+/// where they were: the finish path must not leak a `RanFrameRoot` or
+/// an owner root.
+#[test]
+fn raw_done_success_leaves_root_counts_unchanged() {
+    let _serial = SERIAL.lock();
+    let mut cpu = CollectorBackend::new();
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::const_int(42))]);
+    finish.pos().set(OpRef::void_op(0));
+    let ops: Vec<OpRc> = vec![finish].into_iter().map(OpRc::new).collect();
+    let token = JitCellToken::new(5101);
+    common::rebind_trace_arg_boxes(&[], &ops);
+    cpu.backend
+        .compile_loop(&[], &ops, &token)
+        .expect("compile_loop");
+
+    let depth0 = majit_gc::shadow_stack::depth();
+    let walked0 = owner_root_addrs();
+    let value = match cpu.backend.execute_token_done_int_raw(&token, &[]) {
+        Ok(value) => value,
+        Err(_) => panic!("raw done int"),
+    };
+    assert_eq!(value, 42);
+    assert_eq!(
+        majit_gc::shadow_stack::depth(),
+        depth0,
+        "raw done success left a word slot"
+    );
+    assert_eq!(
+        owner_root_addrs(),
+        walked0,
+        "raw done success left an owner root"
+    );
+}
+
+/// A raw guard exit builds one owner-root DeadFrame and pops the
+/// `RanFrameRoot` word slot. A collection taken on that DeadFrame
+/// rewrites the owner slot (`JitFrameDeadFrame::new`).
+#[test]
+fn raw_guard_exit_owner_root_and_no_word_slot() {
+    let _serial = SERIAL.lock();
+    let mut cpu = CollectorBackend::new();
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+    guard.pos().set(OpRef::void_op(0));
+    guard.set_fail_arg_types(vec![Type::Int]);
+    guard.setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::const_int(1))]);
+    finish.pos().set(OpRef::void_op(1));
+    let ops: Vec<OpRc> = vec![guard, finish].into_iter().map(OpRc::new).collect();
+    let token = JitCellToken::new(5102);
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
+    cpu.backend
+        .compile_loop(&inputargs, &ops, &token)
+        .expect("compile_loop");
+
+    let depth0 = majit_gc::shadow_stack::depth();
+    let walked0 = owner_root_addrs();
+    let frame = match cpu.backend.execute_token_done_int_raw(&token, &[0]) {
+        Err(frame) => frame,
+        Ok(value) => panic!("expected guard exit, got done {value}"),
+    };
+    assert_eq!(
+        majit_gc::shadow_stack::depth(),
+        depth0,
+        "raw guard exit left a residual word slot"
+    );
+    let tip = frame_addr_of(&frame);
+    let live = owner_root_addrs();
+    assert!(
+        live.contains(&tip),
+        "raw guard exit's frame {tip:#x} is not among the owner roots ({live:#x?})"
+    );
+    assert_eq!(
+        live.len(),
+        walked0.len() + 1,
+        "raw guard exit must create exactly one DeadFrame owner root; before={walked0:#x?} after={live:#x?}"
+    );
+
+    majit_gc::collect_full();
+    let moved = frame_addr_of(&frame);
+    let live = owner_root_addrs();
+    assert!(
+        live.contains(&moved),
+        "after the collection the owner roots ({live:#x?}) no longer name the frame {moved:#x}"
+    );
+    assert_eq!(
+        majit_gc::shadow_stack::depth(),
+        depth0,
+        "collection after raw guard exit left a residual word slot"
+    );
+}
