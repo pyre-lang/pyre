@@ -727,3 +727,58 @@ fn gc_class_instance_field0_parent_read_emits_cast_instance() {
         graph.dump()
     );
 }
+
+/// Nested field-0 inlined parents of a GC class instance are each an
+/// upcast (`lltype.py` `Struct._first_struct` / `rclass.py`
+/// `InstanceRepr.upcast`). `(*p).base.base` is two `cast_pointer`
+/// steps of the same address, not a FieldRead of either prefix.
+#[test]
+fn gc_class_instance_nested_field0_parent_read_emits_two_upcasts() {
+    use crate::model::OpKind;
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::with_shared_lowering(llbc, |context| {
+        let fd =
+            llbc.iter_local_fns()
+                .find(|fd| {
+                    fd.item_meta.name_path_str().contains("mapdict")
+                        && fd.item_meta.source_text.as_deref().is_some_and(|text| {
+                            text.contains("fn unboxed_plain_attribute_destructor(")
+                        })
+                })
+                .expect("mapdict unboxed_plain_attribute_destructor in pyre-object LLBC");
+        crate::front::mir::lower_fun_decl(context, fd)
+            .unwrap_or_else(|err| panic!("lower unboxed_plain_attribute_destructor: {err:?}"))
+    });
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let parent_upcast = |leaf: &str| {
+        ops.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| root.rsplit("::").next() == Some(leaf))
+        })
+    };
+    assert!(
+        parent_upcast("PlainAttribute"),
+        "first field-0 parent must be cast_instance of PlainAttribute; graph={}",
+        graph.dump()
+    );
+    assert!(
+        parent_upcast("AbstractAttribute"),
+        "second field-0 parent must be cast_instance of AbstractAttribute; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "base"
+            )
+        }),
+        "nested field-0 parents must not FieldRead the inlined prefix; graph={}",
+        graph.dump()
+    );
+}

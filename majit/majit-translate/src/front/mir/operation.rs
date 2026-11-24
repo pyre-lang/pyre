@@ -7285,7 +7285,9 @@ impl<'a> Lowering<'a> {
     /// address is the parent address. A FieldRead/getattr of the prefix
     /// would walk `allinstancefields` and load an ancestor slot of the
     /// same name. Enums, closures, integer newtypes, Raw owners, and
-    /// local (non-deref) aggregates are not that parent.
+    /// local (non-deref) aggregates are not that parent. A nested
+    /// field-0 parent (`(*p).base.base`) is still that address: the
+    /// container is a Deref, or is itself this parent read.
     fn gc_instance_first_struct_parent_root(
         &self,
         field_ty: &TyRef,
@@ -7295,9 +7297,16 @@ impl<'a> Lowering<'a> {
         owner_is_closure_env: bool,
         owner_id: Option<&majit_ir::descr::StructId>,
         owner_root: &str,
-        base_is_deref: bool,
+        container: &Place,
     ) -> Option<String> {
-        if !base_is_deref || container_is_enum || owner_is_closure_env {
+        if container_is_enum || owner_is_closure_env {
+            return None;
+        }
+        if !(container.is_deref_projection()
+            || self
+                .gc_instance_first_struct_parent_root_of_place(container)
+                .is_some())
+        {
             return None;
         }
         if host_index != Some((0, 0)) {
@@ -7336,6 +7345,28 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some(parent_root)
+    }
+
+    /// [`Self::gc_instance_first_struct_parent_root`] of a Field place.
+    fn gc_instance_first_struct_parent_root_of_place(&self, place: &Place) -> Option<String> {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        let payload = elem.field_payload()?;
+        let (owner_root, _, field_ty, owner_id, host_index) =
+            self.resolve_adt_field(&inner.ty, payload)?;
+        let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
+        let place_ty = tyref_subst_bound_typevar(&place.ty, &inner.ty, self.llbc);
+        self.gc_instance_first_struct_parent_root(
+            &field_ty,
+            &place_ty,
+            host_index,
+            tyref_is_enum_free(&inner.ty, self.llbc),
+            tyref_is_closure_env(&inner.ty, self.llbc),
+            owner_id.as_ref(),
+            &owner_root,
+            inner,
+        )
     }
 
     /// Ordinary Adt `Field` getattr after the base Variable is known
@@ -7539,7 +7570,7 @@ impl<'a> Lowering<'a> {
             owner_is_closure_env,
             owner_id.as_ref(),
             &owner_root,
-            base_is_deref,
+            inner,
         );
         let field_vt = tyref_to_value_type_with(
             &place_ty,
