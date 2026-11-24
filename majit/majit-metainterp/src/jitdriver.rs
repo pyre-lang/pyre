@@ -10786,6 +10786,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
     ///
+    /// `increment_function_threshold == 0` ("jit is off") returns before the
+    /// lookup, as `maybe_compile_and_run` does.
+    ///
     /// `warmstate.py maybe_compile_and_run` is a closure over
     /// `jitcounter = self.warmrunnerdesc.jitcounter` and
     /// `confirm_enter_jit`; it does `cell = jitcounter.lookup_chain(hash)`
@@ -10814,6 +10817,13 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
         let _ = green_spec;
         let entry = &self.portal_entry;
+        if self
+            .meta
+            .warm_state_ref_for_driver(entry.jd_index)
+            .is_some_and(|warm| warm.function_entry_jit_is_off())
+        {
+            return None;
+        }
         if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
         }
@@ -14894,6 +14904,54 @@ mod tests {
         assert!(
             found.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
             "resolved_cell_procedure_token(hash, Some(greens)) names the function-entry cell"
+        );
+    }
+
+    #[test]
+    fn compiled_function_token_declines_when_the_function_threshold_is_zero() {
+        // warmstate.py maybe_compile_and_run: `if increment_threshold == 0:
+        // return # jit is off`, before the cell lookup, even for a cell
+        // that holds compiled code.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut sd = JitDriverStaticData::new(vec![], vec![]);
+        sd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = driver.register_descriptor(sd);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = GreenKey::new(vec![0x7e15]);
+        let hash = key.get_uhash();
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token);
+        crate::warmstate::GreenRefPin::with(&key, |__p, __l| {
+            driver
+                .meta
+                .warm_state_for_driver(idx)
+                .attach_procedure_to_interp_for_key(__p, __l, std::sync::Arc::clone(&token))
+        });
+        assert!(
+            driver
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
+                .is_some(),
+            "the compiled cell is found while the JIT is on"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_function_threshold(0);
+        assert!(
+            driver
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
+                .is_none(),
+            "function_threshold 0 is `jit is off`: no compiled entry"
         );
     }
 
