@@ -113,6 +113,18 @@ pub fn malloc_raw_zeroed<T>() -> *mut T {
     ptr as *mut T
 }
 
+/// Host fallback for a managed birth that returned null. A refused
+/// managed request (`gc_alloc_failed_pending`) is not a licence for the
+/// host allocator: it aborts through `gc_alloc_failed`, like
+/// [`gc_alloc_young_storage_box`].
+#[inline(always)]
+pub fn malloc_raw_zeroed_unless_gc_failed<T>() -> *mut T {
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        crate::gc_hook::gc_alloc_failed(std::mem::size_of::<T>());
+    }
+    malloc_raw_zeroed::<T>()
+}
+
 /// GC-sweep destructor for a storage box built by
 /// [`gc_alloc_storage_box::<T>`].
 ///
