@@ -951,17 +951,11 @@ fn allocate_zdecompress(
     backend: backend::ZlibDecompressor,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let backend = Box::into_raw(Box::new(Mutex::new(backend)));
-    let _roots = gc_roots::push_roots();
-    let _ = gc_roots::pin_root(cls);
-    let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_ZlibDecompressor::allocate_stable(W_ZlibDecompressor {
         ob: PyObject::default(),
         backend,
     });
-    Ok(pyre_interpreter::typedef::tag_subclass_instance(
-        obj,
-        gc_roots::shadow_stack_get(cls_slot),
-    ))
+    Ok(pyre_interpreter::typedef::tag_subclass_instance(obj, cls))
 }
 
 // `_ZlibDecompressor.decompress(self, /, data, max_length=-1)` — `self`

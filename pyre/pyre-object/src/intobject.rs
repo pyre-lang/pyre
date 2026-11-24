@@ -291,6 +291,16 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
 /// Allocate a `W_IntObject` for an `int` subclass instance, on the managed
 /// heap so it can be reclaimed.
 ///
+/// `intobject.py` `_as_subint` is `space.allocate_instance(W_IntObject,
+/// w_inttype)` then `W_IntObject.__init__`. `allocate_instance` is
+/// `rclass.new_instance` → `malloc` + field stores, which
+/// `rewrite_op_malloc` turns into `new_with_vtable`.
+/// [`crate::lltype::malloc_typed_managed`] is that malloc
+/// (`gct_fv_gc_malloc`); `fuse_boxing_alloc` emits `NewWithVtable` when
+/// this graph keeps the call (`objectobject.rs` `alloc_instance_object`).
+/// A `try_gc_alloc_nursery_raw` residual does not fuse, so a look-inside
+/// `_as_subint` would `getfield` uninitialized mapdict words.
+///
 /// [`w_int_new_unique`] is shared with the JIT's tagged-int unboxing paths
 /// and keeps their `malloc_typed` allocation; a subclass instance cannot
 /// use it, because `register_finalizer` drops anything outside the managed
@@ -299,8 +309,9 @@ pub fn w_int_new_unique(value: i64) -> PyObjectRef {
 /// [`crate::gc_interp::enabled`], matching the other subclass allocators
 /// ([`crate::bytesobject::w_bytes_subclass_from_bytes`],
 /// `w_str_subclass_from_wtf8`).
+#[inline(never)]
 pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
-    let obj = W_IntObjectUser {
+    crate::lltype::malloc_typed_managed(W_IntObjectUser {
         base: W_IntObject {
             ob_header: PyObject {
                 ob_type: &crate::pyobject::INT_USER_TYPE as *const PyType,
@@ -310,24 +321,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         },
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_INT_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_IntObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_IntObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    }) as PyObjectRef
 }
 
 /// Return the address of INT_TYPE for JIT type-id validation.

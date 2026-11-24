@@ -168,14 +168,17 @@ pub extern "C" fn w_float_gc_alloc_word(value: f64) -> i64 {
 /// Allocate a `W_FloatObject` for a `float` subclass instance, on the
 /// managed heap so it can be reclaimed.
 ///
+/// Same `allocate_instance` / `malloc_typed_managed` / `NewWithVtable`
+/// shape as [`crate::intobject::w_int_subclass_new`].
+///
 /// [`w_float_new`] gates its managed allocation on
 /// [`crate::gc_interp::enabled`], whose `PYRE_GC_INTERP=0` rollback mode falls
 /// back to an unreclaimable `malloc_typed` box. A subclass instance cannot:
 /// `register_finalizer` drops anything outside the managed heap, so such an
-/// instance would never die and its `__del__` would never run. See
-/// [`crate::intobject::w_int_subclass_new`].
+/// instance would never die and its `__del__` would never run.
+#[inline(never)]
 pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
-    let obj = W_FloatObjectUser {
+    crate::lltype::malloc_typed_managed(W_FloatObjectUser {
         base: W_FloatObject {
             ob_header: PyObject {
                 ob_type: &crate::pyobject::FLOAT_USER_TYPE as *const PyType,
@@ -185,24 +188,7 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
         },
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
-        W_FLOAT_USER_GC_TYPE_ID,
-        std::mem::size_of::<W_FloatObjectUser>(),
-    );
-    if raw.is_null() {
-        if crate::gc_hook::gc_alloc_failed_pending() {
-            crate::PY_NULL
-        } else {
-            crate::lltype::malloc_typed(obj) as PyObjectRef
-        }
-    } else {
-        unsafe {
-            std::ptr::write(raw as *mut W_FloatObjectUser, obj);
-        }
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    }) as PyObjectRef
 }
 
 /// Box a float constant into a heap Python float object.
