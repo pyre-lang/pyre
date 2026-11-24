@@ -501,6 +501,9 @@ assert refusal(lambda: struct.unpack_from("b", 1)) == (
 assert refusal(lambda: list(struct.iter_unpack("b", 1))) == (
     "a bytes-like object is required, not 'int'"
 )
+assert refusal(lambda: list(struct.iter_unpack("", None)), struct.error) == (
+    "cannot iteratively unpack with a struct of length 0"
+)
 assert refusal(lambda: struct.pack_into("b", 1, 0, 7)) == (
     "pack_into() argument 2 must be read-write bytes-like object, not int"
 )

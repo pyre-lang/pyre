@@ -83,4 +83,139 @@ try:
 finally:
     sys.modules["re"] = saved_re
 
+# `W_SRE_Pattern.subx` / `pattern_subx`: a non-callable replacement is not
+# type-checked against the subject up front. A literal whose type does not
+# match the subject is collected into `sublist_w` and the error comes from
+# the subject's `join`; a no-match shortcut returns the subject before join.
+# A `getstring` / buffer-acquire failure is not an error here — it makes the
+# replacement non-literal, so `re._compile_template` raises.
+#
+# Spec is 3.15 `pattern_subx`. PyPy 3.11 `W_SRE_Pattern.subx` join messages
+# omit "instance" / "a bytes-like object" (`expected str, bytes found` /
+# `expected bytes, str found`), raise `a bytes-like object is required, not
+# int` from `acquire_py_buffer` instead of the template compiler, have no
+# `_sre.template`, and accept a bytearray literal on a str subject
+# (`re.sub('a', bytearray(b'x'), 'a')` returns `'x'`). 3.15 raises
+# `sequence item 0: expected str instance, bytearray found`.
+
+
+def _typeerror(fn, msg):
+    try:
+        fn()
+    except TypeError as e:
+        assert str(e) == msg, (str(e), msg)
+    else:
+        raise AssertionError("expected TypeError: %s" % msg)
+
+
+assert re.sub("z", b"x", "a") == "a"
+_typeerror(lambda: re.sub("b", b"x", "ab"), "sequence item 1: expected str instance, bytes found")
+_typeerror(
+    lambda: re.sub("b", 1, "ab"),
+    "decoding to str: need a bytes-like object, int found",
+)
+_typeerror(
+    lambda: re.sub("z", 1, "ab"),
+    "decoding to str: need a bytes-like object, int found",
+)
+_typeerror(
+    lambda: re.sub(b"b", "x", b"ab"),
+    "sequence item 1: expected a bytes-like object, str found",
+)
+_typeerror(
+    lambda: re.sub(b"b", "x\\0", b"ab"),
+    "sequence item 1: expected a bytes-like object, str found",
+)
+_typeerror(
+    lambda: re.sub("b", b"x\\0", "ab"),
+    "sequence item 1: expected str instance, bytes found",
+)
+_typeerror(
+    lambda: re.sub("b", bytearray(b"x\\0"), "ab"),
+    "sequence item 1: expected str instance, bytes found",
+)
+_typeerror(
+    lambda: re.sub("a", bytearray(b"x"), "a"),
+    "sequence item 0: expected str instance, bytearray found",
+)
+_typeerror(
+    lambda: re.compile("(a)").sub(_sre.template(re.compile("a"), ["x", 1, "y"]), "a"),
+    "decoding to str: need a bytes-like object, _sre.SRE_Template found",
+)
+
+assert re.sub("b", "x", "ab") == "ax"
+assert re.sub("(b)", r"\1X", "ab") == "abX"
+assert re.sub(b"b", b"x", b"ab") == b"ax"
+assert re.sub(b"(b)", br"\1X", b"ab") == b"abX"
+_typeerror(
+    lambda: re.sub("b", b"x", "abb", count=1),
+    "sequence item 1: expected str instance, bytes found",
+)
+_typeerror(lambda: re.subn("b", b"x", "ab"), "sequence item 1: expected str instance, bytes found")
+assert re.subn("z", b"x", "ab") == ("ab", 0)
+assert re.sub("b", lambda m: "X", "ab") == "aX"
+assert re.sub("z", b"x", "ab") == "ab"
+
+# Callable filter: `use_builder == '\x00'`. Each non-None piece is appended
+# to `sublist_w` and the result is the subject's empty-string `join`; type
+# errors come from `join`. None is skipped. A no-match shortcut returns the
+# subject before the filter is called.
+_typeerror(
+    lambda: re.sub("b", lambda m: 1, "ab"),
+    "sequence item 1: expected str instance, int found",
+)
+_typeerror(
+    lambda: re.sub(b"b", lambda m: "x", b"ab"),
+    "sequence item 1: expected a bytes-like object, str found",
+)
+_typeerror(
+    lambda: re.sub("b", lambda m: b"x", "ab"),
+    "sequence item 1: expected str instance, bytes found",
+)
+assert re.sub(b"b", lambda m: bytearray(b"x"), b"ab") == b"ax"
+assert re.sub("b", lambda m: None, "ab") == "a"
+assert re.sub("z", lambda m: 1, "ab") == "ab"
+assert re.subn("b", lambda m: "X", "abab") == ("aXaX", 2)
+
+# PyPy `ObjSpace.acquire_py_buffer` reads a native `W_BufferExporter` first.
+# A bytes/bytearray/array subclass that defines `__buffer__` still contributes
+# its native payload; the override is not called. CPython honours the slot.
+if sys.implementation.name != "cpython":
+    import array
+
+    _buf_calls = []
+
+    class BA(bytearray):
+        def __buffer__(self, flags):
+            _buf_calls.append("ba")
+            return memoryview(b"x")
+
+    assert re.sub(b"a", BA(b"z"), b"a") == b"z"
+    assert _buf_calls == [], _buf_calls
+    _buf_calls.clear()
+
+    class AR(array.array):
+        def __buffer__(self, flags):
+            _buf_calls.append("ar")
+            return memoryview(b"x")
+
+    assert re.sub(b"a", AR("B", b"z"), b"a") == b"z"
+    assert _buf_calls == [], _buf_calls
+
+
+# PEP 688 Python exporter: `getstring` → `PyObject_GetBuffer` accepts
+# `P.__buffer__`. CPython may call twice through `bytes.join`; assert the
+# value only.
+class P:
+    def __buffer__(self, flags):
+        return memoryview(b"x")
+
+
+assert re.sub(b"a", P(), b"a") == b"x"
+
+# `W_SRE_Pattern.subx`: no-match shortcut returns the subject before
+# allocating `sublist_w`.
+assert re.sub(b"q", b"r", b"abc") == b"abc"
+assert re.subn("q", "r", "abc") == ("abc", 0)
+
 print("OK")

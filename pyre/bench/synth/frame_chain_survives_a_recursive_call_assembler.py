@@ -8,6 +8,11 @@
 # `CALL_ASSEMBLER`, and the callee frame that fold hands the assembler is built
 # out of recorded operations rather than by the interpreter's call door.
 #
+# The warm-up must not walk: `chain` reads `f_code` of frames under tracing,
+# `_nonstandard_virtualizable` then `emit_force_virtualizable` forces them,
+# and the trace ends `ABORT_ESCAPE`. `rec` takes the leaf as an argument so
+# warm-up can pass a list-returning dummy; the measured `DEPTHS` walks pass `chain`.
+#
 # `pyframe.py execute_frame` runs `ec.enter(self)` before the merge point and
 # `ec.leave(...)` in a `finally` after it, which is what puts an activation on
 # the `topframeref` / `f_backref` chain `sys._getframe` walks. Upstream's merge
@@ -42,16 +47,20 @@ def chain():
     return names
 
 
-def rec(n):
+def dummy():
+    return []
+
+
+def rec(n, leaf):
     if n <= 0:
-        return chain()
-    return rec(n - 1)
+        return leaf()
+    return rec(n - 1, leaf)
 
 
 def hot(n):
     total = 0
     for _ in range(n):
-        total = (total + len(rec(WARM_DEPTH))) % 1000003
+        total = (total + len(rec(WARM_DEPTH, dummy))) % 1000003
     return total
 
 
@@ -73,7 +82,7 @@ def main():
     hot(WARM)
     walked = []
     for depth in DEPTHS:
-        names = rec(depth)
+        names = rec(depth, chain)
         got = rec_frames(names)
         walked.append(got)
         if got != depth + 1:

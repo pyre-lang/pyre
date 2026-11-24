@@ -4828,7 +4828,7 @@ fn colliding_fundecl_groups_occupy_distinct_graphs() {
             .unstructured()
             .expect("OWNER#2::call_mut has a body");
         let callee_ids: Vec<u64> = body
-            .body
+            .body()
             .iter()
             .filter_map(|bb| {
                 let Ok(TermKind::Call { call, .. }) = bb.term_ref(interpreter) else {

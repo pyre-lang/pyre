@@ -6091,6 +6091,61 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     pyre_object::nestedscope::CELL_FAMILY_GC_TYPE_ID.set(cell_family_tid);
     let _ = pyre_object::nestedscope::dummy_family();
+    // `_rweakkeydict.py WEAKDICTENTRYARRAY`. After CellFamily so no earlier
+    // tid moves. `key` (WeakRefPtr) and `value` (OBJECTPTR) are ordinary GC
+    // pointers in each item, matching the weakvaldict entries array; `f_hash`
+    // is Signed and is not traced. The Weakref object's `weakptr` is the weak
+    // slot (`contains_weakptr`); the dict holds the Weakref itself strongly.
+    {
+        use pyre_object::rweakkeydict::{WeakKeyDictEntries, WeakKeyDictEntry};
+        let tid = gc.get_type_id(
+            GcTypeKey::of(&pyre_object::rweakkeydict::WEAKKEYDICT_ENTRIES_GC_TYPE_ID_CELL),
+            || {
+                TypeInfo::varsize_with_gc_ptr_offsets(
+                    std::mem::offset_of!(WeakKeyDictEntries, items),
+                    std::mem::size_of::<WeakKeyDictEntry>(),
+                    std::mem::offset_of!(WeakKeyDictEntries, length),
+                    vec![
+                        std::mem::offset_of!(WeakKeyDictEntry, key),
+                        std::mem::offset_of!(WeakKeyDictEntry, value),
+                    ],
+                    vec![],
+                )
+            },
+        );
+        pyre_object::rweakkeydict::WEAKKEYDICT_ENTRIES_GC_TYPE_ID_CELL.set(tid);
+        pyre_object::rweakkeydict::set_weakkeydict_entries_gc_type_id(tid);
+    }
+    // `_rweakkeydict.py WEAKDICT`. `entries` is the one GC pointer.
+    let weakkeydict_tid = gc.get_type_id(
+        GcTypeKey::of(&pyre_object::rweakkeydict::WEAKKEYDICT_GC_TYPE_ID_CELL),
+        || {
+            majit_gc::trace::TypeInfo::with_gc_ptrs(
+                std::mem::size_of::<pyre_object::rweakkeydict::WeakKeyDict>(),
+                vec![std::mem::offset_of!(
+                    pyre_object::rweakkeydict::WeakKeyDict,
+                    entries
+                )],
+            )
+            .without_app_level_typedef()
+        },
+    );
+    pyre_object::rweakkeydict::WEAKKEYDICT_GC_TYPE_ID_CELL.set(weakkeydict_tid);
+    pyre_object::rweakkeydict::set_weakkeydict_gc_type_id(weakkeydict_tid);
+    // Optional-module headerless GC instances (`OptionalModuleHooks.raw_gc_types`).
+    // `func.py RawBytes` is the product case: a headerless GC instance whose
+    // light destructor (`RawBytes.__del__`) frees the `str2charp` block. Same
+    // destructor mechanism as `CellFamily` / `W_ArrayBase.__del__`. With no
+    // hooks installed (jit-core), register nothing.
+    if let Some(hooks) = pyre_interpreter::importing::optional_module_hooks() {
+        for ty in (hooks.raw_gc_types)() {
+            let tid = gc.get_type_id(GcTypeKey::of(ty.cell), || {
+                TypeInfo::with_destructor(ty.size, ty.destructor)
+            });
+            ty.cell.set(tid);
+            (ty.set_id)(tid);
+        }
+    }
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(

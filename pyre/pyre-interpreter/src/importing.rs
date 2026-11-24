@@ -717,6 +717,17 @@ pub struct ModuleGcType {
     pub destructor: Option<majit_gc::trace::DestructorFn>,
 }
 
+/// One headerless GC instance a module owns (`lltype.malloc(GcStruct)`, no
+/// `W_Root` header). `func.py RawBytes` is the product case: a light
+/// destructor (`RawBytes.__del__`) frees the `str2charp` block.
+#[derive(Clone, Copy)]
+pub struct ModuleRawGcType {
+    pub cell: &'static pyre_object::lltype::TypeIdCell,
+    pub size: usize,
+    pub destructor: majit_gc::trace::DestructorFn,
+    pub set_id: fn(u32),
+}
+
 /// One `ffi_type` of a `CIF_DESCRIPTION` as `jit_libffi.py` reads it:
 /// `types.getkind`'s kind letter and the type's `size`.
 #[derive(Clone, Copy)]
@@ -767,6 +778,12 @@ pub struct OptionalModuleHooks {
     /// numbers them from [`crate::MODULE_FIRST_TYPE_ID`], after every
     /// interpreter class.
     pub gc_types: fn() -> Vec<ModuleGcType>,
+    /// The `lltype.malloc(GcStruct)` instances (no `W_Root` header) a
+    /// module owns. `func.py RawBytes` is the product case. `build_gc`
+    /// registers each with `TypeInfo::with_destructor` before
+    /// `assign_inheritance_ids_now`. Empty when the optional modules are
+    /// not linked.
+    pub raw_gc_types: fn() -> Vec<ModuleRawGcType>,
     /// Header-only `#[pyre_class]` types the modules allocate immortal; only
     /// the immortal-root walker learns their `w_class` edge.
     pub immortal_w_class_only_descriptors:

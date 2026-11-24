@@ -1,8 +1,17 @@
 //! The module-level functions — PyPy:
 //! `pypy/module/_cffi_backend/func.py`.
+//!
+//! `func.py RawBytes` is the product value: an RPython instance whose light
+//! destructor (`RawBytes.__del__`) frees the `str2charp` block. It is a
+//! headerless GC instance (`lltype.malloc` / `gct_fv_gc_malloc`) with
+//! `TypeInfo::with_destructor`, the same shape as `CellFamily` and
+//! `W_ArrayBase.__del__`.
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
+use pyre_object::lltype::{GcType, TypeIdCell};
 
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj;
@@ -278,144 +287,178 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata(ptr, a[0]))
 }
 
-/// `func.py RawBytes` — a `str2charp` copy of a movable bytes STR, freed
-/// when the weak-key entry is dropped (`RawBytes.__del__`).
-struct RawBytesEntry {
-    /// `WEAKDICTENTRY.key` — `GcWeakrefBox` to the bytes object.
-    key: usize,
-    /// `RawBytes.ptr`.
-    ptr: usize,
+/// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `func.py RawBytes`.
+pub static RAWBYTES_GC_TYPE_ID_CELL: TypeIdCell = TypeIdCell::auto();
+
+static RAWBYTES_GC_TYPE_ID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_rawbytes_gc_type_id(id: u32) {
+    RAWBYTES_GC_TYPE_ID.store(id, Ordering::Relaxed);
 }
+
+pub fn rawbytes_gc_type_id() -> u32 {
+    RAWBYTES_GC_TYPE_ID.load(Ordering::Relaxed)
+}
+
+/// `func.py RawBytes` — `self.ptr = rffi.str2charp(string, track_allocation=False)`.
+#[repr(C)]
+pub struct RawBytes {
+    /// `RawBytes.ptr`.
+    pub ptr: *mut u8,
+}
+
+impl GcType for RawBytes {
+    fn type_id() -> u32 {
+        match rawbytes_gc_type_id() {
+            0 => 0,
+            id => id,
+        }
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// `RawBytes.__del__`: `rffi.free_charp(self.ptr, track_allocation=False)`.
+///
+/// # Safety
+/// `obj_addr` must point at a swept [`RawBytes`]. Runs at most once per
+/// allocation.
+pub unsafe fn rawbytes_destructor(obj_addr: usize) {
+    let raw = obj_addr as *mut RawBytes;
+    let ptr = unsafe { (*raw).ptr };
+    if !ptr.is_null() {
+        unsafe {
+            (*raw).ptr = std::ptr::null_mut();
+            majit_rlib::rffi::free_charp(ptr, false);
+        }
+    }
+}
+
+/// `RawBytes(string)` after `str2charp`. Null means MemoryError is pending.
+/// Takes ownership of `ptr`; a failed malloc frees it.
+pub fn rawbytes_from_charp(ptr: *mut u8) -> *mut RawBytes {
+    let value = RawBytes { ptr };
+    debug_assert_eq!(
+        std::mem::size_of::<RawBytes>(),
+        RawBytes::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = RawBytes::type_id();
+    let mut allocation_root: pyre_object::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+            type_id,
+            RawBytes::SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_raise()
+    .unwrap_or(std::ptr::null_mut());
+    if raw.is_null() {
+        if pyre_object::gc_hook::gc_alloc_failed_pending() {
+            unsafe { majit_rlib::rffi::free_charp(ptr, false) };
+            return std::ptr::null_mut();
+        }
+        return pyre_object::lltype::malloc_typed(value);
+    }
+    unsafe {
+        std::ptr::write(raw as *mut RawBytes, value);
+        if needs_write_barrier {
+            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
+        }
+    }
+    raw as *mut RawBytes
+}
+
+/// `RawBytes(string)`: `str2charp` then `lltype.malloc` of the instance.
+/// Null means MemoryError is pending or `str2charp` failed.
+pub fn rawbytes_new(data: &[u8]) -> *mut RawBytes {
+    let ptr = match majit_rlib::rffi::str2charp(data, false) {
+        Ok(ptr) => ptr,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    rawbytes_from_charp(ptr)
+}
+
+/// `WEAKDICT` pointer. The table is a prebuilt GC object
+/// (`ll_new_weakdict_prebuilt`).
+struct WeakKeyDictPtr(*mut pyre_object::rweakkeydict::WeakKeyDict);
+unsafe impl Send for WeakKeyDictPtr {}
 
 /// `func.py RawBytesCache` — `space.fromcache(RawBytesCache)`.
 /// `self.wdict` is `RWeakKeyDictionary(W_Root, RawBytes)`.
-///
-/// The map is keyed by `gc_identity_hash` of the live bytes object
-/// (`ll_get` / `compute_identity_hash`). That hash is stable across a
-/// moving GC; a HashMap keyed by the box's target address is not (the
-/// target can move). Identity is confirmed with `w_gc_weakref_box_deref`.
 struct RawBytesCache {
-    wdict: parking_lot::Mutex<std::collections::HashMap<usize, Vec<RawBytesEntry>>>,
+    wdict: parking_lot::Mutex<WeakKeyDictPtr>,
 }
 
-/// Process-wide `space.fromcache(RawBytesCache)` singleton (`_pickle`
-/// `PICKLE_STATE` AtomicPtr / `OnceLock` shape). `HashMap::new` is not
-/// `const` here, so the map is built on first use. Weak-box keys are
-/// forwarded by [`walk_raw_bytes_cache_gc`] from `walk_prebuilt_slots`.
+/// Process-wide `space.fromcache(RawBytesCache)` singleton.
+/// `space.fromcache(X)` makes one per space, and the product has one space,
+/// the process-wide `baseobjspace::OBJECT_SPACE`, so this static is its
+/// `RawBytesCache` (`errorbox.rs` `TEXT_P`, `_pickle` `PICKLE_STATE`).
+/// The dict is `ll_new_weakdict_prebuilt` (`WeakKeyDictRepr.convert_const`:
+/// `alloc_raw` + `GCFLAG_NO_HEAP_PTRS` + write barrier) and is reached from
+/// `prebuilt_root_objects`; there is no extra-root walk (`baseobjspace.py
+/// interned_strings`).
 static RAW_BYTES_CACHE: std::sync::OnceLock<RawBytesCache> = std::sync::OnceLock::new();
 
 fn raw_bytes_cache() -> &'static RawBytesCache {
     RAW_BYTES_CACHE.get_or_init(|| RawBytesCache {
-        wdict: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        wdict: parking_lot::Mutex::new(WeakKeyDictPtr(std::ptr::null_mut())),
     })
 }
 
-impl RawBytesCache {
-    fn walk_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
-        let mut wdict = self.wdict.lock();
-        for bucket in wdict.values_mut() {
-            for entry in bucket.iter_mut() {
-                if entry.key != 0 {
-                    let mut key = entry.key as PyObjectRef;
-                    forward(&mut key);
-                    entry.key = key as usize;
-                }
-            }
-        }
+/// PyPy `rthread.Lock.acquire` calls `c_thread_acquirelock`, a `releasegil`
+/// llexternal (`rpython/rlib/rthread.py`). The wrapper runs
+/// `rffi.aroundstate.before()` before the native wait. pyre's equivalent is
+/// `try_lock`, else `before_external_block()` then `lock()`, matching
+/// `queue_lock` and `extension_load_lock`. Its only caller,
+/// `get_raw_address_of_string`, is residual; lookup and insert stay there.
+fn raw_bytes_cache_lock(
+    cache: &'static RawBytesCache,
+) -> parking_lot::MutexGuard<'static, WeakKeyDictPtr> {
+    if let Some(guard) = cache.wdict.try_lock() {
+        return guard;
     }
-
-    fn prune(wdict: &mut std::collections::HashMap<usize, Vec<RawBytesEntry>>) {
-        wdict.retain(|_, bucket| {
-            bucket.retain(|entry| {
-                let target = unsafe {
-                    pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef)
-                };
-                if target.is_null() {
-                    if entry.ptr != 0 {
-                        unsafe {
-                            majit_rlib::rffi::free_charp(entry.ptr as *mut u8, false);
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            !bucket.is_empty()
-        });
-    }
-
-    fn lookup(
-        wdict: &std::collections::HashMap<usize, Vec<RawBytesEntry>>,
-        w_x: PyObjectRef,
-    ) -> Option<*mut u8> {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_x);
-        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-            x_slot,
-        ) as usize);
-        let bucket = wdict.get(&hash)?;
-        for entry in bucket {
-            let target =
-                unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(x_slot)) {
-                return Some(entry.ptr as *mut u8);
-            }
-        }
-        None
-    }
-
-    fn insert(
-        wdict: &mut std::collections::HashMap<usize, Vec<RawBytesEntry>>,
-        w_x: PyObjectRef,
-        key: PyObjectRef,
-        ptr: *mut u8,
-    ) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let pair = pyre_object::gc_roots::pin_roots(&[w_x, key]);
-        let hash = pyre_object::gc_hook::gc_identity_hash(pyre_object::gc_roots::shadow_stack_get(
-            pair,
-        ) as usize);
-        let bucket = wdict.entry(hash).or_default();
-        // `ll_set_nonnull` replaces a matching live key.
-        for entry in bucket.iter_mut() {
-            let target =
-                unsafe { pyre_object::weakref::w_gc_weakref_box_deref(entry.key as PyObjectRef) };
-            if std::ptr::eq(target, pyre_object::gc_roots::shadow_stack_get(pair)) {
-                if entry.ptr != 0 && entry.ptr != ptr as usize {
-                    unsafe {
-                        majit_rlib::rffi::free_charp(entry.ptr as *mut u8, false);
-                    }
-                }
-                entry.key = pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize;
-                entry.ptr = ptr as usize;
-                return;
-            }
-        }
-        bucket.push(RawBytesEntry {
-            key: pyre_object::gc_roots::shadow_stack_get(pair + 1) as usize,
-            ptr: ptr as usize,
-        });
-    }
-}
-
-/// Forward `RawBytesCache.wdict` weak-box keys (`WEAKDICTENTRY.key`).
-pub(crate) fn walk_raw_bytes_cache_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    if let Some(cache) = RAW_BYTES_CACHE.get() {
-        cache.walk_roots(visitor);
-    }
+    let blocked = pyre_interpreter::module::thread::before_external_block();
+    let guard = cache.wdict.lock();
+    drop(blocked);
+    guard
 }
 
 /// `func.py get_raw_address_of_string` — CFFI `ffi.from_buffer` on a bytes
-/// object. Movable STRs are copied into a cached raw block; immovable STRs
+/// object. Movable STRs are copied into a cached `RawBytes`; immovable STRs
 /// hand out the interior pointer (`rgc.can_move`). Two calls with the same
 /// live bytes object return the same pointer.
 #[majit_macros::dont_look_inside]
 unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let x_slot = _roots.pin_roots(&[w_x]);
-    let w_x = _roots.get(x_slot);
+    let cache = raw_bytes_cache();
+    // Lookup and insert stay in one critical section: two threads must get
+    // the same pointer for the same live bytes (`func.py
+    // get_raw_address_of_string` docstring). A thread that has to wait
+    // leaves the running-mutator census (`before_external_block`), so a
+    // collection inside the section by the holder does not wait for it.
+    let mut wdict_guard = raw_bytes_cache_lock(cache);
+    if wdict_guard.0.is_null() {
+        let d = pyre_object::rweakkeydict::ll_new_weakdict_prebuilt();
+        if d.is_null() {
+            return Err(PyError::memory_error(""));
+        }
+        *wdict_guard = WeakKeyDictPtr(d);
+    }
+    let d = wdict_guard.0;
+    pyre_object::rweakkeydict::barrier_weakkeydict(d);
+    if pyre_object::gc_hook::try_gc_owns_object(d as pyre_object::gc_hook::GCREF) {
+        let _ = pyre_object::gc_roots::pin_root(d as PyObjectRef);
+    }
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
+    let existing = unsafe { (*d).ll_get(w_x) };
+    if !existing.is_null() {
+        return Ok(unsafe { (*(existing as *mut RawBytes)).ptr });
+    }
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
     let block = unsafe { pyre_object::bytesobject::w_bytes_block(w_x) };
     // MiniMark: `rgc.must_split_gc_address_space()` is False.
     if !majit_gc::can_move(majit_ir::GcRef(block as usize)) {
@@ -426,40 +469,25 @@ unsafe fn get_raw_address_of_string(w_x: PyObjectRef) -> Result<*mut u8, PyError
         }
         return Ok(ptr);
     }
-    // Allocate the weakref box and the `str2charp` copy before the lock
-    // (`ll_set_nonnull` creates the weakref before lookup). Collection is
-    // forbidden while `wdict` is held.
-    let key = pyre_object::weakref::w_gc_weakref_box_new(_roots.get(x_slot));
-    if key.is_null() {
+    // `w_bytes_data` is a slice into the STR; drop it before the
+    // `RawBytes` malloc, which may collect (`framework.py` `push_roots`).
+    let charp = {
+        let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_x) };
+        majit_rlib::rffi::str2charp(data, false).map_err(|_| PyError::memory_error(""))?
+    };
+    let rawbytes = rawbytes_from_charp(charp);
+    if rawbytes.is_null() {
         return Err(PyError::memory_error(""));
     }
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = _roots.pin_root(key);
-    let data = unsafe { pyre_object::bytesobject::w_bytes_data(_roots.get(x_slot)) };
-    let ptr = majit_rlib::rffi::str2charp(data, false).map_err(|_| PyError::memory_error(""))?;
-    let mut drop_copy = false;
-    let result = {
-        let mut wdict = raw_bytes_cache().wdict.lock();
-        RawBytesCache::prune(&mut wdict);
-        if let Some(existing) = RawBytesCache::lookup(&wdict, _roots.get(x_slot)) {
-            drop_copy = true;
-            existing
-        } else {
-            RawBytesCache::insert(
-                &mut wdict,
-                _roots.get(x_slot),
-                pyre_object::gc_roots::shadow_stack_get(key_slot),
-                ptr,
-            );
-            ptr
-        }
-    };
-    if drop_copy {
-        unsafe {
-            majit_rlib::rffi::free_charp(ptr, false);
-        }
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(rawbytes as PyObjectRef);
+    let w_x = pyre_object::gc_roots::shadow_stack_get(x_slot);
+    let rawbytes = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    if !unsafe { (*d).ll_set(w_x, rawbytes) } {
+        return Err(PyError::memory_error(""));
     }
-    Ok(result)
+    let rawbytes = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    Ok(unsafe { (*(rawbytes as *mut RawBytes)).ptr })
 }
 
 /// `func.py from_buffer`.
@@ -485,48 +513,41 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         Some(w) => pyre_interpreter::baseobjspace::int_w(w)? != 0,
         None => false,
     };
-    // `func.py from_buffer`: `_fetch_as_write_buffer` / `_fetch_as_read_buffer`
-    // first, then `isinstance_w(w_x, space.w_bytes)` picks
-    // `get_raw_address_of_string` vs `buf.get_raw_address()`. Length is
-    // `buf.getlength()` of the acquired buffer.
-    let (fetched_ptr, buffersize, fetched_owner) = if require_writable {
-        let (data, owner, _) =
-            unsafe { pyre_interpreter::builtins::fileio_writebuf(roots.get(object_slot)) }?;
-        (data.as_mut_ptr(), data.len() as i64, owner)
+    // `_fetch_as_write_buffer` / `_fetch_as_read_buffer`: `space.buffer_w`
+    // with `BUF_WRITABLE` / `BUF_SIMPLE`.  `W_CDataFromBuffer` stores `buf`,
+    // `w_keepalive = w_object`, and `view`.  Drop of this lease covers the
+    // length / address errors below. Success `disarm`s it: a made view
+    // (C / ctypes fallthrough) is not released (`NonOwningReleaseView`,
+    // `wrap_getbuffer` `owns_export=False`); the cdata keeps that view as
+    // the `CPyBuffer` carrier (lease 0). The native `_exports` increment
+    // (lease 1) is the release.
+    let flags = if require_writable {
+        pyre_interpreter::builtins::BUF_WRITABLE
     } else {
-        let buf = unsafe { pyre_interpreter::builtins::acquire_readbuf(roots.get(object_slot)) }?;
-        (
-            buf.as_ptr() as *mut u8,
-            buf.len() as i64,
-            roots.get(object_slot),
-        )
+        0
     };
+    let mut acquired = unsafe {
+        pyre_interpreter::builtins::ReadableBuffer::acquire_buffer_w(roots.get(object_slot), flags)
+    }?;
+    let buffersize = unsafe { acquired.len()? } as i64;
     let bytes_type =
         pyre_interpreter::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
-    let (ptr, buffersize, owner) = if unsafe {
+    let ptr = if unsafe {
         pyre_interpreter::baseobjspace::isinstance_w(roots.get(object_slot), bytes_type)
     } {
-        let ptr = unsafe { get_raw_address_of_string(roots.get(object_slot)) }?;
-        (ptr, buffersize, roots.get(object_slot))
-    } else if require_writable {
-        (fetched_ptr, buffersize, fetched_owner)
+        // `get_raw_address_of_string`: a moving STR is copied into
+        // `RawBytesCache`; an immovable STR hands out the interior pointer.
+        unsafe { get_raw_address_of_string(roots.get(object_slot))? }
     } else {
-        let (ptr, _len) = unsafe {
-            pyre_interpreter::builtins::acquire_readbuf_raw_address(roots.get(object_slot))
-        }?;
-        (ptr, buffersize, roots.get(object_slot))
+        let (ptr, _len) =
+            unsafe { pyre_interpreter::builtins::acquire_readbuf_raw_address(acquired.owner()) }?;
+        ptr
     };
-    let owner_slot = object_slot + 2;
-    let _ = roots.pin_root(owner);
-    let held = unsafe { pyre_interpreter::builtins::buffer_export_incref(roots.get(owner_slot)) };
 
     let arraylength = if ct.kind != ctypeobj::KIND_ARRAY {
         buffersize
     } else if ct.length >= 0 {
         if buffersize < ct.size {
-            if held {
-                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
-            }
             return Err(PyError::value_error(format!(
                 "buffer is too small ({buffersize} bytes) for '{}' ({} bytes)",
                 ct.name(),
@@ -541,9 +562,6 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         } else if itemsize > 0 {
             buffersize / itemsize
         } else {
-            if held {
-                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
-            }
             return Err(PyError::new(
                 pyre_interpreter::PyErrorKind::ZeroDivisionError,
                 format!(
@@ -553,12 +571,53 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ));
         }
     };
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(acquired.owner());
+    let held = acquired.is_held();
+    let made_view = acquired.made_view();
+    let owner = roots.get(owner_slot);
+    // Native `_exports` (held) keeps the owner. A made view
+    // (`acquire_buffer_w` C / ctypes fallthrough) is the `CPyBuffer`
+    // carrier: keep it and `disarm` without releasing (`NonOwningReleaseView`,
+    // `wrap_getbuffer` `owns_export=False`). Otherwise a memoryview owner
+    // → `w_memoryview_backing` (null → owner); else owner. A made view is
+    // lease 0: the cdata never releases it.
+    let keep_owner = held || made_view;
+    let backing = if !keep_owner && unsafe { pyre_object::memoryview::is_w_memoryview(owner) } {
+        // `w_memoryview_backing` is `view.backing().w_obj()`: the ultimate
+        // exporter (bytes / bytearray / array) or the GC object that owns
+        // the storage. A live view always has a backing (`w_memoryview_view`
+        // requires it). `w_obj` is that Buffer's exporter field; it is not
+        // null for bytes / bytearray / array. `ctypes.memoryview_at` stores
+        // `None`. If the pointer is null, fall back to `owner` so the
+        // memoryview that holds the off-heap view stays reachable.
+        unsafe { pyre_object::memoryview::w_memoryview_backing(owner) }
+    } else {
+        pyre_object::PY_NULL
+    };
+    let export_owner = if keep_owner || backing.is_null() {
+        owner
+    } else {
+        backing
+    };
+    // Bytes (exact or subclass): `self.buf` is the STR
+    // (`StringBuffer(self._value)`), not the wrapper. bytearray
+    // (`ByteArrayBuffer(self)`) and array (`ArrayBuffer(self)`) keep
+    // the wrapper. `w_keepalive` is still `w_x` until release.
+    let export_owner = if unsafe { pyre_object::bytesobject::is_bytes(export_owner) } {
+        unsafe { pyre_object::bytesobject::w_bytes_block(export_owner) as PyObjectRef }
+    } else {
+        export_owner
+    };
+    let export_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(export_owner);
+    acquired.disarm();
     Ok(cdataobj::new_cdata_from_buffer(
         ptr as usize,
         arraylength,
         roots.get(ctype_slot),
         roots.get(object_slot),
-        roots.get(owner_slot),
+        roots.get(export_slot),
         held,
     ))
 }
@@ -810,4 +869,24 @@ pub fn load_library(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         None => 0,
     };
     super::libraryobj::load_library(a[0], flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RawBytes.__del__` frees the `str2charp` block.
+    #[test]
+    fn rawbytes_destructor_frees_the_charp() {
+        let raw = rawbytes_new(b"abc");
+        assert!(!raw.is_null());
+        let ptr = unsafe { (*raw).ptr };
+        assert!(!ptr.is_null());
+        unsafe {
+            assert_eq!(*ptr, b'a');
+            assert_eq!(*ptr.add(3), 0);
+            rawbytes_destructor(raw as usize);
+            assert!((*raw).ptr.is_null());
+        }
+    }
 }

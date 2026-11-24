@@ -2296,10 +2296,18 @@ pub mod unpack_iter {
             if self.buffer.is_null() {
                 return;
             }
-            if self.made_view {
-                self.made_view = false;
-                self.export_active = false;
-                let mut view = self.buffer;
+            // `unpackiter_iternext` / `W_UnpackIter.descr_next`: drop the
+            // iterator's struct and view before `PyBuffer_Release` /
+            // `release_py_buffer`, so a `__release_buffer__` reentering
+            // `next` sees a spent iterator.
+            let mut view = self.buffer;
+            let made_view = self.made_view;
+            let export_active = self.export_active;
+            self.made_view = false;
+            self.export_active = false;
+            self.buffer = PY_NULL;
+            self.format = PY_NULL;
+            if made_view {
                 if let Err(mut error) = pyre_object::with_roots!(
                     view => crate::builtins::memoryview_release(&[view])
                 ) {
@@ -2311,12 +2319,9 @@ pub mod unpack_iter {
                         rustpython_wtf8::Wtf8::new(""),
                     );
                 }
-            } else if self.export_active {
-                self.export_active = false;
-                unsafe { crate::builtins::buffer_export_decref(self.buffer) };
+            } else if export_active {
+                unsafe { crate::builtins::buffer_export_decref(view) };
             }
-            self.buffer = PY_NULL;
-            self.format = PY_NULL;
         }
     }
 
@@ -2335,7 +2340,7 @@ pub mod unpack_iter {
         ty
     }
 
-    /// `interp_struct.py:178 W_UnpackIter.__init__` — build an unpack
+    /// `Struct_iter_unpack_impl` / `W_UnpackIter.__init__` — build an unpack
     /// iterator, rejecting a zero-length struct or a buffer whose length is
     /// not a whole multiple of the record size.
     pub fn make_unpack_iter(
@@ -2344,9 +2349,10 @@ pub mod unpack_iter {
         buffer: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         let _ = type_object();
-        // `W_UnpackIter.__init__`: size is checked before
-        // `space.acquire_py_buffer`; the live `self.view` lease is stored
-        // on the iterator, never an unrooted caller-local pointer.
+        // [3.15-spec] CPython tag v3.15.2 (identical at the stdlib pin
+        // v3.15.0, `lib-python/stdlib-version.txt`) `Modules/_struct.c`
+        // `Struct_iter_unpack_impl` (`s_size == 0` raised before
+        // `PyObject_GetBuffer`) ↔ PyPy `W_UnpackIter.__init__` acquires first.
         let _roots = pyre_object::gc_roots::push_roots();
         // Both operands already exist. Sequential `pin_root` would normalize
         // after the format and leave the buffer unpublished

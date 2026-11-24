@@ -3380,7 +3380,7 @@ fn surface_inline_subloop_after_back_edge(
     // the only gate that waits for an explicit `loop_header`. With
     // `no_loop_header` the handler stamps `seen_loop_header_for_jdindex`
     // itself and proceeds to `do_recursive_call(..., assembler_call=True)`.
-    if ctx.seen_loop_header_for_jdindex < 0 && !carrier_resume && !no_loop_header {
+    if ctx.seen_loop_header_for_jdindex < 0 && !no_loop_header {
         return None;
     }
     // `opimpl_jit_merge_point` else (`portal_call_depth`): `finishframe` +
@@ -17768,7 +17768,7 @@ fn handle<Sym: WalkSym>(
             // (`should_unroll_one_iteration` is true for `CO_GENERATOR`).
             // `walk_generator_resume` admits it through
             // `WalkFrameStateData.inline_w_code` (`MIFrame.setup(jitcode)`).
-            // No stamped header and no `no_loop_header` / carrier resume:
+            // No stamped header and no `no_loop_header`:
             // return, the inert merge. A stamped header unrolls once on this
             // frame's `unroll_iterations`, then `do_recursive_call(
             // assembler_call=True)`.
@@ -17886,11 +17886,11 @@ fn handle<Sym: WalkSym>(
             // `not jitdriver_sd.no_loop_header` and `portal_call_depth`:
             // return. Nested portal frames — inlined Python callees and
             // the generator-resume body — stay inert until a back-edge
-            // stamps the header. `no_loop_header` stamps itself; a
-            // carrier resume stands in for the crossing it consumes.
+            // stamps the header. Reconstructed frames also wait for a back-edge,
+            // as in `MIFrame.opimpl_jit_merge_point`; only `no_loop_header`
+            // stamps itself.
             if !ctx.is_top_level
                 && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
-                && !in_carrier_resume
                 && !no_loop_header
             {
                 return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -17920,10 +17920,7 @@ fn handle<Sym: WalkSym>(
             };
             if let Some(code) = nested_code {
                 let carrier_resume = carrier_resume_at(code);
-                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                    || carrier_resume
-                    || no_loop_header
-                {
+                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || no_loop_header {
                     if let Some(outcome) = try_surface_inline_subloop_for_pycode(
                         ctx,
                         code,
@@ -17967,10 +17964,7 @@ fn handle<Sym: WalkSym>(
                     let callee_code = current_walk_frame_pycode(ctx);
                     if let Some(callee_code) = callee_code {
                         let carrier_resume = carrier_resume_at(callee_code);
-                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                            || carrier_resume
-                            || no_loop_header
-                        {
+                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || no_loop_header {
                             if let Some(outcome) = try_surface_inline_subloop_for_pycode(
                                 ctx,
                                 callee_code,

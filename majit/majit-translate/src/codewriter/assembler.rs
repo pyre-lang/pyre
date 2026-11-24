@@ -16126,7 +16126,9 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        // The test reads `flat.insns` / `flat.insns_pos` after assembly;
+        // `assemble_with_callcontrol` takes the graph by value.
+        let body = asm.assemble_inner(&mut flat, &regallocs, Some(&cc));
 
         assert!(
             asm.insns.contains_key("arraylen_vable/rdd>i"),
@@ -16361,7 +16363,7 @@ mod tests {
             let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
             let mut flat = flatten_graph(&rewritten, &mut regallocs);
             let mut asm = Assembler::new();
-            let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+            let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
             assert!(
                 asm.insns.contains_key("arraylen_vable/rdd>i"),
                 "vable arraylen must assemble without unique vinfo, got {:?}",
@@ -16523,7 +16525,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let _ = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         for key in [
             "getarrayitem_vable_i/ridd>i",
             "setarrayitem_vable_i/riidd",
@@ -16642,7 +16644,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let body = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let body = asm.assemble_with_callcontrol(flat, &regallocs, Some(&cc));
         let key = "setarrayitem_vable_i/riidd";
         let Some(&opnum) = asm.insns.get(key) else {
             panic!(

@@ -1649,7 +1649,7 @@ pub(in crate::front::mir) fn compute_deref_only_locals(
     let n = body.locals.locals.len();
     let mut disqualified = vec![false; n];
     let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
+    for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }

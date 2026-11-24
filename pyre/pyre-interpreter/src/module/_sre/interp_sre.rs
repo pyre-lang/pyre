@@ -1926,6 +1926,119 @@ impl Drop for HeldBufferExport {
     }
 }
 
+/// `W_SRE_Pattern.subx` filter kind after the callable / literal / template
+/// split. Matching-type literals use the StringBuilder arm. A callable
+/// filter never uses the builder (`use_builder == '\x00'`): each non-None
+/// piece is appended to `sublist_w` and the result is the subject's
+/// empty-string `join`. A mismatched-type / non-builder literal goes
+/// through the same join path. A replaced compiler that still returns a
+/// list is decoded into [`TemplateItem`]s.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubxFilter {
+    Callable,
+    Builder,
+    JoinLiteral,
+    JoinTemplate,
+    ExpandItems,
+}
+
+/// `W_SRE_Pattern.subx` non-callable arm: unicode / bytes / `space.buffer_w`.
+/// The `bool` is `is_buffer`. An acquisition failure is not an error here —
+/// the replacement is treated as non-literal so `compile_template` raises.
+/// It reads through `space.buffer_w` (`_try_buffer_w`: memoryview / native
+/// buffer first — a bytes/bytearray/array subclass reads its native payload,
+/// as pyre's `bytes.join` does — then a Python `__buffer__`, then a C
+/// exporter).
+///
+/// [3.15-spec] acquire/read failure → non-literal (`compile_template` raises)
+/// ↔ PyPy `W_SRE_Pattern.subx` raises from `acquire_py_buffer` — `re.sub('b',
+/// 1, 'ab')` is `TypeError: decoding to str: need a bytes-like object, int
+/// found`; evidence: CPython tag v3.15.2 (identical at the stdlib pin
+/// v3.15.0, `lib-python/stdlib-version.txt`) `Modules/_sre/sre.c`
+/// `pattern_subx`
+/// (`ptr = getstring(...); if (ptr) { ... } else { PyErr_Clear(); literal =
+/// 0; }` then `compile_template`). PyPy: `a bytes-like object is required,
+/// not int`.
+///
+/// [3.15-spec] PEP 688 Python exporter accepted (`getstring` →
+/// `PyObject_GetBuffer`) ↔ PyPy `acquire_py_buffer` requires `W_BufferExporter`
+/// — `re.sub(b"a", P(), b"a")` with `P.__buffer__` returning `memoryview(b"x")`
+/// is `b'x'`; evidence: CPython tag v3.15.2 (identical at the stdlib pin
+/// v3.15.0) `Modules/_sre/sre.c` `getstring`, measured on 3.15.2t.
+fn try_filter_as_string(w_repl: PyObjectRef) -> Option<(Vec<u8>, bool)> {
+    // `to_vec` / `ReadableBuffer::acquire_buffer_w` can host-malloc. Pin
+    // `w_repl` across them (`push_roots` / `pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_repl = RootedObject::pin(w_repl);
+    unsafe {
+        if crate::baseobjspace::isinstance_str_w(w_repl.get()) {
+            return Some((w_str_get_wtf8(w_repl.get()).as_bytes().to_vec(), false));
+        }
+        if crate::baseobjspace::isinstance_bytes_w(w_repl.get()) {
+            return Some((
+                pyre_object::bytesobject::bytes_like_data(w_repl.get()).to_vec(),
+                false,
+            ));
+        }
+        let Ok(buf) = crate::builtins::ReadableBuffer::acquire_buffer_w(
+            w_repl.get(),
+            crate::builtins::BUF_SIMPLE,
+        ) else {
+            return None;
+        };
+        // `space.release_py_buffer` / `PyBuffer_Release(&view)`: Drop of
+        // `ReadableBuffer` is the `finally`, including when the read fails.
+        let copied = match crate::builtins::acquire_readbuf(buf.owner()) {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(_) => None,
+        };
+        drop(buf);
+        copied.map(|bytes| (bytes, true))
+    }
+}
+
+/// `_sub_append_slice` join-path arm: append `slice_w` of `[start, end)` onto
+/// `sublist_w`. The caller skips empty gaps (`last_pos < ctx.match_start`).
+/// `sublist` is a shadow-stack slot: `slice_subject` allocates, so the list
+/// is re-read immediately before `w_list_append`.
+fn subx_append_slice(sublist: RootedObject, subj: Subject, span: (i64, i64)) {
+    let _item_roots = pyre_object::gc_roots::push_roots();
+    let w_item = RootedObject::pin(slice_subject(subj, span, w_none()));
+    unsafe { w_list_append(sublist.get(), w_item.get()) };
+}
+
+fn subx_append_obj(sublist: RootedObject, w_obj: RootedObject) {
+    unsafe { w_list_append(sublist.get(), w_obj.get()) };
+}
+
+/// Non-literal arm: `compile_template`, then `pattern_subx`'s size-0 → LITERAL
+/// of `TemplateObject.literal`, else TEMPLATE, else a replaced compiler's list.
+fn subx_compiled_kind(
+    pat: PyObjectRef,
+    w_source: PyObjectRef,
+    items: &mut Vec<TemplateItem>,
+    filter_slot: &mut usize,
+    template_slot: &mut usize,
+) -> Result<SubxFilter, crate::PyError> {
+    let w_compiled = compile_template_object(pat, w_source)?;
+    let compiled_slot = pyre_object::gc_roots::pin_roots(&[w_compiled]);
+    let w_compiled = || pyre_object::gc_roots::shadow_stack_get(compiled_slot);
+    if unsafe { is_sre_template(w_compiled()) } {
+        let indexes = unsafe { (*(w_compiled() as *const W_SRE_Template)).indexes };
+        if unsafe { pyre_object::w_tuple_len(indexes) } == 0 {
+            let lit = unsafe { (*(w_compiled() as *const W_SRE_Template)).literal };
+            *filter_slot = pyre_object::gc_roots::pin_roots(&[lit]);
+            Ok(SubxFilter::JoinLiteral)
+        } else {
+            *template_slot = compiled_slot;
+            Ok(SubxFilter::JoinTemplate)
+        }
+    } else {
+        *items = template_items_from_compiled(w_compiled())?;
+        Ok(SubxFilter::ExpandItems)
+    }
+}
+
 /// `subx` (interp_sre.py) — the shared sub/subn body.  `repl` is a
 /// callable (invoked per match), a literal template string with backslash
 /// references expanded ([`parse_template`]), or a plain literal; `count`
@@ -1963,126 +2076,164 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let subject_now = || unsafe { subject_of(string(), w_buffer()) };
     let count = arg_int(args, 3, 0)?;
 
-    // interp_sre.py:437-472 — a callable filter is applied per match; a
-    // literal (no backslash) is inserted verbatim; otherwise the template
-    // is compiled into a literal/group reference list.  The replacement's
-    // type must match the subject's (str↔str, bytes↔bytes).
+    // `W_SRE_Pattern.subx`: callable → filter; else `filter_as_string`
+    // (str / bytes / buffer), `literal = '\\' not in filter_as_string`;
+    // matching-type literal → `use_builder`; otherwise `sublist_w` + join.
+    // A non-literal is handed to `re._compile_template` (`compile_template`).
     let filter_is_callable = crate::baseobjspace::callable_w(w_repl());
-    let template = if filter_is_callable {
-        None
+    let mut filter_bytes: Vec<u8> = Vec::new();
+    let mut items: Vec<TemplateItem> = Vec::new();
+    let mut filter_slot = base;
+    let mut template_slot = base;
+    let kind = if filter_is_callable {
+        SubxFilter::Callable
+    } else if let Some((s, is_buffer)) = try_filter_as_string(w_repl()) {
+        let literal = !s.contains(&b'\\');
+        let matching_repl = if subj.is_unicode() {
+            unsafe { crate::baseobjspace::isinstance_str_w(w_repl()) }
+        } else {
+            is_buffer || unsafe { crate::baseobjspace::isinstance_bytes_w(w_repl()) }
+        };
+        let use_builder = literal && matching_repl;
+        if literal {
+            if use_builder {
+                filter_bytes = s;
+                SubxFilter::Builder
+            } else {
+                SubxFilter::JoinLiteral
+            }
+        } else {
+            let w_source = if is_buffer {
+                pyre_object::gc_roots::pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&s))
+            } else {
+                w_repl()
+            };
+            subx_compiled_kind(
+                pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                w_source,
+                &mut items,
+                &mut filter_slot,
+                &mut template_slot,
+            )?
+        }
     } else {
-        Some(match subj {
-            Subject::AsciiStr(_) | Subject::Str(_) => {
-                if !unsafe { is_str(w_repl()) } {
-                    return Err(crate::PyError::type_error(
-                        "sub: replacement must be str or callable",
-                    ));
-                }
-                if unsafe { w_str_get_wtf8(w_repl()) }
-                    .as_bytes()
-                    .contains(&b'\\')
-                {
-                    compile_template(
-                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                        w_repl(),
-                    )?
-                } else {
-                    // `subx` literal arm: no backslash, so the replacement is
-                    // copied verbatim and the template compiler is not invoked.
-                    vec![TemplateItem::Literal(
-                        unsafe { w_str_get_wtf8(w_repl()) }.as_bytes().to_vec(),
-                    )]
-                }
-            }
-            Subject::Bytes(_) => {
-                let Some(w_bytes) = crate::typedef::buffer_as_bytes_like(w_repl())? else {
-                    return Err(crate::PyError::type_error(
-                        "sub: replacement must be bytes-like or callable",
-                    ));
-                };
-                let w_bytes = pyre_object::gc_roots::pin_root(w_bytes);
-                // `W_SRE_Pattern.subx`: test `literal = '\\' not in filter_as_string`
-                // on the original buffer first; `space.newbytes(filter_as_string)`
-                // only in the non-literal template-compilation branch.
-                let filter_as_string =
-                    unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) };
-                if filter_as_string.contains(&b'\\') {
-                    let w_source = if !unsafe { pyre_object::is_bytes(w_bytes) } {
-                        pyre_object::gc_roots::pin_root(
-                            pyre_object::bytesobject::w_bytes_from_bytes(filter_as_string),
-                        )
-                    } else {
-                        w_bytes
-                    };
-                    compile_template(
-                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                        w_source,
-                    )?
-                } else {
-                    vec![TemplateItem::Literal(filter_as_string.to_vec())]
-                }
-            }
-        })
+        subx_compiled_kind(
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
+            w_repl(),
+            &mut items,
+            &mut filter_slot,
+            &mut template_slot,
+        )?
     };
 
     let endpos = subject_now().len();
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0i64;
+    let use_join = matches!(
+        kind,
+        SubxFilter::JoinLiteral | SubxFilter::JoinTemplate | SubxFilter::Callable
+    );
+    // `W_SRE_Pattern.subx`: `if not searchcontext(...): return w_string, 0`
+    // then `sublist_w = strbuilder = None; if use_builder != '\x00':
+    // StringBuilder else sublist_w = []`. The list is allocated only on
+    // the join path and only after the first search matched. `w_list_new_empty`
+    // can collect: pin it, then re-read subjects from slots (`subject_now`).
+    let mut sublist: Option<RootedObject> = None;
     // interp_sre.py `while not count or n < count` — 0 is unlimited, a
     // negative count performs no substitutions; the matching itself streams so
     // a callable filter's side effects interleave with `search`.
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
-        let (mstart, mend) = snap.spans[0];
-        // interp_sre.py:499-502 — copy the gap before this match.
-        if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
-            out.extend_from_slice(gap);
+        if use_join && sublist.is_none() {
+            sublist = Some(RootedObject::pin(w_list_new_empty()));
         }
-        last = mend;
-        if let Some(items) = &template {
-            let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
-                pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                string(),
-                w_buffer(),
-                snap,
-                0,
-                endpos as i64,
-            ))?;
-            expand_into(&mut out, items, m as *const W_SRE_Match, subject_now());
-        } else {
-            // interp_sre.py:505-513 — callable filter; None means "no
-            // piece" (treated as empty), otherwise the returned string.
-            let m = crate::runtime_ops::obj_or_memory_error(make_match_from_snapshot(
-                pyre_object::gc_roots::shadow_stack_get(pat_slot),
-                string(),
-                w_buffer(),
-                snap,
-                0,
-                endpos as i64,
-            ))?;
-            let w_piece = crate::call::call_function_impl_result(w_repl(), &[m])?;
-            if !unsafe { is_none(w_piece) } {
-                match subj {
-                    Subject::AsciiStr(_) | Subject::Str(_) => {
-                        if !unsafe { is_str(w_piece) } {
-                            return Err(crate::PyError::type_error(
-                                "sub callable must return a string",
-                            ));
-                        }
-                        out.extend_from_slice(unsafe { w_str_get_wtf8(w_piece) }.as_bytes());
+        let (mstart, mend) = snap.spans[0];
+        match kind {
+            SubxFilter::JoinLiteral => {
+                if let Some(sublist) = sublist {
+                    if last < mstart {
+                        subx_append_slice(sublist, subject_now(), (last, mstart));
                     }
-                    Subject::Bytes(_) => {
-                        if !unsafe { pyre_object::bytesobject::is_bytes_like(w_piece) } {
-                            return Err(crate::PyError::type_error(
-                                "sub callable must return bytes",
-                            ));
-                        }
-                        out.extend_from_slice(unsafe {
-                            pyre_object::bytesobject::bytes_like_data(w_piece)
-                        });
+                    subx_append_obj(sublist, RootedObject(filter_slot));
+                }
+            }
+            SubxFilter::JoinTemplate => {
+                if let Some(sublist) = sublist {
+                    if last < mstart {
+                        subx_append_slice(sublist, subject_now(), (last, mstart));
+                    }
+                    let _match_roots = pyre_object::gc_roots::push_roots();
+                    let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                        make_match_from_snapshot(
+                            pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                            string(),
+                            w_buffer(),
+                            snap,
+                            0,
+                            endpos as i64,
+                        ),
+                    )?);
+                    let w_piece = RootedObject::pin(expand_template(
+                        pyre_object::gc_roots::shadow_stack_get(template_slot),
+                        m.get(),
+                    )?);
+                    if !unsafe { is_none(w_piece.get()) } {
+                        subx_append_obj(sublist, w_piece);
+                    }
+                }
+            }
+            SubxFilter::Builder => {
+                if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
+                    out.extend_from_slice(gap);
+                }
+                out.extend_from_slice(&filter_bytes);
+            }
+            SubxFilter::ExpandItems => {
+                if let Some(gap) = subject_span_bytes(subject_now(), (last, mstart)) {
+                    out.extend_from_slice(gap);
+                }
+                let _match_roots = pyre_object::gc_roots::push_roots();
+                let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                    make_match_from_snapshot(
+                        pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                        string(),
+                        w_buffer(),
+                        snap,
+                        0,
+                        endpos as i64,
+                    ),
+                )?);
+                expand_into(&mut out, &items, m, &subject_now);
+            }
+            SubxFilter::Callable => {
+                if let Some(sublist) = sublist {
+                    if last < mstart {
+                        subx_append_slice(sublist, subject_now(), (last, mstart));
+                    }
+                    // `W_SRE_Pattern.subx`: callable filter. None is skipped;
+                    // any other `w_piece` is appended as-is. Type errors come
+                    // from the subject's empty-string `join`, not from here.
+                    let _match_roots = pyre_object::gc_roots::push_roots();
+                    let m = RootedObject::pin(crate::runtime_ops::obj_or_memory_error(
+                        make_match_from_snapshot(
+                            pyre_object::gc_roots::shadow_stack_get(pat_slot),
+                            string(),
+                            w_buffer(),
+                            snap,
+                            0,
+                            endpos as i64,
+                        ),
+                    )?);
+                    let w_piece = RootedObject::pin(crate::call::call_function_impl_result(
+                        w_repl(),
+                        &[m.get()],
+                    )?);
+                    if !unsafe { is_none(w_piece.get()) } {
+                        subx_append_obj(sublist, w_piece);
                     }
                 }
             }
         }
+        last = mend;
         Ok(())
     };
     // `state_init` holds the export across the callback loop. The guard
@@ -2130,17 +2281,26 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         let w_result = if is_exact_str_or_bytes(string()) {
             string()
         } else {
-            let w_empty = RootedObject::pin(empty_subject(subj));
+            let w_empty = RootedObject::pin(empty_subject(subject_now()));
             slice_subject(subject_now(), (0, endpos as i64), w_empty.get())
         };
         return Ok((w_result, 0));
+    }
+    if let Some(sublist) = sublist {
+        if last < endpos as i64 {
+            subx_append_slice(sublist, subject_now(), (last, endpos as i64));
+        }
+        let w_empty = RootedObject::pin(empty_subject(subject_now()));
+        let w_item =
+            crate::baseobjspace::call_method_result(w_empty.get(), "join", &[sublist.get()])?;
+        return Ok((w_item, n));
     }
     // `subx` appends the gap from the last match to `ctx.end`, the end
     // fixed when the scan started. The held export keeps that length.
     if let Some(tail) = subject_span_bytes(subject_now(), (last, endpos as i64)) {
         out.extend_from_slice(tail);
     }
-    Ok((finish_output(subj, out), n))
+    Ok((finish_output(subject_now(), out), n))
 }
 
 /// `type(w_string) is unicode` / `is bytes` — the exact-type gate of the
@@ -2522,6 +2682,15 @@ fn compile_template(
     pat: PyObjectRef,
     w_template: PyObjectRef,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
+    template_items_from_compiled(compile_template_object(pat, w_template)?)
+}
+
+/// `compile_template` — the `_sre.SRE_Template` (or a replaced compiler's
+/// list) before it is decoded into [`TemplateItem`]s.
+fn compile_template_object(
+    pat: PyObjectRef,
+    w_template: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     // The import and the `getattr` below collect.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_template = RootedObject::pin(w_template);
@@ -2529,7 +2698,7 @@ fn compile_template(
     let w_re = RootedObject::pin(import_re()?);
     let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
     match crate::call::call_function_impl_result(w_compile, &[pat.get(), w_template.get()]) {
-        Ok(w_result) => template_items_from_compiled(w_result),
+        Ok(w_result) => Ok(w_result),
         Err(err) => compile_template_retry(pat.get(), w_template.get(), err),
     }
 }
@@ -2543,7 +2712,7 @@ fn compile_template_retry(
     pat: PyObjectRef,
     w_template: PyObjectRef,
     mut err: crate::PyError,
-) -> Result<Vec<TemplateItem>, crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     // `type_error_matched` (`OperationError.match`) can collect. Pin first
     // so `pop_roots` reloads `pat` and `w_template` (`shadowstack.py
     // push_roots` / `pop_roots`).
@@ -2579,9 +2748,7 @@ fn compile_template_retry(
     let w_converted = RootedObject::pin(w_converted);
     let w_re = RootedObject::pin(import_re()?);
     let w_compile = crate::baseobjspace::getattr_str(w_re.get(), "_compile_template")?;
-    let w_result =
-        crate::call::call_function_impl_result(w_compile, &[pat.get(), w_converted.get()])?;
-    template_items_from_compiled(w_result)
+    crate::call::call_function_impl_result(w_compile, &[pat.get(), w_converted.get()])
 }
 
 /// Decode the `_sre.SRE_Template` `_sre.template` returned, or a list left
@@ -2642,17 +2809,79 @@ fn push_template_elem(items: &mut Vec<TemplateItem>, elem: PyObjectRef) {
     }
 }
 
+/// `expand_template` — join the template's literals with the match's group
+/// slices. The joiner is empty `str` when `literal` is `str`, else empty
+/// `bytes`, so a type mismatch surfaces as that join's error.
+fn expand_template(w_template: PyObjectRef, m: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let t_slot = pyre_object::gc_roots::pin_roots(&[w_template, m]);
+    let template = || pyre_object::gc_roots::shadow_stack_get(t_slot) as *const W_SRE_Template;
+    let m = || pyre_object::gc_roots::shadow_stack_get(t_slot + 1);
+    let indexes_slot = pyre_object::gc_roots::pin_roots(&[unsafe { (*template()).indexes }]);
+    let n =
+        unsafe { pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(indexes_slot)) };
+    if n == 0 {
+        return Ok(unsafe { (*template()).literal });
+    }
+    let lit0 = RootedObject::pin(unsafe { (*template()).literal });
+    let pieces = RootedObject::pin(w_list_new_empty());
+    unsafe { w_list_append(pieces.get(), lit0.get()) };
+    let literals_slot = pyre_object::gc_roots::pin_roots(&[unsafe { (*template()).literals }]);
+    for i in 0..n {
+        let Some(index_obj) = (unsafe {
+            pyre_object::w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(indexes_slot),
+                i as i64,
+            )
+        }) else {
+            continue;
+        };
+        let index = unsafe { pyre_object::w_int_get_value(index_obj) } as usize;
+        let span = unsafe { w_sre_match_get_span(m(), index) }
+            .ok_or_else(|| crate::PyError::index_error("no such group"))?;
+        let item = unsafe { slice_w(m() as *const W_SRE_Match, span, w_none()) };
+        if !unsafe { is_none(item) } {
+            let item = RootedObject::pin(item);
+            unsafe { w_list_append(pieces.get(), item.get()) };
+        }
+        let Some(next_lit) = (unsafe {
+            pyre_object::w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(literals_slot),
+                i as i64,
+            )
+        }) else {
+            continue;
+        };
+        if !unsafe { is_none(next_lit) } {
+            let next_lit = RootedObject::pin(next_lit);
+            unsafe { w_list_append(pieces.get(), next_lit.get()) };
+        }
+    }
+    let empty = if unsafe { is_str(lit0.get()) } {
+        w_str_new("")
+    } else {
+        pyre_object::bytesobject::w_bytes_from_bytes(b"")
+    };
+    let empty = RootedObject::pin(empty);
+    crate::baseobjspace::call_method_result(empty.get(), "join", &[pieces.get()])
+}
+
 /// Expand the parsed template against a match, appending into `out` — the
 /// `_sre.template().expand()` substitution.  An unmatched group reference
-/// contributes the empty string (`g(group) or empty`).
-fn expand_into(out: &mut Vec<u8>, items: &[TemplateItem], m: *const W_SRE_Match, subj: Subject) {
+/// contributes the empty string (`g(group) or empty`). `out.extend` can
+/// host-malloc, so `m` and the subject are re-read on every group.
+fn expand_into(
+    out: &mut Vec<u8>,
+    items: &[TemplateItem],
+    m: RootedObject,
+    subj: impl Fn() -> Subject,
+) {
     for item in items {
         match item {
             TemplateItem::Literal(lit) => out.extend_from_slice(lit),
             TemplateItem::Group(idx) => {
-                let span =
-                    unsafe { w_sre_match_get_span(m as PyObjectRef, *idx) }.unwrap_or((-1, -1));
-                if let Some(piece) = subject_span_bytes(subj, span) {
+                let span = unsafe { w_sre_match_get_span(m.get(), *idx) }.unwrap_or((-1, -1));
+                if let Some(piece) = subject_span_bytes(subj(), span) {
                     out.extend_from_slice(piece);
                 }
             }
@@ -2877,11 +3106,13 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let w_pat = RootedObject::pin(unsafe { (*(m.get() as *const W_SRE_Match)).w_srepat });
     let items = compile_template(w_pat.get(), w_template.get())?;
     // Re-read after `compile_template`.
-    let mp = m.get() as *const W_SRE_Match;
-    let subj = unsafe { subject_of((*mp).w_string, (*mp).w_buffer) };
+    let subject_now = || {
+        let mp = m.get() as *const W_SRE_Match;
+        unsafe { subject_of((*mp).w_string, (*mp).w_buffer) }
+    };
     let mut out: Vec<u8> = Vec::new();
-    expand_into(&mut out, &items, mp, subj);
-    Ok(finish_output(subj, out))
+    expand_into(&mut out, &items, m, &subject_now);
+    Ok(finish_output(subject_now(), out))
 }
 
 /// `repr_w` (interp_sre.py) — `<re.Match object; span=(s, e),

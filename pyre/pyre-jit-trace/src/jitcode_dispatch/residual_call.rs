@@ -2706,6 +2706,69 @@ fn build_parent_miframe<Sym: WalkSym>(
     build_parent_miframe_from_live_banks(ctx, parent, &pjc, origin, index)
 }
 
+/// `MIFrame.opimpl_jit_merge_point` finishes the recursive portal before
+/// `do_recursive_call`. If that call escapes, `vable_after_residual_call`
+/// converts the remaining callers, with `make_result_of_lastop` already
+/// applied; the completed portal must not be converted and called again.
+pub(crate) fn latch_finished_callee_escape<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    result: Option<OpRef>,
+) -> bool {
+    let origin = "finished-callee-escape";
+    let Some(mut parents) = super::resume_snapshot::finished_callee_parent_frames(ctx) else {
+        return false;
+    };
+    let Some(mirror_stack) = capture_root_vable_stack_image(ctx, origin) else {
+        return false;
+    };
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    let mut banks = Vec::with_capacity(parents.len());
+    let parent_count = parents.len();
+    for (index, parent) in parents.iter_mut().enumerate() {
+        super::resume_snapshot::refresh_paused_parent_blackhole(parent);
+        let Some(mut handoff) = build_parent_miframe(ctx, parent, origin, index) else {
+            return false;
+        };
+        if index + 1 == parent_count
+            && let Some(result) = result
+        {
+            let Some(marker) = parent.resume_marker_jit_pc else {
+                return false;
+            };
+            match super::call_result_register(parent.jitcode_index, marker) {
+                CallResultRegister::Reg('r', color) => {
+                    let Some(Value::Ref(value)) = ctx.trace_ctx.concrete_of_opref(result) else {
+                        return false;
+                    };
+                    handoff.banks.registers_r[color] = Some(value.0 as i64);
+                }
+                CallResultRegister::Void => {}
+                _ => return false,
+            }
+        }
+        framestack.push(handoff.miframe);
+        banks.push(handoff.banks);
+    }
+    if !multi_frame_blackhole_preflight(ctx, &framestack, &banks, origin) {
+        return false;
+    }
+    let last_exc_value = match ctx.last_exc_value_concrete() {
+        ConcreteValue::Ref(value) => value as i64,
+        _ => 0,
+    };
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack,
+            banks,
+            last_exc_value,
+            raising_exception: result.is_none(),
+            mirror_stack: Some(mirror_stack),
+            origin,
+        });
+    });
+    true
+}
+
 /// `descr_call` / operator tails: jitcode and resume pc only, no live banks.
 /// Boxes are the resume `-live-` in liveness order (`resume.py` `number`).
 /// `ctor_continuation` keeps the instance in `INSTANCE_REG` and `__init__`'s
@@ -12398,6 +12461,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // Descend that getter here.
                 if let Some(attr_name) = attr_name.as_deref()
                     && try_walker_orthodox_frame_f_back(
+                        ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                    )?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // `pyframe.py fget_code` → `getcode()` → `hint(self.pycode,
+                // promote=True)`. Descend that getter so the promote records
+                // GUARD_VALUE (`PyFrame.getcode`).
+                if let Some(attr_name) = attr_name.as_deref()
+                    && try_walker_orthodox_frame_f_code(
                         ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                     )?
                     .is_some()

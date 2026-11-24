@@ -154,3 +154,16 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         destructor: None,
     });
 }
+
+/// Headerless `lltype.malloc(GcStruct)` instances this module owns.
+/// `func.py RawBytes` has no `W_Root` header, so it does not fit
+/// [`gc_types`].
+pub(crate) fn raw_gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleRawGcType>) {
+    use pyre_interpreter::importing::ModuleRawGcType;
+    types.push(ModuleRawGcType {
+        cell: &func::RAWBYTES_GC_TYPE_ID_CELL,
+        size: std::mem::size_of::<func::RawBytes>(),
+        destructor: func::rawbytes_destructor,
+        set_id: func::set_rawbytes_gc_type_id,
+    });
+}

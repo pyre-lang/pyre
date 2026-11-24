@@ -1,5 +1,8 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=outer,outer_arming,entry-bridge:inner
+# pyre-check: selfcheck-compiles=outer,outer_arming
+# `inner` does not compile here on PyPy either -- the profile hook reads the
+# traced `inner` frame's `f_code`, `_nonstandard_virtualizable` forces it,
+# and the trace ends `ABORT_ESCAPE`.
 # `c_call` carries the frame that made the call, and for a builtin called from
 # inside a Python callee that is the CALLEE's frame -- never the caller whose
 # compiled trace would have inlined it.

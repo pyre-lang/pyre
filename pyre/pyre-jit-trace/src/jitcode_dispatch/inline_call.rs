@@ -5210,6 +5210,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let token_for_record = token.clone();
     let is_constructor = constructor_result.is_some();
     let mut ran = false;
+    let mut call_returned = false;
     let mut ca_result = OpRef::NONE;
     let exec = {
         let mut record_call = |ctx: &mut WalkContext<'_, '_, Sym>,
@@ -5230,6 +5231,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 )
             };
             ran = true;
+            call_returned = value.is_some();
             ca_result = rec;
             // `do_residual_call` step 5: invalidate on the CALL_MAY_FORCE
             // executed above, not the recorded CALL_ASSEMBLER.
@@ -5265,6 +5267,18 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let exec = match exec {
         Ok(exec) => exec,
         Err(e) => {
+            if dst.is_none()
+                && ran
+                && matches!(e, DispatchError::VableEscapedDuringResidualCall { .. })
+            {
+                // `opimpl_jit_merge_point` has finished this portal before
+                // `do_recursive_call`; an escape resumes its callers with
+                // the completed result (`make_result_of_lastop`).
+                residual_call::latch_finished_callee_escape(
+                    ctx,
+                    call_returned.then_some(ca_result),
+                );
+            }
             if ran && let Some(next_pc) = resume_pc {
                 ctx.live_after_jit_pc = next_pc;
             }
