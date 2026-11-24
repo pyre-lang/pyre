@@ -9317,7 +9317,7 @@ fn genentry_merge_point_jit(
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
     // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
     // counting, and the tick is on the one runner `jitcounter`.
-    let hot = {
+    let (hot, _, procedure_token) = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
         let reds = confirm_reds_if_installed(
@@ -9328,7 +9328,6 @@ fn genentry_merge_point_jit(
         driver
             .meta_interp_mut()
             .maybe_compile_and_run_step_on_driver(jd_no, resolved, pin.save(), 0, &reds)
-            .0
     };
     let tracing = match hot {
         majit_metainterp::warmstate::HotResult::StartTracing => true,
@@ -9345,7 +9344,15 @@ fn genentry_merge_point_jit(
             get_printable_location_genentry(pycode)
         );
     }
-    let driven = drive_generatorentry_trace(green_key, pycode, w_gen, w_arg, matched_cell, tracing);
+    let driven = drive_generatorentry_trace(
+        green_key,
+        pycode,
+        w_gen,
+        w_arg,
+        matched_cell,
+        tracing,
+        procedure_token,
+    );
     // The note is scoped to the walk: whatever it recorded is either
     // consumed by the abort fallback or dropped here.
     pyre_interpreter::call::genentry_resume_note_reset();
@@ -9371,6 +9378,7 @@ fn drive_generatorentry_trace(
     w_arg: pyre_object::PyObjectRef,
     matched_cell: Option<Rc<majit_metainterp::warmstate::BaseJitCell>>,
     tracing: bool,
+    procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
     use majit_metainterp::BackEdgeAction;
 
@@ -9414,7 +9422,9 @@ fn drive_generatorentry_trace(
         let w_gen = roots.get(base + 1);
         let w_arg = roots.get(base + 2);
         let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
-        return run_compiled_generatorentry(green_key, &live_values, dbg);
+        // `EnterJitAssembler(procedure_token)`: the token the decision read.
+        let procedure_token = procedure_token.expect("RunCompiled carries the decision's token");
+        return run_compiled_generatorentry(green_key, procedure_token, &live_values, dbg);
     }
     // warmstate.py bound_reached steps 1-3 before MetaInterp() /
     // NestedTraceGuard::enter.
@@ -9826,20 +9836,35 @@ fn portal_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyErro
 /// `StopIteration` included.
 fn run_compiled_generatorentry(
     green_key: u64,
+    procedure_token: std::sync::Arc<majit_backend::JitCellToken>,
     live_values: &[majit_ir::Value],
     dbg: bool,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
     let mut live_values = live_values.to_vec();
+    // The first run executes the token the entry decision read
+    // (`EnterJitAssembler`). A `ContinueRunningNormally` re-entry looks the
+    // token up by key again. Upstream `handle_jitexception` instead calls
+    // `portal_ptr` with the rebuilt greens and reds, running the portal
+    // body rather than compiled code.
+    let mut decided_token = Some(procedure_token);
     loop {
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values_on_driver(
-                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
-                green_key,
-                &live_values,
-                0,
-            )
+            match decided_token.take() {
+                Some(token) => Some(meta.run_compiled_detailed_with_token_on_driver(
+                    green_key,
+                    &token,
+                    &live_values,
+                    0,
+                )),
+                None => meta.run_compiled_detailed_with_values_on_driver(
+                    pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+                    green_key,
+                    &live_values,
+                    0,
+                ),
+            }
             .map(|r| {
                 (
                     r.is_finish,
@@ -14340,13 +14365,17 @@ fn maybe_compile_and_run(
                 matched,
             )
         }
-        (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key, _) => {
+        (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key, procedure_token) => {
             if !backedge_vsd_matches(frame_root.frame(), loop_header_pc, pycode_root.get()) {
                 return None;
             }
+            // `EnterJitAssembler(procedure_token)`: the token the decision read.
+            let procedure_token =
+                procedure_token.expect("RunCompiled carries the decision's token");
             execute_assembler(
                 frame_root.frame(),
                 compiled_key,
+                &procedure_token,
                 loop_header_pc,
                 driver,
                 info,
@@ -14986,6 +15015,7 @@ fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
 fn execute_assembler(
     frame: &mut PyFrame,
     green_key: u64,
+    procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
     entry_pc: usize,
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -15068,8 +15098,9 @@ fn execute_assembler(
     // itself points into the evacuated (and debug-poisoned) frame.  PyPy roots
     // the frame object and lets its type tracer follow the locals-array field;
     // `FrameRoot` plus `pyframe_object_custom_trace` is that same ownership.
-    let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
+    let mut outcome = driver.run_compiled_detailed_with_bridge_token(
         green_key,
+        procedure_token,
         entry_pc,
         &mut jit_state,
         env,
