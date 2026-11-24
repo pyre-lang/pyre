@@ -144,6 +144,31 @@ unsafe extern "C" fn atfork_child_reinit_thread_tables() {
 
 pub mod gil;
 
+/// `PYRE_GIL=0` at process start: the internal switch that turns the GIL off.
+/// Other values and an unset variable leave the GIL on. `-X gil` is not
+/// accepted and `PYTHON_GIL` is ignored.
+static GIL_ENV_DISABLED: OnceLock<bool> = OnceLock::new();
+
+/// Whether startup asked for the GIL off through `PYRE_GIL=0`.
+///
+/// One owner of that decision: [`apply_gil_env`] and `sys.flags.gil` both
+/// read this, so the flag does not re-parse the environment.
+pub fn gil_env_disabled() -> bool {
+    *GIL_ENV_DISABLED
+        .get_or_init(|| std::env::var_os("PYRE_GIL").as_deref() == Some(std::ffi::OsStr::new("0")))
+}
+
+/// If [`gil_env_disabled`], call [`majit_gc::rgil::disable_gil`] once.
+///
+/// `disable_gil` requires the GIL holder or an uninitialized GIL, at most
+/// one registered mutator, and nobody waiting. Startup calls this before
+/// any user code or any other thread starts.
+pub fn apply_gil_env() {
+    if gil_env_disabled() {
+        majit_gc::rgil::disable_gil();
+    }
+}
+
 /// `rffi.aroundstate.before()`: drop the GIL and leave the collector's RUNNING
 /// census for the duration of a blocking host call.
 pub fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
@@ -649,7 +674,9 @@ pub fn gilstate_check() -> bool {
 /// caller stays outside pyre.  A thread already outside has nothing to give up,
 /// so the nested spelling is what it records rather than a second departure.
 pub fn save_thread() {
-    let guard = majit_gc::rgil::am_i_holding_the_gil().then(before_external_block);
+    // With the GIL off there is no lock to drop, but the thread still leaves
+    // the RUNNING census.
+    let guard = majit_gc::rgil::mutator_may_run().then(before_external_block);
     SAVED_THREADS.with(|saved| saved.borrow_mut().push(guard));
 }
 
