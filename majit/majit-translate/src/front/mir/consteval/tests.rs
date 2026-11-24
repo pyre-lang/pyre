@@ -3418,10 +3418,10 @@ fn oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(
     )
 }
 
-/// A refs-keyed `OnceLock<usize>` payload is `llmemory.Address`.
-/// `*ONCE.get_or_init(f) as *const STRUCT` is `gen_cast` Address→Ptr
-/// (`rbuiltin.py` `cast_adr_to_ptr`) of that prebuilt address:
-/// `InstanceRepr.convert_const` / `__cast_instance_intrinsic[<T>]`.
+/// A refs-keyed `OnceLock<usize>` payload is the prebuilt GC object
+/// (`cache.py Cache.getorbuild` / `baseobjspace.py fromcache`).
+/// `*ONCE.get_or_init(f) as *const STRUCT` is `ptr_cast_marker` →
+/// `__cast_instance_intrinsic[<T>]` (`rclass.py InstanceRepr.convert_const`).
 fn assert_oncelock_usize_cast_to_struct_ptr_is_instance(rvalue_cast: bool) {
     super::register_foldable_const_lits(Vec::new());
     let llbc = oncelock_usize_get_or_init_cast_to_struct_ptr_llbc(rvalue_cast);
@@ -3432,7 +3432,7 @@ fn assert_oncelock_usize_cast_to_struct_ptr_is_instance(rvalue_cast: bool) {
     assert_eq!(
         cast_instance_roots(&graph),
         vec!["Payload".to_string()],
-        "Address-stamped usize as *const STRUCT is SomeInstance(T): {graph:?}"
+        "prebuilt OnceLock<usize> as *const STRUCT is SomeInstance(T): {graph:?}"
     );
     assert!(
         call_paths_in(&graph)
@@ -3444,7 +3444,7 @@ fn assert_oncelock_usize_cast_to_struct_ptr_is_instance(rvalue_cast: bool) {
         call_paths_in(&graph)
             .iter()
             .all(|segments| segments.last().map(String::as_str) != Some("cast_int_to_ptr")),
-        "Address→Ptr is cast_adr_to_ptr / convert_const, not cast_int_to_ptr: {graph:?}"
+        "as *const STRUCT is ptr_cast_marker / convert_const, not cast_int_to_ptr: {graph:?}"
     );
 }
 

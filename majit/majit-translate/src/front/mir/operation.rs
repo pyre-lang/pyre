@@ -2877,10 +2877,12 @@ impl<'a> Lowering<'a> {
                     // keep `SomePtr(GCREF)` on a `SomeInstance(PyObject)`
                     // slot (`pairtype(SomePtr, SomeObject).union`).
                     //
-                    // A scalar OnceLock payload is `llmemory.Address`
-                    // (`gen_cast` ORIG Address → `cast_adr_to_ptr`). A
-                    // classed dest is `InstanceRepr.convert_const` of the
-                    // object at that address.
+                    // A fn-pointer payload (`FnPtrCell`, `OnceLock<fn>`)
+                    // and a harvested `_alloc_flavor_ = "raw"` STRUCT
+                    // static stamp `llmemory.Address` (`gen_cast` ORIG
+                    // Address → `cast_adr_to_ptr`). A classed dest is
+                    // `InstanceRepr.convert_const` of the object at
+                    // that address.
                     if matches!(dst_kind, ValueType::Ref(_)) {
                         if let Some((op, res)) = self.address_to_classed_ptr(dest_ty, &arg, None) {
                             return Ok((Some(op), res));
@@ -3606,6 +3608,15 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
                 let src_ty_owned = operand_tyref(&operand).cloned();
+                // Classify before `resolve_operand` consumes `operand`
+                // (same expression as the `UnaryOp::Cast` twin).
+                let src_is_prebuilt_once_value = match &operand {
+                    Operand::Copy(p) | Operand::Move(p) => self
+                        .prebuilt_once_value_locals
+                        .iter()
+                        .any(|&local| place_references_local(p, local)),
+                    Operand::Const(_) => false,
+                };
 
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
@@ -3614,6 +3625,23 @@ impl<'a> Lowering<'a> {
                 if let Some((op, res)) = self.address_to_classed_ptr(&ty, &v, src_ty_owned.as_ref())
                 {
                     return Ok((Some(op), res));
+                }
+                // Prebuilt OnceLock payload → classed dest: same lane as
+                // `UnaryOp::Cast` (`src_is_prebuilt_once_value`).
+                if src_is_prebuilt_once_value
+                    && matches!(self.value_type_of(&ty), ValueType::Ref(_))
+                {
+                    match self.ptr_cast_marker(
+                        Some(&ValueType::Ref(None)),
+                        None,
+                        &ty,
+                        &v,
+                        self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &v),
+                        None,
+                    ) {
+                        Some((op, res)) => return Ok((Some(op), res)),
+                        None => return Ok((None, v)),
+                    }
                 }
                 if cast_kind_is_unsize(&kind)
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
