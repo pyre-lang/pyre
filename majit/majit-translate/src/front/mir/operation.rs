@@ -6592,9 +6592,9 @@ impl<'a> Lowering<'a> {
             });
             return Ok(var);
         }
-        if let Some(segments) = self.fn_item_const_segments(value) {
+        if let Some(decoded) = self.fn_item_const_segments(value) {
             let bb_id = self.emit_bb(mir_bb);
-            return Ok(self.emit_decoded_const(bb_id, DecodedConst::FnPath(segments)));
+            return Ok(self.emit_decoded_const(bb_id, decoded));
         }
         let decoded = decode_constant(self.llbc, value)?;
         let bb_id = self.emit_bb(mir_bb);
@@ -6611,13 +6611,14 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn fn_item_const_segments(
         &self,
         value: &serde_json::Value,
-    ) -> Option<Vec<String>> {
+    ) -> Option<DecodedConst> {
         let reg = fn_def_of_const(self.llbc, value)?;
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        self.enqueue_spec(fd, &reg.generics)
+        let segments = self.enqueue_spec(fd, &reg.generics)?;
+        Some(decoded_fn_item_const(self.llbc, fd, segments))
     }
 
     /// Emit `decoded` onto `bb_id`. A Unicode scalar is
@@ -6698,14 +6699,14 @@ impl<'a> Lowering<'a> {
             // emits `ConstFnAddr`, which the assembler encodes through the
             // `'i'` argcode), and the flowspace fold gives the define a
             // `Signed` legacy slot to match.
-            DecodedConst::FnPath(segments) => {
+            DecodedConst::FnPath { segments, resolved } => {
                 let mut synthetic = Vec::with_capacity(segments.len() + 1);
                 synthetic.push(crate::model::FN_CONST_HEAD.to_string());
                 synthetic.extend(segments);
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: synthetic,
-                        resolved_path: None,
+                        resolved_path: Some(resolved),
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },

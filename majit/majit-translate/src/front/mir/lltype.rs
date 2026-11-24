@@ -626,12 +626,13 @@ pub(in crate::front::mir) fn impl_atomic_alias_leaf(
     Some(format!("Atomic{first}{}", chars.as_str()))
 }
 
-/// Path segments used to *call* a function named by a `FnDef` constant or
-/// type — the same harvest spelling `decode_constant` stores in a
-/// function-item value and `call_target_segments` emits for a direct
+/// Harvest display segments of a function named by a `FnDef` constant or
+/// type — the spelling `decode_constant` stores in a function-item
+/// value's `segments` and `call_target_segments` emits for a direct
 /// call.  The leaf is [`instance_leaf`] when Charon instantiated the
 /// declaration (`FunctionDesc.cachedgraph`). Unique identity lives on
-/// [`registered_path_for_fun_decl`].
+/// [`registered_path_for_fun_decl`] and is stamped as
+/// `CallTarget::FunctionPath.resolved_path`.
 pub(in crate::front::mir) fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
     spec_segments(llbc, fd, &registered_leaf(llbc, fd))
 }
@@ -12006,7 +12007,7 @@ pub(in crate::front::mir) fn operand_fn_item_segments(
 ) -> Option<Vec<String>> {
     match op? {
         Operand::Const(value) => match decode_constant(llbc, value) {
-            Ok(DecodedConst::FnPath(segments)) if !segments.is_empty() => Some(segments),
+            Ok(DecodedConst::FnPath { segments, .. }) if !segments.is_empty() => Some(segments),
             _ => None,
         },
         Operand::Copy(p) | Operand::Move(p) => tyref_fn_def_call_segments(&p.ty, llbc),

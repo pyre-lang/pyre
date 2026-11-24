@@ -2079,8 +2079,8 @@ impl<'a> Lowering<'a> {
         // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
         // `fn_const`).
         if let Some(value) = promoted_const_copied_const(&body) {
-            let decoded = if let Some(segments) = self.fn_item_const_segments(&value) {
-                DecodedConst::FnPath(segments)
+            let decoded = if let Some(decoded) = self.fn_item_const_segments(&value) {
+                decoded
             } else {
                 match decode_constant(self.llbc, &value) {
                     Ok(decoded) => decoded,

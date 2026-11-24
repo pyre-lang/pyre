@@ -9832,6 +9832,248 @@ fn spec_segments_keeps_disambiguated_parent_of_nested_closure() {
     assert!(b.iter().any(|s| s == "OWNER#3"), "OWNER#3 missing: {b:?}");
 }
 
+/// Two free FunDecls distinguished only by a non-closure Ident
+/// disambiguator (`c::parent#2::f` vs `c::parent#3::f`). Harvest
+/// `ItemMeta::name_path` drops `#N`, so `fundecl_fn_item_segments` /
+/// `decode_fn_def_const` used to store the same function-item constant
+/// while `registered_path_for_fun_decl` (the FunDecl identity, stand-in
+/// for the function object) stayed distinct.
+fn nested_free_fn_item_const_llbc() -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str, n: u64| serde_json::json!({"Ident": [s, n]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let nested = |def_id: u64, parent_n: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("c", 0),
+                ident("parent", parent_n),
+                ident("f", 0),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": bool_ty.clone()
+            },
+            "body": "Opaque"
+        })
+    };
+    let fn_ty = |fun: u64| {
+        serde_json::json!({
+            "FnDef": {
+                "kind": {"Fun": fun},
+                "generics": empty_generics.clone()
+            }
+        })
+    };
+    let fn_const = |fun: u64| {
+        serde_json::json!({"Use": [{"Const": [{
+            "FnDef": {
+                "kind": {"Fun": fun},
+                "generics": empty_generics.clone()
+            }
+        }, fn_ty(fun)]}, "No"]})
+    };
+    let caller = |def_id: u64, leaf: &str, fun: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![ident("c", 0), ident(leaf, 0)]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": fn_ty(fun)
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span.clone(), "ty": fn_ty(fun)}
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [
+                            crate::front::mir::tests::interior_assign(
+                                crate::front::mir::tests::interior_place(0, &fn_ty(fun)),
+                                fn_const(fun),
+                            ),
+                        ],
+                        "kind": "Regular",
+                        "terminator": {"span": span.clone(), "kind": "Return"}
+                    }
+                ]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "c",
+            "type_decls": [],
+            "fun_decls": [
+                caller(0, "take_a", 1),
+                nested(1, 2),
+                nested(2, 3),
+                caller(3, "take_b", 2)
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("nested free-fn FnDef fixture Llbc parses")
+}
+
+#[test]
+fn fn_item_const_keeps_disambiguated_parent_of_nested_free_fn() {
+    use crate::codewriter::call::CallControl;
+    use crate::model::{FunctionGraph, OpKind};
+    use crate::parse::CallPath;
+
+    let llbc = nested_free_fn_item_const_llbc();
+    let f2 = llbc.fn_by_id(1).expect("parent#2::f");
+    let f3 = llbc.fn_by_id(2).expect("parent#3::f");
+    assert_eq!(f2.item_meta.name_path(), "c::parent::f");
+    assert_eq!(f3.item_meta.name_path(), "c::parent::f");
+    let harvest2 = super::fundecl_fn_item_segments(&llbc, f2);
+    let harvest3 = super::fundecl_fn_item_segments(&llbc, f3);
+    assert_eq!(
+        harvest2, harvest3,
+        "harvest spelling of parent#2::f vs parent#3::f should collide"
+    );
+    let id2 = super::registered_path_for_fun_decl(&llbc, f2);
+    let id3 = super::registered_path_for_fun_decl(&llbc, f3);
+    assert_ne!(
+        id2.segments, id3.segments,
+        "registered_path_for_fun_decl parent#2 vs parent#3 collapsed: {:?}",
+        id2.segments
+    );
+    assert!(
+        id2.segments.iter().any(|s| s == "parent#2"),
+        "parent#2 missing from identity: {:?}",
+        id2.segments
+    );
+    assert!(
+        id3.segments.iter().any(|s| s == "parent#3"),
+        "parent#3 missing from identity: {:?}",
+        id3.segments
+    );
+
+    let fn_def = |fun: u64| {
+        serde_json::json!({
+            "kind": {"Fun": fun},
+            "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }
+        })
+    };
+    let decoded2 = super::decode_fn_def_const(&llbc, &fn_def(1)).expect("decode parent#2");
+    let decoded3 = super::decode_fn_def_const(&llbc, &fn_def(2)).expect("decode parent#3");
+    let (const_harvest2, const_resolved2) = match decoded2 {
+        super::DecodedConst::FnPath { segments, resolved } => (segments, resolved),
+        _ => panic!("parent#2 did not decode as FnPath"),
+    };
+    let (const_harvest3, const_resolved3) = match decoded3 {
+        super::DecodedConst::FnPath { segments, resolved } => (segments, resolved),
+        _ => panic!("parent#3 did not decode as FnPath"),
+    };
+    assert_eq!(
+        const_harvest2, harvest2,
+        "FnDef harvest is fundecl_fn_item_segments"
+    );
+    assert_eq!(const_harvest3, harvest3);
+    assert_eq!(
+        const_harvest2, const_harvest3,
+        "FnDef harvest tails collide the way name_path drops Ident #N"
+    );
+
+    let take_a = crate::test_support::lower_function(&llbc, "take_a").expect("lower take_a");
+    let take_b = crate::test_support::lower_function(&llbc, "take_b").expect("lower take_b");
+    let fn_const_of = |graph: &crate::model::FunctionGraph, label: &str| {
+        let mut found = Vec::new();
+        for op in graph_ops(graph) {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            if crate::model::fn_const_segments(target).is_none() {
+                continue;
+            }
+            found.push(target.clone());
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "{label} materialises one fn-item constant; ops={:?}",
+            graph_ops(graph)
+        );
+        found.remove(0)
+    };
+    let fn_consts = vec![
+        fn_const_of(&take_a, "take_a"),
+        fn_const_of(&take_b, "take_b"),
+    ];
+    let segs: Vec<Vec<String>> = fn_consts
+        .iter()
+        .map(|t| crate::model::fn_const_segments(t).unwrap().to_vec())
+        .collect();
+    assert_eq!(segs[0], segs[1], "harvest tails of the two constants");
+    let resolved: Vec<Option<Vec<String>>> = fn_consts
+        .iter()
+        .map(|t| t.resolved_path().map(|p| p.segments.clone()))
+        .collect();
+    assert_ne!(
+        resolved[0], resolved[1],
+        "fn-item constants resolved to the same CallTarget path: {resolved:?}"
+    );
+    assert_eq!(resolved[0].as_ref(), Some(&id2.segments));
+    assert_eq!(resolved[1].as_ref(), Some(&id3.segments));
+    assert_eq!(const_resolved2.segments, id2.segments);
+    assert_eq!(const_resolved3.segments, id3.segments);
+
+    let harvest = CallPath::from_segments(harvest2.iter().cloned());
+    let mut g2 = FunctionGraph::new("f");
+    g2.source_identity = Some("c::parent#2::f".to_string());
+    let mut g3 = FunctionGraph::new("f");
+    g3.source_identity = Some("c::parent#3::f".to_string());
+    let mut cc = CallControl::new();
+    cc.register_function_graph(harvest.clone(), g2.clone());
+    cc.register_function_graph(id2.clone(), g2.clone());
+    cc.register_function_graph(id3.clone(), g3.clone());
+    cc.function_graphs_mut().mark_canonical_path(&harvest);
+    assert_eq!(
+        cc.function_graphs().canonical_path(&id2).segments,
+        harvest.segments,
+        "first graph's canonical_path is the harvest spelling it owns"
+    );
+    assert_eq!(
+        cc.function_graphs().canonical_path(&id3).segments,
+        id3.segments,
+        "second graph's canonical_path is its identity (harvest occupied)"
+    );
+    let addr2 = cc.fnaddr_for_target(&fn_consts[0]);
+    let addr3 = cc.fnaddr_for_target(&fn_consts[1]);
+    assert_ne!(
+        addr2, addr3,
+        "fn-item constants hashed to the same fnaddr: {addr2:#x}"
+    );
+}
+
 /// Inherent `Owner::setitem` and `impl Store for Owner { fn setitem }`
 /// share a leaf. Charon records two FunDeclIds; the call graph follows
 /// each one (`method-call-expr`, `CallControl.graphs_from`).
