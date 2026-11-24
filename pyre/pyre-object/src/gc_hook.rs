@@ -1552,11 +1552,15 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let _hook_lock = hook_test_guard();
         static PENDING: AtomicBool = AtomicBool::new(false);
+        // `exc_data` belongs to the thread that raised: a parallel test's
+        // allocation must not read this test's pending MemoryError.
         fn raise() {
-            PENDING.store(true, Ordering::SeqCst);
+            if hook_test_owner::hook_test_effects_visible() {
+                PENDING.store(true, Ordering::SeqCst);
+            }
         }
         fn occurred() -> bool {
-            PENDING.load(Ordering::SeqCst)
+            hook_test_owner::hook_test_effects_visible() && PENDING.load(Ordering::SeqCst)
         }
         PENDING.store(false, Ordering::SeqCst);
         majit_gc::set_active_raise_memory_error(Some(raise));
