@@ -3998,6 +3998,23 @@ pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
     }
 }
 
+/// Whether a plain guard at `op_pc` has a resume coordinate in the helper
+/// this walk is inside. Reads the walk; does not write the trace or session.
+pub(crate) fn helper_plain_guard_resumes_in_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    helper_innermost_resume_frame(
+        ctx,
+        op_pc,
+        /*after_residual_call=*/ false,
+        &GuardCaptureScope::default(),
+        usize::MAX,
+        None,
+    )
+    .is_ok()
+}
+
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else

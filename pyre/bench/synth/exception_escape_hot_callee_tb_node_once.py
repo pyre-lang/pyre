@@ -169,6 +169,26 @@ def d_deep(n):
     return last
 
 
+def _age_out_of_nursery():
+    # Promote live W_Code (GUARD_VALUE / make_a_counter_per_value, keyed by
+    # address) out of the nursery before the measured loops. A minor that
+    # moves a young object inside the failure burst splits the count.
+    # cranelift core has no gc; 600 discarded ~16 KB tuples (below
+    # large_object_threshold) exceed an 8 MB nursery without compiling
+    # (loop threshold 1039).
+    try:
+        import gc as _gc
+        _gc.collect(0)
+        return
+    except ImportError:
+        pass
+    i = 0
+    while i < 600:
+        dropped = (None,) * 2000
+        i += 1
+
+
+_age_out_of_nursery()
 for driver in (
     d_no_try,
     d_nonmatching,

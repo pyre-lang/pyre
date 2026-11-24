@@ -2,13 +2,16 @@
 # macOS reads 13.2-15.7x on dynasm (19.4x once); the ceiling is about twice
 # that. Generatorentry guards compile bridges the way `compile.py handle_fail` does.
 # pyre-check: jitstats-band=bridges_compiled=1,guard_failures=8
-# macOS dynasm, cranelift and wasm read 6/9/37268 (cranelift 37275 once).
-# All other counters are identical. One TY_NONE guard's `must_compile` crosses the
-# threshold a second time only after its `JitCounter` slot decays.
-# `decay_all_counters` runs on minor collections (`counter.py`), so the
-# allocation done while compiling the previous bridge decides whether the
-# force at `LoadFastBorrow` closes a loop (`reached_loop_header` ->
-# `compile_loop`) or finishes an entry bridge.
+# dynasm, cranelift and wasm read 10/12/73543 at PYPY_GC_NURSERY 1/2/4/8 MB
+# after `_age_out_of_nursery`. The band is leftover schedule jitter, not a
+# nursery split. One TY_NONE guard's `must_compile` crosses the threshold a
+# second time only after its `JitCounter` slot decays.
+# `decay_all_counters` runs every 32 minor collections (`counter.py`
+# `invoke_after_minor_collection`), so a minor inside a failure burst — the
+# 1 MB rec compile used to land on that boundary, wasm 4 MB used to split a
+# GUARD_VALUE by moving young W_Code — decides whether the force at
+# `LoadFastBorrow` closes a loop (`reached_loop_header` -> `compile_loop`)
+# or finishes an entry bridge.
 # Regression oracle: a callee entered through a CALL_ASSEMBLER fold reads a
 # local out of a frame the trace is being recorded for, forcing it.  The
 # recording stops there and execution goes on from behind the call, with the
@@ -86,9 +89,37 @@ def report(label, fn):
     print(label, fn(N), calls[0], seen[0] % 1000003)
 
 
+def _age_out_of_nursery():
+    # Promote live W_Code (GUARD_VALUE / make_a_counter_per_value, keyed by
+    # address) out of the nursery before the measured loops. A minor that
+    # moves a young object inside the failure burst splits the count, and
+    # `decay_all_counters` (counter.py invoke_after_minor_collection) then
+    # decides whether a TY_NONE guard's second `must_compile` compiles a
+    # bridge. cranelift core has no gc; 600 discarded ~16 KB tuples (below
+    # large_object_threshold) exceed an 8 MB nursery without compiling
+    # (loop threshold 1039).
+    try:
+        import gc as _gc
+        # Eight minors: one leaves a 1 MB run's `run_rec` compile on a
+        # 32-minor decay boundary (`invoke_after_minor_collection`). Eight
+        # shifts that remainder off 0.
+        i = 0
+        while i < 8:
+            _gc.collect(0)
+            i += 1
+        return
+    except ImportError:
+        pass
+    i = 0
+    while i < 600:
+        dropped = (None,) * 2000
+        i += 1
+
+
 def main():
     # `gen` first: with `rec` ahead of it no recording of `run_gen` meets the
     # force.
+    _age_out_of_nursery()
     report('gen', run_gen)
     report('rec', run_rec)
     # A second pass enters the loops and bridges the first one compiled.
