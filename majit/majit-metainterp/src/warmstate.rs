@@ -1993,8 +1993,15 @@ impl WarmEnterState {
     /// `maybe_compile_and_run(increment_function_threshold, *args)`:
     /// `if increment_threshold == 0: return # jit is off`.
     #[inline]
-    pub(crate) fn function_entry_jit_is_off(&self) -> bool {
+    pub fn function_entry_jit_is_off(&self) -> bool {
         self.increment_function_threshold == 0.0
+    }
+
+    /// `maybe_compile_and_run(increment_threshold, *args)`:
+    /// `if increment_threshold == 0: return # jit is off`.
+    #[inline]
+    pub fn back_edge_jit_is_off(&self) -> bool {
+        self.increment_threshold == 0.0
     }
 
     /// warmstate.py set_param_function_threshold.
