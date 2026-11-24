@@ -7303,6 +7303,10 @@ pub(crate) fn check_surrogate(mut w_name: PyObjectRef) -> Result<(), crate::PyEr
         // start/end fields are all Signed; keep that type through the call.
         // Root `w_name` only on this arm: `unicode_encode_error` allocates,
         // and the success path (`check_utf8` Ok) does not collect.
+        // [3.15-spec] `start`/`end` are code-point indices. PyPy
+        // `_check_surrogate` forwards the byte offset `CheckError.pos`; a run
+        // at v3.15.0 reports code points (`"\xe9\ud800"` gives 1, 2 where
+        // PyPy gives 2, 3).
         let pos = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, e.pos as usize) as i64;
         return pyre_object::with_roots!(w_name => {
             Err(crate::typedef::unicode_encode_error(
@@ -7639,10 +7643,11 @@ fn type_create_new_type(
         }
         let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(winner_slot);
 
-        // Mixed NUL+surrogate is UnicodeEncodeError: `type_new_set_name`
-        // encodes with `PyUnicode_AsUTF8AndSize` before the `strlen` NUL
-        // test (Objects/typeobject.c, read at v3.14.6 in
-        // ~/Projects/cpython-3146). `_create_new_type` does `'\x00' in name`
+        // [3.15-spec] Mixed NUL+surrogate is UnicodeEncodeError:
+        // `type_new_set_name` encodes with `PyUnicode_AsUTF8AndSize` before
+        // the `strlen` NUL test (Objects/typeobject.c, v3.15.0; a run at
+        // v3.15.0 raises UnicodeEncodeError for `type("a\0\ud800", (), {})`).
+        // `_create_new_type` does `'\x00' in name`
         // then `_check_surrogate` and answers ValueError. The exception type
         // is observable, so `_check_surrogate` runs first; both checks stay
         // before the namespace copy. `_check_utf8` `@jit.elidable` governs

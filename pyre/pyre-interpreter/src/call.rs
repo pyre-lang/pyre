@@ -2527,34 +2527,40 @@ fn read_root_run(
 /// `__call__` dict entry — the implicit `__new__`/`__init__` path below is
 /// its `tp_call` — so any `__call__` resolved on a *non-`type`* metaclass
 /// is a genuine override (enum.EnumType, custom metaclasses with
-/// `__call__`).  Returns the override bound to `callable`, or `None` when
-/// the default class-instantiation path should run.
+/// `__call__`).  Returns the override bound to `callable`, `None` when
+/// the default class-instantiation path should run, or the error raised while binding it.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
-    let metaclass = crate::typedef::r#type(callable)?;
+fn metaclass_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let Some(metaclass) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
     if std::ptr::eq(metaclass.as_ptr(), crate::typedef::w_type()) {
-        return None;
+        return Ok(None);
     }
     // Resolve WHERE `__call__` is defined first; the default `type.__call__`
     // (the implicit instantiation path) is not an override, so a metaclass
     // that merely inherits it — e.g. ABCMeta — keeps the fast path.  The
     // defining-class half is the cheap guard, so it runs before the value
     // half's second residual walk (avoided on the common fast path).
-    let where_defined = unsafe {
+    let Some(where_defined) = (unsafe {
         crate::baseobjspace::lookup_where_class_uncached(metaclass.as_ptr(), "__call__")
-    }?;
+    }) else {
+        return Ok(None);
+    };
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
-        return None;
+        return Ok(None);
     }
-    let mut call_descr = unsafe {
+    let Some(mut call_descr) = (unsafe {
         crate::baseobjspace::lookup_in_type_where_uncached(metaclass.as_ptr(), "__call__")
-    }?;
-    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr())) }
-        .ok()
-        .flatten()
+    }) else {
+        return Ok(None);
+    };
+    // descroperation.py `get_and_call_args`: `space.get(w_descr, w_obj)`
+    // raises out of `__get__`; a descriptor without `__get__` is called as is.
+    let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, metaclass.as_ptr())) }?
         .unwrap_or(call_descr);
-    Some(bound)
+    Ok(Some(bound))
 }
 
 /// Resolve a `__call__` introduced by a classmethod *subtype*. The base
@@ -2752,7 +2758,7 @@ fn call_non_function_callable_with_mode(
     // frameless `space.call_args` / `get_and_call_args`, so the frame stops
     // here and none of them can arm the C-profile path.
     if unsafe { pyre_object::is_type(callable) } {
-        if let Some(bound) = metaclass_call_override(callable) {
+        if let Some(bound) = metaclass_call_override(callable)? {
             return call_callable_with_mode(
                 execution_context,
                 bound,
@@ -4132,7 +4138,7 @@ fn call_with_kwargs_in_ctx_impl(
     // overrides it (enum functional API passes `module=`/`type=` kwargs).
     if dispatch_metaclass_call
         && unsafe { pyre_object::is_type(current_callable()) }
-        && let Some(bound) = metaclass_call_override(current_callable())
+        && let Some(bound) = metaclass_call_override(current_callable())?
     {
         let args = overridden_args();
         return forward_kw(bound, &args, true, std::ptr::null_mut());
@@ -4972,7 +4978,7 @@ pub fn call_function_impl_result(
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
-            if let Some(bound) = metaclass_call_override(callable) {
+            if let Some(bound) = metaclass_call_override(callable)? {
                 return call_function_impl_result(bound, &reloaded_args());
             }
             // The override lookup can collect: dispatch from the roots.
@@ -5871,78 +5877,9 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     }
 }
 
-/// Invoke a user function with an already-resolved argument scope,
-/// frameless (exec ctx pulled from the thread-local set by
-/// __build_class__).  Mirrors [`call_user_function_with_args`] but skips
-/// `fill_user_function_args` because `args` is the final frame-local
-/// layout produced by [`resolve_kwargs`] — re-matching it would treat the
-/// packed `*args` / `**kwargs` slots as extra positionals.
-fn call_user_function_resolved_frameless(
-    mut func: PyObjectRef,
-    args: &[PyObjectRef],
-) -> PyObjectRef {
-    let w_code = unsafe { crate::getcode(func) };
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let closure = unsafe { function_get_closure(func) };
-    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-    let exec_ctx = take_last_exec_ctx();
-    let code_ref = unsafe { &*func_code };
-
-    // `shadowstack.py` `push_roots` / `pop_roots` across `FrameBox::new`.
-    let mut frame = match pyre_object::with_roots!(func => {
-        let inner = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        };
-        crate::pyframe::FrameBox::new(inner)
-    }) {
-        Ok(f) => f,
-        Err(e) => {
-            set_call_error(e);
-            return PY_NULL;
-        }
-    };
-    frame.fix_array_ptrs();
-    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        return match frame_into_generator_for_function(frame, func) {
-            Ok(v) => v,
-            Err(e) => {
-                set_call_error(e);
-                PY_NULL
-            }
-        };
-    }
-    // Argument matching has already happened, but the activation is the same
-    // `PyCode.funcrun` -> `PyFrame.run` one, so this takes the portal on the
-    // terms the ordinary spelling above records.
-    let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
-    match frame.run_with_jit() {
-        Ok(v) => v,
-        Err(e) => {
-            set_call_error(e);
-            PY_NULL
-        }
-    }
-}
-
-/// Call a metaclass with extra keyword arguments.
-///
-/// PyPy: metaclass(name, bases, namespace, **kwds).
-/// Resolves kwargs to the metaclass __new__'s kwonly / **kwds parameters.
-/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod);
-/// unwrap it to the underlying function so the signature-based dispatch and
-/// `is_function` fast-paths below see the real callable rather than the
-/// descriptor wrapper. Builtin `__new__` (not a staticmethod) passes through.
+/// `__new__` is stored as an implicit `staticmethod` (type_new_staticmethod).
+/// Return the wrapped function so `resolve_kwargs` can match keywords against
+/// its signature; a builtin `__new__` (not a staticmethod) is returned as is.
 unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::function::is_staticmethod(f) } {
         unsafe { pyre_object::function::w_staticmethod_get_func(f) }
@@ -5951,6 +5888,11 @@ unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// compiling.py `build_class`: `w_class = space.call_args(w_meta, args)`
+/// with `args_w=[w_name, w_bases, w_namespace]` and the class-definition
+/// keywords. The metaclass is called the same way whether or not it is a
+/// type, so its own `__call__` (`type.__call__` for an ordinary metaclass)
+/// binds and runs `__new__` and `__init__` with those keywords.
 fn call_metaclass_with_kwargs(
     w_metaclass: PyObjectRef,
     name: PyObjectRef,
@@ -5958,15 +5900,10 @@ fn call_metaclass_with_kwargs(
     w_namespace_dict: PyObjectRef,
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
-    // Every argument arrives as a bare word and is held across the metaclass
-    // `__new__` and `__init__` calls, both arbitrary Python.  The caller roots
-    // the namespace and reads it back immediately before this call, and that
-    // is undone the moment it is passed by value.  Tuples and dicts are
-    // nursery-born, and a heap type is born nursery
-    // (`try_gc_alloc_collecting_rooted` / `malloc_fixedsize`); `pin_root`'s return is the pre-collect
-    // word, so every consumer after a collecting call reloads from its slot.
-    // All five are published in one run, so no pin's normalization can move
-    // one that is not yet published.
+    // Every argument arrives as a bare word and is held across the
+    // metaclass call, which is arbitrary Python. All five are published in
+    // one run, so no pin's normalization can move one that is not yet
+    // published; every read after that goes through its slot.
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = _roots.pin_roots(&[w_namespace_dict, kwargs, w_metaclass, name, bases]);
     let kwargs_slot = ns_slot + 1;
@@ -5978,212 +5915,26 @@ fn call_metaclass_with_kwargs(
     let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
     let name = || pyre_object::gc_roots::shadow_stack_get(name_slot);
     let bases = || pyre_object::gc_roots::shadow_stack_get(bases_slot);
-    if unsafe { !pyre_object::is_type(w_metaclass()) } {
-        // compiling.py:215-221 — `space.call_args(w_meta, Arguments(name,
-        // bases, ns, **kwds))`; a non-type metaclass receives the
-        // class-definition keywords too, and `call_args`
-        // (descroperation.py) takes no frame.
-        let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) } {
-            unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs()) }
-        } else {
-            Vec::new()
-        };
-        if !kwds.is_empty() {
-            return match call_with_kwargs_in_ctx(
-                take_last_exec_ctx(),
-                w_metaclass(),
-                &[name(), bases(), w_namespace_dict()],
-                &kwds,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            };
-        }
-        return crate::call_function(w_metaclass(), &[name(), bases(), w_namespace_dict()]);
-    }
-    let kw_base = pyre_object::gc_roots::shadow_stack_len();
-    let n_kw = {
-        let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) }
-        {
-            unsafe {
-                pyre_object::w_dict_items(kwargs())
-                    .into_iter()
-                    .filter(|(k, _)| pyre_object::is_str(*k))
-                    .collect()
-            }
-        } else {
-            Vec::new()
-        };
-        let flat: Vec<PyObjectRef> = kw_items.iter().flat_map(|&(k, v)| [k, v]).collect();
-        let _ = _roots.pin_roots(&flat);
-        kw_items.len()
-    };
-    let kw_key = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i);
-    let kw_value = |i: usize| pyre_object::gc_roots::shadow_stack_get(kw_base + 2 * i + 1);
-    // Find the metaclass __new__ method
-    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass(), "__new__") };
-
-    let instance = if let Some(new_fn) = new_fn {
-        let new_fn = unsafe { unwrap_static_new(new_fn) };
-        // Resolve only against a user-defined __new__ with a real code
-        // object; the builtin type.__new__ has none, so fall through.
-        let is_user_fn = unsafe { crate::is_function(new_fn) }
-            && unsafe {
-                !crate::is_builtin_code(crate::getcode(new_fn) as pyre_object::PyObjectRef)
-            };
-        if is_user_fn {
-            // [mcs, name, bases, ns] positional + the class-definition
-            // kwargs as keywords; resolve_kwargs matches them against the
-            // __new__ signature, filling keyword-only params and packing
-            // the remainder into a `**kwds` parameter when present.
-            // `resolve_kwargs` reaches `store_collected_keyword`. The slots
-            // are the live words; these pins' arguments are not read again.
-            let new_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(new_fn);
-            let names_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-                (0..n_kw).map(kw_key).collect(),
-            ));
-            let mut call_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            call_args.extend((0..n_kw).map(kw_value));
-            match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
-                &call_args,
-                pyre_object::gc_roots::shadow_stack_get(names_slot),
-                false,
-            ) {
-                Ok(resolved) => call_user_function_resolved_frameless(
-                    pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
-                    &resolved,
-                ),
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            }
-        } else {
-            // Builtin type.__new__: the same Arguments shape as
-            // `space.call_obj_args(w_newfunc, self, __args__)`.
-            let mut new_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            let result = if n_kw == 0 {
-                call_function_impl_result(new_fn, &new_args)
-            } else {
-                let mut names = Vec::with_capacity(n_kw);
-                let mut values = Vec::with_capacity(n_kw);
-                for i in 0..n_kw {
-                    names.push(kw_key(i));
-                    values.push(kw_value(i));
-                }
-                call_with_kwargs_in_ctx_impl(
-                    take_last_exec_ctx(),
-                    new_fn,
-                    &new_args,
-                    &names,
-                    &values,
-                    true,
-                    std::ptr::null_mut(),
-                    false,
-                )
-            };
-            match result {
-                Ok(obj) => obj,
-                Err(e) => {
-                    set_call_error(e);
-                    PY_NULL
-                }
-            }
-        }
+    let kwds: Vec<(Wtf8Buf, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs()) } {
+        unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs()) }
     } else {
-        pyre_object::w_instance_new(w_metaclass())
+        Vec::new()
     };
-
-    if instance.is_null() {
-        return PY_NULL;
-    }
-    // Heap types are born nursery (`w_type_new` /
-    // `try_gc_alloc_collecting_rooted`). `__init__` is arbitrary Python and
-    // can collect, so the slot is the
-    // live word after those calls.
-    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(instance);
-    if let Some(w_insttype) = type_call_init_type(
-        pyre_object::gc_roots::shadow_stack_get(instance_slot),
-        w_metaclass(),
-    ) && let Some(init_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
-        let is_user_fn = unsafe { crate::is_function(init_fn) }
-            && unsafe {
-                !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
-            };
-        if is_user_fn && n_kw != 0 {
-            // The metaclass `__new__` ran between the pin and here.
-            // Same slot discipline as `__new__`: `init_fn` is not read again
-            // after the pin.
-            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(init_fn);
-            let names_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
-                (0..n_kw).map(kw_key).collect(),
-            ));
-            let mut call_args = vec![
-                pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                name(),
-                bases(),
-                pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            ];
-            call_args.extend((0..n_kw).map(kw_value));
-            match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
-                &call_args,
-                pyre_object::gc_roots::shadow_stack_get(names_slot),
-                false,
-            ) {
-                Ok(resolved) => {
-                    let res = call_user_function_resolved_frameless(
-                        pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
-                        &resolved,
-                    );
-                    if res.is_null() {
-                        return PY_NULL;
-                    }
-                    if let Err(e) = check_init_returned_none(res) {
-                        set_call_error(e);
-                        return PY_NULL;
-                    }
-                }
-                Err(e) => {
-                    set_call_error(e);
-                    return PY_NULL;
-                }
-            }
-        } else {
-            // Builtin __init__ (e.g. type.__init__) ignores the
-            // class-definition keywords during 3-arg class creation, and a
-            // user __init__ with no kwargs takes only the positional triple.
-            // Either way call positionally; the class-definition kwargs flow
-            // to the __init_subclass__ forwarding path instead of being
-            // rejected here (typeobject.py descr_call passes __args__ to a
-            // builtin __init__, which tolerates them).
-            if let Err(e) = call_function_impl_result(
-                init_fn,
-                &[
-                    pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                    name(),
-                    bases(),
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                ],
-            ) {
+    if !kwds.is_empty() {
+        return match call_with_kwargs_in_ctx(
+            take_last_exec_ctx(),
+            w_metaclass(),
+            &[name(), bases(), w_namespace_dict()],
+            &kwds,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
                 set_call_error(e);
-                return PY_NULL;
+                PY_NULL
             }
-        }
+        };
     }
-
-    pyre_object::gc_roots::shadow_stack_get(instance_slot)
+    crate::call_function(w_metaclass(), &[name(), bases(), w_namespace_dict()])
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
@@ -7582,6 +7333,11 @@ fn build_class_inner(
         };
         // If the metaclass call raised, propagate the original error rather
         // than silently producing a NULL class object.
+        // [3.15-spec] PyPy `build_class` rewrites a traceback-free TypeError
+        // from a metaclass other than `type` into "metaclass found to be
+        // ...". `builtin___build_class__` (Python/bltinmodule.c, v3.15.0)
+        // returns the error from `PyObject_VectorcallDict(meta, ...)`
+        // unchanged; the message is observable, so it is passed through.
         if result.is_null() {
             if let Some(err) = take_call_error() {
                 return Err(err);
@@ -7614,6 +7370,26 @@ fn build_class_inner(
         // `typeobject.py descr__new__`: `name = space.text_w(w_name)`; a lone
         // surrogate is `UnicodeEncodeError` ("surrogates not allowed"). Owned,
         // because the allocations below can move the name's payload.
+        // `_create_new_type`: `'\x00' in name` raises ValueError.
+        // [3.15-spec] For a name holding both a NUL and a lone surrogate,
+        // PyPy tests the NUL first (ValueError). `type_new_set_name`
+        // (Objects/typeobject.c, v3.15.0) encodes with
+        // `PyUnicode_AsUTF8AndSize` before its `strlen` NUL test, and a run at
+        // v3.15.0 raises UnicodeEncodeError for `"a\0\ud800"`. The exception
+        // type is observable, so the surrogate check runs first, as in
+        // `type.__new__` (`builtins.rs`). U+0000 is a single 0x00 byte in
+        // WTF-8.
+        crate::builtins::check_surrogate(pyre_object::gc_roots::shadow_stack_get(w_name_slot))?;
+        if unsafe {
+            pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(w_name_slot))
+        }
+        .as_bytes()
+        .contains(&0)
+        {
+            return Err(crate::PyError::value_error(
+                "type name must not contain null characters",
+            ));
+        }
         let name =
             crate::baseobjspace::str_utf8_w(pyre_object::gc_roots::shadow_stack_get(w_name_slot))?
                 .to_owned();
