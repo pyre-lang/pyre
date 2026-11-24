@@ -19,6 +19,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::function::is_function;
+use crate::objspace::std::iterobject::{
+    BYTEARRAY_ITER_TYPE, BYTES_ITER_TYPE, is_bytearray_iter, is_string_iter, w_bytearray_iter_new,
+    w_bytes_iter_new, w_string_iter_getitem_fn, w_string_iter_index, w_string_iter_seq,
+    w_string_iter_set_index, w_string_iter_set_seq,
+};
 use crate::objspace::std::mapdict::instance_getclass;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::unicodeobject::is_str;
@@ -4297,12 +4302,28 @@ pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let _ = pyre_object::gc_roots::pin_root(callable);
     unsafe {
         let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
-        iterator_reduce_tuple(
-            pyre_object::gc_roots::shadow_stack_get(sp + 1),
-            pyre_object::w_seq_iter_seq(receiver),
-            pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(receiver)),
-            pyre_object::w_seq_iter_empty_kind(receiver),
-        )
+        if pyre_object::iterobject::is_str_iter(receiver) {
+            iterator_reduce_tuple(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                pyre_object::w_fast_unicode_iter_seq(receiver),
+                pyre_object::seq_index_to_i64(pyre_object::w_fast_unicode_iter_index(receiver)),
+                1,
+            )
+        } else if is_string_iter(receiver) {
+            iterator_reduce_tuple(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                w_string_iter_seq(receiver),
+                pyre_object::seq_index_to_i64(w_string_iter_index(receiver)),
+                0,
+            )
+        } else {
+            iterator_reduce_tuple(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                pyre_object::w_seq_iter_seq(receiver),
+                pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(receiver)),
+                pyre_object::w_seq_iter_empty_kind(receiver),
+            )
+        }
     }
 }
 
@@ -4403,32 +4424,64 @@ unsafe fn seq_iter_clamp_length(seq: PyObjectRef) -> Option<i64> {
     }
 }
 
-/// `sequenceiterator.__setstate__(index)` — `iterobject.py descr_setstate
-/// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
-/// sequence is live, clamping a negative index to 0.
-///
-/// The producer-specific identities 3.14 splits this payload into each clamp
-/// the cursor to the sequence's *current* length, so a state past the end
-/// pickles as exhausted rather than verbatim; `bytearray_iterator` instead
-/// stores the -1 exhausted sentinel for a negative state, one-way, the way
-/// `list_iterator` does.  PyPy stores every state verbatim except in
-/// `W_FastUnicodeIterObject.descr_setstate` (`iterobject.py`), which
-/// clamps because it must recompute a byte offset from the cursor.
+/// `sequenceiterator.__setstate__(index)` — `iterobject.py
+/// W_AbstractSeqIterObject.descr_setstate`.
+/// [3.15-spec] clamp to live length for bytes/bytearray/array/str; bytearray
+/// negative state is exhausted ↔ `descr_setstate` (verbatim except negative→0);
+/// evidence: pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("3") /
+/// print("setstate_neg") / print("setstate99"); v3.15.0 `striter_setstate`,
+/// `bytearrayiter_setstate`, `array_arrayiterator___setstate___impl`,
+/// `unicodeiter_setstate`.
 pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     // `args` is the gateway's native copy; `iter_setstate_index` can collect.
     let mut w_iter = args[0];
     let mut index = pyre_object::with_roots!(w_iter => iter_setstate_index(args[1]))?;
     unsafe {
+        if pyre_object::iterobject::is_str_iter(w_iter) {
+            // iterobject.py W_FastUnicodeIterObject.descr_setstate
+            let mut seq = pyre_object::w_fast_unicode_iter_seq(w_iter);
+            if seq.is_null() {
+                return Ok(w_none());
+            }
+            if index < 0 {
+                index = 0;
+            }
+            let length = pyre_object::unicodeobject::w_str_len(seq) as i64;
+            index = index.min(length);
+            pyre_object::w_fast_unicode_iter_set_index(w_iter, cursor_from_i64(index)?);
+            pyre_object::with_roots!(w_iter, seq => {
+                let byteindex =
+                    pyre_object::unicodeobject::w_str_index_to_byte(seq, index as usize);
+                pyre_object::w_fast_unicode_iter_set_byteindex(w_iter, byteindex);
+            });
+            return Ok(w_none());
+        }
+        if is_string_iter(w_iter) {
+            // [3.15-spec] clamp to live length for bytes/bytearray; bytearray
+            // negative state is exhausted ↔ `descr_setstate` (verbatim except
+            // negative→0); evidence:
+            // pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("3") /
+            // print("setstate_neg") / print("setstate99"); v3.15.0
+            // `bytearrayiter_setstate`.
+            let seq = w_string_iter_seq(w_iter);
+            if seq.is_null() || w_string_iter_index(w_iter) < 0 {
+                return Ok(w_none());
+            }
+            if index < 0 {
+                index = if is_bytearray_iter(w_iter) { -1 } else { 0 };
+            } else {
+                let length = pyre_object::bytesobject::bytes_like_len(seq) as i64;
+                index = index.min(length);
+            }
+            w_string_iter_set_index(w_iter, cursor_from_i64(index)?);
+            return Ok(w_none());
+        }
         let seq = pyre_object::w_seq_iter_seq(w_iter);
         if seq.is_null() || pyre_object::w_seq_iter_index(w_iter) < 0 {
             return Ok(w_none());
         }
         if index < 0 {
-            index = if pyre_object::iterobject::is_bytearray_iter(w_iter) {
-                -1
-            } else {
-                0
-            };
+            index = 0;
         } else if let Some(length) = seq_iter_clamp_length(seq) {
             index = index.min(length);
         }
@@ -4443,18 +4496,29 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
 /// reports 0.
 ///
-/// A sequence whose type has no `__len__` reports `NotImplemented` rather than
-/// raising: `iter_len` (`iterobject.c`) guards the length read with
-/// `_PyObject_HasLen`, and a `__getitem__`-only sequence is exactly the case
-/// that guard exists for.  A `__len__` that raises still propagates.  This
-/// intentionally differs from PyPy's `getlength`, which lets `space.len` raise;
-/// the observable behaviour target is 3.14.
+/// [3.15-spec] NotImplemented for a `__getitem__`-only sequence ↔
+/// `iterobject.py W_AbstractSeqIterObject.getlength` (raises via `space.len`) —
+/// `iter(S()).__length_hint__()`; evidence:
+/// pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("1 length_hint");
+/// `iterobject.c iter_len` at v3.15.0 (`_PyObject_HasLen` → `Py_RETURN_NOTIMPLEMENTED`).
 pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        let (seq, index) = if pyre_object::iterobject::is_str_iter(args[0]) {
+            (
+                pyre_object::w_fast_unicode_iter_seq(args[0]),
+                pyre_object::w_fast_unicode_iter_index(args[0]),
+            )
+        } else if is_string_iter(args[0]) {
+            (w_string_iter_seq(args[0]), w_string_iter_index(args[0]))
+        } else {
+            (
+                pyre_object::w_seq_iter_seq(args[0]),
+                pyre_object::w_seq_iter_index(args[0]),
+            )
+        };
         // A negative cursor is `bytearray_iterator`'s exhausted sentinel; it
         // keeps its source referenced but reports nothing remaining.
-        if seq.is_null() || pyre_object::w_seq_iter_index(args[0]) < 0 {
+        if seq.is_null() || index < 0 {
             return Ok(w_int_new(0));
         }
         if is_instance(seq) && lookup(seq, "__len__").is_none() {
@@ -4463,8 +4527,14 @@ pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
         // `args` is the gateway's native copy; `len_w` can run `__len__`.
         let mut w_iter = args[0];
         let length = pyre_object::with_roots!(w_iter => len_w(seq))?;
-        let remaining =
-            length - pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(w_iter));
+        let index = if pyre_object::iterobject::is_str_iter(w_iter) {
+            pyre_object::w_fast_unicode_iter_index(w_iter)
+        } else if is_string_iter(w_iter) {
+            w_string_iter_index(w_iter)
+        } else {
+            pyre_object::w_seq_iter_index(w_iter)
+        };
+        let remaining = length - pyre_object::seq_index_to_i64(index);
         Ok(w_int_new(remaining.max(0)))
     }
 }
@@ -19174,6 +19244,8 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
+            || pyre_object::is_str_iter(obj)
+            || is_string_iter(obj)
             || pyre_object::is_list_iter(obj)
             || pyre_object::is_list_reverse_iter(obj)
             || pyre_object::is_tuple_iter(obj)
@@ -19608,11 +19680,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // `W_FastUnicodeIterObject`.  3.15 splits the visible type by
             // storage; each constructor stamps a constant type word.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let len = w_str_len(obj);
             if pyre_object::unicodeobject::w_str_is_ascii(obj) {
-                return Ok(pyre_object::w_str_ascii_iter_new(obj, len));
+                return Ok(pyre_object::w_str_ascii_iter_new(obj));
             }
-            return Ok(pyre_object::w_str_iter_new(obj, len));
+            return Ok(pyre_object::w_str_iter_new(obj));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let base = if pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -19627,11 +19698,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // `W_StringIterObject`.  3.15 names bytes vs bytearray
             // separately; each constructor stamps a constant type word.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            let len = pyre_object::bytesobject::bytes_like_len(obj);
             if pyre_object::bytearrayobject::is_bytearray(obj) {
-                return Ok(pyre_object::w_bytearray_iter_new(obj, len));
+                return Ok(w_bytearray_iter_new(obj, w_bytearray_iter_getitem_result));
             }
-            return Ok(pyre_object::w_bytes_iter_new(obj, len));
+            return Ok(w_bytes_iter_new(obj, w_bytes_iter_getitem_result));
         }
         // dict → iterate over keys (`pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
@@ -19690,6 +19760,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
+            || pyre_object::is_str_iter(obj)
+            || is_string_iter(obj)
             || pyre_object::is_list_iter(obj)
             || pyre_object::is_list_reverse_iter(obj)
             || pyre_object::is_tuple_iter(obj)
@@ -20626,8 +20698,123 @@ pub(crate) fn reverse_seq_iter_descr_next(obj: PyObjectRef) -> PyResult {
     }
 }
 
+/// `iterobject.py W_FastUnicodeIterObject.descr_next`.  Walk by byte cursor,
+/// wrap `_utf8[start:end]` with length 1.  The single next body for both
+/// `seq_iter_descr_next` and `range_iter_next_or_null`.
+pub(crate) fn fast_unicode_iter_descr_next(obj: PyObjectRef) -> PyResult {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let seq = pyre_object::w_fast_unicode_iter_seq(obj);
+        if seq.is_null() {
+            return Err(PyError::stop_iteration());
+        }
+        let _ = pyre_object::gc_roots::pin_root(seq);
+        let seq_slot = obj_slot + 1;
+        let seq = pyre_object::gc_roots::shadow_stack_get(seq_slot);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let index = pyre_object::w_fast_unicode_iter_index(obj);
+        if index == pyre_object::unicodeobject::w_str_len(seq) as isize {
+            pyre_object::w_fast_unicode_iter_set_seq(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                std::ptr::null_mut(),
+            );
+            return Err(PyError::stop_iteration());
+        }
+        let start = pyre_object::w_fast_unicode_iter_byteindex(obj);
+        let end = pyre_object::unicodeobject::w_str_next_codepoint_pos_dont_look_inside(seq, start);
+        let utf8 = pyre_object::unicodeobject::w_str_storage(seq);
+        let sliced =
+            pyre_object::lowlevel_string::ll_stringslice_startstop(utf8, start as i64, end as i64);
+        let w_res = pyre_object::unicodeobject::w_str_from_storage_and_length(sliced, 1);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        pyre_object::w_fast_unicode_iter_set_byteindex(obj, end);
+        pyre_object::w_fast_unicode_iter_set_index(obj, index + 1);
+        Ok(w_res)
+    }
+}
+
+/// `bytesobject.py W_BytesObject._iter_getitem_result`.
+#[inline(never)]
+pub(crate) fn w_bytes_iter_getitem_result(seq: PyObjectRef, index: isize) -> PyResult {
+    unsafe {
+        let len = pyre_object::bytesobject::w_bytes_len(seq);
+        if index < 0 || (index as usize) >= len {
+            return Err(PyError::index_error("byte index out of range"));
+        }
+        Ok(w_int_new(
+            pyre_object::bytesobject::w_bytes_getitem(seq, index as usize) as i64,
+        ))
+    }
+}
+
+/// `bytearrayobject.py W_BytearrayObject._iter_getitem_result`.
+#[inline(never)]
+pub(crate) fn w_bytearray_iter_getitem_result(seq: PyObjectRef, index: isize) -> PyResult {
+    unsafe {
+        let len = pyre_object::bytearrayobject::w_bytearray_len(seq);
+        if index < 0 || (index as usize) >= len {
+            return Err(PyError::index_error("bytearray index out of range"));
+        }
+        Ok(w_int_new(
+            pyre_object::bytearrayobject::w_bytearray_getitem(seq, index as usize) as i64,
+        ))
+    }
+}
+
+/// `iterobject.py W_StringIterObject.descr_next`.  The single next body
+/// for both `seq_iter_descr_next` and `range_iter_next_or_null`.
+pub(crate) fn string_iter_descr_next(obj: PyObjectRef) -> PyResult {
+    unsafe {
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let seq = w_string_iter_seq(obj);
+        if seq.is_null() {
+            return Err(PyError::stop_iteration());
+        }
+        let index = w_string_iter_index(obj);
+        // [3.15-spec] a negative cursor is `bytearray_iterator`'s exhausted
+        // sentinel, set by `__setstate__` while the source stays referenced.
+        if index < 0 {
+            return Err(PyError::stop_iteration());
+        }
+        let getitem_fn = w_string_iter_getitem_fn(obj);
+        let _ = pyre_object::gc_roots::pin_root(seq);
+        let seq_slot = obj_slot + 1;
+        match getitem_fn(pyre_object::gc_roots::shadow_stack_get(seq_slot), index) {
+            Ok(w_item) => {
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                w_string_iter_set_index(obj, index + 1);
+                Ok(w_item)
+            }
+            Err(mut e) => {
+                // Pin the error before the write-barrier `set_seq` may collect.
+                let err_slot = e.pin(&roots);
+                w_string_iter_set_seq(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    std::ptr::null_mut(),
+                );
+                e.reload(&roots, err_slot);
+                if e.kind == crate::PyErrorKind::IndexError {
+                    Err(PyError::stop_iteration())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
 /// iterobject.py W_SeqIterObject.descr_next.
 pub(crate) fn seq_iter_descr_next(obj: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::iterobject::is_str_iter(obj) } {
+        return fast_unicode_iter_descr_next(obj);
+    }
+    if unsafe { is_string_iter(obj) } {
+        return string_iter_descr_next(obj);
+    }
     unsafe {
         // Seq iterator
 
@@ -20679,73 +20866,32 @@ pub(crate) fn seq_iter_descr_next(obj: PyObjectRef) -> PyResult {
             } else {
                 None
             }
-        } else if is_str(seq) {
-            // Box the idx-th code point as a one-character str,
-            // reading the WTF-8 view so a lone surrogate is yielded
-            // instead of panicking.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, seq]);
-            let item = pyre_object::w_str_codepoint_at(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
-                idx as usize,
-            )
-            .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()));
-            if let Some(v) = item {
-                let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                    as *mut pyre_object::W_SeqIterObject;
-                (*p).index += 1;
-                return Ok(v);
-            }
-            None
-        } else if pyre_object::bytesobject::is_bytes_like(seq) {
-            // Each item is the byte's ordinal, read from the live buffer.
-            if idx < pyre_object::bytesobject::bytes_like_len(seq) as isize {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, seq]);
-                let item = w_int_new(pyre_object::bytesobject::bytes_like_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
-                    idx as usize,
-                ) as i64);
-                let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                    as *mut pyre_object::W_SeqIterObject;
-                (*p).index += 1;
-                return Ok(item);
-            } else {
-                None
-            }
         } else if pyre_object::interp_array::is_array(seq) {
             // `array.array` is not installed without the module, so this
             // guard cannot be true.
             if crate::importing::optional_module_hooks().is_some()
                 && idx < pyre_object::interp_array::w_array_len(seq) as isize
             {
-                // [3.15-spec] ours `array_w_getitem_hook` (direct storage
-                // getter) ↔ PyPy `W_SeqIterObject.descr_next` /
-                // `space.getitem` — the cursor advances as part of the
-                // getter argument even when an invalid unicode value
-                // makes that getter raise, and the getter bypasses a
-                // subclass `__getitem__`; evidence:
-                // `arraymodule.c arrayiter_next` at v3.15.0 (the pinned
-                // tag) does `return (*it->getitem)(ao, it->index++);`,
-                // unchanged at v3.15.2, and a
-                // 3.15.2t run of
-                // `class A(array.array): __getitem__ = lambda s, i: 99`
-                // then `list(iter(A("i", [1, 2])))` prints `[1, 2]`.
+                // [3.15-spec] `array_w_getitem_hook` (direct storage getter) ↔
+                // `interp_array.py W_ArrayBase.descr_iter` → `W_SeqIterObject` +
+                // `space.getitem` — subclass `__getitem__` is ignored and the
+                // cursor advances before the getter; evidence:
+                // pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("4") /
+                // print("4c"); `arraymodule.c arrayiter_next` at v3.15.0
+                // (`return (*it->getitem)(ao, it->index++);`).
                 (*iter_ptr).index += 1;
                 return array_w_getitem_hook(seq, idx as usize);
             }
             None
         } else {
             // Generic sequence-protocol object: fetch lazily through
-            // `space.getitem`.  `iterobject.c iter_iternext` treats BOTH
-            // IndexError and StopIteration as exhaustion (clearing the
-            // sequence so a later next() short-circuits without
-            // re-invoking __getitem__), and propagates any OTHER error
-            // WITHOUT clearing the sequence, leaving the iterator
-            // retryable.  This intentionally differs from PyPy's
-            // `W_SeqIterObject.descr_next` (iterobject.py), which
-            // catches only IndexError and clears `w_seq` on every error;
-            // the observable behaviour target is 3.14.
+            // `space.getitem`.
+            // [3.15-spec] retryable after a non-exhaustion error ↔
+            // `iterobject.py W_SeqIterObject.descr_next` (clears `w_seq` on
+            // every OperationError) — a `__getitem__` ValueError then retry
+            // yields the next item; evidence:
+            // pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("2c");
+            // `iterobject.c iter_iternext` at v3.15.0 (clears only on IndexError/StopIteration).
             //
             // `getitem` runs Python (`__getitem__`), which can relocate
             // `obj`, so pin it and read the iterator state back through the
@@ -23114,6 +23260,12 @@ unsafe fn shortcut_next(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, PyErr
         }
         return Ok(Some(item));
     }
+    if pyre_object::is_str_iter(w_obj) {
+        return fast_unicode_iter_descr_next(w_obj).map(Some);
+    }
+    if is_string_iter(w_obj) {
+        return string_iter_descr_next(w_obj).map(Some);
+    }
     if is_seq_iter(w_obj) {
         return seq_iter_descr_next(w_obj).map(Some);
     }
@@ -24510,7 +24662,7 @@ pub(crate) fn seq_iter_next_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn str_ascii_iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    seq_iter_descr_next(require_next_receiver_pytype(
+    fast_unicode_iter_descr_next(require_next_receiver_pytype(
         args,
         "str_ascii_iterator",
         &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
@@ -24518,7 +24670,7 @@ pub(crate) fn str_ascii_iter_next_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn str_iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    seq_iter_descr_next(require_next_receiver_pytype(
+    fast_unicode_iter_descr_next(require_next_receiver_pytype(
         args,
         "str_iterator",
         &pyre_object::iterobject::STR_ITER_TYPE,
@@ -24526,18 +24678,18 @@ pub(crate) fn str_iter_next_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn bytes_iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    seq_iter_descr_next(require_next_receiver_pytype(
+    string_iter_descr_next(require_next_receiver_pytype(
         args,
         "bytes_iterator",
-        &pyre_object::iterobject::BYTES_ITER_TYPE,
+        &BYTES_ITER_TYPE,
     )?)
 }
 
 pub(crate) fn bytearray_iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    seq_iter_descr_next(require_next_receiver_pytype(
+    string_iter_descr_next(require_next_receiver_pytype(
         args,
         "bytearray_iterator",
-        &pyre_object::iterobject::BYTEARRAY_ITER_TYPE,
+        &BYTEARRAY_ITER_TYPE,
     )?)
 }
 

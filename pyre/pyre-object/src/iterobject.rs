@@ -13,10 +13,10 @@ pub struct W_SeqIterObject {
     /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
     pub index: isize,
     pub length: i64,
-    /// Python 3.14 has producer-specific iterator types whose exhausted
-    /// reduce form retains the producer's empty shape.  Pyre shares this
-    /// payload for those iterators, so retain that type tag on the iterator
-    /// itself: 0 = tuple, 1 = str.
+    /// 3.15 producer-specific iterator types whose exhausted reduce form
+    /// retains the producer's empty shape.  Pyre shares this payload for
+    /// memory/array iterators, so retain that type tag on the iterator itself:
+    /// 0 = tuple.
     pub empty_kind: u8,
 }
 
@@ -30,9 +30,8 @@ pub const SEQ_ITER_LENGTH_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, 
 pub const SEQ_ITER_EMPTY_KIND_OFFSET: usize = std::mem::offset_of!(W_SeqIterObject, empty_kind);
 
 /// `iterobject.py W_FastListIterObject`.  PyPy shares the abstract
-/// `sequenceiterator` typedef, while CPython 3.14 exposes the specialized
-/// concrete type as `list_iterator`; keep the PyPy payload/algorithm and the
-/// 3.14-visible type identity.
+/// `sequenceiterator` typedef; 3.15-visible as `list_iterator`.  Keep the
+/// PyPy payload/algorithm and the 3.15-visible type identity.
 #[pyre_class("list_iterator", static_name = "LIST_ITER")]
 pub struct W_ListIterObject {
     pub seq: PyObjectRef,
@@ -41,7 +40,7 @@ pub struct W_ListIterObject {
 }
 
 /// `iterobject.py W_ReverseSeqIterObject`, specialized to the list producer
-/// required by CPython 3.14's `list_reverseiterator` identity.
+/// required by the 3.15-visible `list_reverseiterator` identity.
 #[pyre_class("list_reverseiterator", static_name = "LIST_REVERSE_ITER")]
 pub struct W_ListReverseIterObject {
     pub seq: PyObjectRef,
@@ -50,7 +49,7 @@ pub struct W_ListReverseIterObject {
 }
 
 /// PyPy's abstract sequence iterator specialized to immutable tuple storage;
-/// CPython 3.14 exposes this concrete identity as `tuple_iterator`.
+/// 3.15-visible as `tuple_iterator`.
 #[pyre_class("tuple_iterator", static_name = "TUPLE_ITER")]
 pub struct W_TupleIterObject {
     pub seq: PyObjectRef,
@@ -58,15 +57,30 @@ pub struct W_TupleIterObject {
     pub index: isize,
 }
 
-// Python 3.14 gives str / bytes / bytearray / memoryview iteration its own
-// concrete type per producer, while PyPy serves all four from the abstract
-// `sequenceiterator`.  Keep PyPy's single payload and `descr_next` and give
-// each producer the 3.14-visible identity through its own `PyType`, the way
-// `dictmultiobject`'s six view iterators share `W_BaseDictMultiIterObject`.
+/// `iterobject.py W_FastUnicodeIterObject`.  Own GC payload (`seq`, `index`,
+/// `byteindex`); 3.15-visible as `str_iterator`.  `str_ascii_iterator` shares
+/// this layout the way the six dict view iterators share one payload.
+#[pyre_class("str_iterator", static_name = "STR_ITER")]
+pub struct W_FastUnicodeIterObject {
+    pub seq: PyObjectRef,
+    /// `W_AbstractSeqIterObject.index`: an RPython `Signed` (machine word).
+    pub index: isize,
+    /// `iterobject.py W_FastUnicodeIterObject.byteindex`.
+    pub byteindex: usize,
+}
+
+// [3.15-spec] producer-specific iterator identities ↔
+// `iterobject.py W_AbstractSeqIterObject.typedef` (`sequenceiterator`);
+// evidence: lib-python/3/test/test_array.py MiscTest.test_disallow_instantiation;
+// pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+// v3.15.0 `PyBytesIter_Type.tp_name` `"bytes_iterator"`,
+// `PyByteArrayIter_Type.tp_name` `"bytearray_iterator"`,
+// `_PyMemoryIter_Type.tp_name` `"memory_iterator"`,
+// `arrayiter_spec.name` `"array.arrayiterator"`.
+// Keep PyPy's `W_SeqIterObject` payload; each identity is its own `PyType`.
+// Str uses [`W_FastUnicodeIterObject`].  Bytes/bytearray use
+// [`W_StringIterObject`].
 pub static STR_ASCII_ITER_TYPE: PyType = crate::pyobject::new_pytype("str_ascii_iterator");
-pub static STR_ITER_TYPE: PyType = crate::pyobject::new_pytype("str_iterator");
-pub static BYTES_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytes_iterator");
-pub static BYTEARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytearray_iterator");
 pub static MEMORY_ITER_TYPE: PyType = crate::pyobject::new_pytype("memory_iterator");
 pub static ARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("array.arrayiterator");
 
@@ -112,36 +126,6 @@ seq_iter_ctor!(
     /// `iterobject.py W_SeqIterObject` / `StdObjSpace.newseqiter`.
     w_seq_iter_new,
     SEQ_ITER_TYPE,
-    0
-);
-
-seq_iter_ctor!(
-    /// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
-    /// 3.15-visible as `str_ascii_iterator` when the string is all ASCII.
-    w_str_ascii_iter_new,
-    STR_ASCII_ITER_TYPE,
-    1
-);
-
-seq_iter_ctor!(
-    /// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
-    /// 3.15-visible as `str_iterator` when the string is not all ASCII.
-    w_str_iter_new,
-    STR_ITER_TYPE,
-    1
-);
-
-seq_iter_ctor!(
-    /// `stringmethods.py StringMethods.descr_iter` → `W_StringIterObject` for bytes.
-    w_bytes_iter_new,
-    BYTES_ITER_TYPE,
-    0
-);
-
-seq_iter_ctor!(
-    /// `stringmethods.py StringMethods.descr_iter` → `W_StringIterObject` for bytearray.
-    w_bytearray_iter_new,
-    BYTEARRAY_ITER_TYPE,
     0
 );
 
@@ -200,6 +184,39 @@ pub fn w_tuple_iter_new(seq: PyObjectRef) -> PyObjectRef {
     })
 }
 
+/// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
+/// 3.15-visible as `str_iterator` when the string is not all ASCII.
+pub fn w_str_iter_new(seq: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let seq = crate::gc_roots::pin_root(seq);
+    W_FastUnicodeIterObject::allocate_stable(W_FastUnicodeIterObject {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        seq,
+        index: 0,
+        byteindex: 0,
+    })
+}
+
+/// `unicodeobject.py W_UnicodeObject.descr_iter` → `W_FastUnicodeIterObject`,
+/// 3.15-visible as `str_ascii_iterator` when the string is all ASCII.
+pub fn w_str_ascii_iter_new(seq: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let seq = crate::gc_roots::pin_root(seq);
+    let value = W_FastUnicodeIterObject {
+        ob: PyObject {
+            ob_type: &STR_ASCII_ITER_TYPE as *const PyType,
+            w_class: crate::pyobject::get_instantiate(&STR_ASCII_ITER_TYPE),
+        },
+        seq,
+        index: 0,
+        byteindex: 0,
+    };
+    crate::lltype::malloc_typed_stable(value) as PyObjectRef
+}
+
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -217,17 +234,14 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     // (`W_AbstractSeqIterObject` layout) answers yes here.
     let tp = unsafe { (*obj).ob_type };
     std::ptr::eq(tp, &SEQ_ITER_TYPE)
-        || std::ptr::eq(tp, &STR_ASCII_ITER_TYPE)
-        || std::ptr::eq(tp, &STR_ITER_TYPE)
-        || std::ptr::eq(tp, &BYTES_ITER_TYPE)
-        || std::ptr::eq(tp, &BYTEARRAY_ITER_TYPE)
         || std::ptr::eq(tp, &MEMORY_ITER_TYPE)
         || std::ptr::eq(tp, &ARRAY_ITER_TYPE)
 }
 
-/// `memory_iterator` — the one producer-specific `W_SeqIterObject` identity
-/// that exposes no pickle protocol (`__length_hint__` / `__setstate__` absent,
-/// `__reduce__` inherited from `object`, which refuses).
+/// [3.15-spec] `memory_iterator` has none of `__length_hint__`/`__setstate__`
+/// ↔ `W_AbstractSeqIterObject.typedef`; evidence:
+/// pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+/// `_PyMemoryIter_Type` at v3.15.0 has no `tp_methods` (`__reduce__` is `object`'s, which refuses).
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -239,24 +253,28 @@ pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
     !obj.is_null() && std::ptr::eq((*obj).ob_type, &MEMORY_ITER_TYPE)
 }
 
-/// `bytearray_iterator` — the one producer-specific `W_SeqIterObject` identity
-/// that carries exhaustion in the cursor: `__setstate__` turns a negative state
-/// into the -1 exhausted sentinel instead of rewinding to the front, and no
-/// later `__setstate__` revives it.  Its immutable siblings (`str`, `bytes`)
-/// and `arrayiterator` clamp a negative state to zero.
+/// `str_iterator` / `str_ascii_iterator` — `iterobject.py
+/// W_FastUnicodeIterObject`.  `__setstate__` recomputes `byteindex` from the
+/// clamped cursor via `_index_to_byte`.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn is_bytearray_iter(obj: PyObjectRef) -> bool {
+pub unsafe fn is_str_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && std::ptr::eq((*obj).ob_type, &BYTEARRAY_ITER_TYPE)
+    if obj.is_null() {
+        return false;
+    }
+    let tp = unsafe { (*obj).ob_type };
+    std::ptr::eq(tp, &STR_ITER_TYPE) || std::ptr::eq(tp, &STR_ASCII_ITER_TYPE)
 }
 
-/// `array.arrayiterator` — carries `__reduce__` / `__setstate__` but, unlike
-/// the str and bytes flavours, no `__length_hint__`.
+/// [3.15-spec] `array.arrayiterator` has `__reduce__`/`__setstate__` but no
+/// `__length_hint__` ↔ `W_AbstractSeqIterObject.typedef`; evidence:
+/// pyre/bench/synth/get_iter_str_bytes_array_subclass.py print("5");
+/// `arrayiter_methods` at v3.15.0 (REDUCE + SETSTATE only).
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -400,6 +418,55 @@ pub unsafe fn w_tuple_iter_set_index(obj: PyObjectRef, index: isize) {
     (*(obj as *mut W_TupleIterObject)).index = index;
 }
 
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_seq(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_FastUnicodeIterObject)).seq
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_index(obj: PyObjectRef) -> isize {
+    (*(obj as *const W_FastUnicodeIterObject)).index
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_byteindex(obj: PyObjectRef) -> usize {
+    (*(obj as *const W_FastUnicodeIterObject)).byteindex
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
+    (*(obj as *mut W_FastUnicodeIterObject)).seq = seq;
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_set_index(obj: PyObjectRef, index: isize) {
+    (*(obj as *mut W_FastUnicodeIterObject)).index = index;
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_fast_unicode_iter_set_byteindex(obj: PyObjectRef, byteindex: usize) {
+    (*(obj as *mut W_FastUnicodeIterObject)).byteindex = byteindex;
+}
+
 /// The wrapped sequence the iterator walks.
 ///
 /// # Safety
@@ -427,7 +494,7 @@ pub unsafe fn w_seq_iter_length(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_SeqIterObject)).length }
 }
 
-/// Empty producer shape used by Python 3.14's exhausted reduce form.
+/// Empty producer shape used by the 3.15 exhausted reduce form.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -469,18 +536,6 @@ mod seq_iter_tests {
         let seq = std::ptr::null_mut();
         let cases: &[(&str, fn(PyObjectRef, usize) -> PyObjectRef, &PyType)] = &[
             ("sequenceiterator", w_seq_iter_new, &SEQ_ITER_TYPE),
-            (
-                "str_ascii_iterator",
-                w_str_ascii_iter_new,
-                &STR_ASCII_ITER_TYPE,
-            ),
-            ("str_iterator", w_str_iter_new, &STR_ITER_TYPE),
-            ("bytes_iterator", w_bytes_iter_new, &BYTES_ITER_TYPE),
-            (
-                "bytearray_iterator",
-                w_bytearray_iter_new,
-                &BYTEARRAY_ITER_TYPE,
-            ),
             ("memory_iterator", w_memory_iter_new, &MEMORY_ITER_TYPE),
             ("array.arrayiterator", w_array_iter_new, &ARRAY_ITER_TYPE),
         ];
@@ -490,10 +545,29 @@ mod seq_iter_tests {
                 std::ptr::eq(unsafe { (*it).ob_type }, tp),
                 "{name} constructor stamped a non-constant or wrong type"
             );
-            assert_eq!(
-                unsafe { w_seq_iter_empty_kind(it) },
-                if name.starts_with("str") { 1 } else { 0 }
-            );
+            assert_eq!(unsafe { w_seq_iter_empty_kind(it) }, 0);
+            assert!(!unsafe { is_str_iter(it) });
+        }
+    }
+
+    #[test]
+    fn fast_unicode_constructors_stamp_their_own_constant_type() {
+        let seq = std::ptr::null_mut();
+        let ascii = w_str_ascii_iter_new(seq);
+        assert!(
+            std::ptr::eq(unsafe { (*ascii).ob_type }, &STR_ASCII_ITER_TYPE),
+            "str_ascii_iterator constructor stamped a non-constant or wrong type"
+        );
+        let it = w_str_iter_new(seq);
+        assert!(
+            std::ptr::eq(unsafe { (*it).ob_type }, &STR_ITER_TYPE),
+            "str_iterator constructor stamped a non-constant or wrong type"
+        );
+        for obj in [ascii, it] {
+            assert!(unsafe { is_str_iter(obj) });
+            assert!(!unsafe { is_seq_iter(obj) });
+            assert_eq!(unsafe { w_fast_unicode_iter_index(obj) }, 0);
+            assert_eq!(unsafe { w_fast_unicode_iter_byteindex(obj) }, 0);
         }
     }
 }

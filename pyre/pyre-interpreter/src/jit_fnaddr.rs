@@ -7379,11 +7379,6 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             iterobject::STR_ASCII_ITER_TYPE
         ),
         pytype_addr!("iterobject::STR_ITER_TYPE", iterobject::STR_ITER_TYPE),
-        pytype_addr!("iterobject::BYTES_ITER_TYPE", iterobject::BYTES_ITER_TYPE),
-        pytype_addr!(
-            "iterobject::BYTEARRAY_ITER_TYPE",
-            iterobject::BYTEARRAY_ITER_TYPE
-        ),
         pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
         pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
@@ -7518,6 +7513,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         (
             "pycode::CODE_TYPE",
             &crate::pycode::CODE_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTES_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTES_ITER_TYPE as *const _ as i64,
+        ),
+        (
+            "iterobject::BYTEARRAY_ITER_TYPE",
+            &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE as *const _ as i64,
         ),
         (
             "pytraceback::PYTRACEBACK_TYPE",

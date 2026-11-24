@@ -3916,6 +3916,8 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
+                || pyre_object::is_str_iter(iter)
+                || crate::objspace::std::iterobject::is_string_iter(iter)
                 || pyre_object::is_list_iter(iter)
                 || pyre_object::is_list_reverse_iter(iter)
                 || pyre_object::is_tuple_iter(iter)
@@ -8152,7 +8154,7 @@ ok = got == ["a", "\u00e9", "\udc80"]
                 !std::ptr::eq((*it).ob_type, &SEQ_ITER_TYPE),
                 "GET_ITER over str must not materialise a sequenceiterator over a list"
             );
-            let seq = (*(it as *const W_SeqIterObject)).seq;
+            let seq = pyre_object::w_fast_unicode_iter_seq(it);
             assert!(
                 std::ptr::eq(seq, s),
                 "the lazy str iterator must walk the original string"

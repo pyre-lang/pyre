@@ -580,8 +580,8 @@ mod tests {
             let types = [
                 &STR_ASCII_ITER_TYPE,
                 &STR_ITER_TYPE,
-                &BYTES_ITER_TYPE,
-                &BYTEARRAY_ITER_TYPE,
+                &crate::objspace::std::iterobject::BYTES_ITER_TYPE,
+                &crate::objspace::std::iterobject::BYTEARRAY_ITER_TYPE,
             ];
             let nexts: Vec<PyObjectRef> = types
                 .iter()
@@ -609,7 +609,7 @@ mod tests {
             let _roots = gc_roots::push_roots();
             let seq = gc_roots::pin_root(w_str_new("ab"));
             let iter_slot = gc_roots::shadow_stack_len();
-            let _ = gc_roots::pin_root(w_str_ascii_iter_new(seq, 2));
+            let _ = gc_roots::pin_root(w_str_ascii_iter_new(seq));
             assert!(std::ptr::eq(
                 (*gc_roots::shadow_stack_get(iter_slot)).ob_type,
                 &STR_ASCII_ITER_TYPE

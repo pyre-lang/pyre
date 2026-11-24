@@ -2180,6 +2180,99 @@ static TUPLE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+/// PyPy `iterobject.py W_FastUnicodeIterObject` fields.
+static FAST_UNICODE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::iterobject::W_FastUnicodeIterObject>(),
+        <pyre_object::iterobject::W_FastUnicodeIterObject as pyre_object::lltype::GcType>::type_id(
+        ),
+        &pyre_object::iterobject::STR_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                std::mem::offset_of!(pyre_object::iterobject::W_FastUnicodeIterObject, seq),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                std::mem::offset_of!(pyre_object::iterobject::W_FastUnicodeIterObject, index),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "byteindex",
+                std::mem::offset_of!(pyre_object::iterobject::W_FastUnicodeIterObject, byteindex),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_FastUnicodeIterObject",
+        "iterobject::W_FastUnicodeIterObject",
+    )
+});
+
+/// PyPy `iterobject.py W_StringIterObject` fields.
+static STRING_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_interpreter::objspace::std::iterobject::W_StringIterObject>(),
+        <pyre_interpreter::objspace::std::iterobject::W_StringIterObject as pyre_object::lltype::GcType>::type_id(
+        ),
+        &pyre_interpreter::objspace::std::iterobject::BYTES_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                std::mem::offset_of!(
+                    pyre_interpreter::objspace::std::iterobject::W_StringIterObject,
+                    seq
+                ),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                std::mem::offset_of!(
+                    pyre_interpreter::objspace::std::iterobject::W_StringIterObject,
+                    index
+                ),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "getitem_fn",
+                std::mem::offset_of!(
+                    pyre_interpreter::objspace::std::iterobject::W_StringIterObject,
+                    getitem_fn
+                ),
+                std::mem::size_of::<
+                    pyre_interpreter::objspace::std::iterobject::StringIterGetitemFn,
+                >(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_StringIterObject",
+        "objspace::std::iterobject::W_StringIterObject",
+    )
+});
+
 /// PyPy `iterobject.py W_FastListIterObject` fields.
 static LIST_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
@@ -4458,6 +4551,36 @@ pub fn tuple_iter_seq_descr() -> DescrRef {
 /// Field descriptor for `W_TupleIterObject.index`.
 pub fn tuple_iter_index_descr() -> DescrRef {
     field_descr_from_group(&TUPLE_ITER_DESCR_GROUP, 1)
+}
+
+/// Field descriptor for `W_FastUnicodeIterObject.seq`.
+pub fn fast_unicode_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&FAST_UNICODE_ITER_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_FastUnicodeIterObject.index`.
+pub fn fast_unicode_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&FAST_UNICODE_ITER_DESCR_GROUP, 1)
+}
+
+/// Field descriptor for `W_FastUnicodeIterObject.byteindex`.
+pub fn fast_unicode_iter_byteindex_descr() -> DescrRef {
+    field_descr_from_group(&FAST_UNICODE_ITER_DESCR_GROUP, 2)
+}
+
+/// Field descriptor for `W_StringIterObject.seq`.
+pub fn string_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&STRING_ITER_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_StringIterObject.index`.
+pub fn string_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&STRING_ITER_DESCR_GROUP, 1)
+}
+
+/// Field descriptor for `W_StringIterObject.getitem_fn`.
+pub fn string_iter_getitem_fn_descr() -> DescrRef {
+    field_descr_from_group(&STRING_ITER_DESCR_GROUP, 2)
 }
 
 /// Immutable iterator-list edge of `functional.py W_Zip`.
@@ -8742,6 +8865,16 @@ pub fn tuple_iter_size_descr() -> DescrRef {
     TUPLE_ITER_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for `iterobject.py W_FastUnicodeIterObject`.
+pub fn fast_unicode_iter_size_descr() -> DescrRef {
+    FAST_UNICODE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `iterobject.py W_StringIterObject`.
+pub fn string_iter_size_descr() -> DescrRef {
+    STRING_ITER_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for `iterobject.py W_FastListIterObject`.
 pub fn list_iter_size_descr() -> DescrRef {
     LIST_ITER_DESCR_GROUP.size_descr.clone()
@@ -11185,6 +11318,8 @@ mod tests {
             ("W_LongObject", w_long_size_descr()),
             ("W_TupleObject", w_tuple_size_descr()),
             ("W_TupleIter", tuple_iter_size_descr()),
+            ("W_FastUnicodeIter", fast_unicode_iter_size_descr()),
+            ("W_StringIter", string_iter_size_descr()),
             ("W_ListIter", list_iter_size_descr()),
             ("W_ZipObject", w_zip_size_descr()),
             ("SpecialisedTupleII", specialised_tuple_ii_size_descr()),
@@ -16435,6 +16570,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("iterobject::W_TupleIterObject", || {
         LazyLock::force(&TUPLE_ITER_DESCR_GROUP);
+    }),
+    ("iterobject::W_FastUnicodeIterObject", || {
+        LazyLock::force(&FAST_UNICODE_ITER_DESCR_GROUP);
+    }),
+    ("objspace::std::iterobject::W_StringIterObject", || {
+        LazyLock::force(&STRING_ITER_DESCR_GROUP);
     }),
     ("iterobject::W_ListIterObject", || {
         LazyLock::force(&LIST_ITER_DESCR_GROUP);
