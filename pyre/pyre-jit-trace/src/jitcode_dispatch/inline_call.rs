@@ -7305,6 +7305,52 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
         true,
         false,
     );
+    let resolved_callable = pyre_object::gc_roots::shadow_stack_get(early_base + 1);
+    let args_box = Box::new(parsed);
+    let args_ptr = args_box.as_ref() as *const pyre_interpreter::argument::Arguments as usize;
+    // One `pin_roots` for the three `make_sure_not_resized` twins
+    // (`framework.py push_roots`); sequential `pin_root` would query
+    // after the first write and leave later twins invisible.
+    let twins_base = _bind_roots.pin_roots(&[
+        args_box.arguments_w_gc as pyre_object::PyObjectRef,
+        args_box.keyword_names_w_gc as pyre_object::PyObjectRef,
+        args_box.keywords_w_gc as pyre_object::PyObjectRef,
+    ]);
+
+    let defs_obj = unsafe { pyre_interpreter::function_get_defaults(resolved_callable) };
+    let ndef = if defs_obj.is_null()
+        || unsafe { pyre_object::is_none(defs_obj) }
+        || unsafe { !pyre_object::is_tuple(defs_obj) }
+    {
+        0
+    } else {
+        unsafe { pyre_object::w_tuple_len(defs_obj) }
+    };
+    let (defs_slot, defaults_base) = if ndef > 0 {
+        let defs_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _bind_roots.pin_root(defs_obj);
+        let defaults_base = pyre_object::gc_roots::shadow_stack_len();
+        (defs_slot, defaults_base)
+    } else {
+        (0, 0)
+    };
+    // Boxing a specialised tuple item can collect; the tuple is re-read
+    // and each item pinned (`framework.py push_roots` / `pop_roots`).
+    for i in 0..ndef {
+        let defs_obj = pyre_object::gc_roots::shadow_stack_get(defs_slot);
+        let value = unsafe { pyre_object::w_tuple_getitem(defs_obj, i as i64) }
+            .unwrap_or(pyre_object::PY_NULL);
+        let _ = _bind_roots.pin_root(value);
+    }
+    let defs_obj = if ndef > 0 {
+        pyre_object::gc_roots::shadow_stack_get(defs_slot)
+    } else {
+        defs_obj
+    };
+    let mut defaults_w = Vec::with_capacity(ndef);
+    for i in 0..ndef {
+        defaults_w.push(pyre_object::gc_roots::shadow_stack_get(defaults_base + i));
+    }
     let kwnames = pyre_object::gc_roots::shadow_stack_get(early_base);
     let resolved_callable = pyre_object::gc_roots::shadow_stack_get(early_base + 1);
     let receiver_obj =
@@ -7327,33 +7373,6 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     for i in 0..nkw {
         keyword_name_objs[i] =
             pyre_object::gc_roots::shadow_stack_get(early_base + kw_name_pin + i);
-    }
-    let args_box = Box::new(parsed);
-    let args_ptr = args_box.as_ref() as *const pyre_interpreter::argument::Arguments as usize;
-    // One `pin_roots` for the three `make_sure_not_resized` twins
-    // (`framework.py push_roots`); sequential `pin_root` would query
-    // after the first write and leave later twins invisible.
-    let twins_base = _bind_roots.pin_roots(&[
-        args_box.arguments_w_gc as pyre_object::PyObjectRef,
-        args_box.keyword_names_w_gc as pyre_object::PyObjectRef,
-        args_box.keywords_w_gc as pyre_object::PyObjectRef,
-    ]);
-
-    let defs_obj = unsafe { pyre_interpreter::function_get_defaults(resolved_callable) };
-    let ndef = if defs_obj.is_null()
-        || unsafe { pyre_object::is_none(defs_obj) }
-        || unsafe { !pyre_object::is_tuple(defs_obj) }
-    {
-        0
-    } else {
-        unsafe { pyre_object::w_tuple_len(defs_obj) }
-    };
-    let mut defaults_w = Vec::with_capacity(ndef);
-    for i in 0..ndef {
-        defaults_w.push(
-            unsafe { pyre_object::w_tuple_getitem(defs_obj, i as i64) }
-                .unwrap_or(pyre_object::PY_NULL),
-        );
     }
     let kw_defs = unsafe { pyre_interpreter::function_get_kwdefaults(resolved_callable) };
     let kw_defs = if kw_defs.is_null() || unsafe { pyre_object::is_none(kw_defs) } {

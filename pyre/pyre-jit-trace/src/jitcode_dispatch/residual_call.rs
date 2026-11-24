@@ -5506,6 +5506,33 @@ fn allow_numbered_may_force_record<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>)
         && ctx.fbw_mode.allow_numbered_may_force
 }
 
+/// Whether a force of an enclosing inlined frame by this residual could not
+/// be recorded.
+///
+/// `do_residual_call` step 3 (`vrefs_after_residual_call` /
+/// `stop_tracking_virtualref`) writes a forced inline frame's folded locals
+/// before `direct_call_may_force`. Each store goes through
+/// `_nonstandard_virtualizable`, whose `implement_guard_value` resumes at the
+/// residual's own pc. A transparent helper has no such coordinate at a pc
+/// with no `-live-`. The call has run by then, so the walk refuses before it.
+fn forced_inline_callee_retire_is_unresumable<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    if !ctx.fbw_mode.transparent_helper_subwalk {
+        return false;
+    }
+    let standard = ctx.trace_ctx.standard_virtualizable_box();
+    let folded_ancestor = inline_callee_shadow_states(ctx).iter().any(|state| {
+        state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
+            shadow.fold_frame_reg != u16::MAX
+                && shadow.frame_box != OpRef::NONE
+                && standard != Some(shadow.frame_box)
+        })
+    });
+    folded_ancestor && !super::resume_snapshot::helper_plain_guard_resumes_in_frame(ctx, op_pc)
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5611,6 +5638,10 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             )
         {
             Some(("may-force-in-transparent-helper", addr, 0))
+        } else if may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
+            && forced_inline_callee_retire_is_unresumable(ctx, op_pc)
+        {
+            Some(("may-force-under-folded-inline-callee", addr, 0))
         } else {
             None
         }
@@ -6874,18 +6905,41 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // `materialize_published_callee_locals` writes).
         let vrefs_before = ctx.trace_ctx.snapshot_virtualref_boxes();
         ctx.trace_ctx.vrefs_after_residual_call();
-        record_forced_inline_locals_before_call(ctx, op_pc, &vrefs_before)?;
-        if let Some(record_call) = record_after_execute.as_mut() {
-            let rooted_ref = if call_descr.result_type() == majit_ir::Type::Ref {
-                match (residual_result_scope.as_ref(), residual_result_index) {
-                    (Some(scope), Some(index)) => Some(scope.get(index) as i64),
-                    _ => None,
+        let after_call = 'record: {
+            if let Err(err) = record_forced_inline_locals_before_call(ctx, op_pc, &vrefs_before) {
+                break 'record Err(err);
+            }
+            if let Some(record_call) = record_after_execute.as_mut() {
+                let rooted_ref = if call_descr.result_type() == majit_ir::Type::Ref {
+                    match (residual_result_scope.as_ref(), residual_result_index) {
+                        (Some(scope), Some(index)) => Some(scope.get(index) as i64),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let value = may_force_call_value(call_descr, exec_result, rooted_ref);
+                match record_call(ctx, value) {
+                    Ok(result) => recorded = result,
+                    Err(err) => break 'record Err(err),
                 }
-            } else {
-                None
-            };
-            let value = may_force_call_value(call_descr, exec_result, rooted_ref);
-            recorded = record_call(ctx, value)?;
+            }
+            Ok(())
+        };
+        if let Err(err) = after_call {
+            // The call has run, so `vable_after_residual_call` pairs with the
+            // stamp whatever the recording did (`pyjitpl.py do_residual_call`
+            // has no exit between the two). Leaving here with the token set
+            // fails `tracing_before_residual_call`'s TOKEN_NONE assert at the
+            // next residual.
+            if let Some(obj) = vable_obj_root.as_ref() {
+                let _ = vable_after_residual_call(**obj as usize);
+            }
+            if let Some(depth) = vable_root_depth {
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            }
+            saved_vable_root.take();
+            return Err(err);
         }
     }
     // `vinfo.tracing_after_residual_call(virtualizable)`
