@@ -71,7 +71,7 @@ pub fn repr_addr(addr: usize) -> String {
 pub fn repr_gc_addr(obj: PyObjectRef) -> String {
     let _roots = pyre_object::gc_roots::push_roots();
     let live = pyre_object::gc_roots::pin_root(obj);
-    repr_addr(pyre_object::gc_hook::gc_identity_hash(live as usize))
+    repr_addr(pyre_object::gc_hook::gc_id(live as usize))
 }
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance,

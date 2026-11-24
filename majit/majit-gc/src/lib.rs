@@ -4490,11 +4490,18 @@ pub fn set_active_gc_current_object_address(hook: Option<GcCurrentObjectAddressF
     majit_ir::set_gc_current_object_address(hook);
 }
 
-/// Return a GC-move-stable address for identity hashing.
+/// Return a GC-move-stable address for MiniMark `id` / `identityhash`.
 /// Falls back to `addr` when no backend is installed.
 #[inline]
 pub fn gc_id_or_identityhash(addr: usize) -> usize {
     majit_ir::gc_id_or_identityhash(addr)
+}
+
+/// `rpython/memory/support.py` `mangle_hash`, over the signed machine
+/// word (`lltype.Signed`): the shift is arithmetic at the target's width.
+#[inline]
+pub fn mangle_hash(i: isize) -> isize {
+    i ^ (i >> 4)
 }
 
 /// Whether `addr` lies inside the active backend's managed GC heap.

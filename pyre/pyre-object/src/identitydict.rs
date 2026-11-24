@@ -28,7 +28,7 @@ pub struct IdentityKey(pub PyObjectRef);
 impl std::hash::Hash for IdentityKey {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        crate::gc_hook::gc_identity_hash(self.0 as usize).hash(state);
+        crate::gc_hook::gc_identityhash(self.0 as usize).hash(state);
     }
 }
 
@@ -458,8 +458,8 @@ impl DictStrategy for IdentityDictStrategy {
     /// the pointer.  Trace `key.0` through an unsafe pointer cast so a
     /// minor collection keeps each identity key's referent alive.
     ///
-    /// Hash is now stable across GC moves via `gc_identity_hash`
-    /// (shadow-based, minimark.py id_or_identityhash), so no rehash is needed.
+    /// Hash is now stable across GC moves via `gc_identityhash`
+    /// (MiniMark `identityhash`), so no rehash is needed.
     /// Trace key and value pointers so the GC updates them in place.
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let entries = identity_storage_mut(w_dict);

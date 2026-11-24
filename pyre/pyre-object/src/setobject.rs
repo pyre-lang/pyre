@@ -824,7 +824,7 @@ pub struct IdentitySetKey {
 impl std::hash::Hash for IdentitySetKey {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        crate::gc_hook::gc_identity_hash(self.obj as usize).hash(state);
+        crate::gc_hook::gc_identityhash(self.obj as usize).hash(state);
     }
 }
 
@@ -852,7 +852,7 @@ impl crate::rordereddict::GcRefOffsets for IdentitySetKey {
 
 /// `setobject.py IdentitySetStrategy.get_empty_dict` — `{}` keyed by
 /// object identity. The key is [`IdentitySetKey`]. The table hash is
-/// `gc_identity_hash` as is, the hasher `IdentityDictStorage` uses.
+/// `gc_identityhash` as is, the hasher `IdentityDictStorage` uses.
 /// `(IdentityKey, PyObjectRef)` is the identity-dict entries id; this
 /// table's value is `()`.
 pub type IdentitySetStorage =
@@ -2541,8 +2541,8 @@ unsafe fn w_set_lock_pair(left: PyObjectRef, right: PyObjectRef) -> (SetGuard, O
     if !crate::objlock::stripes_taken() {
         return (w_set_lock(left), None);
     }
-    let left_key = crate::gc_hook::gc_identity_hash(left as usize);
-    let right_key = crate::gc_hook::gc_identity_hash(right as usize);
+    let left_key = crate::gc_hook::gc_id(left as usize);
+    let right_key = crate::gc_hook::gc_id(right as usize);
     let left_index = crate::objlock::stripe_index(left_key);
     let right_index = crate::objlock::stripe_index(right_key);
     if left_index == right_index {

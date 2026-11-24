@@ -1285,15 +1285,6 @@ pub(crate) extern "C" fn _ll_1_int_abs(x: i64) -> i64 {
     (x ^ mask).wrapping_sub(mask)
 }
 
-/// `support.py` `_ll_1_gc_identityhash` (`@elidable`):
-/// `lltype.identityhash(x)`, which the minimark GC answers as
-/// `mangle_hash(id_or_identityhash(obj))`. `x` is the object word.
-#[majit_macros::elidable_cannot_raise]
-pub(crate) extern "C" fn _ll_1_gc_identityhash(x: i64) -> i64 {
-    let identity = pyre_object::gc_hook::gc_identity_hash(x as usize) as i64;
-    identity ^ (identity >> 4)
-}
-
 /// `support.py` `_ll_2_int_floordiv`: no-branch reverse of [`ll_int_py_div`].
 ///
 /// `x // y` is [`ll_int_py_div`] (`oopspec` `int.py_div`). The shift is

@@ -1009,10 +1009,10 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// bindings have no `(...)` pattern, so no argname lookup is needed.
 ///
 /// Return type is `Vec<NormalizedArg>` (not `Vec<Variable>`): a slot
-/// may be a passthrough `Pass(Variable)` or a `ConstInt(i64)` literal
-/// that the caller must materialise as an `OpKind::ConstInt` op.
-/// `jtransform.rs::handle_builtin_call` mints fresh Variables for
-/// constant slots at the residual-call site.
+/// may be a passthrough `Pass(Variable)`, a `ConstInt(i64)` /
+/// `ConstFloat(u64)` injection, or an original `op.args` `Constant`
+/// (`NormalizedArg::Constant`). `jtransform.rs::handle_builtin_call`
+/// mints fresh Variables for constant slots at the residual-call site.
 ///
 /// `gc_identityhash` / `gc_id` arrive as [`OpKind::LoweredBlackholeOp`]
 /// (`effect_graph_from_rtyped_helper`). The arms below delegate to
@@ -1127,7 +1127,15 @@ pub fn get_gcid_oopspec(op: &SpaceOperation) -> (String, Vec<NormalizedArg>) {
 /// `LL_OPERATIONS[op.opname].canraise`; `lloperation.py` `LLOp` with
 /// `canmallocgc=True` adds `(MemoryError,)`, so `call.py` `_canraise`
 /// answers `"mem"`.
-pub fn gc_identity_helper_graph(helper_name: &str, llop: &str) -> FunctionGraph {
+///
+/// `arg_lltype` is `v.concretetype` of the llop operand
+/// (`builtin_func_for_spec` `args_s = [lltype_to_annotation(v) for v in
+/// ll_args]`). Two pointer types therefore get two helper graphs.
+pub fn gc_identity_helper_graph(
+    helper_name: &str,
+    llop: &str,
+    arg_lltype: &LowLevelType,
+) -> FunctionGraph {
     let mut graph = FunctionGraph::new(helper_name).with_source_identity(helper_name);
     let x = graph
         .push_op_var(
@@ -1140,7 +1148,7 @@ pub fn gc_identity_helper_graph(helper_name: &str, llop: &str) -> FunctionGraph 
             true,
         )
         .expect("support.py _ll_1_gc_identityhash / _ll_1_gc_id takes one pointer");
-    FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+    x.set_concretetype(Some(arg_lltype.clone()));
     let result = graph
         .push_op_var(
             graph.startblock,
@@ -1159,27 +1167,17 @@ pub fn gc_identity_helper_graph(helper_name: &str, llop: &str) -> FunctionGraph 
 /// `op.args` for a lowered llop (`OpKind::LoweredBlackholeOp`).
 ///
 /// `support.py get_identityhash_oopspec` / `get_gcid_oopspec` return
-/// `op.args` (Variables and Constants). A Constant maps to the
-/// `NormalizedArg` variant of that type (`ConstInt` / `ConstFloat`).
-/// `NormalizedArg` has no constant-GC-pointer arm; a Constant GCREF
-/// panics rather than being dropped (`call_arg_vars`) or inventing a
-/// variant.
+/// `op.args` (Variables and Constants) unchanged. A Constant of any
+/// type is `NormalizedArg::Constant` holding that Constant; it is
+/// not dropped (`call_arg_vars`) and not rewritten as ConstInt /
+/// ConstFloat (those arms are `normalize_opargs` literal injections).
 fn spaceop_args_as_normalized(op: &SpaceOperation) -> Vec<NormalizedArg> {
     match &op.kind {
         OpKind::LoweredBlackholeOp { args, .. } => args
             .iter()
             .map(|arg| match arg {
                 LinkArg::Value(var) => NormalizedArg::Pass(var.clone()),
-                LinkArg::Const(c) => match &c.value {
-                    ConstValue::Int(n) => NormalizedArg::ConstInt(*n),
-                    ConstValue::Float(bits) => NormalizedArg::ConstFloat(*bits),
-                    other => panic!(
-                        "get_identityhash_oopspec/get_gcid_oopspec: NormalizedArg \
-                         has Pass/ConstInt/ConstFloat only; constant operand \
-                         {other:?} has no variant (constant GC pointer cannot \
-                         be represented)"
-                    ),
-                },
+                LinkArg::Const(c) => NormalizedArg::Constant(c.clone()),
             })
             .collect(),
         other => panic!(
@@ -1220,18 +1218,23 @@ pub enum NormalizeSlot {
 /// `support.py normalize_opargs` return-shape.
 ///
 /// Upstream returns a list where each entry is either an existing
-/// `Variable` reference (`opargs[obj.n]`) or a fresh
-/// `Constant(obj, lltype.typeOf(obj))`.  Pyre splits the two cases
+/// `Variable` / `Constant` (`opargs[obj.n]`) or a fresh
+/// `Constant(obj, lltype.typeOf(obj))`.  Pyre splits the cases
 /// into a discriminated enum so callers (`decode_builtin_call` and
 /// downstream) can decide how to materialise constants — pyre's
-/// constants are `OpKind::ConstInt` SSA ops whose creation needs
-/// graph-builder access at the callsite.
+/// injected literals are `OpKind::ConstInt` SSA ops whose creation
+/// needs graph-builder access at the callsite; an original `op.args`
+/// Constant is held as-is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedArg {
     /// `support.py result.append(opargs[obj.n])` — pass an
     /// existing `Variable` through verbatim (upstream `Hlvalue::Variable`
     /// at `flowspace/model.py` identity).
     Pass(crate::flowspace::model::Variable),
+    /// `support.py result.append(opargs[obj.n])` when `opargs[n]` is a
+    /// Constant; also `get_identityhash_oopspec` / `get_gcid_oopspec`
+    /// returning `op.args` Constants unchanged.
+    Constant(crate::flowspace::model::Constant),
     /// `support.py result.append(Constant(obj, lltype.Signed))`
     /// — caller materialises an `OpKind::ConstInt(v)` op carrying
     /// this value.
@@ -2187,6 +2190,80 @@ mod tests {
         assert_eq!(spec_uni.fnaddr, 0x2000);
     }
 
+    #[test]
+    fn builtin_func_for_spec_cache_keyed_on_gc_identityhash_ptr_lltype() {
+        // `support.py builtin_func_for_spec` keys on `tuple(ll_args)`.
+        // Two `gc_identityhash` operands with distinct pointer lltypes
+        // (`OBJECTPTR` vs `GCREF`) produce two cache entries; repeating
+        // the same lltype reuses the first. The helper graph input is
+        // that operand lltype, not a fixed unqualified GcRef.
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let object_args = [OBJECTPTR.clone()];
+        let gcref_args = [GCREF.clone()];
+        assert_ne!(object_args[0], gcref_args[0]);
+        let object_label = specialized_helper_leaf("_ll_1_gc_identityhash", &object_args);
+        let gcref_label = specialized_helper_leaf("_ll_1_gc_identityhash", &gcref_args);
+        assert_ne!(object_label, gcref_label);
+
+        let object_graph =
+            gc_identity_helper_graph(object_label.as_str(), "gc_identityhash", &object_args[0]);
+        let gcref_graph =
+            gc_identity_helper_graph(gcref_label.as_str(), "gc_identityhash", &gcref_args[0]);
+        let object_input = object_graph.block(object_graph.startblock).operations[0]
+            .result
+            .as_ref()
+            .expect("helper Input x");
+        let gcref_input = gcref_graph.block(gcref_graph.startblock).operations[0]
+            .result
+            .as_ref()
+            .expect("helper Input x");
+        assert_eq!(object_input.concretetype(), Some(object_args[0].clone()));
+        assert_eq!(gcref_input.concretetype(), Some(gcref_args[0].clone()));
+        assert_ne!(object_input.concretetype(), gcref_input.concretetype());
+
+        let mut cc = CallControl::new();
+        cc.register_function_fnaddr(CallPath::from_segments([object_label.as_str()]), 0x18411);
+        cc.register_function_fnaddr(CallPath::from_segments([gcref_label.as_str()]), 0x18412);
+        let spec_object = builtin_func_for_spec(
+            Some(&cc),
+            "gc_identityhash",
+            &[Type::Ref],
+            Type::Int,
+            None,
+            None,
+            Some(&object_args),
+        );
+        let spec_gcref = builtin_func_for_spec(
+            Some(&cc),
+            "gc_identityhash",
+            &[Type::Ref],
+            Type::Int,
+            None,
+            None,
+            Some(&gcref_args),
+        );
+        assert_ne!(spec_object.impl_name, spec_gcref.impl_name);
+        assert_eq!(spec_object.impl_name, object_label);
+        assert_eq!(spec_gcref.impl_name, gcref_label);
+        assert_eq!(spec_object.fnaddr, 0x18411);
+        assert_eq!(spec_gcref.fnaddr, 0x18412);
+
+        cc.register_function_fnaddr(CallPath::from_segments([object_label.as_str()]), 0x9999);
+        let spec_object_again = builtin_func_for_spec(
+            Some(&cc),
+            "gc_identityhash",
+            &[Type::Ref],
+            Type::Int,
+            None,
+            None,
+            Some(&object_args),
+        );
+        assert_eq!(spec_object_again.fnaddr, 0x18411);
+        assert_eq!(spec_object_again.impl_name, spec_object.impl_name);
+    }
+
     // ───────── `decode_builtin_call` tests ─────────
 
     fn make_call_op(
@@ -2326,6 +2403,50 @@ mod tests {
         let (name, opargs) = decode_builtin_call(&op, &cc);
         assert_eq!(name, "gc_id");
         assert_eq!(opargs, vec![NormalizedArg::Pass(arg)]);
+    }
+
+    fn gcref_constant() -> crate::flowspace::model::Constant {
+        use crate::translator::rtyper::lltypesystem::lltype::nullptr;
+        use crate::translator::rtyper::rclass::{OBJECT, OBJECTPTR};
+        let ptr = nullptr(OBJECT.clone()).expect("nullptr(OBJECT)");
+        crate::flowspace::model::Constant::with_concretetype(
+            crate::flowspace::model::ConstValue::LLPtr(Box::new(ptr)),
+            OBJECTPTR.clone(),
+        )
+    }
+
+    fn make_llop_const(opname: &str, c: crate::flowspace::model::Constant) -> SpaceOperation {
+        SpaceOperation {
+            result: None,
+            kind: OpKind::LoweredBlackholeOp {
+                opname: opname.to_string(),
+                args: vec![LinkArg::Const(c)],
+            },
+        }
+    }
+
+    #[test]
+    fn decode_builtin_call_gc_identityhash_returns_constant_gcref() {
+        // `support.py get_identityhash_oopspec` → `('gc_identityhash', op.args)`
+        // including a Constant GCREF.
+        let cc = CallControl::new();
+        let c = gcref_constant();
+        let op = make_llop_const("gc_identityhash", c.clone());
+        let (name, opargs) = decode_builtin_call(&op, &cc);
+        assert_eq!(name, "gc_identityhash");
+        assert_eq!(opargs, vec![NormalizedArg::Constant(c)]);
+    }
+
+    #[test]
+    fn decode_builtin_call_gc_id_returns_constant_gcref() {
+        // `support.py get_gcid_oopspec` → `('gc_id', op.args)`
+        // including a Constant GCREF.
+        let cc = CallControl::new();
+        let c = gcref_constant();
+        let op = make_llop_const("gc_id", c.clone());
+        let (name, opargs) = decode_builtin_call(&op, &cc);
+        assert_eq!(name, "gc_id");
+        assert_eq!(opargs, vec![NormalizedArg::Constant(c)]);
     }
 
     // ── `parse_oopspec` + `normalize_opargs` pure-function ports ────

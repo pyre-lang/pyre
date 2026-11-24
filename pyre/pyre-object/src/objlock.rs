@@ -3,11 +3,10 @@
 //! lock). One table per family, reset after fork. A thread that holds the GIL,
 //! or a process that has not published `gil_ready`, takes no stripe.
 //!
-//! Stripes are keyed on the object's GC identity hash
-//! ([`crate::gc_hook::gc_identity_hash`], minimark `identityhash`) because
-//! instances and heap types move; a raw address would name a different stripe
-//! after a minor collection. The hash is computed only when a stripe is
-//! actually taken.
+//! Stripes are keyed on MiniMark `id` ([`crate::gc_hook::gc_id`],
+//! `id_or_identityhash`) because instances and heap types move; a raw
+//! address would name a different stripe after a minor collection. The
+//! id is computed only when a stripe is actually taken.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -46,7 +45,7 @@ pub fn stripes_taken() -> bool {
 ///
 /// Callers that order two stripes compute this only when [`stripes_taken`].
 pub fn stable_stripe_index(obj: usize) -> usize {
-    stripe_index(crate::gc_hook::gc_identity_hash(obj))
+    stripe_index(crate::gc_hook::gc_id(obj))
 }
 
 struct ForkLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
@@ -100,7 +99,7 @@ impl LockFamily {
         if !stripes_taken() {
             return 0;
         }
-        self.acquire_unconditionally(crate::gc_hook::gc_identity_hash(obj))
+        self.acquire_unconditionally(crate::gc_hook::gc_id(obj))
     }
 
     /// A contended stripe must not be waited on from inside the running-mutator
@@ -137,7 +136,7 @@ impl LockFamily {
         if !stripes_taken() {
             return Some(0);
         }
-        let lock = self.stripe(crate::gc_hook::gc_identity_hash(obj));
+        let lock = self.stripe(crate::gc_hook::gc_id(obj));
         let guard = lock.try_lock()?;
         std::mem::forget(guard);
         Some(lock as *const parking_lot::ReentrantMutex<()> as usize)

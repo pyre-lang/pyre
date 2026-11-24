@@ -3727,7 +3727,7 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             if len > 1 {
                 let block = pyre_object::bytesobject::w_bytes_block(obj);
                 return Some(pyre_object::intobject::w_int_new(
-                    pyre_object::gc_hook::gc_identity_hash(block as usize) as i64,
+                    pyre_object::gc_hook::gc_id(block as usize) as i64,
                 ));
             }
             let base: i64 = if len == 1 {
@@ -3747,7 +3747,7 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             if len > 1 {
                 let storage = pyre_object::unicodeobject::w_str_storage(obj);
                 return Some(pyre_object::intobject::w_int_new(
-                    pyre_object::gc_hook::gc_identity_hash(storage as usize) as i64 + IDTAG_ALT_UID,
+                    pyre_object::gc_hook::gc_id(storage as usize) as i64 + IDTAG_ALT_UID,
                 ));
             }
             let base: i64 = if len == 1 {
@@ -4051,7 +4051,7 @@ pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError>
     let _roots = pyre_object::gc_roots::push_roots();
     let function_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(function);
-    let x = pyre_object::gc_hook::gc_identity_hash(instance as usize) as i64;
+    let x = pyre_object::gc_hook::gc_id(instance as usize) as i64;
     let y =
         crate::baseobjspace::hash_w_strict(pyre_object::gc_roots::shadow_stack_get(function_slot))?;
     let value = x ^ y;
@@ -4952,7 +4952,7 @@ mod tests {
         let storage = unsafe { pyre_object::unicodeobject::w_str_storage(ascii) };
         assert_eq!(
             unsafe { pyre_object::intobject::w_int_get_value(ascii_uid) },
-            pyre_object::gc_hook::gc_identity_hash(storage as usize) as i64 + IDTAG_ALT_UID
+            pyre_object::gc_hook::gc_id(storage as usize) as i64 + IDTAG_ALT_UID
         );
 
         // The branch is based on `_len()`, so one non-ASCII code point uses

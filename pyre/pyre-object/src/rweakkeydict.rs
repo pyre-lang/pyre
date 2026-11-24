@@ -225,7 +225,7 @@ fn ll_hash(entries: *mut WeakKeyDictEntries, i: usize) -> isize {
 
 /// `compute_identity_hash(llkey)`.
 fn ll_keyhash(llkey: PyObjectRef) -> isize {
-    crate::gc_hook::gc_identity_hash(llkey as usize) as isize
+    crate::gc_hook::gc_identityhash(llkey as usize) as isize
 }
 
 /// `ll_keyeq(d, weakkey1, realkey2)`.

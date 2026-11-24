@@ -2516,6 +2516,35 @@ fn link_arg_concrete_type(arg: &LinkArg) -> crate::codewriter::type_state::Concr
     }
 }
 
+/// `v.concretetype` (`jtransform.py Transformer.prepare_builtin_call`).
+/// A Variable / Constant carries the rtyper's `LowLevelType`; a missing
+/// cell means the operand was never rtyped.
+fn link_arg_lltype(
+    arg: &LinkArg,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    match arg {
+        LinkArg::Value(var) => var.concretetype(),
+        LinkArg::Const(c) => c.concretetype.clone(),
+    }
+}
+
+/// `argtypes = [v.concretetype for v in args]`.
+fn link_args_lltypes(
+    args: &[LinkArg],
+    oopspec_name: &str,
+) -> Vec<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    args.iter()
+        .map(|arg| {
+            link_arg_lltype(arg).unwrap_or_else(|| {
+                panic!(
+                    "jtransform.py Transformer.prepare_builtin_call: \
+                     v.concretetype missing on {oopspec_name} operand"
+                )
+            })
+        })
+        .collect()
+}
+
 /// RPython's rtyper writes `op.result.concretetype` before jtransform
 /// `getkind`. The frontend leaves dests `Unknown` even when `ty` is Int
 /// (`W_BytesIO.pos`), so `get_value_kind_var` defaults to `'r'` and
@@ -5124,7 +5153,7 @@ impl<'a> Transformer<'a> {
     /// `support.py builtin_func_for_spec` resolves `_ll_<n>_<oopspec>`,
     /// then this emits `direct_call(c_func, *args)`. `args` is the mixed
     /// `op.args` list (`Variable` / `Constant`); `v.concretetype` is
-    /// `link_arg_concrete_type`.
+    /// [`link_arg_lltype`].
     fn prepare_builtin_call(
         &mut self,
         op: &SpaceOperation,
@@ -5144,6 +5173,9 @@ impl<'a> Transformer<'a> {
                 ConcreteType::Unknown => Some(majit_ir::value::Type::Ref),
             })
             .collect();
+        // `jtransform.py Transformer.prepare_builtin_call`:
+        // `argtypes = [v.concretetype for v in args]`.
+        let ll_arg_types = link_args_lltypes(args, oopspec_name);
         let result_ct = op
             .result
             .as_ref()
@@ -5166,7 +5198,7 @@ impl<'a> Transformer<'a> {
             result_ir_type,
             extra,
             extrakey,
-            None,
+            Some(&ll_arg_types),
         );
         let target = CallTarget::function_path([spec.impl_name.as_str()]);
         SpaceOperation {
@@ -5202,22 +5234,16 @@ impl<'a> Transformer<'a> {
                 "Transformer._do_builtin_call: expected gc_identityhash/gc_id, got {other:?}"
             ),
         };
-        self.stamp_value_kind(
-            graph,
-            op.result.clone(),
-            crate::codewriter::type_state::ConcreteType::Signed,
-        );
-        for arg in &link_args {
-            if let LinkArg::Value(var) = arg {
-                self.stamp_value_kind(
-                    graph,
-                    Some(var.clone()),
-                    crate::codewriter::type_state::ConcreteType::GcRef,
-                );
-            }
-        }
+        // `prepare_builtin_call` keeps every operand's `concretetype`:
+        // the rtyper already typed the llop's pointer operand and Signed
+        // result. `builtin_func_for_spec` keys on that lltype tuple, so
+        // two pointer types get two MixLevelHelperAnnotator graphs.
         let helper_leaf = format!("_ll_{}_{}", link_args.len(), oopspec_name.replace('.', "_"));
-        let helper_path = crate::parse::CallPath::from_segments([helper_leaf.as_str()]);
+        let ll_arg_types = link_args_lltypes(&link_args, &oopspec_name);
+        let specialized_leaf =
+            crate::codewriter::strfind::specialized_helper_leaf(&helper_leaf, &ll_arg_types);
+        let helper_path = crate::parse::CallPath::from_segments([specialized_leaf.as_str()]);
+        let unspecialized_path = crate::parse::CallPath::from_segments([helper_leaf.as_str()]);
         {
             let cc = self.callcontrol.as_mut().expect(
                 "Transformer._do_builtin_call: CallControl is required \
@@ -5227,13 +5253,21 @@ impl<'a> Transformer<'a> {
             // `_ll_1_gc_identityhash` / `_ll_1_gc_id`: the helper graph
             // is the single `canmallocgc` llop, so `canraise.py`
             // `RaiseAnalyzer` / `call.py` `_canraise` answer `"mem"`.
+            let arg_lltype = ll_arg_types.first().unwrap_or_else(|| {
+                panic!("Transformer._do_builtin_call: {oopspec_name} takes one pointer operand")
+            });
             cc.register_function_graph(
                 helper_path.clone(),
                 crate::codewriter::support::gc_identity_helper_graph(
-                    helper_leaf.as_str(),
+                    specialized_leaf.as_str(),
                     oopspec_name.as_str(),
+                    arg_lltype,
                 ),
             );
+            // Host `HELPER_FNADDRS` binds the unspecialized leaf; the
+            // specialized MixLevel name aliases that fnaddr
+            // (`CallControl::alias_function_fnaddr`).
+            cc.alias_function_fnaddr(helper_path.clone(), &unspecialized_path);
             // `support.py _ll_1_gc_identityhash` is `@elidable`.
             // `_ll_1_gc_id` is not (`id(const)` must not fold).
             if oopspec_name == "gc_identityhash" {
@@ -7743,20 +7777,6 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "gc_identityhash" => {
-                // `jtransform.py rewrite_op_gc_identityhash =
-                // _do_builtin_call` → `direct_call(_ll_1_gc_identityhash, x)`.
-                RewriteResult::Replace(self.emit_gc_identityhash(
-                    graph,
-                    operand,
-                    op.result.clone(),
-                    graph_name,
-                ))
-            }
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
             } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
                 // `rint.py rtype_abs` → `int_abs`.  `jtransform.py
                 // rewrite_op_int_abs = _do_builtin_call` emits
@@ -9820,61 +9840,6 @@ impl<'a> Transformer<'a> {
                     ),
                     args_i: vec![operand.clone()],
                     args_r: vec![],
-                    args_f: vec![],
-                    result_kind: 'i',
-                    indirect_targets: None,
-                },
-            },
-        ]
-    }
-
-    /// Emit `direct_call(_ll_1_gc_identityhash, x)` — `jtransform.py rewrite_op_gc_identityhash = _do_builtin_call`. `support.py` `_ll_1_gc_identityhash` is `@elidable` and cannot raise; its one argument is a GC reference.
-    fn emit_gc_identityhash(
-        &mut self,
-        graph: &mut FunctionGraph,
-        operand: &crate::flowspace::model::Variable,
-        result: Option<crate::flowspace::model::Variable>,
-        graph_name: &str,
-    ) -> Vec<SpaceOperation> {
-        let target = CallTarget::function_path(["_ll_1_gc_identityhash"]);
-        let direct_call = SpaceOperation {
-            result: result.clone(),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(std::iter::once(operand.clone())),
-                result_ty: ValueType::Int,
-            },
-        };
-        let regular = self
-            .callcontrol
-            .as_ref()
-            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
-        if regular
-            && let RewriteResult::Replace(ops) = self.handle_regular_call(
-                &direct_call,
-                &target,
-                std::slice::from_ref(operand),
-                &ValueType::Int,
-                graph_name,
-                graph,
-            )
-        {
-            return ops;
-        }
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
-        vec![
-            funcptr_op,
-            SpaceOperation {
-                result,
-                kind: OpKind::CallResidual {
-                    funcptr: CallFuncPtr::Value(funcptr),
-                    descriptor: CallDescriptor::from_signature(
-                        &[majit_ir::value::Type::Ref],
-                        majit_ir::value::Type::Int,
-                        EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
-                    ),
-                    args_i: vec![],
-                    args_r: vec![operand.clone()],
                     args_f: vec![],
                     result_kind: 'i',
                     indirect_targets: None,
@@ -13809,10 +13774,13 @@ impl<'a> Transformer<'a> {
         // slots are materialised here as fresh `OpKind::ConstInt(v)`
         // ops prepended to whatever the downstream rewrite emits —
         // mirroring upstream's `Constant(obj, ...)` Variable
-        // introduction.  Without an argname registry the normalized
-        // list is just `Pass(vid)` for each raw arg, so the
-        // effective_args == args.to_vec() and no prefix ops are
-        // emitted.
+        // introduction.  `NormalizedArg::Constant` is an original
+        // `op.args` Constant (`get_identityhash_oopspec` /
+        // `get_gcid_oopspec`); materialise it the same way
+        // `_do_builtin_call` does (`materialize_const_result`).
+        // Without an argname registry the normalized list is just
+        // `Pass(vid)` for each raw arg, so the effective_args ==
+        // args.to_vec() and no prefix ops are emitted.
         let (decoded_oopspec, effective_args, mut const_prefix_ops) =
             if let Some(cc) = self.callcontrol.as_deref() {
                 if cc.get_oopspec(target).is_some() {
@@ -13823,6 +13791,18 @@ impl<'a> Transformer<'a> {
                     for slot in normalized {
                         match slot {
                             NormalizedArg::Pass(var) => eff.push(var),
+                            // `support.py get_identityhash_oopspec` /
+                            // `get_gcid_oopspec` return `op.args`
+                            // Constants unchanged; `_do_builtin_call`
+                            // materializes a GCREF via
+                            // `materialize_const_result`.
+                            NormalizedArg::Constant(c) => {
+                                let var = graph.alloc_value_var_with_type(link_arg_concrete_type(
+                                    &LinkArg::Const(c.clone()),
+                                ));
+                                prefix.push(materialize_const_result(var.clone(), &c));
+                                eff.push(var);
+                            }
                             // `support.py:723 Constant(obj, lltype.Signed)`.
                             // Only integer literals (`lltype.Signed`-tagged)
                             // reach this arm — `parse_literal_slot` panics
@@ -19148,7 +19128,8 @@ fn remap_value(
     resolve_alias(value, aliases)
 }
 
-/// `jtransform_opname::materialize` / `handle_builtin_call` `NormalizedArg::ConstInt`:
+/// `jtransform_opname::materialize` / `handle_builtin_call`
+/// `NormalizedArg::Constant` / `_do_builtin_call` Constant GCREF:
 /// a Constant occupying a Variable-only slot is a Const* that defines that
 /// variable. Called once at `do_rename(result, Constant)` so later
 /// Variable-only uses of `result` stay defined.
@@ -31505,6 +31486,125 @@ mod tests {
         transformed.graph.block(graph.startblock).operations.clone()
     }
 
+    /// `support.py builtin_func_for_spec` keys on `tuple(ll_args)`.
+    /// Two `gc_identityhash` llops whose operands have distinct pointer
+    /// lltypes produce two cache entries; repeating the same lltype
+    /// reuses the first.
+    #[test]
+    fn gc_identityhash_cache_keyed_on_operand_ptr_lltype() {
+        use crate::codewriter::support::BuiltinFuncSpecCacheKey;
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use majit_ir::value::Type;
+
+        let objectptr = OBJECTPTR.clone();
+        let gcref = GCREF.clone();
+        assert_ne!(objectptr, gcref);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments(["_ll_1_gc_identityhash"]),
+            0x18405,
+        );
+
+        let mut graph = FunctionGraph::new("gc_identityhash_lltypes");
+        let p_object = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p_object".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        p_object.set_concretetype(Some(objectptr.clone()));
+        let p_gcref = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p_gcref".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        p_gcref.set_concretetype(Some(gcref.clone()));
+        let r1 = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::LoweredBlackholeOp {
+                    opname: "gc_identityhash".to_string(),
+                    args: crate::model::call_args(vec![p_object.clone()]),
+                },
+                true,
+            )
+            .unwrap();
+        let r2 = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::LoweredBlackholeOp {
+                    opname: "gc_identityhash".to_string(),
+                    args: crate::model::call_args(vec![p_gcref.clone()]),
+                },
+                true,
+            )
+            .unwrap();
+        let r3 = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::LoweredBlackholeOp {
+                    opname: "gc_identityhash".to_string(),
+                    args: crate::model::call_args(vec![p_object]),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(r3.clone()));
+        FunctionGraph::set_concretetype_of_inline(&r1, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&r2, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&r3, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let _transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let key_object = BuiltinFuncSpecCacheKey {
+            oopspec_name: "gc_identityhash".to_string(),
+            ll_args: vec![Type::Ref],
+            ll_res: Type::Int,
+            extrakey: None,
+            ll_arg_lltypes: vec![objectptr],
+        };
+        let key_gcref = BuiltinFuncSpecCacheKey {
+            oopspec_name: "gc_identityhash".to_string(),
+            ll_args: vec![Type::Ref],
+            ll_res: Type::Int,
+            extrakey: None,
+            ll_arg_lltypes: vec![gcref],
+        };
+        assert_ne!(key_object, key_gcref);
+        let spec_object = cc
+            .lookup_builtin_func_for_spec_cache(&key_object)
+            .expect("OBJECTPTR gc_identityhash cache entry");
+        let spec_gcref = cc
+            .lookup_builtin_func_for_spec_cache(&key_gcref)
+            .expect("GCREF gc_identityhash cache entry");
+        assert_ne!(spec_object.impl_name, spec_gcref.impl_name);
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments(["_ll_1_gc_identityhash"]),
+            0x9999,
+        );
+        let spec_object_again = cc
+            .lookup_builtin_func_for_spec_cache(&key_object)
+            .expect("OBJECTPTR entry reused for the third llop");
+        assert_eq!(spec_object_again.fnaddr, spec_object.fnaddr);
+        assert_eq!(spec_object_again.impl_name, spec_object.impl_name);
+    }
+
     /// `get_identityhash_oopspec` returns `op.args`, including a Constant
     /// GCREF. `_do_builtin_call` counts that operand so the helper is
     /// `_ll_1_gc_identityhash`.
@@ -31586,6 +31686,10 @@ mod tests {
     fn gc_identityhash_lowers_to_elidable_residual_call() {
         let mut cc = crate::call::CallControl::new();
         cc.find_all_graphs_for_tests();
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments(["_ll_1_gc_identityhash"]),
+            0x18401,
+        );
 
         let mut graph = FunctionGraph::new("gc_identityhash_body");
         let operand = graph
@@ -31602,10 +31706,9 @@ mod tests {
         let result_var = graph
             .push_op_var(
                 graph.startblock,
-                OpKind::UnaryOp {
-                    op: "gc_identityhash".to_string(),
-                    operand: operand.clone(),
-                    result_ty: ValueType::Int,
+                OpKind::LoweredBlackholeOp {
+                    opname: "gc_identityhash".to_string(),
+                    args: crate::model::call_args(vec![operand.clone()]),
                 },
                 true,
             )
@@ -31621,7 +31724,7 @@ mod tests {
         let ops = &transformed.graph.block(graph.startblock).operations;
         assert!(
             !ops.iter().any(|op| {
-                matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "gc_identityhash")
+                matches!(&op.kind, OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_identityhash")
             }),
             "bare gc_identityhash must not survive: {ops:?}"
         );
@@ -31647,13 +31750,22 @@ mod tests {
         assert!(args_i.is_empty(), "args_i must be empty: {ops:?}");
         assert_eq!(args_r, &vec![operand]);
         assert_eq!(result_kind, 'i');
+        assert!(
+            descriptor.extra_info.check_is_elidable(),
+            "support.py _ll_1_gc_identityhash is @elidable: {descriptor:?}"
+        );
         assert_eq!(
             descriptor.extra_info.extraeffect,
-            ExtraEffect::ElidableCannotRaise
+            ExtraEffect::ElidableOrMemoryError,
+            "call.py _canraise of support.py _ll_1_gc_identityhash is mem: {descriptor:?}"
         );
         assert!(
-            !ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
-            "ElidableCannotRaise must not append a trailing -live-: {ops:?}"
+            descriptor.extra_info.can_collect,
+            "lloperation.py gc_identityhash canmallocgc: {descriptor:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
+            "residual that can raise is followed by -live-: {ops:?}"
         );
     }
 

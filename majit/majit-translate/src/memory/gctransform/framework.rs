@@ -489,9 +489,10 @@ const NONCOLLECTING_GC_OPS: &[&str] = &[
 /// `FnPtrCell` whose production body is installed by
 /// `install_pyre_object_hooks` (plus `register_maybe_finalizer_hook` and
 /// `register_stale_array_holder_hook`), so the trampoline is a one-element
-/// family rather than an unknown fn-pointer. `gc_identity_hash` joins through
-/// its trampoline; collection is the `lloperation.py` `gc_identityhash`
-/// `canmallocgc=True` seed on `gc_id_or_identityhash`.
+/// family rather than an unknown fn-pointer. MiniMark `id` / `identityhash`
+/// join through the trampoline; collection is the `lloperation.py`
+/// `gc_identityhash` / `gc_id` `canmallocgc=True` seed on
+/// `gc_id_or_identityhash`.
 pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
     (
         "gc_hook::try_gc_alloc",
@@ -585,7 +586,15 @@ pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
         &["eval::pyre_object_gc_owns_object_trampoline"],
     ),
     (
-        "gc_hook::gc_identity_hash",
+        "gc_hook::gc_id",
+        &["eval::pyre_object_gc_identity_hash_trampoline"],
+    ),
+    (
+        "gc_hook::gc_identityhash",
+        &["eval::pyre_object_gc_identity_hash_trampoline"],
+    ),
+    (
+        "gc_hook::id_or_identityhash",
         &["eval::pyre_object_gc_identity_hash_trampoline"],
     ),
     (
@@ -3788,7 +3797,7 @@ mod tests {
         });
         let wrapper = serde_json::json!({
             "def_id": 0,
-            "item_meta": item_meta(&["gc_hook", "gc_identity_hash"]),
+            "item_meta": item_meta(&["gc_hook", "gc_identityhash"]),
             "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
             "body": {"Unstructured": {
                 "span": span.clone(),

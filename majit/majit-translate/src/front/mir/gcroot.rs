@@ -1138,12 +1138,14 @@ pub(in crate::front::mir) fn gc_root_pin_path(name: &str) -> bool {
     (last == Some("pin_root") || last == Some("pin_roots")) && segments.contains(&"gc_roots")
 }
 
-/// `gc_hook::gc_identity_hash` (`framework.py` `gct_gc_identityhash`).
-/// The unique graph's `usize` slot is `r_uint`; callers that pass Signed
+/// `gc_hook::gc_identityhash` / `gc_hook::gc_id`, MiniMark `identityhash`
+/// / `id` (`framework.py` `gct_gc_identityhash` / `gct_gc_id`). The unique
+/// graph's `usize` slot is `r_uint`; callers that pass Signed
 /// (`cast_ptr_to_int`) must retype before `mergeinputargs`.
-pub(in crate::front::mir) fn gc_identity_hash_path(name: &str) -> bool {
+pub(in crate::front::mir) fn gc_identity_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&"gc_identity_hash") && segments.contains(&"gc_hook")
+    segments.contains(&"gc_hook")
+        && matches!(segments.last().copied(), Some("gc_identityhash" | "gc_id"))
 }
 
 /// The root-bracket guard type and the call that closes one.

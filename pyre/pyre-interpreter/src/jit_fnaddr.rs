@@ -6531,12 +6531,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "_ll_1_int_abs",
         crate::objspace::descroperation::_ll_1_int_abs,
     );
-    cpa1!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::_ll_1_gc_identityhash",
-        "_ll_1_gc_identityhash",
-        crate::objspace::descroperation::_ll_1_gc_identityhash,
-    );
     cpa2!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::_ll_2_int_floordiv",
@@ -6552,7 +6546,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `support.py` `_ll_1_gc_identityhash` / `_ll_1_gc_id`: residual
     // targets of `jtransform.py rewrite_op_gc_identityhash` /
     // `rewrite_op_gc_id` (`_do_builtin_call`). Body is
-    // `gc_hook::gc_identity_hash` (`lltype.identityhash` / `llop.gc_id`).
+    // `gc_hook::gc_identityhash` / `gc_hook::gc_id` (`lltype.identityhash` / `llop.gc_id`).
     // Without these the codewriter falls back to `symbolic_fnaddr_for_path`.
     cpa1!(
         &mut entries,

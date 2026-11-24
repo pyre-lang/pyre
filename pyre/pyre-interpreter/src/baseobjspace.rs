@@ -6571,7 +6571,7 @@ pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
 pub fn id(mut w_obj: PyObjectRef) -> PyObjectRef {
     match pyre_object::with_roots!(w_obj => crate::function::immutable_unique_id(w_obj)) {
         Some(w_id) => w_id,
-        None => w_int_new(pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64),
+        None => w_int_new(pyre_object::gc_hook::gc_id(w_obj as usize) as i64),
     }
 }
 

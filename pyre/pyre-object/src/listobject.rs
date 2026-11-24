@@ -3049,8 +3049,8 @@ unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
     if !crate::objlock::stripes_taken() {
         return (w_list_lock(a), w_list_lock(b));
     }
-    let a_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(a) as usize);
-    let b_key = crate::gc_hook::gc_identity_hash(crate::mapdict::instance_getclass(b) as usize);
+    let a_key = crate::gc_hook::gc_id(crate::mapdict::instance_getclass(a) as usize);
+    let b_key = crate::gc_hook::gc_id(crate::mapdict::instance_getclass(b) as usize);
     let a_index = crate::objlock::stripe_index(a_key);
     let b_index = crate::objlock::stripe_index(b_key);
     if a_index == b_index {
