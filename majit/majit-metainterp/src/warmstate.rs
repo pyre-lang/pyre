@@ -2232,18 +2232,6 @@ impl WarmEnterState {
             .is_some_and(|cell| cell.flags.get().contains(JcFlags::JC_FORCE_FINISH))
     }
 
-    /// Typed form of [`Self::should_force_finish_tracing`].
-    ///
-    /// `mark_force_finish_tracing_for_key` writes `JC_FORCE_FINISH` through
-    /// `ensure_jit_cell_at_key` (`warmstate.py`). `bound_reached` then reads
-    /// that same cell (`bool(cell.flags.get() & JC_FORCE_FINISH)`). A hash
-    /// read of the bucket head misses when the bucket holds more than one
-    /// owner.
-    pub fn should_force_finish_tracing_for_key(&self, pin: &GreenRefPin, live: &GreenKey) -> bool {
-        self.lookup_chain_with_key(pin, live)
-            .is_some_and(|cell| cell.flags.get().contains(JcFlags::JC_FORCE_FINISH))
-    }
-
     /// Boost the current loop/function green key so the next execution
     /// immediately retriggers tracing.
     ///
