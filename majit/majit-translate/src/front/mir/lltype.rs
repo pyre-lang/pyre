@@ -6370,6 +6370,11 @@ pub(crate) const W_ROOT_CLASS_ROOT: &str = "pyobject::PyObject";
 /// Class identity of `pyre_object::dictmultiobject::ObjectKey`.
 pub(crate) const OBJECT_KEY_CLASS_ROOT: &str = "dictmultiobject::ObjectKey";
 
+/// Leaf of [`W_ROOT_CLASS_ROOT`] (`PyObject` / `pyobject::PyObject`).
+pub(crate) fn is_w_root_class_root(root: &str) -> bool {
+    root.rsplit("::").next().unwrap_or(root) == "PyObject"
+}
+
 /// Exact class-root spellings of the rstr `STR` / WTF-8 string family.
 ///
 /// `class_identity_spelling` of the declarations:
@@ -17555,6 +17560,14 @@ fn field_row_lltype(
         // that STR, not a W_Root.
         if is_str_family_class_root(pointee) || is_rstr_str_layout_declaration(pointee) {
             return Some(crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone());
+        }
+        // `*mut PyObject` is OBJECTPTR (`rclass.py`) even when PyObject
+        // is declared GC. Declared-GC-first would seed GCREF, and
+        // `SomePtr.getattr` of `DICTENTRY.value` (`get_ll_dict`) would
+        // stay SomePtr, which cannot union with
+        // `project_struct_field_type` Instance(PyObject).
+        if is_w_root_class_root(pointee) {
+            return Some(OBJECTPTR.clone());
         }
         if spelling_is_declared_gc(&reg.gc_struct_ids, pointee) {
             return Some((*GCREF).clone());

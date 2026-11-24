@@ -137,7 +137,10 @@ impl Default for PyObject {
     /// Null header — `Self::allocate` rewrites both fields at malloc time.
     #[inline]
     fn default() -> Self {
-        Self::EMPTY
+        Self {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        }
     }
 }
 

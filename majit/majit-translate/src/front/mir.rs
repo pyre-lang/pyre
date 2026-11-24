@@ -9767,8 +9767,8 @@ pub use self::gcroot::{
 };
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
-    adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
-    charon_literal_to_ast_string, charon_type_value_to_ast_string,
+    W_ROOT_CLASS_ROOT, adt_head_instantiation_suffix, cached_global_marker_str,
+    charon_array_len_to_string, charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     entry_family_is_entry_path, entry_family_name_path, fixed_array_index_identity,
     fnptr_indirect_enabled, gcarray_item_struct_ptr_annotation, gcarray_item_struct_ptr_lltype,

@@ -22,7 +22,9 @@
 //! `lltypesystem/lltype.rs` and is re-exported from `annotator/model.rs`
 //! so the `SomeValue::Ptr` variant keeps using the annotator-model path.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::lltypesystem::lltype;
 use crate::annotator::argument::ArgumentsForTranslation;
@@ -277,7 +279,10 @@ impl SomePtr {
                     return Ok(carray_item_field_annotation(field_t));
                 }
                 match example.getattr(attr) {
-                    Ok(v) => Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v))),
+                    Ok(v) => Ok(annotation_of_exposed_struct_field(
+                        struct_ptr_field_lltype(&self.ll_ptrtype, attr).as_ref(),
+                        ll_to_annotation(v),
+                    )),
                     // A raw-pointer `p.is_null()` whose receiver keeps its
                     // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
                     // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
@@ -389,10 +394,11 @@ impl SomePtr {
         match example.getattr(attr) {
             Ok(v) => {
                 if v != lltype::LowLevelValue::Void {
-                    let v_lltype = annotation_to_lltype(s_value, None)?;
-                    example
-                        .setattr(attr, v_lltype._defl())
-                        .map_err(AnnotatorError::new)?;
+                    let val = setattr_llvalue_for_ptr_field(
+                        struct_ptr_field_lltype(&self.ll_ptrtype, attr).as_ref(),
+                        s_value,
+                    )?;
+                    example.setattr(attr, val).map_err(AnnotatorError::new)?;
                 }
                 Ok(SomeValue::Impossible)
             }
@@ -411,12 +417,33 @@ impl SomePtr {
 /// nullable SomeString, a registered class-root `Ptr(GcStruct)` is the
 /// nullable instance. `llannotation.py` `lltype_to_annotation` of `Ptr`
 /// is SomePtr; the conversion is the same Rust adaptation as
-/// [`gc_class_root_ptr_as_instance`].
+/// [`gc_class_root_ptr_as_instance`]. A by-value nested Struct field is
+/// converted by [`annotation_of_exposed_struct_field`] before this
+/// (the `Ptr(Struct)` / InteriorPtr `_ptr._expose` of that field).
 fn highlevel_of_ptr_field_annotation(s: SomeValue) -> SomeValue {
     if let Some(s_str) = strptr_as_somestring(&s) {
         return s_str;
     }
-    gc_class_root_ptr_as_instance(&s).unwrap_or(s)
+    gc_class_root_ptr_as_instance(&s)
+        .or_else(|| objectptr_as_w_root_instance(&s))
+        .unwrap_or(s)
+}
+
+/// Field getattr whose harvested lltype is a by-value nested Struct
+/// (`_ptr._expose` of `DICTENTRY.key` in `get_ll_dict` is `Ptr(Struct)`
+/// / InteriorPtr) reads as that struct's Instance via
+/// [`nested_struct_ptr_as_instance`]. Other field spellings use
+/// [`highlevel_of_ptr_field_annotation`].
+fn annotation_of_exposed_struct_field(
+    field_t: Option<&lltype::LowLevelType>,
+    s: SomeValue,
+) -> SomeValue {
+    if field_t.is_some_and(|t| matches!(t, lltype::LowLevelType::Struct(_))) {
+        if let Some(inst) = nested_struct_ptr_as_instance(&s) {
+            return inst;
+        }
+    }
+    highlevel_of_ptr_field_annotation(s)
 }
 
 /// A field whose lltype is `rstr.STRPTR` (`Ptr(GcStruct('rpy_string'))`)
@@ -482,6 +509,107 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
     )))
 }
 
+/// `rclass.py` `OBJECTPTR = Ptr(OBJECT)`. A field whose harvested lltype
+/// is that word (`DICTENTRY.value: *mut PyObject`, `get_ll_dict`) reads
+/// as nullable `SomeInstance` of [`crate::front::mir::W_ROOT_CLASS_ROOT`],
+/// the annotation `project_struct_field_type` gives the same spelling.
+fn objectptr_as_w_root_instance(s: &SomeValue) -> Option<SomeValue> {
+    let SomeValue::Ptr(p) = s else {
+        return None;
+    };
+    let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
+    if ty != *crate::translator::rtyper::rclass::OBJECTPTR {
+        return None;
+    }
+    instance_of_struct_root(crate::front::mir::W_ROOT_CLASS_ROOT)
+}
+
+/// `_ptr._expose` of a by-value nested Struct field (`DICTENTRY.key` in
+/// `get_ll_dict`) is `Ptr(Struct)` / InteriorPtr. That read is the
+/// struct's Instance when the name is in the bookkeeper `struct_fields`
+/// registry and `getuniqueclassdef_for_struct_root` succeeds — the same
+/// two conditions as [`gc_class_root_ptr_as_instance`], without
+/// `_gckind == Gc`. A pointer-to-struct field stays a pointer; only a
+/// by-value nested Struct field reaches here
+/// ([`annotation_of_exposed_struct_field`]).
+fn nested_struct_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
+    let name = nested_struct_ptr_root_name(s)?;
+    instance_of_registered_struct_root(name)
+}
+
+fn nested_struct_ptr_root_name(s: &SomeValue) -> Option<&str> {
+    match s {
+        SomeValue::Ptr(p) => match &p.ll_ptrtype.TO {
+            lltype::PtrTarget::Struct(st) => Some(st._name.as_str()),
+            _ => None,
+        },
+        SomeValue::InteriorPtr(ip) => match ip.ll_ptrtype.TO.as_ref() {
+            lltype::LowLevelType::Struct(st) => Some(st._name.as_str()),
+            lltype::LowLevelType::Ptr(p) => match &p.TO {
+                lltype::PtrTarget::Struct(st) => Some(st._name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn registered_struct_classdef(
+    name: &str,
+) -> Option<Rc<RefCell<crate::annotator::classdesc::ClassDef>>> {
+    let bk = bookkeeper::getbookkeeper()?;
+    let registered = bk
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .is_some_and(|reg| reg.fields.contains_key(name));
+    if !registered {
+        return None;
+    }
+    bk.getuniqueclassdef_for_struct_root(name).ok()
+}
+
+fn instance_of_registered_struct_root(name: &str) -> Option<SomeValue> {
+    let classdef = registered_struct_classdef(name)?;
+    Some(SomeValue::Instance(SomeInstance::new(
+        Some(classdef),
+        true,
+        std::collections::BTreeMap::new(),
+    )))
+}
+
+fn instance_of_struct_root(root: &str) -> Option<SomeValue> {
+    let bk = bookkeeper::getbookkeeper()?;
+    let classdef = bk.getuniqueclassdef_for_struct_root(root).ok()?;
+    Some(SomeValue::Instance(SomeInstance::new(
+        Some(classdef),
+        true,
+        std::collections::BTreeMap::new(),
+    )))
+}
+
+fn struct_ptr_field_lltype(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowLevelType> {
+    match &ptr.TO {
+        lltype::PtrTarget::Struct(st) => st.getattr_field_type(attr),
+        lltype::PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(lltype::LowLevelType::Struct(st)) => st.getattr_field_type(attr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn interior_ptr_field_lltype(
+    ptr: &lltype::InteriorPtr,
+    attr: &str,
+) -> Option<lltype::LowLevelType> {
+    match ptr.TO.as_ref() {
+        lltype::LowLevelType::Struct(st) => st.getattr_field_type(attr),
+        _ => None,
+    }
+}
+
 /// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
 /// `direct_ptradd` stamps the array wrapper so `rewrite_op_direct_ptradd`
 /// can scale `TO.OF`; field getattr/setattr reads that item layout.
@@ -512,6 +640,18 @@ fn carray_item_field_annotation(field_t: lltype::LowLevelType) -> SomeValue {
             std::collections::BTreeMap::new(),
         ));
     }
+    if let lltype::LowLevelType::Struct(st) = &field_t {
+        let s = SomeValue::Ptr(SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(st.as_ref().clone()),
+        }));
+        if let Some(inst) = nested_struct_ptr_as_instance(&s) {
+            return inst;
+        }
+    }
+    if field_t == *crate::translator::rtyper::rclass::OBJECTPTR {
+        let s = lltype_to_annotation(field_t);
+        return objectptr_as_w_root_instance(&s).unwrap_or(s);
+    }
     lltype_to_annotation(field_t)
 }
 
@@ -531,6 +671,78 @@ fn carray_item_struct_field<'a>(
     Some((st, field_t))
 }
 
+/// Store of `SomeInstance` into a by-value nested Struct field when the
+/// Instance's classdef is the classdef of that struct root (`Rc::ptr_eq`,
+/// the same intern [`gc_class_root_ptr_as_instance`] uses). Motivating
+/// store: `DICTENTRY.key` (`get_ll_dict`).
+fn nested_struct_field_accepts_instance(
+    field_t: &lltype::LowLevelType,
+    s_value: &SomeValue,
+) -> bool {
+    let SomeValue::Instance(inst) = s_value else {
+        return false;
+    };
+    let lltype::LowLevelType::Struct(st) = field_t else {
+        return false;
+    };
+    let Some(classdef) = registered_struct_classdef(&st._name) else {
+        return false;
+    };
+    inst.classdef
+        .as_ref()
+        .is_some_and(|cd| Rc::ptr_eq(cd, &classdef))
+}
+
+/// Store of `SomeInstance` into `rclass.OBJECTPTR` when the Instance's
+/// classdef is the W_Root class-root or a subclass of it
+/// (`ClassDef.getmro` identity). Any other Instance is left to
+/// `annotation_to_lltype`, which is the error `SomePtr.setattr`
+/// (`lltype.py`) raised before the OBJECTPTR Instance store.
+fn objectptr_field_accepts_instance(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
+    if *field_t != *crate::translator::rtyper::rclass::OBJECTPTR {
+        return false;
+    }
+    let SomeValue::Instance(inst) = s_value else {
+        return false;
+    };
+    let Some(classdef) = inst.classdef.as_ref() else {
+        return false;
+    };
+    let Some(root) = bookkeeper::getbookkeeper().and_then(|bk| {
+        bk.getuniqueclassdef_for_struct_root(crate::front::mir::W_ROOT_CLASS_ROOT)
+            .ok()
+    }) else {
+        return false;
+    };
+    crate::annotator::classdesc::ClassDef::getmro(classdef)
+        .iter()
+        .any(|cd| Rc::ptr_eq(cd, &root))
+}
+
+/// `SomePtr.setattr` / `SomeInteriorPtr.setattr` (`lltype.py`): an
+/// Instance is accepted only when the field's lltype is exactly what
+/// that Instance's class lowers to ([`objectptr_field_accepts_instance`]
+/// or [`nested_struct_field_accepts_instance`]). The example store uses
+/// the field's own `_defl()`, so the `_ptr.__setattr__` type check still
+/// runs. Other values convert through `annotation_to_lltype` then
+/// `_defl()`, the same sequence as upstream.
+fn ptr_field_accepts_instance(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
+    objectptr_field_accepts_instance(field_t, s_value)
+        || nested_struct_field_accepts_instance(field_t, s_value)
+}
+
+fn setattr_llvalue_for_ptr_field(
+    field_t: Option<&lltype::LowLevelType>,
+    s_value: &SomeValue,
+) -> Result<lltype::LowLevelValue, AnnotatorError> {
+    if let Some(field_t) = field_t {
+        if ptr_field_accepts_instance(field_t, s_value) {
+            return Ok(field_t._defl());
+        }
+    }
+    Ok(annotation_to_lltype(s_value, None)?._defl())
+}
+
 /// `InstanceRepr.lowleveltype` is `Ptr(GcStruct)`. A store of
 /// `SomeInstance` into an item-struct pointer or Address field is that word.
 fn carray_item_struct_field_accepts(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
@@ -543,6 +755,7 @@ fn carray_item_struct_field_accepts(field_t: &lltype::LowLevelType, s_value: &So
         Err(_) if matches!(s_value, SomeValue::Instance(_)) && is_pointer_word_lltype(field_t) => {
             true
         }
+        Err(_) if nested_struct_field_accepts_instance(field_t, s_value) => true,
         _ => false,
     }
 }
@@ -699,7 +912,10 @@ impl SomeInteriorPtr {
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => {
                 let v = example.getattr(attr).map_err(AnnotatorError::new)?;
-                Ok(highlevel_of_ptr_field_annotation(ll_to_annotation(v)))
+                Ok(annotation_of_exposed_struct_field(
+                    interior_ptr_field_lltype(&self.ll_ptrtype, attr).as_ref(),
+                    ll_to_annotation(v),
+                ))
             }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
@@ -755,10 +971,11 @@ impl SomeInteriorPtr {
         };
         let mut example = self.ll_ptrtype._example();
         if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
-            let v_lltype = annotation_to_lltype(s_value, None)?;
-            example
-                .setattr(attr, v_lltype._defl())
-                .map_err(AnnotatorError::new)?;
+            let val = setattr_llvalue_for_ptr_field(
+                interior_ptr_field_lltype(&self.ll_ptrtype, attr).as_ref(),
+                s_value,
+            )?;
+            example.setattr(attr, val).map_err(AnnotatorError::new)?;
         }
         Ok(SomeValue::Impossible)
     }
@@ -1720,6 +1937,257 @@ mod tests {
         assert!(
             !matches!(value, SomeValue::String(_)),
             "interior OBJECTPTR value must not read as SomeString, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn someptr_getattr_object_key_nested_struct_is_instance() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "dictmultiobject::ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let _pos = bk.at_position(None);
+
+        let inner = lltype::Struct::new(
+            "dictmultiobject::ObjectKey",
+            vec![
+                ("hash".into(), lltype::LowLevelType::Signed),
+                ("obj".into(), lltype::LowLevelType::Signed),
+            ],
+        );
+        let entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("key".into(), lltype::LowLevelType::Struct(Box::new(inner)))],
+            )),
+        });
+        let attr =
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str("key")).unwrap();
+        let SomeValue::Instance(key) = entry.getattr(&attr).unwrap() else {
+            panic!("nested registered Struct field must read as Instance");
+        };
+        let root = bk
+            .getuniqueclassdef_for_struct_root("dictmultiobject::ObjectKey")
+            .unwrap();
+        assert!(
+            key.classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &root)),
+            "classdef of the registered struct root, got {:?}",
+            key.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+        );
+    }
+
+    fn const_field_attr(name: &str) -> SomeValue {
+        crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+    }
+
+    fn instance_of(
+        classdef: std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) -> SomeValue {
+        SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        ))
+    }
+
+    fn setattr_err_is_annotation_to_lltype(err: AnnotatorError) -> bool {
+        err.msg
+            .unwrap_or_default()
+            .contains("should return a low-level type")
+    }
+
+    #[test]
+    fn someptr_setattr_nested_struct_field_accepts_matching_instance() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "dictmultiobject::ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let _pos = bk.at_position(None);
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("dictmultiobject::ObjectKey")
+            .unwrap();
+
+        let inner = lltype::Struct::new(
+            "dictmultiobject::ObjectKey",
+            vec![
+                ("hash".into(), lltype::LowLevelType::Signed),
+                ("obj".into(), lltype::LowLevelType::Signed),
+            ],
+        );
+        let entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("key".into(), lltype::LowLevelType::Struct(Box::new(inner)))],
+            )),
+        });
+        let result = entry
+            .setattr(&const_field_attr("key"), &instance_of(classdef))
+            .expect("setattr of nested registered struct must accept matching Instance");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_setattr_nested_struct_field_rejects_wrong_classdef() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "dictmultiobject::ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "OtherNested".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let _pos = bk.at_position(None);
+        let wrong = bk.getuniqueclassdef_for_struct_root("OtherNested").unwrap();
+
+        let inner = lltype::Struct::new(
+            "dictmultiobject::ObjectKey",
+            vec![
+                ("hash".into(), lltype::LowLevelType::Signed),
+                ("obj".into(), lltype::LowLevelType::Signed),
+            ],
+        );
+        let entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("key".into(), lltype::LowLevelType::Struct(Box::new(inner)))],
+            )),
+        });
+        let err = entry
+            .setattr(&const_field_attr("key"), &instance_of(wrong))
+            .expect_err("wrong nested-struct classdef must be rejected");
+        assert!(
+            setattr_err_is_annotation_to_lltype(err),
+            "rejected Instance keeps the pre-RBX90 annotation_to_lltype error"
+        );
+    }
+
+    fn objectptr_entry_ptr() -> SomePtr {
+        SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![(
+                    "value".into(),
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                )],
+            )),
+        })
+    }
+
+    fn bookkeeper_with_w_root() -> (
+        std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
+        crate::annotator::bookkeeper::PositionGuard,
+        std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            crate::front::mir::W_ROOT_CLASS_ROOT.to_string(),
+            vec![("w_class".to_string(), "*mut PyObject".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let pos = bk.at_position(None);
+        let root = bk
+            .getuniqueclassdef_for_struct_root(crate::front::mir::W_ROOT_CLASS_ROOT)
+            .unwrap();
+        (bk, pos, root)
+    }
+
+    #[test]
+    fn someptr_setattr_objectptr_accepts_w_root_subclass() {
+        use std::rc::Rc;
+
+        let (bk, _pos, root) = bookkeeper_with_w_root();
+        let root_host = bk.intern_class_by_qualname(crate::front::mir::W_ROOT_CLASS_ROOT);
+        let sub_host = bk.intern_class_by_qualname_with_bases("WRootSubclass", vec![root_host]);
+        let subclass = bk.getuniqueclassdef(&sub_host).unwrap();
+        assert!(
+            crate::annotator::classdesc::ClassDef::getmro(&subclass)
+                .iter()
+                .any(|cd| Rc::ptr_eq(cd, &root)),
+            "test subclass must sit on the W_Root classdef MRO"
+        );
+
+        let result = objectptr_entry_ptr()
+            .setattr(&const_field_attr("value"), &instance_of(subclass))
+            .expect("OBJECTPTR setattr must accept a W_Root subclass Instance");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_setattr_objectptr_rejects_unrelated_class() {
+        let (bk, _pos, _root) = bookkeeper_with_w_root();
+        let unrelated_host = bk.intern_class_by_qualname_with_bases("UnrelatedClass", vec![]);
+        let unrelated = bk.getuniqueclassdef(&unrelated_host).unwrap();
+        let err = objectptr_entry_ptr()
+            .setattr(&const_field_attr("value"), &instance_of(unrelated))
+            .expect_err("unrelated class into OBJECTPTR must be rejected");
+        assert!(
+            setattr_err_is_annotation_to_lltype(err),
+            "rejected Instance keeps the pre-RBX90 annotation_to_lltype error"
+        );
+    }
+
+    #[test]
+    fn someptr_setattr_rejects_instance_into_gcref_and_signed() {
+        let (_bk, _pos, root) = bookkeeper_with_w_root();
+        let s_value = instance_of(root);
+        let gcref_entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::GCREF.clone())],
+            )),
+        });
+        let signed_entry = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::LowLevelType::Signed)],
+            )),
+        });
+        let gcref_err = gcref_entry
+            .setattr(&const_field_attr("value"), &s_value)
+            .expect_err("Instance into GCREF must be rejected");
+        let signed_err = signed_entry
+            .setattr(&const_field_attr("value"), &s_value)
+            .expect_err("Instance into Signed must be rejected");
+        assert!(
+            setattr_err_is_annotation_to_lltype(gcref_err),
+            "GCREF rejection keeps the pre-RBX90 annotation_to_lltype error"
+        );
+        assert!(
+            setattr_err_is_annotation_to_lltype(signed_err),
+            "Signed rejection keeps the pre-RBX90 annotation_to_lltype error"
         );
     }
 }
