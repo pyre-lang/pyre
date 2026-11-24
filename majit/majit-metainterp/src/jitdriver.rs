@@ -8835,8 +8835,9 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// `warmstate.py bound_reached` steps 4-5. `matched` is the cell the
-    /// one comparekey walk returned.
+    /// `warmstate.py bound_reached` steps 4-5. `matched` is `None` when no
+    /// door lookup ran; `Some` carries the door's one lookup (hit or known
+    /// miss).
     pub fn force_start_tracing_with_cell(
         &mut self,
         green_key: u64,
@@ -8845,7 +8846,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) {
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         majit_gc::ensure_type_registry_closed();
@@ -8935,7 +8936,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
-    /// `matched` is the cell the one comparekey walk returned.
+    /// `matched` is `None` when no door lookup ran; `Some` carries the
+    /// door's one lookup (hit or known miss).
     pub fn bound_reached_with_cell(
         &mut self,
         green_key: u64,
@@ -8943,7 +8945,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) {
         if self.meta.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key);
@@ -9060,7 +9062,7 @@ impl<S: JitState> JitDriver<S> {
                 None => ResolvedJitCell::miss(green_key),
             }
         };
-        let matched = resolved.cell.clone();
+        let matched = Some(resolved.clone());
         match self
             .meta
             .maybe_compile_and_run_step_on_driver(
@@ -9181,7 +9183,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> bool {
         if spdiag_enabled() {
             eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
@@ -10784,6 +10786,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
     ///
+    /// `increment_function_threshold == 0` ("jit is off") returns before the
+    /// lookup, as `maybe_compile_and_run` does.
+    ///
     /// `warmstate.py maybe_compile_and_run` is a closure over
     /// `jitcounter = self.warmrunnerdesc.jitcounter` and
     /// `confirm_enter_jit`; it does `cell = jitcounter.lookup_chain(hash)`
@@ -10812,6 +10817,13 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
         let _ = green_spec;
         let entry = &self.portal_entry;
+        if self
+            .meta
+            .warm_state_ref_for_driver(entry.jd_index)
+            .is_some_and(|warm| warm.function_entry_jit_is_off())
+        {
+            return None;
+        }
         if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
         }
@@ -11301,7 +11313,7 @@ impl<S: JitState> JitDriver<S> {
                 live.types.as_slice(),
             ),
         };
-        let matched = resolved.cell.clone();
+        let matched = Some(resolved.clone());
         let cell_key = resolved.cell_key().unwrap_or(resolved.hash);
         pin.reload(&mut live);
         let step = if already_ticked {
@@ -14892,6 +14904,54 @@ mod tests {
         assert!(
             found.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
             "resolved_cell_procedure_token(hash, Some(greens)) names the function-entry cell"
+        );
+    }
+
+    #[test]
+    fn compiled_function_token_declines_when_the_function_threshold_is_zero() {
+        // warmstate.py maybe_compile_and_run: `if increment_threshold == 0:
+        // return # jit is off`, before the cell lookup, even for a cell
+        // that holds compiled code.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut sd = JitDriverStaticData::new(vec![], vec![]);
+        sd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = driver.register_descriptor(sd);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = GreenKey::new(vec![0x7e15]);
+        let hash = key.get_uhash();
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token);
+        crate::warmstate::GreenRefPin::with(&key, |__p, __l| {
+            driver
+                .meta
+                .warm_state_for_driver(idx)
+                .attach_procedure_to_interp_for_key(__p, __l, std::sync::Arc::clone(&token))
+        });
+        assert!(
+            driver
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
+                .is_some(),
+            "the compiled cell is found while the JIT is on"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_function_threshold(0);
+        assert!(
+            driver
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
+                .is_none(),
+            "function_threshold 0 is `jit is off`: no compiled entry"
         );
     }
 

@@ -6941,7 +6941,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `warmstate.py bound_reached` steps 4-5 plus the MetaInterp constructor
-    /// half. `matched` is the cell the one comparekey walk returned.
+    /// half. `matched` is `None` when no door lookup ran; `Some` carries the
+    /// door's one lookup (hit or known miss).
     pub fn force_start_tracing_cell(
         &mut self,
         green_key: u64,
@@ -6950,7 +6951,7 @@ impl<M: Clone> MetaInterp<M> {
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> BackEdgeAction {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
@@ -7179,7 +7180,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
-    /// `matched` is the cell the one comparekey walk returned.
+    /// `matched` is `None` when no door lookup ran; `Some` carries the
+    /// door's one lookup (hit or known miss).
     pub fn bound_reached_cell(
         &mut self,
         green_key: u64,
@@ -7188,7 +7190,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> BackEdgeAction {
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
@@ -7265,8 +7267,8 @@ impl<M: Clone> MetaInterp<M> {
     /// Commit a `StartTracing` answer from
     /// [`Self::maybe_compile_and_run_step_on_driver`] and consume the expensive tracing
     /// arguments. The caller ran [`Self::bound_reached_prelude`]; this is
-    /// steps 4-5 plus `setup_tracing`. `matched` is the cell that decision
-    /// walked.
+    /// steps 4-5 plus `setup_tracing`. `matched` is `None` when no door
+    /// lookup ran; `Some` carries the door's one lookup (hit or known miss).
     pub(crate) fn start_back_edge_trace(
         &mut self,
         green_key: u64,
@@ -7275,7 +7277,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> BackEdgeAction {
         self.bound_reached_cell(
             green_key,
@@ -7330,7 +7332,7 @@ impl<M: Clone> MetaInterp<M> {
                 None => crate::warmstate::ResolvedJitCell::miss(green_key),
             },
         };
-        let matched = resolved.cell.clone();
+        let matched = Some(resolved.clone());
         match self
             .maybe_compile_and_run_step_on_driver(
                 jd_no,
@@ -7480,17 +7482,18 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Keep `matched` when the door already walked; otherwise one
+    /// `Some` is the door's one lookup (hit or known miss) and is never
+    /// searched again. `None` means no door lookup ran, so one
     /// `JitCell.get_jitcell` / `lookup_chain` walk.
     fn matched_or_resolve(
         &self,
         jd_no: usize,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
         pin: &crate::warmstate::GreenRefPin,
         live: &mut majit_ir::GreenKey,
     ) -> Option<std::rc::Rc<crate::warmstate::BaseJitCell>> {
         match matched {
-            Some(cell) => Some(cell),
+            Some(resolved) => resolved.cell,
             None => {
                 pin.reload(live);
                 let hash = live.get_uhash();
@@ -7514,7 +7517,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         code_slot: usize,
         target_pc: usize,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> (
         Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
         majit_ir::GreenKey,
@@ -7549,7 +7552,7 @@ impl<M: Clone> MetaInterp<M> {
                 };
                 let has_greenargs = !live.types.is_empty();
                 let matched = match matched {
-                    Some(cell) => Some(cell),
+                    Some(resolved) => resolved.cell,
                     None if has_greenargs => {
                         let pin = crate::warmstate::GreenRefPin::pin_one(0);
                         let mut resolved_live = pin.live_clone(&live);
@@ -24694,6 +24697,64 @@ mod metainterp_static_data_tests {
             meta.starting_green_key(),
             Some(marked),
             "the trace is keyed on the cell force_start_tracing marked"
+        );
+    }
+
+    #[test]
+    fn force_start_tracing_cell_with_a_resolved_miss_installs_a_new_cell() {
+        use crate::BackEdgeAction;
+        // `warmstate.py bound_reached`: a door miss (`cell is None`) builds
+        // `JitCell(*greenargs)` and installs it; it does not walk the chain
+        // again. A known miss must not mark a cell already in that bucket.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let key = gk(0xA155);
+        crate::warmstate::GreenRefPin::with(&key, |__p, __l| {
+            meta.warm_state_for_driver(0).ensure_cell_for_key(__p, __l)
+        });
+        let installed = crate::warmstate::GreenRefPin::with(&key, |__p, __l| {
+            meta.warm_state_for_driver(0)
+                .lookup_chain_with_key(__p, __l)
+        })
+        .expect("ensure_cell_for_key installed a cell");
+        let hash = key.get_uhash();
+        let action = {
+            let _zbh_pin = crate::warmstate::GreenRefPin::pin_slices(&key.values, &key.types);
+            meta.force_start_tracing_cell(
+                hash,
+                _zbh_pin.save(),
+                0,
+                Some((&key.values, &key.types)),
+                None,
+                &[],
+                Some(crate::warmstate::ResolvedJitCell { cell: None, hash }),
+            )
+        };
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert!(
+            !installed
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TRACING),
+            "a known miss must not mark the previously installed cell"
+        );
+        let marked = meta
+            .starting_green_key()
+            .expect("force_start_tracing_cell marked a cell");
+        let new_cell = meta
+            .warm_state_for_driver(0)
+            .cell_by_key(marked)
+            .expect("the marked key names a cell");
+        assert!(
+            new_cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TRACING),
+            "the tracing cell is the one bound_reached just installed"
+        );
+        assert!(
+            !std::rc::Rc::ptr_eq(&new_cell, &installed),
+            "the tracing cell is a new cell"
         );
     }
 
