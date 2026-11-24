@@ -1120,6 +1120,42 @@ pub fn get_gcid_oopspec(op: &SpaceOperation) -> (String, Vec<NormalizedArg>) {
     ("gc_id".to_string(), spaceop_args_as_normalized(op))
 }
 
+/// MixLevelHelperAnnotator.constfunc of `support.py` `_ll_1_gc_identityhash`
+/// / `_ll_1_gc_id`. The helper body is the single llop
+/// (`lltype.identityhash` / `llop.gc_id`). `canraise.py`
+/// `RaiseAnalyzer.analyze_simple_operation` reads
+/// `LL_OPERATIONS[op.opname].canraise`; `lloperation.py` `LLOp` with
+/// `canmallocgc=True` adds `(MemoryError,)`, so `call.py` `_canraise`
+/// answers `"mem"`.
+pub fn gc_identity_helper_graph(helper_name: &str, llop: &str) -> FunctionGraph {
+    let mut graph = FunctionGraph::new(helper_name).with_source_identity(helper_name);
+    let x = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .expect("support.py _ll_1_gc_identityhash / _ll_1_gc_id takes one pointer");
+    FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+    let result = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::LoweredBlackholeOp {
+                opname: llop.to_string(),
+                args: crate::model::call_args(vec![x]),
+            },
+            true,
+        )
+        .expect("support.py _ll_1_gc_identityhash / _ll_1_gc_id returns the llop result");
+    FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+    graph.set_return(graph.startblock, Some(result));
+    graph
+}
+
 /// `op.args` for a lowered llop (`OpKind::LoweredBlackholeOp`).
 ///
 /// `support.py get_identityhash_oopspec` / `get_gcid_oopspec` return

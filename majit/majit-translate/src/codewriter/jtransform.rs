@@ -5223,6 +5223,17 @@ impl<'a> Transformer<'a> {
                 "Transformer._do_builtin_call: CallControl is required \
                  (support.py builtin_func_for_spec / setup_extra_builtin)",
             );
+            // MixLevelHelperAnnotator.constfunc of `support.py`
+            // `_ll_1_gc_identityhash` / `_ll_1_gc_id`: the helper graph
+            // is the single `canmallocgc` llop, so `canraise.py`
+            // `RaiseAnalyzer` / `call.py` `_canraise` answer `"mem"`.
+            cc.register_function_graph(
+                helper_path.clone(),
+                crate::codewriter::support::gc_identity_helper_graph(
+                    helper_leaf.as_str(),
+                    oopspec_name.as_str(),
+                ),
+            );
             // `support.py _ll_1_gc_identityhash` is `@elidable`.
             // `_ll_1_gc_id` is not (`id(const)` must not fold).
             if oopspec_name == "gc_identityhash" {
@@ -31417,6 +31428,11 @@ mod tests {
             descriptor.extra_info.check_is_elidable(),
             "support.py _ll_1_gc_identityhash is @elidable: {descriptor:?}"
         );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableOrMemoryError,
+            "call.py _canraise of support.py _ll_1_gc_identityhash is mem: {descriptor:?}"
+        );
         assert!(
             descriptor.extra_info.can_collect,
             "lloperation.py gc_identityhash canmallocgc: {descriptor:?}"
@@ -31444,6 +31460,11 @@ mod tests {
         assert!(
             !descriptor.extra_info.check_is_elidable(),
             "support.py _ll_1_gc_id is not @elidable: {descriptor:?}"
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::CanRaise,
+            "call.py _canraise of support.py _ll_1_gc_id is mem → EF_CAN_RAISE: {descriptor:?}"
         );
         assert!(
             descriptor.extra_info.can_collect,
@@ -31508,6 +31529,11 @@ mod tests {
             descriptor.extra_info.check_is_elidable(),
             "support.py _ll_1_gc_identityhash is @elidable: {descriptor:?}"
         );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableOrMemoryError,
+            "call.py _canraise of support.py _ll_1_gc_identityhash is mem: {descriptor:?}"
+        );
         assert!(
             descriptor.extra_info.can_collect,
             "lloperation.py gc_identityhash canmallocgc: {descriptor:?}"
@@ -31540,6 +31566,11 @@ mod tests {
         assert!(
             !descriptor.extra_info.check_is_elidable(),
             "support.py _ll_1_gc_id is not @elidable: {descriptor:?}"
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::CanRaise,
+            "call.py _canraise of support.py _ll_1_gc_id is mem → EF_CAN_RAISE: {descriptor:?}"
         );
         assert!(
             descriptor.extra_info.can_collect,
