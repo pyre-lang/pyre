@@ -54,6 +54,7 @@ pub struct GcVarSizeLayout {
 
 pub mod address_dict;
 pub mod collector;
+pub mod critical_section;
 pub mod gc_sync;
 pub mod gcreftracer;
 pub mod header;
