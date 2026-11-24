@@ -24664,6 +24664,144 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
     }
 }
 
+/// `Rvalue::Discriminant` of an `Option<Cow<str>>` field is `is None`
+/// of the getattr (`signature.py` `has_kwarg`). Integer tag-decode of a
+/// `SomeString` is a blocked block; jtransform loads the first word.
+#[test]
+fn option_cow_str_field_discriminant_is_none_test() {
+    use crate::model::{OpKind, ValueType, VecFieldPart};
+
+    let w = crate::layout::target_word_size() as u64;
+    let empty = window_empty_generics();
+    let str_adt = serde_json::json!({"Adt": {"id": 3, "generics": empty.clone()}});
+    let string_adt = serde_json::json!({"Adt": {"id": 2, "generics": empty.clone()}});
+    let cow_ty = named_adt(1, vec![str_adt.clone()]);
+    let option_ty = option_adt_node(0, cow_ty);
+    let holder_ty = serde_json::json!({"Adt": {"id": 4, "generics": empty.clone()}});
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let cow = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "borrow", "Cow"])),
+        "kind": {"Enum": [
+            {
+                "name": "Borrowed",
+                "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": {"Ref": ["Erased", str_adt, "Shared"]}
+                }],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Owned",
+                "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": string_adt
+                }],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    });
+    let string_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "string", "String"])),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "host",
+            "value": {
+                "size": w * 3,
+                "align": w,
+                "discriminator": {"Known": 0},
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let str_decl = serde_json::json!({
+        "def_id": 3,
+        "item_meta": fixture_item_meta(ident_path(&["core", "str", "str"])),
+        "kind": "Opaque",
+        "ptr_metadata": "Length"
+    });
+    let holder = interior_struct(
+        4,
+        &["fixture", "Holder"],
+        &[("name", option_ty.clone())],
+        w * 3,
+        &[0],
+        false,
+    );
+    let field_place = window_place(
+        serde_json::json!({
+            "Projection": [
+                window_place(serde_json::json!({"Local": 1}), &holder_ty),
+                {"Field": [null, 0]}
+            ]
+        }),
+        &option_ty,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "holder_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [holder_ty.clone()],
+            "output": disc_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &disc_ty),
+                window_local(1, &holder_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &disc_ty),
+                        {"Discriminant": field_place}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(
+        vec![option_enum(0), cow, string_decl, str_decl, holder],
+        vec![caller],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "holder_disc")
+        .unwrap_or_else(|err| panic!("lower Option<Cow<str>> field Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, ty: ValueType::Str, .. }
+                if field.vec_part == Some(VecFieldPart::HostNicheWord)
+        )),
+        "host-niche string-option Discriminant is getattr Str + HostNicheWord; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+        "host-niche string-option Discriminant is is None; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub")),
+        "annotator must not see integer sub of a SomeString getattr; graph={}",
+        graph.dump()
+    );
+}
+
 /// `Rvalue::Discriminant` of `Option<*mut GCREFOpaque>` is
 /// `bool(self)` (`lltype.py` `SomePtr.bool` / `ptr_nonzero`).
 /// `is_(SomePtr, ConstNone)` folds because `SomePtr.can_be_none` is

@@ -7464,6 +7464,19 @@ pub(crate) fn fielddescrof(
                 majit_ir::descr::ArrayFlag::Pointer,
                 ".vtable",
             ),
+            // Unsigned: `SimpleFieldDescr::is_field_signed` is
+            // `flag == Signed` (`descr.py`). The None word is
+            // `usize::MAX - 1`; a signed 4-byte load sign-extends
+            // `0xFFFF_FFFE` to i64 `-2`, which never equals
+            // `target_host_niche_none_word()` `4294967294` on wasm32.
+            // `layout.rs` `host_niche_none_word`. Type::Int still
+            // assembles `getfield_raw_i`.
+            crate::model::VecFieldPart::HostNicheWord => (
+                0,
+                majit_ir::value::Type::Int,
+                majit_ir::descr::ArrayFlag::Unsigned,
+                ".host_niche",
+            ),
         };
         offset = offset.saturating_add(add);
         field_size = word;
@@ -8450,21 +8463,23 @@ mod tests {
                     VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
                         ValueType::Ref(None)
                     }
-                    VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
-                        ValueType::Int
-                    }
+                    VecFieldPart::Len
+                    | VecFieldPart::FatLen
+                    | VecFieldPart::FatMeta
+                    | VecFieldPart::HostNicheWord => ValueType::Int,
                 },
                 Some(&cc),
                 true,
             );
-            let (offset, size, flag, name) = match descr {
+            let (offset, size, flag, signed, name) = match descr {
                 crate::jitcode::BhDescr::Field {
                     offset,
                     field_size,
                     field_flag,
+                    is_field_signed,
                     name,
                     ..
-                } => (offset, field_size, field_flag, name),
+                } => (offset, field_size, field_flag, is_field_signed, name),
                 other => panic!("expected field descr, got {other:?}"),
             };
             let fat = crate::fat_ptr_layout::probe();
@@ -8475,6 +8490,7 @@ mod tests {
                 VecFieldPart::FatLen | VecFieldPart::FatMeta | VecFieldPart::FatVtable => {
                     fat.len_offset
                 }
+                VecFieldPart::HostNicheWord => 0,
             };
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
@@ -8482,16 +8498,19 @@ mod tests {
                 VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
                     ArrayFlag::Pointer
                 }
-                VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
-                    ArrayFlag::Unsigned
-                }
+                VecFieldPart::Len
+                | VecFieldPart::FatLen
+                | VecFieldPart::FatMeta
+                | VecFieldPart::HostNicheWord => ArrayFlag::Unsigned,
             };
             assert_eq!(flag, expect_flag);
+            assert!(!signed, "{field} {part:?} must load unsigned");
             assert!(name.ends_with(match part {
                 VecFieldPart::Buf => ".buf",
                 VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => ".len",
                 VecFieldPart::FatData => ".data",
                 VecFieldPart::FatVtable => ".vtable",
+                VecFieldPart::HostNicheWord => ".host_niche",
             }));
             if matches!(part, VecFieldPart::Buf | VecFieldPart::FatData) {
                 assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));

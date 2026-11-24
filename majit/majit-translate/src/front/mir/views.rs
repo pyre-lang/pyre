@@ -3936,7 +3936,8 @@ pub(in crate::front::mir) fn inline_vec_field_part(
         crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
         crate::model::VecFieldPart::Len
         | crate::model::VecFieldPart::FatLen
-        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
+        | crate::model::VecFieldPart::FatMeta
+        | crate::model::VecFieldPart::HostNicheWord => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3972,7 +3973,8 @@ pub(in crate::front::mir) fn retarget_vec_operand(
         crate::model::VecFieldPart::FatData
         | crate::model::VecFieldPart::FatLen
         | crate::model::VecFieldPart::FatMeta
-        | crate::model::VecFieldPart::FatVtable => {
+        | crate::model::VecFieldPart::FatVtable
+        | crate::model::VecFieldPart::HostNicheWord => {
             return vec_var.clone();
         }
     };
@@ -3982,7 +3984,8 @@ pub(in crate::front::mir) fn retarget_vec_operand(
         | crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
         crate::model::VecFieldPart::Len
         | crate::model::VecFieldPart::FatLen
-        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
+        | crate::model::VecFieldPart::FatMeta
+        | crate::model::VecFieldPart::HostNicheWord => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -4096,7 +4099,8 @@ pub(crate) fn fat_part_value_type(
         | crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
         crate::model::VecFieldPart::Len
         | crate::model::VecFieldPart::FatLen
-        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
+        | crate::model::VecFieldPart::FatMeta
+        | crate::model::VecFieldPart::HostNicheWord => ValueType::Int,
     }
 }
 

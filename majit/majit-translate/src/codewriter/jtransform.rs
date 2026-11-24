@@ -6723,6 +6723,35 @@ impl<'a> Transformer<'a> {
                 // The operand is resolved through `aliases` first because a
                 // preceding identity cast may have renamed it.
                 let operand = resolve_alias(operand, &self.aliases);
+                if let Some(OpKind::FieldRead { field, .. }) =
+                    defining_op(graph, &operand).map(|def| &def.kind)
+                    && field.vec_part == Some(VecFieldPart::HostNicheWord)
+                {
+                    if let Some(result) = &op.result {
+                        result.set_concretetype(Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                        ));
+                    }
+                    let none_word = self.fresh_synthetic_variable_typed(
+                        graph,
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
+                    return RewriteResult::Replace(vec![
+                        SpaceOperation {
+                            result: Some(none_word.clone()),
+                            kind: OpKind::ConstInt(crate::layout::target_host_niche_none_word()),
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::BinOp {
+                                op: "eq".into(),
+                                lhs: operand,
+                                rhs: none_word,
+                                result_ty: ValueType::Int,
+                            },
+                        },
+                    ]);
+                }
                 if let Some(result) = &op.result {
                     result.set_concretetype(Some(
                         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
@@ -10654,6 +10683,42 @@ impl<'a> Transformer<'a> {
                 }
                 return RewriteResult::Replace(Vec::new());
             }
+        }
+        // Host-niche string-option Discriminant: the flow graph is
+        // `getattr` + `is None` (`SomeString`). Load the first word as
+        // Int so assemble emits `getfield_raw_i` / `_pure` with an
+        // unsigned word-sized descr (`layout.rs` `host_niche_none_word`),
+        // then the `is_` rewrite compares it to the target-width
+        // host-niche None word (`layout::target_host_niche_none_word`).
+        if field.vec_part == Some(crate::model::VecFieldPart::HostNicheWord) {
+            let OpKind::FieldRead { base, pure, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            let base = base.clone();
+            let pure = *pure
+                || self
+                    .callcontrol
+                    .as_deref()
+                    .and_then(|cc| cc.field_immutability(field.owner_root.as_deref(), &field.name))
+                    .is_some_and(|rank| rank.is_immutable() || rank.is_quasi_immutable());
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: getfield({owner}.{name}) → host-niche first word",
+                    owner = field.owner_root.as_deref().unwrap_or("<?>"),
+                    name = field.name,
+                ),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::FieldRead {
+                    base,
+                    field: field.clone(),
+                    ty: ValueType::Int,
+                    pure,
+                },
+            }]);
         }
         // `jtransform.py rewrite_op_getfield`:
         //     RESULT = op.result.concretetype
@@ -48411,6 +48476,92 @@ mod tests {
                 .iter()
                 .all(|op| !matches!(op.kind, OpKind::FieldRead { .. }))
         }));
+    }
+
+    /// Host-niche string-option Discriminant: `getattr` + `is None` becomes
+    /// `GETFIELD_RAW_I` of the first word plus `eq` with the target-width
+    /// host-niche None word.
+    #[test]
+    fn host_niche_string_option_is_none_is_first_word_eq() {
+        let mut graph = FunctionGraph::new("host_niche_is_none");
+        let bb = graph.startblock;
+        let base = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let field = graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new("name", Some("Holder".into()))
+                        .with_vec_part(crate::model::VecFieldPart::HostNicheWord)
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Str,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&field, ConcreteType::GcRef);
+        let none = graph.push_op_var(bb, OpKind::ConstNone, true).unwrap();
+        FunctionGraph::set_concretetype_of_inline(&none, ConcreteType::Void);
+        let is_none = graph
+            .push_op_var(
+                bb,
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: field.clone(),
+                    rhs: none,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(is_none));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops: Vec<_> = transformed
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { ty: ValueType::Int, field, .. }
+                    if field.vec_part == Some(crate::model::VecFieldPart::HostNicheWord)
+            )),
+            "HostNicheWord getattr must load the first word as Int; graph={}",
+            transformed.graph.dump()
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+            "is_ must not remain; graph={}",
+            transformed.graph.dump()
+        );
+        let none_word = crate::layout::target_host_niche_none_word();
+        let const_ids: std::collections::HashSet<u64> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::ConstInt(v) if *v == none_word => op.result.as_ref().map(|v| v.id()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !const_ids.is_empty(),
+            "must materialize the target-width host-niche None word; graph={}",
+            transformed.graph.dump()
+        );
+        assert!(
+            ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp { op, lhs, rhs, .. } if op == "eq" => {
+                    const_ids.contains(&lhs.id()) || const_ids.contains(&rhs.id())
+                }
+                _ => false,
+            }),
+            "is None of a host-niche string-option is eq(raw, target none word); graph={}",
+            transformed.graph.dump()
+        );
     }
 
     /// Build a graph that calls `receiver.run()` on a `dyn Handler`
