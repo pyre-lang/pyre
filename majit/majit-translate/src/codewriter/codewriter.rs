@@ -830,6 +830,13 @@ impl CodeWriter {
         // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
 
+        // `all.py backend_optimizations` runs
+        // `simplify.transform_dead_op_vars(graph, translator)` before
+        // `CodeWriter.transform_graph_to_jitcode` reaches jtransform. Spine A
+        // ports only its translator-gated dead `direct_call` arm here; the
+        // general dead-op pass remains outside this pipeline's scope.
+        crate::model::prune_dead_direct_calls(&mut graph_owned, callcontrol);
+
         // RPython codewriter.py:37 `portal_jd =
         // self.callcontrol.jitdriver_sd_from_portal_graph(graph)` — look
         // up the JitDriverStaticData keyed by portal graph identity. In

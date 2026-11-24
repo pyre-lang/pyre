@@ -11659,6 +11659,20 @@ impl CallControl {
     }
 }
 
+impl crate::model::ModelGraphLookup for CallControl {
+    fn direct_graph(
+        &self,
+        target: &CallTarget,
+    ) -> Option<std::rc::Rc<crate::model::FunctionGraph>> {
+        self.target_to_path_and_graph(target)
+            .map(|(_path, graph)| graph)
+    }
+
+    fn indirect_graph(&self, path: &CallPath) -> Option<std::rc::Rc<crate::model::FunctionGraph>> {
+        self.function_graphs.get(path)
+    }
+}
+
 /// `CallPath`s of the impls `trait_method_impls` records for
 /// `(trait_root, method_name)`.
 fn impls_for_indirect(

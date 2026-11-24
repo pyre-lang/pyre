@@ -1211,6 +1211,25 @@ pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
         || crate::front::std_identity::is_manually_drop_new_path(segments)
 }
 
+/// The lloperation name produced when `rewrite_op_direct_call` lowers a
+/// model-call spelling of an rtyper pointer cast.
+///
+/// Spine A's registered graphs retain these host-call spellings until
+/// jtransform.  Consumers that must apply an lloperation property before
+/// jtransform use this same classifier, then consult `LL_OPERATIONS` for the
+/// property itself.
+pub(crate) fn model_call_llop_name(segments: &[String]) -> Option<&'static str> {
+    if is_same_as_identity_call_path(segments) {
+        Some("same_as")
+    } else if is_lltype_cast_path(segments, "cast_ptr_to_int") {
+        Some("cast_ptr_to_int")
+    } else if is_lltype_cast_path(segments, "cast_int_to_ptr") {
+        Some("cast_int_to_ptr")
+    } else {
+        None
+    }
+}
+
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
 /// (`__cast_pointer`, `__cast_instance_intrinsic`,
 /// `__cast_address_intrinsic`).

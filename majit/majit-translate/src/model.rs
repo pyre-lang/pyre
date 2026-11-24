@@ -8472,7 +8472,6 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      no standalone Input shape, but the line-by-line port
 ///      sweeps them under the same canremove rule.
 ///
-///      TODO: translator-gated arms not ported.
 ///      Upstream's Step 5 has two further `elif` arms after the
 ///      canremove drop:
 ///        - `simplify.py elif op.opname == 'simple_call'`
@@ -8486,14 +8485,14 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          — the arm is structurally inapplicable.
 ///        - `simplify.py elif op.opname == 'direct_call'`
 ///          removes the call when `has_no_side_effects(translator,
-///          graph) and op is not block.raising_op`.  Gated on
-///          `translator is not None`; pyre's caller passes
-///          `translator=None`, so the arm is unreachable.  The
-///          `op is not block.raising_op` clause is moot for the
-///          same reason.
-///          Convergence path: surface a translator-equivalent (callee
-///          effect classifier) and route `OpKind::Call`-with-elidable-EI
-///          through this Step's drop path.
+///          graph) and op is not block.raising_op`. The model-graph
+///          [`has_no_side_effects`] / [`rec_op_has_side_effects`] port
+///          routes that arm through this Step whenever a
+///          [`ModelGraphLookup`] is supplied to the shared implementation.
+///          [`prune_dead_phis`] supplies none and therefore preserves its
+///          historical behaviour; [`prune_dead_direct_calls`] supplies the
+///          codewriter lookup and selects only this translator-gated arm for
+///          Spine A.
 ///   6. For each reachable block, walk its exits and drop
 ///      `Link.args[i]` for every `i` where `target.inputargs[i]`
 ///      is not in `read_vars` — inputarg-side trim happens in a
@@ -8504,11 +8503,144 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      `block.inputargs[i]` (and its matching `OpKind::Input` op
 ///      if still present in `block.operations`) for every dead
 ///      Variable (`simplify.py:520-524`).
+pub fn prune_dead_phis(graph: &mut FunctionGraph) {
+    prune_dead_phis_impl(graph, None, false);
+}
+
+/// Run only the translator-gated `direct_call` arm of
+/// `simplify.transform_dead_op_vars_in_blocks`.
+pub(crate) fn prune_dead_direct_calls(graph: &mut FunctionGraph, lookup: &dyn ModelGraphLookup) {
+    prune_dead_phis_impl(graph, Some(lookup), true);
+}
+
+pub(crate) trait ModelGraphLookup {
+    fn direct_graph(&self, target: &CallTarget) -> Option<Rc<FunctionGraph>>;
+    fn indirect_graph(&self, path: &crate::parse::CallPath) -> Option<Rc<FunctionGraph>>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ModelGraphKey(usize);
+
+impl ModelGraphKey {
+    fn of(graph: &FunctionGraph) -> Self {
+        Self(graph as *const FunctionGraph as usize)
+    }
+}
+
+/// Model-graph port of `simplify.py op_has_side_effects`.
+///
+/// [`crate::inline::is_pure_op`] is the existing model-op projection of
+/// `lloperation.LL_OPERATIONS[op.opname].sideeffects`; calls are classified
+/// recursively by [`rec_op_has_side_effects`] instead.
+fn op_has_side_effects(kind: &OpKind) -> bool {
+    !crate::inline::is_pure_op(kind)
+}
+
+fn model_call_llop_name(kind: &OpKind) -> Option<&'static str> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    crate::codewriter::jtransform::model_call_llop_name(segments)
+}
+
+/// Model-graph port of `simplify.py rec_op_has_side_effects`.
+pub(crate) fn rec_op_has_side_effects(
+    kind: &OpKind,
+    lookup: &dyn ModelGraphLookup,
+    seen: Option<&HashSet<ModelGraphKey>>,
+) -> bool {
+    match kind {
+        // `jtransform.py rewrite_op_cast_pointer` rewrites these model
+        // markers to `same_as` before they become lloperations. Reuse the
+        // codewriter's existing target classifier: the resulting
+        // `cast_pointer` / `same_as` has `LLOp.sideeffects == False` and is
+        // not a regular `direct_call` for the recursive arm below.
+        OpKind::Call { .. } if model_call_llop_name(kind).is_some() => {
+            let opname = model_call_llop_name(kind).expect("matched model lloperation call");
+            crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
+                .get(opname)
+                .expect("jtransform model-call projection must name an lloperation")
+                .sideeffects
+        }
+        OpKind::Call { target, .. } => {
+            let Some(graph) = lookup.direct_graph(target) else {
+                return true;
+            };
+            !has_no_side_effects(&graph, lookup, seen)
+        }
+        OpKind::IndirectCall { graphs, .. } => {
+            let Some(graphs) = graphs else {
+                return true;
+            };
+            for path in graphs {
+                let Some(graph) = lookup.indirect_graph(path) else {
+                    return true;
+                };
+                if !has_no_side_effects(&graph, lookup, seen) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => op_has_side_effects(kind),
+    }
+}
+
+/// Model-graph port of `simplify.py has_no_side_effects`.
+pub(crate) fn has_no_side_effects(
+    graph: &FunctionGraph,
+    lookup: &dyn ModelGraphLookup,
+    seen: Option<&HashSet<ModelGraphKey>>,
+) -> bool {
+    let key = ModelGraphKey::of(graph);
+    let mut newseen = match seen {
+        None => HashSet::new(),
+        Some(seen) => {
+            if seen.contains(&key) {
+                return true;
+            }
+            seen.clone()
+        }
+    };
+    newseen.insert(key);
+
+    // `FunctionGraph.iterblocks()` visits only blocks reachable from the
+    // startblock. Keep the dense block-id walk local instead of introducing a
+    // graph-keyed side table.
+    let mut reachable = vec![false; graph.blocks.len()];
+    let mut pending = vec![graph.startblock];
+    while let Some(block_id) = pending.pop() {
+        if reachable[block_id.0] {
+            continue;
+        }
+        reachable[block_id.0] = true;
+        if block_id == graph.exceptblock {
+            return false;
+        }
+        let block = graph.block(block_id);
+        for op in &block.operations {
+            if rec_op_has_side_effects(&op.kind, lookup, Some(&newseen)) {
+                return false;
+            }
+        }
+        pending.extend(block.exits.iter().map(|link| link.target));
+    }
+    true
+}
+
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub fn prune_dead_phis(graph: &mut FunctionGraph) {
+fn prune_dead_phis_impl(
+    graph: &mut FunctionGraph,
+    lookup: Option<&dyn ModelGraphLookup>,
+    only_dead_direct_calls: bool,
+) {
     use crate::inline::can_remove_op;
     use std::collections::HashMap;
     let start = graph.startblock;
@@ -8609,7 +8741,11 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             // `simplify.py:441-445`:
             //   if not canremove(op, block):    read_vars.update(args)
             //   else:                           dependencies[result] += args
-            let removable = can_remove_op(&op.kind) && Some(i) != raising_op_idx;
+            // The direct-call-only sweep keeps every other op, so their
+            // operands stay read: a call whose result feeds a dead but
+            // retained op is not dead here.
+            let removable =
+                can_remove_op(&op.kind) && Some(i) != raising_op_idx && !only_dead_direct_calls;
             if let Some(result_var) = op.result.clone()
                 && removable
             {
@@ -8737,7 +8873,19 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 Some(r) => !read_vars.contains(r),
                 None => false,
             };
-            if dead && can_remove_op(&op.kind) && Some(i) != raising_op_idx {
+            let dead_direct_call = dead
+                && Some(i) != raising_op_idx
+                && lookup.is_some_and(|lookup| {
+                    matches!(op.kind, OpKind::Call { .. })
+                        && model_call_llop_name(&op.kind).is_none()
+                        && !rec_op_has_side_effects(&op.kind, lookup, None)
+                });
+            if (dead
+                && can_remove_op(&op.kind)
+                && Some(i) != raising_op_idx
+                && !only_dead_direct_calls)
+                || dead_direct_call
+            {
                 dead_op_positions.push((block.id, i));
             }
         }
@@ -8751,6 +8899,10 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         for i in dead_indices.into_iter().rev() {
             block.operations.remove(i);
         }
+    }
+
+    if only_dead_direct_calls {
+        return;
     }
 
     // Step 6: trim Link.args at indices whose target inputarg is dead.
@@ -13690,6 +13842,299 @@ mod tests {
             .unwrap();
         graph.push_inputarg_var(block, phi_var.clone());
         phi_var
+    }
+
+    #[derive(Default)]
+    struct TestModelGraphLookup {
+        direct: Vec<(CallTarget, Rc<FunctionGraph>)>,
+        indirect: Vec<(crate::parse::CallPath, Rc<FunctionGraph>)>,
+    }
+
+    impl ModelGraphLookup for TestModelGraphLookup {
+        fn direct_graph(&self, target: &CallTarget) -> Option<Rc<FunctionGraph>> {
+            self.direct
+                .iter()
+                .find_map(|(registered, graph)| (registered == target).then(|| Rc::clone(graph)))
+        }
+
+        fn indirect_graph(&self, path: &crate::parse::CallPath) -> Option<Rc<FunctionGraph>> {
+            self.indirect
+                .iter()
+                .find_map(|(registered, graph)| (registered == path).then(|| Rc::clone(graph)))
+        }
+    }
+
+    fn direct_call(target: CallTarget) -> OpKind {
+        OpKind::Call {
+            target,
+            args: Vec::new(),
+            result_ty: ValueType::Int,
+        }
+    }
+
+    fn pure_callee(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph.set_return(graph.startblock, None);
+        graph
+    }
+
+    fn make_exceptblock_reachable(graph: &mut FunctionGraph) {
+        let entry = graph.startblock;
+        if graph.block(entry).exits.is_empty() {
+            graph.set_return(entry, None);
+        }
+        let normal = graph.block(entry).exits[0].clone();
+        let exception_args = graph.block(graph.exceptblock).inputargs.clone();
+        let exception = Link::from_variables(graph, exception_args, graph.exceptblock, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal, exception],
+        );
+    }
+
+    fn graph_has_call(graph: &FunctionGraph, result: &crate::flowspace::model::Variable) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| op.result.as_ref() == Some(result) && matches!(op.kind, OpKind::Call { .. }))
+    }
+
+    #[test]
+    fn dead_direct_call_removal_follows_callee_side_effects_and_liveness() {
+        let pure_target = CallTarget::function_path(["pure"]);
+        let write_target = CallTarget::function_path(["writes_field"]);
+        let raise_target = CallTarget::function_path(["raises"]);
+        let missing_target = CallTarget::function_path(["missing"]);
+
+        let pure = Rc::new(pure_callee("pure"));
+
+        let mut writes_field = FunctionGraph::new("writes_field");
+        let write_entry = writes_field.startblock;
+        let base = writes_field
+            .push_op_var(write_entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let value = writes_field
+            .push_op_var(write_entry, OpKind::ConstInt(1), true)
+            .unwrap();
+        writes_field.push_op_var(
+            write_entry,
+            OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor {
+                    name: "value".into(),
+                    owner_root: Some("Owner".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    owner_typeptr_hint: false,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        writes_field.set_return(write_entry, None);
+        let writes_field = Rc::new(writes_field);
+
+        let mut raises = pure_callee("raises");
+        make_exceptblock_reachable(&mut raises);
+        let raises = Rc::new(raises);
+
+        let lookup = TestModelGraphLookup {
+            direct: vec![
+                (pure_target.clone(), pure),
+                (write_target.clone(), writes_field),
+                (raise_target.clone(), raises),
+            ],
+            indirect: Vec::new(),
+        };
+
+        let mut graph = FunctionGraph::new("caller");
+        let entry = graph.startblock;
+        let dead_pure = graph
+            .push_op_var(entry, direct_call(pure_target.clone()), true)
+            .unwrap();
+        let dead_write = graph
+            .push_op_var(entry, direct_call(write_target), true)
+            .unwrap();
+        let dead_raise = graph
+            .push_op_var(entry, direct_call(raise_target), true)
+            .unwrap();
+        let unresolved = graph
+            .push_op_var(entry, direct_call(missing_target), true)
+            .unwrap();
+        let live_pure = graph
+            .push_op_var(entry, direct_call(pure_target), true)
+            .unwrap();
+        graph.set_return(entry, Some(live_pure.clone()));
+
+        prune_dead_direct_calls(&mut graph, &lookup);
+
+        assert!(!graph_has_call(&graph, &dead_pure));
+        assert!(graph_has_call(&graph, &dead_write));
+        assert!(graph_has_call(&graph, &dead_raise));
+        assert!(graph_has_call(&graph, &unresolved));
+        assert!(graph_has_call(&graph, &live_pure));
+
+        let mut without_lookup = FunctionGraph::new("without_lookup");
+        let entry = without_lookup.startblock;
+        let call = without_lookup
+            .push_op_var(
+                entry,
+                direct_call(CallTarget::function_path(["pure"])),
+                true,
+            )
+            .unwrap();
+        without_lookup.set_return(entry, None);
+        prune_dead_phis(&mut without_lookup);
+        assert!(
+            graph_has_call(&without_lookup, &call),
+            "existing prune_dead_phis callers without a graph lookup keep direct calls"
+        );
+    }
+
+    #[test]
+    fn dead_direct_call_removal_keeps_the_raising_op() {
+        let target = CallTarget::function_path(["pure"]);
+        let lookup = TestModelGraphLookup {
+            direct: vec![(target.clone(), Rc::new(pure_callee("pure")))],
+            indirect: Vec::new(),
+        };
+        let mut graph = FunctionGraph::new("caller");
+        let entry = graph.startblock;
+        let call = graph.push_op_var(entry, direct_call(target), true).unwrap();
+        make_exceptblock_reachable(&mut graph);
+
+        prune_dead_direct_calls(&mut graph, &lookup);
+
+        assert!(graph_has_call(&graph, &call));
+    }
+
+    /// A dead call whose result feeds a dead op the direct-call-only sweep
+    /// keeps stays, so the retained op never reads an undefined result.
+    #[test]
+    fn dead_direct_call_removal_keeps_a_call_read_by_a_retained_dead_op() {
+        let target = CallTarget::function_path(["pure"]);
+        let lookup = TestModelGraphLookup {
+            direct: vec![(target.clone(), Rc::new(pure_callee("pure")))],
+            indirect: Vec::new(),
+        };
+        let mut graph = FunctionGraph::new("caller");
+        let entry = graph.startblock;
+        let call = graph.push_op_var(entry, direct_call(target), true).unwrap();
+        let one = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let sum = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: call.clone(),
+                    rhs: one,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, None);
+
+        prune_dead_direct_calls(&mut graph, &lookup);
+
+        let sum_kept = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| op.result.as_ref() == Some(&sum));
+        assert!(sum_kept, "the direct-call-only sweep keeps the dead add");
+        assert!(graph_has_call(&graph, &call));
+    }
+
+    #[test]
+    fn model_graph_side_effect_analysis_terminates_on_mutual_recursion() {
+        let a_target = CallTarget::function_path(["a"]);
+        let b_target = CallTarget::function_path(["b"]);
+        let mut a = FunctionGraph::new("a");
+        let a_entry = a.startblock;
+        a.push_op_var(a_entry, direct_call(b_target.clone()), true);
+        a.set_return(a_entry, None);
+        let mut b = FunctionGraph::new("b");
+        let b_entry = b.startblock;
+        b.push_op_var(b_entry, direct_call(a_target.clone()), true);
+        b.set_return(b_entry, None);
+        let a = Rc::new(a);
+        let b = Rc::new(b);
+        let lookup = TestModelGraphLookup {
+            direct: vec![(a_target, Rc::clone(&a)), (b_target, b)],
+            indirect: Vec::new(),
+        };
+
+        assert!(has_no_side_effects(&a, &lookup, None));
+    }
+
+    #[test]
+    fn model_graph_identity_cast_uses_its_lowered_lloperation_effect() {
+        let target = CallTarget::function_path(["pure"]);
+        let mut pure = FunctionGraph::new("pure");
+        let entry = pure.startblock;
+        let operand = pure.push_op_var(entry, OpKind::ConstRefNull, true).unwrap();
+        let cast = cast_instance_call("Object", operand);
+        pure.push_op_var(entry, cast, true);
+        pure.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path([
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "cast_ptr_to_int",
+                ]),
+                args: Vec::new(),
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        pure.set_return(entry, None);
+        let lookup = TestModelGraphLookup {
+            direct: vec![(target, Rc::new(pure.clone()))],
+            indirect: Vec::new(),
+        };
+
+        assert!(has_no_side_effects(&pure, &lookup, None));
+    }
+
+    #[test]
+    fn model_graph_indirect_call_requires_a_fully_resolved_pure_family() {
+        let pure_path = crate::parse::CallPath::from_segments(["pure"]);
+        let pure = Rc::new(pure_callee("pure"));
+        let lookup = TestModelGraphLookup {
+            direct: Vec::new(),
+            indirect: vec![(pure_path.clone(), pure)],
+        };
+        let funcptr = crate::flowspace::model::Variable::named("funcptr");
+        let known = OpKind::IndirectCall {
+            funcptr: funcptr.clone(),
+            args: Vec::new(),
+            graphs: Some(vec![pure_path]),
+            family_key: None,
+            result_ty: ValueType::Int,
+        };
+        let unknown = OpKind::IndirectCall {
+            funcptr,
+            args: Vec::new(),
+            graphs: None,
+            family_key: None,
+            result_ty: ValueType::Int,
+        };
+
+        assert!(!rec_op_has_side_effects(&known, &lookup, None));
+        assert!(rec_op_has_side_effects(&unknown, &lookup, None));
     }
 
     #[test]
