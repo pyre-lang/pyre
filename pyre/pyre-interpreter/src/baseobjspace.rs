@@ -1158,13 +1158,6 @@ pub fn allocate_lock() -> *mut Lock {
     Box::into_raw(Box::new(Lock::new()))
 }
 
-/// Whether `needle` is pointer-identical to any entry of an installed MRO
-/// slice.  Shared by [`issubtype_w`] and
-/// [`crate::typedef::check_user_subclass`].
-pub(crate) fn mro_contains(mro: &[PyObjectRef], needle: PyObjectRef) -> bool {
-    mro.iter().any(|&t| std::ptr::eq(t, needle))
-}
-
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
 /// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py:1640-1644
 /// _issubtype`: `w_type in w_sub.mro_w`); a type whose MRO is not yet
