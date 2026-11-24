@@ -1398,7 +1398,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             MODULE_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<ModuleDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<ModuleDictStorage>()
         } else {
             raw as *mut ModuleDictStorage
         };

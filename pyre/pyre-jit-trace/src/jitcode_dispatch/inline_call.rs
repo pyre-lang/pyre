@@ -7850,26 +7850,26 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
             }
             drop(args_box);
         }
-        Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, _)) => {
+        Ok((DispatchOutcome::SubRaise { .. }, _)) => {
             // Residual `*_jit_abi` error builders publish `TypeError(getmsg)`
             // and the helper SubRaises before `_match_signature` returns
             // Shape. Same cut as SubReturn !ok: residual CALL_KW lets
-            // `parse_into_scope` format `fnname() ` + getmsg. Catch is the
-            // can't-cut path; `run_orthodox_helper_subwalk` does not plant
-            // last_exc_value on a bubbling SubRaise.
+            // `parse_into_scope` format `fnname() ` + getmsg.
             if binder_can_cut() {
                 consume_published_residual_error_for_cut(ctx);
                 cut_declined_subwalk(ctx, saved_pos);
                 return Ok(None);
             }
-            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                ctx.set_last_exc_value(exc, exc_concrete);
-                return Ok(Some((DispatchOutcome::Continue, target)));
-            }
-            return Ok(Some((
-                DispatchOutcome::SubRaise { exc, exc_concrete },
-                op.next_pc,
-            )));
+            drop(args_box);
+            // The binder already executed an effect (a journaled store or an
+            // unjournaled residual), so a residual re-execution of the call would
+            // run it twice (`wrapper_can_cut_to_residual`). The published error
+            // carries `getmsg` without `parse_into_scope`'s function-name prefix,
+            // so the trace cannot raise it either.
+            return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc: op.pc,
+                symbolic: 0,
+            });
         }
         Ok(_) => {
             if binder_can_cut() {
@@ -7996,8 +7996,18 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
     ) {
         Ok(Some(outcome)) => Ok(Some(outcome)),
         Ok(None) => {
-            cut_declined_subwalk(ctx, saved_pos);
-            Ok(None)
+            if binder_can_cut() {
+                cut_declined_subwalk(ctx, saved_pos);
+                Ok(None)
+            } else {
+                // The binder already executed an effect (a journaled store or an
+                // unjournaled residual), so a residual re-execution of the call would
+                // run it twice (`wrapper_can_cut_to_residual`).
+                Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op.pc,
+                    symbolic: 0,
+                })
+            }
         }
         Err(error) => Err(error),
     }

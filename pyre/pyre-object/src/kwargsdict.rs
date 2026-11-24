@@ -276,13 +276,16 @@ pub unsafe fn w_dict_is_kwargs_or_empty_kwargs(w_dict: PyObjectRef) -> bool {
 /// including the first store on `EmptyKwargsDictStrategy`
 /// (`switch_to_unicode_strategy` → `KwargsDictStrategy`).
 ///
-/// The body is only the kwargs parallel-list overwrite/append
-/// (`_setitem_correct_indirection` without the size-16 unicode
-/// promote). `w_dict_store` / `switch_to_correct_strategy` /
-/// `switch_to_object_strategy` stay out: those graphs contain
-/// `__hash__`/`__eq__` callbacks, so `RandomEffectsAnalyzer` would
-/// stamp `EF_RANDOM_EFFECTS` and `getcalldescr` would ignore the
-/// harvested `cannot_raise` mark (`call.py` random_effects arm
+/// The body is the kwargs parallel-list overwrite/append
+/// (`_setitem_correct_indirection`). At `KWARGS_PROMOTE_THRESHOLD`
+/// (`kwargsdict.py _setitem_correct_indirection`) it stores nothing
+/// and returns `false`; the caller then stores through the general
+/// `setitem` path, which is where `switch_to_unicode_strategy` runs.
+/// `w_dict_store` / `switch_to_unicode_strategy` /
+/// `switch_to_object_strategy` stay out of this helper: those graphs
+/// contain `__hash__`/`__eq__` callbacks, so `RandomEffectsAnalyzer`
+/// would stamp `EF_RANDOM_EFFECTS` and `getcalldescr` would ignore
+/// the harvested `cannot_raise` mark (`call.py` random_effects arm
 /// before `_canraise`). The caller
 /// (`argument.py _collect_keyword_args`) takes this path only when
 /// the dict is still kwargs/empty-kwargs and the key is an exact
@@ -296,7 +299,7 @@ pub unsafe fn w_dict_store_kwargs_str(
     w_dict: PyObjectRef,
     w_key: PyObjectRef,
     w_value: PyObjectRef,
-) {
+) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let dict_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_roots(&[w_dict, w_key, w_value]);
@@ -330,12 +333,19 @@ pub unsafe fn w_dict_store_kwargs_str(
     for i in 0..keys_w.len() {
         if crate::w_str_eq_w(kwargs_at(keys_w, i), w_key) {
             values_w[i] = w_value;
-            return;
+            return true;
         }
+    }
+    // `kwargsdict.py _setitem_correct_indirection`: at the size
+    // threshold the caller stores through the general `setitem` path
+    // (`switch_to_unicode_strategy`), not this residual.
+    if keys_w.len() >= KWARGS_PROMOTE_THRESHOLD {
+        return false;
     }
     keys_w.push(w_key);
     values_w.push(w_value);
     crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+    true
 }
 
 /// `kwargsdict.py KwargsDictStrategy._getitem_correct_indirection`
@@ -706,7 +716,11 @@ mod tests {
         unsafe {
             let empty = crate::dictmultiobject::w_dict_new_kwargs();
             assert!(w_dict_is_kwargs_or_empty_kwargs(empty));
-            w_dict_store_kwargs_str(empty, crate::w_str_new("a"), crate::w_int_new(1));
+            assert!(w_dict_store_kwargs_str(
+                empty,
+                crate::w_str_new("a"),
+                crate::w_int_new(1)
+            ));
             assert!(w_dict_is_kwargs_or_empty_kwargs(empty));
             let object = crate::dictmultiobject::w_dict_new();
             assert!(!w_dict_is_kwargs_or_empty_kwargs(object));
@@ -718,7 +732,7 @@ mod tests {
         unsafe {
             let w_dict = crate::dictmultiobject::w_dict_new_kwargs();
             let w_a = crate::w_str_new("a");
-            w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(1));
+            assert!(w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(1)));
             assert_eq!(
                 crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
                 crate::dictmultiobject::StrategyKind::Kwargs
@@ -727,10 +741,65 @@ mod tests {
                 crate::w_int_get_value(w_dict_lookup_or_null_kwargs_strategy(w_dict, w_a).unwrap()),
                 1
             );
-            w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(9));
+            assert!(w_dict_store_kwargs_str(w_dict, w_a, crate::w_int_new(9)));
             assert_eq!(
                 crate::w_int_get_value(w_dict_lookup_or_null_kwargs_strategy(w_dict, w_a).unwrap()),
                 9
+            );
+        }
+    }
+
+    #[test]
+    fn kwargs_store_str_refuses_append_at_promote_threshold() {
+        unsafe {
+            let w_dict = crate::dictmultiobject::w_dict_new_kwargs();
+            for i in 0..KWARGS_PROMOTE_THRESHOLD {
+                let w_key = crate::w_str_new(&format!("k{i}"));
+                assert!(w_dict_store_kwargs_str(
+                    w_dict,
+                    w_key,
+                    crate::w_int_new(i as i64)
+                ));
+            }
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+            assert_eq!(
+                KWARGS_DICT_STRATEGY.length(w_dict),
+                KWARGS_PROMOTE_THRESHOLD
+            );
+
+            let extra = crate::w_str_new("k16");
+            assert!(!w_dict_store_kwargs_str(
+                w_dict,
+                extra,
+                crate::w_int_new(16)
+            ));
+            assert_eq!(
+                KWARGS_DICT_STRATEGY.length(w_dict),
+                KWARGS_PROMOTE_THRESHOLD
+            );
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+
+            let existing = crate::w_str_new("k0");
+            assert!(w_dict_store_kwargs_str(
+                w_dict,
+                existing,
+                crate::w_int_new(99)
+            ));
+            assert_eq!(
+                KWARGS_DICT_STRATEGY.length(w_dict),
+                KWARGS_PROMOTE_THRESHOLD
+            );
+            assert_eq!(
+                crate::w_int_get_value(
+                    w_dict_lookup_or_null_kwargs_strategy(w_dict, existing).unwrap()
+                ),
+                99
             );
         }
     }

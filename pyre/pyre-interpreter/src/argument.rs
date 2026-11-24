@@ -2452,13 +2452,14 @@ pub fn collect_keyword_args(
         // argument.py `_collect_keyword_args`:
         // `space.setitem(w_kwds, w_key, keywords_w[i])` raises
         // OperationError. Map that raise onto `CollectKeywordArgsOutcome::Py`.
-        if unsafe {
+        let stored = unsafe {
             pyre_object::kwargsdict::w_dict_is_kwargs_or_empty_kwargs(w_kwds)
                 && pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE)
-        } {
-            setitem_kwargs_dict(w_kwds, w_key, w_value);
-        } else if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
-            return CollectKeywordArgsOutcome::Py(err);
+        } && setitem_kwargs_dict(w_kwds, w_key, w_value);
+        if !stored {
+            if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
+                return CollectKeywordArgsOutcome::Py(err);
+            }
         }
         i += 1;
     }
@@ -2486,13 +2487,14 @@ fn collect_keyword_args_vec(
         let w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
         let w_key = pyre_object::gc_roots::shadow_stack_get(names_base + i);
         let w_value = pyre_object::gc_roots::shadow_stack_get(values_base + i);
-        if unsafe {
+        let stored = unsafe {
             pyre_object::kwargsdict::w_dict_is_kwargs_or_empty_kwargs(w_kwds)
                 && pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE)
-        } {
-            setitem_kwargs_dict(w_kwds, w_key, w_value);
-        } else if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
-            return CollectKeywordArgsOutcome::Py(err);
+        } && setitem_kwargs_dict(w_kwds, w_key, w_value);
+        if !stored {
+            if let Err(err) = setitem_kwargs_dict_general(w_kwds, w_key, w_value) {
+                return CollectKeywordArgsOutcome::Py(err);
+            }
         }
     }
     CollectKeywordArgsOutcome::Ok
@@ -2506,17 +2508,16 @@ fn collect_keyword_args_vec(
 /// `dstrategy.imp`); the residual is `dont_look_inside_cannot_raise`
 /// because that store does not re-enter Python (`call.py getcalldescr`
 /// `cannot_raise_effect_info()`). One-word `bool` so the residual ABI
-/// can record the call.
+/// can record the call. `false` means the helper stored nothing at the
+/// `_setitem_correct_indirection` size threshold, so the caller stores
+/// through [`setitem_kwargs_dict_general`].
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(crate) fn setitem_kwargs_dict(
     w_kwds: PyObjectRef,
     w_key: PyObjectRef,
     w_value: PyObjectRef,
 ) -> bool {
-    unsafe {
-        pyre_object::kwargsdict::w_dict_store_kwargs_str(w_kwds, w_key, w_value);
-        true
-    }
+    unsafe { pyre_object::kwargsdict::w_dict_store_kwargs_str(w_kwds, w_key, w_value) }
 }
 
 /// `space.setitem(w_kwds, w_key, w_value)` for a key or dict that is not
@@ -2867,24 +2868,6 @@ fn match_signature_missing_err(
         missing,
         positional,
     })
-}
-
-/// `parse_into_scope` maps `ArgErr` to `fnname() ` + `getmsg`. Residual
-/// error builders publish the `getmsg` TypeError; the CALL_KW descent
-/// puts the function name on in the same place the try/except around
-/// `_match_signature` would.
-pub fn typeerror_with_binder_fnname(exc: PyObjectRef, fnname: &str) -> PyObjectRef {
-    let msg = match unsafe { crate::display::py_str_wtf8(exc) } {
-        Ok(s) => s,
-        Err(_) => return exc,
-    };
-    let prefix = format!("{fnname}()");
-    let msg_s = crate::display::wtf8_display_string(msg, "");
-    if msg_s.starts_with(&prefix) {
-        return exc;
-    }
-    let mut err = crate::PyError::type_error(format!("{prefix} {msg_s}"));
-    err.to_exc_object()
 }
 
 fn publish_match_outcome_as_residual(outcome: MatchOutcome) -> i64 {

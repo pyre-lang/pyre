@@ -672,8 +672,8 @@ pub unsafe fn dict_entries_value_set_at(
 /// [`dict_entries_value_set_at`]; this wrapper carries the hint.
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `_ll_dict_setitem_lookup_done`. The key is the caller's, not an
-/// argument here, so the predicate is `isvirtual(entries)`.
+/// `_ll_dict_setitem_lookup_done`. `key` is the lookup key
+/// (`setitem_str`'s `key`), the `&str` the caller probed with.
 /// A heap table residualises so a compiled STORE_NAME does not emit
 /// `setinteriorfield_gc` against a nursery `DICTENTRYARRAY` that a
 /// later `NewWithVtable` collection forwards out from under the loop.
@@ -684,20 +684,22 @@ pub unsafe fn dict_entries_value_set_at(
 /// Same as [`dict_entries_value_at`].
 fn dict_entries_setitem_lookup_done_iff(
     entries: &mut ObjectDictStorage,
-    _index: usize,
+    key: &str,
     _value: PyObjectRef,
+    _index: usize,
 ) -> bool {
-    // rordereddict.py `_ll_dict_setitem_lookup_done`: `isvirtual(d)`
-    // (the key is the caller's, not an argument here).
-    majit_rlib::jit::isvirtual(entries)
+    // rordereddict.py `_ll_dict_setitem_lookup_done`: isvirtual(d) and isconstant(key)
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
 }
 
 #[majit_macros::look_inside_iff(dict_entries_setitem_lookup_done_iff)]
 pub unsafe fn dict_entries_setitem_lookup_done(
     entries: &mut ObjectDictStorage,
-    index: usize,
+    key: &str,
     value: PyObjectRef,
+    index: usize,
 ) {
+    let _ = key;
     dict_entries_value_set_at(entries, index, value)
 }
 
@@ -2919,7 +2921,7 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
             dict_entries_insert_object(entries, w_key, roots.get(value_slot));
             w_dict_bump_keys_version(obj);
         } else {
-            dict_entries_setitem_lookup_done(entries, idx as usize, roots.get(value_slot));
+            dict_entries_setitem_lookup_done(entries, key, roots.get(value_slot), idx as usize);
         }
         return;
     }
@@ -4716,7 +4718,7 @@ pub unsafe fn w_dict_setitem_str_unicode_strategy_hashed(
         Some(idx) => {
             let w_value = roots.get(value_slot);
             let entries = w_dict_object_storage_mut(roots.get(dict_slot));
-            dict_entries_setitem_lookup_done(entries, idx, w_value);
+            dict_entries_setitem_lookup_done(entries, key, w_value, idx);
         }
         None => {
             let stored_key = object_key_for_new_str(key, hash);
@@ -8442,7 +8444,9 @@ impl DictStrategy for ObjectDictStrategy {
             crate::dictmultiobject::OBJECT_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::ObjectDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<
+                crate::dictmultiobject::ObjectDictStorage,
+            >()
         } else {
             raw as *mut crate::dictmultiobject::ObjectDictStorage
         };
@@ -8637,7 +8641,9 @@ impl DictStrategy for BytesDictStrategy {
             crate::dictmultiobject::BYTES_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::BytesDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<
+                crate::dictmultiobject::BytesDictStorage,
+            >()
         } else {
             raw as *mut crate::dictmultiobject::BytesDictStorage
         };
@@ -8872,7 +8878,9 @@ impl DictStrategy for UnicodeDictStrategy {
             crate::dictmultiobject::OBJECT_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::ObjectDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<
+                crate::dictmultiobject::ObjectDictStorage,
+            >()
         } else {
             raw as *mut crate::dictmultiobject::ObjectDictStorage
         };
@@ -9126,7 +9134,9 @@ impl DictStrategy for IntDictStrategy {
             crate::dictmultiobject::INT_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::IntDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<
+                crate::dictmultiobject::IntDictStorage,
+            >()
         } else {
             raw as *mut crate::dictmultiobject::IntDictStorage
         };

@@ -5818,14 +5818,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_object::dict_entries_slot_count",
         pyre_object::dictmultiobject::dict_entries_slot_count,
     );
-    upa3!(
+    // Native `&str` is two words; residual `bh_call_r` passes one rstr STR.
+    // Bind the word-ABI adapters, matching `dict_entries_probe_str_trampoline`.
+    cpa4!(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_setitem_lookup_done",
         "pyre_object::dict_entries_setitem_lookup_done",
-        pyre_object::dictmultiobject::dict_entries_setitem_lookup_done,
+        pyre_object::dictmultiobject::__majit_call_target_dict_entries_setitem_lookup_done,
     );
     // getfunctionptr of the trampoline graph; the dispatch wrapper residual-calls this.
-    cpa3!(
+    cpa4!(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_setitem_lookup_done_trampoline",
         "pyre_object::dict_entries_setitem_lookup_done_trampoline",

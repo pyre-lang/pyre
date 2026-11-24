@@ -327,7 +327,7 @@ impl DictStrategy for IdentityDictStrategy {
             IDENTITY_DICT_STORAGE_SIZE,
         );
         let d = if raw.is_null() {
-            crate::gc_storage::malloc_raw_zeroed::<IdentityDictStorage>()
+            crate::gc_storage::malloc_raw_zeroed_unless_gc_failed::<IdentityDictStorage>()
         } else {
             raw as *mut IdentityDictStorage
         };
