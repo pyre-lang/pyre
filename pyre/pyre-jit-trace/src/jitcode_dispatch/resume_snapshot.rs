@@ -2033,6 +2033,12 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `[k0, v0 .. k_{n-1}, v_{n-1}]`. `opcode_build_map`
         // (`shared_opcode.rs`) `pop_n(size * 2)`.
         pyre_interpreter::Instruction::BuildMap { count } => 2 * count.get(op_arg) as usize,
+        // `[code]`. `MAKE_FUNCTION` pops the code object, then reads
+        // `self.get_w_globals()` (`pyopcode.py MAKE_FUNCTION`).
+        pyre_interpreter::Instruction::MakeFunction => 1,
+        // `[level, fromlist]`. `IMPORT_NAME` pops fromlist then level, then
+        // reads `self.get_w_globals()` (`pyopcode.py IMPORT_NAME`).
+        pyre_interpreter::Instruction::ImportName { .. } => 2,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(

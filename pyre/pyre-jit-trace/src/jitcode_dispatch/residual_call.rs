@@ -9794,6 +9794,42 @@ pub(crate) fn residual_arg_concretes<Sym: WalkSym>(
         .collect()
 }
 
+/// The receiver shape the tuple subscript routes through the real callee:
+/// a concrete canonical `W_TupleObject` (exact `TUPLE_TYPE` and exact
+/// class) or an arity-2 specialisation, with an exact-int in-range key.
+fn subscr_receiver_is_exact_tuple_in_range<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> bool {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 {
+        return false;
+    }
+    let (Some(seq_obj), Some(key_obj)) = (
+        walker_concrete_ref_object(ctx, r_args[0]),
+        walker_concrete_ref_object(ctx, r_args[1]),
+    ) else {
+        return false;
+    };
+    let spec_type = unsafe { (*seq_obj).ob_type };
+    let canonical = unsafe {
+        std::ptr::eq(spec_type, &pyre_object::pyobject::TUPLE_TYPE)
+            && std::ptr::eq(
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(seq_obj),
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+            )
+    };
+    if !canonical && specialised_pair_kind(spec_type).is_none() {
+        return false;
+    }
+    if !unsafe { pyre_object::is_int(key_obj) } {
+        return false;
+    }
+    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
+    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
+    let index = if raw_key < 0 { raw_key + len } else { raw_key };
+    (0..len).contains(&index)
+}
+
 /// `pyjitpl.py` `MIFrame.do_residual_or_indirect_call` ICT half:
 /// Const `funcbox` → `bytecode_for_address` → `perform_call`.
 ///
@@ -12898,6 +12934,27 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
                     );
                     if is_subscr {
+                        // An exact tuple receiver with an in-range exact-int key
+                        // enters the operation's real callee
+                        // (`binary_value_from_tag`) from its entry, the way
+                        // `pyjitpl.py MIFrame.do_residual_or_indirect_call`
+                        // reaches `perform_call`; that body's own call reaches
+                        // the tuple getitem.
+                        if subscr_receiver_is_exact_tuple_in_range(ctx, &r_args)
+                            && let Some(outcome) = try_do_residual_or_indirect_call(
+                                ctx,
+                                op.pc,
+                                op.next_pc,
+                                funcptr,
+                                &i_args,
+                                &r_args,
+                                &[],
+                                dst,
+                                dst_bank,
+                            )?
+                        {
+                            return Ok(outcome);
+                        }
                         // A user-instance receiver resolves `__getitem__` on
                         // its own type; inline that body instead of leaving
                         // the subscript an opaque residual.  The storage folds

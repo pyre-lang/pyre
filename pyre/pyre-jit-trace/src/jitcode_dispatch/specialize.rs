@@ -5755,7 +5755,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// self-consistent, but a side exit hands a real pair — inline `value0` /
 /// `value1`, no `wrappeditems` block — to whatever consumer the trace picked
 /// for the canonical layout, and
-/// [`try_walker_orthodox_subscr_tuple_item`] then reads a field that is
+/// the tuple getitem reached through `binary_value_from_tag` then reads a field that is
 /// not there.
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
@@ -6523,40 +6523,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         );
     }
 
-    // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  Two
-    // gates, both required:
-    //   * `ob_type == &TUPLE_TYPE` (tupleobject.py / tupleobject.rs) —
-    //     NOT `is_tuple()` (which also accepts the three
-    //     SPECIALISED_TUPLE_{II,FF,OO} variants).  Specialised tuples store
-    //     `value0`/`value1` inline with no `wrappeditems` block, so a
-    //     `getfield(wrappeditems)` on one yields garbage.
-    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance carries
-    //     `TUPLE_USER_TYPE` and may override `__getitem__`; `baseobjspace::getitem` honours that
-    //     override (subclass_special_override) so the pure `wrappeditems[i]`
-    //     load must NOT be taken for it.
-    // A failing gate falls to the generic residual.  The paired runtime
-    // `guard_class(&TUPLE_TYPE)` + exact `w_class` guard (in
-    // `try_walker_orthodox_subscr_tuple_item`) deopt any later non-canonical
-    // tuple or subclass instance flowing in.
-    let tuple_canonical = unsafe {
-        std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
-            && std::ptr::eq(
-                pyre_interpreter::objspace::std::mapdict::instance_getclass(list_obj),
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-            )
-    };
-    // Serve the canonical layout and the arity-2 specialisations from the
-    // real reader.
-    if tuple_canonical || specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
-        if let Some(hit) = spec_gate(SpecFold::SubscrTupleDescent, || {
-            try_walker_orthodox_subscr_tuple_item(
-                ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
-            )
-        })? {
-            return Ok(Some(hit));
-        }
-    }
-
     // A `str` receiver descends `getitem_str` (`descr_getitem`'s scalar arm).
     // `is_exact_type` only checks the shared payload `ob_type`; a str subclass
     // carries that same value and distinguishes itself through `w_class`.
@@ -6789,110 +6755,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     )?;
     Ok(Some(()))
 }
-
-/// Descend `w_tuple_getitem`'s compiled body for a tuple subscript whose
-/// receiver class and item index are both known at trace time, instead of
-/// re-emitting that body's length test and field reads by hand.
-///
-/// This is the orthodox shape, and it replaced the hand-written
-/// `subscr_specialised_pair` reader that stood in for it:
-/// upstream's `getitem` is an ordinary graph the tracer inlines
-/// (`specialisedtupleobject.py`, whose `getitem` unrolls `iter_n` to the
-/// matching `value%s`), and the callee's `ob_type` chain folds against the
-/// pinned class down to the one specialisation this trace saw.
-///
-/// The trace-time range check here is a decline gate, not the trace's safety
-/// argument: it keeps an out-of-range subscript on the generic residual instead
-/// of tracing a raising path.  What holds for the *next* receiver is the
-/// callee's own length test, which is why this enters at `w_tuple_getitem`
-/// rather than at the `_known` reader it wraps -- the reader is documented
-/// "known-in-bounds" and carries no test to record.
-fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    key_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    // The canonical layout, whose caller has already checked the exact class,
-    // and the arity-2 specialisations.
-    let spec_type = unsafe { (*seq_obj).ob_type };
-    let canonical = std::ptr::eq(spec_type, &pyre_object::pyobject::TUPLE_TYPE);
-    if !canonical && specialised_pair_kind(spec_type).is_none() {
-        return Ok(None);
-    }
-    // Exact int keys only: a slice, a bool or an int subclass reaches a
-    // different objspace path, and the callee takes a machine index.
-    if !unsafe { pyre_object::is_int(key_obj) } {
-        return Ok(None);
-    }
-    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
-    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
-    let index = if raw_key < 0 { raw_key + len } else { raw_key };
-    if !(0..len).contains(&index) {
-        return Ok(None);
-    }
-
-    // Resolve every possible decline before recording a guard.
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &TUPLE_GETITEM_DESCENT) else {
-        return Ok(None);
-    };
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    // A specialisation carries its own `ob_type`, so its class guard is the
-    // whole precondition, and its length is 2 by construction.  The canonical
-    // layout also pins the exact class, since a subclass instance may
-    // override `__getitem__`.
-    if canonical {
-        walker_guard_exact_w_class(
-            ctx,
-            op_pc,
-            seq_op,
-            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-        )?;
-    }
-    walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
-
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
-    let index_arg = if canonical {
-        key_index
-    } else {
-        // Freeze the key: the two slots are separate fields, so the callee's
-        // `match idx` folds to one of them only against a constant.
-        let index_arg = ctx.trace_ctx.const_int(raw_key);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_index, index_arg])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(key_index, index_arg);
-        index_arg
-    };
-    // The class guard and the frozen-key `GuardValue` carry snapshots.
-    // An unsupported body cuts back through them; leaving the snapshots
-    // would name boxes the later remap has dropped.
-    let walked = run_prepared_orthodox_descent(
-        ctx,
-        op_pc,
-        prep,
-        &[(index_arg, raw_key)],
-        &[(seq_op, seq_obj)],
-        &[],
-        dst,
-        dst_bank,
-        &TUPLE_GETITEM_DESCENT,
-        None,
-    )?;
-    orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
-}
-
-const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_object::tupleobject::w_tuple_getitem",
-    decline_tag: "SUBSCR-TUPLE-SUBWALK",
-};
 
 /// An operator's descent: which body to enter and the tag its decline
 /// reports.

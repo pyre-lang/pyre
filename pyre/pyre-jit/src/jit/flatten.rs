@@ -4867,7 +4867,9 @@ where
     )
 }
 
-/// Lower IMPORT_NAME's globals argument to a one-Ref residual call.
+/// Lower IMPORT_NAME / MAKE_FUNCTION's globals argument to the
+/// `inline_call_r_r` of `PyFrame::get_w_globals` when that body is fully
+/// bound, otherwise to the `bh_load_import_globals_fn` Plain residual.
 ///
 /// `bh_load_import_globals_fn` is `get_w_globals()`: `debugdata.w_globals` on a
 /// frame carrying a payload, `promote(pycode).w_globals` otherwise. The first
@@ -4886,14 +4888,32 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    lower_frame_only_ref_hlop_to_insn(
-        op,
-        "load_import_globals",
+    if op.opname != "load_import_globals" || op.args.len() != 1 {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    // `pyopcode.py MAKE_FUNCTION` / `IMPORT_NAME` call `self.get_w_globals()`;
+    // `jtransform.py handle_regular_call` makes that an `inline_call_r_r` of
+    // the `get_w_globals` graph. A build without that body fully bound keeps
+    // the `bh_load_import_globals_fn` residual.
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        inline_call_targets::GET_W_GLOBALS,
+        frame_operand.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
+    Some(build_residual_call_r_r_insn_from_operands(
         ctx.load_import_globals_fn_idx,
+        vec![frame_operand],
+        CallFlavor::Plain,
         majit_ir::RuntimeHelperKind::LoadImportGlobals,
-        get_register,
-        lower_constant,
-    )
+        dst_reg,
+    ))
 }
 
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
@@ -6802,6 +6822,9 @@ pub(crate) mod inline_call_targets {
     pub const LOAD_GLOBAL_VALUE: &str = "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value";
     /// LOAD_NAME — `pyopcode.py LOAD_NAME` (w_locals probe, then `_load_global`).
     pub const LOAD_NAME_VALUE: &str = "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value";
+    /// IMPORT_NAME / MAKE_FUNCTION globals — `pyframe.py get_w_globals`,
+    /// `lower_load_import_globals_hlop_to_insn`.
+    pub const GET_W_GLOBALS: &str = "pyframe::PyFrame::get_w_globals";
 }
 
 /// The body of a fixed callee path whose host addresses this build has fully
@@ -14279,6 +14302,46 @@ mod tests {
                 super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
             },
         );
+    }
+
+    #[test]
+    fn lower_load_import_globals_hlop_emits_inline_call_or_residual_fallback() {
+        let (opname, args, result) =
+            lower_unary_hlop_fixture("load_import_globals", |op, ctx, gr, lc| {
+                super::lower_load_import_globals_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| {
+                    lc(c)
+                })
+            });
+        // Same scan `assert_unary_lowering_inlines_bound_body` reads, plus the
+        // host `fnaddr` `fully_bound_callee_body` also requires. A body with
+        // startpoints and no symbolic residuals but fnaddr 0 keeps the
+        // `bh_load_import_globals_fn` residual (`reject_unresolved_inline_call`).
+        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        let body_is_bound = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(
+            "pyframe::PyFrame::get_w_globals",
+        )
+        .is_some_and(|jitcode| {
+            jitcode.startpoints.is_some()
+                && jitcode.reachable_symbolic_residuals().targets.is_empty()
+                && jitcode.fnaddr != 0
+                && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(jitcode.fnaddr)
+        });
+        if body_is_bound {
+            assert_eq!(opname, "inline_call_r_r");
+            assert!(
+                matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
+                "load_import_globals inline target, got {:?}",
+                args[0]
+            );
+        } else {
+            assert_eq!(opname, "residual_call_r_r");
+            assert!(
+                matches!(args[0], Operand::ConstInt(idx) if idx == 0),
+                "load_import_globals_fn pool index 0, got {:?}",
+                args[0]
+            );
+        }
+        assert_unary_hlop_call_tail("load_import_globals", &args, result);
     }
 
     #[test]

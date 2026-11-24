@@ -491,6 +491,17 @@ pub(crate) extern "C" fn pyframe_load_global_value_word(
     }
 }
 
+/// One-word ABI for `PyFrame.get_w_globals` (`pyframe.py get_w_globals`),
+/// the `inline_call_r_r` target of IMPORT_NAME / MAKE_FUNCTION's globals
+/// (`flatten.rs inline_call_targets::GET_W_GLOBALS`). This is the address
+/// blackhole `bh_call_r` calls.
+#[inline(never)]
+pub(crate) extern "C" fn pyframe_get_w_globals_word(frame: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::pyframe_get_w_globals_word");
+    let frame = unsafe { &*(frame as usize as *const crate::pyframe::PyFrame) };
+    frame.get_w_globals() as usize as i64
+}
+
 /// One-word residual ABI for `PyFrame.load_name_value`
 /// (`pyopcode.py LOAD_NAME`); `llmodel.py bh_call_r` passes the `&str`
 /// as one rstr STR word.
@@ -2799,6 +2810,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::type_methods::list_extend_items",
         crate::opcode_ops::jit_type_methods_list_extend_items,
+    );
+    // IMPORT_NAME / MAKE_FUNCTION globals' `inline_call_r_r`
+    // (`flatten.rs inline_call_targets`). The graph is `PyFrame.get_w_globals`;
+    // this bridge is the one-word address blackhole `bh_call_r` calls.
+    cp1!(
+        &mut entries,
+        "pyframe::PyFrame::get_w_globals",
+        pyframe_get_w_globals_word,
     );
     // LOAD_GLOBAL's `inline_call_ir_r` (`flatten.rs inline_call_targets`).
     // The graph is `PyFrame.load_global_value`; this bridge is the one-word
@@ -7959,14 +7978,15 @@ mod tests {
         ll_list_int_resize_ge_word, ll_list_obj_resize_ge_word, majit_stringbuilder_append_jit_abi,
         majit_stringbuilder_build_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
-        pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
-        pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs, replace_value_word_jit_abi,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        switch_to_correct_strategy_word, unicode_dict_getitem_str_hashed_word,
-        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
-        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
-        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
-        w_list_pop_end_word, w_module_dict_lookup_object_entries_word, write_bytes_word_jit_abi,
+        pyframe_get_w_globals_word, pyframe_load_global_value_word, pyframe_load_name_value_word,
+        pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs,
+        replace_value_word_jit_abi, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
+        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
+        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
+        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
+        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word, write_bytes_word_jit_abi,
     };
     use std::collections::HashMap;
 
@@ -8965,6 +8985,10 @@ mod tests {
             (
                 "pyre_interpreter::type_methods::list_extend_items",
                 crate::opcode_ops::jit_type_methods_list_extend_items as *const () as usize as i64,
+            ),
+            (
+                "pyframe::PyFrame::get_w_globals",
+                pyframe_get_w_globals_word as *const () as usize as i64,
             ),
             (
                 "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",

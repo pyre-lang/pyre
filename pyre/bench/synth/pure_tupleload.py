@@ -15,7 +15,7 @@
 # residual path. It MUST NOT SIGSEGV and MUST stay correct.
 #
 # Case C builds a fresh arity-2 pair per iteration and reads both halves. This
-# is the shape `subscr_tuple_descent` serves by descending `w_tuple_getitem`;
+# is the shape traced through `binary_value_from_tag`'s own call to `w_tuple_getitem`;
 # the hand-written `subscr_specialised_pair` reader it replaced measured 46.3x
 # here when suppressed, the largest single-fold effect in the corpus, so this
 # loop is what keeps the ceiling below honest.

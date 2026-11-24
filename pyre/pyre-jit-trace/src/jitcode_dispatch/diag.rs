@@ -375,7 +375,6 @@ spec_folds! {
     Subscr               => ("subscr",                   "residual_call,inline_call", "-"),
     BinaryOpIntZeroDiv   => ("binary_op_int_zero_div",   "residual_call,inline_call", "-"),
     Unpack               => ("unpack",                   "residual_call", "-"),
-    SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
     InstanceIter         => ("instance_iter",            "residual_call", "-"),
     GeneratorNext        => ("generator_next",           "residual_call", "-"),

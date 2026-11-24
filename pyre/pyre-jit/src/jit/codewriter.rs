@@ -19936,7 +19936,7 @@ mod tests {
         assert!(!pyjit.has_abort);
         assert_ne!(pyjit.metadata.portal_frame_reg, u16::MAX);
         let calls: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
-            .filter(|op| op.key.contains("residual_call"))
+            .filter(|op| op.key.contains("inline_call") || op.key.contains("residual_call"))
             .collect();
         assert!(
             calls.iter().any(|op| {
@@ -19944,7 +19944,7 @@ mod tests {
                 (op.pc + 3..op.pc + 8)
                     .any(|i| code.get(i).copied() == Some(pyjit.metadata.portal_frame_reg as u8))
             }),
-            "MAKE_FUNCTION must read globals from this frame, not a build-time constant"
+            "MAKE_FUNCTION must read globals from this frame (inline_call_r_r of get_w_globals or the live-frame residual), not a build-time constant"
         );
     }
 
