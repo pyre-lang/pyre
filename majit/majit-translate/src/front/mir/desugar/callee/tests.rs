@@ -1109,10 +1109,49 @@ fn identity_path_for_fun_decl_uses_the_call_leaf_and_specialization() {
     assert_ne!(spec.segments, base.segments);
 }
 
+/// One Charon `NameSeg` in an `inherent_adt_impl_make_llbc` family fixture.
+#[derive(Clone, Copy)]
+enum FixtureSeg<'a> {
+    Ident(&'a str),
+    /// Inherent `impl Self` whose TypeDecl is `id`.
+    Inherent(u64),
+    /// `impl Trait for Self` (`Trait` is the `trait_impls` row).
+    TraitImpl {
+        self_ty: u64,
+        trait_impl: u64,
+    },
+}
+
 /// JSON LLBC: inherent `fn make` methods whose Self is an ADT TypeDecl.
 /// `types` is `(def_id, ident path)`; `methods` is
 /// `(fun def_id, impl-module idents, self TypeDecl id)`.
 fn inherent_adt_impl_make_llbc(types: &[(u64, &[&str])], methods: &[(u64, &[&str], u64)]) -> Llbc {
+    let types: Vec<(u64, Vec<FixtureSeg<'_>>)> = types
+        .iter()
+        .map(|(id, path)| (*id, path.iter().copied().map(FixtureSeg::Ident).collect()))
+        .collect();
+    let funs: Vec<(u64, Vec<FixtureSeg<'_>>)> = methods
+        .iter()
+        .map(|(def_id, module, self_id)| {
+            let mut segs: Vec<FixtureSeg<'_>> =
+                module.iter().copied().map(FixtureSeg::Ident).collect();
+            segs.push(FixtureSeg::Inherent(*self_id));
+            segs.push(FixtureSeg::Ident("make"));
+            (*def_id, segs)
+        })
+        .collect();
+    fixture_adt_llbc(&types, &funs, &[], &[])
+}
+
+/// Sparse `type_decls` / `fun_decls` / `trait_decls` / `trait_impls`
+/// indexed by `def_id`. `traits` is `(id, ident path)`; `trait_impls`
+/// is `(impl_id, trait_id, self TypeDecl id)`.
+fn fixture_adt_llbc(
+    types: &[(u64, Vec<FixtureSeg<'_>>)],
+    funs: &[(u64, Vec<FixtureSeg<'_>>)],
+    traits: &[(u64, &[&str])],
+    trait_impls: &[(u64, u64, u64)],
+) -> Llbc {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
     }});
@@ -1135,42 +1174,103 @@ fn inherent_adt_impl_make_llbc(types: &[(u64, &[&str])], methods: &[(u64, &[&str
         })
     };
     let ty = |id: u64| serde_json::json!({"Value": [id, adt(id)]});
-    let inherent = |id: u64| {
-        serde_json::json!({"Impl": {"Ty": {
+    let seg_json = |seg: FixtureSeg<'_>| match seg {
+        FixtureSeg::Ident(s) => ident(s),
+        FixtureSeg::Inherent(id) => serde_json::json!({"Impl": {"Ty": {
             "skip_binder": ty(id),
             "kind": "InherentImplBlock"
-        }}})
+        }}}),
+        FixtureSeg::TraitImpl {
+            self_ty,
+            trait_impl,
+        } => serde_json::json!({"Impl": {
+            "Ty": {"skip_binder": ty(self_ty), "kind": "TraitImpl"},
+            "Trait": trait_impl
+        }}),
     };
-    let type_decls: Vec<_> = types
-        .iter()
-        .map(|(id, path)| {
-            serde_json::json!({
-                "def_id": id,
-                "item_meta": meta(path.iter().copied().map(ident).collect()),
-                "kind": {"Struct": []}
+    let fill = |rows: Vec<(u64, serde_json::Value)>| {
+        let n = rows
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .map(|id| id + 1)
+            .unwrap_or(0);
+        let mut out = vec![serde_json::Value::Null; n as usize];
+        for (id, value) in rows {
+            out[id as usize] = value;
+        }
+        out
+    };
+    let type_decls = fill(
+        types
+            .iter()
+            .map(|(id, path)| {
+                (
+                    *id,
+                    serde_json::json!({
+                        "def_id": id,
+                        "item_meta": meta(path.iter().copied().map(seg_json).collect()),
+                        "kind": {"Struct": []}
+                    }),
+                )
             })
-        })
-        .collect();
-    let mut fun_decls = vec![serde_json::Value::Null];
-    for (def_id, module, self_id) in methods {
-        let mut name: Vec<_> = module.iter().copied().map(ident).collect();
-        name.push(inherent(*self_id));
-        name.push(ident("make"));
-        fun_decls.push(serde_json::json!({
-            "def_id": def_id,
-            "item_meta": meta(name),
-            "signature": {
-                "is_unsafe": false,
-                "inputs": [],
-                "output": {"Scalar": "Bool"}
-            },
-            "body": {"Unstructured": {
-                "span": span.clone(),
-                "locals": {"arg_count": 0, "locals": []},
-                "body": []
-            }}
-        }));
-    }
+            .collect(),
+    );
+    let fun_decls = fill(
+        funs.iter()
+            .map(|(def_id, path)| {
+                (
+                    *def_id,
+                    serde_json::json!({
+                        "def_id": def_id,
+                        "item_meta": meta(path.iter().copied().map(seg_json).collect()),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [],
+                            "output": {"Scalar": "Bool"}
+                        },
+                        "body": {"Unstructured": {
+                            "span": span.clone(),
+                            "locals": {"arg_count": 0, "locals": []},
+                            "body": []
+                        }}
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let trait_decls = fill(
+        traits
+            .iter()
+            .map(|(id, path)| {
+                (
+                    *id,
+                    serde_json::json!({
+                        "def_id": id,
+                        "item_meta": meta(path.iter().copied().map(ident).collect()),
+                        "methods": []
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let trait_impl_decls = fill(
+        trait_impls
+            .iter()
+            .map(|(impl_id, trait_id, self_ty)| {
+                (
+                    *impl_id,
+                    serde_json::json!({
+                        "impl_trait": {
+                            "id": trait_id,
+                            "generics": {"types": [adt(*self_ty)], "const_generics": []}
+                        },
+                        "methods": []
+                    }),
+                )
+            })
+            .collect(),
+    );
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -1179,8 +1279,8 @@ fn inherent_adt_impl_make_llbc(types: &[(u64, &[&str])], methods: &[(u64, &[&str
             "type_decls": type_decls,
             "fun_decls": fun_decls,
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impl_decls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("inherent ADT impl fixture parses")
@@ -1284,6 +1384,173 @@ fn registered_path_for_fun_decl_same_module_inherent_impl_is_type_decl_path() {
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>()
+    );
+}
+
+/// `impl A { fn build() { struct T; impl T { fn make() {} } } }` vs
+/// `impl B { fn build() { struct T; impl T { fn make() {} } } }`.
+/// TypeDecl paths carry the enclosing inherent Impl; Ident-only Self
+/// (`c::build::T::make`) collides (`Bookkeeper.getdesc` keys the
+/// function object).
+#[test]
+fn registered_path_for_fun_decl_distinguishes_nested_type_decls_in_inherent_impls() {
+    let llbc = fixture_adt_llbc(
+        &[
+            (0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")]),
+            (1, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("B")]),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(0),
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(1),
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+        ],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(2),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(3),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+        ],
+        &[],
+        &[],
+    );
+    let in_a = identity_segs(&llbc, 1);
+    let in_b = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_a, in_b,
+        "nested TypeDecl T in impl A vs impl B collapsed: {in_a:?} {in_b:?}"
+    );
+}
+
+/// Same nested `struct T; impl T { fn make }`, but the enclosing scope
+/// is `impl X for A { fn build() }` vs `impl Y for A { fn build() }`
+/// (same Self, different traits).
+#[test]
+fn registered_path_for_fun_decl_distinguishes_nested_type_decls_in_trait_impls() {
+    let llbc = fixture_adt_llbc(
+        &[
+            (0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")]),
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 0,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 1,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("T"),
+                ],
+            ),
+        ],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(1),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::Inherent(2),
+                    FixtureSeg::Ident("make"),
+                ],
+            ),
+        ],
+        &[(0, &["c", "X"]), (1, &["c", "Y"])],
+        &[(0, 0, 0), (1, 1, 0)],
+    );
+    let in_x = identity_segs(&llbc, 1);
+    let in_y = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_x, in_y,
+        "nested TypeDecl T in impl X for A vs impl Y for A collapsed: {in_x:?} {in_y:?}"
+    );
+}
+
+/// FunDecl nested in a trait-impl method:
+/// `impl X for A { fn build() { fn helper() {} } }` vs
+/// `impl Y for A { fn build() { fn helper() {} } }`. The last Impl is
+/// the trait impl; `scope_owner_impl_seg` / last-Impl `render_trait_impl`
+/// must keep X vs Y.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_helpers_nested_in_trait_impl_methods() {
+    let llbc = fixture_adt_llbc(
+        &[(0, vec![FixtureSeg::Ident("c"), FixtureSeg::Ident("A")])],
+        &[
+            (
+                1,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 0,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("helper"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    FixtureSeg::Ident("c"),
+                    FixtureSeg::TraitImpl {
+                        self_ty: 0,
+                        trait_impl: 1,
+                    },
+                    FixtureSeg::Ident("build"),
+                    FixtureSeg::Ident("helper"),
+                ],
+            ),
+        ],
+        &[(0, &["c", "X"]), (1, &["c", "Y"])],
+        &[(0, 0, 0), (1, 1, 0)],
+    );
+    let in_x = identity_segs(&llbc, 1);
+    let in_y = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_x, in_y,
+        "helper nested in impl X for A vs impl Y for A collapsed: {in_x:?} {in_y:?}"
     );
 }
 
