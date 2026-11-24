@@ -266,15 +266,33 @@ pub(super) fn enable_finalizers() -> Result<(), pyre_interpreter::PyError> {
     // Unlike gc.enable(), an unmatched enable is an error rather than a
     // no-op. Before UserDelAction is installed there cannot have been a
     // matching disable, so that is the same zero lock depth.
-    let Some(uda) = user_del_action().filter(|uda| uda.finalizers_lock_count > 0) else {
+    let Some(uda) = user_del_action() else {
         return Err(pyre_interpreter::PyError::value_error(
             "finalizers are already enabled",
         ));
     };
-    uda.finalizers_lock_count -= 1;
-    if uda.finalizers_lock_count == 0
-        && let Some(pending) = uda.pending_with_disabled_del.take()
-    {
+    // `interp_gc.py enable_finalizers`: check the depth before decrementing.
+    // Serialize this transition with disable_finalizers and gc_disabled, then
+    // release the list mutex before invoking any application finalizer.
+    // The GC root walk (`walk_space_user_del_action_roots`) takes this mutex,
+    // so nothing that can allocate on the managed heap runs while it is held:
+    // the `ValueError` is built after the guard is dropped.
+    let pending = {
+        let mut deferred = uda.pending_with_disabled_del.lock();
+        if uda.finalizers_lock_count.load(Ordering::Acquire) == 0 {
+            None
+        } else {
+            let previous = uda.finalizers_lock_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+            Some(if previous == 1 { deferred.take() } else { None })
+        }
+    };
+    let Some(pending) = pending else {
+        return Err(pyre_interpreter::PyError::value_error(
+            "finalizers are already enabled",
+        ));
+    };
+    if let Some(pending) = pending {
         // The list just left its GC-visible UserDelAction slot; keep every
         // entry rooted while the finalizers run (upstream clears the
         // GC-visible list as it progresses).
@@ -296,9 +314,10 @@ pub(super) fn enable_finalizers() -> Result<(), pyre_interpreter::PyError> {
 pub(super) fn disable_finalizers() {
     // The lock is recursive and deliberately independent of gc.isenabled().
     if let Some(uda) = user_del_action() {
-        uda.finalizers_lock_count += 1;
-        if uda.pending_with_disabled_del.is_none() {
-            uda.pending_with_disabled_del = Some(Vec::new());
+        let mut pending = uda.pending_with_disabled_del.lock();
+        uda.finalizers_lock_count.fetch_add(1, Ordering::AcqRel);
+        if pending.is_none() {
+            *pending = Some(Vec::new());
         }
     }
 }
