@@ -259,6 +259,11 @@ impl<'a> Lowering<'a> {
                 return Ok(());
             }
         }
+        if let CallFunc::Regular(reg) = &call.func
+            && self.try_lower_object_vec_rangefrom(mir_bb, &call, dest_local, target, reg)?
+        {
+            return Ok(());
+        }
         if self.is_pair_call(&call, dest_local) {
             return self.lower_pair_call(mir_bb, call, dest_local, target);
         }
@@ -267,22 +272,24 @@ impl<'a> Lowering<'a> {
         self.owner_root_reroot = self.owner_root_reroot_call(mir_bb, &call, dest_local)?;
         let rerooted = self.owner_root_reroot.is_some();
 
-        // The call result kind is the MIR-declared type of the
-        // destination place. RPython `call.py` `getcalldescr` reads `FUNC.RESULT`
-        // off the callee funcptr; the destination local's declared type
-        // is that same value at the call site, so deriving it here keeps
-        // `getcalldescr`'s `RESULT == FUNC.RESULT` check (`call.py`)
-        // satisfied for non-`Int` returns such as
-        // `new_for_call_with_closure_and_globals_obj` (Ref).
+        // The call result kind is `FUNC.RESULT` (`call.py:222`): the
+        // callee FunDecl output after substitution (`dest_class_ty`).
+        // An unused dest can be the unit dummy while the callee still
+        // returns `usize`; RPython still carries a typed `op.result`
+        // (`jtransform.py handle_regular_call` `reskind =
+        // getkind(op.result.concretetype)[0]`). Unit is the FunDecl
+        // output (`is_unit_type` on that type); a non-unit output stamps
+        // a result Variable through `valuetype_to_concrete_for_legacy`.
         //
         // A `-> ()` callee's graph reports a void result kind (its
-        // `Return` lowers via `set_return(None)`, see [`is_unit_type`]),
-        // and [`tyref_to_value_type`] paints unit `Void` so the call
+        // `Return` lowers via `set_return(None)`), and
+        // [`tyref_to_value_type`] paints unit `Void` so the call
         // site's `FUNC.RESULT` matches (`call.rs`,
         // `ExecutionContext.force_all_frames`).
         //
-        // A raw pointer to a non-byte scalar is the address word.
-        // `history.py` `getkind` banks every raw `Ptr` as `int`, and
+        // A raw pointer to a scalar is the address word.
+        // `history.py` `getkind` banks every raw `Ptr` as `int`,
+        // including `*mut u8` (`rffi.CCHARP`), and
         // [`pygraph_initial_block`] already records that parameter as
         // `Int`. The call that produced the pointer uses the same bank.
         // `std::alloc::alloc` / `alloc_zeroed` is that same Address
@@ -322,41 +329,128 @@ impl<'a> Lowering<'a> {
                 .map(|fd| clone_tyref(&fd.signature.output)),
             _ => None,
         };
-        let dest_class_ty: &TyRef = match &fd_output {
-            Some(out)
-                if tyref_enum_instantiation_suffix(
-                    &call.dest.ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                )
-                .is_empty()
-                    && !tyref_enum_instantiation_suffix(out, self.llbc, self.tombstoned_leaves)
-                        .is_empty() =>
-            {
-                out
-            }
-            _ => &call.dest.ty,
+        // `rtyper.py` `setconcretetype` writes `FUNC.RESULT` from the
+        // callee binding. Substitute `T` on the FunDecl output so a
+        // generic `Option<&T>` dest is already Address when `T` is raw.
+        // `substitute_field_typevars` reads `owner.Adt.generics`, the
+        // same wrapper `instantiate_adt_field_ty` uses.
+        let substituted_output = match &call.func {
+            CallFunc::Regular(reg) => fd_output.as_ref().and_then(|out| {
+                let generics = self.instantiate_call_generics(&reg.generics);
+                substitute_fun_output_typevars(out, &generics, self.llbc).or_else(|| {
+                    regular_call_fun_decl_id(&reg.kind)
+                        .and_then(|id| self.llbc.fn_by_id(id))
+                        .and_then(|fd| fd.item_meta.instantiation().cloned())
+                        .and_then(|inst| substitute_fun_output_typevars(out, &inst, self.llbc))
+                })
+            }),
+            _ => None,
         };
-        let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
+        let dest_class_owned: TyRef = {
+            let candidate = substituted_output.as_ref().or(fd_output.as_ref());
+            match candidate {
+                Some(out)
+                    if !self.tyref_output_is_unsubstituted(out)
+                        && (tyref_enum_instantiation_suffix(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )
+                        .is_empty()
+                            || !tyref_enum_instantiation_suffix(
+                                out,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            )
+                            .is_empty()) =>
+                {
+                    clone_tyref(out)
+                }
+                _ => clone_tyref(&call.dest.ty),
+            }
+        };
+        let dest_class_ty = &dest_class_owned;
+        let mut arg_locals: Vec<Option<usize>> = call
+            .args
+            .iter()
+            .map(|op| match op {
+                Operand::Copy(p) | Operand::Move(p) => match p.kind {
+                    PlaceKind::Local(i) => Some(i as usize),
+                    _ => None,
+                },
+                Operand::Const(_) => None,
+            })
+            .collect();
+        let arg_operands = call.args.clone();
+        let result_ty = if is_unit_type(dest_class_ty, self.llbc) {
             ValueType::Void
         } else if callee_is_std_alloc_raw {
             ValueType::Int
-        } else if !callee_returns_gc_block
-            && !graph_is_items_block_base_accessor(&self.graph.name)
-            && let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc)
+        } else if callee_returns_gc_block {
+            // Collapsed items-base / typed-array `base()` is the GC
+            // block header (`l.items`). `history.py` `getkind` of a GC
+            // pointer is `ref`. The dest spelling `*mut u8` / `*mut i64`
+            // is the interior address `rffi.cast` produces after this
+            // call (`ann_direct_ptradd`). `Ref(None)` so
+            // `result_narrow_root` does not emit a class cast.
+            ValueType::Ref(None)
+        } else if graph_is_items_block_base_accessor(&self.graph.name)
+            && raw_scalar_address_value_type(dest_class_ty, self.llbc).is_some()
+        {
+            // Host null/offset calls in a normalized `ll_items` body carry
+            // the same GcArray repr as the accessor's caller-facing result.
+            ValueType::Ref(None)
+        } else if !graph_is_items_block_base_accessor(&self.graph.name)
+            && let Some(ccharp) = raw_u8_ccharp_bank(dest_class_ty, self.llbc)
         {
             // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
+            // The items-block accessor body (`rlist.py` `ll_items`) keeps
+            // `*mut u8` as the GC header so `null_mut` stays ConstRefNull.
             ccharp
         } else if !callee_returns_gc_block
-            && let Some(voidp) = raw_c_void_ptr_bank(&call.dest.ty, self.llbc)
+            && let Some(voidp) = raw_c_void_ptr_bank(dest_class_ty, self.llbc)
+                .or_else(|| {
+                    crate::front::result_exc::tyref_result_ok(dest_class_ty, self.llbc)
+                        .or_else(|| {
+                            crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
+                        })
+                        .and_then(|ok| raw_c_void_ptr_bank(&ok, self.llbc))
+                })
+                .or_else(|| raw_c_void_ptr_bank(&call.dest.ty, self.llbc))
         {
+            // FunDecl output after substitution, same as CCHARP. Result dest
+            // is the Ok payload (`rffi.py` VOIDP). Kind stays Int
+            // (`history.py` getkind of a raw Ptr).
             voidp
-        } else if !callee_returns_gc_block
-            && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
+        } else if !graph_is_items_block_base_accessor(&self.graph.name)
+            && let Some(raw) = raw_scalar_address_value_type(dest_class_ty, self.llbc)
         {
             raw
         } else {
-            self.value_type_of(dest_class_ty)
+            let painted = self.value_type_of(dest_class_ty);
+            // Residual FUNC.RESULT is `dont_look_inside_return_token`
+            // (`call.py getcalldescr`); RegularCall dest is the same
+            // `tyref_to_value_type_with` painter as main.
+            // Transparent raw wrapper (`RootScope` → usize): the peel
+            // paints Unsigned and [`tyref_call_signature_raw_value`]
+            // misses the wrapper (`strip_ty_indirections`). `history.py`
+            // `getkind` of that word is `'int'`. FUNC.RESULT still
+            // spells `u64`.
+            match painted {
+                ValueType::Unsigned
+                    if tyref_transparent_inner_value_type(
+                        dest_class_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .is_some() =>
+                {
+                    ValueType::Int
+                }
+                other => other,
+            }
         };
         // A typed `Ref(Some(root))` already carries the intern key
         // (`tyref_to_value_type` paints a payload-carrying enum this way).
@@ -382,6 +476,12 @@ impl<'a> Lowering<'a> {
         // `getattr("__getitem__")` (`getitem_SomeInstance`). Narrow through
         // the `[Class]` list spelling brick 3 already uses for
         // `*base.add(idx)` (`object_ref_items_list_root`).
+        // `tuple_items_base` returns `*mut PyObjectRef`. Charon expands
+        // `type PyObjectRef = *mut PyObject` one level, so dest.ty is
+        // `*mut PyObject` and [`object_ref_items_list_root`] (which wants
+        // `*mut *mut Class`) misses. The FunDecl is still the items-base
+        // accessor (`regular_call_is_items_block_accessor`); brick 3's
+        // `[PyObject]` list spelling is that ARRAY's identity.
         let items_block_items_list_root = match &call.func {
             CallFunc::Regular(reg)
                 if regular_call_is_items_block_accessor(reg, self.llbc)
@@ -389,9 +489,11 @@ impl<'a> Lowering<'a> {
             {
                 object_ref_items_list_root(&call.dest.ty, self.llbc)
                     .or_else(|| object_ref_items_list_root(dest_class_ty, self.llbc))
+                    .or_else(|| Some("[PyObject]".to_string()))
             }
             _ => None,
         };
+        let has_items_block_list_root = items_block_items_list_root.is_some();
         let result_narrow_root: Option<String> = match &result_ty {
             // A producer's graph returns the rbigint its handle roots
             // ([`OwnerRootPlan`]), the instance `RBigInt::clone` narrows to.
@@ -546,6 +648,21 @@ impl<'a> Lowering<'a> {
                 }),
             _ => None,
         };
+        // Fieldless enums are ints. Same gate as `instance_narrow_for_type`:
+        // the bookkeeper pre-mints variant classdefs for inheritance
+        // numbering; that classdef is not the value (`rclass.py`
+        // `cast_instance` requires a pointer).
+        // `callee_returns_gc_block` is the collapsed header (`l.items`):
+        // skip a class cast of the block itself. The items-base list
+        // spelling is the ARRAY identity of that header, and wraptuple's
+        // `*base` / `*base.add(1)` reads need it (`getitem` of
+        // `GcArray(OBJECTPTR)`). Keep that narrow when it fired.
+        let result_narrow_root = if callee_returns_gc_block && !has_items_block_list_root {
+            None
+        } else {
+            result_narrow_root
+                .filter(|_| tyref_fieldless_enum_pointee(dest_class_ty, self.llbc).is_none())
+        };
         // The Call dest is already `SomeInstance(root)` when `result_ty`
         // names that root, except `ptr::null_mut` / `null`:
         // `ptr_null_constant` is classdef-less regardless of `result_ty`
@@ -591,29 +708,13 @@ impl<'a> Lowering<'a> {
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
+        // `arg_locals` / `arg_operands` were captured above for the
+        // `as_ref` dest stamp.
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
         // STR/list views converted to `(data, len)` for this call
         // (`emit_str_to_window` / `emit_list_view_to_window`). Keepalive
         // after the last use of that raw `char *` (`keepalive_until_here`).
         let mut converted_window_owners: Vec<Variable> = Vec::new();
-        // MIR local index behind each plain-local argument, kept
-        // alongside the resolved Variables so call intercepts can
-        // consult per-local lowering state
-        // (`const_discriminant_locals`).
-        let arg_locals: Vec<Option<usize>> = call
-            .args
-            .iter()
-            .map(|op| match op {
-                Operand::Copy(p) | Operand::Move(p) => match p.kind {
-                    PlaceKind::Local(i) => Some(i as usize),
-                    _ => None,
-                },
-                Operand::Const(_) => None,
-            })
-            .collect();
-        // Kept beside `arg_locals`. A projection (`pair.0`) and a literal
-        // have no bare local; `spill_address_source` reads the operand.
-        let arg_operands = call.args.clone();
         // Every argument's place type, captured before the operands are
         // consumed. A residual `fn f<T>(x: &T)` keeps `T` as a `TypeVar`
         // on the declaration (`monomorphize:false`); the place type is the
@@ -727,12 +828,13 @@ impl<'a> Lowering<'a> {
                     .flatten();
                 // `first` / `last` share `get`'s `T` generic; the same
                 // ARRAY identity / thin-pointer proof feeds their
-                // `ArrayRead`. Skip the generic walk on every other
-                // Regular call.
-                let first_element = self
-                    .is_slice_first_or_last_call(reg)
-                    .then(|| self.slice_get_element(reg))
-                    .flatten();
+                // `ArrayRead`. RangeFrom `get(start..)` uses that
+                // identity to stamp the getslice marker, so the walk
+                // also runs for `<[T]>::get`.
+                let first_element = (self.is_slice_first_or_last_call(reg)
+                    || self.is_slice_get_call(reg))
+                .then(|| self.slice_get_element(reg))
+                .flatten();
                 // `arraylen_gc` only for an object-pointer receiver. The
                 // element-read identity above is a different value: a
                 // `[u8]` slice is length-prefixed and still not the GC
@@ -767,15 +869,22 @@ impl<'a> Lowering<'a> {
         // makes `pair_callee_decl` reject the call. Those sites keep the
         // data word as the receiver and leave the length in the frame
         // (`slice_get` reads it via FatLen / the recorded diamond).
+        //
+        // The window *return* ABI (`SLICE_LEN_SLOT` + CCHARP) is the
+        // instantiated dest, not the FunDecl output. An Opaque generic
+        // `from_raw_parts_mut` still spells `&mut [T]`; `pair_item_kind_of_node`
+        // maps a TypeVar item to Ref, so `pair_or_window_fun_inputs` would
+        // mark that output as a pair. `ensure_window_ccharp` then stored
+        // CCHARP into `Tuple<[u8],…>::__pos_0`, whose field getkind is ref.
         let (pair_input_is_pair_or_window, callee_output_is_window): (Vec<bool>, bool) =
             match &call.func {
                 CallFunc::Regular(reg) => regular_call_fun_decl_id(&reg.kind)
                     .and_then(|id| self.llbc.fn_by_id(id))
                     .map(|fd| {
-                        let (inputs, output) = self.pair_or_window_fun_inputs(fd, &reg.generics);
+                        let (inputs, _) = self.pair_or_window_fun_inputs(fd, &reg.generics);
                         (
                             inputs,
-                            output
+                            tyref_is_u8_window(&call.dest.ty, self.llbc)
                                 && fd.is_global_initializer().is_none()
                                 && !fundecl_is_promoted_const(fd),
                         )
@@ -874,6 +983,7 @@ impl<'a> Lowering<'a> {
         // (`fork_in_bounds`); later ops and the close belong on that tail.
         bb_id = self.emit_bb(mir_bb);
         let resolved_call_args = args.clone();
+        self.pass_by_value_multiword_as_addr(mir_bb, &call.func, &mut args);
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
         let raw_scalar_spills =
@@ -913,16 +1023,36 @@ impl<'a> Lowering<'a> {
         // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
-        // `v.extend_from_slice(s)` on a `Vec` of one-word items is
-        // `ll_extend` from the pair (`rlist.py` `ll_extend` /
-        // `AbstractListRepr.rtype_method_extend`). The helper is
-        // `rust_vec_helper_segments` / `rust_vec_helper_ops` arity 3
-        // `(l, items, length)` (`rrustvec.rs` `"extend_from_slice"`).
+        // `build_list_from_refs` / `build_tuple_from_refs` residual ABI is
+        // the `(ptr, len)` pair (`build_list_from_refs_jit_abi`). The
+        // graph's `&[PyObjectRef]` is the length-prefixed GcArray; expand
+        // it the same way `Vec::extend_from_slice` splices `ll_extend`.
+        if let CallFunc::Regular(reg) = &call.func
+            && regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(path_is_build_refs_pair_abi)
+            && pair_lens.is_empty()
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_object_pointer_slice(ty, self.llbc))
+        {
+            let (items, length) =
+                self.expand_object_gcarray_header_to_items_len(mir_bb, args[0].clone());
+            args = vec![items, length];
+        }
+        // `v.extend_from_slice(s)` on a pair-spliced `&[T]` is
+        // `ll_extend` from the pair (`rlist.py ll_extend` /
+        // `rrustvec.rs` `VecOp::ExtendFromSlice`). An object-pointer
+        // `&[PyObjectRef]` is the length-prefixed GcArray word, not a
+        // pair: that case is `vec_extend_gcarray_kind` below
+        // (`rlist.py ll_extend` with `l2` the GcArray).
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
-                if matches!(pair_lens.as_slice(), [(1, _)])
-                    && regular_call_name_path(reg, self.llbc).as_deref()
-                        == Some("alloc::vec::<Impl>::extend_from_slice") =>
+                if regular_call_name_path(reg, self.llbc)
+                    .as_deref()
+                    .is_some_and(path_is_vec_extend_from_slice)
+                    && matches!(pair_lens.as_slice(), [(1, _)]) =>
             {
                 first_arg_ty
                     .as_ref()
@@ -1021,7 +1151,11 @@ impl<'a> Lowering<'a> {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
             {
-                let args = splice_pair_lens(args, pair_lens);
+                let args = if matches!(pair_lens.as_slice(), [(1, _)]) {
+                    splice_pair_lens(args, pair_lens)
+                } else {
+                    self.expand_object_gcarray_to_items_len(mir_bb, args)
+                };
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         // `ll_extend` from the `(items, length)` pair
@@ -1033,6 +1167,7 @@ impl<'a> Lowering<'a> {
                         ),
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args),
@@ -1053,6 +1188,7 @@ impl<'a> Lowering<'a> {
                         .collect(),
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args),
@@ -1255,6 +1391,34 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_option_take(
+                    mir_bb,
+                    &reg,
+                    &arg_locals,
+                    &arg_operands,
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // `lltype.nullptr` of a raw Ptr (`rbuiltin.py`
+                // `rtype_const_result`, `rnone.py` `rtype_is_None`):
+                // Address `NULL` in the int bank. `null_mut()` annotates
+                // as a classdef-less `SomeInstance` (`ptr_null_constant`)
+                // and cannot union with a `RustVec` header word
+                // (`rrustvec.rs` `rust_vec_lltype`, `history.py` `getkind`
+                // `'int'`). FunDecl identity, dest already stamped Int.
+                if args.is_empty()
+                    && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                    && self.is_ptr_null_mut(&reg)
+                {
+                    let null = self.graph.push_address_null(bb_id);
+                    self.local_var[dest_local] = Some(LocalValue::One(null));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Fold an inline `core::mem::size_of::<T>()` /
                 // `align_of::<T>()` call to its build-time byte size /
                 // alignment — the same constant `fold_size_const_global`
@@ -1263,37 +1427,40 @@ impl<'a> Lowering<'a> {
                 // `try_gc_alloc_stable_raw(tid, size_of::<T>())`, and
                 // `Layout::from_size_align(_, align_of::<usize>())`).
                 // Removes the residual `<host std.mem.size_of>` /
-                // `align_of` call the rtyper cannot register.  Declines
-                // (falls through to the ordinary call path) for a pointer /
-                // tuple / unresolved layout.
+                // `align_of` call the rtyper cannot register. A thin
+                // pointer is one address word (`llmemory.sizeof(Address)`);
+                // a tuple or a struct whose Charon offsets did not resolve
+                // still folds from its field types.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
                     let want_align = match fd.item_meta.name_path_str() {
-                        "core::mem::size_of" => Some(false),
-                        "core::mem::align_of" => Some(true),
+                        "core::mem::size_of" | "std::mem::size_of" => Some(false),
+                        "core::mem::align_of" | "std::mem::align_of" => Some(true),
                         _ => None,
                     };
                     if let Some(want_align) = want_align
-                        && let Some(ty) = reg
-                            .generics
-                            .get("types")
-                            .and_then(serde_json::Value::as_array)
-                            .and_then(|a| a.first())
-                        && let Some(size) = self.size_align_const_from_tyexpr(want_align, ty)
+                        && let Some(ty) = size_align_call_type_arg(fd, &reg.generics)
                     {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::ConstInt(size),
-                        });
-                        self.local_var[dest_local] = Some(LocalValue::One(res));
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
+                        if let Some(size) = self.size_align_const_from_tyexpr(want_align, ty) {
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind: OpKind::ConstInt(size),
+                            });
+                            self.local_var[dest_local] = Some(LocalValue::One(res));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        } else if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
+                            eprintln!(
+                                "[mir-frontend] size_align fold miss graph={} want_align={} ty={}",
+                                self.graph.name, want_align, ty
+                            );
+                        }
                     }
                 }
                 // `Layout::new::<T>()` is `size_of::<T>()` plus `align_of::<T>()`
@@ -1817,11 +1984,12 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
-                // identity in the lifted value model (String/&str and
-                // Vec/&[T] share one repr), so alias the destination to
-                // the receiver instead of emitting a `deref` method call
-                // the rtyper cannot route on the classdef-less receiver.
+                // identity in the lifted value model (String/&str share one
+                // repr), so alias the destination to the receiver instead of
+                // emitting a `deref` method call the rtyper cannot route on
+                // the classdef-less receiver.
                 //
                 // A `Vec` of one-word items is the address of its raw
                 // `{ptr, len, cap}` header, not a list. Aliasing that header
@@ -1973,9 +2141,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `prebuilt_str_storage(&str)` / `prebuilt_wtf8_storage(&Wtf8)` is
-                // the name's prebuilt `STR` (`CONST_STR_CACHE`,
-                // `BaseLLStringRepr.convert_const`), which the operand already is.
+                // `prebuilt_str_storage(&str)` is the literal's prebuilt
+                // `STR` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const`),
+                // which the `&str` operand already is.
                 if args.len() == 1 && self.is_prebuilt_str_storage_identity(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
                     let target_bb = self.block_id[target];
@@ -2369,6 +2537,83 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<*mut T>::offset_from` / `<*const T>::offset_from` is
+                // address arithmetic: `adr_delta` then int floordiv by
+                // `size_of::<T>()` (`llmemory` address ops). A residual
+                // call here is a symbolic path hash, not a code address.
+                if args.len() == 2
+                    && let Some(pointee_size) =
+                        self.ptr_offset_from_pointee_size(&reg, first_arg_ty.as_ref())
+                {
+                    let ptr_int = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
+                    let origin_int = push_cast_ptr_to_int(&mut self.graph, bb_id, args[1].clone());
+                    let delta = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(delta.clone()),
+                        kind: OpKind::BinOp {
+                            op: "sub".to_string(),
+                            lhs: ptr_int,
+                            rhs: origin_int,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    let result = if pointee_size <= 1 {
+                        delta
+                    } else {
+                        let size = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(size.clone()),
+                            kind: OpKind::ConstInt(pointee_size),
+                        });
+                        let quot = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(quot.clone()),
+                            kind: OpKind::BinOp {
+                                op: "floordiv".to_string(),
+                                lhs: delta,
+                                rhs: size,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                        quot
+                    };
+                    self.local_var[dest_local] = Some(LocalValue::One(result));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::ptr::from_ref` / `from_mut` is rustc `return r`
+                // (`ptr/mod.rs`). RPython has no reference type separate
+                // from `Ptr`; `rptr.py` / `annlowlevel.py specialize_call`
+                // emit `cast_pointer` and `jtransform.py
+                // rewrite_op_cast_pointer` aliases via `same_as`. Alias
+                // here so unique-graph annotate never residualises a host
+                // Call the registry does not own.
+                if args.len() == 1
+                    && regular_call_name_path(&reg, self.llbc)
+                        .as_deref()
+                        .is_some_and(|name| {
+                            let segs: Vec<String> = name
+                                .split("::")
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            crate::codewriter::jtransform::is_ptr_from_ref_path(&segs)
+                        })
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
                 // `lltype.direct_ptradd(ptr, unscaled_count)`.  `sub`
                 // negates the count.  The pointer's concretetype carries
@@ -2428,7 +2673,58 @@ impl<'a> Lowering<'a> {
                             count = neg;
                         }
                         let item = item_lltype_for_size(pointee_size);
-                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
+                        // `item_lltype_for_size` of a 40-byte `DICTENTRY`
+                        // is `FixedSizeArray(Char, n)` and `direct_ptradd`
+                        // stamps `CArrayPtr` of that blob (`lltype.py`
+                        // `_nofield`). A harvested GcArray ITEM is
+                        // `Ptr(Struct)` (`getarraysubstruct`). A GC item
+                        // recasts the address word with `cast_ptr_to_int`
+                        // then `cast_int_to_ptr`, the same way
+                        // `direct_arrayitems` dest is typed. A Raw item
+                        // (`rordereddict.py` `DICTENTRY` / `lltype.py`
+                        // `Struct`) goes through
+                        // `restore_offset_pointer_type` (`ll2ctypes.py`
+                        // `ForceCastEntry`): `ann_cast_int_to_ptr` expects
+                        // Integer, and the ptradd result is still a Ptr.
+                        let gc_item_ptr =
+                            self.ptr_add_gcarray_item_result_lltype(first_arg_ty.as_ref());
+                        let raw_entry = args[0].concretetype();
+                        let added = push_direct_ptradd(
+                            &mut self.graph,
+                            bb_id,
+                            args[0].clone(),
+                            count,
+                            &item,
+                        );
+                        match gc_item_ptr {
+                            Some(item_ptr)
+                                if matches!(
+                                    &item_ptr,
+                                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(p)
+                                        if p._needsgc()
+                                ) =>
+                            {
+                                let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, added);
+                                emit_dest_typed_cast_int_to_ptr(
+                                    &mut self.graph,
+                                    bb_id,
+                                    addr,
+                                    item_ptr,
+                                )
+                            }
+                            Some(item_ptr) => restore_offset_pointer_type(
+                                &mut self.graph,
+                                bb_id,
+                                Some(item_ptr),
+                                added,
+                            ),
+                            None => restore_offset_pointer_type(
+                                &mut self.graph,
+                                bb_id,
+                                raw_entry,
+                                added,
+                            ),
+                        }
                     };
                     self.local_var[dest_local] = Some(LocalValue::One(offset));
                     let target_bb = self.block_id[target];
@@ -2440,8 +2736,10 @@ impl<'a> Lowering<'a> {
                 // raw store into the already-allocated object.  An aggregate
                 // write is left for `lower_struct_ptr_writes`.
                 if args.len() == 2
-                    && let Some((item_ty, itemsize, is_item_signed)) =
-                        self.ptr_write_store_descr(&reg, second_arg_ty.as_ref())
+                    && let Some((item_ty, itemsize, is_item_signed)) = self.ptr_write_store_descr(
+                        &reg,
+                        second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                    )
                 {
                     let offset = self
                         .graph
@@ -2571,6 +2869,91 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `&vec[k..]` of a raw-pointer Vec is the same address
+                // view as RangeFull, offset by `k` items
+                // (`lltype.direct_ptradd`). The getslice rewrite declines
+                // an Int-banked receiver (`arraylen_gc` of the header).
+                if args.len() == 2 && is_vec_rangefrom_index_regular(&reg, self.llbc) {
+                    let object_vec = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc));
+                    let start = self
+                        .slice_index_rangefrom_sites
+                        .iter()
+                        .find(|site| site.range_result == args[1])
+                        .map(|site| site.start.clone())
+                        .or_else(|| self.rangefrom_start_of(&args[1]));
+                    // `Vec<*mut PyObject>[k..]` is `l[start:]`
+                    // (`ll_listslice_startonly`). Whole-list RangeFull
+                    // already copies into a GcArray; the suffix is that
+                    // copy plus the existing getslice marker.
+                    if object_vec
+                        && vec_index_regular_unchecked_leaf(&reg, self.llbc) == Some("index")
+                        && let Some(start) = start.clone()
+                    {
+                        let view = self.emit_path_call(
+                            mir_bb,
+                            "pyre_object::gc_roots::gcarray_from_pyobject_vec",
+                            vec![args[0].clone()],
+                            ValueType::Ref(None),
+                        );
+                        let bb_id = self.emit_bb(mir_bb);
+                        let dest_ty = {
+                            let local = self.body.locals.locals.get(dest_local).ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: object vec RangeFrom dest local {dest_local} is missing"
+                                ))
+                            })?;
+                            clone_tyref(&local.ty)
+                        };
+                        if let Some(list_root) = object_pointer_slice_list_root(&dest_ty, self.llbc)
+                            .or_else(|| object_pointer_slice_list_root(&call.dest.ty, self.llbc))
+                            .or_else(|| {
+                                first_arg_ty
+                                    .as_ref()
+                                    .and_then(|ty| object_vec_item_as_list_root(ty, self.llbc))
+                            })
+                        {
+                            let list = self.narrow_value_to_instance_root(
+                                bb_id,
+                                crate::model::LinkArg::Value(view),
+                                &list_root,
+                            );
+                            let list_var = list
+                                .as_variable()
+                                .expect("cast_instance of a Variable stays a Variable")
+                                .clone();
+                            let sliced =
+                                self.emit_object_vec_getslice_rangefrom(bb_id, list_var, start);
+                            self.local_var[dest_local] = Some(LocalValue::One(sliced));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                    }
+                    if !object_vec
+                        && borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc, self.gc_struct_ids)
+                        && let Some(start) = start
+                    {
+                        let casted = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(casted.clone()),
+                            kind: cast_int_to_ptr_call(args[0].clone()),
+                        });
+                        let word = crate::layout::target_word_size() as i64;
+                        let item = item_lltype_for_size(word);
+                        let offset =
+                            push_direct_ptradd(&mut self.graph, bb_id, casted, start, &item);
+                        self.local_var[dest_local] = Some(LocalValue::One(offset));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // RPython's UTF-8 carrier is a byte string. A Rust
                 // `as_bytes()[i]` over the frontend's string identity is
                 // therefore `ord(s[i])`, not a list/array element load and
@@ -2583,46 +2966,43 @@ impl<'a> Lowering<'a> {
                     && self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && !self.is_slice_scalar_index_mut_call(&reg)
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let byte_copy = self.graph.name.ends_with("::copied_byte_vec");
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec!["__string_byte_getitem".to_string()],
-                                resolved_path: None,
-                                fun_decl_id: None,
-                                specialization: crate::parse::GraphSpecialization::Regular,
+                    if let Some(src) = self.take_string_repr_gcref(&args[0]) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let byte_copy = self.graph.name.ends_with("::copied_byte_vec");
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::function_path(["__string_byte_getitem"]),
+                                args: crate::model::call_args(vec![src, args[1].clone()]),
+                                // `ord` returns RPython Signed. The byte-copy
+                                // helper stores `u8`, so that graph's read is
+                                // unsigned. Rust's `u8` spelling is otherwise
+                                // representation detail here.
+                                result_ty: if byte_copy {
+                                    ValueType::Unsigned
+                                } else {
+                                    ValueType::Int
+                                },
                             },
-                            args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
-                            // `ord` returns RPython Signed. The byte-copy
-                            // helper stores `u8`, so that graph's read is
-                            // unsigned. Rust's `u8` spelling is otherwise
-                            // representation detail here.
-                            result_ty: if byte_copy {
-                                ValueType::Unsigned
-                            } else {
-                                ValueType::Int
-                            },
-                        },
-                    });
-                    // No `index_elem_alias` entry.  That table exists so a
-                    // paired `*p = v` becomes an `ArrayWrite` over the same
-                    // base, and this base is a `StringRepr` value — upstream
-                    // has no `setitem` on one (`rstr.py` offers only
-                    // `ll_str2mutable` / `mutable_str` for writes), so the
-                    // write half cannot exist.  The arm is already guarded by
-                    // `!is_slice_scalar_index_mut_call`, but recording an
-                    // alias whose pairing would mint an op RPython does not
-                    // have is a latent illegal-op source, and it also feeds
-                    // `compute_index_write_extra_live`'s liveness reasoning.
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                        });
+                        // No `index_elem_alias` entry.  That table exists so a
+                        // paired `*p = v` becomes an `ArrayWrite` over the same
+                        // base, and this base is a `StringRepr` value — upstream
+                        // has no `setitem` on one (`rstr.py` offers only
+                        // `ll_str2mutable` / `mutable_str` for writes), so the
+                        // write half cannot exist.  The arm is already guarded by
+                        // `!is_slice_scalar_index_mut_call`, but recording an
+                        // alias whose pairing would mint an op RPython does not
+                        // have is a latent illegal-op source, and it also feeds
+                        // `compute_index_write_extra_live`'s liveness reasoning.
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `as_bytes()[a..b]` / `w_bytearray_data(buf)[p..p+count]`
                 // is `getslice` of the byte-string view (`RStringIO.read`
@@ -2652,6 +3032,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![leaf.to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(getslice_args),
                             result_ty: ValueType::Ref(None),
@@ -2927,19 +3308,19 @@ impl<'a> Lowering<'a> {
                             .map(|ty| tyref_to_ast_string(ty, self.llbc));
                         let remapped = element_spelling
                             .as_deref()
-                            .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                            .and_then(crate::front::typestr::fat_box_array_id)
                             .or_else(|| {
                                 array_type_id
                                     .as_deref()
-                                    .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                                    .and_then(crate::front::typestr::fat_box_array_id)
                             })
                             .or_else(|| {
                                 receiver
                                     .as_deref()
-                                    .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                                    .and_then(crate::front::typestr::fat_box_array_id)
                             });
                         if let Some(id) = remapped {
-                            array_type_id = Some(id.to_string());
+                            array_type_id = Some(id);
                         }
                     }
                     // `&frame.items[i]` is a bounds-checked index (`nolength:
@@ -3072,6 +3453,7 @@ impl<'a> Lowering<'a> {
                                     ),
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![
@@ -3093,6 +3475,7 @@ impl<'a> Lowering<'a> {
                                     array_type_id.as_deref(),
                                 ),
                                 pure: false,
+                                taken_by_address: false,
                             },
                         };
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3203,6 +3586,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![
@@ -3294,6 +3678,7 @@ impl<'a> Lowering<'a> {
                                 array_type_id.as_str(),
                             )),
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -3357,6 +3742,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -3422,6 +3808,7 @@ impl<'a> Lowering<'a> {
                                 array_type_id.as_str(),
                             )),
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -3465,15 +3852,25 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                    let kind = if first_arg_is_string_byte_view {
+                    // The add traces to `<[u8]>::as_ptr`. Recover the STR
+                    // even when the block-entry byte-view mark missed a
+                    // forward edge (`merge_string_byte_view_state` skips
+                    // not-yet-lowered successors). `&mut [u8]` has no STR
+                    // and stays `ArrayRead`.
+                    let (base, recovered_str) = match self.take_string_repr_gcref(&args[0]) {
+                        Some(recovered) => (recovered, true),
+                        None => (args[0].clone(), false),
+                    };
+                    let kind = if first_arg_is_string_byte_view || recovered_str {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
-                            args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
+                            args: crate::model::call_args(vec![base.clone(), args[1].clone()]),
                             result_ty: ValueType::Int,
                         }
                     } else if window_load {
@@ -3486,7 +3883,7 @@ impl<'a> Lowering<'a> {
                         }
                     } else {
                         OpKind::ArrayRead {
-                            base: args[0].clone(),
+                            base: base.clone(),
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
@@ -3498,6 +3895,7 @@ impl<'a> Lowering<'a> {
                                 array_type_id.as_str(),
                             )),
                             pure: false,
+                            taken_by_address: false,
                         }
                     };
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3508,7 +3906,7 @@ impl<'a> Lowering<'a> {
                         dest_local,
                         IndexElemAlias {
                             base_local: arg_locals.first().copied().flatten(),
-                            base_var: args[0].clone(),
+                            base_var: base,
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
                             item_ty,
@@ -3567,6 +3965,96 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `FixedObjectArray::load_atomic(self, index, order)` is
+                // `ll_getitem_fast` (`rlist.py`) on the same
+                // `FixedSizeListRepr` `set_ref` writes. The method body
+                // is `item_atomic_ptr(index).load(order)`; collapsing
+                // the call keeps `getattr("item_atomic_ptr")` off the
+                // SomeList intern. Ordering is the array descr's load.
+                if args.len() == 3 && self.is_object_array_load_atomic_call(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
+                            nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
+                            pure: false,
+                            taken_by_address: false,
+                        },
+                    });
+                    let narrowed =
+                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(res), "PyObject");
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        narrowed
+                            .as_variable()
+                            .expect("a FixedObjectArray getitem stays a Variable")
+                            .clone(),
+                    ));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `FixedObjectArray::item_atomic_ptr(self, index)` is the
+                // interior of `l.items[index]` (`rlist.py` `ll_getitem_fast`).
+                // Bind dest to that getarrayitem and record
+                // `index_elem_alias` so a following `Atomic::load` is
+                // the element already read. Do not collapse
+                // `compare_exchange_ref` here: CAS stays
+                // `AtomicPtr::compare_exchange` (`extfunc.py`).
+                if args.len() == 2 && self.is_object_array_item_atomic_ptr_call(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
+                            nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
+                            pure: false,
+                            taken_by_address: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            rust_vec: None,
+                            list_root: None,
+                            items_owner: None,
+                            no_element: false,
+                        },
+                    );
+                    let narrowed =
+                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(res), "PyObject");
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        narrowed
+                            .as_variable()
+                            .expect("a FixedObjectArray item_atomic_ptr stays a Variable")
+                            .clone(),
+                    ));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3711,6 +4199,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3724,6 +4213,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -3763,10 +4253,17 @@ impl<'a> Lowering<'a> {
                 // (`rtyper/rbuilder.py` `AbstractStringBuilderRepr`), wherever
                 // the builder lives: a local or an instance attribute such as
                 // `rutf8.py` `Utf8StringBuilder._s`.
-                if let Some(method) = string_builder_method_leaf(self.llbc, &reg) {
+                // The markers exist for the lift-only adapter
+                // (`flowspace_adapter`); a graph that stays on this spine
+                // keeps the FunDecl so residual_shim can bind
+                // `StringBuilder::{new,append,build}`.
+                if self.builder_mode
+                    && let Some(method) = string_builder_method_leaf(self.llbc, &reg)
+                {
                     // `AbstractStringBuilderRepr.rtyper_new` yields the
                     // builder (`SomeStringBuilder`); `rtype_method_build`
                     // yields `SomeString` (`Ptr(STR)`).
+
                     let (marker, result_ty, concrete) = match method {
                         "new" => (
                             crate::runtime_names::shims::STRINGBUILDER_NEW,
@@ -3792,6 +4289,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![marker.to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(args.clone()),
@@ -3842,6 +4340,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: if builder_ctor_leaf == Some("with_capacity") {
@@ -3879,6 +4378,7 @@ impl<'a> Lowering<'a> {
                                     segments: vec!["__majit_stringbuilder_append".to_string()],
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![res.clone(), args[0].clone()]),
@@ -3969,6 +4469,7 @@ impl<'a> Lowering<'a> {
                                     ],
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![acc_val, piece_val]),
@@ -4059,6 +4560,12 @@ impl<'a> Lowering<'a> {
                     // is the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
+                    // `get().0 as *mut T` of an erased `OwnerRootGuard` is
+                    // the loaded GCREF word (`owner_root_guard.rs`). rustc
+                    // may emit that as `<ptr>::cast` after an int-to-ptr.
+                    // Recast onto the registered dest
+                    // (`rgc.cast_gcref_to_instance`). `deref_mut` casts a
+                    // `frame_ptr` call, which is not a guard word.
                     let dest_kind = self.value_type_of(&call.dest.ty);
                     let dest_is_ref = matches!(dest_kind, ValueType::Ref(_));
                     // Dest rstr `STR` (`is_rstr_str_layout_declaration`).
@@ -4076,7 +4583,11 @@ impl<'a> Lowering<'a> {
                     let src_root = first_arg_ty.as_ref().and_then(|ty| {
                         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
                     });
-                    if dest_is_str
+                    if let Some(word) = self.guard_root_word(&args[0]) {
+                        let recast =
+                            self.recast_gcref_word_to_registered_dest(bb_id, &call.dest.ty, word);
+                        self.local_var[dest_local] = Some(LocalValue::One(recast));
+                    } else if dest_is_str
                         && let Some((kind, res)) = self.ptr_cast_marker(
                             src_kind.as_ref(),
                             src_root.as_deref(),
@@ -4107,6 +4618,24 @@ impl<'a> Lowering<'a> {
                             dest_root.as_deref(),
                         );
                         self.local_var[dest_local] = Some(LocalValue::One(raw));
+                    } else if let Some((base, offset)) =
+                        self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
+                        && let Some(root) =
+                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                    {
+                        // `direct_arrayitems` of a GC array header
+                        // (`addr_of_mut!((*header).items).cast::<Entry>()`).
+                        // Dest is a pointer to the inlined item STRUCT, whose
+                        // declared kind is Raw; the header's `GcType` is what
+                        // makes this `direct_arrayitems`, not dest paint.
+                        let res = self.emit_array_tail_item_ptr(
+                            bb_id,
+                            base,
+                            offset,
+                            &root,
+                            &call.dest.ty,
+                        );
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if dest_is_ref
                         && let Some((base, offset)) =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
@@ -4146,7 +4675,7 @@ impl<'a> Lowering<'a> {
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else if self.should_emit_rffi_cast_identity_to_raw_scalar(
                         &call.dest.ty,
-                        first_arg_ty.as_ref(),
+                        self.ssa_value_kind(&args[0]).as_ref(),
                     ) {
                         // `index_words_ptr` is `typed_items_block_items_base
                         // as *mut i64` and returns that address. The source
@@ -4282,11 +4811,23 @@ impl<'a> Lowering<'a> {
                 // row carries the built object is `Bookkeeper.immutablevalue`
                 // of that object: the host initialized it before the row was
                 // captured, so the call is the constant and `f` never runs.
+                // dest is `&T`. Alias keeps the Address word of the cell;
+                // FieldRead of T's fields is getattr of a named field, which
+                // `SomeAddress.getattr` rejects (`llmemory.py`). Recast onto
+                // T (`annlowlevel.py` `cast_opaque_ptr`) so `.0.get()` of a
+                // `Cell` wrapper annotates.
                 if args.len() == 2
                     && !self.multi_assigned_locals.contains(&dest_local)
                     && self.is_prebuilt_once_lock_get_or_init(&reg, &args[0])
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    if let Some(v) = self.local_var[dest_local]
+                        .as_ref()
+                        .and_then(|lv| lv.one().ok())
+                    {
+                        let recast = self.recast_onto_dest_class_root(bb_id, v, &call.dest.ty);
+                        self.local_var[dest_local] = Some(LocalValue::One(recast));
+                    }
                     self.prebuilt_once_value_locals.push(dest_local);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -4341,6 +4882,40 @@ impl<'a> Lowering<'a> {
                             || (is_acquire
                                 && self.atomic_template_final_field_is_quasi_immutable(&template)))
                     {
+                        // A pinned static Atomic* is the object's address
+                        // (`rptr.py InteriorPtrRepr` parentptrtype). The
+                        // load is the inner scalar at that address
+                        // (`rtype_getattr` getinteriorfield of a
+                        // non-container FIELD_TYPE), not the static object
+                        // (`bookkeeper.py immutablevalue`).
+                        // Integer Atomic* statics stay a word `raw_load`.
+                        // `AtomicPtr` dest is a GCREF (`sys_exc_info_code`);
+                        // `raw_load` of Unsigned from that Ptr fails
+                        // `rtype_raw_load`. Fold the field instead
+                        // (`rptr.py InteriorPtrRepr`).
+                        if parent.is_none()
+                            && matches!(template.kind, PlaceKind::Global { .. })
+                            && matches!(
+                                self.value_type_of(&call.dest.ty),
+                                ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                            )
+                            && let Some((item_ty, itemsize, is_item_signed)) =
+                                self.atomic_load_word_descr(&call.dest.ty, first_arg_ty.as_ref())
+                        {
+                            let base = self.resolve_place(mir_bb, template.clone())?;
+                            let loaded = self.emit_raw_word_load(
+                                bb_id,
+                                base,
+                                item_ty,
+                                itemsize,
+                                is_item_signed,
+                            );
+                            self.local_var[dest_local] = Some(LocalValue::One(loaded));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         let value = self.fold_atomic_field_on_captured_parent(
                             template,
                             parent,
@@ -4383,34 +4958,37 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity of a non-borrow leaves the
                         // field *address*; loading that word is `raw_load`.
                         if let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&call.dest.ty)
+                            self.atomic_load_word_descr(&call.dest.ty, first_arg_ty.as_ref())
                         {
-                            let offset = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(offset.clone()),
-                                kind: OpKind::ConstInt(0),
-                            });
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind: OpKind::RawLoad {
-                                    base: args[0].clone(),
-                                    offset,
-                                    item_ty,
-                                    itemsize,
-                                    is_item_signed,
-                                },
-                            });
+                            let res = self.emit_raw_word_load(
+                                bb_id,
+                                args[0].clone(),
+                                item_ty,
+                                itemsize,
+                                is_item_signed,
+                            );
                             self.local_var[dest_local] = Some(LocalValue::One(res));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
                             self.graph.set_goto(bb_id, target_bb, link_args);
                             return Ok(());
                         }
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    // `item_atomic_ptr` already bound dest to
+                    // `ll_getitem_fast`. Unique-graph of `load_atomic`
+                    // takes `Ordering` as an argument, so the slot is
+                    // `unknown`; the getarrayitem is still the element.
+                    // A write-only `index_mut` alias has no element.
+                    if recv.is_some_and(|local| {
+                        self.index_elem_alias
+                            .get(&local)
+                            .is_some_and(|alias| !alias.no_element)
+                    }) {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -4647,6 +5225,23 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `from_raw_parts` of a fat box's own FatData and FatLen
+                // rebuilds that box. A different length is a subslice and
+                // keeps `n`.
+                if args.len() == 2
+                    && self.is_from_raw_parts_call(&reg)
+                    && let Some(box_var) =
+                        self.fat_box_whole_slice_from_raw_parts(&args[0], &args[1])
+                {
+                    if !self.is_fat_box_var(&box_var) {
+                        self.fat_box_vars.push(box_var.clone());
+                    }
+                    self.alias_dest_to_arg0(dest_local, box_var, false);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `f64::abs(x)` is `float_abs` (`lloperation.py` /
                 // `rfloat.rtype_abs`).  Opaque in core, so the callsite
                 // would skip as an unregistered FunctionPath.
@@ -4707,6 +5302,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["ll_math".to_string(), leaf.to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(args.iter().cloned()),
@@ -4934,6 +5530,16 @@ impl<'a> Lowering<'a> {
                             Some(&call.dest.ty),
                         );
                     }
+                    // A raw scalar pointer is already `int` (`history.py`
+                    // `getkind` of a raw `Ptr`). `cast_ptr_to_int` /
+                    // `cast_int_to_ptr` of that word is identity.
+                    if host_lltype_cast_is_int_identity(&path, src.as_ref(), &dst) {
+                        self.local_var[dest_local] = Some(LocalValue::One(args[0].clone()));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `llop.threadlocalref_get` / `threadlocalref_store`
                 // (`rthread.py ThreadLocalField.getraw` / `setraw`).
@@ -5041,6 +5647,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5090,6 +5697,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5172,6 +5780,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![recv]),
@@ -5200,6 +5809,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5235,6 +5845,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5265,6 +5876,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__strlen".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5423,7 +6035,7 @@ impl<'a> Lowering<'a> {
                     let fat_len = if str_family_len {
                         None
                     } else {
-                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
+                        self.fat_len_of(bb_id, &args[0])
                     };
                     let len = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
                         self.bind_array_view_len_in_block(bb_id, len_var)
@@ -5439,6 +6051,7 @@ impl<'a> Lowering<'a> {
                                     segments: vec!["__strlen".to_string()],
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -5450,6 +6063,7 @@ impl<'a> Lowering<'a> {
                                     segments: vec!["__len".to_string()],
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -5493,7 +6107,7 @@ impl<'a> Lowering<'a> {
                     let fat_len = if str_family_len {
                         None
                     } else {
-                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
+                        self.fat_len_of(bb_id, &args[0])
                     };
                     let res = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
                         self.bind_array_view_len_in_block(bb_id, len_var)
@@ -5736,6 +6350,7 @@ impl<'a> Lowering<'a> {
                                 ),
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5793,6 +6408,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__len".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5916,13 +6532,33 @@ impl<'a> Lowering<'a> {
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
                 // the receiver (twin of the `as_slice` identity above and
-                // `NonNull::as_ptr`).  A `Vec::as_ptr` is deliberately excluded
-                // (its items live behind a getfield, not the receiver) — see
-                // `is_container_as_ptr_identity`.
+                // `NonNull::as_ptr`) when dest getkind is still `ref`. Dest
+                // `*mut u8` is `rffi.CCHARP` (`history.py` `getkind` of a
+                // raw `Ptr` is `'int'`), so a GC receiver is
+                // `rbuiltin.py` `rtype_cast_ptr_to_int`. A `Vec::as_ptr` is
+                // deliberately excluded (its items live behind a getfield,
+                // not the receiver) — see `is_container_as_ptr_identity`.
                 // A window's `as_ptr` is `FatData` only; it does not mark
                 // `string_byte_view`. A W1 `as_bytes()` view keeps the mark
                 // via `alias_dest_to_arg0_inherit`.
+                // A W2 list receiver (`&mut [u8]` / `Vec<u8>` after
+                // as_mut_slice identity) is `rgc.nonmoving_raw_ptr_for_resizable_list`
+                // (`emit_list_items_ccharp`), the same helper the
+                // `alloc::vec::as_ptr` arm below uses. Identity would alias
+                // dest to the list header (Signed) and never emit that CCHARP.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
+                    if first_arg_is_list_view
+                        || first_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_is_u8_list(ty, self.llbc))
+                    {
+                        let ptr = self.emit_list_items_ccharp(mir_bb, args[0].clone());
+                        self.local_var[dest_local] = Some(LocalValue::One(ptr));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                     // A fat `Box<[T]>` receiver's data word is not the box
                     // variable. `arraylen_gc` on that word reads a constant.
                     let data = if let Some(data) =
@@ -5932,8 +6568,26 @@ impl<'a> Lowering<'a> {
                     } else {
                         args[0].clone()
                     };
-                    self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
-                    self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                    // A W1 string view is still `Ptr(STR)` (`rstr.py
+                    // ll_stritem_nonneg`), not a materialized CCHARP window.
+                    // `is_as_view_noop`: receiver and dest share a repr
+                    // class (10-26). `slice_as_ptr_word` only when they
+                    // differ. Mark dest so `p.add(i)` sees the STR even
+                    // when `merge_string_byte_view_state` skipped the
+                    // successor (`*const u8` is not a pre-pass window).
+                    let view_noop =
+                        is_as_view_noop(self.llbc, &reg, first_arg_ty.as_ref(), &call.dest.ty);
+                    let data = if view_noop {
+                        data
+                    } else {
+                        self.slice_as_ptr_word(mir_bb, &call.dest.ty, data, true)
+                    };
+                    if view_noop {
+                        self.alias_dest_to_arg0(dest_local, data, true);
+                    } else {
+                        self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
+                        self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5958,6 +6612,37 @@ impl<'a> Lowering<'a> {
                     if let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) {
                         let v = self.read_mem_slot(mir_bb, &slot)?;
                         self.local_var[dest_local] = Some(LocalValue::One(v));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    // Field-address `Cell::get` is that field's `getfield`
+                    // (`jtransform.py` `rewrite_op_getfield`). The borrow
+                    // is `taken_by_address` on the preceding FieldRead.
+                    if let Some(OpKind::FieldRead {
+                        base,
+                        mut field,
+                        pure,
+                        ..
+                    }) = self.address_field_read_of(bb_id, &args[0])
+                    {
+                        field.taken_by_address = false;
+                        let ty = self.value_type_of(&call.dest.ty);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(concretetype_for_field(&ty));
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::FieldRead {
+                                base,
+                                field,
+                                ty,
+                                pure,
+                            },
+                        });
+                        let res = self.recast_onto_dest_class_root(bb_id, res, &call.dest.ty);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -6001,6 +6686,79 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `Cell<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`.
+                // `set` is a store of that inner word (`setfield` on the
+                // owning struct). Scalar `get` is the field-place rewrite
+                // above. A write through the cell address would assemble
+                // `setfield_gc` on an interior pointer (`jtransform.py`
+                // `rewrite_op_setfield` only barriers a gc STRUCT).
+                if args.len() == 2 && self.is_cell_word_set(&reg) {
+                    let payload_ty = first_arg_ty.as_ref().and_then(|ty| {
+                        let peeled = self
+                            .tyref_peel_ref_to_pointee(ty)
+                            .unwrap_or_else(|| ty.clone());
+                        self.tyref_adt_type_arg(&peeled, 0)
+                    });
+                    if let Some(value_ty) = second_arg_ty
+                        .as_ref()
+                        .or(second_const_arg_ty.as_ref())
+                        .or(payload_ty.as_ref())
+                    {
+                        let ty = tyref_to_value_type_with(
+                            value_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        let kind = if let Some(OpKind::FieldRead {
+                            base, mut field, ..
+                        }) = self.address_field_read_of(bb_id, &args[0])
+                        {
+                            field.taken_by_address = false;
+                            OpKind::FieldWrite {
+                                base,
+                                field,
+                                value: args[1].clone().into(),
+                                ty,
+                            }
+                        } else {
+                            let cell_ty = first_arg_ty.as_ref().map(|ty| {
+                                self.tyref_peel_ref_to_pointee(ty)
+                                    .unwrap_or_else(|| ty.clone())
+                            });
+                            let owner_declared_gc = cell_ty.as_ref().and_then(|ty| {
+                                container_declared_gc(
+                                    ty,
+                                    self.llbc,
+                                    self.gc_struct_ids,
+                                    self.immutable_fields,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                            });
+                            OpKind::FieldWrite {
+                                base: args[0].clone(),
+                                field: FieldDescriptor::new(
+                                    "value",
+                                    Some("core::cell::Cell".into()),
+                                )
+                                .with_owner_declared_gc(owner_declared_gc),
+                                value: args[1].clone().into(),
+                                ty,
+                            }
+                        };
+                        self.graph
+                            .block_mut(bb_id)
+                            .operations
+                            .push(SpaceOperation { result: None, kind });
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
+
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -6183,6 +6941,9 @@ impl<'a> Lowering<'a> {
                 // items (`rlist.py` `ll_arraycopy`). A one-word `T` is
                 // `ll_slice_arraycopy_*`; `typed_items_block_items_base`
                 // dests are the header, so add `itemoffsetof` first.
+                // A non-one-word `T` is `rtype_copy_nonoverlapping`:
+                // `cast_ptr_to_adr` then residual `raw_memcopy` of
+                // `sizeof(T)*n` (`misc.py _raw_memcopy_opaque`).
                 if args.len() == 3 && self.is_ptr_copy_nonoverlapping(&reg) {
                     let kind = first_arg_ty
                         .as_ref()
@@ -6232,6 +6993,48 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
+                    let itemsize = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| raw_ptr_pointee_byte_size(ty, self.llbc))
+                        .or_else(|| {
+                            second_arg_ty
+                                .as_ref()
+                                .and_then(|ty| raw_ptr_pointee_byte_size(ty, self.llbc))
+                        })
+                        .or_else(|| {
+                            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                                return None;
+                            };
+                            let fd = self.llbc.fn_by_id(*id)?;
+                            raw_ptr_pointee_byte_size(fd.signature.inputs.first()?, self.llbc)
+                        });
+                    if let Some(itemsize) = itemsize
+                        && let Some(src) = self.copy_nonoverlapping_raw_addr(
+                            mir_bb,
+                            args[0].clone(),
+                            arg_locals.first().copied().flatten(),
+                            first_arg_ty.as_ref(),
+                        )
+                        && let Some(dst) = self.copy_nonoverlapping_raw_addr(
+                            mir_bb,
+                            args[1].clone(),
+                            arg_locals.get(1).copied().flatten(),
+                            second_arg_ty.as_ref(),
+                        )
+                    {
+                        let nbytes = self.scale_copy_count_to_nbytes(
+                            mir_bb,
+                            args[2].clone(),
+                            third_arg_ty.as_ref(),
+                            itemsize,
+                        );
+                        self.emit_raw_memcopy(mir_bb, src, dst, nbytes);
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // A `Vec` of one-word items is the raw header `RustVecRepr`
                 // lowers; its constructors, `push`, and `as_ptr` /
@@ -6253,6 +7056,7 @@ impl<'a> Lowering<'a> {
                             .is_some_and(|ty| tyref_is_u8_list(ty, self.llbc)))
                 {
                     let ptr = self.emit_list_items_ccharp(mir_bb, args[0].clone());
+                    self.list_view_locals.retain(|&local| local != dest_local);
                     self.local_var[dest_local] = Some(LocalValue::One(ptr));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6317,39 +7121,245 @@ impl<'a> Lowering<'a> {
                     None => (segments, method_hint),
                 };
                 // `v.reverse()` reaches `<[T]>::reverse` through
-                // `Vec::deref_mut`, which aliases the slice to the `Vec`
-                // header; that is `ll_reverse` on the list.
-                let (segments, method_hint) = match arg_locals
-                    .first()
-                    .copied()
-                    .flatten()
-                    .filter(|_| args.len() == 1 && is_core_slice_reverse(&original_segments))
-                    .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
-                {
-                    Some(kind) => (
-                        rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
-                        None,
-                    ),
-                    None => (segments, method_hint),
-                };
+                // `Vec::deref_mut` / `as_mut_slice`. A one-word-item Vec
+                // aliases the slice to the header (`ll_vec_reverse`). An
+                // object-pointer slice is the length-prefixed array, and
+                // `rtype_method_reverse` (`rlist.py`) wants the FunctionPath
+                // `flowspace_adapter` rewrites to `getattr(recv, "reverse")`.
+                // Leaving Charon's impl `Method` on `[T]` residualizes
+                // `core::slice::<Impl>::reverse` — `[T]` has no classdef.
+                let (segments, method_hint) =
+                    if args.len() == 1 && is_core_slice_reverse(&original_segments) {
+                        match arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
+                        {
+                            Some(kind) => (
+                                rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
+                                None,
+                            ),
+                            None => (original_segments.clone(), None),
+                        }
+                    } else {
+                        (segments, method_hint)
+                    };
                 // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
                 // Write the shadow-stack range into that vec. The codewriter
                 // sends the call back when that argument is not a signed word.
-                let (segments, method_hint) = if args.len() == 2
-                    && fmt_path_ends_with(
-                        &original_segments,
-                        &["gc_roots", "shadow_stack_copy_range"],
-                    )
-                    && self.var_is_object_vec_header(&args[1])
+                // Method `RootScope::pin_roots(&self, slice)`: the guard is
+                // the save_point word, the slice is the length-prefixed
+                // GcArray (`rlist.py` `GcArray(OBJECTPTR)`). Free `pin_roots`
+                // takes that one GcArray (`pin_roots_jit_abi`). Drop the
+                // receiver when it is still present.
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("pin_roots")
+                    && original_segments.iter().any(|s| s == "gc_roots")
+                {
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "pin_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
+                } else {
+                    (segments, method_hint)
+                };
+                // Method `RootScope::publish(&self, slice)` is the same
+                // guard-word / GcArray split (`root_scope_publish_jit_abi`).
+                // `get_and_call_function` publishes then normalizes; a pair
+                // helper with the GcArray in rdi and leftover `len` in rdx
+                // copies the length word as slot 0 (`pair_items`). Free
+                // `publish_roots` takes the length-prefixed GcArray
+                // (`publish_roots_jit_abi`).
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("publish")
+                    && original_segments.iter().any(|s| s == "gc_roots")
+                {
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "publish_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
+                } else {
+                    (segments, method_hint)
+                };
+                // Remaining `RootScope` methods keep main's
+                // `dont_look_inside*`, so the method path is the
+                // pointer-receiver trampoline. Methods that use the
+                // thread cell drop the receiver and name the free
+                // helper, the `pin_roots` / `publish` rewrite above.
+                // Close still needs the save_point word; name the
+                // lowered close (`root_scope_close_word`).
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("root_scope_close")
+                    && original_segments.iter().any(|s| s == "gc_roots")
                 {
                     (
                         vec![
                             "pyre_object".to_string(),
                             "gc_roots".to_string(),
-                            "shadow_stack_copy_range_into_vec".to_string(),
+                            "root_scope_close_word".to_string(),
                         ],
                         None,
                     )
+                } else {
+                    (segments, method_hint)
+                };
+                let (segments, method_hint) = if original_segments.iter().any(|s| s == "RootScope")
+                    && original_segments.iter().any(|s| s == "gc_roots")
+                {
+                    match original_segments.last().map(String::as_str) {
+                        Some("pin_root") if args.len() == 2 => {
+                            args.remove(0);
+                            arg_locals.remove(0);
+                            (
+                                vec![
+                                    "pyre_object".to_string(),
+                                    "gc_roots".to_string(),
+                                    "pin_root".to_string(),
+                                ],
+                                None,
+                            )
+                        }
+                        Some("get") if args.len() == 2 => {
+                            args.remove(0);
+                            arg_locals.remove(0);
+                            (
+                                vec![
+                                    "pyre_object".to_string(),
+                                    "gc_roots".to_string(),
+                                    "shadow_stack_get".to_string(),
+                                ],
+                                None,
+                            )
+                        }
+                        Some("set") if args.len() == 3 => {
+                            args.remove(0);
+                            arg_locals.remove(0);
+                            (
+                                vec![
+                                    "pyre_object".to_string(),
+                                    "gc_roots".to_string(),
+                                    "shadow_stack_set".to_string(),
+                                ],
+                                None,
+                            )
+                        }
+                        Some("normalize") if args.len() == 3 => {
+                            args.remove(0);
+                            arg_locals.remove(0);
+                            (
+                                vec![
+                                    "pyre_object".to_string(),
+                                    "gc_roots".to_string(),
+                                    "normalize_roots".to_string(),
+                                ],
+                                None,
+                            )
+                        }
+                        Some("normalize_moved") if args.len() == 3 => {
+                            args.remove(0);
+                            arg_locals.remove(0);
+                            (
+                                vec![
+                                    "pyre_object".to_string(),
+                                    "gc_roots".to_string(),
+                                    "root_scope_normalize_moved_jit_abi".to_string(),
+                                ],
+                                None,
+                            )
+                        }
+                        _ => (segments, method_hint),
+                    }
+                } else {
+                    (segments, method_hint)
+                };
+                let (segments, method_hint) = if args.len() == 2
+                    && fmt_path_ends_with(
+                        &original_segments,
+                        &["gc_roots", "shadow_stack_copy_range"],
+                    ) {
+                    let into_vec = || {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "shadow_stack_copy_range_into_vec".to_string(),
+                            ],
+                            None,
+                        )
+                    };
+                    let dest_local = arg_locals.get(1).copied().flatten().or_else(|| {
+                        match arg_operands.get(1)? {
+                            Operand::Copy(place) | Operand::Move(place) => place_base_local(place),
+                            Operand::Const(_) => None,
+                        }
+                    });
+                    let dest_is_object_pair = pair_lens.iter().any(|(at, _)| *at == 1)
+                        || dest_local.is_some_and(|local| {
+                            matches!(
+                                self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                                Some(LocalValue::Pair(_, _, _))
+                            ) && self.body.locals.locals.get(local).is_some_and(|loc| {
+                                slice_ty_item_is_object_pointer(&loc.ty, self.llbc)
+                            })
+                        });
+                    if self.var_is_object_vec_header(&args[1]) {
+                        into_vec()
+                    } else if let Some(local) = dest_local {
+                        let vec_var = self.vec_header_var_of_slice_local(local).or_else(|| {
+                            let loc = self.body.locals.locals.get(local)?;
+                            if !tyref_is_object_pointer_rust_vec(&loc.ty, self.llbc) {
+                                return None;
+                            }
+                            self.local_var
+                                .get(local)?
+                                .as_ref()
+                                .map(LocalValue::link_word)
+                        });
+                        if let Some(vec_var) = vec_var {
+                            args[1] = vec_var;
+                            pair_lens.retain(|(at, _)| *at != 1);
+                            into_vec()
+                        } else if dest_is_object_pair {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                                 pair slice with no Vec header"
+                            )));
+                        } else {
+                            (segments, method_hint)
+                        }
+                    } else if dest_is_object_pair {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                             pair slice with no Vec header"
+                        )));
+                    } else {
+                        (segments, method_hint)
+                    }
                 } else {
                     (segments, method_hint)
                 };
@@ -6578,6 +7588,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![cst]),
@@ -6686,6 +7697,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__strlen".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -6968,6 +7980,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec!["__len".to_string()],
                                 resolved_path: None,
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -7037,7 +8050,7 @@ impl<'a> Lowering<'a> {
                     }
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -7155,17 +8168,24 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = scalar_inherent_method_path(
-                        &reg,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ) {
+                    } else if segments == original_segments
+                        && let Some(path) = scalar_inherent_method_path(
+                            &reg,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    {
+                        // A prior retarget (`pin_roots` / `publish` → the
+                        // free helper) already rewrote `segments`. The
+                        // inherent-method path would stamp the wrapper
+                        // method back over that helper.
                         CallTarget::FunctionPath {
                             segments: path,
                             resolved_path: None,
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
                     } else if args.len() == 1
@@ -7175,6 +8195,7 @@ impl<'a> Lowering<'a> {
                             segments: vec![marker.to_string()],
                             resolved_path: None,
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
                     } else {
@@ -7245,6 +8266,20 @@ impl<'a> Lowering<'a> {
                         }
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
+                        // The FunctionPath names a FunDecl when it still
+                        // carries that decl's id. A later rewrite
+                        // (`ll_vec_*`, pin_roots, …) drops it. Blanket
+                        // `Into` already resolved a different `from` id
+                        // inside `call_target_segments`.
+                        let path_fun_decl_id = if !same_callee {
+                            None
+                        } else if let Some(IntoDevirt::Target { fn_id: from_id, .. }) =
+                            self.blanket_into_devirt(&reg)
+                        {
+                            Some(from_id)
+                        } else {
+                            fun_decl_id
+                        };
                         match method_hint {
                             Some((owner_root, leaf, _)) if !args.is_empty() => {
                                 // Method is this FunDecl: stamp its registered
@@ -7267,7 +8302,11 @@ impl<'a> Lowering<'a> {
                                 // and the traced body binds a classdef-less
                                 // receiver. Paint the classdef onto this
                                 // argument only.
-                                if let Some(root) = self.opaque_traced_method_self_root(&reg)
+                                // A prior retarget (`pin_roots` / `get` → the
+                                // free helper) already dropped that receiver;
+                                // `args[0]` is then the helper's payload.
+                                if segments == original_segments
+                                    && let Some(root) = self.opaque_traced_method_self_root(&reg)
                                     && let Some(recv) = args.first().cloned()
                                 {
                                     let narrowed = self.graph.alloc_value_var_with_type(
@@ -7301,10 +8340,14 @@ impl<'a> Lowering<'a> {
                                     });
                                     args[0] = narrowed;
                                 }
+                                let names_fun_decl = fun_decl_id.is_some_and(|id| {
+                                    function_path_names_fun_decl(path_fun_decl_id, id)
+                                });
                                 let mut target = CallTarget::FunctionPath {
                                     segments,
                                     resolved_path: None,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 };
                                 if same_callee && let Some(id) = self.call_target_fun_decl_id(&reg)
@@ -7313,6 +8356,24 @@ impl<'a> Lowering<'a> {
                                     if let Some(fd) = self.llbc.fn_by_id(id) {
                                         target = stamp_call_target_fun_decl(target, self.llbc, fd);
                                     }
+                                }
+                                // A rewritten std `Vec` helper (`ll_vec_*`) is
+                                // monomorphic; the original FunDecl's type
+                                // arguments must not ride along as turbofish
+                                // (`ll_vec_newlist_hint_r::<PyObject>`), or
+                                // the oopspec / fnaddr lookup misses. Stamp
+                                // generics only when the path still names
+                                // that FunDecl.
+                                if names_fun_decl
+                                    && let Some(id) = fun_decl_id
+                                    && let Some(fd) = self.llbc.fn_by_id(id)
+                                {
+                                    target = self.attach_call_generics(
+                                        target,
+                                        fd,
+                                        &reg.generics,
+                                        first_arg_ty.as_ref(),
+                                    );
                                 }
                                 target
                             }
@@ -7407,6 +8468,7 @@ impl<'a> Lowering<'a> {
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 let profilefunc_graphs = profilefunc_graphs_for_call(self.llbc, &dyn_operand);
+                let const_fn_id = operand_fundef(self.llbc, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -7502,6 +8564,21 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         }
                     }
+                } else if let Some(fun_id) = const_fn_id.or_else(|| {
+                    folded_fun_id_from_immutable_static(self.llbc, self.body, &dyn_operand)
+                }) && let Some(fd) = self.llbc.fn_by_id(fun_id)
+                {
+                    // A Const `FnDef` (or a field of an immutable static
+                    // that folded to one) is `direct_call`.
+                    // `jtransform.py handle_regular_indirect_call` inlines
+                    // the same target when the funcbox is Const; naming
+                    // the FunDecl here lets `find_all_graphs` enter it.
+                    let path = registered_path_for_fun_decl(self.llbc, fd);
+                    OpKind::Call {
+                        target: CallTarget::function_path(path.segments).with_fun_decl_id(fun_id),
+                        args: crate::model::call_args(args),
+                        result_ty,
+                    }
                 } else if let Some(graphs) = eval_hook_graphs.or(profilefunc_graphs) {
                     // `register_eval_override`'s function, `_trace`'s
                     // `profilefunc` trampolines, and the `FnDef` values
@@ -7568,6 +8645,7 @@ impl<'a> Lowering<'a> {
                             segments: vec!["__dyn_call".to_string()],
                             resolved_path: None,
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(full_args),
@@ -7643,6 +8721,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7704,6 +8783,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7745,6 +8825,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7790,6 +8871,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7941,6 +9023,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7985,6 +9068,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8023,6 +9107,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8056,6 +9141,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8089,6 +9175,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8205,6 +9292,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8283,6 +9371,7 @@ impl<'a> Lowering<'a> {
                         segments: residual,
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: args.clone(),
@@ -8319,6 +9408,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8346,6 +9436,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8382,6 +9473,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8436,6 +9528,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8448,13 +9541,18 @@ impl<'a> Lowering<'a> {
         // Allocate the result Variable now. Bind it to the destination
         // local after copy-in so `p = f(&mut p)` still reads the previous
         // local, not this not-yet-defined result.
-        let result_var = self
-            .graph
-            .alloc_value_var_with_type(if callee_is_std_alloc_raw {
-                crate::model::ConcreteType::Signed
-            } else {
-                crate::model::ConcreteType::Unknown
-            });
+        //
+        // `rtyper.py` `setconcretetype` writes `v.concretetype =
+        // bindingrepr(v).lowleveltype` from `FUNC.RESULT`. Stamp that
+        // kind here so a later `Discriminant` can read
+        // `getkind(var.concretetype)` without reconstructing it from the
+        // producer op (`rnone.py` `rtype_is_None`).
+        let result_stamp = if callee_is_std_alloc_raw {
+            crate::model::ConcreteType::Signed
+        } else {
+            concretetype_for_op_kind(&op_kind, &self.raw_alloc_flavor_structs)
+        };
+        let result_var = self.graph.alloc_value_var_with_type(result_stamp);
         // `*mut TypedItemsBlock` is `GcArray(Signed)` storage. Keep that
         // ARRAY layout on the call result so `do_fixed_newlist` reads
         // `op.result.concretetype.TO` instead of the callee's leaf name.
@@ -8482,23 +9580,52 @@ impl<'a> Lowering<'a> {
         // A `Vec` result is `RustVecRepr.lowleveltype`
         // (`rrustvec.rs rust_vec_lltype`), kind `int`. Without that
         // pointer the arm emits GC `new_array_clear`, whose result
-        // bank is `ref`.
-        if result_var.concretetype().is_none() {
-            stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
-        }
+        // bank is `ref`. Stamp `FUNC.RESULT` first (`dest_class_ty`,
+        // the FunDecl output): `annlowlevel.py`
+        // `MixLevelHelperAnnotator.getgraph` annotates the helper
+        // from that signature, not the dest place.
+        stamp_rust_vec_header(&result_var, dest_class_ty, self.llbc);
+        stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
         // Result-of-carrier dest is the Ok payload after rewire
         // (`result_exc` `remint_call_as_payload`). Stamp that payload so
         // overlay Signed keeps CCHARP / VOIDP (`set_concretetype_of_inline`).
         if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
-            let stamp_ty = crate::front::result_exc::result_exc_projected_ok(
+            let dest_ok = crate::front::result_exc::result_exc_projected_ok(
                 &call.dest.ty,
                 self.llbc,
                 self.static_addrs.error_carrier,
-            );
-            let stamp_src = stamp_ty.as_ref().unwrap_or(&call.dest.ty);
+            )
+            .or_else(|| crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc));
+            let class_ok = crate::front::result_exc::result_exc_projected_ok(
+                dest_class_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+            .or_else(|| crate::front::result_exc::tyref_result_ok(dest_class_ty, self.llbc));
+            let dest_peel = dest_ok.as_ref().unwrap_or(&call.dest.ty);
+            let class_peel = class_ok.as_ref().unwrap_or(dest_class_ty);
+            let is_raw_c_ptr = |ty: &TyRef| {
+                tyref_is_raw_u8_ptr(ty, self.llbc)
+                    || tyref_is_raw_c_void_ptr(ty, self.llbc)
+                    || tyref_is_raw_c_void_pp(ty, self.llbc)
+            };
+            // Result dest is the Ok payload after rewire
+            // (`result_exc` `remint_call_as_payload`). Stamp that payload
+            // so overlay Signed keeps CCHARP / VOIDP
+            // (`set_concretetype_of_inline`). `tyref_result_ok` peels
+            // without the carrier spec; FunDecl output is the same peel
+            // when the dest local is not the Result ADT.
+            let stamp_src = if is_raw_c_ptr(dest_peel) {
+                dest_peel
+            } else if is_raw_c_ptr(class_peel) {
+                class_peel
+            } else {
+                dest_peel
+            };
             stamp_raw_u8_ccharp(&result_var, stamp_src, self.llbc);
+            stamp_raw_c_void_voidp(&result_var, stamp_src, self.llbc);
             stamp_fn_ptr(
                 &result_var,
                 stamp_src,
@@ -8719,13 +9846,17 @@ impl<'a> Lowering<'a> {
         // `ListIteratorRepr.rtype_next` already rewrites from the inherent
         // four-segment path.
         if let OpKind::Call { target, .. } = &op_kind
-            && crate::front::iter_next::is_iterator_next_target(target)
-            && (crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-                || matches!(
-                    target,
-                    CallTarget::FunctionPath { segments, .. }
-                        if crate::front::iter_next::is_slice_iter_next_segments(segments)
-                ))
+            && ((crate::front::iter_next::is_iterator_next_target(target)
+                && (crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+                    || matches!(
+                        target,
+                        CallTarget::FunctionPath { segments, .. }
+                            if crate::front::iter_next::is_slice_iter_next_segments(segments)
+                    )))
+                || (crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_exclusive_word_int_range(ty, self.llbc))))
         {
             // A slice iterator yields `Option<&T>`; peel that one `&` so the
             // recorded kind is the item's own, the way `ll_listnext` hands
@@ -8820,10 +9951,10 @@ impl<'a> Lowering<'a> {
             }
         {
             self.range_iter_new_sites
-                .push(crate::front::range_iter::RangeNewSite {
-                    result_var: result_var.clone(),
-                    kind: crate::front::range_iter::RangeSiteKind::Inclusive { narrow, unsigned },
-                });
+                .push(crate::front::range_iter::RangeNewSite::new(
+                    result_var.clone(),
+                    crate::front::range_iter::RangeSiteKind::Inclusive { narrow, unsigned },
+                ));
         }
         // Capture `Map::collect` at the construction site, where the
         // closure env is a concrete ADT.  The adapter body is
@@ -9110,21 +10241,8 @@ impl<'a> Lowering<'a> {
         // validates the producer/consumer CFG adjacency; this site only keeps
         // the closure and Result type ownership that is unavailable after MIR
         // lowering.
-        if let OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
-            && receiver_root.as_deref().is_some_and(|root| {
-                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
-                    == "Option"
-            })
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && call_target_leaf_is(target, "ok_or_else")
             && args.len() == 2
             && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
@@ -9456,7 +10574,12 @@ impl<'a> Lowering<'a> {
                 range: range_site.range_result,
                 start: range_site.start,
             };
-            self.annotate_slice_first_site(&mut site, &arg_locals, first_arg_ty.as_ref(), None);
+            self.annotate_slice_first_site(
+                &mut site,
+                &arg_locals,
+                first_arg_ty.as_ref(),
+                slice_first_element.clone(),
+            );
             site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
         }
@@ -9695,6 +10818,36 @@ impl<'a> Lowering<'a> {
             &resolved_call_args,
             &call.dest.ty,
         )?;
+        // Later rewrites may change `op_kind.result_ty` after the
+        // Variable was allocated. Stamp from the emitted op so a
+        // successor Discriminant reads `getkind(var.concretetype)`
+        // (`rtyper.py` `setconcretetype`).
+        let emit_stamp = concretetype_for_op_kind(&op_kind, &self.raw_alloc_flavor_structs);
+        crate::model::FunctionGraph::set_concretetype_of_inline(&result_var, emit_stamp);
+        // `set_concretetype_of_inline` preserves a richer header when
+        // `getkind` already matches; a collapsed `Signed` rewrite is
+        // replaced from `FUNC.RESULT` again.
+        stamp_rust_vec_header(&result_var, dest_class_ty, self.llbc);
+        stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
+        // `hint` is `same_as` of its value (`jtransform.py`
+        // `rewrite_op_hint`). `Function.getcode` is
+        // `promote(self.code as usize) as PyObject`: the promote
+        // result is a fresh variable, so the int→ptr fold has to see
+        // the pointer the word came from. Record it here so
+        // [`Self::address_cast_pointer`] does not walk the graph.
+        if let OpKind::Hint { value, .. } = &op_kind {
+            if let Some(orig) = self
+                .cast_ptr_to_int_src
+                .get(value)
+                .cloned()
+                .or_else(|| self.address_cast_origin_by_id(value.id()))
+            {
+                self.cast_ptr_to_int_src.insert(result_var.clone(), orig);
+            }
+            if let Some(orig) = self.raw_address_uint_src.get(value).cloned() {
+                self.raw_address_uint_src.insert(result_var.clone(), orig);
+            }
+        }
         let dest_is_cell = self.is_cell_local(dest_local);
         if !dest_is_cell {
             self.local_var[dest_local] = Some(match slice_next {
@@ -9704,21 +10857,32 @@ impl<'a> Lowering<'a> {
                 },
                 _ => LocalValue::One(result_var.clone()),
             });
+            if tyref_is_u8_list(&call.dest.ty, self.llbc)
+                && matches!(
+                    self.local_var.get(dest_local),
+                    Some(Some(LocalValue::One(_)))
+                )
+            {
+                self.bind_list_view_local(dest_local, result_var.clone());
+            }
         }
+
         // A fat `&dyn` / `Box<dyn>` result is two words. Record it so
         // `front::dyn_fat` can splice the callee before the vtable word
         // is dropped on the one-word return.
         if matches!(&op_kind, OpKind::Call { .. }) && tyref_is_fat_dyn(&call.dest.ty, self.llbc) {
             self.dyn_return_calls.push(result_var.clone());
         }
-        // A callee whose output is a window uses the two-word return ABI
-        // wherever the call is lowered (`ret_len_slot_local` /
-        // `SLICE_LEN_SLOT_NEW` / `TAKE`), including a dest that is a STR
-        // view, a list, or unused. Identity wrappers returned above, so a
-        // W1 source whose output type is also `&[u8]` does not leave a
-        // dead slot. A STR-view range index stays two arguments so
-        // `front::slice_index` can rewrite it to `__getslice_*`
-        // (`rewire_one_slice_index_site` requires `args.len() == 2`).
+        // A callee whose dest is a W3 window uses the two-word return ABI
+        // (`ret_len_slot_local` / `SLICE_LEN_SLOT_NEW` / `TAKE`). A W2
+        // list dest (`&mut [u8]`) keeps the residual result word; the
+        // FunDecl output of Opaque `from_raw_parts_mut` still spells
+        // `&mut [T]` and is not this ABI. Identity wrappers returned
+        // above, so a W1 source whose output type is also `&[u8]` does
+        // not leave a dead slot. A STR-view range index stays two
+        // arguments so `front::slice_index` can rewrite it to
+        // `__getslice_*` (`rewire_one_slice_index_site` requires
+        // `args.len() == 2`).
         let range_index_consumer = matches!(
             &op_kind,
             OpKind::Call { args, .. }
@@ -9977,6 +11141,48 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    /// Preceding `FieldRead` whose result is `addr` of a field place, not
+    /// the field's value. `Cell::get` / `Cell::set` of a struct field rewrite
+    /// to that field on the owner (`jtransform.py` `rewrite_op_getfield` /
+    /// `rewrite_op_setfield`). The borrow can sit in a predecessor block
+    /// of the `set` terminator, so the SSA def is the whole graph.
+    pub(in crate::front::mir) fn address_field_read_of(
+        &self,
+        bb_id: crate::model::BlockId,
+        addr: &Variable,
+    ) -> Option<OpKind> {
+        let matches = |op: &SpaceOperation| -> Option<OpKind> {
+            let OpKind::FieldRead { field, .. } = &op.kind else {
+                return None;
+            };
+            if op.result.as_ref() == Some(addr)
+                && field.taken_by_address
+                && field.vec_part.is_none()
+                && !field.inline_vec
+            {
+                Some(op.kind.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(kind) = self
+            .graph
+            .block(bb_id)
+            .operations
+            .iter()
+            .rev()
+            .find_map(matches)
+        {
+            return Some(kind);
+        }
+        self.graph
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != bb_id.0)
+            .find_map(|(_, block)| block.operations.iter().rev().find_map(matches))
+    }
+
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` / `set` /
     /// `replace` of a field place is that field's own `getfield` /
     /// `setfield`. `core::cell::Cell` only. Charon sometimes drops the
@@ -10030,6 +11236,15 @@ impl<'a> Lowering<'a> {
         cross: &'a dyn crate::front::clause_spec::CrossCrateLookup,
     ) {
         self.cross_crate = Some(cross);
+    }
+
+    pub(in crate::front::mir) fn set_spec_instantiation(
+        &mut self,
+        types: &'a [serde_json::Value],
+        const_generics: &'a [serde_json::Value],
+    ) {
+        self.spec_types = types;
+        self.spec_const_generics = const_generics;
     }
 
     /// Specialized path for a direct call whose type args are concrete,
@@ -10165,19 +11380,27 @@ impl<'a> Lowering<'a> {
     }
 
     /// Impl method named by a `TraitImpl` trait ref, specialized when that
-    /// impl's own clauses are concrete. A `Clause` ref returns `None` so
+    /// impl's own clauses are concrete. A method the impl does not override
+    /// uses the trait's provided default, specialized at that `Self`
+    /// (`trait_default_method`). A `Clause` ref returns `None` so
     /// the call keeps the trait-declaration path, unless the receiver
     /// type is a known ADT ([`trait_method_on_known_receiver`]).
     ///
     /// `description.py` `ClassDesc.lookup` / `MethodDesc`: rustc has
     /// already selected the impl, so the call is that impl's graph.
-    /// Specialization (`FunctionDesc.cachedgraph`) is only queued from
-    /// a spec body; a non-spec caller still names the impl method.
+    /// `specialize.py default_specialize` / `FunctionDesc.cachedgraph`:
+    /// a resolved impl method with concrete type arguments is its own
+    /// graph, including a call from a non-spec body. An inherited default
+    /// is the same: one graph per `Self`, so `opcode_build_list::<H>`
+    /// inside `OpcodeStepExecutor::build_list` sees a concrete `H`.
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let impl_method = crate::front::clause_spec::trait_impl_method(payload, self.llbc);
+        let from_default = impl_method.is_none();
+        let (fn_id, generics) = impl_method
+            .or_else(|| crate::front::clause_spec::trait_default_method(payload, self.llbc))?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
         // Naming that graph residualizes the unspecialized Into path;
@@ -10205,13 +11428,20 @@ impl<'a> Lowering<'a> {
             }
             return self.opaque_nullary_impl_target(fd);
         }
-        let path = fd.item_meta.name_path_str();
-        let leaf = path.rsplit("::").next().unwrap_or("fn");
-        if self.spec_body
-            && let Some(segments) = self.enqueue_spec(fd, &generics)
-        {
+        if let Some(segments) = self.enqueue_spec(fd, &generics) {
             return Some((segments, None));
         }
+        // A provided default whose `cachedgraph` copy was not minted
+        // stays the original FunDecl (`description.py` `ClassDesc.lookup`
+        // of the trait method). Naming `spec_segments` residualizes
+        // `Iterator::take` as an unregistered `IntoIter::take` path;
+        // main's `specialized_trait_target` only consults
+        // `trait_impl_method`, so that default is looked inside.
+        if from_default {
+            return None;
+        }
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("fn");
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
@@ -10240,6 +11470,67 @@ impl<'a> Lowering<'a> {
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
+    /// Depth-0 `TypeVar`s in a nested call's `generics` are this
+    /// `cachedgraph` copy's type arguments. Substitute them before
+    /// `concrete_type_args` / `call_site_generic_rust_args` so a call
+    /// `pop_n::<H>` inside `opcode_build_list::<PyFrame>` carries `PyFrame`.
+    pub(in crate::front::mir) fn instantiate_call_generics(
+        &self,
+        generics: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut g = generics.clone();
+        if self.spec_body && !(self.spec_types.is_empty() && self.spec_const_generics.is_empty()) {
+            crate::front::clause_spec::substitute_type_vars(
+                &mut g,
+                self.llbc,
+                self.spec_types,
+                self.spec_const_generics,
+            );
+        }
+        g
+    }
+
+    pub(in crate::front::mir) fn attach_call_generics(
+        &self,
+        target: CallTarget,
+        fd: &FunDecl,
+        generics: &serde_json::Value,
+        fallback_arg_ty: Option<&TyRef>,
+    ) -> CallTarget {
+        let generics = self.instantiate_call_generics(generics);
+        let target = attach_call_generic_instance(target, fd, &generics, self.llbc);
+        if !target.generic_rust_args().is_empty() {
+            return target;
+        }
+        match self.generic_args_from_arg_ty(fd, fallback_arg_ty) {
+            Some(args) => target.with_generic_rust_args(args),
+            None => target,
+        }
+    }
+
+    /// When the call's `generics.types` are still TypeVars, the first
+    /// argument's (peeled) type is the instantiation of a single type
+    /// parameter (`pop_n::<H>(&mut H, ...)`).
+    pub(in crate::front::mir) fn generic_args_from_arg_ty(
+        &self,
+        fd: &FunDecl,
+        ty: Option<&TyRef>,
+    ) -> Option<Vec<String>> {
+        if fd.generics.as_ref()?.types_len != 1 {
+            return None;
+        }
+        let ty = ty?;
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        let value = tyref_to_spec_json(&peeled);
+        let name = crate::front::clause_spec::spec_type_name(&value, self.llbc, 0, false);
+        if name.is_empty() || name.starts_with('?') || name.starts_with('v') {
+            return None;
+        }
+        Some(vec![name])
+    }
+
     pub(in crate::front::mir) fn enqueue_spec(
         &self,
         fd: &FunDecl,
@@ -10256,6 +11547,8 @@ impl<'a> Lowering<'a> {
         if fun_decl_is_convert_into_impl(self.llbc, fd) {
             return None;
         }
+        let generics_owned = self.instantiate_call_generics(generics);
+        let generics = &generics_owned;
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
         if self.callee_is_host_builtin(fd) {
             return None;
@@ -10288,11 +11581,17 @@ impl<'a> Lowering<'a> {
         // `FunctionDesc.cachedgraph`: each concrete instantiation is
         // its own graph, including a look-inside generic whose body
         // names no `Clause`. The inner residual then sees the type
-        // arguments. A still-open `Clause` ref refuses (`None`).
-        let trait_refs =
-            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+        // arguments. A leftover `Clause` ref (`T: ?Sized` MetaSized /
+        // Pointee) does not refuse once the type arguments are
+        // concrete: `residual_generic_fun_segments` already uses
+        // `unwrap_or_default`, and `substitute_clauses` no-ops when
+        // the replacement is missing. `loop_unrolling_heuristic` is
+        // that shape (`rlib/jit.py` `specialize.call_location`).
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                .unwrap_or_default();
         let leaf = path.rsplit("::").next().unwrap_or("fn").to_string();
         let leaf = crate::front::clause_spec::spec_leaf(&leaf, fd.def_id, generics, self.llbc);
         spec.borrow_mut()
@@ -10316,10 +11615,17 @@ impl<'a> Lowering<'a> {
         path: &str,
     ) -> Option<Vec<String>> {
         let cross = self.cross_crate?;
-        let trait_refs =
-            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+        // A leftover `Clause` ref (`T: ?Sized` MetaSized / Pointee) does
+        // not refuse once the type arguments are concrete: the
+        // unstructured path (`enqueue_spec`) already uses
+        // `unwrap_or_default`, and `substitute_clauses` no-ops when the
+        // replacement is missing. `loop_unrolling_heuristic` is that
+        // shape (`rlib/jit.py` `specialize.call_location`).
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                .unwrap_or_default();
         let mut result = None;
         let mut decline: Option<&'static str> = None;
         cross.with_crates(&mut |crates| {
@@ -11285,6 +12591,27 @@ impl Lowering<'_> {
                     | StmtKind::PlaceMention(_))
             )
         })
+    }
+
+    /// Recast `value` onto the class root of `dest_ty` when that type
+    /// names an instance (`lltype.py` `ann_cast_opaque_ptr`).
+    fn recast_onto_dest_class_root(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        value: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) else {
+            return value;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call(&root, value),
+        });
+        narrowed
     }
 
     /// Signed-word `raw_load` of a fn-pointer niche (`FnPtrCell::get` at

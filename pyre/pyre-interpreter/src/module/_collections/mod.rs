@@ -626,7 +626,7 @@ pub mod deque_rev_iter {
 /// the elements sit in a native Vec the collector does not walk while each
 /// append allocates the next block.  Publish the whole run up front and read
 /// the deque and each element back at the turn that consumes them.
-fn extend_from_iterable(
+pub fn extend_from_iterable(
     mut self_obj: PyObjectRef,
     iterable: PyObjectRef,
     is_extend_right: bool,
@@ -834,7 +834,7 @@ fn check_index_under_guard(self_obj: PyObjectRef, idx: i64) -> Result<(), crate:
 }
 
 /// `W_Deque.locate`: choose the nearer endpoint and walk whole blocks.
-fn locate(self_obj: PyObjectRef, mut index: i64) -> (PyObjectRef, i64) {
+pub fn locate(self_obj: PyObjectRef, mut index: i64) -> (PyObjectRef, i64) {
     let deque = W_Deque::from_obj(self_obj).expect("deque");
     if index < (deque.len >> 1) {
         index += deque.leftindex;
@@ -859,7 +859,7 @@ fn locate(self_obj: PyObjectRef, mut index: i64) -> (PyObjectRef, i64) {
 /// against another deque, ignoring `maxlen`; `NotImplemented` when the
 /// other operand is not a deque.  Delegates to list comparison over
 /// snapshots of both backings.
-fn deque_compare(
+pub fn deque_compare(
     mut self_obj: PyObjectRef,
     mut other: PyObjectRef,
     op: crate::baseobjspace::CompareOp,
@@ -938,10 +938,7 @@ fn deque_compare(
 
 /// `W_Deque.mul` — repeat the elements `num` times, then re-bound by
 /// `maxlen` by routing through the constructor (which trims).
-pub(crate) fn deque_repeat(
-    self_obj: PyObjectRef,
-    n: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+pub fn deque_repeat(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // PyPy's W_Deque.mul receives `w_int` and starts with `space.int_w`.
     // CPython v3.14.6 routes the public sq_repeat slot through
     // abstract.c sequence_repeat first, so only __index__ is admitted and an
@@ -1017,7 +1014,7 @@ pub(crate) fn deque_repeat(
     }
 }
 
-fn reverse_unlocked(self_obj: PyObjectRef) {
+pub fn reverse_unlocked(self_obj: PyObjectRef) {
     let deque = W_Deque::from_obj(self_obj).expect("deque");
     let mut li = deque.leftindex;
     let mut lb = deque.leftblock;

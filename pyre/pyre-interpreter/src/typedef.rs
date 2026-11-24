@@ -535,6 +535,7 @@ pub fn init_subclass_ranges() {
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
     crate::runtime_ops::register_sandbox_stub_publisher();
+    crate::objspace::descroperation::init_interned_binop_names();
     // The object-space store site can see that a `locals_cells_stack_w` array
     // has already moved, but not who still points at it; this crate owns the
     // frame chain, so it supplies the holder scan.
@@ -7379,7 +7380,7 @@ fn iterable_uses_base_iter(obj: PyObjectRef, base_type: &pyre_object::PyType) ->
     }
 }
 
-fn set_init_from_iterable_impl(
+pub fn set_init_from_iterable_impl(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
     wrap_hash_error: bool,
@@ -25461,7 +25462,7 @@ fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 /// Keeping the decomposition on pyre's translated `RBigInt` surface matches
 /// PyPy's `W_FloatObject.descr_as_integer_ratio` and avoids crossing into
 /// RustPython's opaque malachite `Rational` implementation.
-fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError> {
+pub fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError> {
     if value.is_infinite() {
         return Err(crate::PyError::overflow_error(
             "cannot convert Infinity to integer ratio",
@@ -25939,16 +25940,36 @@ fn object_descr_new_from(
         }
         crate::call::check_type_instantiable(cls)?;
         if positional.len() > 1 || has_keywords {
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+            let tp_new = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    "__new__",
+                )
+            };
+            let obj_new = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    w_object,
+                    "__new__",
+                )
+            };
             if !same_inherited_slot(tp_new, obj_new) {
                 return Err(crate::PyError::type_error(
                     "object.__new__() takes exactly one argument (the type to instantiate)"
                         .to_string(),
                 ));
             }
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+            let tp_init = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    "__init__",
+                )
+            };
+            let obj_init = unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    w_object,
+                    "__init__",
+                )
+            };
             if same_inherited_slot(tp_init, obj_init) {
                 let name = unsafe { pyre_object::w_type_get_name(cls) };
                 return Err(crate::PyError::type_error(format!(
@@ -32995,7 +33016,7 @@ fn set_op_xor(
 /// `setobject.py W_BaseSetObject.descr_union` — the result starts as a copy
 /// of self and every operand is merged in: a set operand through its storage
 /// (`:366`), any other iterable element by element (`:368-369`).
-pub(crate) fn set_method_union(
+pub fn set_method_union(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33222,7 +33243,7 @@ fn set_intersection_len_absorbed(err: &mut crate::PyError) -> bool {
 /// with duplicates is measured longer than the set it becomes. That measure
 /// disagreeing with the set lengths is what leaves work for the swap in
 /// `set_intersect_update`.
-pub(crate) fn set_method_intersection(
+pub fn set_method_intersection(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33310,7 +33331,7 @@ pub(crate) fn set_method_intersection(
 
 /// `setobject.py W_BaseSetObject.descr_difference` — a copy of self with
 /// `descr_difference_update` run over it.
-pub(crate) fn set_method_difference(
+pub fn set_method_difference(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -33781,7 +33802,7 @@ fn set_setitem_with_hash_result(rc: i64) -> Result<(), crate::PyError> {
 /// One `iterkeys_with_hash` pass of
 /// `ObjectSetStrategy._symmetric_difference_unwrapped`: keys of `walk` that
 /// `contains_with_hash` misses in `probe` are placed in `d_new`.
-fn symmetric_difference_one_side(
+pub fn symmetric_difference_one_side(
     walk_slot: usize,
     probe_slot: usize,
     d_new_slot: usize,

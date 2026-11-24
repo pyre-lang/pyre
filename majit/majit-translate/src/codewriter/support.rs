@@ -122,6 +122,7 @@ pub(crate) fn decode_hp_hint_args(
     marker_args: &[Variable],
     numgreens: usize,
     numreds: usize,
+    graph_name: &str,
 ) -> (Vec<Variable>, Vec<Variable>) {
     assert!(
         marker_args.len() >= numgreens,
@@ -144,11 +145,12 @@ pub(crate) fn decode_hp_hint_args(
             );
         }
         let sorted = sort_vars(&vars);
+        let bank = if is_green { "greens" } else { "reds" };
         assert_eq!(
             vars, sorted,
             "You have to reorder the variables named in the JitDriver (both the 'greens' and \
              'reds' independently). They must be sorted like this: first all the integer-like, \
-             then all the pointer-like, and finally the floats.\nGot: {:?}\nExpected: {:?}",
+             then all the pointer-like, and finally the floats.\ngraph={graph_name} {bank}\nGot: {:?}\nExpected: {:?}",
             vars, sorted
         );
         vars
@@ -186,7 +188,7 @@ pub(crate) fn split_before_jit_merge_point(
         args.get(1..)
             .expect("jit_merge_point method call must carry its receiver"),
     );
-    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds);
+    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds, &graph.name);
     let mut linkargs = greens;
     linkargs.extend(reds);
     crate::unsimplify::split_block(graph, portalblock, 0, Some(&linkargs))
@@ -217,7 +219,7 @@ pub(crate) fn rewrite_jit_merge_point(
         args.get(1..)
             .expect("jit_merge_point method call must carry its receiver"),
     );
-    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds);
+    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds, &graph.name);
     let mut call_args = greens;
     call_args.extend(reds);
     let return_input = graph.block(graph.returnblock).inputargs.first().cloned();

@@ -26,6 +26,7 @@ fn helper_roots_compile_their_callees_without_a_portal_or_unrelated_graphs() {
                     segments: callee.segments.clone(),
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: majit_translate::GraphSpecialization::Regular,
                 },
                 args: Vec::new(),

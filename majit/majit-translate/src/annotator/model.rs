@@ -5309,6 +5309,22 @@ mod tests {
     }
 
     #[test]
+    fn someptr_setattr_accepts_somestring_into_strptr_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new("Entry", vec![("key".into(), STRPTR.clone())])),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
+        let result = s_ptr
+            .setattr(&SomeValue::String(s_attr), &s_str0())
+            .expect("SomePtr.setattr of a STR key dummy is STRPTR");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
     fn someptr_getattr_reads_carray_item_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, LowLevelType, Ptr, PtrTarget, Struct,
@@ -5402,6 +5418,27 @@ mod tests {
         let result = s_ptr
             .setattr(&SomeValue::String(s_attr), &s_value)
             .expect("SomePtr.setattr must accept Instance into an Address item field");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_setattr_accepts_somestring_into_carray_item_strptr_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![("key".into(), STRPTR.clone())],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("key")));
+        let result = s_ptr
+            .setattr(&SomeValue::String(s_attr), &s_str0())
+            .expect("SomePtr.setattr of a STR key dummy into Array.OF STRPTR");
         assert!(matches!(result, SomeValue::Impossible));
     }
 

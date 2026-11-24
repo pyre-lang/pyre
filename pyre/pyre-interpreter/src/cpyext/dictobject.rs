@@ -4,6 +4,7 @@ use super::object::{argument, arguments};
 use super::pyerrors::trap;
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 use std::ffi::{CStr, c_char, c_int};
 
 #[unsafe(no_mangle)]

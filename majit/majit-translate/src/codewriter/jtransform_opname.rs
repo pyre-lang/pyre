@@ -1552,6 +1552,7 @@ fn emit_conditional_call_oopspec_named(
             mut segments,
             resolved_path: _,
             fun_decl_id,
+            generic_rust_args,
             specialization,
         } => {
             segments.insert(0, FN_CONST_HEAD.to_string());
@@ -1559,6 +1560,7 @@ fn emit_conditional_call_oopspec_named(
                 segments,
                 resolved_path: None,
                 fun_decl_id,
+                generic_rust_args,
                 specialization,
             }
         }
@@ -1761,6 +1763,7 @@ fn emit_getarrayitem(
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: array._immutable_field(),
+                taken_by_address: false,
             },
             result,
         );
@@ -1790,6 +1793,7 @@ fn emit_getarrayitem(
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
+                taken_by_address: false,
             },
             result,
         );
@@ -2470,6 +2474,7 @@ fn emit_getinteriorfield(
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: array._immutable_field(),
+                taken_by_address: false,
             },
             result,
         );

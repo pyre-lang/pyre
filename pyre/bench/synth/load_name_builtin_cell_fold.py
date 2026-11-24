@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=2.5
-# pyre-check: spec-folds=builtin_len_descent
 # pyre-check: skip-cpython
 # pyre-check: trace-shape=<module>:absent=CallMayForceR
 # A module-scope LOAD_NAME whose name misses the module dict resolves through

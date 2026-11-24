@@ -274,6 +274,10 @@ const MAJIT_ONLY: &[&str] = &[
     // `pyjitpl.py opimpl_goto_if_exception_mismatch`.
     "arraybase_vable/rdd>i",
     "newlist_clear/idddd>r",
+    // `pyjitpl.py opimpl_gc_load_indexed_f`. The walker has no arm.
+    // The integer twin left PYRE_ONLY when majit's table bound
+    // `opimpl_gc_load_indexed_i` (`c4363351bad`).
+    "gc_load_indexed_f/riiii>f",
     "rvmprof_code/ii",
     // `opimpl_unreachable` aborts the walk instead of panicking.
     "unreachable/",
@@ -289,22 +293,16 @@ const PYRE_ONLY: &[&str] = &[
     // when majit's tracer gained the pure array-read arms.
     // `getarrayitem_gc_f/rid>f` and `getarrayitem_gc_f_pure/rid>f` left this
     // list when majit's tracer gained the float getarrayitem arms.
-    // Constant-length form. The register-length `new_array_clear/id>r`
-    // is decoded by both tracers.
-    "new_array_clear/cd>r",
-    "setarrayitem_gc_i/ricd",
-    "setarrayitem_gc_r/rcrd",
-    // The push/pop bank transfers.
-    "float_pop/>f",
-    "float_push/f",
-    "int_pop/>i",
-    "int_push/i",
-    "ref_pop/>r",
-    "ref_push/r",
+    // `record_quasiimmut_field/rdd` left this list when majit's tracer gained
+    // `pyjitpl.py opimpl_record_quasiimmut_field`.
+    // `new_array_clear/cd>r`, `setarrayitem_gc_{i,r}` const-index forms,
+    // the push/pop bank transfers, `gc_load_indexed_i/riiii>i` and
+    // `strgetitem/rc>i` left when the branch's pyjitpl table
+    // (`c4363351bad`) bound `opimpl_new_array`, `opimpl_setarrayitem_gc_*`,
+    // `opimpl_any_push`/`opimpl_any_pop`, `opimpl_gc_load_indexed_i` and
+    // `opimpl_strgetitem` onto those bytes.
     // Raw float store.
     "raw_store_f/iifd",
-    // `pyjitpl.py opimpl_gc_load_indexed_i`. Majit's tracer has no arm.
-    "gc_load_indexed_i/riiii>i",
     // `pyjitpl.py` `_opimpl_getinteriorfield_gc_any` /
     // `execute_setinteriorfield_gc`. Majit's tracer has no arm.
     "getinteriorfield_gc_f/rid>f",
@@ -313,10 +311,6 @@ const PYRE_ONLY: &[&str] = &[
     "setinteriorfield_gc_f/rifd",
     "setinteriorfield_gc_i/riid",
     "setinteriorfield_gc_r/rird",
-    // Constant-index string read (`pyjitpl.py opimpl_strgetitem`). Majit's
-    // `BC_STRLEN` / `BC_STRGETITEM` arms decode the register-index shapes
-    // only.
-    "strgetitem/rc>i",
 ];
 
 /// Keys the encoding names that neither tracer decodes.
@@ -340,7 +334,6 @@ const PYRE_ONLY: &[&str] = &[
 /// so a new arrival costs compilation rather than correctness.
 const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
-    "gc_load_indexed_f/riiii>f",
     "getlistitem_gc_f/ridd>f",
     "getlistitem_gc_i/ridd>i",
     "getlistitem_gc_r/ridd>r",
@@ -419,10 +412,8 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// helper graphs (`rbuilder.py ll_append` / `ll_grow_by` / `ll_build`) emit
 /// them.  No walked body builds through those graphs yet.
 ///
-/// `getfield_raw_r/id>r` is numbered the same way. `jtransform.py
-/// rewrite_op_getfield` emits the pure form to load an immutable field off
-/// a raw struct (map terminator `w_cls`); `blackhole.py bhimpl_getfield_raw_r`
-/// / `wire_bhimpl_handlers` bind the handler. `insns.rs` has no `BC_*`.
+/// `getfield_raw_r/id>r` left this list when `insns.rs` named
+/// `BC_GETFIELD_RAW_R`; both tracers decode that byte.
 ///
 /// `record_quasiimmut_field/idd` is numbered the same way. A headerless
 /// raw owner (`AuditHolder`, `GilReadyState`) puts the pointer in the
@@ -449,7 +440,6 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         .collect();
     unnamed.sort();
     let mut expected: Vec<String> = [
-        "getfield_raw_r/id>r",
         "record_quasiimmut_field/idd",
         "current_trace_length/>i",
         "int_same_as/i>i",

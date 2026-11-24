@@ -28,9 +28,15 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 /// answers `True` for *every* field of a struct carrying that hint, so
 /// each vtable slot reaches `descr.py:231 is_pure = STRUCT.
 /// _immutable_field(fieldname) != False` as a pure field.  Pyre's
-/// per-field spelling of the same declaration: all four slots are
-/// written once during startup (`assign_subclass_range` /
-/// `set_instantiate`, both before any bytecode runs) and never again.
+/// per-field spelling of the same declaration: the slots are written
+/// once during startup (`assign_subclass_range` / `set_instantiate` /
+/// `set_shortcut_binop`, all before any bytecode runs) and never again.
+///
+/// `shortcut_binop` is the `W_Root.shortcut___mod__` class attribute
+/// (`typedef.py use_special_method_shortcut`): a pointer to the
+/// interp-level binop table, filled by the interpreter after the
+/// descrs exist.  It is not an OBJECT_VTABLE field; it lives at the
+/// end so the four upstream slots keep their offsets.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields(
     "subclassrange_min",
@@ -41,7 +47,8 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "weakref_offset",
     "user_subclass",
     "user_base",
-    "mapdict_access"
+    "mapdict_access",
+    "shortcut_binop"
 )]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
@@ -87,6 +94,10 @@ pub struct PyType {
     /// class has no mixin. Immutable after type creation
     /// (`_immutable_fields_`); a constant type folds the slot load.
     pub mapdict_access: Option<&'static crate::mapdict::MapdictMixinAccess>,
+    /// `typedef.py use_special_method_shortcut` — opaque pointer to
+    /// the interpreter's per-layout binop shortcut table.  Null until
+    /// `init_interned_binop_names` writes it.
+    pub shortcut_binop: AtomicPtr<()>,
 }
 
 /// Common header for all Python objects.
@@ -207,6 +218,7 @@ const fn new_pytype_kind(
         user_subclass: std::ptr::null(),
         user_base: std::ptr::null(),
         mapdict_access: None,
+        shortcut_binop: AtomicPtr::new(std::ptr::null_mut()),
     }
 }
 
@@ -434,6 +446,24 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
 pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
     let tp = unsafe { (*obj).ob_type };
     !tp.is_null() && unsafe { (*tp).mapdict_offset != 0 }
+}
+
+/// `typedef.py` class-attribute write of `shortcut___mod__` and siblings.
+///
+/// The interpreter stores an opaque vtable pointer; the object crate
+/// never dereferences it.  Release on the write pairs with the
+/// Relaxed load below the same way [`set_instantiate`] does: the
+/// unique writer runs before any bytecode, so the JIT sees a plain
+/// word.
+pub fn set_shortcut_binop(tp: &PyType, vtable: *mut ()) {
+    tp.shortcut_binop.store(vtable, Ordering::Release);
+}
+
+/// Relaxed load of [`PyType::shortcut_binop`].  Same word-load
+/// contract as [`get_instantiate`].
+#[inline]
+pub fn get_shortcut_binop(tp: &PyType) -> *mut () {
+    tp.shortcut_binop.load(Ordering::Relaxed)
 }
 
 /// True when `obj`'s Python class is exactly the builtin type for its

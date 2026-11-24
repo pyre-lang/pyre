@@ -185,7 +185,7 @@ type RecursionHome = *mut crate::PyExecutionContext;
 /// execution context; this Rust TLS is only the pre-context fallback and has
 /// no source-translatable object graph.
 #[majit_macros::dont_look_inside]
-fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
+pub fn detached_recursion_state_get() -> (usize, *mut PyFrame) {
     DETACHED_RECURSION.with(|c| c.get())
 }
 
@@ -443,7 +443,38 @@ pub fn current_eval_fn_addr() -> usize {
 /// `eval_with_jit` and the rewritten portal stub are in the closure. The
 /// result/exception split stays on the pending-error channel used by the
 /// other bare-`PyObjectRef` call boundaries.
+#[inline(always)]
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
+    clear_call_error();
+    // warmspot.py `rewrite_jit_merge_point`: callers of the original portal
+    // graph reach `direct_call(portal_runner, greens..., reds...)`, which
+    // `guess_call_kind` classifies as recursive. The five words are the jd0
+    // portal arguments (`next_instr`, `is_being_profiled`, `pycode`, `frame`,
+    // `ec`), same order as `jit_merge_point`. `frame` is the GCREF red
+    // (`interp_jit.py` `reds = ['frame', 'ec']`, `history.py getkind`),
+    // the same `&mut PyFrame` `jit_merge_point` and `EvalFn` take.
+    let next_instr = frame.next_instr() as i64;
+    let is_being_profiled = i64::from(frame.get_is_being_profiled());
+    let pycode = frame.pycode as PyObjectRef;
+    let ec = getexecutioncontext();
+    recursive_portal_enter(next_instr, is_being_profiled, pycode, frame, ec)
+}
+
+/// Direct call the codewriter classifies as the jd0 portal runner.
+///
+/// The traced form is `recursive_call`, not this body
+/// (`warmspot.py` `rewrite_jit_merge_point`). Residual
+/// (`rlib/jit.py` `dont_look_inside`): looking inside types
+/// `get_eval_fn()` as Integer and fails `simple_call`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn recursive_portal_enter(
+    _next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: PyObjectRef,
+    frame: &mut PyFrame,
+    _ec: *const crate::PyExecutionContext,
+) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
         Ok(value) => value,
@@ -1225,7 +1256,7 @@ fn format_unknown_kwds_err(fname: &Wtf8, unmatched: &[Wtf8Buf]) -> Wtf8Buf {
 #[cold]
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-fn resolve_kwargs_binding_error(
+pub fn resolve_kwargs_binding_error(
     callable: PyObjectRef,
     args: &[PyObjectRef],
     kwarg_names: PyObjectRef,
@@ -1487,8 +1518,6 @@ pub fn call_user_function_resolved(
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
-    let eval_fn = get_eval_fn();
-
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
@@ -1500,7 +1529,12 @@ pub fn call_user_function_resolved(
         )?)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
-    eval_fn(&mut func_frame, None)
+    let result = eval_current_frame_raw(&mut func_frame);
+    if result.is_null() {
+        Err(take_call_error().expect("pending call error"))
+    } else {
+        Ok(result)
+    }
 }
 
 /// Invoke a builtin's function pointer for a positional-only call,
@@ -1611,7 +1645,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
     builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
-fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+pub fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
     // collection between the outer `space.call_function` reload and this
@@ -1672,7 +1706,7 @@ fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> 
 /// (method / type / staticmethod / classmethod / instance-`__call__`) is
 /// identical for both — only the leaf executor differs — so the two entry
 /// points share one body instead of a stripped-down copy.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 enum CallMode {
     Jit,
     Plain,
@@ -2371,7 +2405,7 @@ fn call_kw_in_ctx_impl(
 /// The bound scope has the `Arguments.parse_into_scope` layout
 /// (`co_argcount + kwonly + *args + **kwargs`, defaults filled) and is what
 /// `call_user_function_resolved` copies into the new frame.
-fn call_user_function_from_call_kw(
+pub fn call_user_function_from_call_kw(
     execution_context: *const crate::PyExecutionContext,
     target_func: PyObjectRef,
     call_args: &[PyObjectRef],
@@ -2520,6 +2554,17 @@ fn read_root_run(
         out.push(roots.get(base + index));
     }
     out
+}
+
+/// True when `type(callable) is type`. This is the first test
+/// `metaclass_call_override` makes, and it cannot collect: `r#type` and
+/// `w_type` are pointer reads. It is a subset of "no override" — a class
+/// whose metaclass is exactly `type` uses `type.__call__`, the default
+/// constructor.
+#[inline]
+fn metaclass_is_type(callable: PyObjectRef) -> bool {
+    crate::typedef::r#type(callable)
+        .is_some_and(|m| std::ptr::eq(m.as_ptr(), crate::typedef::w_type()))
 }
 
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
@@ -2714,11 +2759,100 @@ fn call_callable_with_mode(
         }
         return call_callable_with_mode(execution_context, func, &call_args, mode, profile_frame);
     }
+    // One-arg type call (`ValueError("v")`) is a word residual so the
+    // exception-bridge walk can construct the instance instead of
+    // residualising the slice-ABI generic dispatcher.
+    // `descroperation.py call` looks up `type(w_obj).__call__`; when
+    // `type(w_obj) is type` that lookup is `type.__call__`, the default
+    // constructor.  The predicate is a pointer-identity test and cannot
+    // collect, so `callable` and `args` may stay unrooted here.  Any other
+    // metaclass (ABCMeta, EnumType, a metaclass with `__call__`) falls
+    // through to `call_non_function_callable_with_mode`, which performs
+    // the override check with roots.
+    if unsafe { pyre_object::is_type(callable) } && args.len() == 1 && metaclass_is_type(callable) {
+        let value = call_type_one_arg(execution_context, callable, args[0]);
+        if value.is_null() {
+            return Err(
+                take_call_error().unwrap_or_else(|| PyError::type_error("constructor failed"))
+            );
+        }
+        return Ok(value);
+    }
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
 }
 
+/// Zero-arg CALL as two word values (`frame`, callable). Portal jitcode
+/// must not carry a `&[]` slice operand — that serializes as a non-GC
+/// `Array<*mut PyObject;0>` Ref and `ARRAYLEN_GC` faults on it.
+/// `descroperation.py get_and_call_function(w_descr, w_obj)` has no extra
+/// `*args_w` list at arity 0; this is that specialized graph.
+/// Errors go through [`set_call_error`]; a null return is the failure.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
+pub extern "C" fn call_zero_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// One-arg CALL as three word values (`frame`, callable, arg). Portal
+/// interpret cannot rebuild a `&[T]` from residual boxes — that SIGBUS'd
+/// in `pin_roots` — so `opcode_call` nargs=1 residual-calls this instead.
+/// Errors go through [`set_call_error`]; a null return is the failure.
+///
+/// `extern "C"` plus `inline(never)`: a Rust `fn(&mut PyFrame, …)` was
+/// emitted as an extract-time code address (not a symbolic path hash),
+/// which SIGSEGV'd at runtime. The C ABI matches `cpa3` remapping.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn call_one_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+    arg: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, std::slice::from_ref(&arg)) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// Word ABI for `Type(arg)`. The generic dispatcher takes a slice and
+/// returns `Result`, which cannot be a residual.
+#[majit_macros::dont_look_inside]
+pub fn call_type_one_arg(
+    execution_context: *const crate::PyExecutionContext,
+    w_type: PyObjectRef,
+    w_arg: PyObjectRef,
+) -> PyObjectRef {
+    match type_descr_call_with_mode(execution_context, w_type, &[w_arg], CallMode::Plain) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside(word_enums(CallMode))]
 fn call_non_function_callable_with_mode(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -2882,8 +3016,8 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let eval_fn = get_eval_fn();
-    call_user_function_with_eval(frame, callable, args, eval_fn)
+    let _ = frame;
+    call_user_function_with_ctx(getexecutioncontext(), callable, args, false)
 }
 
 /// Plain interpreter-only user-function call.
@@ -4005,7 +4139,7 @@ fn call_with_minted_keyword_names(
 /// `methodcall` is `Arguments.methodcall`; `_match_signature` raises
 /// `ArgErrTooManyMethod` when it is set. Callers that hold an `Arguments`
 /// pass `args.methodcall`; star-arg and minted-name paths pass `false`.
-fn call_with_kwargs_in_ctx_impl(
+pub fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
@@ -4739,7 +4873,12 @@ fn call_with_kwargs_in_ctx_impl(
             // local (`shadowstack.py` `push_roots`); this ABI boundary is
             // outside that transform.
             let _callee_locals_root = crate::pyframe::FrameLocalsRoot::new(func_frame.as_mut_ptr());
-            return get_eval_fn()(&mut func_frame, None);
+            let result = eval_current_frame_raw(&mut func_frame);
+            return if result.is_null() {
+                Err(take_call_error().expect("pending call error"))
+            } else {
+                Ok(result)
+            };
         } // end user function branch
     } // end is_function
 

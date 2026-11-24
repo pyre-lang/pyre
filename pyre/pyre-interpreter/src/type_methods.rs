@@ -3540,7 +3540,7 @@ enum IntOrLong<'a> {
 /// leading `-` (e.g. `-0x2a`); `_format_int_or_long` strips them again with
 /// `skip_leading`.
 #[majit_macros::jit_elidable]
-fn _int_to_base(base: u32, value: i64) -> String {
+pub fn _int_to_base(base: u32, value: i64) -> String {
     if base == 10 {
         return value.to_string();
     }
@@ -5843,7 +5843,7 @@ fn padded_byte_len(body_len: usize, run: usize, fill: CodePoint) -> usize {
 /// `n` is a padding run derived from a caller-supplied `width`, so the space
 /// for it is reserved fallibly up front; growing the buffer one code point at
 /// a time would abort the process on an unsatisfiable run.
-fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) -> Result<(), crate::PyError> {
+pub fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) -> Result<(), crate::PyError> {
     out.try_reserve_exact(n.saturating_mul(cp.len_wtf8()))
         .map_err(|_| crate::builtins::reservation_failed())?;
     for _ in 0..n {
@@ -7214,7 +7214,10 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
 }
 
 /// `dictmultiobject.py update1_dict_dict` / `rev_update1_dict_dict`.
-fn dict_update1_dict_dict(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn dict_update1_dict_dict(
+    w_dict: PyObjectRef,
+    w_data: PyObjectRef,
+) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_data]);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
@@ -7353,7 +7356,7 @@ pub(crate) fn mapping_keys_listview(
 
 /// `dictmultiobject.py update1_keys` —
 /// `for k in o.keys(): dict.__setitem__(d, k, o[k])`.
-fn dict_update1_keys(
+pub fn dict_update1_keys(
     w_dict: PyObjectRef,
     w_data: PyObjectRef,
     w_keys: PyObjectRef,
@@ -7385,7 +7388,10 @@ fn dict_update1_keys(
 }
 
 /// `dictmultiobject.py update1_pairs` — iterable of `(key, value)` pairs.
-fn dict_update1_pairs(w_dict: PyObjectRef, w_iterable: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn dict_update1_pairs(
+    w_dict: PyObjectRef,
+    w_iterable: PyObjectRef,
+) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_iterable]);
     let w_iterator =

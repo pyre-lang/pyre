@@ -605,7 +605,7 @@ pub(crate) fn global_build_jitcodes() -> &'static [std::sync::Arc<JitCode>] {
 /// produced eagerly; pyre's runtime jitcodes are emitted on demand
 /// per-Python-frame and lack a global allocation index, so the pool
 /// is per-`JitCode` here as a sibling of the canonical `core`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct JitCodeExecState {
     /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
     pub descrs: Vec<RuntimeBhDescr>,
@@ -631,6 +631,24 @@ pub struct JitCodeExecState {
     /// An ordinary inline JitCode leaves this false; `add_sub_jitcode`
     /// refuses a callee that latched it.
     pub reads_identity_slots: bool,
+    /// Post-regalloc Ref-bank color of the portal jitdriver's first red
+    /// (`frame`; `interp_jit.py` `reds = ['frame', 'ec']`). Unique-walk
+    /// analog of `PyJitCodeMetadata.portal_frame_reg`:
+    /// `record_inline_application_traceback` reads
+    /// `registers_r[portal_frame_reg]`. `u16::MAX` when the body has no
+    /// portal frame red (skeletons, helpers). 0 is a valid color.
+    pub portal_frame_reg: u16,
+}
+
+impl Default for JitCodeExecState {
+    fn default() -> Self {
+        Self {
+            descrs: Vec::new(),
+            jit_merge_point_offset: None,
+            reads_identity_slots: false,
+            portal_frame_reg: u16::MAX,
+        }
+    }
 }
 
 // Wrapper `JitCode` — runtime jitcode = canonical core + descr pool.
@@ -1326,6 +1344,32 @@ impl JitCode {
         }
         Ok(site)
     }
+
+    /// `pyjitpl.py MIFrame.make_result_of_lastop`: the dest register is
+    /// `ord(self.bytecode[self.pc-1])` and the bank is
+    /// `self.jitcode._resulttypes[self.pc]`.
+    ///
+    /// A caller suspended in a residual `CALL` (not `BC_INLINE_CALL`) still
+    /// records that pair. Resume uses it to wire the callee's return when
+    /// `inline_call_ending_at` cannot see an inline-call encoding.
+    pub fn result_slot_at_pc(&self, pc: usize) -> Option<(JitArgKind, usize)> {
+        let body = self.try_body()?;
+        let kind = body
+            .resulttypes
+            .as_ref()
+            .and_then(|types| types.get(&pc).copied())?;
+        let dest = *body.code.get(pc.checked_sub(1)?)?;
+        if dest == NO_RETURN_REG {
+            return None;
+        }
+        let kind = match kind {
+            'i' => JitArgKind::Int,
+            'r' => JitArgKind::Ref,
+            'f' => JitArgKind::Float,
+            _ => return None,
+        };
+        Some((kind, dest as usize))
+    }
 }
 
 /// Why [`JitCode::inline_resume_site_for`] declined a caller/callee pair.
@@ -1931,6 +1975,7 @@ mod tests {
             ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.
             ("abort/>r", majit_jitcode::insns::BC_ABORT_RESULT_R),
+            ("abort/>i", majit_jitcode::insns::BC_ABORT_RESULT_I),
             // dyn-trait method pointer reification (backend epic).
             (
                 "vtable_method_ptr/rd>i",

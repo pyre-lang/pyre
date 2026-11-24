@@ -282,7 +282,7 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
 }
 
-fn call_published(which: usize, args: &[PyObjectRef]) -> PyResult {
+pub fn call_published(which: usize, args: &[PyObjectRef]) -> PyResult {
     // `args` is the gateway's native copy; publishing allocates.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.pin_roots(args);

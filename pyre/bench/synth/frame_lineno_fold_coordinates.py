@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: spec-folds=frame_lineno
 # pyre-check: trace-shape=main:present=Jump
 # Self-checking guard for the line an app-level `f_lineno` read reports for the
 # frame that is running it.

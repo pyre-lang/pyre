@@ -701,6 +701,8 @@ pub fn complete_struct_or_union(
                 // A nested anonymous struct or union: its fields are spliced
                 // in at this offset under their own names.
                 for w_srcfld in super::ctypestruct::fields_list_of(ftype)? {
+                    // `append` (`w_list_append`) can collect; `w_srcfld` is
+                    // still live for `name_of_field` after it.
                     let iter_roots = pyre_object::gc_roots::push_roots();
                     let src_slot = iter_roots.pin_roots(&[w_srcfld]);
                     let srcfld =

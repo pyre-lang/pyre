@@ -1262,12 +1262,33 @@ impl FunctionDesc {
     /// carries. Publishes `_signature_` through
     /// `publish_residual_result_signature`; does not overwrite an
     /// existing one. Does not write `_cache`.
+    ///
+    /// A second install (GraphStore residual, then
+    /// `register_unsafe_fn_stubs`) keeps the published
+    /// `_signature_[1]` (`signature.py` `enforce_signature_return`).
+    /// `project_struct_field_type` of a `GcArray` list mints a fresh
+    /// `ListDef` (`listdef.py` `ListDef.same_as` is identity); a
+    /// Debug-identical replacement fails `contains` under
+    /// `TLS.no_side_effects_in_union`.
     pub(crate) fn install_external_stub(&mut self, stub: Rc<PyGraph>, s_result: SomeValue) {
+        let s_result = self.published_residual_result().unwrap_or(s_result);
         *self.source_graph.borrow_mut() = Some(SourceGraph::External {
             stub,
             s_result: s_result.clone(),
         });
         crate::translator::rtyper::call_registry::publish_residual_result_signature(self, s_result);
+    }
+
+    /// Declared residual result already published as `_signature_[1]`
+    /// or parked on the External slot. `None` when neither exists.
+    fn published_residual_result(&self) -> Option<SomeValue> {
+        if let Some(s) = self.residual_signature_result() {
+            return Some(s);
+        }
+        match &self.annsignature.as_ref()?.result {
+            ParamType::Annotation(s) => Some((**s).clone()),
+            _ => None,
+        }
     }
 
     /// Peek at a built source template without running a pending lift.
@@ -4090,6 +4111,53 @@ mod tests {
             matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
             "per-key stub result is the External SomeInteger, got {link_ann:?}"
         );
+    }
+
+    /// A second `install_external_stub` of a Debug-identical `SomeList`
+    /// keeps the first `ListDef` (`listdef.py` `same_as`). GraphStore
+    /// residual plus `register_unsafe_fn_stubs` would otherwise fail
+    /// `enforce_signature_return`.
+    #[test]
+    fn install_external_stub_keeps_published_list_signature_identity() {
+        use super::super::signature::enforce_signature_return;
+        use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
+
+        let mut host_func =
+            GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "alloc_frame_locals_array_nursery",
+            int_sig(&["n"]),
+            None,
+            None,
+        );
+        let item = SomeValue::Integer(SomeInteger::default());
+        let first = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            item.clone(),
+            false,
+            false,
+        )));
+        let second = SomeValue::List(SomeList::new(ListDef::new(None, item, false, false)));
+        assert!(
+            !first.contains(&second),
+            "distinct ListDefs must not contain each other"
+        );
+        fd.install_external_stub(make_pygraph(int_sig(&["n"]), Some(Vec::new())), first);
+        fd.install_external_stub(make_pygraph(int_sig(&["n"]), Some(Vec::new())), second);
+        let kept = fd
+            .residual_signature_result()
+            .expect("External s_result after the second install");
+        let annsig = fd.annsignature.as_ref().expect("published _signature_");
+        enforce_signature_return(
+            "alloc_frame_locals_array_nursery",
+            &bk(),
+            &annsig.result,
+            &kept,
+        )
+        .expect("published ListDef must contain the stub result");
     }
 
     /// A minted per-key stub keeps the template's func id, defaults and

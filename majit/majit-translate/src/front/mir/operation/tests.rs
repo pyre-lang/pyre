@@ -465,6 +465,87 @@ fn restore_offset_pointer_type_keeps_ptradd_when_entry_is_signed() {
     assert_eq!(restored, ptradd, "no pointer annotation to restore");
 }
 
+/// `rordereddict.py` `DICTENTRY` is `lltype.Struct` (`GcKind::Raw`)
+/// inlined in a `GcArray`. Byte `direct_ptradd` stamps `CCHARP`;
+/// `restore_offset_pointer_type` recasts with `rffi.cast`
+/// (`ll2ctypes.py` `ForceCastEntry`), not `cast_int_to_ptr` of the
+/// still-Ptr blob (`lltype.py` `ann_cast_int_to_ptr` expects Integer).
+#[test]
+fn restore_offset_pointer_type_recasts_ccharp_to_raw_struct_ptr() {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
+    let mut graph = FunctionGraph::new("test");
+    let bb = graph.startblock;
+    let ptr = graph
+        .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+        .expect("pointer value");
+    let entry_ty = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(Struct::new(
+            "Entry",
+            vec![
+                ("key".into(), LowLevelType::Signed),
+                ("f_valid".into(), LowLevelType::Bool),
+            ],
+        )),
+    }));
+    ptr.set_concretetype(Some(entry_ty.clone()));
+    let count = graph
+        .push_op_var(bb, OpKind::ConstInt(8), true)
+        .expect("count");
+    let ptradd =
+        super::push_direct_ptradd(&mut graph, bb, ptr, count, &super::item_lltype_for_size(40));
+    let restored =
+        super::restore_offset_pointer_type(&mut graph, bb, Some(entry_ty.clone()), ptradd.clone());
+    assert_eq!(
+        restored.concretetype().as_ref(),
+        Some(&entry_ty),
+        "restored dest is Ptr(Struct Entry)"
+    );
+    let recast = graph
+        .block(bb)
+        .operations
+        .iter()
+        .find(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("cast")
+                    && segments.iter().any(|s| s == "rffi")
+            }
+            _ => false,
+        })
+        .expect("rffi.cast recast of Raw DICTENTRY");
+    assert_eq!(recast.result.as_ref(), Some(&restored));
+    let recast_int_to_entry = graph.block(bb).operations.iter().any(|op| {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            return false;
+        };
+        if segments.last().map(String::as_str) != Some("cast_int_to_ptr") {
+            return false;
+        }
+        match args.first() {
+            Some(crate::model::LinkArg::Const(c)) => match &c.value {
+                crate::flowspace::model::ConstValue::LowLevelType(ty) => matches!(
+                    ty.as_ref(),
+                    LowLevelType::Ptr(p)
+                        if matches!(&p.TO, PtrTarget::Struct(st) if st._name.contains("Entry"))
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    });
+    assert!(
+        !recast_int_to_entry,
+        "Raw DICTENTRY dest is rffi.cast, not cast_int_to_ptr of Ptr(Struct Entry)"
+    );
+}
+
 #[test]
 fn restore_offset_pointer_type_keeps_ccharp_for_gc_entry() {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};

@@ -3,7 +3,7 @@ mod common;
 use std::collections::HashSet;
 
 use common::{
-    INTERPRETER_LLBC, OBJECT_LLBC, RLIB_LLBC,
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, RLIB_LLBC,
     build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc, lower_named,
     lower_named_with_static_addrs,
 };
@@ -12,21 +12,39 @@ use majit_translate::{
     CallPath,
     ErrorCarrierSpec,
     FunctionGraph,
+    HeuristicLayoutProvider,
     HostStaticAddrs,
+    LayoutProvider,
+    SemanticProgram,
     annotator::classdesc::{
         register_flattened_list_storage_leaves, register_struct_fields_with_layout,
     },
     codewriter::{
         CodeWriter,
         call::CallControl,
-        jtransform::{GraphTransformConfig, transform_graph},
+        jtransform::{GraphTransformConfig, Transformer, transform_graph},
     },
     flowspace::argument::Signature,
     // build_semantic_* on shared artefacts goes through common.
     model::{
-        ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, ValueType, VecFieldPart,
+        ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, ValueType,
+        VecFieldPart, getkind,
     },
-    translator::rtyper::{legacy_annotator, legacy_resolve},
+    translator::rtyper::{
+        legacy_annotator, legacy_resolve,
+        lltypesystem::{
+            lltype::{LowLevelType, PtrTarget},
+            rstr::STRPTR,
+        },
+    },
+};
+
+const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
+    carrier_path: "pyre_interpreter::error::PyError",
+    carrier_class: "",
+    carrier_wrappers: &[],
+    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+    from_exc_object: Some(("PyError", "from_exc_object")),
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
@@ -528,17 +546,6 @@ fn pycode_code_ptr_is_raw_int_kind() {
         "empty harvest cannot int-bank at the legacy layer"
     );
 }
-
-/// The carrier the production prepass names (`pyre-jit-trace/build/prepass.rs`).
-/// Without it, `front::result_exc` leaves every `Result<T, PyError>` `?` as a
-/// residual `branch` and these bodies appear to lower.
-const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
-    carrier_path: "pyre_interpreter::error::PyError",
-    carrier_class: "",
-    carrier_wrappers: &[],
-    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
-    from_exc_object: Some(("PyError", "from_exc_object")),
-};
 
 fn production_addrs() -> HostStaticAddrs<'static> {
     HostStaticAddrs {
@@ -1097,18 +1104,12 @@ fn root_producers(
     roots
 }
 
-/// `charpsize2str` is `vec![0u8; size]; copy_bytes(cp, out.as_mut_ptr(), size); out`.
-/// `Vec<u8>::as_mut_ptr` of the byte list reads the items through
-/// `rgc.nonmoving_raw_ptr_for_resizable_list`, whose result is `CCHARP`.
-///
-/// `str2charp` is `raw_malloc_or_memory_error(bytes)?` then
-/// `copy_bytes(s.as_ptr(), array.cast(), …)`, so the dst is the `Ok`
-/// payload of that Result. `raw_malloc` is its own graph (`libc::malloc`
-/// then `p.cast()`); that identity cast is `cast_int_to_ptr(CCHARP)`
-/// (`lltype.py` `ann_cast_int_to_ptr` / `rffi.cast`). The annotator carries
-/// `SomePtr(CCHARP)` onto `copy_bytes` dst.
+/// `charpsize2str` residual-calls `rstr.py` `copy_raw_to_string`
+/// (`rffi.py` `charpsize2str`). `str2charp` residual-calls
+/// `rstr.py` `copy_string_to_raw`. `raw_malloc` is `libc::malloc`
+/// then `cast_int_to_ptr(CCHARP)` (`lltype.py` `ann_cast_int_to_ptr`).
 #[test]
-fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
+fn charpsize2str_and_str2charp_copy_through_rstr_raw() {
     use majit_translate::translator::rtyper::lltypesystem::rffi::CCHARP;
 
     let llbc = load_llbc(RLIB_LLBC);
@@ -1116,63 +1117,19 @@ fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
     let str2charp = lower_named(llbc, "str2charp").expect("lower str2charp");
     let raw_malloc = lower_native_raw_malloc(llbc);
 
-    let cdst = copy_bytes_dst(&charpsize).expect("charpsize2str calls copy_bytes");
-    let cdst_roots = root_producers(&charpsize, &cdst);
     assert!(
-        cdst_roots.iter().any(|(kind, _)| {
-            call_path_leaf(kind) == Some("__majit_nonmoving_raw_ptr_for_resizable_list")
-        }),
-        "charpsize2str copy_bytes dst roots at rgc.nonmoving_raw_ptr_for_resizable_list; cdst_roots={cdst_roots:?}"
+        call_leaves(&charpsize).contains(&"copy_raw_to_string"),
+        "charpsize2str residual-calls copy_raw_to_string (`rffi.py` `charpsize2str`); leaves={:?}",
+        call_leaves(&charpsize)
     );
     assert!(
-        !charpsize
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| call_path_leaf(&op.kind) == Some("ll_vec_as_ptr")),
+        !call_leaves(&charpsize).contains(&"ll_vec_as_ptr"),
         "charpsize2str does not go through ll_vec_as_ptr"
     );
-
-    let dst = copy_bytes_dst(&str2charp).expect("str2charp calls copy_bytes");
-    let dst_roots = root_producers(&str2charp, &dst);
-    let ok_payload_base = dst_roots
-        .iter()
-        .find_map(|(kind, _)| match kind {
-            OpKind::FieldRead { base, field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_ref()
-                        .is_some_and(|s| s.ends_with("::Ok") && s.contains("Result")) =>
-            {
-                Some(base)
-            }
-            _ => None,
-        })
-        .expect(&format!(
-            "str2charp copy_bytes dst is the Ok payload of a Result; dst_roots={dst_roots:?}"
-        ));
-    let base_roots = root_producers(&str2charp, ok_payload_base);
-    let result_arg = base_roots.iter().find_map(|(kind, _)| match kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
-            args.first().and_then(LinkArg::as_variable).cloned()
-        }
-        _ => None,
-    });
-    // `rffi.py str2charp` copies into the raw allocation. A frontend
-    // `cast_pointer` alias may narrow its Result carrier, but is not a
-    // required producer when the call already carries that class.
-    let result_arg = result_arg.unwrap_or_else(|| ok_payload_base.clone());
-    let result_roots = root_producers(&str2charp, &result_arg);
     assert!(
-        result_roots
-            .iter()
-            .any(|(kind, _)| call_path_leaf(kind) == Some("raw_malloc_or_memory_error")),
-        "str2charp's Ok payload comes from raw_malloc_or_memory_error's Result; result_roots={result_roots:?}"
+        call_leaves(&str2charp).contains(&"copy_string_to_raw"),
+        "str2charp residual-calls copy_string_to_raw (`rffi.py` `str2charp`); leaves={:?}",
+        call_leaves(&str2charp)
     );
 
     let ret = graph_return_value(&raw_malloc).expect("raw_malloc returns a value");
@@ -1261,22 +1218,1095 @@ fn lower_native_raw_malloc(llbc: &'static Llbc) -> FunctionGraph {
     graph
 }
 
-fn copy_bytes_dst(graph: &FunctionGraph) -> Option<majit_translate::flowspace::model::Variable> {
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let OpKind::Call {
+/// Production `getcalldescr` panics in `w_code_qualname_obj` calling
+/// residual `w_code_get_ptr`: FUNC.RESULT Int, caller cell GCREF.
+/// A flavor-raw `*const CodeObject` result is `rclass.py getgcflavor`
+/// raw `Ptr`, `history.getkind` int. Publish that cell.
+#[test]
+fn w_code_qualname_obj_get_ptr_call_result_is_raw_int() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        HostStaticAddrs {
+            error_carrier: ERROR_CARRIER,
+            ..Default::default()
+        },
+        &["pycode", "gc_roots", "unicodeobject"],
+        &[
+            "w_code_qualname_obj",
+            "w_code_get_ptr",
+            "publish_code_slot_store_rooting",
+            "push_roots",
+            "pin_root",
+            "root_scope_close",
+            "w_str_new",
+            "base",
+            "get",
+            "owner",
+        ],
+    )
+    .expect("lower w_code_qualname_obj and residual get_ptr callees");
+
+    {
+        let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (qualified, fields) in entries {
+            let layout_pairs: Option<Vec<(String, String)>> =
+                program.struct_fields.fields.get(qualified).map(|rows| {
+                    rows.iter()
+                        .map(|row| (row.name.clone(), row.ty.clone()))
+                        .collect()
+                });
+            register_struct_fields_with_layout(qualified, fields, layout_pairs.as_deref());
+        }
+    }
+    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+
+    let mut callcontrol = CallControl::new();
+    callcontrol.set_known_struct_names(program.known_struct_names.clone());
+    callcontrol.set_struct_fields(program.struct_fields.clone());
+    callcontrol.set_enum_variant_by_discriminant(program.enum_variant_by_discriminant.clone());
+    callcontrol.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    callcontrol.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    callcontrol.foreign_opaque_method_externals = program.foreign_opaque_method_externals.clone();
+
+    let crate_prefix = |module: &str| -> &'static str {
+        match module {
+            "gc_roots" | "unicodeobject" => "pyre_object",
+            _ => "pyre_interpreter",
+        }
+    };
+    let mut qualname_path = None;
+    let mut get_ptr_path = None;
+    let mut qualname_graph = None;
+    let mut get_ptr_return_type = None;
+    let mut get_ptr_hints = None;
+    for func in &program.functions {
+        let mut graph = func.graph().clone();
+        if let Some(rt) = &func.return_type {
+            graph = graph.with_return_type(rt.clone());
+        }
+        let mut paths = Vec::new();
+        if func.module_path.is_empty() {
+            paths.push(CallPath::from_segments([func.name.as_str()]));
+        } else {
+            paths.push(CallPath::from_segments([
+                func.module_path.as_str(),
+                func.name.as_str(),
+            ]));
+            paths.push(CallPath::from_segments([
+                crate_prefix(&func.module_path),
+                func.module_path.as_str(),
+                func.name.as_str(),
+            ]));
+        }
+        if let Some(owner) = func.self_ty_root.as_deref() {
+            paths.push(CallPath::for_impl_method(owner, &func.name));
+        }
+        for path in paths {
+            if func.name == "w_code_qualname_obj" && path.segments.len() == 3 {
+                qualname_path = Some(path.clone());
+                qualname_graph = Some(graph.clone());
+            }
+            if func.name == "w_code_get_ptr" && path.segments.len() == 3 {
+                get_ptr_path = Some(path.clone());
+                get_ptr_return_type = func.return_type.clone();
+                get_ptr_hints = Some(func.hints.clone());
+            }
+            if func.hints.is_empty() {
+                callcontrol.register_function_graph(path, graph.clone());
+            } else {
+                callcontrol.register_function_graph_with_hints(
+                    path,
+                    graph.clone(),
+                    func.hints.clone(),
+                );
+            }
+        }
+    }
+    let qualname_path = qualname_path.expect("pyre_interpreter::pycode::w_code_qualname_obj");
+    let get_ptr_path = get_ptr_path.expect("pyre_interpreter::pycode::w_code_get_ptr");
+    let qualname_graph = qualname_graph.expect("w_code_qualname_obj graph");
+    callcontrol.add_candidate_graph(qualname_path.clone());
+
+    let mut cw = CodeWriter::new();
+    cw.run_two_phase_prepass(&callcontrol);
+    let published =
+        cw.dual_gate_publish_concretetypes(&qualname_graph, &mut callcontrol, &qualname_path);
+    let is_match = published.is_some();
+
+    let declared_kind = callcontrol.declared_return_kind(&get_ptr_path);
+    let (result_ty, dest, dest_ll, dest_ann, dest_kind) = qualname_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } if segments.last().map(String::as_str) == Some("w_code_get_ptr") => {
+                let dest = op.result.as_ref().expect("get_ptr dest").clone();
+                let dest_ll = dest.concretetype();
+                let dest_kind = dest_ll.as_ref().map(getkind);
+                let dest_ann = dest.annotation.borrow().as_ref().map(|s| format!("{s:?}"));
+                Some((result_ty.clone(), dest, dest_ll, dest_ann, dest_kind))
+            }
+            _ => None,
+        })
+        .expect("w_code_qualname_obj calls w_code_get_ptr");
+    let (twin_ll, twin_ann, twin_kind) = published
+        .as_ref()
+        .and_then(|(twins, _)| twins.get(&dest))
+        .map(|twin| {
+            let twin_ll = twin.concretetype();
+            let twin_kind = twin_ll.as_ref().map(getkind);
+            let twin_ann = twin.annotation.borrow().as_ref().map(|s| format!("{s:?}"));
+            (twin_ll, twin_ann, twin_kind)
+        })
+        .unwrap_or((None, Some("<dest not in twins>".into()), None));
+
+    assert_eq!(
+        dest_kind,
+        Some(ConcreteType::Signed),
+        "w_code_get_ptr dest must be getkind int (rclass.py getgcflavor raw). \
+         match={is_match} declared_kind={declared_kind:?} \
+         result_ty={result_ty:?} get_ptr_return_type={get_ptr_return_type:?} \
+         get_ptr_hints={get_ptr_hints:?} harvest_codeobject={} \
+         dest_ll={dest_ll:?} dest_ann={dest_ann:?} \
+         twin_ll={twin_ll:?} twin_ann={twin_ann:?} twin_kind={twin_kind:?}",
+        program
+            .raw_alloc_flavor_structs
+            .iter()
+            .any(|k| k.contains("CodeObject")),
+    );
+}
+
+/// Install `CallControl` layouts the same way `lib.rs` does after
+/// `derive_program_metadata`: heuristic rows, then `apply_exact_layout`
+/// from `program.exact_layouts`.
+fn install_semantic_layouts(callcontrol: &mut CallControl, program: &SemanticProgram) {
+    majit_ir::descr::register_struct_ids(program.struct_ids.clone());
+    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+    let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+        program.struct_fields.fields.clone().into();
+    let provider = HeuristicLayoutProvider::from_struct_fields(
+        &pair_fields,
+        &program.known_struct_names,
+        &program.immutable_fields,
+        &program.raw_alloc_flavor_structs,
+    );
+    let mut names: Vec<_> = pair_fields.keys().cloned().collect();
+    names.sort();
+    for struct_name in names {
+        let Some(sid) = majit_ir::descr::struct_id_for_name(&struct_name) else {
+            continue;
+        };
+        let exact = program.exact_layouts.get(&sid);
+        let layout = match exact {
+            Some(exact) => {
+                provider.get_struct_layout_exact(&struct_name, &exact.field_offsets, exact.size)
+            }
+            None => provider.get_struct_layout(&struct_name),
+        };
+        if let Some(layout) = layout {
+            callcontrol.set_struct_layout(sid, layout);
+        }
+    }
+}
+
+/// `code.names[idx].as_str()` is a borrow of a by-value String item
+/// in the host `Box<[String]>` / `Vec<String>` FatData region. Place
+/// Index is the raw item ADDRESS: `rptr.py` InteriorPtrRepr
+/// `direct_ptradd` of the names items pointer by the unscaled index,
+/// item size `sizeof` the three-word String header. A one-word
+/// `ArrayRead` of a `Vec<String>` item would load only the UTF-8 data
+/// pointer (`get_type_flag("String")` is FLAG_POINTER). `Repr.rtype_str`
+/// then copies that header. jtransform `rewrite_op_direct_ptradd`
+/// (`jtransform.py rewrite_op_getarraysubstruct` returns
+/// `rewrite_op_direct_ptradd`) is `int_mul` by that size plus
+/// `int_add`, kind `'i'`.
+#[test]
+fn execute_store_name_names_index_is_raw_item_address() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        HostStaticAddrs {
+            error_carrier: ERROR_CARRIER,
+            ..Default::default()
+        },
+        &["pyopcode", "eval", "pyframe", "pycode"],
+        &["load_name_from_code"],
+    )
+    .expect("lower load_name_from_code");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "load_name_from_code")
+        .expect("load_name_from_code graph");
+
+    let ops: Vec<_> = function
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let dump: Vec<String> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                item_ty,
+                array_type_id,
+                nolength,
+                taken_by_address,
+                ..
+            } => Some(format!(
+                "ArrayRead item_ty={item_ty:?} array_type_id={array_type_id:?} \
+                 nolength={nolength} taken_by_address={taken_by_address}"
+            )),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty,
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => Some(format!(
+                "direct_ptradd args={args:?} result_ty={result_ty:?} dest_ct={:?}",
+                op.result.as_ref().and_then(|v| v.concretetype())
+            )),
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "names"
+                    && matches!(
+                        field.vec_part,
+                        Some(majit_translate::model::VecFieldPart::FatData)
+                            | Some(majit_translate::model::VecFieldPart::FatLen)
+                    ) =>
+            {
+                Some(format!(
+                    "FieldRead names vec_part={:?} ty={ty:?}",
+                    field.vec_part
+                ))
+            }
+            OpKind::UnaryOp {
+                op: uop, result_ty, ..
+            } if uop == "str" => Some(format!(
+                "UnaryOp str result_ty={result_ty:?} dest_ct={:?}",
+                op.result.as_ref().and_then(|v| v.concretetype())
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let vec_string_reads: Vec<_> = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::ArrayRead { array_type_id, .. } => {
+                array_type_id.as_deref() == Some("Vec<String>")
+            }
+            _ => false,
+        })
+        .collect();
+    assert!(
+        vec_string_reads.is_empty(),
+        "names[idx] is not a one-word ArrayRead of a Vec<String> item. dump={dump:?}"
+    );
+
+    let names_items = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. }
+            if field.name == "names"
+                && field.vec_part == Some(majit_translate::model::VecFieldPart::FatData) =>
+        {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let names_items =
+        names_items.unwrap_or_else(|| panic!("names FatData is the items pointer. dump={dump:?}"));
+
+    fn item_ptr_aliases(
+        graph: &FunctionGraph,
+        root: &majit_translate::flowspace::model::Variable,
+    ) -> HashSet<majit_translate::flowspace::model::Variable> {
+        let mut set = HashSet::new();
+        set.insert(root.clone());
+        loop {
+            let before = set.len();
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let Some(dest) = op.result.as_ref() else {
+                        continue;
+                    };
+                    if set.contains(dest) {
+                        continue;
+                    }
+                    let follows = match &op.kind {
+                        OpKind::UnaryOp {
+                            op: uop, operand, ..
+                        } if uop == "same_as" => set.contains(operand),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            args,
+                            ..
+                        } if matches!(
+                            segments.last().map(String::as_str),
+                            Some("cast_ptr_to_int" | "cast_int_to_ptr" | "cast")
+                        ) =>
+                        {
+                            args.iter()
+                                .any(|a| a.as_variable().is_some_and(|v| set.contains(v)))
+                        }
+                        _ => false,
+                    };
+                    if follows {
+                        set.insert(dest.clone());
+                    }
+                }
+                for link in &block.exits {
+                    let Some(succ) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                        continue;
+                    };
+                    for (i, arg) in link.args.iter().enumerate() {
+                        let Some(v) = arg.as_variable() else {
+                            continue;
+                        };
+                        if !set.contains(v) {
+                            continue;
+                        }
+                        if let Some(inp) = succ.inputargs.get(i) {
+                            set.insert(inp.clone());
+                        }
+                    }
+                }
+            }
+            if set.len() == before {
+                break;
+            }
+        }
+        set
+    }
+
+    let item_bytes = 3 * majit_translate::layout::target_word_size() as usize;
+    fn is_string_header_items_ptr(ty: &LowLevelType, item_bytes: usize) -> bool {
+        let LowLevelType::Ptr(ptr) = ty else {
+            return false;
+        };
+        let PtrTarget::Array(arr) = &ptr.TO else {
+            return false;
+        };
+        match &arr.OF {
+            LowLevelType::FixedSizeArray(fsa) => {
+                fsa.length == item_bytes && matches!(fsa.OF, LowLevelType::Char)
+            }
+            _ => false,
+        }
+    }
+
+    let aliases = item_ptr_aliases(function.graph(), &names_items);
+    let ptradds: Vec<_> = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
-            } = &op.kind
-            else {
-                continue;
-            };
-            if segments.last().map(String::as_str) != Some("copy_bytes") {
-                continue;
-            }
-            return args.get(1).and_then(LinkArg::as_variable).cloned();
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => args
+                .first()
+                .and_then(|a| a.as_variable())
+                .is_some_and(|base| aliases.contains(base)),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        ptradds.len(),
+        1,
+        "names[idx] is direct_ptradd of the names items pointer. dump={dump:?}"
+    );
+    let ptradd = ptradds[0];
+    match &ptradd.kind {
+        OpKind::Call { args, .. } => {
+            let index = args
+                .get(1)
+                .and_then(|a| a.as_variable())
+                .expect("direct_ptradd count");
+            assert_eq!(
+                FunctionGraph::concretetype_of(index),
+                ConcreteType::Signed,
+                "direct_ptradd count is the unscaled index. dump={dump:?}"
+            );
         }
+        other => panic!("expected direct_ptradd, got {other:?}"),
     }
-    None
+    let ptradd_ty = ptradd.result.as_ref().and_then(|v| v.concretetype());
+    assert!(
+        ptradd_ty
+            .as_ref()
+            .is_some_and(|ty| is_string_header_items_ptr(ty, item_bytes)),
+        "direct_ptradd item is sizeof(String header)={item_bytes}. dest_ct={ptradd_ty:?} dump={dump:?}"
+    );
+
+    let ptradd_result = ptradd.result.as_ref().expect("direct_ptradd result");
+    let header = ops.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+            && args.iter().any(|a| a.as_variable() == Some(ptradd_result)) =>
+        {
+            op.result.clone()
+        }
+        _ => None,
+    });
+    let header = header.unwrap_or_else(|| {
+        panic!("interior pointer recasts into the String header. dump={dump:?}")
+    });
+    let conversions: Vec<_> = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: uop, result_ty, operand, .. }
+                    if uop == "str" && *result_ty == ValueType::Str && operand == &header
+            )
+        })
+        .collect();
+    assert_eq!(
+        conversions.len(),
+        1,
+        "as_str of the interior &String is UnaryOp str. dump={dump:?}"
+    );
+    let produced = conversions[0].result.as_ref().expect("str() result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&*STRPTR),
+        "rtype_str of the header is Ptr(STR). dump={dump:?}"
+    );
+
+    let saw_fat_len = ops.iter().any(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } => {
+            field.vec_part == Some(majit_translate::model::VecFieldPart::FatLen)
+        }
+        _ => false,
+    });
+    assert!(
+        saw_fat_len,
+        "fat-box Index bounds-checks against the sibling FatLen part"
+    );
+    let saw_lt = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::BinOp { op, .. } if op == "lt"
+        )
+    });
+    assert!(saw_lt, "guard_item_index emits index < FatLen");
+    let saw_bounds_panic = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.iter().any(|s| s.contains("ll_slice_bounds_panic")),
+        _ => false,
+    });
+    assert!(
+        saw_bounds_panic,
+        "out-of-bounds arm is ll_slice_bounds_panic"
+    );
+
+    let mut callcontrol = CallControl::new();
+    callcontrol.set_known_struct_names(program.known_struct_names.clone());
+    callcontrol.set_struct_fields(program.struct_fields.clone());
+    callcontrol.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    install_semantic_layouts(&mut callcontrol, &program);
+
+    let config = GraphTransformConfig::default();
+    let probe_graph = majit_translate::model::copygraph(function.graph());
+    let rewritten = Transformer::new(&config)
+        .with_callcontrol(&mut callcontrol)
+        .transform(&probe_graph);
+
+    let rewrite_dump: Vec<String> = rewritten
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                taken_by_address,
+                item_ty,
+                ..
+            } => Some(format!(
+                "ArrayRead id={array_type_id:?} nolength={nolength} \
+                 taken={taken_by_address} item={item_ty:?}"
+            )),
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } => Some(format!(
+                "BinOp {bin} result_ty={result_ty:?} dest={:?}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            OpKind::ConstInt(n) => Some(format!("ConstInt {n}")),
+            OpKind::FieldRead { field, ty, .. } => Some(format!(
+                "getfield {}.{} ty={ty:?} dest={:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
+                Some("leftover direct_ptradd".into())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let word = item_bytes as i64;
+    let saw_mul_24 = rewritten.graph.blocks.iter().any(|block| {
+        let ops = &block.operations;
+        ops.windows(2).any(|pair| {
+            matches!(&pair[0].kind, OpKind::ConstInt(n) if *n == word)
+                && matches!(
+                    &pair[1].kind,
+                    OpKind::BinOp { op, result_ty, .. }
+                        if op == "int_mul" && *result_ty == ValueType::Int
+                )
+        })
+    });
+    assert!(
+        saw_mul_24,
+        "rewrite_op_direct_ptradd is int_mul by sizeof(String header)={word}. dump={rewrite_dump:?}"
+    );
+    let saw_int_add = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } if bin == "int_add" && *result_ty == ValueType::Int => op
+                .result
+                .as_ref()
+                .is_some_and(|v| FunctionGraph::concretetype_of(v) == ConcreteType::Signed),
+            _ => false,
+        })
+    });
+    assert!(
+        saw_int_add,
+        "rewrite_op_direct_ptradd is int_add kind 'i'. dump={rewrite_dump:?}"
+    );
+    let leftover_gc_item = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead { nolength, .. } => !nolength,
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_gc_item,
+        "no getarrayitem_gc after rewrite. dump={rewrite_dump:?}"
+    );
+    let leftover_vec_string = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead { array_type_id, .. } => {
+                array_type_id.as_deref() == Some("Vec<String>")
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_vec_string,
+        "no one-word ArrayRead of a Vec<String> item after rewrite. dump={rewrite_dump:?}"
+    );
+    let leftover_ptradd = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_ptradd,
+        "direct_ptradd is rewritten, not residual. dump={rewrite_dump:?}"
+    );
+    let leftover_raw_r = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead {
+                field, ty, pure, ..
+            } if field.owner_declared_gc == Some(false)
+                && matches!(ty, ValueType::Ref(_))
+                && !*pure
+                && !field.taken_by_address =>
+            {
+                true
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_raw_r,
+        "no getfield_raw_r leftover. dump={rewrite_dump:?}"
+    );
+}
+
+/// `w_code_const` indexes `code_constants` (`from_raw_parts` of
+/// `Constants` FatData / FatLen) as `&constants[idx]`. rustc does not
+/// inline `code_constants`, so the Index is of that Call dest: a raw
+/// `nolength` ArrayRead of `[ConstantData]` (headerless slice spelling)
+/// with `taken_by_address`. jtransform rewrites it as `getarraysubstruct`
+/// (`int_mul` sizeof(ConstantData) + `int_add`, kind `'i'`).
+///
+/// `co_consts_w` is a `FixedObjectArray`; `load_atomic` is
+/// `ll_getitem_fast` (`rlist.py`) of that length-prefixed list and stays
+/// `getarrayitem_gc` after rewrite.
+#[test]
+fn w_code_const_constants_index_is_raw_item_address() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        HostStaticAddrs {
+            error_carrier: ERROR_CARRIER,
+            ..Default::default()
+        },
+        &["pycode", "pyframe"],
+        &[
+            "w_code_const",
+            "code_constants",
+            "pyobject_from_constant",
+            "realize_code_constant",
+        ],
+    )
+    .expect("lower w_code_const");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_const")
+        .expect("w_code_const graph");
+
+    let ops_dump: Vec<String> = function
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                item_ty,
+                array_type_id,
+                nolength,
+                taken_by_address,
+                ..
+            } => Some(format!(
+                "ArrayRead item_ty={item_ty:?} array_type_id={array_type_id:?} \
+                 nolength={nolength} taken_by_address={taken_by_address}"
+            )),
+            OpKind::ArrayLen {
+                array_type_id,
+                nolength,
+                ..
+            } => Some(format!(
+                "ArrayLen array_type_id={array_type_id:?} nolength={nolength}"
+            )),
+            OpKind::FieldRead { field, ty, .. } => Some(format!(
+                "FieldRead {}.{} vec_part={:?} ty={ty:?} dest={:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+                field.vec_part,
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!("Call {}", segments.join("::"))),
+            _ => None,
+        })
+        .collect();
+    let array_dump = ops_dump.clone();
+    let code_constants_dump: Vec<String> = program
+        .functions
+        .iter()
+        .find(|f| f.name == "code_constants")
+        .map(|f| {
+            f.graph()
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .map(|op| match &op.kind {
+                    OpKind::ArrayRead {
+                        item_ty,
+                        array_type_id,
+                        nolength,
+                        taken_by_address,
+                        ..
+                    } => format!(
+                        "ArrayRead item_ty={item_ty:?} array_type_id={array_type_id:?} \
+                         nolength={nolength} taken_by_address={taken_by_address}"
+                    ),
+                    OpKind::ArrayLen {
+                        array_type_id,
+                        nolength,
+                        ..
+                    } => format!("ArrayLen array_type_id={array_type_id:?} nolength={nolength}"),
+                    OpKind::FieldRead { field, ty, .. } => format!(
+                        "FieldRead {}.{} vec_part={:?} ty={ty:?}",
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
+                        field.vec_part
+                    ),
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => format!("Call {}", segments.join("::")),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["<no code_constants graph>".to_string()]);
+    let mut saw_constants = false;
+    for op in function
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+    {
+        let OpKind::ArrayRead {
+            array_type_id,
+            nolength,
+            taken_by_address,
+            item_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let id = array_type_id.as_deref().unwrap_or("");
+        if id != "[ConstantData]" && id != "Vec<ConstantData>" {
+            continue;
+        }
+        saw_constants = true;
+        assert!(
+            *nolength,
+            "constants items region is headerless. dump={array_dump:?}"
+        );
+        assert!(
+            *taken_by_address,
+            "`&constants[idx]` is the item address. dump={array_dump:?}"
+        );
+        assert!(
+            matches!(item_ty, ValueType::Ref(Some(name)) if name == "bytecode::ConstantData"),
+            "borrowed ConstantData item. dump={array_dump:?}"
+        );
+    }
+    assert!(
+        saw_constants,
+        "w_code_const must ArrayRead [ConstantData] or Vec<ConstantData>. \
+         dump={array_dump:?} code_constants={code_constants_dump:?}"
+    );
+
+    let mut callcontrol = CallControl::new();
+    callcontrol.set_known_struct_names(program.known_struct_names.clone());
+    callcontrol.set_struct_fields(program.struct_fields.clone());
+    callcontrol.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    install_semantic_layouts(&mut callcontrol, &program);
+
+    let item_bytes = callcontrol
+        .struct_layout_for("ConstantData")
+        .map(|layout| layout.size as i64)
+        .expect("ConstantData Charon layout after --include");
+
+    let config = GraphTransformConfig::default();
+    let probe_graph = majit_translate::model::copygraph(function.graph());
+    let rewritten = Transformer::new(&config)
+        .with_callcontrol(&mut callcontrol)
+        .transform(&probe_graph);
+
+    let rewrite_dump: Vec<String> = rewritten
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                taken_by_address,
+                item_ty,
+                ..
+            } => Some(format!(
+                "ArrayRead id={array_type_id:?} nolength={nolength} \
+                 taken={taken_by_address} item={item_ty:?}"
+            )),
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } => Some(format!(
+                "BinOp {bin} result_ty={result_ty:?} dest={:?}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            OpKind::ConstInt(n) => Some(format!("ConstInt {n}")),
+            OpKind::FieldRead { field, ty, .. } => Some(format!(
+                "getfield {}.{} ty={ty:?} dest={:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let saw_mul = rewritten.graph.blocks.iter().any(|block| {
+        let ops = &block.operations;
+        ops.windows(2).any(|pair| {
+            matches!(&pair[0].kind, OpKind::ConstInt(n) if *n == item_bytes)
+                && matches!(
+                    &pair[1].kind,
+                    OpKind::BinOp { op, result_ty, .. }
+                        if op == "int_mul" && *result_ty == ValueType::Int
+                )
+        })
+    });
+    assert!(
+        saw_mul,
+        "getarraysubstruct is int_mul by sizeof(ConstantData)={item_bytes}. \
+         dump={rewrite_dump:?}"
+    );
+    let saw_int_add = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } if bin == "int_add" && *result_ty == ValueType::Int => op
+                .result
+                .as_ref()
+                .is_some_and(|v| FunctionGraph::concretetype_of(v) == ConcreteType::Signed),
+            _ => false,
+        })
+    });
+    assert!(
+        saw_int_add,
+        "getarraysubstruct is int_add kind 'i'. dump={rewrite_dump:?}"
+    );
+    let leftover_constants_gc_item = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead {
+                nolength,
+                array_type_id,
+                ..
+            } => {
+                !*nolength
+                    && array_type_id.as_deref()
+                        != Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_constants_gc_item,
+        "constants index is not leftover getarrayitem_gc. dump={rewrite_dump:?}"
+    );
+    let saw_consts_w_getitem = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                taken_by_address,
+                ..
+            } => {
+                array_type_id.as_deref()
+                    == Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                    && !*nolength
+                    && !*taken_by_address
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        saw_consts_w_getitem,
+        "co_consts_w load_atomic is ll_getitem_fast. dump={rewrite_dump:?}"
+    );
+    let leftover_raw_r = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead {
+                field, ty, pure, ..
+            } if field.owner_declared_gc == Some(false)
+                && matches!(ty, ValueType::Ref(_))
+                && !*pure
+                && !field.taken_by_address =>
+            {
+                true
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_raw_r,
+        "no getfield_raw_r leftover. dump={rewrite_dump:?}"
+    );
+}
+
+fn cc_nested_u8_array_id(id: &str) -> bool {
+    let id = id.trim();
+    id.starts_with("[[u8;1];") || id.starts_with("[[u8; 1];")
+}
+
+/// `interp_termios.tcgetattr` reads `t.cc[vmin][0] as i64`. `cc` is
+/// `[[u8; 1]; NCCS]`: the outer item is ContainerType, so the Index is
+/// `getarraysubstruct` (`int_mul` sizeof(`[u8;1]`) + `int_add`, kind `'i'`),
+/// and the inner `[0]` is `getarrayitem_raw_i`.
+#[test]
+fn interp_termios_tcgetattr_cc_index_is_getarraysubstruct() {
+    let llbc = load_llbc(MODULE_LLBC);
+    let graph =
+        lower_named(llbc, "interp_termios::tcgetattr").expect("lower interp_termios::tcgetattr");
+
+    let array_dump: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                item_ty,
+                array_type_id,
+                nolength,
+                taken_by_address,
+                ..
+            } => Some(format!(
+                "ArrayRead item_ty={item_ty:?} array_type_id={array_type_id:?} \
+                 nolength={nolength} taken_by_address={taken_by_address}"
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let mut saw_outer = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::ArrayRead {
+            array_type_id,
+            nolength,
+            taken_by_address,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(id) = array_type_id.as_deref() else {
+            continue;
+        };
+        if !cc_nested_u8_array_id(id) {
+            continue;
+        }
+        saw_outer = true;
+        assert!(
+            *nolength,
+            "cc items region is headerless. dump={array_dump:?}"
+        );
+        assert!(
+            *taken_by_address,
+            "`t.cc[vmin][0]` outer Index is the item address. dump={array_dump:?}"
+        );
+    }
+    assert!(
+        saw_outer,
+        "tcgetattr must ArrayRead [[u8;1];NCCS]. dump={array_dump:?}"
+    );
+
+    let config = GraphTransformConfig::default();
+    let rewritten = Transformer::new(&config).transform(&graph);
+    let rewrite_dump: Vec<String> = rewritten
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                taken_by_address,
+                item_ty,
+                ..
+            } => Some(format!(
+                "ArrayRead id={array_type_id:?} nolength={nolength} \
+                 taken={taken_by_address} item={item_ty:?}"
+            )),
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } => Some(format!(
+                "BinOp {bin} result_ty={result_ty:?} dest={:?}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of)
+            )),
+            OpKind::ConstInt(n) => Some(format!("ConstInt {n}")),
+            _ => None,
+        })
+        .collect();
+
+    let saw_mul = rewritten.graph.blocks.iter().any(|block| {
+        let ops = &block.operations;
+        ops.windows(2).any(|pair| {
+            matches!(&pair[0].kind, OpKind::ConstInt(1))
+                && matches!(
+                    &pair[1].kind,
+                    OpKind::BinOp { op, result_ty, .. }
+                        if op == "int_mul" && *result_ty == ValueType::Int
+                )
+        })
+    });
+    assert!(
+        saw_mul,
+        "getarraysubstruct is int_mul by sizeof([u8;1])=1. dump={rewrite_dump:?}"
+    );
+    let saw_int_add = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::BinOp {
+                op: bin, result_ty, ..
+            } if bin == "int_add" && *result_ty == ValueType::Int => op
+                .result
+                .as_ref()
+                .is_some_and(|v| FunctionGraph::concretetype_of(v) == ConcreteType::Signed),
+            _ => false,
+        })
+    });
+    assert!(
+        saw_int_add,
+        "getarraysubstruct is int_add kind 'i'. dump={rewrite_dump:?}"
+    );
+    let saw_inner = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::ArrayRead {
+                    nolength: true,
+                    taken_by_address: false,
+                    item_ty: ValueType::Unsigned,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        saw_inner,
+        "inner [0] is getarrayitem_raw_i. dump={rewrite_dump:?}"
+    );
+    let leftover_raw_r = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::ArrayRead {
+                    item_ty: ValueType::Ref(_),
+                    taken_by_address: false,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        !leftover_raw_r,
+        "no getarrayitem_raw_r leftover. dump={rewrite_dump:?}"
+    );
+    let leftover_gc_item = rewritten.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::ArrayRead { nolength, .. } => !nolength,
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_gc_item,
+        "no getarrayitem_gc after rewrite. dump={rewrite_dump:?}"
+    );
 }

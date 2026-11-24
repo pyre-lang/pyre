@@ -76,7 +76,6 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
-    guard_words: &std::collections::HashSet<Variable>,
     expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<(), LowerError> {
@@ -250,11 +249,6 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
         crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
             .map_err(LowerError::Unsupported)?;
     }
-    // `get().0 as *mut T` is emitted as `cast_int_to_ptr` while the
-    // loaded word is still a reference field. After empty-block
-    // elimination the cast's operand is that load (through block
-    // arguments). Fold it back so the reference is what the cast returns.
-    fold_int_to_ptr_of_ref_load(graph, guard_words);
     refuse_inlined_struct_field_writes(graph, expand_inline_struct)?;
     Ok(())
 }
@@ -287,106 +281,6 @@ pub(in crate::front::mir) fn refuse_inlined_struct_field_writes(
         }
     }
     Ok(())
-}
-
-/// Drop `cast_int_to_ptr` of a reference-typed field load, or of an
-/// erased `FrameBox` / `OwnerRootGuard` / `PyError` word. The place type of
-/// the cast is an integer, but the value is the GCREF (`createframe`'s
-/// `W_Root`, or `OperationError` as the instance), so the integer bank
-/// does not hold it.
-pub(in crate::front::mir) fn fold_int_to_ptr_of_ref_load(
-    graph: &mut FunctionGraph,
-    guard_words: &std::collections::HashSet<Variable>,
-) {
-    let mut aliases: Vec<(Variable, Variable)> = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let Some(result) = op.result.clone() else {
-                continue;
-            };
-            let Some(arg) = int_to_ptr_operand(op) else {
-                continue;
-            };
-            if ref_load_root(graph, &arg, guard_words) {
-                aliases.push((result, arg));
-            }
-        }
-    }
-    let mut folded = false;
-    for (result, arg) in &aliases {
-        if forward_identity(graph, result, arg) {
-            folded = true;
-        }
-    }
-    if folded {
-        crate::model::eliminate_empty_blocks(graph);
-        crate::model::clear_unreachable_blocks(graph);
-    }
-}
-
-pub(in crate::front::mir) fn int_to_ptr_operand(op: &SpaceOperation) -> Option<Variable> {
-    match &op.kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            result_ty: ValueType::Ref(_),
-        } if segments
-            .last()
-            .is_some_and(|leaf| leaf == "cast_int_to_ptr") =>
-        {
-            args.first().and_then(LinkArg::as_variable).cloned()
-        }
-        OpKind::UnaryOp {
-            op,
-            operand,
-            result_ty: ValueType::Ref(_),
-        } if op == "cast_int_to_ptr" => Some(operand.clone()),
-        _ => None,
-    }
-}
-
-pub(in crate::front::mir) fn ref_load_root(
-    graph: &FunctionGraph,
-    var: &Variable,
-    guard_words: &std::collections::HashSet<Variable>,
-) -> bool {
-    if guard_words.contains(var) {
-        return true;
-    }
-    let Some((block_id, idx)) = resolve_to_producer_op(graph, var) else {
-        return false;
-    };
-    let Some(op) = graph
-        .blocks
-        .iter()
-        .find(|block| block.id == block_id)
-        .and_then(|block| block.operations.get(idx))
-    else {
-        return false;
-    };
-    match &op.kind {
-        OpKind::FieldRead {
-            ty: ValueType::Ref(_),
-            ..
-        } if op
-            .result
-            .as_ref()
-            .is_some_and(|result| guard_words.contains(result)) =>
-        {
-            true
-        }
-        OpKind::Input {
-            class_root: Some(root),
-            ty: ValueType::Ref(_),
-            ..
-        } if frame_box::owner_is_frame_box(root) || owner_is_error_carrier(root) => true,
-        OpKind::UnaryOp { op, operand, .. }
-            if matches!(op.as_str(), "same_as" | "int_copy" | "int_same_as") =>
-        {
-            ref_load_root(graph, operand, guard_words)
-        }
-        _ => false,
-    }
 }
 
 /// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and

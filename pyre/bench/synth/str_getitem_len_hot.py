@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=builtin_len_descent
 # pyre-check: trace-shape=hot_len:absent=CallMayForceR
 # Hot-loop str/unicode subscript and length over every string kind: ASCII /
 # latin1 (1-byte code units), BMP (2-byte), and non-BMP astral (4-byte). The

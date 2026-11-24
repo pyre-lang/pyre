@@ -895,7 +895,7 @@ fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
 /// obtain the input iterator, and call the receiver's (possibly overridden)
 /// `write` method once for each line.  The iteration is deliberately lazy;
 /// no list snapshot is introduced.
-pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
+pub fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
     let mut self_obj = args
         .first()
         .copied()
@@ -1088,7 +1088,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `interp_iobase.py:W_IOBase.readlines_w` — consume the stream iterator,
 /// stopping after the accumulated line lengths exceed a positive hint.
-pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
+pub fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     let mut self_obj = args
         .first()
         .copied()

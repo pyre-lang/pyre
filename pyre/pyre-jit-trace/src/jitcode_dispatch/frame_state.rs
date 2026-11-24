@@ -28,6 +28,28 @@ pub struct WalkFrameStateData {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
+    /// Walk-level operand-stack snapshot, indexed by absolute extra
+    /// (`s` in `0..vstack_depth`). The Python operand stack is all-Ref.
+    pub vstack_boxes: Vec<OpRef>,
+    /// Last Ref written through `write_ref_reg` during the current Python
+    /// opcode — the candidate TOS for a value-producing opcode.
+    pub vstack_last_ref: OpRef,
+    /// `(py_pc, depth, boxes, occupied)` saved when a reorder region is
+    /// armed. Restored when the walk returns to that coordinate.
+    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
+    /// Operand-stack extra the mirror currently reflects — the extra on
+    /// entry to the Python opcode at `vstack_cur_pypc`.
+    pub vstack_depth: usize,
+    /// Python pc of the opcode currently being walked.
+    pub vstack_cur_pypc: u32,
+    /// Whether `vstack_boxes` is a trustworthy mirror. False until seeded
+    /// and latched false on the first unmodeled stack effect.
+    pub vstack_valid: bool,
+    /// py_pc the walk backed off from in an out-of-order FOR_ITER-entry
+    /// permutation. `u32::MAX` outside such a region.
+    pub vstack_reorder_ceiling: u32,
+    /// py_pc reported while inside an out-of-line exception landing block.
+    pub vstack_handler_landing_py: Option<u32>,
     /// The exception a bridge resumes with, and after a walked
     /// `set_current_exception` the value that store published.  Read by the
     /// nullary bare-reraise folds, and by the PUSH_EXC_INFO `prev` save only
@@ -123,6 +145,14 @@ impl Default for WalkFrameStateData {
         Self {
             callee_shadow: None,
             outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
             concrete_registers_r: Vec::new(),
@@ -207,6 +237,15 @@ impl WalkFrameState {
         for slot in &mut data.outer_active_boxes {
             replace(slot);
         }
+        for slot in &mut data.vstack_boxes {
+            replace(slot);
+        }
+        replace(&mut data.vstack_last_ref);
+        if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
+            for slot in boxes {
+                replace(slot);
+            }
+        }
         if let Some(shadow) = &mut data.callee_shadow {
             replace(&mut shadow.frame_box);
             for slot in shadow.opref.values_mut() {
@@ -261,6 +300,15 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
     };
     for value in &mut data.outer_active_boxes {
         walk_frame_box(value, visitor);
+    }
+    for value in &mut data.vstack_boxes {
+        walk_frame_box(value, visitor);
+    }
+    walk_frame_box(&mut data.vstack_last_ref, visitor);
+    if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
+        for value in boxes {
+            walk_frame_box(value, visitor);
+        }
     }
     if let Some(shadow) = &mut data.callee_shadow {
         walk_frame_box(&mut shadow.frame_box, visitor);

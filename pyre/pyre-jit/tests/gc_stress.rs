@@ -857,13 +857,13 @@ assert result == 44850, result
 }
 
 /// A bare-class exception raised with a bare-class `from` cause exercises window
-/// B: the normalized cause (`RuntimeError`) lives only in a Rust local across the
+/// B: the normalized `RaiseCause` handle lives only in a Rust local across the
 /// class-exception instantiation (`call_function(ValueError, &[])`), a GC
 /// safepoint, before `attach_raise_cause` reads it. The `push_roots` /
-/// `pin_root(cause)` bracket keeps the cause alive so `__cause__` is a live
-/// `RuntimeError`; without it that read is against a swept block. Under
-/// `MAJIT_GC_STRESS` the instantiation deterministically collects inside the
-/// window.
+/// `pin_root(handle)` bracket keeps the object (and its traced `w_cause` /
+/// `invalid` fields) alive so `__cause__` is a live `RuntimeError`; without it
+/// that read is against a swept block. Under `MAJIT_GC_STRESS` the
+/// instantiation deterministically collects inside the window.
 #[test]
 fn class_exc_from_class_cause_keeps_cause_across_collection() {
     const PROGRAM: &str = r#"

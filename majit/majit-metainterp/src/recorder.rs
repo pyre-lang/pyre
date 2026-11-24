@@ -49,6 +49,11 @@ struct ValueSlot {
     heapc: majit_trace::heapcache::HeapcRecord,
     /// The slot is on [`Trace::young_ref_slots`].
     young_listed: Cell<bool>,
+    /// The stamped word is a collector object (`gc_owns_object` at stamp).
+    /// A raw / interior / stack pointer (`&[T]` slice data) is a Ref in
+    /// the kind bank but is not a GCREF; `settle_concrete_ref` must not
+    /// treat `classify == None` as "the object died".
+    gc_referent: Cell<bool>,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -316,6 +321,18 @@ pub struct Trace {
     /// fallback (no `value_slot` for that position). Settled the same
     /// weakref way so a residual does not execute a recycled address.
     young_fallback_positions: RefCell<Vec<u32>>,
+    /// Owner-root for a just-stamped `RefFrontendOp._resref` until a live
+    /// box walk first observes it (`forward_concrete_ref`).
+    ///
+    /// history.py `_make_op` returns a FrontendOp Python object; the local
+    /// that holds it is a GC root until `registers_r` stores it. `OpRef` is
+    /// a Copy index, so the slot's concrete is not a root until then.
+    /// Walking every `value_slots` concrete would keep residual CALL
+    /// results alive for the whole trace; this pin is only the unpublished
+    /// window. Indexed like `value_slots`. Publish on first
+    /// `forward_concrete_ref`, not at `set_ref_reg`: a later store can
+    /// overwrite the register while a Rust local still holds the OpRef.
+    unpublished_resrefs: RefCell<Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>>,
     /// Dropped before [`Self::const_ptr_indexes`] (declaration order) so the
     /// extra area unregisters while the index list is still valid.
     const_ptr_area: RefCell<Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>>,
@@ -543,6 +560,7 @@ impl Trace {
             young_ref_slots: RefCell::new(Vec::new()),
             young_inputarg_positions: RefCell::new(Vec::new()),
             young_fallback_positions: RefCell::new(Vec::new()),
+            unpublished_resrefs: RefCell::new(Vec::new()),
             const_ptr_area: RefCell::new(None),
             const_ptr_indexes: Box::new(RefCell::new(Vec::new())),
         }
@@ -1133,16 +1151,15 @@ impl Trace {
         // previous argument's encode, so a prebuilt `Box::ConstPtr`
         // does not keep the from-space address.
         // `history.py` `RefFrontendOp._resref` is a GC field of the op once
-        // `_make_op` attaches it. Until `value_slots` holds it, a Rust
-        // `Value::Ref` is not a root, and the reserve and encode below can
-        // minor-collect (`stress_trace_pool_alloc` /
+        // `_make_op` attaches it. Until a live box walk observes the OpRef,
+        // a Rust `Value::Ref` is not a root, and the reserve and encode
+        // below can minor-collect (`stress_trace_pool_alloc` /
         // `alloc_fast_nursery_collecting`). Pin the referent across them
-        // and stamp the forwarded address. Skip the sentinel and addresses
-        // the collector does not own (test CPUs return a host buffer).
-        // After the slot exists, a live box is forwarded by
-        // `walk_active_trace_refs`; a dead slot is settled after the
-        // collection. Do not owner-root every stamped slot — that would
-        // keep residual CALL results alive for the whole trace.
+        // and keep the pin until `forward_concrete_ref`. Skip the sentinel
+        // and addresses the collector does not own (test CPUs return a host
+        // buffer). Do not owner-root every stamped slot for the whole
+        // trace — that would keep residual CALL results alive after the
+        // box is dead.
         let value_pin = match value {
             Some(Value::Ref(r)) if r != GcRef::NO_CONCRETE && !r.is_null() => {
                 let r = GcRef(majit_gc::gc_current_object_address(r.0));
@@ -1214,7 +1231,7 @@ impl Trace {
             descr_pos,
         });
         let value = match value_pin {
-            Some(pin) => Some(Value::Ref(pin.get())),
+            Some(ref pin) => Some(Value::Ref(pin.get())),
             None => value,
         };
         let opref = if ty != Type::Void {
@@ -1224,9 +1241,14 @@ impl Trace {
                 opcode,
                 heapc: majit_trace::heapcache::HeapcRecord::default(),
                 young_listed: Cell::new(false),
+                gc_referent: Cell::new(false),
             });
+            let slot = self.value_slots.len() - 1;
             if let Some(v) = value {
-                self.note_concrete_ref(self.value_slots.len() - 1, v);
+                self.note_concrete_ref(slot, v);
+            }
+            if let Some(pin) = value_pin {
+                self.hold_unpublished_resref(slot, pin);
             }
             self.box_count += 1;
             OpRef::op_typed(box_index, ty)
@@ -2012,6 +2034,7 @@ impl Trace {
     /// at that position next, and list it a second time.
     fn truncate_value_slots(&mut self, len: usize) {
         self.value_slots.truncate(len);
+        self.unpublished_resrefs.borrow_mut().truncate(len);
         self.young_ref_slots
             .get_mut()
             .retain(|&slot| (slot as usize) < len);
@@ -2324,6 +2347,37 @@ impl Trace {
         }
     }
 
+    fn hold_unpublished_resref(&self, slot: usize, pin: majit_gc::shadow_stack::OwnerRootGuard) {
+        let mut pins = self.unpublished_resrefs.borrow_mut();
+        if slot >= pins.len() {
+            pins.resize_with(slot + 1, || None);
+        }
+        pins[slot] = Some(pin);
+    }
+
+    /// Drop the unpublished `_resref` owner-root once a live box holds
+    /// this FrontendOp (`registers_r` / snapshot / heapcache).
+    pub(crate) fn publish_resref(&self, opref: OpRef) {
+        if opref.is_constant() || opref.is_none() {
+            return;
+        }
+        let Some(slot) = opref.raw().checked_sub(self.box_prefix()) else {
+            return;
+        };
+        let mut pins = self.unpublished_resrefs.borrow_mut();
+        if let Some(pin) = pins.get_mut(slot as usize) {
+            *pin = None;
+        }
+    }
+
+    fn unpublished_resref_at(&self, slot: usize) -> Option<GcRef> {
+        self.unpublished_resrefs
+            .borrow()
+            .get(slot)
+            .and_then(|p| p.as_ref())
+            .map(|p| p.get())
+    }
+
     /// history.py `RefFrontendOp._resref`: forward the concrete GCREF of
     /// one live FrontendOp / InputArg. `ConstPtr` values live on the
     /// OpRef itself and are walked separately.
@@ -2336,18 +2390,23 @@ impl Trace {
         };
         visitor(&mut gcref);
         self.set_concrete_at(opref.raw(), Value::Ref(gcref));
+        self.publish_resref(opref);
     }
 
     /// Put a slot just stamped with a `Value::Ref` on
     /// [`Self::young_ref_slots`], once until the next minor collection.
     fn note_concrete_ref(&self, slot: usize, value: Value) {
+        let vs = &self.value_slots[slot];
         let Value::Ref(gcref) = value else {
+            vs.gc_referent.set(false);
             return;
         };
         if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+            vs.gc_referent.set(false);
             return;
         }
-        let vs = &self.value_slots[slot];
+        let is_gc = majit_gc::gc_owns_object(gcref.0);
+        vs.gc_referent.set(is_gc);
         if !vs.young_listed.replace(true) {
             self.young_ref_slots.borrow_mut().push(slot as u32);
         }
@@ -2386,8 +2445,13 @@ impl Trace {
     }
 
     /// Settle one slot's `Value::Ref` against a collection: moved to where
-    /// its referent went, cleared if the referent died.
+    /// its referent went, cleared if the referent died. A non-GC referent
+    /// (raw / interior / stack pointer) stays put: `classify == None` is
+    /// not "the object died".
     fn settle_concrete_ref(vs: &ValueSlot, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        if !vs.gc_referent.get() {
+            return;
+        }
         Self::settle_resref_cell(&vs.concrete, classify);
     }
 
@@ -2418,7 +2482,11 @@ impl Trace {
             // `Trace::cut` drops a listed slot together with the slot itself.
             let vs = &self.value_slots[slot as usize];
             vs.young_listed.set(false);
-            Self::settle_concrete_ref(vs, classify);
+            if let Some(gcref) = self.unpublished_resref_at(slot as usize) {
+                vs.concrete.set(Some(Value::Ref(gcref)));
+            } else {
+                Self::settle_concrete_ref(vs, classify);
+            }
             if let Some(v) = vs.concrete.get()
                 && let Value::Ref(gcref) = v
                 && in_nursery(gcref.0)
@@ -2484,7 +2552,11 @@ impl Trace {
     /// is `value_slots` itself; a slot still on `young_ref_slots` may name an
     /// old referent this major frees, so it is settled here too.
     pub(crate) fn settle_concrete_refs(&self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        for vs in self.value_slots.iter() {
+        for (i, vs) in self.value_slots.iter().enumerate() {
+            if let Some(gcref) = self.unpublished_resref_at(i) {
+                vs.concrete.set(Some(Value::Ref(gcref)));
+                continue;
+            }
             Self::settle_concrete_ref(vs, classify);
         }
         for ia in self.inputargs.iter() {

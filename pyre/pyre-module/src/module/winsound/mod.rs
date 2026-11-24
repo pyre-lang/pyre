@@ -11,6 +11,7 @@
 
 use pyre_object::PyObjectRef;
 use rustpython_host_env::winsound as host_winsound;
+use rustpython_wtf8::Wtf8;
 
 /// Play from a buffer rather than from a name.
 const SND_MEMORY: i32 = host_winsound::SND_MEMORY as i32;

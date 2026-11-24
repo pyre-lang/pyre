@@ -865,6 +865,19 @@ impl ListRootGuard {
             GcRef(0)
         }
     }
+
+    /// Pop the list slots now. `framework.py` `push_roots` only covers a
+    /// collecting call; a residual that cannot collect must not leave
+    /// these slots on the same shadow stack as a truncate helper
+    /// (`try_pop_to` / `FrameAnchor` Drop / `root_scope_close`).
+    #[inline]
+    pub fn release(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        majit_gc::shadow_stack::try_pop_to(self.base);
+        self.len = 0;
+    }
 }
 
 impl Drop for ListRootGuard {

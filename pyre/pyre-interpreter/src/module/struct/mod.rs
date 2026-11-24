@@ -13,6 +13,7 @@
 use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 
 /// True on a big-endian build; the native (`@` / no-prefix) byte order.
 const fn native_is_bigendian() -> bool {
@@ -333,7 +334,7 @@ fn struct_init_apply(self_obj: PyObjectRef, w_format: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-fn struct_new_impl(
+pub fn struct_new_impl(
     cls: PyObjectRef,
     pos: &[PyObjectRef],
     kw_names: &[PyObjectRef],

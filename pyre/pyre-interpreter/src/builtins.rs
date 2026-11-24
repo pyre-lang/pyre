@@ -661,7 +661,7 @@ pub fn w_memoryview_new_native_with_flags(
     w_memoryview_new_with_flags_impl(w_obj, flags, false)
 }
 
-fn w_memoryview_new_with_flags_impl(
+pub fn w_memoryview_new_with_flags_impl(
     w_obj: PyObjectRef,
     flags: i32,
     allow_python_slot: bool,
@@ -2199,7 +2199,7 @@ unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool 
 }
 
 /// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
-unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
+pub unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
     let mut descr = descr;
     unsafe {
         pyre_object::with_roots!(descr => crate::typedef::ensure_array_typeobjects());
@@ -2806,7 +2806,12 @@ pub(crate) fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 
 /// `_IsCContiguous` — C order has the last (fastest) dimension's stride
 /// equal to `itemsize`, growing by the dimension sizes toward the front.
-fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+pub fn memoryview_is_c_contiguous(
+    shape: &[i64],
+    strides: &[i64],
+    itemsize: i64,
+    length: i64,
+) -> bool {
     // `len == 0` holds exactly when some extent is zero, and such a view is
     // contiguous in both orders whatever its strides say.
     if length == 0 {
@@ -2832,7 +2837,12 @@ fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, len
 
 /// `_IsFortranContiguous` — Fortran order has the first (fastest)
 /// dimension's stride equal to `itemsize`, growing toward the back.
-fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+pub fn memoryview_is_f_contiguous(
+    shape: &[i64],
+    strides: &[i64],
+    itemsize: i64,
+    length: i64,
+) -> bool {
     if length == 0 {
         return true;
     }
@@ -10701,7 +10711,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// `make_sure_not_resized`.  [`pyre_object::interp_exceptions::rlist_new`]
 /// builds the same block from a `Vec`, which a traced body cannot record.
 #[inline(never)]
-unsafe fn exc_args_w_of_five(
+pub unsafe fn exc_args_w_of_five(
     a1: PyObjectRef,
     a2: PyObjectRef,
     a3: PyObjectRef,
@@ -10745,7 +10755,7 @@ unsafe fn exc_args_w_of_five(
 
 /// The fixed `args_w` list of four positionals; see [`exc_args_w_of_five`].
 #[inline(never)]
-unsafe fn exc_args_w_of_four(
+pub unsafe fn exc_args_w_of_four(
     a1: PyObjectRef,
     a2: PyObjectRef,
     a3: PyObjectRef,
@@ -11093,7 +11103,7 @@ unicode_error_descr_init_gateway!(
 /// then the five slots.  The start and end slots are the reboxed integers;
 /// `args` keeps the originals.
 #[inline(never)]
-unsafe fn unicode_error_descr_init_five(
+pub unsafe fn unicode_error_descr_init_five(
     w_self: PyObjectRef,
     w_encoding: PyObjectRef,
     w_object: PyObjectRef,
@@ -11147,7 +11157,7 @@ unsafe fn unicode_error_descr_init_five(
 /// `W_BaseException.descr_init` stores `args_w`, then the four slots.  The
 /// start and end slots are the reboxed integers; `args` keeps the originals.
 #[inline(never)]
-unsafe fn unicode_translate_error_descr_init(
+pub unsafe fn unicode_translate_error_descr_init(
     w_self: PyObjectRef,
     w_object: PyObjectRef,
     w_start: PyObjectRef,
@@ -12625,7 +12635,7 @@ fn exception_group_new_args(
 /// before `tuple(exceptions)`, so the repr is the source sequence's and not the
 /// converted tuple's.  Extracting the helper puts the capture on one side or
 /// the other and loses one of those two orderings.
-fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `descr_new(space, w_subtype, w_message, w_exceptions)` counts only the
     // positional arguments it was bound to. Keywords stay on `Arguments`
     // for `exception_group_new_args`; wrap is the positional slice.
@@ -13381,7 +13391,7 @@ fn exception_group_projection(
     Ok(matching)
 }
 
-pub(crate) fn exception_group_prep_reraise_star(
+pub fn exception_group_prep_reraise_star(
     w_orig: PyObjectRef,
     w_exc_list: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -14371,7 +14381,7 @@ pub fn getindex_w(mut w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// becomes its ASCII digit and non-ASCII whitespace becomes a space, so
 /// `int("４２")` and `float("١٫٥")`-style inputs parse.  An all-ASCII string
 /// is returned untouched.
-fn unicode_to_decimal_w(w_unistr: PyObjectRef) -> Result<String, crate::PyError> {
+pub fn unicode_to_decimal_w(w_unistr: PyObjectRef) -> Result<String, crate::PyError> {
     let utf8 = unsafe { w_str_get_wtf8(w_unistr) };
     if let Ok(s) = utf8.as_str()
         && s.is_ascii()
@@ -14821,9 +14831,9 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__float__") }
         {
             let mut result = unsafe {
-                pyre_object::with_roots!(obj =>
+                pyre_object::with_roots!(obj => {
                     crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])
-                )?
+                })?
             };
             unsafe {
                 if is_float(result) {
@@ -15292,6 +15302,9 @@ pub(crate) fn builtin_set_add_items_intersection(
     builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
+/// The per-item `add` loop of `pyopcode.py BUILD_SET`, which is
+/// `@jit.unroll_safe`: the item count is the opcode's constant argument.
+#[majit_macros::unroll_safe]
 fn builtin_set_add_items_impl(
     set: Option<PyObjectRef>,
     items: &[PyObjectRef],
@@ -15339,7 +15352,7 @@ fn builtin_set_add_items_impl(
 ///
 /// Zero-arg super() finds __class__ and self from the calling frame.
 /// CPython: Objects/typeobject.c super_init
-pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let args = super_init_args(args)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();

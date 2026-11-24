@@ -180,7 +180,7 @@ fn lazy_import_repr_impl(op: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
     Ok(w_str_new(&format!("<lazy_import '{name_s}'>")))
 }
 
-fn is_resolving(op: PyObjectRef) -> bool {
+pub fn is_resolving(op: PyObjectRef) -> bool {
     let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
         return false;

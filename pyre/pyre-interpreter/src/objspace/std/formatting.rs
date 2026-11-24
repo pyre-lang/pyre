@@ -384,7 +384,7 @@ fn parse_bytes_incremental(
 /// (`%(k)s`) looks the value up in the operand as a mapping and does not
 /// consume a positional slot; surplus positional values are an error
 /// only when the operand is not itself a mapping.
-pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+pub unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // The conversions below run Python, and `BINARY_OP %` popped both operands
     // before dispatching here, so neither the format string nor the operand
     // is rooted by the frame any more.  A str is immobile and read directly
@@ -521,7 +521,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     Ok(w_str_from_wtf8_managed(result))
 }
 
-pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+pub unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // CPython 3.14 bytearray_mod_lock_held increments `ob_exports` before
     // `_PyBytes_FormatEx` observes the receiver and decrements it after every
     // success/error return.  Re-entrant formatting callbacks may overwrite
@@ -563,7 +563,7 @@ pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -
     bytes_format_percent_inner(pyre_object::gc_roots::shadow_stack_get(fmt_slot), args)
 }
 
-unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+pub unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // As `str_format_percent`: the conversions run Python and `BINARY_OP %`
     // popped both operands, so nothing else roots them.  A nursery bytearray
     // `fmt` moves across a conversion, so the result kind is read from the

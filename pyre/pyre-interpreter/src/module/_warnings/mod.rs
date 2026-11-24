@@ -349,7 +349,7 @@ fn check_matched(
     crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
-fn get_filter(
+pub fn get_filter(
     category: PyObjectRef,
     text: PyObjectRef,
     lineno: i64,

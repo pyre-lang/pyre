@@ -6782,6 +6782,7 @@ impl JitCodeBuilder {
             // (blackhole.py handler argcode-based decode parity).
             jit_merge_point_offset: self.jit_merge_point_offset,
             reads_identity_slots: self.reads_identity_slots,
+            portal_frame_reg: u16::MAX,
         };
         // codewriter.py `jitcode.index = index` — back-stamped by
         // `state::jitcode_for` at registration time. JitCode::new
@@ -7609,6 +7610,14 @@ mod tests {
                     site.result_slot(),
                     bank.map(|kind| (kind, 9usize)),
                     "return slot for {args_r:?} args, bank {bank:?}",
+                );
+                // pyjitpl.py make_result_of_lastop: dest is bytecode[pc-1],
+                // kind is _resulttypes[pc]. Residual CALL helpers have no
+                // BC_INLINE_CALL encoding; resume still needs this pair.
+                assert_eq!(
+                    jitcode.result_slot_at_pc(end),
+                    bank.map(|kind| (kind, 9usize)),
+                    "result_slot_at_pc for {args_r:?} args, bank {bank:?}",
                 );
                 // Canonical `inline_call_r_*`: opcode + descr u16 + R-list
                 // + dest byte for a typed result.
