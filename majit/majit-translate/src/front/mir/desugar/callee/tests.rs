@@ -1,5 +1,6 @@
 use super::{
-    FnPtrFamily, discover_fnptr_field_families, fn_ptr_family_for, profilefunc_graphs_for_call,
+    FnPtrFamily, collect_fnptr_family_inputs, discover_fnptr_field_families, fn_ptr_family_for,
+    profilefunc_graphs_for_call, publish_fnptr_field_families_across, resolve_fnptr_field_families,
 };
 
 use majit_charon_reader::Llbc;
@@ -476,8 +477,9 @@ fn fnptr_field_family_unions_static_and_runtime_stores() {
     );
 }
 
-/// A runtime store of a parameter is not a recoverable FunDecl, so the
-/// family is unpublished even when a static also stores `f`.
+/// A runtime store of a parameter with no Regular call site is not a
+/// recoverable FunDecl, so the family is unpublished even when a static
+/// also stores `f`.
 #[test]
 fn fnptr_field_family_unpublished_when_a_store_is_not_a_fndef() {
     let table = adt_ty(0);
@@ -616,6 +618,221 @@ fn fnptr_field_family_unions_diamond_local_assigns() {
         family_members(&rows, "mod::Table", "slot"),
         ["c::mod::f", "c::mod::g"],
         "diamond union of f and g: {rows:?}"
+    );
+}
+
+fn table_param_constructor(def_id: u64, path: &[&str], type_id: u64) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [fn_ty.clone()],
+            "output": struct_ty.clone()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                local_ty(0, &struct_ty),
+                local_ty(1, &fn_ty)
+            ]},
+            "body": [{
+                "statements": [assign_local(
+                    0,
+                    &struct_ty,
+                    serde_json::json!({"Aggregate": [{"Adt": [type_id, null]}, [
+                        move_local(1, &fn_ty)
+                    ]]})
+                )],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })
+}
+
+fn call_ctor_with_fn(
+    def_id: u64,
+    path: &[&str],
+    ctor_id: u64,
+    stored_fun: u64,
+    type_id: u64,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let fn_ty = fnptr_ty();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &fn_ty),
+                local_ty(2, &struct_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [assign_local(
+                        1,
+                        &fn_ty,
+                        fn_def_to_fn_ptr(fn_def_const(stored_fun))
+                    )],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": ctor_id},
+                                "generics": empty_generics()
+                            }},
+                            "args": [move_local(1, &fn_ty)]
+                        },
+                        "dest": typed_local(2, &struct_ty),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// A constructor that stores its fn-pointer parameter closes the family
+/// over FunDecls passed at Regular call sites (`FunctionDesc.pycall`
+/// unions arguments over call sites). A Dynamic read+call through the
+/// field follows both members (`FunctionReprBase.call` `c_graphs`).
+#[test]
+fn fnptr_field_family_unions_constructor_parameter_call_sites() {
+    let table = adt_ty(0);
+    let table_ptr = serde_json::json!({"RawPtr": [table.clone(), "Const"]});
+    let fn_ty = fnptr_ty();
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                {"kind": {"Local": 1}, "ty": table_ptr.clone()},
+                "Deref"
+            ]}, "ty": table},
+            {"Field": [null, 0]}
+        ]},
+        "ty": fn_ty.clone()
+    });
+    let harvested = dynamic_call_fun(
+        30,
+        &["c", "mod", "harvested_caller"],
+        vec![assign_local(
+            2,
+            &fn_ty,
+            serde_json::json!({"Use": [{"Read": field_place}, "No"]}),
+        )],
+        copy_local(2, &fn_ty),
+        vec![
+            local_ty(0, &unit_ty()),
+            local_ty(1, &table_ptr),
+            local_ty(2, &fn_ty),
+        ],
+        1,
+        vec![table_ptr],
+    );
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_param_constructor(21, &["c", "mod", "make"], 0),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            call_ctor_with_fn(23, &["c", "mod", "call_g"], 21, 2, 0),
+            harvested,
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "constructor parameter call sites union f and g: {rows:?}"
+    );
+    let cg = crate::memory::gctransform::framework::build(&llbc);
+    let harvested_callees = cg.callees.get(&30).expect("harvested caller");
+    assert!(
+        harvested_callees.contains(&1) && harvested_callees.contains(&2),
+        "read+call through the field follows both members: {harvested_callees:?}"
+    );
+    assert!(
+        !cg.indirect.contains(&30),
+        "harvested Dynamic is analyze_indirect_call, not top_result"
+    );
+}
+
+fn opaque_fun(
+    def_id: u64,
+    path: &[&str],
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+        "src": "Normal",
+        "body": "Opaque"
+    })
+}
+
+/// Constructor stores live in one artefact and Regular call sites in
+/// another (`FunctionDesc.pycall` unions arguments over the program).
+#[test]
+fn fnptr_field_family_unions_constructor_parameter_across_artefacts() {
+    let ctor = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![table_param_constructor(21, &["c", "mod", "make"], 0)],
+        vec![],
+    );
+    let callers = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            opaque_fun(21, &["c", "mod", "make"], vec![fnptr_ty()], adt_ty(0)),
+            call_ctor_with_fn(22, &["c", "mod", "call_f"], 21, 1, 0),
+            call_ctor_with_fn(23, &["c", "mod", "call_g"], 21, 2, 0),
+        ],
+        vec![],
+    );
+    let ctor_only = discover_fnptr_field_families(&ctor);
+    assert!(
+        family_members(&ctor_only, "mod::Table", "slot").is_empty(),
+        "constructor artefact has no Regular call sites: {ctor_only:?}"
+    );
+    let mut inputs = collect_fnptr_family_inputs(&ctor);
+    inputs.merge(collect_fnptr_family_inputs(&callers));
+    let rows = resolve_fnptr_field_families(&inputs);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"],
+        "call sites in the other artefact union f and g: {rows:?}"
+    );
+    let published = publish_fnptr_field_families_across(&[&ctor, &callers]);
+    assert_eq!(
+        family_members(&published, "mod::Table", "slot"),
+        ["c::mod::f", "c::mod::g"]
+    );
+    assert_eq!(
+        family_members(
+            &discover_fnptr_field_families(&callers),
+            "mod::Table",
+            "slot"
+        ),
+        ["c::mod::f", "c::mod::g"],
+        "seeded artefact sees the program-wide family"
     );
 }
 

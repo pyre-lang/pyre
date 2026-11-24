@@ -252,7 +252,7 @@ fn build_semantic_program_via_active_frontend(
             let mut eval_override_graphs = Vec::new();
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
-            let mut fnptr_field_families = Vec::new();
+            let mut fnptr_family_inputs = front::mir::FnPtrFamilyInputs::default();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut repr_transparent = std::collections::HashSet::new();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
@@ -393,11 +393,7 @@ fn build_semantic_program_via_active_frontend(
                         profilefunc_spellings.push(spelling);
                     }
                 }
-                for row in front::mir::discover_fnptr_field_families(&llbc) {
-                    if !fnptr_field_families.contains(&row) {
-                        fnptr_field_families.push(row);
-                    }
-                }
+                fnptr_family_inputs.merge(front::mir::collect_fnptr_family_inputs(&llbc));
                 prof.mark(&format!("    harvest {p}"));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
@@ -409,6 +405,8 @@ fn build_semantic_program_via_active_frontend(
                 profilefunc_graphs.clone(),
                 profilefunc_spellings.clone(),
             );
+            let fnptr_field_families =
+                front::mir::resolve_fnptr_field_families(&fnptr_family_inputs);
 
             let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
                 static_addrs,
@@ -448,6 +446,9 @@ fn build_semantic_program_via_active_frontend(
                 }
                 if !profilefunc_spellings.is_empty() {
                     llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
+                }
+                if !fnptr_field_families.is_empty() {
+                    front::mir::seed_fnptr_field_families(&llbc, fnptr_field_families.clone());
                 }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());

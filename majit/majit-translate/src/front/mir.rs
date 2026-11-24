@@ -732,6 +732,11 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
         profilefunc_graphs,
         profilefunc_spellings,
     );
+    let fnptr_field_families = if function_filter.is_some() {
+        Vec::new()
+    } else {
+        publish_fnptr_field_families_across(llbcs)
+    };
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key is [`crate::model::graph_key_of`] when `funcobj_identity`
     // is present: `FunctionDesc.cachedgraph` keeps one graph per (desc,
@@ -780,6 +785,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             &mut acc.enum_variant_by_discriminant,
             Some(&acc.struct_ids),
         );
+        acc.fnptr_field_families = fnptr_field_families;
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -9763,9 +9769,11 @@ pub(crate) use self::consteval::{
 };
 pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, discover_eval_override_graphs, discover_profilefunc_graphs,
-    discover_profilefunc_spellings, fnptr_field_family_member_fn_ids, fnptr_field_under_use,
-    fnptr_struct_field_target, release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
+    FnPtrFamilyInputs, collect_fnptr_family_inputs, discover_eval_hook_graphs,
+    discover_eval_override_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
+    fnptr_field_family_member_fn_ids, fnptr_field_under_use, fnptr_struct_field_target,
+    publish_fnptr_field_families_across, release_declared_vable_array_address,
+    resolve_fnptr_field_families, seed_fnptr_field_families, vtable_slot_under_fn_ptr_cast,
 };
 pub use self::desugar::callee::{harvest_path_for_fun_decl, registered_path_for_fun_decl};
 pub(crate) use self::desugar::rewire::{

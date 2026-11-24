@@ -549,10 +549,13 @@ fn push_unique_spelling(out: &mut Vec<String>, spelling: String) {
 /// (`FunctionReprBase.call` `descs = list(s_pbc.descriptions)` then
 /// `row_of_graphs`). The family is the union of every store: a static
 /// Aggregate, a runtime constructor, a field assignment through a place,
-/// and a `from_access`-style copy of the same `(struct, field)`. A store
-/// that is not a recoverable FunDecl (a parameter, a call result, a field
-/// of another type) marks the slot unknown; that field publishes no row
-/// (`FnPtrFamily::Unknown` / `graphs_from` None).
+/// a `from_access`-style copy of the same `(struct, field)`, and a
+/// constructor parameter whose Regular call sites pass FunDecl constants
+/// (`description.py FunctionDesc.pycall` unions arguments over call
+/// sites). A store that is not a recoverable FunDecl (a parameter with no
+/// such call site, a call result, a field of another type) marks the slot
+/// unknown; that field publishes no row (`FnPtrFamily::Unknown` /
+/// `graphs_from` None).
 pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String)> {
     llbc_derived(llbc)
         .fnptr_field_families
@@ -568,12 +571,68 @@ pub(in crate::front::mir) fn fnptr_field_family_struct_key(td: &TypeDecl) -> Str
 }
 
 fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, String)> {
+    resolve_fnptr_field_families(&collect_fnptr_family_inputs(llbc))
+}
+
+/// Per-artefact FnPtr-field stores and Regular call arguments, keyed by
+/// registered FunDecl path so a constructor in one crate and its call
+/// sites in another union the same way `FunctionDesc.pycall` unions
+/// arguments over the whole program.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FnPtrFamilyInputs {
+    call_args: std::collections::HashMap<String, Vec<Vec<PathArg>>>,
+    stores: Vec<FieldStore>,
+}
+
+impl FnPtrFamilyInputs {
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (callee, mut sites) in other.call_args {
+            self.call_args.entry(callee).or_default().append(&mut sites);
+        }
+        self.stores.extend(other.stores);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PathArg {
+    Funs(std::collections::BTreeSet<String>),
+    Params(std::collections::BTreeSet<(String, usize)>),
+    Mixed {
+        funs: std::collections::BTreeSet<String>,
+        params: std::collections::BTreeSet<(String, usize)>,
+    },
+    ClosedCopy,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+enum FieldStore {
+    Fun {
+        struct_path: String,
+        field: String,
+        fun_path: String,
+    },
+    Param {
+        struct_path: String,
+        field: String,
+        fn_path: String,
+        arg_pos: usize,
+    },
+    Unknown {
+        struct_path: String,
+        field: String,
+    },
+}
+
+/// Walk one artefact: Regular call arguments (resolved inside that
+/// artefact) and FnPtr-field stores (parameters stay parameters).
+pub(crate) fn collect_fnptr_family_inputs(llbc: &Llbc) -> FnPtrFamilyInputs {
+    let mut inputs = FnPtrFamilyInputs::default();
+    collect_path_call_args(llbc, &mut inputs);
     let structs = fnptr_struct_tables(llbc);
     if structs.is_empty() {
-        return Vec::new();
+        return inputs;
     }
-    let mut out = Vec::new();
-    let mut unknown: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_fun_decls() {
         if !fd.has_unstructured_body() {
             continue;
@@ -581,7 +640,52 @@ fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, S
         let Some(body) = fd.unstructured_transient() else {
             continue;
         };
-        enroll_fnptr_field_stores(llbc, &body, &structs, &mut out, &mut unknown);
+        enroll_fnptr_field_stores(llbc, fd.def_id, &body, &structs, &mut inputs.stores);
+    }
+    inputs
+}
+
+/// `FunctionDesc.pycall` unions over every Regular site of a path.
+/// A parameter store whose sites do not close is Unknown.
+pub(crate) fn resolve_fnptr_field_families(
+    inputs: &FnPtrFamilyInputs,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut unknown: Vec<(String, String)> = Vec::new();
+    for store in &inputs.stores {
+        match store {
+            FieldStore::Unknown { struct_path, field } => {
+                push_unknown(&mut unknown, struct_path, field)
+            }
+            FieldStore::Fun {
+                struct_path,
+                field,
+                fun_path,
+            } => push_family_row(&mut out, struct_path, field, fun_path),
+            FieldStore::Param {
+                struct_path,
+                field,
+                fn_path,
+                arg_pos,
+            } => match resolve_param(inputs, fn_path, *arg_pos, &mut Vec::new()) {
+                PathArg::Unknown => push_unknown(&mut unknown, struct_path, field),
+                PathArg::ClosedCopy => {}
+                PathArg::Funs(funs) => {
+                    for fun_path in funs {
+                        push_family_row(&mut out, struct_path, field, &fun_path);
+                    }
+                }
+                PathArg::Params(_) => push_unknown(&mut unknown, struct_path, field),
+                PathArg::Mixed { funs, params } => {
+                    if !params.is_empty() {
+                        push_unknown(&mut unknown, struct_path, field);
+                    }
+                    for fun_path in funs {
+                        push_family_row(&mut out, struct_path, field, &fun_path);
+                    }
+                }
+            },
+        }
     }
     out.retain(|(path, field, _)| {
         !unknown
@@ -589,6 +693,248 @@ fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, S
             .any(|(unknown_path, unknown_field)| unknown_path == path && unknown_field == field)
     });
     out
+}
+
+/// Install a program-wide family on this artefact so
+/// `fnptr_struct_field_target` sees constructor call sites that live in
+/// another crate (`FunctionDesc.pycall`).
+pub(crate) fn seed_fnptr_field_families(llbc: &Llbc, rows: Vec<(String, String, String)>) {
+    let _ = llbc_derived(llbc).fnptr_field_families.set(rows);
+}
+
+pub(crate) fn publish_fnptr_field_families_across(
+    llbcs: &[&Llbc],
+) -> Vec<(String, String, String)> {
+    let mut inputs = FnPtrFamilyInputs::default();
+    for llbc in llbcs {
+        inputs.merge(collect_fnptr_family_inputs(llbc));
+    }
+    let rows = resolve_fnptr_field_families(&inputs);
+    for llbc in llbcs {
+        seed_fnptr_field_families(llbc, rows.clone());
+    }
+    rows
+}
+
+fn push_unknown(unknown: &mut Vec<(String, String)>, struct_path: &str, field: &str) {
+    let key = (struct_path.to_string(), field.to_string());
+    if !unknown.contains(&key) {
+        unknown.push(key);
+    }
+}
+
+fn push_family_row(
+    out: &mut Vec<(String, String, String)>,
+    struct_path: &str,
+    field: &str,
+    fun_path: &str,
+) {
+    if fun_path.is_empty() {
+        return;
+    }
+    let row = (
+        struct_path.to_string(),
+        field.to_string(),
+        fun_path.to_string(),
+    );
+    if !out.contains(&row) {
+        out.push(row);
+    }
+}
+
+fn fun_decl_callpath(llbc: &Llbc, id: u64) -> Option<String> {
+    let fd = llbc.fn_by_id(id)?;
+    let key = registered_path_for_fun_decl(llbc, fd).canonical_key();
+    if key.is_empty() { None } else { Some(key) }
+}
+
+fn collect_path_call_args(llbc: &Llbc, inputs: &mut FnPtrFamilyInputs) {
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let Some(body) = fd.unstructured_transient() else {
+            continue;
+        };
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body().iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                continue;
+            };
+            let Some(callee_path) = fun_decl_callpath(llbc, *id) else {
+                continue;
+            };
+            let args = call
+                .args
+                .iter()
+                .map(|operand| {
+                    let mut cx = FnPtrStoreCx::new(llbc, u64::MAX, "");
+                    path_arg_from(llbc, cx.of_operand_in_fun(fd.def_id, operand))
+                })
+                .collect();
+            inputs.call_args.entry(callee_path).or_default().push(args);
+        }
+    }
+}
+
+fn path_arg_from(llbc: &Llbc, source: StoreSource) -> PathArg {
+    match source {
+        StoreSource::Unknown => PathArg::Unknown,
+        StoreSource::ClosedCopy => PathArg::ClosedCopy,
+        StoreSource::Funs(funs) => match funs_to_paths(llbc, funs) {
+            None => PathArg::Unknown,
+            Some(paths) => PathArg::Funs(paths),
+        },
+        StoreSource::Params(params) => match params_to_paths(llbc, params) {
+            None => PathArg::Unknown,
+            Some(paths) => PathArg::Params(paths),
+        },
+        StoreSource::Mixed { funs, params } => {
+            match (funs_to_paths(llbc, funs), params_to_paths(llbc, params)) {
+                (None, _) | (_, None) => PathArg::Unknown,
+                (Some(funs), Some(params)) => PathArg::Mixed { funs, params },
+            }
+        }
+    }
+}
+
+fn funs_to_paths(
+    llbc: &Llbc,
+    funs: std::collections::BTreeSet<u64>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for id in funs {
+        paths.insert(fun_decl_callpath(llbc, id)?);
+    }
+    Some(paths)
+}
+
+fn params_to_paths(
+    llbc: &Llbc,
+    params: std::collections::BTreeSet<(u64, usize)>,
+) -> Option<std::collections::BTreeSet<(String, usize)>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for (fun_id, arg_local) in params {
+        let path = fun_decl_callpath(llbc, fun_id)?;
+        paths.insert((path, arg_local - 1));
+    }
+    Some(paths)
+}
+
+fn resolve_param(
+    inputs: &FnPtrFamilyInputs,
+    fn_path: &str,
+    arg_pos: usize,
+    visiting: &mut Vec<(String, usize)>,
+) -> PathArg {
+    let key = (fn_path.to_string(), arg_pos);
+    if visiting.contains(&key) {
+        return PathArg::ClosedCopy;
+    }
+    let Some(sites) = inputs.call_args.get(fn_path) else {
+        return PathArg::Unknown;
+    };
+    if sites.is_empty() {
+        return PathArg::Unknown;
+    }
+    visiting.push(key);
+    let mut acc: Option<PathArg> = None;
+    for args in sites {
+        let next = match args.get(arg_pos) {
+            None => PathArg::Unknown,
+            Some(PathArg::Unknown) => PathArg::Unknown,
+            Some(PathArg::ClosedCopy) => PathArg::ClosedCopy,
+            Some(PathArg::Funs(funs)) => PathArg::Funs(funs.clone()),
+            Some(PathArg::Params(params)) => flatten_params(inputs, params, visiting),
+            Some(PathArg::Mixed { funs, params }) => merge_path_arg(
+                PathArg::Funs(funs.clone()),
+                flatten_params(inputs, params, visiting),
+            ),
+        };
+        acc = Some(match acc {
+            None => next,
+            Some(prev) => merge_path_arg(prev, next),
+        });
+        if matches!(acc, Some(PathArg::Unknown)) {
+            visiting.pop();
+            return PathArg::Unknown;
+        }
+    }
+    visiting.pop();
+    acc.unwrap_or(PathArg::Unknown)
+}
+
+fn flatten_params(
+    inputs: &FnPtrFamilyInputs,
+    params: &std::collections::BTreeSet<(String, usize)>,
+    visiting: &mut Vec<(String, usize)>,
+) -> PathArg {
+    let mut acc: Option<PathArg> = None;
+    for (fn_path, arg_pos) in params {
+        let next = resolve_param(inputs, fn_path, *arg_pos, visiting);
+        acc = Some(match acc {
+            None => next,
+            Some(prev) => merge_path_arg(prev, next),
+        });
+        if matches!(acc, Some(PathArg::Unknown)) {
+            return PathArg::Unknown;
+        }
+    }
+    acc.unwrap_or(PathArg::Unknown)
+}
+
+fn merge_path_arg(left: PathArg, right: PathArg) -> PathArg {
+    match (left, right) {
+        (PathArg::Unknown, _) | (_, PathArg::Unknown) => PathArg::Unknown,
+        (PathArg::ClosedCopy, other) | (other, PathArg::ClosedCopy) => other,
+        (PathArg::Funs(mut left), PathArg::Funs(right)) => {
+            left.extend(right);
+            PathArg::Funs(left)
+        }
+        (PathArg::Params(mut left), PathArg::Params(right)) => {
+            left.extend(right);
+            PathArg::Params(left)
+        }
+        (left, right) => {
+            let (mut funs, mut params) = path_arg_parts(left);
+            let (f2, p2) = path_arg_parts(right);
+            funs.extend(f2);
+            params.extend(p2);
+            if funs.is_empty() {
+                PathArg::Params(params)
+            } else if params.is_empty() {
+                PathArg::Funs(funs)
+            } else {
+                PathArg::Mixed { funs, params }
+            }
+        }
+    }
+}
+
+fn path_arg_parts(
+    arg: PathArg,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<(String, usize)>,
+) {
+    match arg {
+        PathArg::Funs(funs) => (funs, std::collections::BTreeSet::new()),
+        PathArg::Params(params) => (std::collections::BTreeSet::new(), params),
+        PathArg::Mixed { funs, params } => (funs, params),
+        PathArg::ClosedCopy | PathArg::Unknown => (
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::new(),
+        ),
+    }
 }
 
 fn fnptr_struct_tables(
@@ -616,12 +962,13 @@ fn fnptr_struct_tables(
 
 fn enroll_fnptr_field_stores(
     llbc: &Llbc,
+    fun_id: u64,
     body: &Unstructured,
     structs: &std::collections::HashMap<u64, (String, Vec<Option<String>>)>,
-    out: &mut Vec<(String, String, String)>,
-    unknown: &mut Vec<(String, String)>,
+    stores: &mut Vec<FieldStore>,
 ) {
     let assigns = collect_local_assigns(llbc, body);
+    let arg_count = body.locals.arg_count;
     let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body().iter().enumerate() {
         if !forward_blocks[bb_idx] {
@@ -639,21 +986,9 @@ fn enroll_fnptr_field_stores(
                     let Some(field) = slot.as_deref() else {
                         continue;
                     };
-                    record_fnptr_store(
-                        llbc,
-                        struct_path,
-                        field,
-                        store_source_of_operand(
-                            llbc,
-                            operand,
-                            struct_id,
-                            field,
-                            &assigns,
-                            &mut Vec::new(),
-                        ),
-                        out,
-                        unknown,
-                    );
+                    let source = FnPtrStoreCx::new(llbc, struct_id, field)
+                        .of_operand(fun_id, arg_count, &assigns, operand);
+                    record_fnptr_store(llbc, struct_path, field, source, stores);
                 }
             }
             if let Some((struct_id, struct_path, field)) = fnptr_field_slot(llbc, place)
@@ -662,21 +997,9 @@ fn enroll_fnptr_field_stores(
                     .iter()
                     .any(|slot| slot.as_deref() == Some(field.as_str()))
             {
-                record_fnptr_store(
-                    llbc,
-                    &struct_path,
-                    &field,
-                    store_source_of_rvalue(
-                        llbc,
-                        rvalue,
-                        struct_id,
-                        &field,
-                        &assigns,
-                        &mut Vec::new(),
-                    ),
-                    out,
-                    unknown,
-                );
+                let source = FnPtrStoreCx::new(llbc, struct_id, &field)
+                    .of_rvalue(fun_id, arg_count, &assigns, rvalue);
+                record_fnptr_store(llbc, &struct_path, &field, source, stores);
             }
         }
     }
@@ -687,30 +1010,69 @@ fn record_fnptr_store(
     struct_path: &str,
     field: &str,
     source: StoreSource,
-    out: &mut Vec<(String, String, String)>,
-    unknown: &mut Vec<(String, String)>,
+    stores: &mut Vec<FieldStore>,
 ) {
     match source {
         StoreSource::ClosedCopy => {}
-        StoreSource::Unknown => {
-            let key = (struct_path.to_string(), field.to_string());
-            if !unknown.contains(&key) {
-                unknown.push(key);
+        StoreSource::Unknown => stores.push(FieldStore::Unknown {
+            struct_path: struct_path.to_string(),
+            field: field.to_string(),
+        }),
+        StoreSource::Funs(funs) => record_fun_stores(llbc, struct_path, field, funs, stores),
+        StoreSource::Params(params) => {
+            record_param_stores(llbc, struct_path, field, params, stores)
+        }
+        StoreSource::Mixed { funs, params } => {
+            record_fun_stores(llbc, struct_path, field, funs, stores);
+            record_param_stores(llbc, struct_path, field, params, stores);
+        }
+    }
+}
+
+fn record_fun_stores(
+    llbc: &Llbc,
+    struct_path: &str,
+    field: &str,
+    funs: std::collections::BTreeSet<u64>,
+    stores: &mut Vec<FieldStore>,
+) {
+    match funs_to_paths(llbc, funs) {
+        None => stores.push(FieldStore::Unknown {
+            struct_path: struct_path.to_string(),
+            field: field.to_string(),
+        }),
+        Some(paths) => {
+            for fun_path in paths {
+                stores.push(FieldStore::Fun {
+                    struct_path: struct_path.to_string(),
+                    field: field.to_string(),
+                    fun_path,
+                });
             }
         }
-        StoreSource::Funs(funs) => {
-            for fun in funs {
-                let Some(stored) = llbc.fn_by_id(fun) else {
-                    continue;
-                };
-                let callpath = registered_path_for_fun_decl(llbc, stored).canonical_key();
-                if callpath.is_empty() {
-                    continue;
-                }
-                let row = (struct_path.to_string(), field.to_string(), callpath);
-                if !out.contains(&row) {
-                    out.push(row);
-                }
+    }
+}
+
+fn record_param_stores(
+    llbc: &Llbc,
+    struct_path: &str,
+    field: &str,
+    params: std::collections::BTreeSet<(u64, usize)>,
+    stores: &mut Vec<FieldStore>,
+) {
+    match params_to_paths(llbc, params) {
+        None => stores.push(FieldStore::Unknown {
+            struct_path: struct_path.to_string(),
+            field: field.to_string(),
+        }),
+        Some(paths) => {
+            for (fn_path, arg_pos) in paths {
+                stores.push(FieldStore::Param {
+                    struct_path: struct_path.to_string(),
+                    field: field.to_string(),
+                    fn_path,
+                    arg_pos,
+                });
             }
         }
     }
@@ -720,11 +1082,19 @@ fn record_fnptr_store(
 ///
 /// `ClosedCopy` is a read of the same `(struct, field)` (`from_access`-style
 /// `x.f` stored into `y.f` of the same type): it adds no new target.
-/// `Unknown` is any other non-FunDecl (a parameter, a call, a different
-/// field). `FunctionReprBase.call` unions `s_pbc.descriptions`; an unknown
-/// store means the annotated set is not closed.
+/// `Params` is a constructor argument; `resolve_fnptr_field_families`
+/// unions Regular call sites of that FunDecl path (`FunctionDesc.pycall`).
+/// `Unknown` is any other non-FunDecl (a parameter whose Regular call
+/// sites do not close, a call, a different field). `FunctionReprBase.call`
+/// unions `s_pbc.descriptions`; an unknown store means the annotated set
+/// is not closed.
 enum StoreSource {
     Funs(std::collections::BTreeSet<u64>),
+    Params(std::collections::BTreeSet<(u64, usize)>),
+    Mixed {
+        funs: std::collections::BTreeSet<u64>,
+        params: std::collections::BTreeSet<(u64, usize)>,
+    },
     ClosedCopy,
     Unknown,
 }
@@ -733,95 +1103,154 @@ fn merge_store_source(left: StoreSource, right: StoreSource) -> StoreSource {
     match (left, right) {
         (StoreSource::Unknown, _) | (_, StoreSource::Unknown) => StoreSource::Unknown,
         (StoreSource::ClosedCopy, other) | (other, StoreSource::ClosedCopy) => other,
-        (StoreSource::Funs(mut left), StoreSource::Funs(right)) => {
-            left.extend(right);
-            StoreSource::Funs(left)
+        (left, right) => {
+            let (mut funs, mut params) = store_source_parts(left);
+            let (f2, p2) = store_source_parts(right);
+            funs.extend(f2);
+            params.extend(p2);
+            if funs.is_empty() {
+                StoreSource::Params(params)
+            } else if params.is_empty() {
+                StoreSource::Funs(funs)
+            } else {
+                StoreSource::Mixed { funs, params }
+            }
         }
     }
 }
 
-fn store_source_of_rvalue(
-    llbc: &Llbc,
-    rvalue: &Rvalue,
-    dest_struct: u64,
-    dest_field: &str,
-    assigns: &LocalAssigns<'_>,
-    visiting: &mut Vec<usize>,
-) -> StoreSource {
-    let Some(operand) = rvalue_use_operand(rvalue) else {
-        return StoreSource::Unknown;
-    };
-    store_source_of_operand(llbc, operand, dest_struct, dest_field, assigns, visiting)
+fn store_source_parts(
+    source: StoreSource,
+) -> (
+    std::collections::BTreeSet<u64>,
+    std::collections::BTreeSet<(u64, usize)>,
+) {
+    match source {
+        StoreSource::Funs(funs) => (funs, std::collections::BTreeSet::new()),
+        StoreSource::Params(params) => (std::collections::BTreeSet::new(), params),
+        StoreSource::Mixed { funs, params } => (funs, params),
+        StoreSource::ClosedCopy | StoreSource::Unknown => (
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::new(),
+        ),
+    }
 }
 
-fn store_source_of_operand(
-    llbc: &Llbc,
-    operand: &Operand,
+/// Resolve a store operand to FunDecls or constructor parameters.
+/// Visiting is `(fun_id, local)`. Call-site union is
+/// `resolve_fnptr_field_families` (`FunctionDesc.pycall`).
+struct FnPtrStoreCx<'a> {
+    llbc: &'a Llbc,
     dest_struct: u64,
-    dest_field: &str,
-    assigns: &LocalAssigns<'_>,
-    visiting: &mut Vec<usize>,
-) -> StoreSource {
-    if let Some(fun) = operand_fundef(llbc, operand) {
-        return StoreSource::Funs(std::collections::BTreeSet::from([fun]));
-    }
-    let Some(place) = operand_place(operand) else {
-        return StoreSource::Unknown;
-    };
-    if let Some((struct_id, _, field)) = fnptr_field_slot(llbc, place) {
-        if struct_id == dest_struct && field == dest_field {
-            return StoreSource::ClosedCopy;
+    dest_field: &'a str,
+    visiting: Vec<(u64, usize)>,
+}
+
+impl<'a> FnPtrStoreCx<'a> {
+    fn new(llbc: &'a Llbc, dest_struct: u64, dest_field: &'a str) -> Self {
+        Self {
+            llbc,
+            dest_struct,
+            dest_field,
+            visiting: Vec::new(),
         }
-        return StoreSource::Unknown;
     }
-    let PlaceKind::Local(index) = place.kind else {
-        return StoreSource::Unknown;
-    };
-    store_source_of_local(
-        llbc,
-        index as usize,
-        dest_struct,
-        dest_field,
-        assigns,
-        visiting,
-    )
-}
 
-fn store_source_of_local(
-    llbc: &Llbc,
-    index: usize,
-    dest_struct: u64,
-    dest_field: &str,
-    assigns: &LocalAssigns<'_>,
-    visiting: &mut Vec<usize>,
-) -> StoreSource {
-    if visiting.contains(&index) {
-        return StoreSource::ClosedCopy;
+    fn of_rvalue(
+        &mut self,
+        fun_id: u64,
+        arg_count: u64,
+        assigns: &LocalAssigns<'_>,
+        rvalue: &Rvalue,
+    ) -> StoreSource {
+        let Some(operand) = rvalue_use_operand(rvalue) else {
+            return StoreSource::Unknown;
+        };
+        self.of_operand(fun_id, arg_count, assigns, operand)
     }
-    if assigns.opaque.get(index).copied().unwrap_or(true) {
-        return StoreSource::Unknown;
-    }
-    let Some(rvalues) = assigns.rvalues.get(index) else {
-        return StoreSource::Unknown;
-    };
-    if rvalues.is_empty() {
-        return StoreSource::Unknown;
-    }
-    visiting.push(index);
-    let mut acc: Option<StoreSource> = None;
-    for rvalue in rvalues {
-        let next = store_source_of_rvalue(llbc, rvalue, dest_struct, dest_field, assigns, visiting);
-        acc = Some(match acc {
-            None => next,
-            Some(prev) => merge_store_source(prev, next),
-        });
-        if matches!(acc, Some(StoreSource::Unknown)) {
-            visiting.pop();
+
+    fn of_operand(
+        &mut self,
+        fun_id: u64,
+        arg_count: u64,
+        assigns: &LocalAssigns<'_>,
+        operand: &Operand,
+    ) -> StoreSource {
+        if let Some(fun) = operand_fundef(self.llbc, operand) {
+            return StoreSource::Funs(std::collections::BTreeSet::from([fun]));
+        }
+        let Some(place) = operand_place(operand) else {
+            return StoreSource::Unknown;
+        };
+        if let Some((struct_id, _, field)) = fnptr_field_slot(self.llbc, place) {
+            if struct_id == self.dest_struct && field == self.dest_field {
+                return StoreSource::ClosedCopy;
+            }
             return StoreSource::Unknown;
         }
+        let PlaceKind::Local(index) = place.kind else {
+            return StoreSource::Unknown;
+        };
+        self.of_local(fun_id, arg_count, assigns, index as usize)
     }
-    visiting.pop();
-    acc.unwrap_or(StoreSource::Unknown)
+
+    fn of_local(
+        &mut self,
+        fun_id: u64,
+        arg_count: u64,
+        assigns: &LocalAssigns<'_>,
+        index: usize,
+    ) -> StoreSource {
+        let key = (fun_id, index);
+        if self.visiting.contains(&key) {
+            return StoreSource::ClosedCopy;
+        }
+        if assigns.opaque.get(index).copied().unwrap_or(true) {
+            return StoreSource::Unknown;
+        }
+        let Some(rvalues) = assigns.rvalues.get(index) else {
+            return StoreSource::Unknown;
+        };
+        if rvalues.is_empty() {
+            if index >= 1 && (index as u64) <= arg_count {
+                return self.of_parameter(fun_id, index);
+            }
+            return StoreSource::Unknown;
+        }
+        self.visiting.push(key);
+        let mut acc: Option<StoreSource> = None;
+        for rvalue in rvalues {
+            let next = self.of_rvalue(fun_id, arg_count, assigns, rvalue);
+            acc = Some(match acc {
+                None => next,
+                Some(prev) => merge_store_source(prev, next),
+            });
+            if matches!(acc, Some(StoreSource::Unknown)) {
+                self.visiting.pop();
+                return StoreSource::Unknown;
+            }
+        }
+        self.visiting.pop();
+        acc.unwrap_or(StoreSource::Unknown)
+    }
+
+    fn of_parameter(&mut self, fun_id: u64, arg_local: usize) -> StoreSource {
+        StoreSource::Params(std::collections::BTreeSet::from([(fun_id, arg_local)]))
+    }
+
+    fn of_operand_in_fun(&mut self, fun_id: u64, operand: &Operand) -> StoreSource {
+        if let Some(fun) = operand_fundef(self.llbc, operand) {
+            return StoreSource::Funs(std::collections::BTreeSet::from([fun]));
+        }
+        let Some(fd) = self.llbc.fn_by_id(fun_id) else {
+            return StoreSource::Unknown;
+        };
+        let Some(body) = fd.unstructured_transient() else {
+            return StoreSource::Unknown;
+        };
+        let assigns = collect_local_assigns(self.llbc, &body);
+        self.of_operand(fun_id, body.locals.arg_count, &assigns, operand)
+    }
 }
 
 fn aggregate_struct_decl_id(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> {
