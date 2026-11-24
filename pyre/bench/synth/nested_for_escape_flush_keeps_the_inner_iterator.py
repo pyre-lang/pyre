@@ -1,8 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: skip-backends=wasm
-# wasm still prints PASS but compiles a root trace after five loop aborts,
-# so it cannot declare the native `main` loop.
 # The nested `FOR_ITER` operand stack must survive a compiled `_getframe(1)`
 # from the inlined callee. The walk answers that call with the portal red
 # box and folds `f_lasti` at the CALL, so the loop compiles instead of

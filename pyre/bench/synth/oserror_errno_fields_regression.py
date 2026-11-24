@@ -2,13 +2,14 @@
 # pyre-check: selfcheck-interpreted
 # The invariant is interpreter-level, so the run compiles no loop.
 # pyre-check: skip-backends=wasm
-# The wasm guest has no os/filesystem support used by this fixture.
+# The wasm guest filesystem is read-only, so the pid-named directory this
+# fixture creates cannot be made (`OSError: [Errno 30] Read-only file system`)
+# and the FileExistsError half cannot run. open() of a missing path already
+# raises FileNotFoundError(2) on wasm.
 # A failed syscall raises the errno-specific OSError subclass with
 # .errno/.strerror/.filename set and args=(errno, strerror): open() of a
 # missing path -> FileNotFoundError(2), os.mkdir of an existing path ->
-# FileExistsError(17).  Native-only: the wasm guest has no os/filesystem
-# (open() raises NotImplementedError, `import os` has no posix backend), so
-# this guard skips that backend. Behaviour verified against CPython/PyPy.
+# FileExistsError(17).
 #
 # Both fixtures come from `os` alone: a pid-named directory this script
 # creates in the cwd, rather than tempfile.mkdtemp, so the guard stays

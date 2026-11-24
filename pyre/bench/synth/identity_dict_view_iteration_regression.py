@@ -1,12 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main,walk
-# pyre-check: skip-backends=wasm
-# The wasm guest has no `time` module, which the ratio below is built on.
 # Self-checking regression guard for the cost of walking an IDENTITY dict's view.
-#
-# The correctness half is still covered on wasm by
-# `module_dict_view_iteration_regression.py`, which walks the same view
-# machinery without a clock.
 #
 # Same trait-default trap as `module_dict_view_iteration_regression.py`, in the
 # other strategy that never overrode it.  The dict-view iterator keeps an integer

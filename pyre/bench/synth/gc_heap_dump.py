@@ -1,9 +1,10 @@
 # pyre-check: no-cpython
 # pyre-check: skip-backends=wasm
 # pyre-check: requires-modules=math
-# The dump's destination is a file, and the wasm guest has no filesystem: it
-# ships no `os` module at all, so the `import os` below raises before any of
-# this runs. Nothing here is about the backend.
+# The dump's destination is a file. The wasm guest filesystem is read-only
+# and tempfile finds no usable temporary directory
+# (`FileNotFoundError: No usable temporary directory found`), so the dump
+# has nowhere to be written. Nothing here is about the backend.
 # `tempfile` imports `random`, which imports `math`.
 import gc
 import os

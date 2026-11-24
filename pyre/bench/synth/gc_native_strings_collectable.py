@@ -1,5 +1,4 @@
 # pyre-check: no-cpython
-# pyre-check: skip-backends=wasm
 # pyre-check: requires-modules=mmap
 
 import _io
