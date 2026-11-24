@@ -63,6 +63,15 @@ def check_guard_transitions():
 
     # A subclass arrives after the exact-int trace is hot without a branch at
     # the operation site; each unary fold must leave through its class guard.
+    # The compiled loop GUARD_VALUEs each lambda's `Function.code`, and
+    # `must_compile` keys that failing ref by `cast_ptr_to_int(refval)`. A
+    # minor collection inside a guard's 200 `trace_eagerness` failures used to
+    # move a still-young code object and restart its counter (guard_failures
+    # 610/673/671 at a 1/2/4MiB nursery, 790 on windows-latest). The `fill`
+    # allocation is larger than check.py's pinned 4MiB nursery, so a minor
+    # collection promotes the code objects before the first transition.
+    fill = list(map(str, range(50000)))
+    del fill
     for op, expected in (
         (lambda value: -value, "NEG"),
         (lambda value: +value, "POS"),

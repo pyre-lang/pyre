@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=24
-# After FBW inline screens dropped (#2600), cranelift CI reads 10.7-11.7x
-# (dynasm 7.8-9.2x). The ceiling is twice the slower cranelift reading.
+# pyre-check: max-pypy-ratio=17
+# Cranelift CI reads 8.2x (dynasm 5.9-7.6x, a local macOS dynasm 5.7-6.2x)
+# with traces unchanged from the 10.7-11.7x readings after #2600. The ceiling
+# is twice the slower cranelift reading.
 # wasm once read guard_failures 12664 against 12635 on dynasm. A user
 # instance now promotes its map (mapdict.py MapdictStorageMixin._get_mapdict_map
 # = jit.promote(self.map); class identity is terminator.w_cls). Map nodes are
