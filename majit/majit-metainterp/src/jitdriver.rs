@@ -8835,8 +8835,9 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// `warmstate.py bound_reached` steps 4-5. `matched` is the cell the
-    /// one comparekey walk returned.
+    /// `warmstate.py bound_reached` steps 4-5. `matched` is `None` when no
+    /// door lookup ran; `Some` carries the door's one lookup (hit or known
+    /// miss).
     pub fn force_start_tracing_with_cell(
         &mut self,
         green_key: u64,
@@ -8845,7 +8846,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) {
         let pin = crate::warmstate::GreenRefPin::adopt(code_slot);
         majit_gc::ensure_type_registry_closed();
@@ -8935,7 +8936,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// `warmstate.py bound_reached` steps 4-5 plus `setup_tracing`.
-    /// `matched` is the cell the one comparekey walk returned.
+    /// `matched` is `None` when no door lookup ran; `Some` carries the
+    /// door's one lookup (hit or known miss).
     pub fn bound_reached_with_cell(
         &mut self,
         green_key: u64,
@@ -8943,7 +8945,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) {
         if self.meta.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key);
@@ -9060,7 +9062,7 @@ impl<S: JitState> JitDriver<S> {
                 None => ResolvedJitCell::miss(green_key),
             }
         };
-        let matched = resolved.cell.clone();
+        let matched = Some(resolved.clone());
         match self
             .meta
             .maybe_compile_and_run_step_on_driver(
@@ -9181,7 +9183,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        matched: Option<std::rc::Rc<crate::warmstate::BaseJitCell>>,
+        matched: Option<crate::warmstate::ResolvedJitCell>,
     ) -> bool {
         if spdiag_enabled() {
             eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
@@ -11301,7 +11303,7 @@ impl<S: JitState> JitDriver<S> {
                 live.types.as_slice(),
             ),
         };
-        let matched = resolved.cell.clone();
+        let matched = Some(resolved.clone());
         let cell_key = resolved.cell_key().unwrap_or(resolved.hash);
         pin.reload(&mut live);
         let step = if already_ticked {
