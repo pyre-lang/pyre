@@ -678,3 +678,52 @@ fn interior_header_base_stamps_concrete_array_on_local_and_entries() {
         Some(expected)
     );
 }
+
+/// Field-0 inlined parent of a GC class instance is the instance-pointer
+/// upcast (`lltype.py` `Struct._first_struct` / `rclass.py`
+/// `InstanceRepr.upcast`), not a FieldRead of the prefix.
+#[test]
+fn gc_class_instance_field0_parent_read_emits_cast_instance() {
+    use crate::model::OpKind;
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::with_shared_lowering(llbc, |context| {
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta.name_path_str().contains("mapdict")
+                    && fd
+                        .item_meta
+                        .source_text
+                        .as_deref()
+                        .is_some_and(|text| text.contains("fn storage_needed("))
+            })
+            .expect("mapdict storage_needed in pyre-object LLBC");
+        crate::front::mir::lower_fun_decl(context, fd)
+            .unwrap_or_else(|err| panic!("lower storage_needed: {err:?}"))
+    });
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let parent_upcast = ops.iter().find(|op| {
+        crate::model::cast_instance_root(&op.kind)
+            .is_some_and(|root| root.rsplit("::").next() == Some("PlainAttribute"))
+    });
+    assert!(
+        parent_upcast.is_some(),
+        "field-0 parent read must be cast_instance of the parent class; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "base"
+            )
+        }),
+        "field-0 parent must not FieldRead the inlined prefix; graph={}",
+        graph.dump()
+    );
+}
