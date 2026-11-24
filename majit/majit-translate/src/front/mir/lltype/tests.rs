@@ -9655,9 +9655,9 @@ fn spec_segments_keeps_ident_before_vtable_method() {
     assert_ne!(getitem_path, setitem_path);
 }
 
-/// Ancestor Impl Self types `a::Foo` and `b::Foo` share the last path
-/// component `Foo` and the same last Impl (`parent::Foo`). Rendering each
-/// Impl from its payload keeps the paths distinct.
+/// Last Impl Self types `a::Foo` and `b::Foo` share the last Ident `Foo`.
+/// Inherent identity is the Self TypeDecl path plus the method (E0592);
+/// ancestor Impls in the FunDecl path are replaced, not concatenated.
 #[test]
 fn spec_segments_distinguishes_impls_that_share_a_self_leaf() {
     let span = serde_json::json!({"data": {
@@ -9701,9 +9701,9 @@ fn spec_segments_distinguishes_impls_that_share_a_self_leaf() {
             "item_meta": meta(vec![
                 ident("parent", 0),
                 ident("Foo", 0),
-                inherent(ancestor),
-                ident("nested", 0),
                 inherent(0),
+                ident("nested", 0),
+                inherent(ancestor),
                 ident("m", 0),
             ]),
             "signature": {
@@ -9734,20 +9734,26 @@ fn spec_segments_distinguishes_impls_that_share_a_self_leaf() {
     let a = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(1).expect("a::Foo")).segments;
     let b = super::registered_path_for_fun_decl(&llbc, llbc.fn_by_id(2).expect("b::Foo")).segments;
     assert_ne!(a, b, "a::Foo vs b::Foo collapsed: {a:?}");
-    assert!(
-        a.iter().any(|s| s.contains("a::Foo")),
-        "a::Foo missing: {a:?}"
+    assert_eq!(
+        a,
+        ["a", "Foo", "m"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
-    assert!(
-        b.iter().any(|s| s.contains("b::Foo")),
-        "b::Foo missing: {b:?}"
+    assert_eq!(
+        b,
+        ["b", "Foo", "m"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     );
     assert!(!a.iter().any(|s| s.starts_with('@')));
     assert!(!b.iter().any(|s| s.starts_with('@')));
 }
 
-/// Nested closure inside an inherent method: parent Ident `#N` is part of
-/// the FunDecl name and stays in the path.
+/// Nested closure inside an inherent method: parent Ident `#N` lives on
+/// the Self TypeDecl and stays in the identity (`spec_ident_name`).
 #[test]
 fn spec_segments_keeps_disambiguated_parent_of_nested_closure() {
     let span = serde_json::json!({"data": {
@@ -9766,29 +9772,34 @@ fn spec_segments_keeps_disambiguated_parent_of_nested_closure() {
     let generics = serde_json::json!({
         "regions": [], "types": [], "const_generics": [], "trait_refs": []
     });
-    let owner_adt = serde_json::json!({
-        "Adt": {"id": 0, "generics": generics, "builtin": null}
-    });
-    let owner_ty = serde_json::json!({"Value": [0, owner_adt.clone()]});
-    let inherent = serde_json::json!({"Impl": {"Ty": {
-        "skip_binder": owner_ty,
-        "kind": "InherentImplBlock"
-    }}});
-    let owner = serde_json::json!({
-        "def_id": 0,
-        "item_meta": meta(vec![
-            ident("fixture", 0), ident("method_owner", 0), ident("OWNER", 0)
-        ]),
-        "kind": {"Struct": []}
-    });
-    let closure = |def_id: u64, parent_n: u64| {
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics.clone(), "builtin": null}
+        })
+    };
+    let inherent = |id: u64| {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [id, adt(id)]},
+            "kind": "InherentImplBlock"
+        }}})
+    };
+    let owner = |id: u64, n: u64| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(vec![
+                ident("fixture", 0), ident("method_owner", 0), ident("OWNER", n)
+            ]),
+            "kind": {"Struct": []}
+        })
+    };
+    let closure = |def_id: u64, parent_n: u64, self_id: u64| {
         serde_json::json!({
             "def_id": def_id,
             "item_meta": meta(vec![
                 ident("fixture", 0),
                 ident("method_owner", 0),
                 ident("OWNER", parent_n),
-                inherent.clone(),
+                inherent(self_id),
                 ident("method", 0),
                 ident("closure", 0),
                 ident("call", 0),
@@ -9806,8 +9817,8 @@ fn spec_segments_keeps_disambiguated_parent_of_nested_closure() {
         "has_errors": false,
         "translated": {
             "crate_name": "fixture",
-            "type_decls": [owner],
-            "fun_decls": [null, closure(1, 2), closure(2, 3)],
+            "type_decls": [owner(0, 2), owner(1, 3)],
+            "fun_decls": [null, closure(1, 2, 0), closure(2, 3, 1)],
             "global_decls": [],
             "trait_decls": [],
             "trait_impls": []

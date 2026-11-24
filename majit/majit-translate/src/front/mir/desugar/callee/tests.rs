@@ -1109,6 +1109,184 @@ fn identity_path_for_fun_decl_uses_the_call_leaf_and_specialization() {
     assert_ne!(spec.segments, base.segments);
 }
 
+/// JSON LLBC: inherent `fn make` methods whose Self is an ADT TypeDecl.
+/// `types` is `(def_id, ident path)`; `methods` is
+/// `(fun def_id, impl-module idents, self TypeDecl id)`.
+fn inherent_adt_impl_make_llbc(types: &[(u64, &[&str])], methods: &[(u64, &[&str], u64)]) -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics.clone(), "builtin": null}
+        })
+    };
+    let ty = |id: u64| serde_json::json!({"Value": [id, adt(id)]});
+    let inherent = |id: u64| {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": ty(id),
+            "kind": "InherentImplBlock"
+        }}})
+    };
+    let type_decls: Vec<_> = types
+        .iter()
+        .map(|(id, path)| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path.iter().copied().map(ident).collect()),
+                "kind": {"Struct": []}
+            })
+        })
+        .collect();
+    let mut fun_decls = vec![serde_json::Value::Null];
+    for (def_id, module, self_id) in methods {
+        let mut name: Vec<_> = module.iter().copied().map(ident).collect();
+        name.push(inherent(*self_id));
+        name.push(ident("make"));
+        fun_decls.push(serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(name),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": []},
+                "body": []
+            }}
+        }));
+    }
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "c",
+            "type_decls": type_decls,
+            "fun_decls": fun_decls,
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("inherent ADT impl fixture parses")
+}
+
+fn identity_segs(llbc: &Llbc, id: u64) -> Vec<String> {
+    super::registered_path_for_fun_decl(llbc, llbc.fn_by_id(id).expect("fun")).segments
+}
+
+/// Two inherent impls in one module whose Self types are `a::T` and
+/// `b::T` (non-generic). Harvest `for_impl_method` already names the
+/// TypeDecl (`a::T::make` / `b::T::make`). The FunDecl identity is the
+/// TypeDecl path plus the method (`c::a::T::make` / `c::b::T::make`);
+/// last-Ident-only Self (`T`) would collapse both onto `c::m::T::make`
+/// (`Bookkeeper.getdesc` keys the function object).
+///
+/// `fnptr_family_llbc` / `unit_fun` mint Ident-only `item_meta` paths
+/// and cannot carry an Impl payload; this fixture is the same JSON
+/// shape as `lltype/tests.rs`
+/// `spec_segments_distinguishes_impls_that_share_a_self_leaf`.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_inherent_impls_that_share_a_self_leaf() {
+    let llbc = inherent_adt_impl_make_llbc(
+        &[(0, &["c", "a", "T"]), (1, &["c", "b", "T"])],
+        &[(1, &["c", "m"], 0), (2, &["c", "m"], 1)],
+    );
+    let a = llbc.fn_by_id(1).expect("impl a::T");
+    let b = llbc.fn_by_id(2).expect("impl b::T");
+    let a_harvest = super::harvest_path_for_fun_decl(&llbc, a).segments;
+    let b_harvest = super::harvest_path_for_fun_decl(&llbc, b).segments;
+    assert_eq!(
+        a_harvest,
+        crate::parse::CallPath::for_impl_method("a::T", "make").segments
+    );
+    assert_eq!(
+        b_harvest,
+        crate::parse::CallPath::for_impl_method("b::T", "make").segments
+    );
+    assert_ne!(a_harvest, b_harvest, "harvest a::T vs b::T collapsed");
+    let a_id = super::registered_path_for_fun_decl(&llbc, a).segments;
+    let b_id = super::registered_path_for_fun_decl(&llbc, b).segments;
+    assert_ne!(
+        a_id, b_id,
+        "identity a::T vs b::T collapsed: {a_id:?} {b_id:?}"
+    );
+    assert_eq!(
+        a_id,
+        ["c", "a", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        b_id,
+        ["c", "b", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Suffix-overlap of the impl module with Self's TypeDecl path is not
+/// an identity: `impl` in `c::x::m` for `c::m::T` and `impl` in `c::x`
+/// for `c::x::m::T` both became `c::x::m::T::make` under that rule.
+#[test]
+fn registered_path_for_fun_decl_distinguishes_inherent_impls_whose_module_overlaps_self() {
+    let llbc = inherent_adt_impl_make_llbc(
+        &[(0, &["c", "m", "T"]), (1, &["c", "x", "m", "T"])],
+        &[(1, &["c", "x", "m"], 0), (2, &["c", "x"], 1)],
+    );
+    let in_xm = identity_segs(&llbc, 1);
+    let in_x = identity_segs(&llbc, 2);
+    assert_ne!(
+        in_xm, in_x,
+        "identity c::m::T vs c::x::m::T collapsed: {in_xm:?} {in_x:?}"
+    );
+    assert_eq!(
+        in_xm,
+        ["c", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        in_x,
+        ["c", "x", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Same-module `impl T`: identity is the TypeDecl path plus the method,
+/// which matches the pre-250 spelling `c::m::T::make`.
+#[test]
+fn registered_path_for_fun_decl_same_module_inherent_impl_is_type_decl_path() {
+    let llbc = inherent_adt_impl_make_llbc(&[(0, &["c", "m", "T"])], &[(1, &["c", "m"], 0)]);
+    assert_eq!(
+        identity_segs(&llbc, 1),
+        ["c", "m", "T", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A monomorphized vtable keeps its method slots as `*const ()`, so the
 /// `dyn` call casts the slot into a temporary and calls that; the slot
 /// read is recovered from the temporary's single producer.
